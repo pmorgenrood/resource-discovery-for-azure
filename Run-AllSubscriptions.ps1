@@ -716,7 +716,17 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+#
+# The @(...) wrap is REQUIRED, not cosmetic. Get-CompletedSubscriptionIds
+# returns @() on a fresh run, and an empty array captured from a function call
+# collapses to $null on assignment. Without the wrap, the first
+# `$CompletedIds += $Sub.Id` below evaluates `$null + '<id>'`, which STRING-
+# concatenates instead of array-appending - so the completed set becomes one
+# mashed-together id string. That silently breaks -Resume (its `-contains`
+# never matches the mashed string, so every subscription is reprocessed) and
+# any downstream membership check. @(...) guarantees a real (possibly empty)
+# array so `+=` always appends.
+$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID)
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.

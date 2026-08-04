@@ -42,7 +42,7 @@ BeforeAll {
     # Guard: the functions under test must be defined by the shared file. If a
     # future change renames or removes one, fail loudly here rather than with a
     # confusing "command not found" mid-test.
-    $TargetFunctions = @('Get-StreamResumeStateFiles', 'Merge-FailedAttempts', 'Get-WrapperExitCode', 'Add-FailedAttempt', 'Remove-FailedAttempt', 'Get-ConsumptionAccessOutcome', 'Resolve-AccessPreflight', 'Test-SubscriptionAccessAll')
+    $TargetFunctions = @('Get-StreamResumeStateFiles', 'Merge-FailedAttempts', 'Get-WrapperExitCode', 'Add-FailedAttempt', 'Remove-FailedAttempt', 'Get-ConsumptionAccessOutcome', 'Resolve-AccessPreflight', 'Test-SubscriptionAccessAll', 'Get-CompletedSubscriptionIds')
     foreach ($Fn in $TargetFunctions)
     {
         if (-not (Get-Command $Fn -CommandType Function -ErrorAction SilentlyContinue))
@@ -492,5 +492,41 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         { Get-RunSummaryLogContent -Visible 0 -Eligible 0 -Processed 0 `
                 -FailedSubscriptions $null -CollectorFailures $null `
                 -MetricsFailedSubs $null -ConsumptionFailedSubs $null } | Should -Not -Throw
+    }
+}
+
+Describe 'Resume-state completed-ids seed array-ness (regression: null-collapse -> string concat)' {
+
+    # A PowerShell gotcha broke the sequential resume path: an empty array
+    # captured from a FUNCTION CALL collapses to $null on assignment, so
+    #     $CompletedIds = Get-CompletedSubscriptionIds ...   # returns @() on a fresh run
+    # left $CompletedIds as $null. The per-subscription loop's
+    #     $CompletedIds += $Sub.Id
+    # then evaluated `$null + '<id>'`, which STRING-concatenates rather than
+    # array-appending - mashing every completed id into one string. That silently
+    # broke -Resume (its `-contains` never matches the mashed string, so every
+    # subscription is reprocessed). The fix wraps the seed in @(...). These tests
+    # lock in both the behaviour and the source form.
+
+    It 'seeds a fresh-run (absent-file) completed list as an array so += appends instead of concatenating' {
+        $AbsentPath = Join-Path $script:TestRoot ('no-such-state-' + [guid]::NewGuid().ToString('N') + '.json')
+        # Mirror the wrapper's FIXED seed expression exactly.
+        $CompletedIds = @(Get-CompletedSubscriptionIds -Path $AbsentPath -Tenant 'tenant-fresh')
+        $CompletedIds += 'sub-a'
+        $CompletedIds += 'sub-b'
+        @($CompletedIds).Count | Should -Be 2 -Because 'each += must append a distinct element, not concatenate a string'
+        ($CompletedIds -join '|') | Should -Be 'sub-a|sub-b'
+        ($CompletedIds -contains 'sub-a') | Should -BeTrue -Because '-Resume relies on -contains matching each completed id'
+    }
+
+    It 'keeps the @(...) wrap on the completed-ids seed in Run-AllSubscriptions.ps1 (guards against reverting the fix)' {
+        $WrapperPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
+        Test-Path $WrapperPath | Should -BeTrue
+        # Match CODE lines only: drop whole-line comments so an explanatory
+        # comment that happens to show the unwrapped form can never false-fail
+        # the negative guard below.
+        $CodeText = ((Get-Content -Path $WrapperPath) | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        ($CodeText -match '\$CompletedIds\s*=\s*@\(\s*Get-CompletedSubscriptionIds') | Should -BeTrue -Because 'the completed-ids seed must be @()-wrapped so an empty result stays an array'
+        ($CodeText -match '\$CompletedIds\s*=\s*Get-CompletedSubscriptionIds') | Should -BeFalse -Because 'an unwrapped seed collapses @() to $null on a fresh run and breaks -Resume'
     }
 }
