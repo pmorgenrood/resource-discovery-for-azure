@@ -13,12 +13,7 @@ param(
     $MetricsLookbackDays = 31 # Default tracking duration window determining how far back to ask Azure for data
 )
 
-# Shared cross-cutting helpers (Write-RdaProgress). This extension is invoked via
-# `& $MetricPath` from ResourceInventory.ps1, which already dot-sources this file,
-# so the function is normally in scope. Re-load it here (only if not already
-# defined) so the extension stays self-contained and progress never no-ops just
-# because of how it was invoked. Best-effort: a missing file must not break the
-# metrics phase.
+
 if (-not (Get-Command -Name 'Write-RdaProgress' -ErrorAction SilentlyContinue))
 {
     $CommonFunctionsFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1'
@@ -28,23 +23,99 @@ if (-not (Get-Command -Name 'Write-RdaProgress' -ErrorAction SilentlyContinue))
     }
 }
 
+
+if (-not (Get-Command -Name 'Resolve-ObfuscationToken' -ErrorAction SilentlyContinue))
+{
+    function Resolve-ObfuscationToken
+    {
+        param(
+            [string]$RealValue,
+            [string]$LookupKey,
+            $SharedDictionary,
+            [hashtable]$LocalCache,
+            [string]$TokenPrefix
+        )
+
+        if ($null -ne $SharedDictionary -and $SharedDictionary.ContainsKey($LookupKey)) { return $SharedDictionary[$LookupKey] }
+        if ($LocalCache.ContainsKey($RealValue)) { return $LocalCache[$RealValue] }
+
+        $Token = $TokenPrefix + [guid]::NewGuid().ToString()
+        $LocalCache[$RealValue] = $Token
+        return $Token
+    }
+}
+
+if (-not (Get-Command -Name 'Build-ObfuscatedResourceUri' -ErrorAction SilentlyContinue))
+{
+    function Build-ObfuscatedResourceUri
+    {
+        param(
+            [string]$RawUri,
+            [string]$Prefix,
+            $SubscriptionDictionary,
+            $ResourceGroupDictionary,
+            $NameDictionary,
+            [hashtable]$SubCache,
+            [hashtable]$RgCache,
+            [hashtable]$NameCache
+        )
+
+        if ([string]::IsNullOrEmpty($RawUri))
+        {
+            return 'obfuscated'
+        }
+
+        if ($RawUri -notmatch '^/subscriptions/([^/]+)(/resourcegroups/([^/]+))?(/providers/(.+))?$')
+        {
+            if (-not $NameCache.ContainsKey($RawUri))
+            {
+                $NameCache[$RawUri] = $Prefix + [guid]::NewGuid().ToString()
+            }
+            return $NameCache[$RawUri]
+        }
+
+        $RealSub = $Matches[1]
+        $RealRg = $Matches[3]
+        $RealProv = $Matches[5]
+
+        $ObfSub = Resolve-ObfuscationToken -RealValue $RealSub -LookupKey $RawUri -SharedDictionary $SubscriptionDictionary -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
+
+        $RebuiltUri = '/subscriptions/' + $ObfSub
+
+        if (-not [string]::IsNullOrEmpty($RealRg))
+        {
+            $RgTag = if ($RealRg -match '^mc_') { 'mc_' } else { '' }
+            $ObfRg = Resolve-ObfuscationToken -RealValue $RealRg -LookupKey $RawUri -SharedDictionary $ResourceGroupDictionary -LocalCache $RgCache -TokenPrefix ($Prefix + 'rg_' + $RgTag)
+            $RebuiltUri += '/resourcegroups/' + $ObfRg
+        }
+
+        if (-not [string]::IsNullOrEmpty($RealProv))
+        {
+            $ProvParts = $RealProv -split '/'
+            $Rebuilt = @()
+            for ($Pi = 0; $Pi -lt $ProvParts.Count; $Pi++)
+            {
+                $Part = $ProvParts[$Pi]
+                $IsNameSegment = ($Pi -ge 2 -and ($Pi % 2 -eq 0))
+                if ($IsNameSegment -and -not [string]::IsNullOrEmpty($Part) -and $Part -ne '$system')
+                {
+                    $NameSharedDict = if ($Pi -eq $ProvParts.Count - 1) { $NameDictionary } else { $null }
+                    $Rebuilt += Resolve-ObfuscationToken -RealValue $Part -LookupKey $RawUri -SharedDictionary $NameSharedDict -LocalCache $NameCache -TokenPrefix $Prefix
+                }
+                else
+                {
+                    $Rebuilt += $Part
+                }
+            }
+            $RebuiltUri += '/providers/' + ($Rebuilt -join '/')
+        }
+
+        return $RebuiltUri
+    }
+}
+
 if ($Task -eq 'Processing')
 {
-    # ---------------------------------------------------------------------
-    # Metrics diagnostics -> consolidated LOCAL debug log, NOT the terminal.
-    # ---------------------------------------------------------------------
-    # On a large multi-subscription run the per-call and end-of-phase [Metrics]
-    # lines flooded the console (and, coming from concurrent runspaces, made it
-    # look frozen until a keypress forced a repaint). They now route through the
-    # single shared logger with -NoConsole (off the terminal) + -ToDebugLog
-    # (append to $Global:DebugLogFile, the same file the per-collector heartbeat
-    # writes). Write-MetricsDiag is a THIN wrapper - it only prefixes '[Metrics] '
-    # so the consolidated log stays readable, then delegates to Write-Log; it has
-    # NO independent log-sink logic of its own. Write-Log is Global (defined in
-    # Functions/Common.Functions.ps1) so it is in scope here even though this
-    # extension is invoked via '& $MetricPath'. When no $Global:DebugLogFile is
-    # set (e.g. a standalone extension run) Write-Log's -ToDebugLog is a silent
-    # no-op, so nothing ever lands on the terminal either way.
     function Write-MetricsDiag([string]$Line)
     {
         Write-Log -Message ('[Metrics] ' + $Line) -NoConsole -ToDebugLog
@@ -72,11 +143,6 @@ if ($Task -eq 'Processing')
     # Establish an offset timestamp rolled back exactly 24 hours ago
     $MetricTimeOneDay = (Get-Date).AddDays(-1)
 
-    # Build a fast id -> subscription lookup once. The per-resource loops below
-    # previously scanned the entire $Subscriptions list with Where-Object for
-    # every resource (O(N*M)); on a large estate that is thousands of linear
-    # scans. A hashtable makes each lookup O(1). The full subscription object
-    # is stored so existing `$subscription.Name` references keep working.
     $SubLookup = @{}
     foreach ($subItem in $Subscriptions)
     {
@@ -102,7 +168,7 @@ if ($Task -eq 'Processing')
                     MetricName = 'Percentage CPU';
                     StartTime = $MetricStartTime;
                     EndTime = $MetricEndTime;
-                    Interval = '00:15:00';
+                    Interval = '1:00:00';
                     Aggregation = 'Maximum';
                     Measure = 'Average';
                     Id = $virtualMachine.Id;
@@ -119,7 +185,7 @@ if ($Task -eq 'Processing')
                     MetricName = 'Available Memory Bytes';
                     StartTime = $MetricStartTime;
                     EndTime = $MetricEndTime;
-                    Interval = '00:15:00';
+                    Interval = '1:00:00';
                     Aggregation = 'Minimum';
                     Measure = 'Average';
                     Id = $virtualMachine.Id;
@@ -133,20 +199,6 @@ if ($Task -eq 'Processing')
         }
     }
 
-    # Define Managed Disk Metrics
-    #
-    # Actual disk performance (IOPS + throughput) for ATTACHED managed disks.
-    # VMDisk.ps1 already records each disk's PROVISIONED ceiling
-    # (diskIOPSReadWrite / diskMBpsReadWrite); these metrics capture what the
-    # disk actually DID, so the two together are what drive storage right-sizing.
-    #
-    # Scoped to attached disks (ManagedBy populated): unattached disks have no
-    # meaningful I/O, and querying them only burns Azure Monitor read budget
-    # against the ~12k reads/hour/subscription ceiling. The 'Composite Disk ...'
-    # names are the per-disk composite metrics Azure Monitor exposes on the
-    # microsoft.compute/disks scope (read+write split). Series='true' so the
-    # engine produces both the 95th-percentile peak (MetricPercentile) and the
-    # average (MetricValue) for each, exactly like the VM CPU/memory series.
     $ManagedDisks = $Resources | Where-Object { $_.TYPE -eq 'microsoft.compute/disks' -and -not [string]::IsNullOrEmpty($_.ManagedBy) }
 
     if ($ManagedDisks)
@@ -155,24 +207,10 @@ if ($Task -eq 'Processing')
         {
             $Subscription = $SubLookup[$managedDisk.subscriptionId]
 
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Read Operations/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:15:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Write Operations/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:15:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Read Bytes/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:15:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Write Bytes/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:15:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
-        }
-    }
-
-    #Define Storage Account Metrics
-
-    $StorageAccounts = $Resources | Where-Object { $_.TYPE -eq 'microsoft.storage/storageaccounts' }
-
-    if ($StorageAccounts)
-    {
-        foreach ($storageAccount in $StorageAccounts)
-        {
-            $Subscription = $SubLookup[$storageAccount.subscriptionId]
-
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'UsedCapacity'; StartTime = $MetricTimeOneDay; EndTime = $MetricEndTime; Interval = '01:00:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $storageAccount.Id; SubName = $Subscription.Name; ResourceGroup = $storageAccount.ResourceGroup; Name = $storageAccount.Name; Location = $storageAccount.Location; Service = 'Storage Account'; Series = 'false' })
+            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Read Operations/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
+            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Write Operations/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
+            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Read Bytes/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
+            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'Composite Disk Write Bytes/sec'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $managedDisk.Id; SubName = $Subscription.Name; ResourceGroup = $managedDisk.ResourceGroup; Name = $managedDisk.Name; Location = $managedDisk.Location; Service = 'Managed Disk'; Series = 'true' })
         }
     }
 
@@ -189,7 +227,7 @@ if ($Task -eq 'Processing')
             if ($sqlDb.kind -match 'vcore')
             {
                 $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'cpu_limit'; StartTime = $MetricTimeOneDay; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'false' })
-                $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'cpu_used'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:30:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
+                $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'cpu_used'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
 
                 if ($sqlDb.kind -match 'serverless')
                 {
@@ -199,10 +237,10 @@ if ($Task -eq 'Processing')
             else
             {
                 $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'dtu_limit'; StartTime = $MetricTimeOneDay; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'false' })
-                $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'dtu_used'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:30:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
+                $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'dtu_used'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Average'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
             }
 
-            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'cpu_percent'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '00:30:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
+            $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'cpu_percent'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1:00:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'true' })
             $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'allocated_data_storage'; StartTime = $MetricTimeOneDay; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Average'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'false' })
 
             $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'storage'; StartTime = $MetricTimeOneDay; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Maximum'; Measure = 'Largest'; Id = $sqlDb.Id; SubName = $Subscription.Name; ResourceGroup = $sqlDb.ResourceGroup; Name = $sqlDb.Name; Location = $sqlDb.Location; Service = 'SQL Database'; Series = 'false' })
@@ -359,43 +397,22 @@ if ($Task -eq 'Processing')
 
 
     $MetricCount = $MetricDefs.Count
-
     $WarningPreference = "SilentlyContinue"
-
-    # ---------------------------------------------------------------------
-    # Metrics collection diagnostics + resilience configuration
-    # ---------------------------------------------------------------------
-    # Capture the Az context ONCE in the parent. ForEach-Object -Parallel runs
-    # each item in a fresh runspace that does NOT inherit the parent's Az
-    # session, so without passing this through explicitly (-DefaultProfile)
-    # the first Get-AzMetric in each runspace can stall on an implicit token
-    # acquisition or fail outright - a prime suspect for the metrics phase
-    # appearing to "hang". Captured here, passed in via $using below.
     $MetricAzContext = $null
+
     try
     {
         $MetricAzContext = (Get-AzContext)
     }
     catch
     {
-        # The Azure PowerShell module (Az) has a built-in feature that saves your login tokens to a secure file on your local hard drive.
-        # When a new, blank runspace spins up, Azure PowerShell will automatically look at this local file to log itself in.
         Write-MetricsDiag "WARNING: could not capture Az context for parallel runspaces; metric calls will rely on per-runspace context autosave."
     }
 
-    # Resilience knobs for the per-call Get-AzMetric wrapper. These are stable
-    # internals rather than script parameters: a 120s client-side timeout per
-    # call and up to 3 retries (exponential backoff) handles transient ARM
-    # throttling/hangs without exposing extra knobs to the operator. Adjust here
-    # if Azure Monitor behaviour changes; they were deliberately NOT promoted to
-    # parameters to keep the script surface small.
     $MetricTimeoutSeconds = 120
     $MetricMaxRetries = 3
 
-    # Thread-safe diagnostics: each parallel runspace appends one record so the
-    # parent can summarise where time went and which calls timed out / were
-    # throttled / errored. This is the "where exactly is it getting stuck"
-    # instrumentation - it survives the runspace boundary via $using.
+
     $MetricDiagnostics = [System.Collections.Concurrent.ConcurrentBag[psobject]]::new()
 
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -414,12 +431,7 @@ if ($Task -eq 'Processing')
         if ($Defs.Count -ge $RangeBatch -or $MetricsProcessed -ge $MetricCount)
         {
             $BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            # Bar-only progress: the metrics phase runs inside the non-interactive
-            # parallel stream worker, where one stdout line per batch would clutter
-            # the parent's demuxed output on a large tenant. -BarOnly renders the
-            # Write-Progress bar interactively (no-op otherwise, no stdout line).
-            # The per-batch dispatch detail is preserved as Write-Verbose below and
-            # in the end-of-phase diagnostics summary.
+
             Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} call(s))" -f $RangeIdx, $Defs.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
             Write-Verbose ("[Metrics] Batch {0}: dispatching {1} metric call(s) (processed {2}/{3})." -f $RangeIdx, $Defs.Count, $MetricsProcessed, $MetricCount)
 
@@ -429,31 +441,15 @@ if ($Task -eq 'Processing')
                 $CallMaxRetries = $using:MetricMaxRetries
                 $DiagBag = $using:MetricDiagnostics
 
-                # Per-call progress was previously written to the console with
-                # Write-Host for EVERY metric definition (thousands per sub). From
-                # concurrent runspaces that flood is what made the terminal appear
-                # frozen until a keypress forced a repaint. The per-call outcome
-                # (including this "processing" detail) is still recorded in
-                # $diagBag below and surfaced in the end-of-phase diagnostics
-                # summary, so nothing is lost from the log - only the live console
-                # spam is removed. Warnings (retry) and errors (giving up) below
-                # are intentionally kept on the console.
-
                 $MetricError = $false
                 $MetricName = $_.MetricName
                 $MetricService = $_.Service
 
-                # Per-call diagnostics: outcome is one of Success / Timeout /
-                # Throttled / Error and is reported back to the parent so the
-                # metrics phase can show exactly which calls stalled.
                 $CallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                 $CallOutcome = 'Success'
                 $CallAttempts = 0
                 $CallErrorMsg = $null
 
-                # Common args for every attempt. -DefaultProfile forces the call
-                # to use the parent's captured Az context instead of relying on
-                # the fresh runspace inheriting a session (which it does not).
                 $MetricArgs = @{
                     ResourceId      = $_.Id
                     MetricName      = $_.MetricName
@@ -471,11 +467,6 @@ if ($Task -eq 'Processing')
 
                 try
                 {
-                    # Retry loop with exponential backoff. Attempt 0 is the first
-                    # try; up to $callMaxRetries additional attempts follow. Each
-                    # attempt is bounded by a client-side timeout implemented with
-                    # a thread job so a single hung HTTP call can never wedge the
-                    # whole metrics phase the way an un-timed Get-AzMetric can.
                     $Attempt = 0
                     $Succeeded = $false
                     $LastError = $null
@@ -526,27 +517,12 @@ if ($Task -eq 'Processing')
 
                         if ($Succeeded)
                         {
-                            # Per-call success was previously logged to the console
-                            # (one DarkGreen line per metric). Removed to stop the
-                            # concurrent-runspace console flood; the success is still
-                            # recorded in $diagBag below (Outcome='Success') and
-                            # counted in the end-of-phase summary. The break MUST stay
-                            # - it is the retry-loop exit on a successful call.
                             break
                         }
 
-                        # Failed attempt - decide whether to retry. The per-call
-                        # retry / giving-up detail is deliberately NOT written to
-                        # the console: from concurrent runspaces it flooded the
-                        # terminal. The final per-metric Outcome, Attempts and
-                        # Error are recorded in the diagnostics bag below and
-                        # surfaced in the end-of-phase summary (written to the
-                        # debug log), so nothing diagnostic is lost.
+
                         if ($Attempt -lt $CallMaxRetries)
                         {
-                            # Exponential backoff: 2^attempt seconds, capped, plus
-                            # jitter so a wave of throttled calls does not retry in
-                            # lockstep. Throttled calls wait a bit longer.
                             $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
                             if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, 60) }
                             $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
@@ -566,13 +542,6 @@ if ($Task -eq 'Processing')
                         throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
                     }
 
-                    # Total interval count Azure Monitor returned for this metric,
-                    # including intervals that carry no datapoint. This is the
-                    # denominator for coverage / %TimeOn-style derivations: for a VM's
-                    # 'Percentage CPU' series, MetricCount / MetricTotalCount * 100 is
-                    # the fraction of the window the VM was actually running (%TimeOn).
-                    # Captured here, before the Measure switch below collapses
-                    # $metricQueryResults to a scalar.
                     $MetricTotalCount = @($MetricQuery.Data).Count
 
                     $MetricQueryResults = 0
@@ -643,13 +612,6 @@ if ($Task -eq 'Processing')
                     $MetricError = $true
                     if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
                     $CallErrorMsg = $_.Exception.Message
-                    # No Write-Error here: this runs in a ForEach-Object -Parallel
-                    # worker, so a Write-Error surfaced one error-stream record per
-                    # failed metric - on a large multi-sub run that is exactly the
-                    # noise this change removes. The failure is not lost: it is
-                    # recorded in $diagBag below (Outcome='Error', Error=$callErrorMsg)
-                    # and surfaced in the end-of-phase summary written to the debug
-                    # log, and $metricError still flags the metric record ($obj) below.
                 }
 
                 $CallStopwatch.Stop()
@@ -716,16 +678,22 @@ if ($Task -eq 'Processing')
                     }
                     else
                     {
-                        # Fallback: resource not in main dictionary (e.g., deleted/transient resource)
-                        # Cache the obfuscated value so same resource correlates across metrics
                         if (![string]::IsNullOrEmpty($OriginalId))
                         {
                             $FbPrefix = if ($OriginalId -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b') { 'nonprod_' } else { 'prod_' }
-                            $ResourceIdDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString()
-                            $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString()
-                            $ResourceSubDictionary[$OriginalId] = $FbPrefix + 'sub_' + [guid]::NewGuid().ToString()
-                            $ResourceGroupDictionary[$OriginalId] = $FbPrefix + 'rg_' + [guid]::NewGuid().ToString()
-                            $metric.ID = $ResourceIdDictionary[$OriginalId]
+
+                            if (-not $script:MetricsFallbackSubCache) { $script:MetricsFallbackSubCache = @{} }
+                            if (-not $script:MetricsFallbackRgCache) { $script:MetricsFallbackRgCache = @{} }
+                            if (-not $script:MetricsFallbackNameCache) { $script:MetricsFallbackNameCache = @{} }
+
+                            $ObfuscatedId = Build-ObfuscatedResourceUri -RawUri $OriginalId -Prefix $FbPrefix -SubscriptionDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary -NameDictionary $ResourceNameDictionary -SubCache $script:MetricsFallbackSubCache -RgCache $script:MetricsFallbackRgCache -NameCache $script:MetricsFallbackNameCache
+
+                            $ResourceIdDictionary[$OriginalId] = $ObfuscatedId
+                            if (-not $ResourceNameDictionary.ContainsKey($OriginalId)) { $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
+                            if (-not $ResourceSubDictionary.ContainsKey($OriginalId)) { $ResourceSubDictionary[$OriginalId] = $FbPrefix + 'sub_' + [guid]::NewGuid().ToString() }
+                            if (-not $ResourceGroupDictionary.ContainsKey($OriginalId)) { $ResourceGroupDictionary[$OriginalId] = $FbPrefix + 'rg_' + [guid]::NewGuid().ToString() }
+
+                            $metric.ID = $ObfuscatedId
                             $metric.Name = $ResourceNameDictionary[$OriginalId]
                             $metric.Subscription = $ResourceSubDictionary[$OriginalId]
                             $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
@@ -746,12 +714,6 @@ if ($Task -eq 'Processing')
     Write-RdaProgress -Activity 'Metrics collection' -Completed
 
     $PhaseStopwatch.Stop()
-
-    # ---------------------------------------------------------------------
-    # Metrics phase summary - the "where did it get stuck" report.
-    # Groups every per-call diagnostic record by outcome, and surfaces the
-    # slowest calls so a hang or throttling hotspot is obvious at a glance.
-    # ---------------------------------------------------------------------
     $DiagRecords = @($MetricDiagnostics)
     $OkCount = @($DiagRecords | Where-Object { $_.Outcome -eq 'Success' }).Count
     $TimeoutCount = @($DiagRecords | Where-Object { $_.Outcome -eq 'Timeout' }).Count
