@@ -59,12 +59,10 @@ function Variables
 
     if ($Obfuscate.IsPresent)
     {
-        # Identifier dictionaries are OrdinalIgnoreCase: Azure treats resource ids, subscription ids and RG names as case-insensitive, and the billing resourceUri often differs in case from the Resource-Graph id. A case-sensitive dictionary would miss that join and mint a fresh (unrecoverable) token.
         $Global:ResourceIdDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $Global:ResourceNameDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $Global:ResourceSubscriptionDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $Global:ResourceResourceGroupDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        # Tag values and free text stay case-sensitive: Azure tag values are case-sensitive, so 'Prod' and 'prod' must map to distinct tokens.
         $Global:TagValueDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Global:FreeTextDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
     }
@@ -1392,7 +1390,6 @@ function ExecuteInventoryProcessing()
                             if (-not $script:ConsumptionNameCache) { $script:ConsumptionNameCache = @{} }
 
 
-                            # Reuse the inventory token read-only when this billing row's resource was inventoried (the dictionary is now case-insensitive, so a billing resourceUri that differs only in case still joins). Otherwise rebuild via the per-run caches, which keep same-URI rows deterministic WITHOUT writing consumption fragments back into $ResourceIdDictionary - that would pollute the exported ResourceIdMap (obfuscated-full-id -> real-id) that Reveal consumes.
                             if (![string]::IsNullOrEmpty($RawUri) -and $ResourceIdDictionary.ContainsKey($RawUri))
                             {
                                 $ObfuscatedUri = $ResourceIdDictionary[$RawUri]
