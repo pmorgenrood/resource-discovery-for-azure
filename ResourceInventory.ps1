@@ -16,6 +16,7 @@ param ($TenantID,
     [switch]$UseMetricsBatch,
     [switch]$SkipConsumption,
     [switch]$SkipMarketplace,
+    [switch]$SkipFoundryCoverage,
     [switch]$Obfuscate,
     [string]$ObfuscationDictionary,
     [switch]$RunAllSubs,
@@ -688,6 +689,7 @@ function ExecuteInventoryProcessing()
         $Global:MetricsJsonFile = ($DefaultPath + "Metrics_" + $Global:ReportName + "_" + $CurrentDateTime + ".json")
         $Global:ConsumptionFileCsv = ($DefaultPath + "Consumption_" + $Global:ReportName + "_" + $CurrentDateTime + ".csv")
         $Global:MarketplaceFileCsv = ($DefaultPath + "Marketplace_" + $Global:ReportName + "_" + $CurrentDateTime + ".csv")
+        $Global:FoundryCoverageFileCsv = ($DefaultPath + "FoundryModelCoverage_" + $Global:ReportName + "_" + $CurrentDateTime + ".csv")
 
         if ($RunAllSubs.IsPresent)
         {
@@ -1284,7 +1286,14 @@ function ExecuteInventoryProcessing()
                             Start-Sleep -Seconds $ConsumptionBackoffSeconds
                         }
                     }
-                    $UsageDataExport = $UsageData.UsageAggregations.Properties | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime
+                    # The Get-UsageAggregates payload names the per-resource licensing/instance JSON
+                    # blob "InstanceData". The deployed ingestion server reads that same blob
+                    # from a Consumption CSV column named "AdditionalInfo" (VM Windows/AHB + SQL vCore
+                    # detection bind to AdditionalInfo, not InstanceData), so a column literally named
+                    # InstanceData arrives empty server-side and that detection silently degrades. Map
+                    # the source property to a column named AdditionalInfo here at the point of ingest,
+                    # so every downstream read (below) and the emitted CSV header both use AdditionalInfo.
+                    $UsageDataExport = $UsageData.UsageAggregations.Properties | Select-Object @{ Name = 'AdditionalInfo'; Expression = { $_.InstanceData } }, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime
 
                     Write-Log -Message ("Records found: $($UsageDataExport.Count)...") -Severity 'Info'
 
@@ -1292,7 +1301,7 @@ function ExecuteInventoryProcessing()
 
                     for ($Item = 0; $Item -lt $UsageDataExport.Count; $Item++)
                     {
-                        $RawInstanceData = $UsageDataExport[$Item].InstanceData
+                        $RawInstanceData = $UsageDataExport[$Item].AdditionalInfo
                         if ([string]::IsNullOrEmpty($RawInstanceData))
                         {
                             continue
@@ -1383,12 +1392,12 @@ function ExecuteInventoryProcessing()
                             }
                         }
 
-                        $UsageDataExport[$Item].InstanceData = $InstanceObject | ConvertTo-Json -Compress
+                        $UsageDataExport[$Item].AdditionalInfo = $InstanceObject | ConvertTo-Json -Compress
 
                         $NewUsageDataExport.Add($UsageDataExport[$Item]) | Out-Null
                     }
 
-                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
+                    $NewUsageDataExport | Select-Object AdditionalInfo, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
 
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
 
@@ -1697,6 +1706,21 @@ function ExecuteInventoryProcessing()
                 {
                     if ($null -eq $Row) { continue }
 
+                    # FOUNDRY FOLD CAPTURE (P1). The deployed ingestion server reads ONLY
+                    # Consumption_*.csv and has NO reader for this Marketplace_*.csv, so Claude/
+                    # Anthropic usage collected here is invisible server-side unless it is ALSO
+                    # folded into the Consumption CSV as a "Foundry Models" row. Capture the RAW
+                    # (pre-obfuscation) Claude rows now, keyed by the pinned subscription, so the
+                    # fold step (GetFoundryFoldConsumption, invoked after this phase) can shape and
+                    # append them with its OWN obfuscation pass - identical in spirit to how the
+                    # Marketplace export below runs its own ConvertTo-RdaMarketplaceRow. Detection
+                    # is the single-owner predicate Test-RdaClaudeMarketplaceRow.
+                    if (Test-RdaClaudeMarketplaceRow -Row $Row)
+                    {
+                        if ($null -eq $script:FoundryFoldClaudeRows) { $script:FoundryFoldClaudeRows = [System.Collections.ArrayList]::new() }
+                        $null = $script:FoundryFoldClaudeRows.Add([pscustomobject]@{ SubId = $sub.Id; SubName = $sub.Name; Row = $Row })
+                    }
+
                     # Field mapping + obfuscation live in ConvertTo-RdaMarketplaceRow
                     # (Functions/ResourceInventory.Functions.ps1) so the exact same code path
                     # is unit-tested. Product identifiers (PublisherName/OfferName/PlanName)
@@ -1765,6 +1789,454 @@ function ExecuteInventoryProcessing()
         if ($script:MarketplaceRecordsThisRun -eq 0 -and $script:MarketplaceFailedSubsThisRun -eq 0)
         {
             Write-Log -Message ('Marketplace: 0 rows collected for the subscription(s) in scope for this run. This is a CONFIRMED ZERO - the Microsoft.Consumption/marketplaces endpoint was reached successfully and returned no rows, meaning no Azure Marketplace / third-party SaaS charges (e.g. an Anthropic/Claude Marketplace offer) were billed to them in the last 31 days. It is NOT a missing/failed section.') -Severity 'Warning'
+        }
+
+        function GetFoundryFoldConsumption()
+        {
+            # P1 FOUNDRY FOLD. Folds Claude/Anthropic usage into the FIRST-PARTY Consumption_*.csv so
+            # the deployed ingestion server - which reads ONLY Consumption_*.csv and has NO reader for
+            # Marketplace_*.csv - actually sees it. Runs AFTER GetMarketplaceConsumption (it consumes the
+            # raw Claude rows that phase captured in $script:FoundryFoldClaudeRows) and is gated by the
+            # SAME -SkipConsumption / -SkipMarketplace switches (the caller only invokes it when both are
+            # off), so the fold follows the Marketplace phase's skip coherence exactly.
+            #
+            #   Tier 1 (CCU / cost, ALWAYS): one folded "Foundry Models" row per captured Claude
+            #     Marketplace row, carrying the Azure cost, marked non-token. This is the certain part.
+            #
+            # Tier 2 per-model token-role fold deferred - needs live-tenant metric-name verification
+            # + account->Claude correlation; see findings ledger.
+            #
+            # The shaping + obfuscation of each row lives in the unit-tested pure helper
+            # (ConvertTo-RdaFoldedFoundryRow in Functions/ResourceInventory.Functions.ps1); this
+            # function is the collector wiring.
+
+            $DebugPreference = "SilentlyContinue"
+
+            if ($null -eq $Global:FoundryFoldRecordCount) { $Global:FoundryFoldRecordCount = 0 }
+            if ($null -eq $script:FoundryFoldRecordsThisRun) { $script:FoundryFoldRecordsThisRun = 0 }
+
+            $ClaudeRows = @($script:FoundryFoldClaudeRows)
+            if ($ClaudeRows.Count -eq 0)
+            {
+                # CONFIRMED ZERO, not a silent skip: the Marketplace phase ran and found no Claude/
+                # Anthropic rows to fold. Mirrors the Marketplace confirmed-zero notice.
+                Write-Log -Message ('Foundry fold: no Claude/Anthropic Marketplace rows were collected for the subscription(s) in scope, so there is nothing to fold into the Consumption CSV. This is a CONFIRMED ZERO (the Marketplace phase ran), NOT a skipped/failed section.') -Severity 'Info'
+                return
+            }
+
+            Write-Log -Message ("Foundry fold: folding {0} Claude/Anthropic Marketplace row(s) into the Consumption CSV as 'Foundry Models' rows so the server's Foundry->Bedrock path sees them." -f $ClaudeRows.Count) -Severity 'Info'
+
+            # Per-run obfuscation caches for the folded rows (parity with the Marketplace/consumption
+            # paths). Product identity (the model) stays readable in MeterName; only ResourceId is masked.
+            if ($Obfuscate.IsPresent)
+            {
+                if (-not $script:FoundryFoldSubCache) { $script:FoundryFoldSubCache = @{} }
+                if (-not $script:FoundryFoldRgCache) { $script:FoundryFoldRgCache = @{} }
+                if (-not $script:FoundryFoldNameCache) { $script:FoundryFoldNameCache = @{} }
+            }
+
+            $FoldExport = [System.Collections.ArrayList]::new()
+
+            # ---- Tier 1: one folded cost row per captured Claude Marketplace row (always) ----
+            foreach ($Captured in $ClaudeRows)
+            {
+                $Folded = ConvertTo-RdaFoldedFoundryRow -Row $Captured.Row -Obfuscate:$Obfuscate.IsPresent -UriKeyedNameDictionary $Global:ResourceIdDictionary -SubCache $script:FoundryFoldSubCache -RgCache $script:FoundryFoldRgCache -NameCache $script:FoundryFoldNameCache
+                $null = $FoldExport.Add($Folded)
+            }
+
+            # ---- Append the folded rows onto the SAME Consumption CSV the server reads ----
+            # Export-Csv -Append with the identical column set the first-party path emits, so a folded
+            # row is schema-identical to a native consumption row (it just carries MeterCategory=
+            # 'Foundry Models' + the fold markers inside AdditionalInfo). If the first-party phase wrote
+            # no rows, -Append creates the file with the same header.
+            if ($FoldExport.Count -gt 0)
+            {
+                $FoldExport | Select-Object AdditionalInfo, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
+            }
+
+            $Global:FoundryFoldRecordCount += $FoldExport.Count
+            $script:FoundryFoldRecordsThisRun += $FoldExport.Count
+            Write-Log -Message ("Foundry fold: appended {0} folded 'Foundry Models' (Tier 1 CCU/cost) row(s) to the Consumption CSV." -f $FoldExport.Count) -Severity 'Info'
+        }
+    }
+
+    function GetFoundryModelCoverage()
+    {
+        # ADDITIVE Azure AI Foundry model billing-plane coverage collector.
+        #
+        # WHY THIS EXISTS. A downstream server-side pricing pipeline ingests ONLY the Azure
+        # Retail Prices API. Microsoft splits Foundry models across TWO independent billing
+        # planes: "sold directly by Azure" (billed on Azure meters -> appears in Retail
+        # Prices -> priced fine) and "from partners/community" (billed through Azure
+        # Marketplace - for Claude via Claude Consumption Units / CCU - NOT in Retail
+        # Prices). A Marketplace-only model was therefore SILENTLY DROPPED: no Azure cost,
+        # no AWS mapping, and (the real bug) NO WARNING. The split is PER MODEL, not per
+        # vendor, so a vendor can look "covered" while one SKU vanishes. This phase probes
+        # BOTH planes per deployed model and emits an explicit coverage flag so a
+        # Marketplace-only or entirely-uncovered model is NEVER silently dropped again.
+        #
+        # COLLECTION AND HANDOFF ONLY. This does NOT price anything and does NOT map to AWS
+        # - it collects the Azure-side signal (what is deployed, which plane covers each,
+        # and whatever usage was collectable) and hands it to the server pricing team.
+        #
+        # RELATIONSHIP TO THE MARKETPLACE COLLECTOR. GetMarketplaceConsumption (above)
+        # answers "what Marketplace/CCU dollars were billed"; this phase answers "what
+        # models are deployed and which plane covers each", then JOINS the Marketplace rows
+        # back to deployed models where possible. It performs its OWN per-subscription
+        # Get-AzConsumptionMarketplace probe (scoped to the subscription context inside this
+        # phase's loop), independent of GetMarketplaceConsumption. Both reads are idempotent
+        # billing-plane reads, so the extra call is safe; the two phases are not coupled.
+        #
+        # SOURCE OF TRUTH for "what is deployed" (the design spec section 3.2, verified live): the ARM
+        # per-account deployments list. Resource Graph indexes the deployment resource SHELL
+        # but returns EMPTY name/properties.model, so Graph is used ONLY to enumerate the
+        # CognitiveServices accounts; each account's deployments are then read via ARM.
+        #
+        # GRACEFUL DEGRADATION (the design spec section 10). Every probe fails loud-and-local, never
+        # silently. UNPRICED is emitted ONLY when BOTH planes were successfully probed and
+        # BOTH came back negative; any probe failure yields an Unknown-<reason> status, so a
+        # probe gap never masquerades as a confirmed coverage gap (no-overclaiming).
+
+        $DebugPreference = "SilentlyContinue"
+
+        [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
+
+        if ($null -eq $Global:FoundryCoverageRecordCount) { $Global:FoundryCoverageRecordCount = 0 }
+        if ($null -eq $Global:FoundryCoverageFailedSubs) { $Global:FoundryCoverageFailedSubs = @() }
+        if ($null -eq $Global:FoundryCoverageUnpricedCount) { $Global:FoundryCoverageUnpricedCount = 0 }
+        if ($null -eq $script:FoundryCoverageRecordsThisRun) { $script:FoundryCoverageRecordsThisRun = 0 }
+
+        $DeploymentsApiVersion = '2024-10-01'  # single named constant; a future bump is one edit (the design spec section 3.3)
+        $ProbeWindowStart = (Get-Date).AddDays(-31).Date
+        $ProbeWindowEnd = (Get-Date).AddDays(-1).Date
+        $RunTimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+
+        if (-not (Test-DataPlaneAuthReady -Phase 'FoundryModelCoverage'))
+        {
+            Write-Log -Message ('FoundryModelCoverage: SKIPPED - could not establish a usable Azure context/token after one reconnect attempt. The rest of the inventory will continue.') -Severity 'Error'
+            $Global:FoundryCoverageFailedSubs += [pscustomobject]@{
+                Name             = '(all subscriptions)'
+                Id               = '(auth)'
+                Message          = 'FoundryModelCoverage phase skipped: no usable Azure context/token after one reconnect attempt.'
+                Complete         = $false
+                RecordsCollected = 0
+            }
+            return
+        }
+
+        # Retail Prices catalog is GLOBAL + unauthenticated (the design spec section 4.1): pull the
+        # 'Foundry Models' service catalog ONCE per run and cache it. A network failure
+        # here is not fatal - it makes the Azure-metered axis INDETERMINATE (never UNPRICED).
+        $RetailCatalog = $null
+        $RetailProbed = $false
+        try
+        {
+            $RetailCatalog = @(Get-RdaFoundryRetailCatalog)
+            $RetailProbed = $RetailCatalog.Count -gt 0
+            if ($RetailProbed)
+            {
+                Write-Log -Message ("FoundryModelCoverage: pulled {0} Retail Prices catalog item(s) for serviceName 'Foundry Models'." -f $RetailCatalog.Count) -Severity 'Info'
+            }
+            else
+            {
+                Write-Log -Message ("FoundryModelCoverage: the Retail Prices catalog for serviceName 'Foundry Models' returned zero items on a successful call. The Azure-metered axis will be marked INDETERMINATE (never UNPRICED) for this run.") -Severity 'Warning'
+            }
+        }
+        catch
+        {
+            Write-Log -Message ("FoundryModelCoverage: Retail Prices catalog could not be read ({0}). The Azure-metered axis will be marked INDETERMINATE (never UNPRICED) for this run." -f $_.Exception.Message) -Severity 'Warning'
+        }
+
+        # Shared obfuscation dictionary views (same derivation as the Marketplace collector).
+        $script:FoundrySubGuidTokenMap = $null
+        $script:FoundryRgTokenMap = $null
+        if ($Obfuscate.IsPresent)
+        {
+            $script:FoundrySubGuidTokenMap = @{}
+            if ($null -ne $Global:ResourceSubscriptionDictionary)
+            {
+                foreach ($ShKey in $Global:ResourceSubscriptionDictionary.Keys)
+                {
+                    if ($ShKey -match '(?i)/subscriptions/([^/]+)')
+                    {
+                        $ShGuid = $Matches[1]
+                        if (-not $script:FoundrySubGuidTokenMap.ContainsKey($ShGuid)) { $script:FoundrySubGuidTokenMap[$ShGuid] = $Global:ResourceSubscriptionDictionary[$ShKey] }
+                    }
+                }
+            }
+            $script:FoundryRgTokenMap = @{}
+            if ($null -ne $Global:ResourceResourceGroupDictionary)
+            {
+                foreach ($ShKey in $Global:ResourceResourceGroupDictionary.Keys)
+                {
+                    if ($ShKey -match '(?i)/resourcegroups/([^/]+)')
+                    {
+                        $ShRg = $Matches[1]
+                        if (-not $script:FoundryRgTokenMap.ContainsKey($ShRg)) { $script:FoundryRgTokenMap[$ShRg] = $Global:ResourceResourceGroupDictionary[$ShKey] }
+                    }
+                }
+            }
+            if (-not $script:FoundrySubCache) { $script:FoundrySubCache = @{} }
+            if (-not $script:FoundryRgCache) { $script:FoundryRgCache = @{} }
+            if (-not $script:FoundryNameCache) { $script:FoundryNameCache = @{} }
+        }
+
+        foreach ($sub in $Global:Subscriptions)
+        {
+            if (![string]::IsNullOrEmpty($SubscriptionID))
+            {
+                if ($SubscriptionID -ne $sub.Id)
+                {
+                    Write-Log -Message ("Skipping (FoundryModelCoverage): {0}" -f $sub.Name) -Severity 'Info'
+                    continue
+                }
+            }
+
+            $FcContextOk = $false
+            $FcContextSwitchError = $null
+            try
+            {
+                $null = Set-AzContext -Subscription $sub.id -ErrorAction Stop
+                $FcContextOk = ((Get-AzContext).Subscription.Id -eq $sub.id)
+            }
+            catch { $FcContextSwitchError = $_.Exception.Message }
+
+            if (-not $FcContextOk)
+            {
+                $SkipMessage = ("FoundryModelCoverage SKIPPED: could not switch the Azure context to this subscription{0}. The signed-in identity likely lacks access to it. Skipped rather than reporting zero deployed models." -f $(if ($FcContextSwitchError) { " ($FcContextSwitchError)" } else { ' (context did not match the target after Set-AzContext)' }))
+                Write-Log -Message ("FoundryModelCoverage: {0} - {1}" -f $sub.Name, $SkipMessage) -Severity 'Error'
+                $Global:FoundryCoverageFailedSubs += [pscustomobject]@{ Name = $sub.Name; Id = $sub.Id; Message = $SkipMessage; Complete = $false; RecordsCollected = 0 }
+                continue
+            }
+
+            Write-Log -Message ("Assessing Foundry model billing-plane coverage for: {0}" -f $sub.Name) -Severity 'Info'
+
+            $FcRecordsThisSub = 0
+            $FcFailedThisSub = $false
+            $FcFailureMessage = $null
+
+            try
+            {
+                # 1. Enumerate CognitiveServices accounts (Graph preferred; RDA already has
+                #    Search-AzGraph plumbing). Graph is only used to LIST accounts here - never
+                #    to read deployment model detail (the design spec section 3.2).
+                $Accounts = @()
+                try
+                {
+                    $AccountsResult = Invoke-AzGraphQuerySafe -Subscription @($sub.id) -Query @"
+resources
+| where type =~ 'microsoft.cognitiveservices/accounts'
+| project id, name, kind, sku, location, resourceGroup, subscriptionId
+"@
+                    $Accounts = @($AccountsResult.data)
+                }
+                catch
+                {
+                    # ARM accounts-list fallback (the design spec section 3.3, verified HTTP 200).
+                    Write-Log -Message ("FoundryModelCoverage: Resource Graph account enumeration failed for {0} ({1}); falling back to the ARM accounts-list." -f $sub.Name, $_.Exception.Message) -Severity 'Warning'
+                    $ArmAcctResp = Invoke-AzRestMethod -Method GET -Path ("/subscriptions/{0}/providers/Microsoft.CognitiveServices/accounts?api-version={1}" -f $sub.id, $DeploymentsApiVersion) -ErrorAction Stop
+                    if ($ArmAcctResp.StatusCode -ge 400) { throw ("ARM accounts-list returned HTTP {0}: {1}" -f $ArmAcctResp.StatusCode, $ArmAcctResp.Content) }
+                    $Accounts = @((($ArmAcctResp.Content | ConvertFrom-Json).value) | ForEach-Object {
+                            [pscustomobject]@{ id = $_.id; name = $_.name; kind = $_.kind; sku = $_.sku; location = $_.location; resourceGroup = ($_.id -replace '(?i)^/subscriptions/[^/]+/resourcegroups/([^/]+)/.*$', '$1'); subscriptionId = $sub.id }
+                        })
+                }
+
+                # Probe the Marketplace plane ONCE for this subscription (the design spec section 5). A
+                # denial makes the Marketplace axis INDETERMINATE for every model in this sub
+                # (never UNPRICED) rather than falsely calling models UNPRICED.
+                $MarketplaceRows = @()
+                $MarketplaceProbed = $true
+                $MarketplaceDeniedReason = $null
+                try
+                {
+                    $MarketplaceRows = @(Get-AzConsumptionMarketplace -StartDate $ProbeWindowStart -EndDate $ProbeWindowEnd -ErrorAction Stop)
+                }
+                catch
+                {
+                    $MarketplaceProbed = $false
+                    if (Test-RdaConsumptionDenial -ErrorMessage $_.Exception.Message)
+                    {
+                        $MarketplaceDeniedReason = 'MarketplaceDenied'
+                        Write-Log -Message ("FoundryModelCoverage: Marketplace plane DENIED for {0}: {1}. Models will be marked Unknown-MarketplaceDenied (NOT UNPRICED). Grant Cost Management Reader and re-run." -f $sub.Name, $_.Exception.Message) -Severity 'Warning'
+                    }
+                    else
+                    {
+                        $MarketplaceDeniedReason = 'MarketplaceProbeFailed'
+                        Write-Log -Message ("FoundryModelCoverage: Marketplace plane probe failed for {0}: {1}. Models will be marked Unknown-MarketplaceProbeFailed (NOT UNPRICED)." -f $sub.Name, $_.Exception.Message) -Severity 'Warning'
+                    }
+                }
+
+                $ExportRows = [System.Collections.ArrayList]::new()
+                $MatchedMarketplaceRows = [System.Collections.Generic.HashSet[string]]::new()
+
+                foreach ($acct in $Accounts)
+                {
+                    # 2. List deployments per account via ARM (authoritative; the design spec section 3.3).
+                    $Deployments = @()
+                    try
+                    {
+                        $DepResp = Invoke-AzRestMethod -Method GET -Path ($acct.id + '/deployments?api-version=' + $DeploymentsApiVersion) -ErrorAction Stop
+                        if ($DepResp.StatusCode -ge 400) { throw ("ARM deployments-list returned HTTP {0}" -f $DepResp.StatusCode) }
+                        $Deployments = @(($DepResp.Content | ConvertFrom-Json).value)
+                    }
+                    catch
+                    {
+                        Write-Log -Message ("FoundryModelCoverage: could not list deployments for account {0} ({1}); recording an account-level probe failure rather than assuming zero deployments." -f $acct.name, $_.Exception.Message) -Severity 'Warning'
+                        # Do NOT report zero deployed models - emit a probe-failure marker row.
+                        $null = $ExportRows.Add((ConvertTo-RdaFoundryCoverageRow -Record ([pscustomobject]@{
+                                        SubscriptionGuid = $sub.id; SubscriptionName = $sub.Name; ResourceGroup = $acct.resourceGroup; AccountName = $acct.name; AccountId = $acct.id
+                                        AccountKind = "$($acct.kind)"; DeploymentName = '(deployments not enumerated)'; ModelName = ''; ModelFormat = ''; ModelVersion = ''
+                                        DeploymentSku = ''; DeploymentCapacity = ''; Region = "$($acct.location)"; DetectedPlanes = 'None'
+                                        CoverageStatus = 'Unknown-DeploymentsNotEnumerated'; CoverageFlag = ('Coverage INDETERMINATE: the account''s deployments could not be listed ({0}). NOT declared UNPRICED.' -f $_.Exception.Message)
+                                        RetailPriceMatch = '(not probed)'; MarketplacePublisher = ''; MarketplaceOffer = ''; CcuQuantity = ''; CcuUnitOfMeasure = ''; MarketplacePretaxCost = ''; MarketplaceCurrency = ''; CcuAttribution = ''
+                                        TokenMetricsPresent = $false; InputTokens = ''; OutputTokens = ''; TotalTokens = ''
+                                        ProbeWindowStart = $ProbeWindowStart.ToString('yyyy-MM-dd'); ProbeWindowEnd = $ProbeWindowEnd.ToString('yyyy-MM-dd'); RunTimestampUtc = $RunTimestampUtc
+                                    }) -Obfuscate:$Obfuscate.IsPresent -SubGuidTokenMap $script:FoundrySubGuidTokenMap -RgTokenMap $script:FoundryRgTokenMap -SubCache $script:FoundrySubCache -RgCache $script:FoundryRgCache -NameCache $script:FoundryNameCache))
+                        continue
+                    }
+
+                    foreach ($d in $Deployments)
+                    {
+                        $Model = [pscustomobject]@{
+                            SubscriptionGuid = $sub.id
+                            SubscriptionName = $sub.Name
+                            ResourceGroup    = $acct.resourceGroup
+                            AccountName      = $acct.name
+                            AccountId        = $acct.id
+                            AccountKind      = "$($acct.kind)"
+                            DeploymentName   = "$($d.name)"
+                            ModelName        = "$($d.properties.model.name)"
+                            ModelFormat      = "$($d.properties.model.format)"
+                            ModelVersion     = "$($d.properties.model.version)"
+                            DeploymentSku    = "$($d.sku.name)"
+                            DeploymentCapacity = "$($d.sku.capacity)"
+                            Region           = "$($acct.location)"
+                        }
+
+                        # 3a. Azure-metered plane: confident per-model Retail Prices match.
+                        $RetailMatch = Test-RdaRetailPriceMatch -Model $Model -CatalogItems $RetailCatalog
+                        $AzureMetered = [bool]$RetailMatch.Matched
+
+                        # 3b. Marketplace plane.
+                        $MpMatch = Test-RdaMarketplaceModelMatch -Model $Model -MarketplaceRows $MarketplaceRows
+                        $MarketplaceCovered = [bool]$MpMatch.Matched
+
+                        $Coverage = Get-RdaFoundryCoverageStatus -AzureMetered $AzureMetered -MarketplaceCovered $MarketplaceCovered -RetailProbed $RetailProbed -MarketplaceProbed $MarketplaceProbed -MarketplaceDeniedReason $MarketplaceDeniedReason
+
+                        $DetectedPlanes = @()
+                        if ($AzureMetered) { $DetectedPlanes += 'AzureMetered' }
+                        if ($MarketplaceCovered) { $DetectedPlanes += 'Marketplace' }
+                        if ($DetectedPlanes.Count -eq 0) { $DetectedPlanes = @('None') }
+
+                        $MpRow = $MpMatch.Row
+                        if ($null -ne $MpRow -and -not [string]::IsNullOrEmpty("$($MpRow.InstanceId)")) { $null = $MatchedMarketplaceRows.Add("$($MpRow.InstanceId)|$($MpRow.MeterId)") }
+
+                        if ($Coverage.CoverageStatus -eq 'UNPRICED') { $Global:FoundryCoverageUnpricedCount++ }
+
+                        $Record = [pscustomobject]@{
+                            SubscriptionGuid = $sub.id; SubscriptionName = $sub.Name; ResourceGroup = $acct.resourceGroup; AccountName = $acct.name; AccountId = $acct.id
+                            AccountKind = $Model.AccountKind; DeploymentName = $Model.DeploymentName; ModelName = $Model.ModelName; ModelFormat = $Model.ModelFormat; ModelVersion = $Model.ModelVersion
+                            DeploymentSku = $Model.DeploymentSku; DeploymentCapacity = $Model.DeploymentCapacity; Region = $Model.Region
+                            DetectedPlanes = ($DetectedPlanes -join '+'); CoverageStatus = $Coverage.CoverageStatus; CoverageFlag = $Coverage.CoverageFlag; RetailPriceMatch = $RetailMatch.RetailMatch
+                            MarketplacePublisher = $(if ($MarketplaceCovered) { "$($MpRow.PublisherName)" } else { '' })
+                            MarketplaceOffer = $(if ($MarketplaceCovered) { "$($MpRow.OfferName)" } else { '' })
+                            CcuQuantity = $(if ($MarketplaceCovered) { $MpRow.ConsumedQuantity } else { '' })
+                            CcuUnitOfMeasure = $(if ($MarketplaceCovered) { "$($MpRow.UnitOfMeasure)" } else { '' })
+                            MarketplacePretaxCost = $(if ($MarketplaceCovered) { $MpRow.PretaxCost } else { '' })
+                            MarketplaceCurrency = $(if ($MarketplaceCovered) { "$($MpRow.Currency)" } else { '' })
+                            CcuAttribution = $(if ($MarketplaceCovered) { $MpMatch.CcuAttribution } else { '' })
+                            TokenMetricsPresent = $false; InputTokens = ''; OutputTokens = ''; TotalTokens = ''
+                            ProbeWindowStart = $ProbeWindowStart.ToString('yyyy-MM-dd'); ProbeWindowEnd = $ProbeWindowEnd.ToString('yyyy-MM-dd'); RunTimestampUtc = $RunTimestampUtc
+                        }
+
+                        # 4. OPTIONAL richer usage tiers (probe-and-branch, never fail if absent):
+                        #    Azure Monitor per-deployment token metrics, discovered at runtime via
+                        #    metric-definitions (the design spec section 6). A Marketplace/partner deployment
+                        #    that emits nothing here is EXPECTED, not an error.
+                        try
+                        {
+                            $MetricProbe = Get-RdaFoundryTokenMetrics -AccountId $acct.id -DeploymentName $Model.DeploymentName -StartTime $ProbeWindowStart -EndTime $ProbeWindowEnd
+                            if ($null -ne $MetricProbe)
+                            {
+                                $Record.TokenMetricsPresent = [bool]$MetricProbe.Present
+                                $Record.InputTokens = $MetricProbe.InputTokens
+                                $Record.OutputTokens = $MetricProbe.OutputTokens
+                                $Record.TotalTokens = $MetricProbe.TotalTokens
+                            }
+                        }
+                        catch
+                        {
+                            Write-Log -Message ("FoundryModelCoverage: token-metric probe for {0}/{1} did not complete ({2}); recorded as absent, not failed." -f $acct.name, $Model.DeploymentName, $_.Exception.Message) -Severity 'Info'
+                        }
+
+                        $null = $ExportRows.Add((ConvertTo-RdaFoundryCoverageRow -Record $Record -Obfuscate:$Obfuscate.IsPresent -SubGuidTokenMap $script:FoundrySubGuidTokenMap -RgTokenMap $script:FoundryRgTokenMap -SubCache $script:FoundrySubCache -RgCache $script:FoundryRgCache -NameCache $script:FoundryNameCache))
+                    }
+                }
+
+                # 3c. Unattributed Marketplace/CCU rows: a Claude/partner CCU line that could
+                #     NOT be tied to any deployed model (deleted deployment, or a sub the
+                #     identity could not fully enumerate). Emit a synthetic row so the DOLLARS
+                #     are never dropped (the design spec section 9 anti-silent-drop guarantee). Only rows
+                #     whose offer names a KNOWN Foundry model vendor are surfaced. The match
+                #     is on precise, multi-character vendor discriminators (the model-format
+                #     vendors from the design spec section 4.2 plus the 'foundry' service token) - NOT a
+                #     bare 'ai' token, which is far too common a substring and would sweep in
+                #     unrelated Marketplace SaaS charges as false model coverage gaps.
+                foreach ($MpRow in $MarketplaceRows)
+                {
+                    if ($null -eq $MpRow) { continue }
+                    $Key = "$($MpRow.InstanceId)|$($MpRow.MeterId)"
+                    if ($MatchedMarketplaceRows.Contains($Key)) { continue }
+                    $OfferTokens = @(Get-RdaFoundryModelMatchTokens -Value ("$($MpRow.PublisherName) $($MpRow.OfferName) $($MpRow.PlanName)"))
+                    $LooksLikeModelVendor = @($OfferTokens | Where-Object { $_ -in @('anthropic', 'claude', 'cohere', 'mistral', 'ministral', 'codestral', 'llama', 'openai', 'deepseek', 'grok', 'kimi', 'qwen', 'phi', 'tsuzumi', 'foundry') }).Count -gt 0
+                    if (-not $LooksLikeModelVendor) { continue }
+
+                    $null = $ExportRows.Add((ConvertTo-RdaFoundryCoverageRow -Record ([pscustomobject]@{
+                                    SubscriptionGuid = $sub.id; SubscriptionName = $sub.Name; ResourceGroup = "$($MpRow.ResourceGroup)"; AccountName = ''; AccountId = ''
+                                    AccountKind = ''; DeploymentName = '(unattributed Marketplace/CCU charge)'; ModelName = ''; ModelFormat = ''; ModelVersion = ''
+                                    DeploymentSku = ''; DeploymentCapacity = ''; Region = ''; DetectedPlanes = 'Marketplace'
+                                    CoverageStatus = 'MarketplaceOnly'; CoverageFlag = 'Marketplace/CCU charge that could NOT be tied to a deployed model in this subscription; carried so the billed dollars are not dropped.'
+                                    RetailPriceMatch = '(n/a - unattributed Marketplace charge)'
+                                    MarketplacePublisher = "$($MpRow.PublisherName)"; MarketplaceOffer = "$($MpRow.OfferName)"; CcuQuantity = $MpRow.ConsumedQuantity; CcuUnitOfMeasure = "$($MpRow.UnitOfMeasure)"; MarketplacePretaxCost = $MpRow.PretaxCost; MarketplaceCurrency = "$($MpRow.Currency)"; CcuAttribution = 'AggregatedOffer'
+                                    TokenMetricsPresent = $false; InputTokens = ''; OutputTokens = ''; TotalTokens = ''
+                                    ProbeWindowStart = $ProbeWindowStart.ToString('yyyy-MM-dd'); ProbeWindowEnd = $ProbeWindowEnd.ToString('yyyy-MM-dd'); RunTimestampUtc = $RunTimestampUtc
+                                }) -Obfuscate:$Obfuscate.IsPresent -SubGuidTokenMap $script:FoundrySubGuidTokenMap -RgTokenMap $script:FoundryRgTokenMap -SubCache $script:FoundrySubCache -RgCache $script:FoundryRgCache -NameCache $script:FoundryNameCache))
+                }
+
+                if ($ExportRows.Count -gt 0)
+                {
+                    $ExportRows | Select-Object SubscriptionGuid, SubscriptionName, ResourceGroup, AccountName, AccountKind, DeploymentName, ModelName, ModelFormat, ModelVersion, DeploymentSku, DeploymentCapacity, Region, DetectedPlanes, CoverageStatus, CoverageFlag, RetailPriceMatch, MarketplacePublisher, MarketplaceOffer, CcuQuantity, CcuUnitOfMeasure, MarketplacePretaxCost, MarketplaceCurrency, CcuAttribution, TokenMetricsPresent, InputTokens, OutputTokens, TotalTokens, ProbeWindowStart, ProbeWindowEnd, RunTimestampUtc | Export-Csv -LiteralPath $Global:FoundryCoverageFileCsv -Encoding utf8 -Append -NoTypeInformation
+                }
+
+                $FcRecordsThisSub = $ExportRows.Count
+                Write-Log -Message ("FoundryModelCoverage records for {0}: {1} (deployed-model + coverage-gap rows)." -f $sub.Name, $FcRecordsThisSub) -Severity 'Info'
+            }
+            catch
+            {
+                $FcFailedThisSub = $true
+                $FcFailureMessage = ("{0} (this subscription's Foundry coverage assessment is INCOMPLETE)" -f $_.Exception.Message)
+                Write-Log -Message ("FoundryModelCoverage failed for {0}: {1}" -f $sub.Name, $FcFailureMessage) -Severity 'Warning'
+            }
+
+            $Global:FoundryCoverageRecordCount += $FcRecordsThisSub
+            $script:FoundryCoverageRecordsThisRun += $FcRecordsThisSub
+            if ($FcFailedThisSub)
+            {
+                $Global:FoundryCoverageFailedSubs += [pscustomobject]@{ Name = $sub.Name; Id = $sub.Id; Message = $FcFailureMessage; Complete = $false; RecordsCollected = $FcRecordsThisSub }
+            }
+        }
+
+        # HONEST NEGATIVES (the design spec section 9). Zero deployed Foundry models is a CONFIRMED ZERO
+        # (accounts were enumerated and none held deployments), NOT a silently-missing
+        # section - log it explicitly so an empty file reads as "verified none".
+        if ($Global:FoundryCoverageRecordCount -eq 0 -and ($Global:FoundryCoverageFailedSubs | Where-Object { $_.Id -ne '(auth)' } | Measure-Object).Count -eq 0)
+        {
+            Write-Log -Message ('FoundryModelCoverage: 0 deployed Foundry/CognitiveServices model deployments found across all in-scope subscriptions. This is a CONFIRMED ZERO - accounts were enumerated and none held model deployments. It is NOT a missing/failed section.') -Severity 'Warning'
+        }
+        if ($Global:FoundryCoverageUnpricedCount -gt 0)
+        {
+            Write-Log -Message ("FoundryModelCoverage: {0} deployed model(s) classified UNPRICED (found in NEITHER billing plane). These are LOUD coverage gaps the server pricing team must investigate - see the UNPRICED rows in the coverage CSV." -f $Global:FoundryCoverageUnpricedCount) -Severity 'Warning'
         }
     }
 
@@ -1846,6 +2318,32 @@ function ExecuteInventoryProcessing()
             GetMarketplaceConsumption
             $MarketplacePhaseTimer.Stop()
             $script:PhaseTimings['Marketplace consumption collection (billing)'] = $MarketplacePhaseTimer.Elapsed
+
+            # P1 FOUNDRY FOLD. Folds the Claude/Anthropic Marketplace rows the phase above captured
+            # into the SAME first-party Consumption_*.csv the server reads, as 'Foundry Models' rows,
+            # so Claude usage is no longer dropped server-side. Runs under the SAME gate as the
+            # Marketplace phase (only when neither -SkipConsumption nor -SkipMarketplace is set), so
+            # the fold follows the identical skip coherence. It appends to the Consumption CSV
+            # written by GetResourceConsumption above.
+            $FoundryFoldPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            GetFoundryFoldConsumption
+            $FoundryFoldPhaseTimer.Stop()
+            $script:PhaseTimings['Foundry fold (Claude -> Consumption CSV)'] = $FoundryFoldPhaseTimer.Elapsed
+        }
+
+        # ADDITIVE Foundry model billing-plane coverage collector. Gated by the SAME
+        # -SkipConsumption switch: it needs the same billing / Cost Management Reader
+        # access to probe the Marketplace plane per subscription, and it performs its own
+        # per-subscription Get-AzConsumptionMarketplace read (independent of, and idempotent
+        # with, the Marketplace collector's). It is skipped independently with
+        # -SkipFoundryCoverage. It emits a SEPARATE FoundryModelCoverage_* output and never
+        # touches the first-party Consumption_* or Marketplace_* paths.
+        if (!$SkipFoundryCoverage.IsPresent)
+        {
+            $FoundryCoveragePhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            GetFoundryModelCoverage
+            $FoundryCoveragePhaseTimer.Stop()
+            $script:PhaseTimings['Foundry model coverage collection (billing-plane probe)'] = $FoundryCoveragePhaseTimer.Elapsed
         }
     }
     elseif (!$SkipMarketplace.IsPresent)
@@ -2203,7 +2701,7 @@ if ($ConsumptionCreated)
 
 if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 {
-    "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8
+    "AdditionalInfo,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8
 }
 
 # Marketplace CSV parallels the Consumption CSV: an empty-but-present file (header only)
@@ -2229,6 +2727,29 @@ if ($SkipConsumption.IsPresent -or $SkipMarketplace.IsPresent -or !$MarketplaceC
     "PublisherName,OfferName,PlanName,OrderNumber,ConsumedService,ConsumedQuantity,UnitOfMeasure,PretaxCost,Currency,IsEstimated,MeterId,UsageStart,UsageEnd,SubscriptionGuid,SubscriptionName,ResourceGroup,InstanceId,InstanceName" | Out-File -LiteralPath $Global:MarketplaceFileCsv -Encoding utf8
 }
 
+# FoundryModelCoverage CSV parallels the Consumption/Marketplace CSVs: an empty-but-present
+# file (header only) is written when the phase was skipped or produced no rows, so a
+# downstream consumer sees a deliberate, schema-shaped "0 coverage rows" rather than a
+# missing file. This mirrors the confirmed-zero diagnostic the collector logs.
+$FoundryCoverageCreated = Test-Path -LiteralPath $Global:FoundryCoverageFileCsv
+$FoundryCoverageEmpty = $false
+if ($FoundryCoverageCreated)
+{
+    try
+    {
+        $FoundryCoverageEmpty = ((Get-Item -LiteralPath $Global:FoundryCoverageFileCsv -ErrorAction Stop).Length -eq 0)
+    }
+    catch
+    {
+        $FoundryCoverageEmpty = $true
+    }
+}
+
+if ($SkipConsumption.IsPresent -or $SkipFoundryCoverage.IsPresent -or !$FoundryCoverageCreated -or $FoundryCoverageEmpty)
+{
+    "SubscriptionGuid,SubscriptionName,ResourceGroup,AccountName,AccountKind,DeploymentName,ModelName,ModelFormat,ModelVersion,DeploymentSku,DeploymentCapacity,Region,DetectedPlanes,CoverageStatus,CoverageFlag,RetailPriceMatch,MarketplacePublisher,MarketplaceOffer,CcuQuantity,CcuUnitOfMeasure,MarketplacePretaxCost,MarketplaceCurrency,CcuAttribution,TokenMetricsPresent,InputTokens,OutputTokens,TotalTokens,ProbeWindowStart,ProbeWindowEnd,RunTimestampUtc" | Out-File -LiteralPath $Global:FoundryCoverageFileCsv -Encoding utf8
+}
+
 if ($Obfuscate.IsPresent)
 {
     $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -ConsumptionRecordCount $(if ($null -ne $script:ConsumptionRecordsThisRun) { [int]$script:ConsumptionRecordsThisRun } else { 0 }) -ConsumptionRequested:(-not $SkipConsumption.IsPresent) -MarketplaceRecordCount $(if ($null -ne $script:MarketplaceRecordsThisRun) { [int]$script:MarketplaceRecordsThisRun } else { 0 }) -MarketplaceRequested:((-not $SkipConsumption.IsPresent) -and (-not $SkipMarketplace.IsPresent)) -MetricsApiCallCount $(if ($null -ne $script:MetricsApiCallsThisRun) { [int]$script:MetricsApiCallsThisRun } else { 0 }) -MetricsRequested:(-not $SkipMetrics.IsPresent) -Obfuscated:$Obfuscate.IsPresent
@@ -2237,7 +2758,7 @@ if ($Obfuscate.IsPresent)
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
     $CompressionOutput = @{
-        LiteralPath      = @($Global:HtmlFile, $Global:ConsumptionFileCsv, $Global:MarketplaceFileCsv) + $ShareableExtras + $JsonFiles
+        LiteralPath      = @($Global:HtmlFile, $Global:ConsumptionFileCsv, $Global:MarketplaceFileCsv, $Global:FoundryCoverageFileCsv) + $ShareableExtras + $JsonFiles
         CompressionLevel = 'Fastest'
         DestinationPath  = [WildcardPattern]::Escape($Global:ZipOutputFile)
     }
@@ -2259,7 +2780,7 @@ else
     $JsonFiles = Get-ChildItem -LiteralPath $DefaultPath -Filter "*.json" | Where-Object { $_.Name -notlike "ObfuscationDictionary_*" -and $_.Name -notlike "Full_*" -and $_.Name -notlike "Heartbeat_*" -and $_.Name -notlike "DebugLog_*" -and $_.Name -notlike "ErrorLog_*" } | Select-Object -ExpandProperty FullName
 
     $CompressionOutput = @{
-        LiteralPath      = @($Global:HtmlFile, $Global:ConsumptionFileCsv, $Global:MarketplaceFileCsv) + $ShareableExtras + $JsonFiles
+        LiteralPath      = @($Global:HtmlFile, $Global:ConsumptionFileCsv, $Global:MarketplaceFileCsv, $Global:FoundryCoverageFileCsv) + $ShareableExtras + $JsonFiles
         CompressionLevel = 'Fastest'
         DestinationPath  = [WildcardPattern]::Escape($Global:ZipOutputFile)
     }

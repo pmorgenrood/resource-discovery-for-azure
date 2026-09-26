@@ -197,6 +197,687 @@ function Global:ConvertTo-RdaMarketplaceRow
         InstanceName     = $OutInstanceName
     }
 }
+function Global:Test-RdaClaudeMarketplaceRow
+{
+    # Returns $true when a Marketplace row (PSMarketplace shape) is an Anthropic/Claude
+    # offer that should be folded into the first-party Consumption CSV as a "Foundry Models"
+    # row (see ConvertTo-RdaFoldedFoundryRow and the GetFoundryFoldConsumption collector).
+    #
+    # WHY A TOKEN MATCH, NOT AN EXACT PUBLISHER STRING. The exact PublisherName/OfferName/
+    # PlanName spellings Azure Marketplace uses for a Claude-on-Foundry offer are not yet
+    # verified against a live billed row (no such subscription is available to this project),
+    # so this matches on the stable, human-meaningful tokens "anthropic" and "claude" anywhere
+    # in the three product-identity fields rather than hardcoding one brittle full string. That
+    # is the same "product identity lives in PublisherName/OfferName/PlanName" contract the
+    # Marketplace collector already documents. The match is case-insensitive.
+    param([Parameter(Mandatory = $true)][AllowNull()]$Row)
+
+    if ($null -eq $Row) { return $false }
+    $Haystack = ("{0} {1} {2}" -f $Row.PublisherName, $Row.OfferName, $Row.PlanName)
+    return ($Haystack -imatch '\b(anthropic|claude)\b')
+}
+
+function Global:Get-RdaClaudeModelIdentity
+{
+    # Derives a server-recognizable Claude MODEL identity string from a Marketplace row's
+    # product-identity fields (OfferName/PlanName, then PublisherName as a last resort).
+    #
+    # SERVER CONTRACT. The ingestion server resolves the model by alias-matching a recognizable
+    # Claude token (e.g. "Claude Sonnet 4.5", "Claude Opus 4.5", "Claude Haiku 4.5") out of
+    # MeterName/ProductName. This returns the best such string we can read from the row so the
+    # folded row's MeterName carries it. When the row names a specific family (sonnet/opus/haiku)
+    # and/or a version, that specific identity is returned; otherwise a bare "Claude" is returned
+    # so the row is still attributable to Claude even when the model cannot be pinned down.
+    #
+    # CAVEAT (unverified against a live tenant). The precise OfferName/PlanName spellings Azure
+    # uses for Claude-on-Foundry are not yet confirmed against a real billed row. This parser is
+    # deliberately tolerant (family + optional version tokens) rather than an exact-string table,
+    # and MUST be validated once a live Claude-on-Foundry deployment is available.
+    param([Parameter(Mandatory = $true)]$Row)
+
+    $Text = ("{0} {1} {2}" -f $Row.OfferName, $Row.PlanName, $Row.PublisherName)
+
+    # Family (sonnet/opus/haiku) - the strongest model signal.
+    $Family = $null
+    if ($Text -imatch '\b(sonnet|opus|haiku)\b') { $Family = (Get-Culture).TextInfo.ToTitleCase($Matches[1].ToLower()) }
+
+    # Version like "4.5", "3.7", "4", "3" ONLY when it sits ADJACENT to the family token (either
+    # side), e.g. "Claude 3 Sonnet" or "Sonnet 4.5". A Claude model version is a single-digit major
+    # with an optional minor (never a large plan quantity like "100000 tokens"), so the number is
+    # bounded to \d(?:\.\d+)? - a bare "100000" adjacent to the family is NOT treated as a version.
+    $Version = $null
+    if ($Family)
+    {
+        $Fam = [regex]::Escape($Family)
+        if ($Text -imatch ('\b(\d(?:\.\d+)?)\s+' + $Fam + '\b')) { $Version = $Matches[1] }
+        elseif ($Text -imatch ('\b' + $Fam + '\s+(\d(?:\.\d+)?)\b')) { $Version = $Matches[1] }
+    }
+
+    if ($Family)
+    {
+        if ($Version) { return ("Claude {0} {1}" -f $Family, $Version) }
+        return ("Claude {0}" -f $Family)
+    }
+
+    # No family token: still return a Claude identity so the row is attributable. Without a family
+    # to anchor a version, do NOT attach a spurious number.
+    return 'Claude'
+}
+
+function Global:ConvertTo-RdaFoldedFoundryRow
+{
+    # TIER 1 FOLD (CCU / cost, always available). Maps ONE Claude/Anthropic Marketplace row
+    # (PSMarketplace shape, as returned by Get-AzConsumptionMarketplace) to a row shaped like
+    # the FIRST-PARTY Consumption CSV, so the deployed ingestion server - which reads ONLY
+    # Consumption_*.csv and has NO reader for Marketplace_*.csv - actually sees Claude usage.
+    #
+    # WHY. The server's Foundry->Bedrock path admits a consumption row ONLY when its
+    # MeterCategory == "Foundry Models" (exact string). Claude has no first-party Azure retail
+    # meter, so Claude usage arrives only on the Marketplace endpoint and is silently dropped
+    # server-side. Folding it into the Consumption CSV with MeterCategory="Foundry Models" and
+    # the Claude model identity in MeterName is what makes the server attribute the Azure cost.
+    #
+    # NON-TOKEN (CCU / cost) MARKING. This Tier 1 row carries the Marketplace PretaxCost as an
+    # Azure cost, NOT a token count. The server must attribute that Azure cost but must NOT try
+    # to compute an AWS Bedrock token price from it (that is Tier 2's job, when per-model token
+    # telemetry exists). So the row is marked non-token: Unit is a cost/quantity unit (never a
+    # token unit) and additionalInfo.IsTokenMeter=$false. The per-(model,role) TOKEN rows are
+    # produced separately by Tier 2 with the role encoded in MeterName and a token Unit.
+    #
+    # OUTPUT SHAPE. Returns an object carrying EXACTLY the first-party Consumption CSV columns
+    # (AdditionalInfo, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity,
+    # Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter,
+    # ReservationId, ReservationOrderId) so the collector can Select-Object + Export-Csv -Append
+    # it straight onto the existing Consumption_*.csv with no schema change.
+    #   - MeterCategory = "Foundry Models" (exact, server contract).
+    #   - MeterName     = the Claude model identity (server resolves the model from it).
+    #   - Quantity      = the Marketplace ConsumedQuantity (usage quantity, mirrors first-party).
+    #   - Unit          = the Marketplace UnitOfMeasure, or a neutral cost unit; NEVER a token unit.
+    #   - AdditionalInfo = a JSON blob shaped like the first-party path's
+    #                      {"Microsoft.Resources":{resourceUri,location,additionalInfo:{...}}},
+    #                      carrying PretaxCost/Currency (the Azure cost the server attributes),
+    #                      the readable product identity, and the fold markers. Cost lives here
+    #                      because the Consumption CSV has no dedicated cost column - the
+    #                      first-party path likewise carries per-resource detail inside this blob.
+    #
+    # SYNTHESIZED, STABLE, OBFUSCATION-CONSISTENT ResourceId + MeterId. The server requires a
+    # NON-EMPTY ResourceId and MeterId. A Marketplace row's InstanceId/MeterId may be empty, so
+    # when absent we SYNTHESIZE them deterministically from the row's stable identity fields (a
+    # SHA256 over publisher/offer/plan/instance) so the same offer maps to the same ids across
+    # runs. Under -Obfuscate the ResourceId is routed through the SAME Build-ObfuscatedResourceUri
+    # path the first-party consumption + Marketplace rows use, so a folded row cross-references the
+    # rest of the bundle exactly like every other row and never leaks a real identifier.
+    #
+    # OBFUSCATION PARITY. Same param surface as ConvertTo-RdaMarketplaceRow: the caller passes the
+    # shared URI-keyed name dictionary and the per-run caches. Product identity (the "which model"
+    # signal) stays readable in MeterName by design, exactly as Marketplace keeps PublisherName/
+    # OfferName/PlanName readable.
+    param(
+        [Parameter(Mandatory = $true)]$Row,
+        [bool]$Obfuscate = $false,
+        # URI-keyed shared resource-ID dictionary ($Global:ResourceIdDictionary), passed through to
+        # Build-ObfuscatedResourceUri exactly as the Marketplace/consumption paths do.
+        $UriKeyedNameDictionary = $null,
+        [hashtable]$SubCache = $null,
+        [hashtable]$RgCache = $null,
+        [hashtable]$NameCache = $null
+    )
+
+    # --- Model identity (readable, drives server model resolution via MeterName) ---
+    $ModelIdentity = Get-RdaClaudeModelIdentity -Row $Row
+
+    # --- Stable synthetic ids from the row's identity, used when the row lacks its own ---
+    $IdentitySeed = ("{0}|{1}|{2}|{3}" -f $Row.PublisherName, $Row.OfferName, $Row.PlanName, $Row.InstanceId)
+    $Sha = [System.Security.Cryptography.SHA256]::Create()
+    try
+    {
+        $HashBytes = $Sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($IdentitySeed))
+    }
+    finally
+    {
+        $Sha.Dispose()
+    }
+    $HashHex = -join ($HashBytes | ForEach-Object { $_.ToString('x2') })
+    # A GUID-shaped slice so the synthetic ids look like the ARM/meter ids they stand in for and
+    # are stable for a given offer identity across runs.
+    $SynthGuid = ("{0}-{1}-{2}-{3}-{4}" -f $HashHex.Substring(0, 8), $HashHex.Substring(8, 4), $HashHex.Substring(12, 4), $HashHex.Substring(16, 4), $HashHex.Substring(20, 12))
+
+    # MeterId: prefer the row's own, else the synthetic (server requires non-empty).
+    $MeterId = if (-not [string]::IsNullOrEmpty($Row.MeterId)) { $Row.MeterId } else { ("foundryfold-{0}" -f $SynthGuid) }
+
+    # ResourceId: prefer the row's InstanceId, else a synthetic SaaS-shaped ARM URI so the server
+    # sees a well-formed non-empty resource id. Kept as an ARM path so obfuscation preserves its
+    # structure exactly like a real one.
+    $RawResourceId = if (-not [string]::IsNullOrEmpty($Row.InstanceId))
+    {
+        $Row.InstanceId
+    }
+    elseif (-not [string]::IsNullOrEmpty($Row.SubscriptionGuid))
+    {
+        ("/subscriptions/{0}/providers/Microsoft.Foundry/foundryModels/{1}" -f $Row.SubscriptionGuid, $SynthGuid)
+    }
+    else
+    {
+        ("/providers/Microsoft.Foundry/foundryModels/{0}" -f $SynthGuid)
+    }
+
+    $ResourceLocation = if (-not [string]::IsNullOrEmpty($Row.MeterRegion)) { $Row.MeterRegion } elseif (-not [string]::IsNullOrEmpty($Row.ResourceLocation)) { $Row.ResourceLocation } else { 'global' }
+
+    # --- Obfuscation of the ResourceId (parity with the Marketplace/consumption paths) ---
+    $OutResourceId = $RawResourceId
+    if ($Obfuscate)
+    {
+        if ($null -eq $SubCache) { $SubCache = @{} }
+        if ($null -eq $RgCache) { $RgCache = @{} }
+        if ($null -eq $NameCache) { $NameCache = @{} }
+
+        $Prefix = if ("$($Row.InstanceId) $($Row.InstanceName) $($Row.ResourceGroup)" -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or "$RawResourceId" -match '(^|/|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+        $OutResourceId = Build-ObfuscatedResourceUri -RawUri $RawResourceId -Prefix $Prefix -SubscriptionDictionary $null -ResourceGroupDictionary $null -NameDictionary $UriKeyedNameDictionary -SubCache $SubCache -RgCache $RgCache -NameCache $NameCache
+    }
+
+    # --- AdditionalInfo JSON blob (mirror the first-party {"Microsoft.Resources":{...}} shape) ---
+    # Cost lives here because the Consumption CSV carries no dedicated cost column; the first-party
+    # path likewise stows per-resource licensing detail inside this same blob. The fold markers let
+    # the server (and a human reading the CSV) tell a folded Claude cost row from a native one.
+    $AdditionalInfoObject = [PSCustomObject]@{
+        'Microsoft.Resources' = [PSCustomObject]@{
+            resourceUri    = $OutResourceId
+            location       = $ResourceLocation
+            additionalInfo = [PSCustomObject]@{
+                # Fold provenance + non-token marking.
+                IsFoundryFold  = $true
+                FoldTier       = 1
+                IsTokenMeter   = $false
+                ModelIdentity  = $ModelIdentity
+                # The Azure cost the server attributes for this Claude usage.
+                PretaxCost     = $Row.PretaxCost
+                Currency       = $Row.Currency
+                # The Marketplace usage quantity + its original unit, preserved for fidelity (the
+                # emitted Unit column is forced to a neutral non-token 'CCU' - see the Unit note).
+                ConsumedQuantity        = $Row.ConsumedQuantity
+                MarketplaceUnitOfMeasure = $Row.UnitOfMeasure
+                # Readable product identity (never masked - the "which offer" signal).
+                PublisherName  = $Row.PublisherName
+                OfferName      = $Row.OfferName
+                PlanName       = $Row.PlanName
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        AdditionalInfo     = ($AdditionalInfoObject | ConvertTo-Json -Compress -Depth 6)
+        MeterCategory      = 'Foundry Models'
+        MeterId            = $MeterId
+        MeterName          = $ModelIdentity
+        MeterRegion        = $ResourceLocation
+        # Carry the readable model identity as the sub-category too, a second place the server can
+        # read the model from, mirroring how the product identity is preserved on Marketplace rows.
+        MeterSubCategory   = $ModelIdentity
+        # Usage quantity, mirroring the first-party path (NOT a token count - this is the CCU/cost row).
+        Quantity           = $Row.ConsumedQuantity
+        # A FIXED non-token unit. The server decides token-vs-cost partly from the Unit
+        # (Quantity x TokensPerAzureUnit(Unit)); a token-shaped Marketplace unit like "1M Tokens"
+        # on this cost row could make the server misprice the CCU/usage Quantity as tokens. So this
+        # Tier 1 row ALWAYS carries a neutral unit and marks itself non-token; the real Marketplace
+        # unit is preserved in additionalInfo.MarketplaceUnitOfMeasure for fidelity. Per-role TOKEN
+        # rows (with a token unit) are Tier 2's job.
+        Unit               = 'CCU'
+        UsageStartTime     = $Row.UsageStart
+        UsageEndTime       = $Row.UsageEnd
+        ResourceId         = $OutResourceId
+        ResourceLocation   = $ResourceLocation
+        ConsumptionMeter   = $ModelIdentity
+        ReservationId      = ''
+        ReservationOrderId = ''
+    }
+}
+
+function Global:Get-RdaFoundryModelMatchTokens
+{
+    # Normalizes a free-form model/meter string into a lower-cased set of alphanumeric
+    # tokens, used by Test-RdaRetailPriceMatch to compare a deployed model's identity
+    # against a Retail Prices catalog entry WITHOUT a hardcoded model->meter table.
+    #
+    # WHY. There is no clean join key between a deployment's properties.model.name
+    # (e.g. 'gpt-4o', 'claude-opus-5') and a Retail Prices meterName/skuName/productName
+    # (e.g. 'Azure OpenAI GPT5', '5.4 opt Dz 1M Tokens') - the catalog names are
+    # marketing-shaped and abbreviated (the design spec section 4.3). So we compare on normalized
+    # token OVERLAP rather than an exact key. Purely mechanical, so it lives in a pure
+    # helper and is unit-tested.
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return @() }
+
+    # Lower-case, split on any non-alphanumeric run, drop empties and 1-char noise.
+    $Lower = $Value.ToLowerInvariant()
+    $Parts = [regex]::Split($Lower, '[^a-z0-9]+') | Where-Object { $_.Length -ge 2 }
+    return @($Parts | Select-Object -Unique)
+}
+
+function Global:Test-RdaRetailPriceMatch
+{
+    # Decides whether a single deployed model has a CONFIDENT match among the supplied
+    # Azure Retail Prices catalog items (serviceName eq 'Foundry Models'), returning the
+    # matched productName/meterName so the server team can audit the match (the design spec section 4.3).
+    #
+    # CONSERVATIVE + PER-MODEL (the design spec section 4.2/4.3): the match is decided at the individual
+    # catalog-item granularity, never at vendor granularity - a vendor like Cohere/Llama/
+    # Mistral can be PARTIALLY present (some SKUs metered, others not), so "the vendor has
+    # meters" is NOT proof this SKU is metered. A match requires BOTH:
+    #   1. the model's vendor discriminator (ModelFormat, e.g. 'OpenAI') to appear in the
+    #      catalog item's tokens, AND
+    #   2. the distinctive tokens of the model's name/version (e.g. 'gpt','4o') to be
+    #      covered by the catalog item's tokens.
+    # A miss is NOT proof of absence (it may be a naming mismatch) - the caller combines
+    # this with the Marketplace probe before ever emitting UNPRICED (the design spec section 4.3/10).
+    param(
+        [Parameter(Mandatory = $true)]$Model,
+        $CatalogItems
+    )
+
+    $Result = [pscustomobject]@{
+        Matched      = $false
+        RetailMatch  = '(no confident Retail Prices match)'
+    }
+
+    if ($null -eq $CatalogItems -or @($CatalogItems).Count -eq 0) { return $Result }
+
+    $ModelName = "$($Model.ModelName)"
+    $ModelFormat = "$($Model.ModelFormat)"
+
+    $NameTokens = @(Get-RdaFoundryModelMatchTokens -Value $ModelName)
+    $FormatTokens = @(Get-RdaFoundryModelMatchTokens -Value $ModelFormat)
+
+    # A model with no usable name tokens cannot be confidently matched - be conservative.
+    if ($NameTokens.Count -eq 0) { return $Result }
+
+    foreach ($Item in @($CatalogItems))
+    {
+        if ($null -eq $Item) { continue }
+
+        $ItemText = @(
+            "$($Item.productName)"
+            "$($Item.meterName)"
+            "$($Item.skuName)"
+            "$($Item.armSkuName)"
+        ) -join ' '
+        $ItemTokens = @(Get-RdaFoundryModelMatchTokens -Value $ItemText)
+        if ($ItemTokens.Count -eq 0) { continue }
+
+        # Condition 1: vendor discriminator present (when we have one to check).
+        $VendorOk = $true
+        if ($FormatTokens.Count -gt 0)
+        {
+            $VendorOk = @($FormatTokens | Where-Object { $ItemTokens -contains $_ }).Count -gt 0
+        }
+        if (-not $VendorOk) { continue }
+
+        # Condition 2: the model's distinctive name tokens are covered by the item's
+        # tokens. Require ALL name tokens (drift-safe: a partial coincidental token
+        # overlap must not count as a confident match).
+        $NameCovered = @($NameTokens | Where-Object { $ItemTokens -notcontains $_ }).Count -eq 0
+        if (-not $NameCovered) { continue }
+
+        $Result.Matched = $true
+        $Result.RetailMatch = ("{0} / {1}" -f "$($Item.productName)", "$($Item.meterName)").Trim(' /')
+        return $Result
+    }
+
+    return $Result
+}
+
+function Global:Test-RdaMarketplaceModelMatch
+{
+    # Decides whether a deployed model is covered by the Marketplace plane, by looking for
+    # a Marketplace/CCU row (PSMarketplace-shaped) whose PublisherName/OfferName corresponds
+    # to the model's vendor (the design spec section 5.2). Because CCU is billed as a SINGLE AGGREGATED
+    # line per subscription/offer (the design spec section 2.1/5.2), we do NOT expect one row per model:
+    # any attributable Marketplace row for the model's vendor is Marketplace-plane evidence.
+    #
+    # Returns the matched row (for CCU quantity/cost) and whether the CCU could be tied to a
+    # SPECIFIC deployment (PerModel) or only to the offer aggregate (AggregatedOffer).
+    param(
+        [Parameter(Mandatory = $true)]$Model,
+        $MarketplaceRows
+    )
+
+    $Result = [pscustomobject]@{
+        Matched        = $false
+        Row            = $null
+        CcuAttribution = $null
+    }
+
+    if ($null -eq $MarketplaceRows -or @($MarketplaceRows).Count -eq 0) { return $Result }
+
+    $VendorTokens = @(Get-RdaFoundryModelMatchTokens -Value "$($Model.ModelFormat) $($Model.ModelName)")
+    $AccountRg = "$($Model.ResourceGroup)"
+    $AccountId = "$($Model.AccountId)"
+
+    $KnownVendorTokens = @('anthropic', 'claude', 'cohere', 'mistral', 'ministral', 'codestral', 'llama', 'openai', 'deepseek', 'grok', 'kimi', 'qwen', 'phi', 'tsuzumi', 'foundry')
+    $ModelVendorDiscriminators = @($VendorTokens | Where-Object { $_ -in $KnownVendorTokens })
+    if ($ModelVendorDiscriminators.Count -eq 0) { return $Result }
+
+    $BestOfferRow = $null
+
+    foreach ($Row in @($MarketplaceRows))
+    {
+        if ($null -eq $Row) { continue }
+
+        $OfferText = @("$($Row.PublisherName)", "$($Row.OfferName)", "$($Row.PlanName)") -join ' '
+        $OfferTokens = @(Get-RdaFoundryModelMatchTokens -Value $OfferText)
+        if ($OfferTokens.Count -eq 0) { continue }
+
+        # Vendor alignment: overlap on a KNOWN Foundry-vendor discriminator (e.g.
+        # 'anthropic'/'claude'), not any incidental shared name token. A bare common
+        # word like 'meta' in an unrelated publisher must not align the model to that
+        # offer. Vendor-level here is CORRECT: Marketplace attribution is inherently
+        # offer-level (aggregated), unlike the per-model Retail Prices match.
+        $VendorAligned = @($ModelVendorDiscriminators | Where-Object { $OfferTokens -contains $_ }).Count -gt 0
+        if (-not $VendorAligned) { continue }
+
+        # Can we tie the CCU line to THIS specific deployment/account? Only if the row's
+        # InstanceId/ResourceGroup references the model's account/RG. The common case is
+        # NO (aggregation collapses per-model detail) -> AggregatedOffer.
+        $InstanceId = "$($Row.InstanceId)"
+        $RowRg = "$($Row.ResourceGroup)"
+        $TiedToDeployment = $false
+        if (-not [string]::IsNullOrEmpty($AccountId) -and -not [string]::IsNullOrEmpty($InstanceId) -and $InstanceId -like ("*" + $AccountId + "*"))
+        {
+            $TiedToDeployment = $true
+        }
+        elseif (-not [string]::IsNullOrEmpty($AccountRg) -and -not [string]::IsNullOrEmpty($RowRg) -and $RowRg -eq $AccountRg)
+        {
+            $TiedToDeployment = $true
+        }
+
+        if ($TiedToDeployment)
+        {
+            $Result.Matched = $true
+            $Result.Row = $Row
+            $Result.CcuAttribution = 'PerModel'
+            return $Result
+        }
+
+        if ($null -eq $BestOfferRow) { $BestOfferRow = $Row }
+    }
+
+    if ($null -ne $BestOfferRow)
+    {
+        $Result.Matched = $true
+        $Result.Row = $BestOfferRow
+        $Result.CcuAttribution = 'AggregatedOffer'
+    }
+
+    return $Result
+}
+
+function Global:Get-RdaFoundryCoverageStatus
+{
+    # The core branch/flag decision (the design spec section 3-5, 9, 10). Given the outcome of BOTH
+    # plane probes for one deployed model, returns the CoverageStatus + a human-readable
+    # CoverageFlag. This is the whole point of the collector - it is what fixes "dropped
+    # with no warning".
+    #
+    # KEY INVARIANT (no-overclaiming, the design spec section 10): UNPRICED is emitted ONLY when BOTH
+    # planes were SUCCESSFULLY probed and BOTH came back negative. If either probe
+    # failed/was denied/was unreachable, the status is Unknown-<reason>, NEVER UNPRICED -
+    # a probe failure must never masquerade as a confirmed coverage gap.
+    param(
+        [bool]$AzureMetered,          # confident Retail Prices match found
+        [bool]$MarketplaceCovered,    # Marketplace/CCU evidence found
+        [bool]$RetailProbed = $true,  # was the Retail Prices catalog readable this run?
+        [bool]$MarketplaceProbed = $true, # was the Marketplace plane successfully probed for this sub?
+        [string]$MarketplaceDeniedReason = $null # set when Marketplace was denied/failed
+    )
+
+    if ($AzureMetered)
+    {
+        $Status = if ($MarketplaceCovered) { 'AzureMetered+Marketplace' } else { 'AzureMetered' }
+        $Flag = if ($MarketplaceCovered)
+        {
+            'Billed on BOTH planes: an Azure meter exists (Retail Prices) AND Marketplace/CCU usage was found.'
+        }
+        else
+        {
+            'Azure-metered: a matching meter exists in the Retail Prices API. Priced by the server team via Retail Prices.'
+        }
+        return [pscustomobject]@{ CoverageStatus = $Status; CoverageFlag = $Flag }
+    }
+
+    if ($MarketplaceCovered)
+    {
+        return [pscustomobject]@{
+            CoverageStatus = 'MarketplaceOnly'
+            CoverageFlag   = 'Marketplace-billed, absent from Retail Prices - priced via CCU path.'
+        }
+    }
+
+    # Neither plane came back positive. Decide UNPRICED vs Unknown-<reason> based on
+    # whether BOTH planes were actually probed successfully.
+    if (-not $MarketplaceProbed)
+    {
+        $Reason = if (-not [string]::IsNullOrEmpty($MarketplaceDeniedReason)) { $MarketplaceDeniedReason } else { 'MarketplaceNotProbed' }
+        return [pscustomobject]@{
+            CoverageStatus = ('Unknown-' + $Reason)
+            CoverageFlag   = ('Coverage INDETERMINATE on the Marketplace axis ({0}); NOT declared UNPRICED because the Marketplace plane was not successfully probed. Grant Cost Management Reader (or Billing Reader on the billing scope) and re-run.' -f $Reason)
+        }
+    }
+
+    if (-not $RetailProbed)
+    {
+        return [pscustomobject]@{
+            CoverageStatus = 'Unknown-RetailCatalogUnavailable'
+            CoverageFlag   = 'Coverage INDETERMINATE on the Azure-metered axis (Retail Prices catalog could not be read this run); NOT declared UNPRICED. Retry when the price catalog is reachable.'
+        }
+    }
+
+    # BOTH planes probed, BOTH negative -> a genuine, confirmed coverage gap.
+    return [pscustomobject]@{
+        CoverageStatus = 'UNPRICED'
+        CoverageFlag   = 'UNPRICED MODEL / COVERAGE GAP - deployed model found in NEITHER billing plane (no Retail Prices meter, no Marketplace/CCU usage). Do NOT silently drop; the server team must investigate.'
+    }
+}
+
+function Global:ConvertTo-RdaFoundryCoverageRow
+{
+    # Maps ONE classified deployed-model record to the flat object emitted into
+    # FoundryModelCoverage_<ReportName>_<stamp>.csv, and applies obfuscation with the SAME
+    # discipline as ConvertTo-RdaMarketplaceRow (the design spec section 9.1):
+    #   - READABLE (product/plane identity, not customer secrets): AccountKind, ModelName,
+    #     ModelFormat, ModelVersion, DeploymentSku, DeploymentCapacity, Region,
+    #     DetectedPlanes, CoverageStatus, CoverageFlag, RetailPriceMatch,
+    #     MarketplacePublisher, MarketplaceOffer, CcuAttribution, all numeric usage/cost,
+    #     the probe presence flags, and the run window/timestamp.
+    #   - MASKED (identifying), via the SHARED run-wide dictionaries so tokens
+    #     cross-reference the rest of the bundle: SubscriptionGuid, SubscriptionName,
+    #     ResourceGroup, AccountName, DeploymentName. Reuses the exact
+    #     Resolve-ObfuscationToken + shared SubGuidTokenMap/RgTokenMap machinery the
+    #     Marketplace collector uses; a sub/RG absent from the shared maps mints a
+    #     deterministic local token so the row is still internally consistent.
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [bool]$Obfuscate = $false,
+        $SubGuidTokenMap = $null,
+        $RgTokenMap = $null,
+        [hashtable]$SubCache = $null,
+        [hashtable]$RgCache = $null,
+        [hashtable]$NameCache = $null
+    )
+
+    $OutSubscriptionGuid = $Record.SubscriptionGuid
+    $OutSubscriptionName = $Record.SubscriptionName
+    $OutResourceGroup = $Record.ResourceGroup
+    $OutAccountName = $Record.AccountName
+    $OutDeploymentName = $Record.DeploymentName
+
+    if ($Obfuscate)
+    {
+        if ($null -eq $SubCache) { $SubCache = @{} }
+        if ($null -eq $RgCache) { $RgCache = @{} }
+        if ($null -eq $NameCache) { $NameCache = @{} }
+
+        $Prefix = if ("$($Record.AccountName) $($Record.DeploymentName) $($Record.ResourceGroup)" -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or "$($Record.AccountName) $($Record.DeploymentName)" -match '(^|/|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+
+        $SharedSubToken = $null
+        if (-not [string]::IsNullOrEmpty($Record.SubscriptionGuid))
+        {
+            $SharedSubToken = Resolve-ObfuscationToken -RealValue $Record.SubscriptionGuid -LookupKey $Record.SubscriptionGuid -SharedDictionary $SubGuidTokenMap -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
+            $OutSubscriptionGuid = $SharedSubToken
+        }
+
+        if (-not [string]::IsNullOrEmpty($Record.SubscriptionName))
+        {
+            if ($null -ne $SharedSubToken)
+            {
+                $OutSubscriptionName = $SharedSubToken
+            }
+            else
+            {
+                $OutSubscriptionName = Resolve-ObfuscationToken -RealValue $Record.SubscriptionName -LookupKey $Record.SubscriptionName -SharedDictionary $null -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
+            }
+        }
+
+        if (-not [string]::IsNullOrEmpty($Record.ResourceGroup))
+        {
+            $RgTag = if ($Record.ResourceGroup -match '^mc_') { 'mc_' } else { '' }
+            $OutResourceGroup = Resolve-ObfuscationToken -RealValue $Record.ResourceGroup -LookupKey $Record.ResourceGroup -SharedDictionary $RgTokenMap -LocalCache $RgCache -TokenPrefix ($Prefix + 'rg_' + $RgTag)
+        }
+
+        if (-not [string]::IsNullOrEmpty($Record.AccountName))
+        {
+            $OutAccountName = Resolve-ObfuscationToken -RealValue $Record.AccountName -LookupKey $Record.AccountName -SharedDictionary $null -LocalCache $NameCache -TokenPrefix $Prefix
+        }
+
+        if (-not [string]::IsNullOrEmpty($Record.DeploymentName))
+        {
+            $OutDeploymentName = Resolve-ObfuscationToken -RealValue $Record.DeploymentName -LookupKey $Record.DeploymentName -SharedDictionary $null -LocalCache $NameCache -TokenPrefix $Prefix
+        }
+    }
+
+    return [PSCustomObject]@{
+        SubscriptionGuid      = $OutSubscriptionGuid
+        SubscriptionName      = $OutSubscriptionName
+        ResourceGroup         = $OutResourceGroup
+        AccountName           = $OutAccountName
+        AccountKind           = $Record.AccountKind
+        DeploymentName        = $OutDeploymentName
+        ModelName             = $Record.ModelName
+        ModelFormat           = $Record.ModelFormat
+        ModelVersion          = $Record.ModelVersion
+        DeploymentSku         = $Record.DeploymentSku
+        DeploymentCapacity    = $Record.DeploymentCapacity
+        Region                = $Record.Region
+        DetectedPlanes        = $Record.DetectedPlanes
+        CoverageStatus        = $Record.CoverageStatus
+        CoverageFlag          = $Record.CoverageFlag
+        RetailPriceMatch      = $Record.RetailPriceMatch
+        MarketplacePublisher  = $Record.MarketplacePublisher
+        MarketplaceOffer      = $Record.MarketplaceOffer
+        CcuQuantity           = $Record.CcuQuantity
+        CcuUnitOfMeasure      = $Record.CcuUnitOfMeasure
+        MarketplacePretaxCost = $Record.MarketplacePretaxCost
+        MarketplaceCurrency   = $Record.MarketplaceCurrency
+        CcuAttribution        = $Record.CcuAttribution
+        TokenMetricsPresent   = $Record.TokenMetricsPresent
+        InputTokens           = $Record.InputTokens
+        OutputTokens          = $Record.OutputTokens
+        TotalTokens           = $Record.TotalTokens
+        ProbeWindowStart      = $Record.ProbeWindowStart
+        ProbeWindowEnd        = $Record.ProbeWindowEnd
+        RunTimestampUtc       = $Record.RunTimestampUtc
+    }
+}
+
+function Global:Get-RdaFoundryRetailCatalog
+{
+    # Pulls the Azure Retail Prices catalog for serviceName 'Foundry Models' (the design spec section 4.1).
+    # The API is GLOBAL and UNAUTHENTICATED - no Azure permission, no per-tenant scoping - so
+    # this is a plain paged HTTP GET, called ONCE per run and cached by the caller. It answers
+    # only "does a first-party Azure meter exist for this model?" (plane membership), not usage.
+    #   https://learn.microsoft.com/en-us/rest/api/cost-management/retail-prices/azure-retail-prices
+    param(
+        [string]$ServiceName = 'Foundry Models',
+        [int]$MaxPages = 200
+    )
+
+    $Base = 'https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview'
+    $Filter = [uri]::EscapeDataString("serviceName eq '$ServiceName'")
+    $Uri = $Base + '&$filter=' + $Filter
+    $Items = [System.Collections.ArrayList]::new()
+    $Page = 0
+
+    while (-not [string]::IsNullOrEmpty($Uri) -and $Page -lt $MaxPages)
+    {
+        $Resp = Invoke-RestMethod -Uri $Uri -Method GET -ErrorAction Stop
+        if ($null -ne $Resp.Items) { foreach ($It in $Resp.Items) { $null = $Items.Add($It) } }
+        $Uri = $Resp.NextPageLink
+        $Page++
+    }
+
+    return @($Items)
+}
+
+function Global:Get-RdaFoundryTokenMetrics
+{
+    # OPTIONAL richer usage tier (the design spec section 6): per-deployment token metrics from Azure
+    # Monitor, DISCOVERED at runtime via Get-AzMetricDefinition (never hardcoded) because the
+    # metric set differs by account kind and evolves. Returns presence + summed token counts,
+    # or a Present=$false record. A Marketplace/partner deployment that emits nothing here is
+    # EXPECTED, not an error - this NEVER throws for an absent/empty metric; it only surfaces
+    # genuine call failures to the caller (which records them as absent, not failed).
+    param(
+        [Parameter(Mandatory = $true)][string]$AccountId,
+        [Parameter(Mandatory = $true)][string]$DeploymentName,
+        [Parameter(Mandatory = $true)][datetime]$StartTime,
+        [Parameter(Mandatory = $true)][datetime]$EndTime
+    )
+
+    $Result = [pscustomobject]@{ Present = $false; InputTokens = ''; OutputTokens = ''; TotalTokens = '' }
+
+    $Defs = @()
+    try { $Defs = @(Get-AzMetricDefinition -ResourceId $AccountId -ErrorAction Stop) }
+    catch { return $Result }  # metrics not authorized / not available -> absent, not failed
+
+    # Discover token metrics by NAME rather than assuming a fixed set. Azure OpenAI exposes
+    # ProcessedPromptTokens/GeneratedTokens; newer AIServices adds InputTokens/OutputTokens/
+    # TotalTokens - all dimensioned by ModelDeploymentName (the design spec section 6.1).
+    $NameOf = { param($d) if ($d.Name.Value) { $d.Name.Value } else { "$($d.Name)" } }
+    $HasMetric = { param($n) @($Defs | Where-Object { (& $NameOf $_) -eq $n }).Count -gt 0 }
+
+    $InputMetric = @('InputTokens', 'ProcessedPromptTokens') | Where-Object { & $HasMetric $_ } | Select-Object -First 1
+    $OutputMetric = @('OutputTokens', 'GeneratedTokens') | Where-Object { & $HasMetric $_ } | Select-Object -First 1
+    $TotalMetric = @('TotalTokens') | Where-Object { & $HasMetric $_ } | Select-Object -First 1
+
+    if (-not $InputMetric -and -not $OutputMetric -and -not $TotalMetric) { return $Result }
+
+    $DimFilter = ("ModelDeploymentName eq '{0}'" -f $DeploymentName)
+    $Sum = {
+        param($MetricName)
+        if ([string]::IsNullOrEmpty($MetricName)) { return $null }
+        try
+        {
+            $M = Get-AzMetric -ResourceId $AccountId -MetricName $MetricName -AggregationType Total -StartTime $StartTime -EndTime $EndTime -TimeGrain '1.00:00:00' -MetricFilter $DimFilter -WarningAction SilentlyContinue -ErrorAction Stop
+            $Total = 0.0
+            foreach ($Series in @($M.Data)) { foreach ($Pt in @($Series.Data)) { if ($null -ne $Pt.Total) { $Total += [double]$Pt.Total } } }
+            return $Total
+        }
+        catch { return $null }
+    }
+
+    $In = & $Sum $InputMetric
+    $Out = & $Sum $OutputMetric
+    $Tot = & $Sum $TotalMetric
+
+    if ($null -ne $In -or $null -ne $Out -or $null -ne $Tot)
+    {
+        $Result.Present = $true
+        if ($null -ne $In) { $Result.InputTokens = $In }
+        if ($null -ne $Out) { $Result.OutputTokens = $Out }
+        if ($null -ne $Tot) { $Result.TotalTokens = $Tot }
+    }
+
+    return $Result
+}
 
 function Global:Resolve-ObfuscationToken
 {
