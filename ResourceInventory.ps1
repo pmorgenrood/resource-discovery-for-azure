@@ -1203,7 +1203,7 @@ function ExecuteInventoryProcessing()
         $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Version' -Value NotSet
         $Global:SmaResources.Version = $Global:Version
 
-        $Global:SmaResources | ConvertTo-Json -depth 100 -compress | Out-File $Global:JsonFile
+        Write-InventoryJson -InputObject $Global:SmaResources -Path $Global:JsonFile
 
         Write-Log -Message ('Resource Reporting Phase Done.') -Severity 'Info'
     }
