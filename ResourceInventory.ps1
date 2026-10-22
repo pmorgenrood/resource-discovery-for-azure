@@ -46,6 +46,10 @@ function Variables
 {
     $Global:ResourceContainers = @()
     $Global:Resources = @()
+    # Discovered resource count for this run. $Global:Resources is released once the inventory
+    # is written, so callers read this instead; reset here so an early exit never reports the
+    # previous run's count.
+    $Global:ResourceCount = 0
     $Global:Subscriptions = ''
     $Global:ReportName = $ReportName
     $Global:Version = GetLocalVersion
@@ -683,6 +687,8 @@ Function RunInventorySetup()
     GetSubscriptionsData
     ResourceInventoryLoop
     ResourceInventoryAvd
+
+    $Global:ResourceCount = @($Global:Resources).Count
 
     if ($Obfuscate.IsPresent)
     {
@@ -1466,6 +1472,14 @@ function ExecuteInventoryProcessing()
 
     ProcessMetricsResult
     ProcessResourceResult
+
+    # Nothing reads the collector output or the discovery rows after the inventory is written, and
+    # on a large estate the report step needs that memory. The count stays in $Global:ResourceCount.
+    $Global:SmaResources = $null
+    $Global:Resources = $null
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
+    [System.GC]::Collect()
 
     if (!$SkipMetrics.IsPresent)
     {
