@@ -114,6 +114,47 @@ if (-not (Get-Command -Name 'Build-ObfuscatedResourceUri' -ErrorAction SilentlyC
     }
 }
 
+# Definitions of one resource that share a time window, time grain and aggregation
+# can be fetched with one Get-AzMetric call, since -MetricName takes several names.
+# -AggregationType takes a single value, so different aggregations stay separate
+# calls. Time grains are compared as TimeSpan, so '1:00:00' and '01:00:00' match.
+function Get-MetricGroupKey
+{
+    param($Def)
+
+    $Grain = [timespan]::Zero
+    $GrainKey = if ([timespan]::TryParse([string]$Def.Interval, [cultureinfo]::InvariantCulture, [ref]$Grain)) { $Grain.Ticks } else { [string]$Def.Interval }
+    return ('{0}|{1}|{2}|{3}' -f ([datetime]$Def.StartTime).Ticks, ([datetime]$Def.EndTime).Ticks, $GrainKey, $Def.Aggregation)
+}
+
+# Returns a list of groups; each group is an array of definitions, in their original
+# order, that can share one Get-AzMetric call. A resource's definitions are added
+# consecutively, so grouping only looks within a run of definitions that share the
+# same resource Id.
+function Group-MetricDefinition
+{
+    param($MetricDefs)
+
+    $MetricGroups = [System.Collections.Generic.List[object]]::new()
+    $ResourceGroups = [ordered]@{}
+    $GroupResourceId = $null
+    foreach ($Def in $MetricDefs)
+    {
+        if (-not [string]::Equals([string]$Def.Id, $GroupResourceId, [System.StringComparison]::Ordinal))
+        {
+            foreach ($Members in $ResourceGroups.Values) { $MetricGroups.Add($Members.ToArray()) }
+            $ResourceGroups.Clear()
+            $GroupResourceId = [string]$Def.Id
+        }
+        $GroupKey = Get-MetricGroupKey -Def $Def
+        if (-not $ResourceGroups.Contains($GroupKey)) { $ResourceGroups[$GroupKey] = [System.Collections.Generic.List[object]]::new() }
+        $ResourceGroups[$GroupKey].Add($Def)
+    }
+    foreach ($Members in $ResourceGroups.Values) { $MetricGroups.Add($Members.ToArray()) }
+
+    Write-Output -NoEnumerate -InputObject $MetricGroups
+}
+
 if ($Task -eq 'Processing')
 {
     function Write-MetricsDiag([string]$Line)
@@ -414,6 +455,10 @@ if ($Task -eq 'Processing')
 
 
     $MetricDiagnostics = [System.Collections.Concurrent.ConcurrentBag[psobject]]::new()
+    # One entry per Get-AzMetric request ('Request' or 'Fallback'), for the call count in the summary.
+    $MetricCallLog = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+    $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
 
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays))
@@ -421,245 +466,335 @@ if ($Task -eq 'Processing')
     $RangeBatch = [math]::Min($MetricCount , 250)
     $RangeIdx = 1
     $MetricsProcessed = 0
-    $Defs = [System.Collections.Generic.List[object]]::new()
+    $BatchGroups = [System.Collections.Generic.List[object]]::new()
+    $BatchDefCount = 0
 
-    for ($i = 0; $i -lt $MetricCount; $i++)
+    # A batch is made of whole groups, so one call's metrics never land in different
+    # Metrics_*.json files. A batch closes before a group that would take it past
+    # $RangeBatch definitions; a group larger than that forms a batch of its own.
+    for ($i = 0; $i -lt $MetricGroups.Count; $i++)
     {
-        $Defs.Add($MetricDefs[$i])
-        $MetricsProcessed++
+        $BatchGroups.Add($MetricGroups[$i])
+        $BatchDefCount += $MetricGroups[$i].Count
+        $MetricsProcessed += $MetricGroups[$i].Count
 
-        if ($Defs.Count -ge $RangeBatch -or $MetricsProcessed -ge $MetricCount)
+        $IsLastGroup = ($i + 1) -ge $MetricGroups.Count
+        if ($IsLastGroup -or ($BatchDefCount + $MetricGroups[$i + 1].Count) -gt $RangeBatch)
         {
             $BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-            Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} call(s))" -f $RangeIdx, $Defs.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
-            Write-Verbose ("[Metrics] Batch {0}: dispatching {1} metric call(s) (processed {2}/{3})." -f $RangeIdx, $Defs.Count, $MetricsProcessed, $MetricCount)
+            Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} call(s))" -f $RangeIdx, $BatchGroups.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
+            Write-Verbose ("[Metrics] Batch {0}: dispatching {1} metric call(s) (processed {2}/{3})." -f $RangeIdx, $BatchGroups.Count, $MetricsProcessed, $MetricCount)
 
-            $Defs | ForEach-Object -Parallel {
+            # Each parallel item is one group of definitions.
+            $BatchGroups | ForEach-Object -Parallel {
                 $AzContext = $using:MetricAzContext
                 $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                 $CallMaxRetries = $using:MetricMaxRetries
                 $DiagBag = $using:MetricDiagnostics
+                $MetricBag = ($using:Tmp).Metrics
+                $CallLog = $using:MetricCallLog
 
-                $MetricError = $false
-                $MetricName = $_.MetricName
-                $MetricService = $_.Service
-
-                $CallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $CallOutcome = 'Success'
-                $CallAttempts = 0
-                $CallErrorMsg = $null
-
-                $MetricArgs = @{
-                    ResourceId      = $_.Id
-                    MetricName      = $_.MetricName
-                    StartTime       = $_.StartTime
-                    EndTime         = $_.EndTime
-                    TimeGrain       = $_.Interval
-                    AggregationType = $_.Aggregation
-                    ErrorAction     = 'Stop'
-                    WarningAction   = 'SilentlyContinue'
-                }
-                if ($null -ne $AzContext)
+                # One Get-AzMetric request with the per-call timeout and retry/backoff.
+                # Returns the outcome rather than throwing, so the caller decides how a
+                # failure is recorded for each definition.
+                function Invoke-MetricRequest
                 {
-                    $MetricArgs['DefaultProfile'] = $AzContext
-                }
+                    param($Def, $MetricNames, [string]$Kind)
 
-                try
-                {
-                    $Attempt = 0
-                    $Succeeded = $false
-                    $LastError = $null
-                    $MetricQuery = $null
+                    $CallLog.Add($Kind)
+                    $CallOutcome = 'Success'
+                    $CallAttempts = 0
+                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null }
 
-                    while (-not $Succeeded -and $Attempt -le $CallMaxRetries)
+                    $MetricArgs = @{
+                        ResourceId      = $Def.Id
+                        MetricName      = $MetricNames
+                        StartTime       = $Def.StartTime
+                        EndTime         = $Def.EndTime
+                        TimeGrain       = $Def.Interval
+                        AggregationType = $Def.Aggregation
+                        ErrorAction     = 'Stop'
+                        WarningAction   = 'SilentlyContinue'
+                    }
+                    if ($null -ne $AzContext)
                     {
-                        $CallAttempts = $Attempt + 1
-                        $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                        $TimedOut = $false
-                        $Throttled = $false
+                        $MetricArgs['DefaultProfile'] = $AzContext
+                    }
 
-                        $Job = Start-ThreadJob -ScriptBlock {
-                            param($mArgs)
-                            Get-AzMetric @mArgs
-                        } -ArgumentList $MetricArgs
+                    try
+                    {
+                        $Attempt = 0
+                        $Succeeded = $false
+                        $LastError = $null
+                        $MetricQuery = $null
 
-                        if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
+                        while (-not $Succeeded -and $Attempt -le $CallMaxRetries)
                         {
-                            try
+                            $CallAttempts = $Attempt + 1
+                            $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                            $TimedOut = $false
+                            $Throttled = $false
+
+                            $Job = Start-ThreadJob -ScriptBlock {
+                                param($mArgs)
+                                Get-AzMetric @mArgs
+                            } -ArgumentList $MetricArgs
+
+                            if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                             {
-                                $MetricQuery = Receive-Job -Job $Job -ErrorAction Stop
-                                $Succeeded = $true
-                            }
-                            catch
-                            {
-                                $LastError = $_.Exception.Message
-                                if ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                try
                                 {
-                                    $Throttled = $true
+                                    $MetricQuery = Receive-Job -Job $Job -ErrorAction Stop
+                                    $Succeeded = $true
+                                }
+                                catch
+                                {
+                                    $LastError = $_.Exception.Message
+                                    if ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    {
+                                        $Throttled = $true
+                                    }
+                                }
+                                finally
+                                {
+                                    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                                 }
                             }
-                            finally
+                            else
                             {
+                                # Timed out: stop the hung job and treat as a failed attempt.
+                                $TimedOut = $true
+                                $LastError = ("Timed out after {0}s" -f $CallTimeoutSeconds)
+                                Stop-Job -Job $Job -ErrorAction SilentlyContinue
                                 Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                             }
+
+                            $AttemptStopwatch.Stop()
+
+                            if ($Succeeded)
+                            {
+                                break
+                            }
+
+
+                            if ($Attempt -lt $CallMaxRetries)
+                            {
+                                $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                                if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, 60) }
+                                $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
+                                $SleepSeconds = [math]::Round($Backoff + $Jitter, 2)
+                                Start-Sleep -Seconds $SleepSeconds
+                            }
+                            else
+                            {
+                                $CallOutcome = if ($TimedOut) { 'Timeout' } elseif ($Throttled) { 'Throttled' } else { 'Error' }
+                            }
+
+                            $Attempt++
+                        }
+
+                        if (-not $Succeeded)
+                        {
+                            throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
+                        }
+
+                        $Request.Succeeded = $true
+                        $Request.Query = $MetricQuery
+                    }
+                    catch
+                    {
+                        if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
+                        $Request.ErrorMessage = $_.Exception.Message
+                    }
+
+                    $Request.Outcome = $CallOutcome
+                    $Request.Attempts = $CallAttempts
+                    return $Request
+                }
+
+                # Adds the result record and the diagnostics record for one definition.
+                # $MetricQuery is the response for this metric alone, whether it was
+                # requested on its own or together with other metrics of the resource.
+                function Add-MetricRecord
+                {
+                    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
+
+                    $MetricError = $false
+                    $CallOutcome = $Request.Outcome
+                    $CallErrorMsg = $null
+                    $MetricTimeSeries = $null
+
+                    try
+                    {
+                        if (-not $Request.Succeeded)
+                        {
+                            throw $Request.ErrorMessage
+                        }
+
+                        $MetricTotalCount = @($MetricQuery.Data).Count
+
+                        $MetricQueryResults = 0
+                        $MetricTimeSeries = 0
+
+                        switch ($Def.Aggregation)
+                        {
+                            'Average'
+                            {
+                                $MetricQueryResults = $MetricQuery.Data.Average
+                            }
+                            'Maximum'
+                            {
+                                $MetricQueryResults = $MetricQuery.Data.Maximum
+                            }
+                            'Count'
+                            {
+                                $MetricQueryResults = $MetricQuery.Data.Count
+                            }
+                            'Total'
+                            {
+                                $MetricQueryResults = $MetricQuery.Data.Total
+                            }
+                            'Minimum'
+                            {
+                                $MetricQueryResults = $MetricQuery.Data.Minimum
+                            }
+                        }
+
+                        $MetricQueryResultsCount = ($MetricQueryResults.Where({ $_ -ne $null }).Count)
+
+                        if ($MetricQueryResultsCount -eq 0)
+                        {
+                            $MetricQueryResults = 0
+                            $MetricQueryResultsCount = 0
+                            $MetricPercentileIndex = 0
+                            $MetricPercentile = 0
                         }
                         else
                         {
-                            # Timed out: stop the hung job and treat as a failed attempt.
-                            $TimedOut = $true
-                            $LastError = ("Timed out after {0}s" -f $CallTimeoutSeconds)
-                            Stop-Job -Job $Job -ErrorAction SilentlyContinue
-                            Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
-                        }
+                            $MetricQueryResultsSorted = $MetricQueryResults | Sort-Object
+                            $MetricPercentileIndex = [math]::Ceiling(0.95 * $MetricQueryResultsSorted.Count) - 1
+                            $MetricPercentile = $MetricQueryResultsSorted[$MetricPercentileIndex]
 
-                        $AttemptStopwatch.Stop()
+                            if ($Def.Series -eq 'true')
+                            {
+                                $MetricTimeSeries = $MetricQueryResults.Where({ $_ -ne $null })
+                            }
 
-                        if ($Succeeded)
-                        {
-                            break
-                        }
-
-
-                        if ($Attempt -lt $CallMaxRetries)
-                        {
-                            $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-                            if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, 60) }
-                            $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-                            $SleepSeconds = [math]::Round($Backoff + $Jitter, 2)
-                            Start-Sleep -Seconds $SleepSeconds
-                        }
-                        else
-                        {
-                            $CallOutcome = if ($TimedOut) { 'Timeout' } elseif ($Throttled) { 'Throttled' } else { 'Error' }
-                        }
-
-                        $Attempt++
-                    }
-
-                    if (-not $Succeeded)
-                    {
-                        throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
-                    }
-
-                    $MetricTotalCount = @($MetricQuery.Data).Count
-
-                    $MetricQueryResults = 0
-                    $MetricTimeSeries = 0
-
-                    switch ($_.Aggregation)
-                    {
-                        'Average'
-                        {
-                            $MetricQueryResults = $MetricQuery.Data.Average
-                        }
-                        'Maximum'
-                        {
-                            $MetricQueryResults = $MetricQuery.Data.Maximum
-                        }
-                        'Count'
-                        {
-                            $MetricQueryResults = $MetricQuery.Data.Count
-                        }
-                        'Total'
-                        {
-                            $MetricQueryResults = $MetricQuery.Data.Total
-                        }
-                        'Minimum'
-                        {
-                            $MetricQueryResults = $MetricQuery.Data.Minimum
+                            switch ($Def.Measure)
+                            {
+                                'Average' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Average).Average }
+                                'Maximum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Maximum).Maximum }
+                                'Sum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Sum).Sum }
+                                'Minimum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Minimum).Minimum }
+                                'Largest' { $MetricQueryResults = ($MetricQueryResults | Sort-Object -Descending)[0] }
+                            }
                         }
                     }
-
-                    $MetricQueryResultsCount = ($MetricQueryResults.Where({ $_ -ne $null }).Count)
-
-                    if ($MetricQueryResultsCount -eq 0)
+                    catch
                     {
                         $MetricQueryResults = 0
                         $MetricQueryResultsCount = 0
+                        $MetricTotalCount = 0
                         $MetricPercentileIndex = 0
                         $MetricPercentile = 0
-                    }
-                    else
-                    {
-                        $MetricQueryResultsSorted = $MetricQueryResults | Sort-Object
-                        $MetricPercentileIndex = [math]::Ceiling(0.95 * $MetricQueryResultsSorted.Count) - 1
-                        $MetricPercentile = $MetricQueryResultsSorted[$MetricPercentileIndex]
 
-                        if ($_.Series -eq 'true')
-                        {
-                            $MetricTimeSeries = $MetricQueryResults.Where({ $_ -ne $null })
-                        }
-
-                        switch ($_.Measure)
-                        {
-                            'Average' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Average).Average }
-                            'Maximum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Maximum).Maximum }
-                            'Sum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Sum).Sum }
-                            'Minimum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Minimum).Minimum }
-                            'Largest' { $MetricQueryResults = ($MetricQueryResults | Sort-Object -Descending)[0] }
-                        }
+                        $MetricError = $true
+                        if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
+                        $CallErrorMsg = $_.Exception.Message
                     }
+
+                    $DiagBag.Add([PSCustomObject]@{
+                            MetricIndex = $Def.MetricIndex
+                            Service     = $Def.Service
+                            Name        = $Def.Name
+                            Metric      = $Def.MetricName
+                            Interval    = $Def.Interval
+                            Outcome     = $CallOutcome
+                            Attempts    = $Request.Attempts
+                            ElapsedSec  = [math]::Round($ExtraSeconds + $CallStopwatch.Elapsed.TotalSeconds, 2)
+                            Error       = $CallErrorMsg
+                        })
+
+
+                    $Obj = @{
+                        'ID'                   = $Def.Id;
+                        'Subscription'         = $Def.SubName;
+                        'ResourceGroup'        = $Def.ResourceGroup;
+                        'Name'                 = $Def.Name;
+                        'Location'             = $Def.Location;
+                        'Service'              = $Def.Service;
+                        'Metric'               = $Def.MetricName;
+                        'MetricAggregate'      = $Def.Aggregation;
+                        'MetricTimeGrain'      = $Def.Interval;
+                        'MetricMeasure'        = $Def.Measure;
+                        'MetricPercentile'     = $MetricPercentile;
+                        'MetricValue'          = $MetricQueryResults;
+                        'MetricCount'          = $MetricQueryResultsCount;
+                        'MetricTotalCount'     = $MetricTotalCount;
+                        'MetricSeries'         = $MetricTimeSeries;
+                        'MetricError'          = $MetricError;
+                    }
+
+                    $MetricBag.Add($Obj)
                 }
-                catch
+
+                $GroupDefs = @($_)
+                $CallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+                if ($GroupDefs.Count -eq 1)
                 {
-                    $MetricQueryResults = 0
-                    $MetricQueryResultsCount = 0
-                    $MetricTotalCount = 0
-                    $MetricPercentileIndex = 0
-                    $MetricPercentile = 0
+                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $GroupDefs[0].MetricName -Kind 'Request'
+                    Add-MetricRecord -Def $GroupDefs[0] -Request $Request -MetricQuery $Request.Query -CallStopwatch $CallStopwatch
+                }
+                else
+                {
+                    $MetricNames = [string[]]@($GroupDefs | ForEach-Object { [string]$_.MetricName } | Select-Object -Unique)
+                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $MetricNames -Kind 'Request'
 
-                    $MetricError = $true
-                    if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
-                    $CallErrorMsg = $_.Exception.Message
+                    # Index the response by metric name so each definition gets its own metric.
+                    $ReturnedMetrics = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    if ($Request.Succeeded)
+                    {
+                        foreach ($ReturnedMetric in $Request.Query)
+                        {
+                            $ReturnedName = [string]$ReturnedMetric.Name.Value
+                            if (-not [string]::IsNullOrEmpty($ReturnedName) -and -not $ReturnedMetrics.ContainsKey($ReturnedName))
+                            {
+                                $ReturnedMetrics[$ReturnedName] = $ReturnedMetric
+                            }
+                        }
+                    }
+                    $GroupSeconds = $CallStopwatch.Elapsed.TotalSeconds
+
+                    foreach ($Def in $GroupDefs)
+                    {
+                        if ($Request.Succeeded -and $ReturnedMetrics.ContainsKey([string]$Def.MetricName))
+                        {
+                            Add-MetricRecord -Def $Def -Request $Request -MetricQuery $ReturnedMetrics[[string]$Def.MetricName] -CallStopwatch $CallStopwatch
+                        }
+                        else
+                        {
+                            # One invalid metric name makes Azure reject the whole request, so
+                            # a failed group falls back to one request per metric and only a
+                            # metric that also fails on its own is marked as an error. A metric
+                            # missing from a successful response is requested on its own too.
+                            # Its elapsed time includes the failed group request.
+                            $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                            $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
+                            Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds
+                        }
+                    }
                 }
 
-                $CallStopwatch.Stop()
-                $DiagBag.Add([PSCustomObject]@{
-                        MetricIndex = $_.MetricIndex
-                        Service     = $MetricService
-                        Name        = $_.Name
-                        Metric      = $MetricName
-                        Interval    = $_.Interval
-                        Outcome     = $CallOutcome
-                        Attempts    = $CallAttempts
-                        ElapsedSec  = [math]::Round($CallStopwatch.Elapsed.TotalSeconds, 2)
-                        Error       = $CallErrorMsg
-                    })
-
-
-                $Obj = @{
-                    'ID'                   = $_.Id;
-                    'Subscription'         = $_.SubName;
-                    'ResourceGroup'        = $_.ResourceGroup;
-                    'Name'                 = $_.Name;
-                    'Location'             = $_.Location;
-                    'Service'              = $_.Service;
-                    'Metric'               = $_.MetricName;
-                    'MetricAggregate'      = $_.Aggregation;
-                    'MetricTimeGrain'      = $_.Interval;
-                    'MetricMeasure'        = $_.Measure;
-                    'MetricPercentile'     = $MetricPercentile;
-                    'MetricValue'          = $MetricQueryResults;
-                    'MetricCount'          = $MetricQueryResultsCount;
-                    'MetricTotalCount'     = $MetricTotalCount;
-                    'MetricSeries'         = $MetricTimeSeries;
-                    'MetricError'          = $MetricError;
-                }
-
-                ($using:Tmp).Metrics.Add($Obj)
-
-                $MetricQuery = $null
-                $MetricQueryResults = $null
-                $MetricQueryResultsCount = $null
-                $MetricTotalCount = $null
-                $MetricTimeSeries = $null
-                $MetricQueryResultsSorted = $null
-                $MetricPercentile = $null;
+                $Request = $null
+                $ReturnedMetrics = $null
+                $SingleRequest = $null
 
             } -ThrottleLimit $ConcurrencyLimit
 
-            $Defs.Clear()
+            $BatchGroups.Clear()
+            $BatchDefCount = 0
 
             $BatchStopwatch.Stop()
             Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} call record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $MetricDiagnostics.Count)
@@ -722,6 +857,8 @@ if ($Task -eq 'Processing')
 
     Write-MetricsDiag ("===== Metrics phase summary =====")
     Write-MetricsDiag ("Total calls: {0} | Success: {1} | Timeout: {2} | Throttled: {3} | Error: {4} | Elapsed: {5}s" -f $DiagRecords.Count, $OkCount, $TimeoutCount, $ThrottledCount, $ErrorCount, [math]::Round($PhaseStopwatch.Elapsed.TotalSeconds, 1))
+    $CallRecords = @($MetricCallLog)
+    Write-MetricsDiag ("Azure Monitor requests: {0} for {1} metric definition(s), of which {2} single-metric fallback request(s); retries not counted" -f $CallRecords.Count, $MetricCount, @($CallRecords | Where-Object { $_ -eq 'Fallback' }).Count)
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
@@ -745,4 +882,5 @@ if ($Task -eq 'Processing')
     $WarningPreference = "Continue"
 
     $MetricDefs = $null;
+    $MetricGroups = $null
 }
