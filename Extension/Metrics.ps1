@@ -470,16 +470,16 @@ if ($Task -eq 'Processing')
     $BatchDefCount = 0
 
     # A batch is made of whole groups, so one call's metrics never land in different
-    # Metrics_*.json files. A batch closes before a group that would take it past
-    # $RangeBatch definitions; a group larger than that forms a batch of its own.
+    # Metrics_*.json files. A batch closes once it holds at least $RangeBatch
+    # definitions, so it can exceed that by less than one group and there are never
+    # more batches than with one definition at a time.
     for ($i = 0; $i -lt $MetricGroups.Count; $i++)
     {
         $BatchGroups.Add($MetricGroups[$i])
         $BatchDefCount += $MetricGroups[$i].Count
         $MetricsProcessed += $MetricGroups[$i].Count
 
-        $IsLastGroup = ($i + 1) -ge $MetricGroups.Count
-        if ($IsLastGroup -or ($BatchDefCount + $MetricGroups[$i + 1].Count) -gt $RangeBatch)
+        if ($BatchDefCount -ge $RangeBatch -or ($i + 1) -ge $MetricGroups.Count)
         {
             $BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -495,12 +495,56 @@ if ($Task -eq 'Processing')
                 $MetricBag = ($using:Tmp).Metrics
                 $CallLog = $using:MetricCallLog
 
+                # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
+                # metric name is not valid for the resource. The status code is read from the
+                # exception or one it wraps when available, otherwise the message is used.
+                function Test-MetricBadRequest
+                {
+                    param([System.Exception]$Exception)
+
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    $Messages = [System.Collections.Generic.List[string]]::new()
+                    $Checked = 0
+                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Checked++
+
+                        $StatusCode = $null
+                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.Response.StatusCode
+                        }
+                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.StatusCode
+                        }
+                        if ($null -ne $StatusCode)
+                        {
+                            return ("$StatusCode" -in @('400', 'BadRequest'))
+                        }
+
+                        $Messages.Add([string]$Ex.Message)
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+
+                    return (@($Messages | Where-Object { $_ -match 'BadRequest' }).Count -gt 0)
+                }
+
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
-                # failure is recorded for each definition.
+                # failure is recorded for each definition. With -StopOnBadRequest a
+                # BadRequest answer ends the request at once: the same name set is
+                # rejected the same way on every retry.
                 function Invoke-MetricRequest
                 {
-                    param($Def, $MetricNames, [string]$Kind)
+                    param($Def, $MetricNames, [string]$Kind, [switch]$StopOnBadRequest)
 
                     $CallLog.Add($Kind)
                     $CallOutcome = 'Success'
@@ -535,6 +579,7 @@ if ($Task -eq 'Processing')
                             $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $TimedOut = $false
                             $Throttled = $false
+                            $BadRequest = $false
 
                             $Job = Start-ThreadJob -ScriptBlock {
                                 param($mArgs)
@@ -554,6 +599,10 @@ if ($Task -eq 'Processing')
                                     if ($LastError -match '429|throttl|TooManyRequests|rate limit')
                                     {
                                         $Throttled = $true
+                                    }
+                                    elseif ($StopOnBadRequest)
+                                    {
+                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
                                     }
                                 }
                                 finally
@@ -577,6 +626,11 @@ if ($Task -eq 'Processing')
                                 break
                             }
 
+                            if ($BadRequest)
+                            {
+                                $CallOutcome = 'Error'
+                                break
+                            }
 
                             if ($Attempt -lt $CallMaxRetries)
                             {
@@ -750,7 +804,7 @@ if ($Task -eq 'Processing')
                 else
                 {
                     $MetricNames = [string[]]@($GroupDefs | ForEach-Object { [string]$_.MetricName } | Select-Object -Unique)
-                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $MetricNames -Kind 'Request'
+                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $MetricNames -Kind 'Request' -StopOnBadRequest
 
                     # Index the response by metric name so each definition gets its own metric.
                     $ReturnedMetrics = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -775,11 +829,12 @@ if ($Task -eq 'Processing')
                         }
                         else
                         {
-                            # One invalid metric name makes Azure reject the whole request, so
-                            # a failed group falls back to one request per metric and only a
-                            # metric that also fails on its own is marked as an error. A metric
-                            # missing from a successful response is requested on its own too.
-                            # Its elapsed time includes the failed group request.
+                            # One invalid metric name makes Azure reject the whole request with
+                            # BadRequest, so a rejected group is not retried and falls back to one
+                            # request per metric; only a metric that also fails on its own is
+                            # marked as an error. A group that fails for another reason falls back
+                            # after its retries. A metric missing from a successful response is
+                            # requested on its own too. Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
                             Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds

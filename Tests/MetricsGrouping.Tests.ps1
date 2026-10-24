@@ -6,9 +6,10 @@
 #   - definitions of one resource that share a time window, time grain and
 #     aggregation are fetched with one Get-AzMetric call;
 #   - the result records are the same as with one call per metric;
-#   - a group that Azure rejects falls back to one call per metric, so only the
-#     invalid metric is marked as an error;
-#   - a batch written to Metrics_*.json never splits one call's metrics.
+#   - a group that Azure rejects with BadRequest is not retried and falls back to
+#     one call per metric, so only the invalid metric is marked as an error;
+#   - a batch written to Metrics_*.json never splits one call's metrics, and
+#     there are no more batches than with one definition at a time.
 #
 # Get-AzMetric runs inside ForEach-Object -Parallel and Start-ThreadJob
 # runspaces, which Pester mocks do not reach. The tests therefore put a stand-in
@@ -78,9 +79,12 @@ function Get-AzMetric
             throw "Operation returned an invalid status code 'BadRequest'"
         }
     }
-    if ($env:RDA_TEST_METRIC_REJECT_MULTI -eq '1' -and $Names.Count -gt 1)
+    # RDA_TEST_METRIC_MULTI_ERROR makes every multi-name request fail in a chosen way.
+    switch ($(if ($Names.Count -gt 1) { $env:RDA_TEST_METRIC_MULTI_ERROR } else { '' }))
     {
-        throw "Operation returned an invalid status code 'BadRequest'"
+        'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
+        'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
+        'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -145,7 +149,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [switch]$RejectMulti)
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '')
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -154,7 +158,7 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_CALL_DIR = $CallDir
         $env:RDA_TEST_METRIC_INVALID = $Invalid
         $env:RDA_TEST_METRIC_OMIT = $Omit
-        $env:RDA_TEST_METRIC_REJECT_MULTI = if ($RejectMulti) { '1' } else { '0' }
+        $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
         try
@@ -197,7 +201,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_REJECT_MULTI' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -299,7 +303,7 @@ Describe 'Metrics.ps1 result records' {
 
         $Grouped = Invoke-MetricsRun -Resources $Resources -RunName 'mixed-grouped'
         # Rejecting every multi-name request makes each metric come from a call of its own.
-        $Single = Invoke-MetricsRun -Resources $Resources -RunName 'mixed-single' -RejectMulti
+        $Single = Invoke-MetricsRun -Resources $Resources -RunName 'mixed-single' -MultiError 'BadRequest'
 
         # 2 VM + 8 disk + 8 DTU + 8 vCore + 2 function + 3 PostgreSQL + 2 scale set + 4 Cosmos DB + 1 registry
         $Grouped.Records.Count | Should -Be 38
@@ -347,13 +351,40 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         @($script:Rejected.DebugLines | Where-Object { $_ -match 'Composite Disk Write Bytes/sec' -and $_ -match 'BadRequest' }).Count | Should -BeGreaterThan 0
     }
 
-    It 'requests each metric of the rejected group on its own' {
+    It 'does not retry a grouped request rejected with BadRequest and requests each metric on its own' {
         $Single = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 1 })
         $Grouped = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 4 })
-        # The grouped request and the invalid metric's own request each use the full retry ladder (4 attempts).
-        $Grouped.Count | Should -Be 4
+        $Grouped.Count | Should -Be 1
+        # A single-metric request keeps the full retry ladder (4 attempts), BadRequest included.
         @($Single | Where-Object { $_.MetricName -eq 'Composite Disk Write Bytes/sec' }).Count | Should -Be 4
         @($Single | Where-Object { $_.MetricName -ne 'Composite Disk Write Bytes/sec' }).Count | Should -Be 3
+    }
+
+    It 'recognises BadRequest from the status code when the message does not name it' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-status400' -MultiError 'Status400'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        @($RunMap.Keys | Sort-Object) | Should -Be @($CleanMap.Keys | Sort-Object)
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
+    }
+
+    It 'retries a grouped request that fails for another reason before falling back' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-server-error' -MultiError 'ServerError'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
     }
 
     It 'reports the number of Azure Monitor requests in the diagnostics summary' {
@@ -378,16 +409,19 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
 
 Describe 'Metrics.ps1 batches' {
 
-    It "never splits one call's metrics across Metrics_*.json files" {
-        # 63 disks x 4 metrics = 252 definitions, more than one 250-definition batch.
-        $Disks = @(1..63 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+    It "never splits one call's metrics across Metrics_*.json files and writes no more files than before" {
+        # 125 disks x 4 metrics = 500 definitions: two 250-definition batches when
+        # definitions are batched one at a time, which splits disk 63 across them.
+        $Disks = @(1..125 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
         $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batches'
 
-        $Run.Records.Count | Should -Be 252
-        $Run.Files.Count | Should -BeGreaterThan 1
-        foreach ($File in $Run.Files)
+        $Run.Records.Count | Should -Be 500
+        $Run.Files.Count | Should -Be 2
+        # Every batch but the last holds at least 250 definitions and less than one group more.
+        for ($F = 0; $F -lt $Run.Files.Count - 1; $F++)
         {
-            $File.Records.Count | Should -BeLessOrEqual 250
+            $Run.Files[$F].Records.Count | Should -BeGreaterOrEqual 250
+            $Run.Files[$F].Records.Count | Should -BeLessThan 254
         }
 
         $FilesPerResource = @{}
@@ -399,8 +433,8 @@ Describe 'Metrics.ps1 batches' {
                 [void]$FilesPerResource[$Record.ID].Add($File.Name)
             }
         }
-        $FilesPerResource.Count | Should -Be 63
+        $FilesPerResource.Count | Should -Be 125
         @($FilesPerResource.Keys | Where-Object { $FilesPerResource[$_].Count -ne 1 }) | Should -BeNullOrEmpty
-        $Run.Calls.Count | Should -Be 63
+        $Run.Calls.Count | Should -Be 125
     }
 }
