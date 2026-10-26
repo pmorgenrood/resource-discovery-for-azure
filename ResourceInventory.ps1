@@ -1820,7 +1820,7 @@ else
 
 try
 {
-    Compress-Archive @CompressionOutput
+    Compress-RdaReportArchive @CompressionOutput
 }
 catch
 {
