@@ -127,7 +127,9 @@ if ($Task -eq 'Processing')
         $MetricTotalCount = $DataPoints.Count
 
         $Agg = ([string]$Def.Aggregation).ToLowerInvariant()
-        $MetricQueryResults = @($DataPoints | ForEach-Object { $_.$Agg })
+        # Read through the point's own properties: a point without the field would otherwise read
+        # 'count' as PowerShell's intrinsic Count of a single object, which is 1.
+        $MetricQueryResults = @($DataPoints | ForEach-Object { $_.PSObject.Properties[$Agg].Value })
         $MetricQueryResultsCount = ($MetricQueryResults.Where({ $null -ne $_ }).Count)
         $MetricPercentile = 0
         $MetricTimeSeries = 0
