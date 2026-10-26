@@ -10,7 +10,9 @@
 #     as for the other aggregations, and a point without a Count property reads
 #     as no value rather than as 1;
 #   - a response with no data points gives 0;
-#   - the Total and Maximum definitions of the same account are unchanged.
+#   - the Total and Maximum definitions of the same account are unchanged;
+#   - the -UseMetricsBatch reader (New-RdaMetricObject) reads a getBatch data
+#     point that has no field for the aggregation as no value, not as 1.
 #
 # Get-AzMetric runs inside ForEach-Object -Parallel and the metric worker pool's
 # runspaces, which Pester mocks do not reach. The tests therefore put a stand-in
@@ -242,5 +244,56 @@ Describe 'Metrics.ps1 Count aggregation' {
 
         @($script:Records | Where-Object { $_.MetricError }).Count | Should -Be 0
         (Get-TestRecord -Records $script:Records -Name 'cosmos-mixed' -Metric 'TotalRequests').MetricValue | Should -Be 7
+    }
+}
+
+Describe 'New-RdaMetricObject reads the aggregation field of each getBatch data point' {
+
+    BeforeAll {
+        # The function lives inside the metrics phase, so it is lifted from the source.
+        $Source = Get-Content -LiteralPath $script:MetricsScript -Raw
+        $Tokens = $null; $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$Tokens, [ref]$Errors)
+        if (@($Errors).Count -gt 0) { throw ('Extension/Metrics.ps1 does not parse: {0}' -f $Errors[0].Message) }
+        $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'New-RdaMetricObject' }, $true) | Select-Object -First 1
+        if (-not $FnAst) { throw 'New-RdaMetricObject was not found in Extension/Metrics.ps1' }
+        . ([scriptblock]::Create($FnAst.Extent.Text))
+
+        $script:CountDef = [PSCustomObject]@{
+            Id = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-batch' -f $script:SubscriptionId
+            MetricName = 'TotalRequests'; Aggregation = 'Count'; Measure = 'Largest'; Interval = '00:01:00'; Series = 'false'
+            SubName = 'test-subscription'; ResourceGroup = 'rg-metrics-test'; Name = 'cosmos-batch'; Location = 'westeurope'; Service = 'CosmosDB'
+        }
+
+        # One getBatch metric result, parsed from JSON as Invoke-RestMethod does.
+        function ConvertTo-TestMetricResult
+        {
+            param([string]$DataJson)
+
+            return ('{{"name":{{"value":"TotalRequests"}},"timeseries":[{{"data":{0}}}]}}' -f $DataJson) | ConvertFrom-Json
+        }
+    }
+
+    It 'reads a data point without a count field as no value, not as 1' {
+        $Result = ConvertTo-TestMetricResult -DataJson '[{"timeStamp":"2026-10-01T00:00:00Z","count":3},{"timeStamp":"2026-10-01T00:01:00Z"},{"timeStamp":"2026-10-01T00:02:00Z","count":0}]'
+
+        $Record = New-RdaMetricObject -Def $script:CountDef -MetricResult $Result
+
+        $Record.MetricCount | Should -Be 2
+        $Record.MetricValue | Should -Be 3
+        $Record.MetricTotalCount | Should -Be 3
+        $Record.MetricPercentile | Should -Be 3
+        $Record.MetricError | Should -BeFalse
+    }
+
+    It 'records 0 when no data point has a count field' {
+        $Result = ConvertTo-TestMetricResult -DataJson '[{"timeStamp":"2026-10-01T00:00:00Z"}]'
+
+        $Record = New-RdaMetricObject -Def $script:CountDef -MetricResult $Result
+
+        $Record.MetricValue | Should -Be 0
+        $Record.MetricCount | Should -Be 0
+        $Record.MetricTotalCount | Should -Be 1
+        $Record.MetricPercentile | Should -Be 0
     }
 }
