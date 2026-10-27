@@ -1837,3 +1837,11 @@ catch
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+
+# A direct run that lost a collector still writes the report and zip, then exits 4.
+# Under -RunAllSubs the wrapper treats any non-zero exit as a failed subscription and
+# reports collector failures through its own exit code, so this is skipped there.
+# The zip check keeps 4 to runs that produced their report: Compress-Archive writes no
+# zip when the HTML report is missing.
+$CollectorFailureCount = @(@($script:CollectorFailuresThisRun) | Where-Object { $null -ne $_ }).Count
+if (-not $RunAllSubs.IsPresent -and $CollectorFailureCount -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile)) { exit 4 }
