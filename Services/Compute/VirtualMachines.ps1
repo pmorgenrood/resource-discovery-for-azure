@@ -30,7 +30,7 @@ If ($Task -eq 'Processing')
 
     if ($VirtualMachines)
     {
-        $Tmp = @()
+        $Tmp = [System.Collections.Generic.List[object]]::new()
 
         foreach ($vm in $VirtualMachines)
         {
@@ -100,7 +100,7 @@ If ($Task -eq 'Processing')
                 'Tags'                          = $Tags;
             }
 
-            $Tmp += $Obj
+            [void]$Tmp.Add($Obj)
         }
 
         $Tmp
