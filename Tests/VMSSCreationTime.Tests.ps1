@@ -12,11 +12,10 @@
 # inventory, not only the one with the missing value.
 #
 # This test invokes the REAL Services/Containers/VMSS.ps1 collector with
-# synthetic scale-set records whose timeCreated is absent, null, or a valid
-# timestamp, plus an empty Flexible scale set, and asserts that CreatedTime
-# falls back to 'Unknown' (the same convention as
-# Services/Compute/VirtualMachines.ps1) while every other column is unchanged.
-# Get-AzComputeResourceSku is mocked, so no live Azure is needed.
+# synthetic scale-set records whose timeCreated is absent, null, present but
+# not a date, or a valid timestamp, plus an empty Flexible scale set, and
+# asserts that CreatedTime falls back to 'Unknown' while every other column is
+# unchanged. Get-AzComputeResourceSku is mocked, so no live Azure is needed.
 
 BeforeAll {
     $script:Collector = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Services', 'Containers', 'VMSS.ps1' | Resolve-Path | Select-Object -ExpandProperty Path
@@ -172,6 +171,28 @@ Describe 'VMSS collector CreatedTime' {
         $Rec = @(Invoke-VmssCollector -Resources @(New-VmssRecord -Name 'vmss-utc' -TimeCreatedMode Value -TimeCreated $Iso))[0]
         $Expected = [System.DateTimeOffset]::Parse($Iso, [System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime.ToString('yyyy-MM-dd HH:mm')
         $Rec.CreatedTime | Should -BeExactly $Expected
+    }
+
+    It "writes 'Unknown' when properties.timeCreated is present but not a date ('<Value>')" -ForEach @(
+        @{ Value = 'not-a-date' }
+        @{ Value = '2024-13-45T99:99:99' }
+        @{ Value = '' }
+    ) {
+        $Rec = @(Invoke-VmssCollector -Resources @(New-VmssRecord -Name 'vmss-invalid' -TimeCreatedMode Value -TimeCreated $Value))[0]
+        $Rec.Name | Should -BeExactly 'vmss-invalid'
+        $Rec.CreatedTime | Should -BeExactly 'Unknown'
+        $Expected = Get-ExpectedColumns -Name 'vmss-invalid'
+        foreach ($Key in $Expected.Keys)
+        {
+            $Rec[$Key] | Should -Be $Expected[$Key] -Because "column '$Key' must not depend on timeCreated"
+        }
+    }
+
+    It 'keeps the other scale sets when one has a timeCreated that is not a date' {
+        $Invalid = New-VmssRecord -Name 'vmss-invalid' -TimeCreatedMode Value -TimeCreated 'not-a-date'
+        $Recs = @(Invoke-VmssCollector -Resources @($script:ValidRec, $Invalid, $script:AbsentRec))
+        ($Recs | ForEach-Object { $_.Name }) | Should -Be @('vmss-valid', 'vmss-invalid', 'vmss-absent')
+        ($Recs | ForEach-Object { $_.CreatedTime }) | Should -Be @('2024-03-15 09:41', 'Unknown', 'Unknown')
     }
 
     It 'emits a record for an empty Flexible scale set with no sku, profile or timeCreated' {
