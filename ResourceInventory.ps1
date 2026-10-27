@@ -1075,11 +1075,15 @@ function ExecuteInventoryProcessing()
                 Write-Log -Message ("FAIL  ({0}/{1}) {2}: {3}" -f $ModuleIndex, $ModuleTotal, $ModName, $_.Exception.Message) -NoConsole -ToDebugLog
 
                 if ($null -eq $Global:CollectorFailures) { $Global:CollectorFailures = @() }
-                $Global:CollectorFailures += [pscustomobject]@{
+                $CollectorFailure = [pscustomobject]@{
                     Id      = $SubscriptionID
                     Module  = $ModName
                     Message = $_.Exception.Message
                 }
+                $Global:CollectorFailures += $CollectorFailure
+                # $Global:CollectorFailures is a running total across every subscription a wrapper run
+                # processes; this list holds only this run's failures, for this run's HTML report.
+                $script:CollectorFailuresThisRun += $CollectorFailure
 
                 Write-Log -Message ("Collector FAILED: {0}: {1}" -f $ModName, $_.Exception.Message) -Severity 'Error'
                 Write-Log -Message ("The rest of the inventory will continue, but the '{0}' resource type is MISSING from this report - not empty because there are none, but because the collector errored. Re-run to retry, or investigate the error above if it repeats." -f $ModName) -Severity 'Error'
@@ -1455,6 +1459,7 @@ function ExecuteInventoryProcessing()
     InitializeInventoryProcessing
 
     $script:PhaseTimings = [ordered]@{}
+    $script:CollectorFailuresThisRun = @()
 
     $MetricsPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
     CreateMetricsJob
@@ -1503,7 +1508,7 @@ function FinalizeOutputs
 
         try
         {
-            $null = & $SummaryPath -JsonFile $Global:JsonFile -HtmlFile $Global:HtmlFile -Title $ReportTitle -TenantId $ReportTenantId -Version $Global:Version -ExtractionRunTime $Runtime -ReportingRunTime $ReportingRunTime -PhaseTimings $script:PhaseTimings -PlatOS $PlatformOS -ConsumptionFile $Global:ConsumptionFileCsv
+            $null = & $SummaryPath -JsonFile $Global:JsonFile -HtmlFile $Global:HtmlFile -Title $ReportTitle -TenantId $ReportTenantId -Version $Global:Version -ExtractionRunTime $Runtime -ReportingRunTime $ReportingRunTime -PhaseTimings $script:PhaseTimings -PlatOS $PlatformOS -ConsumptionFile $Global:ConsumptionFileCsv -CollectorFailures $script:CollectorFailuresThisRun
         }
         catch
         {
