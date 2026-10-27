@@ -8,6 +8,7 @@
 #   - the result records are the same as with one call per metric;
 #   - a group that Azure rejects with BadRequest is not retried and falls back to
 #     one call per metric, so only the invalid metric is marked as an error;
+#   - each metric's diagnostics time is the time of the request that answered it;
 #   - a batch written to Metrics_*.json never splits one call's metrics, and
 #     there are no more batches than with one definition at a time.
 #
@@ -69,6 +70,8 @@ function Get-AzMetric
     }
     $CallFile = Join-Path $env:RDA_TEST_METRIC_CALL_DIR ([guid]::NewGuid().ToString() + '.json')
     $Call | ConvertTo-Json -Compress | Set-Content -LiteralPath $CallFile -Encoding utf8
+    # RDA_TEST_SINGLE_DELAY_MS makes every single-metric request take at least that long.
+    if ($Names.Count -eq 1 -and $env:RDA_TEST_SINGLE_DELAY_MS) { Start-Sleep -Milliseconds ([int]$env:RDA_TEST_SINGLE_DELAY_MS) }
 
     # Azure rejects the whole request when one requested name is not valid for the resource.
     foreach ($Rule in @($env:RDA_TEST_METRIC_INVALID -split ';' | Where-Object { $_ }))
@@ -84,6 +87,8 @@ function Get-AzMetric
     {
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
+        'Status500Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::InternalServerError) }
+        'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
     }
 
@@ -149,7 +154,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '')
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -159,6 +164,7 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_INVALID = $Invalid
         $env:RDA_TEST_METRIC_OMIT = $Omit
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
+        $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
         try
@@ -201,7 +207,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -374,6 +380,27 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         }
     }
 
+    It 'recognises a BadRequest wrapped in an exception that reports another status' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-wrapped400' -MultiError 'Status500Wrapping400'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        @($RunMap.Keys | Sort-Object) | Should -Be @($CleanMap.Keys | Sort-Object)
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
+    }
+
+    It 'retries a grouped request when no wrapped exception reports BadRequest' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-wrapped503' -MultiError 'Status500Wrapping503'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+    }
+
     It 'retries a grouped request that fails for another reason before falling back' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-server-error' -MultiError 'ServerError'
 
@@ -404,6 +431,29 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         {
             $RunMap[$Key] | Should -Be $CleanMap[$Key]
         }
+    }
+
+    It 'reports the grouped request time for each metric it answered, also after a fallback request of the group' {
+        # The second of the four disk metrics is left out of the grouped answer and its
+        # own request takes at least 1.5 s; the third and fourth are recorded after it.
+        $Omitted = 'Composite Disk Write Operations/sec'
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'elapsed-omitted' -Omit $Omitted -SingleDelayMs 1500
+
+        # 'Slowest 5 calls' lists every record of this four-metric run with its time.
+        $Elapsed = @{}
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            $Pattern = '\] +(?<Seconds>[0-9]+(\.[0-9]+)?)s idx=[0-9]+ .*/{0} interval=' -f [regex]::Escape($Name)
+            foreach ($Line in $Run.DebugLines)
+            {
+                if ($Line -match $Pattern) { $Elapsed[$Name] = [double]::Parse($Matches['Seconds'], [cultureinfo]::InvariantCulture) }
+            }
+        }
+        $Elapsed.Count | Should -Be 4
+
+        $Answered = @($script:DiskMetricNames | Where-Object { $_ -ne $Omitted } | ForEach-Object { $Elapsed[$_] })
+        @($Answered | Select-Object -Unique).Count | Should -Be 1 -Because 'metrics answered by one request report that request''s time'
+        $Elapsed[$Omitted] | Should -BeGreaterOrEqual ($Answered[0] + 1.49) -Because 'a fallback metric reports the group request plus its own request'
     }
 }
 

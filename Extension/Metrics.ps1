@@ -455,8 +455,10 @@ if ($Task -eq 'Processing')
 
 
     $MetricDiagnostics = [System.Collections.Concurrent.ConcurrentBag[psobject]]::new()
-    # One entry per Get-AzMetric request ('Request' or 'Fallback'), for the call count in the summary.
-    $MetricCallLog = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+    # Get-AzMetric request counts for the summary: [0] every request, [1] single-metric
+    # fallback requests. The parallel runspaces share this array and update it under a
+    # lock (Monitor) on the array itself.
+    $MetricRequestCounts = [long[]]::new(2)
 
     $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
 
@@ -493,18 +495,18 @@ if ($Task -eq 'Processing')
                 $CallMaxRetries = $using:MetricMaxRetries
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
-                $CallLog = $using:MetricCallLog
+                $RequestCounts = $using:MetricRequestCounts
 
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
-                # metric name is not valid for the resource. The status code is read from the
-                # exception or one it wraps when available, otherwise the message is used.
+                # metric name is not valid for the resource. The status code and the message
+                # of the exception and of every exception it wraps are checked, because an
+                # outer exception can report a different status than the 400 it wraps.
                 function Test-MetricBadRequest
                 {
                     param([System.Exception]$Exception)
 
                     $Pending = [System.Collections.Generic.Queue[object]]::new()
                     $Pending.Enqueue($Exception)
-                    $Messages = [System.Collections.Generic.List[string]]::new()
                     $Checked = 0
                     while ($Pending.Count -gt 0 -and $Checked -lt 10)
                     {
@@ -521,12 +523,15 @@ if ($Task -eq 'Processing')
                         {
                             $StatusCode = $Ex.StatusCode
                         }
-                        if ($null -ne $StatusCode)
+                        if ($null -ne $StatusCode -and "$StatusCode" -in @('400', 'BadRequest'))
                         {
-                            return ("$StatusCode" -in @('400', 'BadRequest'))
+                            return $true
+                        }
+                        if ([string]$Ex.Message -match 'BadRequest')
+                        {
+                            return $true
                         }
 
-                        $Messages.Add([string]$Ex.Message)
                         $Pending.Enqueue($Ex.InnerException)
                         if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
                         {
@@ -534,7 +539,7 @@ if ($Task -eq 'Processing')
                         }
                     }
 
-                    return (@($Messages | Where-Object { $_ -match 'BadRequest' }).Count -gt 0)
+                    return $false
                 }
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
@@ -546,7 +551,16 @@ if ($Task -eq 'Processing')
                 {
                     param($Def, $MetricNames, [string]$Kind, [switch]$StopOnBadRequest)
 
-                    $CallLog.Add($Kind)
+                    [System.Threading.Monitor]::Enter($RequestCounts)
+                    try
+                    {
+                        $RequestCounts[0]++
+                        if ($Kind -eq 'Fallback') { $RequestCounts[1]++ }
+                    }
+                    finally
+                    {
+                        [System.Threading.Monitor]::Exit($RequestCounts)
+                    }
                     $CallOutcome = 'Success'
                     $CallAttempts = 0
                     $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null }
@@ -670,10 +684,13 @@ if ($Task -eq 'Processing')
                 # Adds the result record and the diagnostics record for one definition.
                 # $MetricQuery is the response for this metric alone, whether it was
                 # requested on its own or together with other metrics of the resource.
+                # The reported time is $ExtraSeconds plus, when given, the time on
+                # $CallStopwatch when the record is added.
                 function Add-MetricRecord
                 {
                     param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
 
+                    $ElapsedSeconds = $ExtraSeconds
                     $MetricError = $false
                     $CallOutcome = $Request.Outcome
                     $CallErrorMsg = $null
@@ -758,6 +775,11 @@ if ($Task -eq 'Processing')
                         $CallErrorMsg = $_.Exception.Message
                     }
 
+                    if ($null -ne $CallStopwatch)
+                    {
+                        $ElapsedSeconds += $CallStopwatch.Elapsed.TotalSeconds
+                    }
+
                     $DiagBag.Add([PSCustomObject]@{
                             MetricIndex = $Def.MetricIndex
                             Service     = $Def.Service
@@ -766,7 +788,7 @@ if ($Task -eq 'Processing')
                             Interval    = $Def.Interval
                             Outcome     = $CallOutcome
                             Attempts    = $Request.Attempts
-                            ElapsedSec  = [math]::Round($ExtraSeconds + $CallStopwatch.Elapsed.TotalSeconds, 2)
+                            ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
                             Error       = $CallErrorMsg
                         })
 
@@ -805,6 +827,10 @@ if ($Task -eq 'Processing')
                 {
                     $MetricNames = [string[]]@($GroupDefs | ForEach-Object { [string]$_.MetricName } | Select-Object -Unique)
                     $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $MetricNames -Kind 'Request' -StopOnBadRequest
+                    # The group request's own duration, read once: a metric answered by it
+                    # reports this time even when it is recorded after a fallback request
+                    # for another metric of the group.
+                    $GroupSeconds = $CallStopwatch.Elapsed.TotalSeconds
 
                     # Index the response by metric name so each definition gets its own metric.
                     $ReturnedMetrics = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -819,13 +845,12 @@ if ($Task -eq 'Processing')
                             }
                         }
                     }
-                    $GroupSeconds = $CallStopwatch.Elapsed.TotalSeconds
 
                     foreach ($Def in $GroupDefs)
                     {
                         if ($Request.Succeeded -and $ReturnedMetrics.ContainsKey([string]$Def.MetricName))
                         {
-                            Add-MetricRecord -Def $Def -Request $Request -MetricQuery $ReturnedMetrics[[string]$Def.MetricName] -CallStopwatch $CallStopwatch
+                            Add-MetricRecord -Def $Def -Request $Request -MetricQuery $ReturnedMetrics[[string]$Def.MetricName] -ExtraSeconds $GroupSeconds
                         }
                         else
                         {
@@ -912,8 +937,7 @@ if ($Task -eq 'Processing')
 
     Write-MetricsDiag ("===== Metrics phase summary =====")
     Write-MetricsDiag ("Total calls: {0} | Success: {1} | Timeout: {2} | Throttled: {3} | Error: {4} | Elapsed: {5}s" -f $DiagRecords.Count, $OkCount, $TimeoutCount, $ThrottledCount, $ErrorCount, [math]::Round($PhaseStopwatch.Elapsed.TotalSeconds, 1))
-    $CallRecords = @($MetricCallLog)
-    Write-MetricsDiag ("Azure Monitor requests: {0} for {1} metric definition(s), of which {2} single-metric fallback request(s); retries not counted" -f $CallRecords.Count, $MetricCount, @($CallRecords | Where-Object { $_ -eq 'Fallback' }).Count)
+    Write-MetricsDiag ("Azure Monitor requests: {0} for {1} metric definition(s), of which {2} single-metric fallback request(s); retries not counted" -f $MetricRequestCounts[0], $MetricCount, $MetricRequestCounts[1])
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
