@@ -37,13 +37,16 @@ BeforeAll {
     $script:All = @($script:A, $script:B, $script:C)
 
     # Stand-in for ResourceInventory.ps1: records the subscription it was given
-    # and leaves the globals the wrapper reads afterwards.
+    # and leaves the globals the wrapper reads afterwards. The resource count is
+    # set both as the list and as the count, so the stand-in reports one
+    # resource whichever of the two the wrapper reads.
     $script:FakeRoot = Join-Path $script:TestBase 'fake-tool'
     New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
     $FakeInner = @'
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit)
 $Global:RdaIdsTestProcessed += @($SubscriptionID)
 $Global:Resources = @(1)
+$Global:ResourceCount = 1
 $Global:LASTEXITCODE = 0
 '@
     Set-Content -LiteralPath (Join-Path $script:FakeRoot 'ResourceInventory.ps1') -Value $FakeInner -Encoding utf8
