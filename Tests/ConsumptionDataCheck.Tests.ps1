@@ -198,6 +198,239 @@ Describe 'Invoke-ConsumptionValueProbe and Get-ConsumptionCheckVerdict' {
     }
 }
 
+Describe 'Usage probe page cap' {
+    BeforeEach {
+        Mock Start-Sleep { }
+        Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+        # Offers 60 pages of zero quantities, so a reader without a cap reads all
+        # 60 and one with the default cap of 50 stops at 50.
+        $script:PageCalls = 0
+        Mock Get-UsageAggregates {
+            $script:PageCalls++
+            $Next = if ($script:PageCalls -lt 60) { 'more' } else { $null }
+            New-UsagePage -Quantities @(0) -Token $Next
+        }
+    }
+
+    It 'stops after 50 pages by default and says only those pages were read' {
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        $Probe.PagesRead | Should -Be 50
+        $Probe.PageCapReached | Should -BeTrue
+        Should -Invoke Get-UsageAggregates -Times 50 -Exactly
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
+        $Verdict.Outcome | Should -Be 'NoPositiveQuantity'
+        $Verdict.Passed | Should -BeFalse
+        $Verdict.Detail | Should -Match 'only the first 50 page\(s\) were read'
+    }
+
+    It 'honours -MaxPages' {
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxPages 3
+        $Probe.PagesRead | Should -Be 3
+        $Probe.PageCapReached | Should -BeTrue
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+    }
+
+    It 'is not reached when the last page is exactly the cap' {
+        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
+        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0) } -ParameterFilter { $ContinuationToken -eq 'page2' }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxPages 2
+        $Probe.PagesRead | Should -Be 2
+        $Probe.PageCapReached | Should -BeFalse
+        (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Detail | Should -Not -Match 'only the first'
+    }
+
+    It 'passes with a warning at the cap when both role-check answers confirm the usage permission' {
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxPages 3
+        $Role = [pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5 -UsageRole $Role
+        $Verdict.Outcome | Should -Be 'NoUsage'
+        $Verdict.Passed | Should -BeTrue
+        $Verdict.Detail | Should -Match 'only the first 3 page\(s\) were read'
+    }
+}
+
+Describe 'Zero usage with the usage permission confirmed by the role check' {
+    BeforeAll {
+        # A role check record as Test-SubscriptionRoleAccessAll returns it; the
+        # usage verdict comes from the real combination of the two answers.
+        function New-RoleRecord
+        {
+            param([string]$Id = 'sub-a', [string]$Assignments, [string]$Permissions, [string[]]$GrantedBy = @())
+            [pscustomobject]@{
+                Id           = $Id
+                State        = 'Readable'
+                UsageVerdict = (Resolve-RoleCheckVerdict -Assignments $Assignments -Permissions $Permissions)
+                Assignments  = [pscustomobject]@{ Usage = $Assignments; UsageGrantedBy = $GrantedBy }
+            }
+        }
+        $script:NoRowsProbe = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 1; PageCapReached = $false; Attempts = 1; Error = $null }
+        $script:ZeroProbe = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 4; PagesRead = 1; PageCapReached = $false; Attempts = 1; Error = $null }
+        $script:Confirmed = New-RoleRecord -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Reader at subscription')
+    }
+
+    It 'passes NoRows as NoUsage, naming the role and scope, when both answers grant the permission' {
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $script:NoRowsProbe -ResourceCount 1 -UsageRole $script:Confirmed
+        $Verdict.Outcome | Should -Be 'NoUsage'
+        $Verdict.Passed | Should -BeTrue
+        $Verdict.Detail | Should -Match 'returned no usage rows'
+        $Verdict.Detail | Should -Match 'confirmed by the role assignments and by Azure \(Reader at subscription\)'
+    }
+
+    It 'passes NoPositiveQuantity as NoUsage when both answers grant the permission' {
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $script:ZeroProbe -ResourceCount 1 -UsageRole $script:Confirmed
+        $Verdict.Outcome | Should -Be 'NoUsage'
+        $Verdict.Passed | Should -BeTrue
+        $Verdict.Detail | Should -Match '4 usage row\(s\) came back, none with a quantity above zero'
+    }
+
+    It 'still stops (<Expected>) when role assignments say <A> and Azure says <B>' -TestCases @(
+        @{ A = 'Yes'; B = 'No'; Expected = 'NoRows' }
+        @{ A = 'No'; B = 'Yes'; Expected = 'NoRows' }
+        @{ A = 'NotVisible'; B = 'Yes'; Expected = 'NoRows' }
+        @{ A = 'NotVisible'; B = 'No'; Expected = 'NoRows' }
+        @{ A = 'No'; B = 'No'; Expected = 'NoRows' }
+        @{ A = 'Unknown'; B = 'Yes'; Expected = 'NoRows' }
+        @{ A = 'Yes'; B = 'Unknown'; Expected = 'NoRows' }
+    ) {
+        param($A, $B, $Expected)
+        $Role = New-RoleRecord -Assignments $A -Permissions $B -GrantedBy @('Reader at subscription')
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $script:NoRowsProbe -ResourceCount 1 -UsageRole $Role
+        $Verdict.Outcome | Should -Be $Expected
+        $Verdict.Passed | Should -BeFalse
+        (Get-ConsumptionCheckVerdict -Probe $script:ZeroProbe -ResourceCount 1 -UsageRole $Role).Outcome | Should -Be 'NoPositiveQuantity'
+    }
+
+    It 'still stops when there is no role check record for the subscription' {
+        (Get-ConsumptionCheckVerdict -Probe $script:NoRowsProbe -ResourceCount 1 -UsageRole $null).Passed | Should -BeFalse
+        (Get-ConsumptionCheckVerdict -Probe $script:NoRowsProbe -ResourceCount 1).Outcome | Should -Be 'NoRows'
+    }
+
+    It 'still stops on Denied and Error even when both answers grant the permission' {
+        $Denied = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 0; Attempts = 1; Error = (New-StatusException -Message 'Forbidden' -Status Forbidden) }
+        $Failure = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 0; Attempts = 4; Error = (New-StatusException -Message 'Service unavailable' -Status ServiceUnavailable) }
+        $D = Get-ConsumptionCheckVerdict -Probe $Denied -ResourceCount 1 -UsageRole $script:Confirmed
+        $E = Get-ConsumptionCheckVerdict -Probe $Failure -ResourceCount 1 -UsageRole $script:Confirmed
+        $D.Outcome | Should -Be 'Denied'
+        $D.Passed | Should -BeFalse
+        $E.Outcome | Should -Be 'Error'
+        $E.Passed | Should -BeFalse
+    }
+
+    It 'leaves Pass and Exempt unchanged' {
+        $Positive = [pscustomobject]@{ PositiveFound = $true; RowsSeen = 2; PagesRead = 1; Attempts = 1; Error = $null }
+        (Get-ConsumptionCheckVerdict -Probe $Positive -ResourceCount 1 -UsageRole $script:Confirmed).Outcome | Should -Be 'Pass'
+        (Get-ConsumptionCheckVerdict -Probe $null -ResourceCount 0 -UsageRole $script:Confirmed).Outcome | Should -Be 'Exempt'
+    }
+
+    Context 'across subscriptions' {
+        BeforeEach {
+            Mock Start-Sleep { }
+            $script:Printed = [System.Collections.Generic.List[object]]::new()
+            Mock Write-Host { $script:Printed.Add([pscustomobject]@{ Text = [string]$Object; Colour = [string]$ForegroundColor }) }
+            Mock Get-AzContext { $null }
+            Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+            Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 3; 'sub-b' = 1; 'sub-c' = 2 } }
+            $script:Subs = @(
+                [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }
+                [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }
+                [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' }
+            )
+            # Alpha has usage; Bravo and Charlie return none. Bravo's usage
+            # permission is confirmed by both answers, Charlie's only by Azure.
+            $script:LastSub = $null
+            Mock Set-AzContext { $script:LastSub = $Subscription; [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+            Mock Get-UsageAggregates { if ($script:LastSub -eq 'sub-a') { New-UsagePage -Quantities @(2) } else { New-UsagePage } }
+            $script:Roles = @(
+                (New-RoleRecord -Id 'sub-a' -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Reader at subscription'))
+                (New-RoleRecord -Id 'sub-b' -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Billing Reader at management group'))
+                (New-RoleRecord -Id 'sub-c' -Assignments 'NotVisible' -Permissions 'Yes')
+            )
+        }
+
+        It 'passes the confirmed subscription with a yellow warning and stops on the other one' {
+            $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window -RoleCheck $script:Roles
+            $Result.ShouldBlock | Should -BeTrue
+            @($Result.Failed | ForEach-Object { $_.Id }) | Should -Be @('sub-c')
+            @($Result.NoUsage | ForEach-Object { $_.Id }) | Should -Be @('sub-b')
+            $Line = @($script:Printed | Where-Object { $_.Text -like '  `[NoUsage`] Bravo*' })
+            $Line.Count | Should -Be 1
+            $Line[0].Colour | Should -Be 'Yellow'
+            $Line[0].Text | Should -Match 'Billing Reader at management group'
+            $Warning = @($script:Printed | Where-Object { $_.Text -match 'WARNING: no usage above zero for 2026-09-25 to 2026-10-25' })
+            $Warning.Count | Should -Be 1
+            $Warning[0].Colour | Should -Be 'Yellow'
+            $Warning[0].Text | Should -Match 'a new subscription, only free resources, or paused resources'
+            $Warning[0].Text | Should -Match 'consumption sheet will be empty'
+
+            $script:Printed.Clear()
+            Write-ConsumptionDataCheckReport -Result $Result
+            $Text = @($script:Printed | ForEach-Object { $_.Text }) -join "`n"
+            $Text | Should -Match 'Charlie \(sub-c\): NoRows'
+            $Text | Should -Not -Match 'Bravo \(sub-b\): '
+            $Text | Should -Match '1 other subscription\(s\) returned no usage values too'
+            $Text | Should -Match 'Cost Management Reader does NOT'
+        }
+
+        It 'continues when every subscription without usage is confirmed by both answers' {
+            $script:Roles[2] = New-RoleRecord -Id 'sub-c' -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Owner at subscription through a group')
+            $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window -RoleCheck $script:Roles
+            $Result.ShouldBlock | Should -BeFalse
+            @($Result.NoUsage | ForEach-Object { $_.Id }) | Should -Be @('sub-b', 'sub-c')
+
+            $script:Printed.Clear()
+            Write-ConsumptionDataCheckReport -Result $Result
+            $Lines = @($script:Printed | ForEach-Object { $_.Text })
+            $Lines | Should -Contain 'Consumption data confirmed: 1 subscription(s) returned usage values for 2026-09-25 to 2026-10-25.'
+            ($Lines -join "`n") | Should -Match '2 subscription\(s\) returned no usage values for 2026-09-25 to 2026-10-25 and continue with an empty consumption sheet'
+        }
+
+        It 'stops as before when no role check records are passed' {
+            $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
+            @($Result.Failed | ForEach-Object { $_.Id }) | Should -Be @('sub-b', 'sub-c')
+            @($Result.NoUsage).Count | Should -Be 0
+        }
+    }
+}
+
+Describe 'Write-NoUsageSummary (end-of-run list)' {
+    BeforeEach {
+        $script:Printed = [System.Collections.Generic.List[object]]::new()
+        Mock Write-Host { $script:Printed.Add([pscustomobject]@{ Text = [string]$Object; Colour = [string]$ForegroundColor }) }
+    }
+
+    It 'lists every NoUsage subscription by name and id, in yellow' {
+        $Result = Resolve-ConsumptionDataCheck -Window $script:Window -Results @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha'; Outcome = 'Pass'; Passed = $true }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; Outcome = 'NoUsage'; Passed = $true }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; Outcome = 'Exempt'; Passed = $true }
+            [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; Outcome = 'NoUsage'; Passed = $true }
+        )
+        Write-NoUsageSummary -ConsumptionResult $Result
+        $Lines = @($script:Printed | Where-Object { $_.Text -ne '' })
+        $Lines[0].Text | Should -Be 'Subscriptions with no usage values: 2 - the usage permission was confirmed, but no usage above zero came back for 2026-09-25 to 2026-10-25, so their consumption sheet is empty:'
+        @($Lines | ForEach-Object { $_.Text }) | Should -Contain '  - Bravo (sub-b)'
+        @($Lines | ForEach-Object { $_.Text }) | Should -Contain '  - Delta (sub-d)'
+        @($Lines | ForEach-Object { $_.Text }) | Should -Not -Contain '  - Alpha (sub-a)'
+        @($Lines | Where-Object { $_.Colour -ne 'Yellow' }).Count | Should -Be 0
+    }
+
+    It 'prints nothing when there are none, or when the check did not run' {
+        Write-NoUsageSummary -ConsumptionResult (Resolve-ConsumptionDataCheck -Window $script:Window -Results @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha'; Outcome = 'Pass'; Passed = $true }))
+        Write-NoUsageSummary -ConsumptionResult $null
+        $script:Printed.Count | Should -Be 0
+    }
+
+    It 'is called at the end of both scripts with the consumption check result' {
+        $Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Summary = $Wrapper.IndexOf('================ Summary ================')
+        $Summary | Should -BeGreaterThan 0
+        $Wrapper.IndexOf('Write-NoUsageSummary -ConsumptionResult $ConsumptionCheck') | Should -BeGreaterThan $Summary
+        $Direct = Get-Content -Path (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $Direct | Should -Match '\$script:ConsumptionCheckResult = \$ConsumptionCheck'
+        $Direct.IndexOf('Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult') | Should -BeGreaterThan $Direct.IndexOf('Reporting Data File')
+    }
+}
+
 Describe 'Get-ConsumptionErrorKind' {
     It 'treats throttling, timeouts and 5xx as transient' {
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status TooManyRequests) | Should -Be 'Transient'
@@ -321,10 +554,11 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
         $script:CompletedIds = @()
         $script:Resume = $false
         $script:SkipConsumption = $false
+        $script:AccessProbed = @()
     }
 
     AfterAll {
-        Remove-Variable -Name Subscriptions, CompletedIds, Resume, SkipConsumption -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name Subscriptions, CompletedIds, Resume, SkipConsumption, AccessProbed -Scope Script -ErrorAction SilentlyContinue
     }
 
     It 'runs before parallelism tuning and before any inventory invocation, and replaces the first-subscription gate' {
@@ -360,6 +594,26 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
         Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $Subscription -eq 'sub-b' }
         Should -Invoke Set-AzContext -Times 0 -Exactly -ParameterFilter { $Subscription -eq 'sub-a' }
     }
+
+    It 'passes the role check records in: no usage with the permission confirmed by both answers continues' {
+        $script:AccessProbed = @(
+            [pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
+            [pscustomobject]@{ Id = 'sub-b'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
+        )
+        Mock Get-UsageAggregates { New-UsagePage }
+        . $script:CheckBlock
+        Should -Invoke Exit-Wrapper -Times 0 -Exactly
+        @($ConsumptionCheck.NoUsage | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b')
+    }
+
+    It 'still exits 1 on no usage when the usage permission is not confirmed by both answers' {
+        $script:AccessProbed = @(
+            [pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
+            [pscustomobject]@{ Id = 'sub-b'; UsageVerdict = 'YesPermissionsOnly'; Assignments = [pscustomobject]@{ UsageGrantedBy = @() } }
+        )
+        Mock Get-UsageAggregates { New-UsagePage }
+        { . $script:CheckBlock } | Should -Throw 'EXIT 1'
+    }
 }
 
 Describe 'ResourceInventory.ps1 direct run' {
@@ -386,11 +640,13 @@ function global:az
 function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
 # The up-front role check sees Reader at the subscription, so these runs reach
-# the consumption check.
+# the consumption check. RDA_TEST_ROLES 'permissions-only' hides the role
+# assignments, so only Azure's answer grants the usage permission.
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)
+    if ($Path -match '/roleAssignments\?' -and $env:RDA_TEST_ROLES -eq 'permissions-only') { return [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } }
     if ($Path -match '/roleAssignments\?') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ properties = @{ roleDefinitionId = "/subscriptions/$TestSub/providers/Microsoft.Authorization/roleDefinitions/reader"; scope = "/subscriptions/$TestSub"; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) } | ConvertTo-Json -Depth 10) } }
     if ($Path -match '/roleDefinitions/') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } } | ConvertTo-Json -Depth 10) } }
     if ($Path -match '/providers/Microsoft\.Authorization/permissions\?') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ actions = @('*/read'); notActions = @() }) } | ConvertTo-Json -Depth 10) } }
@@ -412,11 +668,12 @@ exit $LASTEXITCODE
 
         function Invoke-DirectRun
         {
-            param([string]$Mode, [switch]$SkipConsumption)
+            param([string]$Mode, [switch]$SkipConsumption, [string]$Roles = 'reader')
             $Out = Join-Path $TestDrive ('out-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             New-Item -ItemType Directory -Path $Out -Force | Out-Null
             $env:RDA_TEST_INVENTORY_MARKER = Join-Path $Out 'inventory.marker'
             $env:RDA_TEST_USAGE_MARKER = Join-Path $Out 'usage.marker'
+            $env:RDA_TEST_ROLES = $Roles
             $PwshArgs = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Root', $script:RepoRoot, '-Out', $Out, '-Mode', $Mode)
             if ($SkipConsumption) { $PwshArgs += '-SkipConsumption' }
             $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String
@@ -430,15 +687,24 @@ exit $LASTEXITCODE
     }
 
     AfterAll {
-        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_USAGE_MARKER -ErrorAction SilentlyContinue
+        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_USAGE_MARKER, Env:\RDA_TEST_ROLES -ErrorAction SilentlyContinue
     }
 
-    It 'exits 1 before any inventory or collector work when consumption returns no values' {
-        $Run = Invoke-DirectRun -Mode 'empty'
+    It 'exits 1 before any inventory or collector work when consumption returns no values and only Azure grants the usage permission' {
+        $Run = Invoke-DirectRun -Mode 'empty' -Roles 'permissions-only'
         $Run.ExitCode | Should -Be 1
         $Run.UsageQueried | Should -BeTrue
         $Run.InventoryReached | Should -BeFalse
         $Run.Output | Should -Match 'Placeholder subscription \(12345678-1234-1234-1234-123456789012\): NoRows'
+    }
+
+    It 'passes the role check records in: no values with the usage permission confirmed by both answers continues with a warning' {
+        $Run = Invoke-DirectRun -Mode 'empty'
+        $Run.UsageQueried | Should -BeTrue
+        $Run.InventoryReached | Should -BeTrue
+        $Run.ExitCode | Should -Be 3
+        $Run.Output | Should -Match '\[NoUsage\] Placeholder subscription - the query succeeded but returned no usage rows; the usage permission is confirmed by the role assignments and by Azure \(Reader at subscription\)'
+        $Run.Output | Should -Match 'WARNING: no usage above zero for '
     }
 
     It 'continues into inventory when consumption returns values' {

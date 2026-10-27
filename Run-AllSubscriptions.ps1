@@ -874,13 +874,18 @@ if ($ScopeForProbe.Count -gt 0)
 # Runs AFTER the role check above, so a failure here is about consumption
 # data, not about reading the subscription; on a refusal the role check's usage
 # verdict for each failing subscription is printed with the fix
-# (Write-UsageRoleReport). The role check never passes or blocks consumption.
+# (Write-UsageRoleReport). The role check records are passed in: a
+# subscription that returns no usage above zero passes with a warning
+# (outcome NoUsage, listed again in the summary) only when its role
+# assignments AND Azure's caller permissions both grant the usage permission
+# at the subscription or above; otherwise it stops the run as above.
 # -AllowPartialAccess does not bypass it. On -Resume only the subscriptions
 # this run will process are checked.
+$ConsumptionCheck = $null
 $ConsumptionCheckScope = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
 if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)
 {
-    $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope
+    $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed
     Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
     Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
     if ($ConsumptionCheck.ShouldBlock)
@@ -1886,6 +1891,11 @@ if ($ConsumptionFailures.Count -gt 0)
     Write-Host "  Note: the consumption sheet in the output report may be empty or incomplete for these subscriptions." -ForegroundColor Yellow
     Write-Host ""
 }
+
+# Subscriptions the up-front consumption data check passed with no usage
+# values (outcome NoUsage): repeated here so their empty consumption sheet is
+# not mistaken for a collection failure.
+Write-NoUsageSummary -ConsumptionResult $ConsumptionCheck
 
 # Surface metrics-phase auth health. Mirrors the consumption block above:
 # metrics were requested (no -SkipMetrics) but skipped because no usable Azure

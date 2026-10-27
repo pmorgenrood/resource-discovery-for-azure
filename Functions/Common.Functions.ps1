@@ -1037,17 +1037,19 @@ function Get-SubscriptionResourceCounts
 
 # Queries one subscription's usage with the billing phase's cmdlet, window and
 # options, following ContinuationToken until a row with a positive quantity is
-# found or the pages run out. The context switch is process-scoped so the
-# operator's saved default subscription is left alone. Returns
-# { PositiveFound; RowsSeen; PagesRead; Attempts; Error }.
+# found, the pages run out, or $MaxPages pages have been read (PageCapReached:
+# more pages were offered but not read). The context switch is process-scoped
+# so the operator's saved default subscription is left alone. Returns
+# { PositiveFound; RowsSeen; PagesRead; PageCapReached; Attempts; Error }.
 function Invoke-ConsumptionValueProbe
 {
     param(
         [Parameter(Mandatory = $true)][string]$SubscriptionId,
         [Parameter(Mandatory = $true)]$Window,
-        [int]$MaxRetries = 3
+        [int]$MaxRetries = 3,
+        [int]$MaxPages = 50
     )
-    $Probe = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 0; Attempts = 0; Error = $null }
+    $Probe = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 0; PageCapReached = $false; Attempts = 0; Error = $null }
 
     $ContextSwitch = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $SubscriptionId -Operation {
         param($Id)
@@ -1096,23 +1098,37 @@ function Invoke-ConsumptionValueProbe
             return $Probe
         }
         $Token = [string]$Page.Value.ContinuationToken
+        if (-not [string]::IsNullOrEmpty($Token) -and $Probe.PagesRead -ge $MaxPages)
+        {
+            $Probe.PageCapReached = $true
+            return $Probe
+        }
     } while (-not [string]::IsNullOrEmpty($Token))
 
     return $Probe
 }
 
-# Pure verdict for one subscription. Passed is $true only for 'Pass' (a
-# positive quantity came back) and 'Exempt' (Resource Graph reports zero
-# resources, so it was not queried). Every other outcome refuses the run:
+# Pure verdict for one subscription. Passed is $true for 'Pass' (a positive
+# quantity came back), 'Exempt' (Resource Graph reports zero resources, so it
+# was not queried) and 'NoUsage' (below). Every other outcome refuses the run:
 #   'NoRows'             - the query succeeded but returned no rows
-#   'NoPositiveQuantity' - rows came back but none had a quantity above zero
+#   'NoPositiveQuantity' - rows came back but none had a quantity above zero,
+#                          or the page cap was reached before one did
 #   'Denied'             - the query was refused for lack of permission
 #   'Error'              - any other failure that persisted after retries
+# 'NoUsage' replaces NoRows and NoPositiveQuantity when $UsageRole (this
+# subscription's record from Test-SubscriptionRoleAccessAll) has UsageVerdict
+# 'Yes': its role assignments AND Azure's caller permissions both grant
+# Microsoft.Commerce/UsageAggregates/read at the subscription or above. The
+# empty answer then reflects no billed usage in the window (a new
+# subscription, only free resources, paused resources) rather than a missing
+# permission. Any other usage verdict, or no record, keeps the refusal.
 function Get-ConsumptionCheckVerdict
 {
     param(
         $Probe,
-        $ResourceCount
+        $ResourceCount,
+        $UsageRole
     )
     if ($null -ne $ResourceCount -and [int]$ResourceCount -eq 0)
     {
@@ -1135,11 +1151,25 @@ function Get-ConsumptionCheckVerdict
         $StatusText = if ($null -ne $Status) { ('HTTP {0}, ' -f $Status) } else { '' }
         return [pscustomobject]@{ Outcome = $Outcome; Passed = $false; Detail = ('query failed ({0}{1} attempt(s)): {2}' -f $StatusText, $Probe.Attempts, $Message) }
     }
-    if ([int]$Probe.RowsSeen -eq 0)
+    $Empty = if ($Probe.PageCapReached)
     {
-        return [pscustomobject]@{ Outcome = 'NoRows'; Passed = $false; Detail = 'the query succeeded but returned no usage rows' }
+        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s) came back, none with a quantity above zero; only the first {1} page(s) were read' -f $Probe.RowsSeen, $Probe.PagesRead) }
     }
-    return [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s) came back, none with a quantity above zero' -f $Probe.RowsSeen) }
+    elseif ([int]$Probe.RowsSeen -eq 0)
+    {
+        [pscustomobject]@{ Outcome = 'NoRows'; Passed = $false; Detail = 'the query succeeded but returned no usage rows' }
+    }
+    else
+    {
+        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s) came back, none with a quantity above zero' -f $Probe.RowsSeen) }
+    }
+    if ($null -ne $UsageRole -and [string]$UsageRole.UsageVerdict -eq 'Yes')
+    {
+        $GrantedBy = @(@($UsageRole.Assignments.UsageGrantedBy) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        $GrantedText = if ($GrantedBy.Count -gt 0) { $GrantedBy -join '; ' } else { 'role not named' }
+        return [pscustomobject]@{ Outcome = 'NoUsage'; Passed = $true; Detail = ('{0}; the usage permission is confirmed by the role assignments and by Azure ({1})' -f $Empty.Detail, $GrantedText) }
+    }
+    return $Empty
 }
 
 # Pure: combine per-subscription results into the run decision.
@@ -1156,6 +1186,7 @@ function Resolve-ConsumptionDataCheck
         Results     = $All
         Failed      = $Failed
         Exempt      = @($All | Where-Object { $_.Outcome -eq 'Exempt' })
+        NoUsage     = @($All | Where-Object { $_.Outcome -eq 'NoUsage' })
         ShouldBlock = ($Failed.Count -gt 0)
     }
 }
@@ -1163,12 +1194,15 @@ function Resolve-ConsumptionDataCheck
 # Checks every subscription in $Subscriptions (objects with Id and Name) and
 # returns the Resolve-ConsumptionDataCheck decision. Every subscription is
 # checked, so a refusal lists all failing ones at once. The process context in
-# effect before the check is restored afterwards.
+# effect before the check is restored afterwards. $RoleCheck is the record list
+# from Test-SubscriptionRoleAccessAll for this run; a subscription's record
+# decides whether an empty answer is 'NoUsage' (Get-ConsumptionCheckVerdict).
 function Invoke-ConsumptionDataCheck
 {
     param(
         [Parameter(Mandatory = $true)][object[]]$Subscriptions,
         $Window = (Get-ConsumptionWindow),
+        [object[]]$RoleCheck = @(),
         [int]$MaxRetries = 3
     )
     $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
@@ -1195,7 +1229,8 @@ function Invoke-ConsumptionDataCheck
                 $Probe = Invoke-ConsumptionValueProbe -SubscriptionId $Id -Window $Window -MaxRetries $MaxRetries
             }
             $Timer.Stop()
-            $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $ResourceCount
+            $UsageRole = @(@($RoleCheck) | Where-Object { $null -ne $_ -and [string]$_.Id -eq $Id })[0]
+            $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $ResourceCount -UsageRole $UsageRole
             $Result = [pscustomobject]@{
                 Id            = $Id
                 Name          = $Name
@@ -1206,8 +1241,12 @@ function Invoke-ConsumptionDataCheck
                 Seconds       = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
             }
             $Results += $Result
-            $Colour = if ($Result.Outcome -eq 'Pass') { 'Green' } elseif ($Result.Passed) { 'DarkGray' } else { 'Red' }
+            $Colour = switch ($Result.Outcome) { 'Pass' { 'Green' } 'NoUsage' { 'Yellow' } default { if ($Result.Passed) { 'DarkGray' } else { 'Red' } } }
             Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $Result.Outcome, $Name, $Result.Detail, $Result.Seconds) -ForegroundColor $Colour
+            if ($Result.Outcome -eq 'NoUsage')
+            {
+                Write-Host ('      WARNING: no usage above zero for {0}. Typical causes: a new subscription, only free resources, or paused resources. The run continues; this subscription''s consumption sheet will be empty.' -f $WindowText) -ForegroundColor Yellow
+            }
         }
     }
     finally
@@ -1229,13 +1268,22 @@ function Write-ConsumptionDataCheckReport
     param([Parameter(Mandatory = $true)]$Result)
     $WindowText = Format-ConsumptionWindow -Window $Result.Window
     $Checked = @($Result.Results | Where-Object { $_.Outcome -ne 'Exempt' })
+    $NoUsage = @($Result.NoUsage)
     if ($Result.Exempt.Count -gt 0)
     {
         Write-Host ('  {0} subscription(s) have no resources in Resource Graph and were not checked (nothing to price).' -f $Result.Exempt.Count) -ForegroundColor DarkGray
     }
     if (-not $Result.ShouldBlock)
     {
-        Write-Host ('Consumption data confirmed: {0} subscription(s) returned usage values for {1}.' -f $Checked.Count, $WindowText) -ForegroundColor Green
+        $WithValues = $Checked.Count - $NoUsage.Count
+        if ($WithValues -gt 0 -or $NoUsage.Count -eq 0)
+        {
+            Write-Host ('Consumption data confirmed: {0} subscription(s) returned usage values for {1}.' -f $WithValues, $WindowText) -ForegroundColor Green
+        }
+        if ($NoUsage.Count -gt 0)
+        {
+            Write-Host ('{0} subscription(s) returned no usage values for {1} and continue with an empty consumption sheet, because the role check confirmed the usage permission (see the warnings above).' -f $NoUsage.Count, $WindowText) -ForegroundColor Yellow
+        }
         return
     }
     Write-Host ''
@@ -1245,8 +1293,31 @@ function Write-ConsumptionDataCheckReport
     {
         Write-Host ('  - {0} ({1}): {2} - {3}; window {4}' -f $Fail.Name, $Fail.Id, $Fail.Outcome, $Fail.Detail, $WindowText) -ForegroundColor Red
     }
+    if ($NoUsage.Count -gt 0)
+    {
+        Write-Host ('  ({0} other subscription(s) returned no usage values too, but passed because the role check confirmed the usage permission.)' -f $NoUsage.Count) -ForegroundColor Yellow
+    }
     Write-Host 'To fix:' -ForegroundColor Yellow
     Write-Host '  1. Give the signed-in identity Microsoft.Commerce/UsageAggregates/read on each subscription above. The built-in Reader and Billing Reader roles include it; Cost Management Reader does NOT.' -ForegroundColor Yellow
     Write-Host '  2. If the identity already has it: the subscription may be partner-managed (CSP) without cost visibility for this identity, or on an offer the legacy usage API (Get-UsageAggregates) does not serve.' -ForegroundColor Yellow
     Write-Host '  3. Or re-run with -SkipConsumption to inventory without consumption data.' -ForegroundColor Yellow
+}
+
+# End-of-run list of the subscriptions the consumption data check passed with
+# outcome 'NoUsage', so their empty consumption sheet is not read as a
+# collection failure. Shared by Run-AllSubscriptions.ps1 and direct runs of
+# ResourceInventory.ps1. Prints nothing when there are none.
+function Write-NoUsageSummary
+{
+    param($ConsumptionResult)
+    if ($null -eq $ConsumptionResult -or $null -eq $ConsumptionResult.Window) { return }
+    $NoUsage = @(@($ConsumptionResult.Results) | Where-Object { $null -ne $_ -and $_.Outcome -eq 'NoUsage' })
+    if ($NoUsage.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host ('Subscriptions with no usage values: {0} - the usage permission was confirmed, but no usage above zero came back for {1}, so their consumption sheet is empty:' -f $NoUsage.Count, (Format-ConsumptionWindow -Window $ConsumptionResult.Window)) -ForegroundColor Yellow
+    foreach ($Sub in $NoUsage)
+    {
+        Write-Host ('  - {0} ({1})' -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+    }
+    Write-Host '  Typical causes: a new subscription, only free resources, or paused resources. If usage was expected, the subscription may be partner-managed (CSP) without cost visibility for this identity.' -ForegroundColor Yellow
 }

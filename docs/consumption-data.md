@@ -29,7 +29,9 @@ Per subscription, the collector:
 
 Before any inventory or metrics work, both entry points check that every
 subscription in the run returns at least one usage row with a quantity above
-zero for this same window, and stop with exit code 1 if one does not. The phase
+zero for this same window, and stop with exit code 1 if one does not, unless
+the up-front role check confirmed the usage permission for it (it then passes
+with a warning and an empty consumption sheet). The phase
 and the check take the window from one helper (`Get-ConsumptionWindow` in
 `Functions/Common.Functions.ps1`), so the two cannot drift. See
 [Consumption data check](../README.md#consumption-data-check-up-front) in the

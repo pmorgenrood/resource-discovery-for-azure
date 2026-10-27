@@ -487,6 +487,46 @@ Describe 'Write-UsageRoleReport' {
     }
 }
 
+Describe 'Role check records feed the consumption data check' {
+    BeforeAll {
+        function Set-AzContext { param($Subscription, $Context, $Scope) }
+        function Get-UsageAggregates { param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) }
+        $script:UsageWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-26T10:00:00')
+    }
+
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Start-Sleep { }
+        Mock Get-RoleCheckCallerObjectId { 'caller-oid' }
+        Mock Get-AzContext { $null }
+        Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+        # The subscription holds resources and returns no usage rows.
+        Mock Invoke-AzRestMethod {
+            $Target = if ($Path) { $Path } else { $Uri }
+            if ($Target -like '/providers/Microsoft.ResourceGraph/*') { return (New-Response -Status 200 -Body @{ data = @(@{ subscriptionId = 'sub-a'; ResourceCount = 1 }) }) }
+            Get-ScenarioResponse -Target $Target
+        }
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
+    }
+
+    It '<Case>: outcome <Expected>' -TestCases @(
+        @{ Case = 'Reader at the subscription in both answers'; Assignments = @(@{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }); Granted = @('Reader'); Expected = 'NoUsage' }
+        @{ Case = 'Reader through a group at a management group'; Assignments = @(@{ Role = 'Reader'; Scope = '/providers/Microsoft.Management/managementGroups/mg-1'; Group = $true }); Granted = @('Reader'); Expected = 'NoUsage' }
+        @{ Case = 'roles include it, Azure does not'; Assignments = @(@{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }); Granted = @('NoCommerce'); Expected = 'NoRows' }
+        @{ Case = 'Azure includes it, the roles do not'; Assignments = @(@{ Role = 'NoCommerce'; Scope = '/subscriptions/sub-a' }); Granted = @('Reader'); Expected = 'NoRows' }
+        @{ Case = 'role assignments not visible'; Assignments = @(); Granted = @('Reader'); Expected = 'NoRows' }
+        @{ Case = 'usage only granted at a resource group'; Assignments = @(@{ Role = 'NoCommerce'; Scope = '/subscriptions/sub-a' }, @{ Role = 'Billing Reader'; Scope = '/subscriptions/sub-a/resourceGroups/rg-one' }); Granted = @('Reader'); Expected = 'NoRows' }
+    ) {
+        param($Case, $Assignments, $Granted, $Expected)
+        Set-RoleScenario -Assignments $Assignments -Permissions @{ '/subscriptions/sub-a' = @{ Status = 200; Roles = $Granted } }
+        $Records = @(Test-SubscriptionRoleAccessAll -Subscriptions @($script:SubA) -IncludeUsage)
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions @($script:SubA) -Window $script:UsageWindow -RoleCheck $Records
+        $Result.Results[0].Outcome | Should -Be $Expected
+        $Result.ShouldBlock | Should -Be ($Expected -ne 'NoUsage')
+        if ($Expected -eq 'NoUsage') { $Result.Results[0].Detail | Should -Match 'Reader at (subscription|management group through a group)' }
+    }
+}
+
 Describe 'Run-AllSubscriptions.ps1 up-front role check' {
     BeforeAll {
         # Runs the wrapper's own statements from '$ScopeForProbe =' to the end

@@ -697,8 +697,12 @@ Function RunInventorySetup()
     #    checked here. When consumption is requested the usage permission is
     #    printed too, for information.
     # 2. Consumption: unless -SkipConsumption, every in-scope subscription must
-    #    return usage values (Invoke-ConsumptionDataCheck). On a refusal the
-    #    role check's usage verdict is printed with the fix.
+    #    return usage values (Invoke-ConsumptionDataCheck). The role check
+    #    records are passed in: a subscription with no usage above zero passes
+    #    with a warning (NoUsage, listed again at the end of the run) only when
+    #    both role-check answers grant the usage permission at the subscription
+    #    or above. On a refusal the role check's usage verdict is printed with
+    #    the fix.
     if (-not $RunAllSubs.IsPresent)
     {
         $AccessProbed = @()
@@ -733,13 +737,14 @@ Function RunInventorySetup()
 
         if (-not $SkipConsumption.IsPresent)
         {
-            $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope
+            $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed
             Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
             Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
             if ($ConsumptionCheck.ShouldBlock)
             {
                 exit 1
             }
+            $script:ConsumptionCheckResult = $ConsumptionCheck
         }
     }
 
@@ -1897,3 +1902,7 @@ catch
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+
+# Direct runs only (the wrapper prints its own): subscriptions the up-front
+# consumption data check passed with no usage values.
+Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult
