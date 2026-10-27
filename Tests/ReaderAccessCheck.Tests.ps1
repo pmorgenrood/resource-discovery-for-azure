@@ -807,9 +807,11 @@ exit $LASTEXITCODE
         $Run.InventoryReached | Should -BeFalse
     }
 
-    It 'does not check the roles under -RunAllSubs (the wrapper already did)' {
+    It 'does not run the role or usage check under -RunAllSubs (the wrapper already did)' {
         $Run = Invoke-DirectRun -Roles 'none' -PermSub 'none' -RunAllSubs
         $Run.RoleCalls.Count | Should -Be 0
+        $Run.Calls | Should -Not -Contain 'usage'
+        $Run.Calls | Should -Not -Contain 'resource counts'
         $Run.InventoryReached | Should -BeTrue
     }
 
