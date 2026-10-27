@@ -47,12 +47,11 @@ if ($Task -eq 'Processing')
             if ([string]::IsNullOrEmpty($RelatedAKSId)) { $RelatedId = ($SFC | Where-Object { $_.Properties.clusterEndpoint -in $1.properties.virtualMachineProfile.extensionProfile.extensions.properties.settings.clusterEndpoint }).id }else { $RelatedId = $RelatedAKSId }
             $Related = if ([string]::IsNullOrEmpty($RelatedId)) { $RelatedId } elseif ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { if ($ResourceIdDictionary.ContainsKey($RelatedId)) { $ResourceIdDictionary[$RelatedId] } else { 'obfuscated' } } else { $RelatedId.split('/')[8] }
 
-            $Timecreated = $Data.timeCreated
-            $Timecreated = [datetime]$Timecreated
-            $Timecreated = $Timecreated.ToString("yyyy-MM-dd HH:mm")
+            $Timecreated = if ($null -ne $Data.timeCreated) { [datetime]($Data.timeCreated) | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' }
 
-            $Cpus = $Vmsizemap[$1.sku.name].CPU;
-            $Ram = $Vmsizemap[$1.sku.name].RAM;
+            $SkuName = $1.sku.name
+            $Cpus = if ($null -ne $SkuName) { $Vmsizemap[$SkuName].CPU } else { $null }
+            $Ram = if ($null -ne $SkuName) { $Vmsizemap[$SkuName].RAM } else { $null }
 
             $Cpus = if ($null -ne $Cpus) { $Cpus } else { '0' }
             $Ram = if ($null -ne $Ram) { $Ram } else { '0' }
