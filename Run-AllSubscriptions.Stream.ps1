@@ -145,11 +145,15 @@ $StreamStateFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json"
 
 $CompletedIds = @()
 $FailedAttempts = @()
+# The report zip recorded per completed sub (New-CompletedReportRecord), kept in
+# this stream's state so the parent can carry it on a later -Resume.
+$Reports = @()
 if ($Resume -or $ResumeFailedOnly)
 {
     $State = Read-StreamState -Path $StreamStateFile
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
+    $Reports = @($State.Reports)
     if ($CompletedIds.Count -gt 0)
     {
         Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedIds.Count) 'DarkGray'
@@ -180,6 +184,9 @@ $ResourceCounts = @()
 # overload resolution against an empty PowerShell array argument.
 $Completed = @($CompletedIds)
 $FailedSubs = @()
+# Subs this stream skipped on -Resume as completed; reported in the summary so
+# the parent can carry their recorded reports into the consolidated zip.
+$SkippedSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -213,6 +220,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
     if ($Resume -and ($Completed -contains $SubId))
     {
         Write-Stream ("skipping (already completed): {0} ({1})" -f $SubName, $SubId) 'DarkGray'
+        $SkippedSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
         continue
     }
 
@@ -220,6 +228,8 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
     try
     {
+        # Cleared first so a stale path from the previous sub is never recorded as this one's.
+        $Global:ZipOutputFile = $null
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -243,13 +253,24 @@ for ($i = 0; $i -lt $PairCount; $i++)
             Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
         }
 
+        # Record the zip this run wrote, replacing any earlier record for the sub.
+        $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $SubId -Name $SubName -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
+        if ($null -ne $NewReport)
+        {
+            $Reports = @(@($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId }) + $NewReport)
+        }
+
         if (-not ($Completed -contains $SubId))
         {
             $Completed += $SubId
             # If this is a retry that finally succeeded, drop the sub from
             # FailedAttempts so the unified resume-state file reflects truth.
             $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $SubId
-            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
+        }
+        elseif ($null -ne $NewReport)
+        {
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
     }
     catch
@@ -301,7 +322,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # history to the next -ResumeFailedOnly invocation.
         $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
             -Id $SubId -Name $SubName -Reason $ErrRecord.Exception.Message
-        Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
+        Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
     }
 }
 
@@ -326,6 +347,7 @@ $Summary = [pscustomobject]@{
     SubsProcessed          = $PairCount
     Completed              = @($Completed)
     Failed                 = $FailedSubs
+    Skipped                = @($SkippedSubs)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
     ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
