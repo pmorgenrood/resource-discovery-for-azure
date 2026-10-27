@@ -36,7 +36,9 @@ If ($Task -eq 'Processing')
         {
             $Sub1 = $SUB | Where-Object { $_.id -eq $vm.subscriptionId }
             $Data = $vm.PROPERTIES
-            $Timecreated = if ($null -ne $Data.timeCreated) { [datetime]($Data.timeCreated) | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' }
+            # A missing timeCreated, or one that does not convert to a date, is
+            # 'Unknown' rather than an exception that fails every virtual machine.
+            $Timecreated = try { if ($null -ne $Data.timeCreated) { [datetime]($Data.timeCreated) | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' } } catch { 'Unknown' }
 
             $Lic = ''
 
