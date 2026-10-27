@@ -456,9 +456,11 @@ function Get-RoleCheckCallerObjectId
 # One ARM GET through Invoke-AzRestMethod with the consumption check's retry
 # policy (Invoke-ConsumptionCallWithRetry): throttling (429), timeouts and 5xx
 # are retried with backoff; any other status is returned at once, so a 400 is
-# not retried. List answers are followed through nextLink, for at most
-# $MaxPages pages; past that the answer is an error ('more than N pages'),
-# which leaves the check inconclusive and stops the run. Returns
+# not retried. List answers are followed through the path and query of
+# nextLink, for at most $MaxPages pages; past that the answer is an error
+# ('more than N pages'), as is a nextLink that is not a valid URL; either
+# leaves the check inconclusive, so the subscription is not readable.
+# Returns
 # { Status; Items; Body; Error }: Status is the last HTTP status ($null for a
 # client-side failure), Items the 'value' entries of every page, Body the last
 # page.
@@ -506,7 +508,22 @@ function Invoke-RoleCheckGet
             $Items += @(@($Body.value) | Where-Object { $null -ne $_ })
         }
         $Next = if ($null -ne $Body) { [string]$Body.nextLink } else { '' }
-        $Target = if ([string]::IsNullOrEmpty($Next)) { $null } else { @{ Uri = $Next } }
+        $Target = $null
+        if (-not [string]::IsNullOrEmpty($Next))
+        {
+            # Only the link's path and query are followed, on the context's
+            # Resource Manager endpoint like every other call here, so the
+            # token never goes to a host named in the answer. A link that is
+            # not an absolute http(s) URL, or has no path (or one starting
+            # with '//', which names a host when joined to a base URL),
+            # counts as a missing answer. The link itself is not logged.
+            $NextUri = $null
+            if (-not [uri]::TryCreate($Next, [System.UriKind]::Absolute, [ref]$NextUri) -or $NextUri.Scheme -notin @('https', 'http') -or $NextUri.AbsolutePath -notmatch '^/[^/]')
+            {
+                return [pscustomobject]@{ Status = $null; Items = @(); Body = $null; Error = 'the answer''s next-page link is not a valid URL' }
+            }
+            $Target = @{ Path = $NextUri.PathAndQuery }
+        }
     }
     return [pscustomobject]@{ Status = $Status; Items = $Items; Body = $Body; Error = $null }
 }

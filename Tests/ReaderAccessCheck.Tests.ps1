@@ -559,9 +559,10 @@ Describe 'Test-SubscriptionRoleAccessAll' {
 Describe 'Invoke-RoleCheckGet page cap' {
     BeforeEach {
         Mock Start-Sleep { }
-        # A list answer of $script:PageCount pages joined by nextLink.
+        # A list answer of $script:PageCount pages joined by nextLink. The
+        # next page is asked for by path, so the page number is read from it.
         Mock Invoke-AzRestMethod {
-            $N = if ($Uri -match 'page=(\d+)$') { [int]$Matches[1] } else { 1 }
+            $N = if ($Path -match 'page=(\d+)$') { [int]$Matches[1] } else { 1 }
             $Body = @{ value = @(@{ id = $N }) }
             if ($N -lt $script:PageCount) { $Body.nextLink = 'https://management.example.test/list?page={0}' -f ($N + 1) }
             New-Response -Status 200 -Body $Body
@@ -581,6 +582,83 @@ Describe 'Invoke-RoleCheckGet page cap' {
         $Answer.Error | Should -Be 'more than 1000 pages'
         $Answer.Status | Should -BeNullOrEmpty
         Should -Invoke Invoke-AzRestMethod -Times 1000 -Exactly
+        Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly -ParameterFilter { -not [string]::IsNullOrEmpty($Uri) }
+    }
+
+    It 'stops at -MaxPages, each page asked for by its path' {
+        $script:PageCount = 10
+        $Answer = Invoke-RoleCheckGet -Path '/subscriptions/sub-a/list' -MaxPages 3
+        $Answer.Error | Should -Be 'more than 3 pages'
+        Should -Invoke Invoke-AzRestMethod -Times 3 -Exactly
+        Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Path -eq '/list?page=2' }
+        Should -Invoke Invoke-AzRestMethod -Times 1 -Exactly -ParameterFilter { $Path -eq '/list?page=3' }
+        Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly -ParameterFilter { -not [string]::IsNullOrEmpty($Uri) }
+    }
+}
+
+Describe 'Invoke-RoleCheckGet next-page link' {
+    BeforeEach {
+        Mock Start-Sleep { }
+        $script:Requests = [System.Collections.Generic.List[object]]::new()
+        # Page 1 answers with $script:NextLink; any later page has none.
+        Mock Invoke-AzRestMethod {
+            $script:Requests.Add([pscustomobject]@{ Path = $Path; Uri = $Uri })
+            if ($script:Requests.Count -eq 1) { return (New-Response -Status 200 -Body @{ value = @(@{ id = 1 }); nextLink = $script:NextLink }) }
+            New-Response -Status 200 -Body @{ value = @(@{ id = 2 }) }
+        }
+    }
+
+    It 'asks for the next page by its path and query on the Resource Manager endpoint, not on the host the link names' {
+        $script:NextLink = 'https://other.example.test/subscriptions/sub-a/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$skipToken=page%2B2'
+        $Answer = Invoke-RoleCheckGet -Path '/subscriptions/sub-a/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01'
+        $Answer.Error | Should -BeNullOrEmpty
+        @($Answer.Items | ForEach-Object { $_.id }) | Should -Be @(1, 2)
+        $script:Requests.Count | Should -Be 2
+        $script:Requests[1].Path | Should -Be '/subscriptions/sub-a/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$skipToken=page%2B2'
+        Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly -ParameterFilter { -not [string]::IsNullOrEmpty($Uri) }
+    }
+
+    It 'counts the answer as missing when the next-page link is <Case>' -TestCases @(
+        @{ Case = 'not a URL'; Link = 'not a url' }
+        @{ Case = 'a relative path'; Link = '/subscriptions/sub-a/list?page=2' }
+        @{ Case = 'a URL without a path'; Link = 'https://other.example.test' }
+        @{ Case = 'a URL whose path is only /'; Link = 'https://other.example.test/?page=2' }
+        @{ Case = 'a URL whose path starts with //'; Link = 'https://management.example.test//other.example.test/list?page=2' }
+        @{ Case = 'not an http(s) URL'; Link = 'file:///subscriptions/sub-a/list' }
+    ) {
+        param($Case, $Link)
+        $script:NextLink = $Link
+        $Answer = Invoke-RoleCheckGet -Path '/subscriptions/sub-a/list'
+        $Answer.Error | Should -Be 'the answer''s next-page link is not a valid URL'
+        $Answer.Status | Should -BeNullOrEmpty
+        @($Answer.Items).Count | Should -Be 0
+        $script:Requests.Count | Should -Be 1
+    }
+
+    It 'skips the subscription whose role assignment list has a malformed next-page link, with its reason, and keeps the other' {
+        Set-RoleScenario -Assignments @(@{ Role = 'Reader'; Scope = '/subscriptions/sub-b' }) -Permissions @{ '/subscriptions/sub-b' = @{ Status = 200; Roles = @('Reader') } }
+        Mock Get-RoleCheckCallerObjectId { 'caller-oid' }
+        Mock Invoke-AzRestMethod {
+            $Target = if ($Path) { $Path } else { $Uri }
+            if ($Target -like '/subscriptions/sub-a/providers/Microsoft.Authorization/roleAssignments*')
+            {
+                return (New-Response -Status 200 -Body @{ value = @(@{ properties = @{ roleDefinitionId = '/subscriptions/sub-a/providers/Microsoft.Authorization/roleDefinitions/Reader'; scope = '/subscriptions/sub-a'; principalId = 'caller-oid' } }); nextLink = 'not a url' })
+            }
+            Get-ScenarioResponse -Target $Target
+        }
+        $script:Lines = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Lines.Add([string]$Object) }
+        $Subs = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
+        $R = @(Test-SubscriptionRoleAccessAll -Subscriptions $Subs)
+        @($R | ForEach-Object { $_.State }) | Should -Be @('Unknown', 'Readable')
+        $R[0].Reason | Should -Be 'role check inconclusive after retries (role assignment list: the answer''s next-page link is not a valid URL)'
+        $Decision = Resolve-AccessPreflight -Probed $R
+        $Decision.ShouldBlock | Should -BeFalse
+        $Decision.InaccessibleIds | Should -Be @('sub-a')
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 2
+        $script:Lines | Should -Contain '    - Alpha (sub-a) - role check inconclusive after retries (role assignment list: the answer''s next-page link is not a valid URL)'
+        $script:Lines | Should -Contain '  Skipping them and continuing with the 1 readable subscription(s). To include them: The role check could not finish (the reason above says why); re-run.'
+        Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly -ParameterFilter { -not [string]::IsNullOrEmpty($Uri) }
     }
 }
 
