@@ -318,25 +318,44 @@ function Get-RoleCheckAction
 }
 
 # Pure: the first notAction of one permission block that can remove read
-# access to some resource type, or $null. A pattern counts when its last
-# segment is '*' or 'read' (ignoring case), unless it is confined to a
-# namespace the inventory never reads resources from: Microsoft.Authorization
-# (a role that cannot read role assignments is handled as 'not visible' by the
+# access to some resource type, or $null. With '*' read as any characters,
+# '/' included (Test-RoleActionPatternMatch), a pattern counts when it can
+# match an action that ends in '/read' (ignoring case): a pattern without '*'
+# when it ends in '/read'; a pattern with '*' when the text after its last '*'
+# is empty, is the end of '/read' ('read', 'ad', 'd', ...) or itself ends in
+# '/read'. A pattern is allowed when its fixed start (the text before its
+# first '*', or all of it) begins with one of the namespaces below and '/',
+# because the inventory reads no resources there: Microsoft.Authorization (a
+# role that cannot read role assignments is handled as 'not visible' by the
 # role check) and the billing namespaces, which the consumption data check
-# covers. Resource Graph silently leaves out resources the caller cannot read,
-# so a role such as '*/read' minus 'Microsoft.Compute/*/read' would otherwise
-# pass the check and produce an inventory without those resources.
+# covers. So 'Microsoft.Authorization/*' is allowed, but 'Microsoft.Auth*',
+# which can also match other namespaces, is not. Resource Graph silently
+# leaves out resources the caller cannot read, so a role such as '*/read'
+# minus 'Microsoft.Compute/*/read' would otherwise pass the check and produce
+# an inventory without those resources.
 function Get-RoleReadExclusion
 {
     param([object[]]$NotActions)
     $Exempt = @('Microsoft.Authorization', 'Microsoft.Commerce', 'Microsoft.Consumption', 'Microsoft.Billing')
+    $IgnoreCase = [System.StringComparison]::OrdinalIgnoreCase
     foreach ($Pattern in @($NotActions))
     {
         $Text = [string]$Pattern
         if ([string]::IsNullOrEmpty($Text)) { continue }
-        $Segments = $Text.Split('/')
-        if ($Segments[-1] -ne '*' -and $Segments[-1] -ne 'read') { continue }
-        if ($Segments.Count -gt 1 -and $Exempt -contains $Segments[0]) { continue }
+        $FirstStar = $Text.IndexOf('*')
+        if ($FirstStar -lt 0)
+        {
+            $CanMatchRead = $Text.EndsWith('/read', $IgnoreCase)
+            $FixedStart = $Text
+        }
+        else
+        {
+            $Tail = $Text.Substring($Text.LastIndexOf('*') + 1)
+            $CanMatchRead = '/read'.EndsWith($Tail, $IgnoreCase) -or $Tail.EndsWith('/read', $IgnoreCase)
+            $FixedStart = $Text.Substring(0, $FirstStar)
+        }
+        if (-not $CanMatchRead) { continue }
+        if (@($Exempt | Where-Object { $FixedStart.StartsWith($_ + '/', $IgnoreCase) }).Count -gt 0) { continue }
         return $Text
     }
     return $null

@@ -273,6 +273,23 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Uses = @($script:CollectionAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Test-ConsumptionResourceUriInResourceGroup' }, $true))
         $Uses.Count | Should -Be 1
     }
+
+    It 'under -ResourceGroup skips a usage row without a resource URI and keeps collecting the subscription' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        Mock Get-UsageAggregates {
+            $NoUri = New-UsageRow -ResourceUri 'placeholder'
+            $NoUri.Properties.InstanceData = (@{ 'Microsoft.Resources' = @{ location = 'westeurope' } } | ConvertTo-Json -Compress)
+            $Rows = @(
+                $NoUri
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+    }
 }
 
 Describe 'Test-ConsumptionRowsHavePositiveQuantity' {

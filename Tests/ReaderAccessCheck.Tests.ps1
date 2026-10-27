@@ -166,6 +166,20 @@ Describe 'Read access that leaves out some resource types' {
         Get-RoleReadExclusion -NotActions @('Microsoft.Compute/virtualMachines/write', $Pattern) | Should -Be $Pattern
     }
 
+    It 'a wildcard notAction <Pattern> that can match a read action (such as <Example>) removes read access' -TestCases @(
+        @{ Pattern = 'Microsoft.Comp*'; Example = 'Microsoft.Compute/virtualMachines/read' }
+        @{ Pattern = 'Microsoft.Compute/*/r*'; Example = 'Microsoft.Compute/disks/read' }
+        @{ Pattern = 'Microsoft.Compute/virtualMachines/re*d'; Example = 'Microsoft.Compute/virtualMachines/read' }
+        @{ Pattern = 'Microsoft.Compute*read'; Example = 'Microsoft.Compute/virtualMachines/read' }
+        @{ Pattern = '*ad'; Example = 'Microsoft.Storage/storageAccounts/read' }
+        @{ Pattern = 'Microsoft.Auth*'; Example = 'Microsoft.AuthExample/items/read' }
+    ) {
+        param($Pattern, $Example)
+        Test-RoleActionPatternMatch -Pattern $Pattern -Action $Example | Should -BeTrue
+        Get-RoleReadExclusion -NotActions @('Microsoft.Compute/virtualMachines/write', $Pattern) | Should -Be $Pattern
+        Test-Allows -Grants @([pscustomobject]@{ Label = 'custom'; Actions = @('*/read'); NotActions = @($Pattern) }) -Kind Resources | Should -BeFalse
+    }
+
     It 'a notAction confined to <Pattern> keeps read access' -TestCases @(
         @{ Pattern = 'Microsoft.Authorization/*' }
         @{ Pattern = 'microsoft.authorization/roleAssignments/read' }
@@ -182,10 +196,19 @@ Describe 'Read access that leaves out some resource types' {
         @{ Pattern = 'Microsoft.Compute/virtualMachines/write' }
         @{ Pattern = 'Microsoft.Compute/*/delete' }
         @{ Pattern = '*/action' }
+        @{ Pattern = '*/write' }
+        @{ Pattern = 'Microsoft.Compute/*rea' }
+        @{ Pattern = 'Microsoft.Authorization/*/Delete' }
+        @{ Pattern = 'Microsoft.Authorization/*/Write' }
+        @{ Pattern = 'Microsoft.Authorization/elevateAccess/Action' }
     ) {
         param($Pattern)
         Get-RoleReadExclusion -NotActions @($Pattern) | Should -BeNullOrEmpty
         Test-Allows -Grants @([pscustomobject]@{ Label = 'custom'; Actions = @('*'); NotActions = @($Pattern) }) -Kind Resources | Should -BeTrue
+    }
+
+    It 'Contributor''s notActions keep read access' {
+        Get-RoleReadExclusion -NotActions $script:BuiltIn['Contributor'].NotActions | Should -BeNullOrEmpty
     }
 
     It 'Reader beside a role that leaves out some types still reads everything (each role counts on its own)' {
