@@ -70,10 +70,15 @@ BeforeAll {
     $script:TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AzContextScopeTest_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $script:TmpRoot -Force | Out-Null
 
+    # A global that did not exist before this file is removed again afterwards,
+    # not left behind as $null; the others get their old values back.
     $script:SavedGlobals = @{}
+    $script:MissingGlobals = [System.Collections.Generic.List[string]]::new()
     foreach ($Name in 'Subscriptions', 'ConsumptionFileCsv', 'ConsumptionRecordCount', 'ConsumptionFailedSubs', 'ErrorLogFile')
     {
-        $script:SavedGlobals[$Name] = Get-Variable -Scope Global -Name $Name -ValueOnly -ErrorAction SilentlyContinue
+        $Existing = Get-Variable -Scope Global -Name $Name -ErrorAction SilentlyContinue
+        if ($null -eq $Existing) { $script:MissingGlobals.Add($Name) }
+        else { $script:SavedGlobals[$Name] = $Existing.Value }
     }
     $script:SavedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
     $script:SavedUICulture = [System.Threading.Thread]::CurrentThread.CurrentUICulture
@@ -83,6 +88,10 @@ AfterAll {
     foreach ($Name in $script:SavedGlobals.Keys)
     {
         Set-Variable -Scope Global -Name $Name -Value $script:SavedGlobals[$Name]
+    }
+    foreach ($Name in $script:MissingGlobals)
+    {
+        Remove-Variable -Scope Global -Name $Name -ErrorAction SilentlyContinue
     }
     [System.Threading.Thread]::CurrentThread.CurrentCulture = $script:SavedCulture
     [System.Threading.Thread]::CurrentThread.CurrentUICulture = $script:SavedUICulture
