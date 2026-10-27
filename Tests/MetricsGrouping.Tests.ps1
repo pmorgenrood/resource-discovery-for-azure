@@ -6,6 +6,8 @@
 #   - definitions of one resource that share a time window, time grain and
 #     aggregation are fetched with one Get-AzMetric call;
 #   - the result records are the same as with one call per metric;
+#   - a metric requested with the 'Count' aggregation is read from each data
+#     point's Count, not from the number of data points;
 #   - a group that Azure rejects with BadRequest is not retried and falls back to
 #     one call per metric, so only the invalid metric is marked as an error;
 #   - each metric's diagnostics time is the time of the request that answered it;
@@ -17,6 +19,9 @@
 # Az.Monitor module first on PSModulePath. It records every call as a file and
 # returns data points derived from the resource id and metric name, so results
 # are deterministic and a metric mapped to the wrong definition is detected.
+# A test can instead give the points of a resource and metric; like the real
+# cmdlet, it then returns .Data as a typed collection with a Count property of
+# its own (the number of points).
 #
 # No live Azure. Run with:
 #   Invoke-Pester ./Tests/MetricsGrouping.Tests.ps1 -Output Detailed
@@ -93,10 +98,36 @@ function Get-AzMetric
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
+    # RDA_TEST_METRIC_POINTS names a JSON file that maps 'resource name|metric name'
+    # to the points to return; a field a point does not list is null, and a field
+    # named in its 'Omit' is left off the point.
+    $GivenPoints = if ($env:RDA_TEST_METRIC_POINTS) { Get-Content -LiteralPath $env:RDA_TEST_METRIC_POINTS -Raw | ConvertFrom-Json -AsHashtable } else { @{} }
     foreach ($Name in $Names)
     {
         # A name listed in RDA_TEST_METRIC_OMIT is left out of multi-name responses only.
         if ($Names.Count -gt 1 -and $Omitted -contains $Name) { continue }
+
+        $GivenKey = ($ResourceId -split '/')[-1] + '|' + $Name
+        if ($GivenPoints.ContainsKey($GivenKey))
+        {
+            $Data = [System.Collections.Generic.List[object]]::new()
+            $Minute = 0
+            foreach ($Fields in @($GivenPoints[$GivenKey]))
+            {
+                $Point = [ordered]@{ TimeStamp = $StartTime.AddMinutes($Minute++) }
+                foreach ($Field in 'Average', 'Minimum', 'Maximum', 'Total', 'Count')
+                {
+                    if (@($Fields['Omit']) -notcontains $Field) { $Point[$Field] = $Fields[$Field] }
+                }
+                $Data.Add([PSCustomObject]$Point)
+            }
+            [PSCustomObject]@{
+                Id   = $ResourceId + '/providers/Microsoft.Insights/metrics/' + $Name
+                Name = [PSCustomObject]@{ Value = $Name; LocalizedValue = $Name }
+                Data = $Data
+            }
+            continue
+        }
 
         $Seed = 0
         foreach ($Char in ($ResourceId + '|' + $Name).ToCharArray()) { $Seed = ($Seed * 31 + [int]$Char) % 100003 }
@@ -154,17 +185,24 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0)
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
         New-Item -ItemType Directory -Path $CallDir -Force | Out-Null
+        $PointsFile = ''
+        if ($Points.Count -gt 0)
+        {
+            $PointsFile = Join-Path $RunDir 'points.json'
+            $Points | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $PointsFile -Encoding utf8
+        }
 
         $env:RDA_TEST_METRIC_CALL_DIR = $CallDir
         $env:RDA_TEST_METRIC_INVALID = $Invalid
         $env:RDA_TEST_METRIC_OMIT = $Omit
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
+        $env:RDA_TEST_METRIC_POINTS = $PointsFile
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
         try
@@ -207,7 +245,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -327,6 +365,28 @@ Describe 'Metrics.ps1 result records' {
         {
             $GroupedMap[$Key] | Should -Be $SingleMap[$Key] -Because "record $Key must not depend on how it was requested"
         }
+    }
+
+    It 'reads each data point''s Count for a Count-aggregated metric, not the number of data points' {
+        # Cosmos DB 'TotalRequests' is the only 'Count' definition, so its group holds
+        # it alone. Measure 'Largest' over the per-point counts 3, null, 7, 0 and a
+        # point without a Count property, which reads as no value rather than as 1.
+        $Cosmos = New-TestResource -Type 'microsoft.documentdb/databaseaccounts' -Provider 'Microsoft.DocumentDB/databaseAccounts' -Name 'cosmos-count' -Kind 'GlobalDocumentDB'
+        $Points = @{ 'cosmos-count|TotalRequests' = @(@{ Count = 3 }, @{ Count = $null }, @{ Omit = 'Count' }, @{ Count = 7 }, @{ Count = 0 }) }
+        $Run = Invoke-MetricsRun -Resources @($Cosmos) -RunName 'cosmos-count' -Points $Points
+
+        $CountCalls = @($Run.Calls | Where-Object { $_.AggregationType -eq 'Count' })
+        $CountCalls.Count | Should -Be 1
+        @($CountCalls[0].MetricName) | Should -Be @('TotalRequests')
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+
+        $Record = @($Run.Records | Where-Object { $_.Metric -eq 'TotalRequests' })
+        $Record.Count | Should -Be 1
+        $Record[0].MetricValue | Should -Be 7
+        $Record[0].MetricCount | Should -Be 3
+        $Record[0].MetricTotalCount | Should -Be 5
+        $Record[0].MetricPercentile | Should -Be 7
     }
 }
 
