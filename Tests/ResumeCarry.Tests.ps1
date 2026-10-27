@@ -671,3 +671,22 @@ Describe 'A failed attempt clears the completed record of a subscription an earl
         @($Agg.FailedSubscriptions).Count | Should -Be 1
     }
 }
+
+Describe 'The -Resume output shows when each carried report was written' {
+    BeforeEach {
+        $script:Root = script:New-CaseRoot
+        $script:Zip = script:New-TestReport -Root $script:Root -Stamp '5aaaa' -SubName 'Sub A'
+    }
+
+    It 'shows the date of a carried report written <Label>, and its age as <Days> day(s)' -TestCases @(
+        @{ Label = '400 days ago'; Offset = -400; Days = 400 },
+        @{ Label = 'in the future (clock skew)'; Offset = 3; Days = 0 }
+    ) {
+        script:Set-ReportAge -Zip $script:Zip -When (Get-Date).ToUniversalTime().AddDays($Offset).AddMinutes(-5)
+        $Rec = New-CompletedReportRecord -InventoryRoot $script:Root -Id 'sub-a' -Name 'Sub A' -ZipPath $script:Zip -Obfuscated $false
+        $Post = script:Invoke-Post -Root $script:Root -Since (Get-Date) -ThisRun @() -Skipped @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -Reports @($Rec)
+        $Expected = '  - Sub A: report written {0}, {1} day(s) ago' -f (Get-Item -LiteralPath $script:Zip).LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $Days
+        @($Post.Text | Where-Object { $_ -like '  - Sub A: *' }) | Should -Be @($Expected)
+        ($Post.Text -join "`n") | Should -Match 'verification: OK \(1 zip\(s\) match 0 successful sub\(s\) this run \+ 1 carried'
+    }
+}

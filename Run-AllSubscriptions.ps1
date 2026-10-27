@@ -1719,6 +1719,19 @@ if ($Resume -and @($SkippedSubscriptions).Count -gt 0)
     if ($CarriedReports.Count -gt 0)
     {
         Write-Host ("Resume: carrying {0} report(s) of subscription(s) completed by an earlier run into the consolidated zip." -f $CarriedReports.Count) -ForegroundColor Cyan
+        # When each carried report was written, so an old one is visible here.
+        # There is no age limit; the age is read from the zip's last-write time.
+        foreach ($Carried in $CarriedReports)
+        {
+            $ZipItem = Get-Item -LiteralPath $Carried.Zip -ErrorAction SilentlyContinue
+            if ($null -eq $ZipItem)
+            {
+                Write-Host ("  - {0}: report date unknown" -f $Carried.Name) -ForegroundColor Cyan
+                continue
+            }
+            $AgeDays = [int][math]::Max(0, [math]::Floor(((Get-Date).ToUniversalTime() - $ZipItem.LastWriteTimeUtc).TotalDays))
+            Write-Host ("  - {0}: report written {1}, {2} day(s) ago" -f $Carried.Name, $ZipItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $AgeDays) -ForegroundColor Cyan
+        }
     }
 }
 $CarriedFolderNames = @($CarriedReports | ForEach-Object { $_.Folder })
