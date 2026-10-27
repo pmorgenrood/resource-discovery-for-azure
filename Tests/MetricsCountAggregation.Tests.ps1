@@ -88,6 +88,7 @@ Export-ModuleMember -Function Get-AzMetric
 
     $script:OriginalModulePath = $env:PSModulePath
     $script:OriginalDebugLogFile = $Global:DebugLogFile
+    $script:OriginalCountSpec = $env:RDA_TEST_COUNT_SPEC
     $env:PSModulePath = $script:ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
 
     function New-TestCosmosDb
@@ -146,7 +147,14 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_COUNT_SPEC' -ErrorAction SilentlyContinue
+    if ($null -eq $script:OriginalCountSpec)
+    {
+        Remove-Item -Path 'Env:RDA_TEST_COUNT_SPEC' -ErrorAction SilentlyContinue
+    }
+    else
+    {
+        $env:RDA_TEST_COUNT_SPEC = $script:OriginalCountSpec
+    }
 }
 
 Describe 'Metrics.ps1 Count aggregation' {
