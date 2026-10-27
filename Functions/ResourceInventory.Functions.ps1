@@ -382,11 +382,12 @@ function Write-RdaShareableDiagnosticsLog
 # closed, so a large set of metrics JSON files can exhaust memory.
 # ZipArchiveMode.Create with CreateEntryFromFile copies each file from disk
 # into the archive in chunks.
-# The archive is built under a temporary name in the destination folder and
-# moved into place only once complete, so a failure never leaves a partial zip
-# at the final name. The temporary name does not end in .zip, so the wrapper's
-# *.zip sweep of the output folders never picks one up. Like Compress-Archive
-# without -Force, an existing destination is an error and is left untouched.
+# The archive is built under a temporary name (.rda-<guid>.partial) in the
+# destination folder and moved into place only once complete, so a failure
+# never leaves a partial zip at the final name. The temporary name does not end
+# in .zip, so the wrapper's *.zip sweep of the output folders never picks one
+# up. Like Compress-Archive without -Force, an existing destination is an error
+# and is left untouched.
 function Compress-RdaReportArchive
 {
     [CmdletBinding()]
@@ -468,7 +469,11 @@ function Compress-RdaReportArchive
     }
 
     $Level = [System.IO.Compression.CompressionLevel]$CompressionLevel
-    $TempPath = '{0}.{1}.partial' -f $DestinationPath, [guid]::NewGuid().ToString('N')
+    # The temporary name has a fixed length (45 characters) that does not
+    # depend on the destination name, so any final name the file system
+    # accepts also works here.
+    $TempName = '.rda-{0}.partial' -f [guid]::NewGuid().ToString('N')
+    $TempPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($DestinationPath), $TempName)
     $ArchiveStream = $null
     $Archive = $null
     try

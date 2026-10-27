@@ -318,6 +318,77 @@ Describe 'Compress-RdaReportArchive failure handling' {
     }
 }
 
+Describe 'Compress-RdaReportArchive with a long destination file name' {
+    # Most Linux and Windows file systems allow 255 characters per file name.
+    # The temporary file must fit wherever the final name fits.
+    BeforeAll {
+        function New-LongZipName
+        {
+            param([int]$Length)
+            $Prefix = 'ResourcesReport_2026-01-02_03_04_'
+            return $Prefix + ('x' * ($Length - $Prefix.Length - 4)) + '.zip'
+        }
+    }
+
+    It 'writes a zip whose file name is <Length> characters' -ForEach @(@{ Length = 223 }, @{ Length = 250 }) {
+        $Root = Join-Path $TestDrive "long-$Length"
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 200 -Seed 11)
+        New-FixtureFile (Join-Path $Root 'b.json') (New-JsonText -Records 100 -Seed 12)
+        $Name = New-LongZipName -Length $Length
+        $Name.Length | Should -Be $Length
+        $Destination = Join-Path $Root $Name
+
+        Compress-RdaReportArchive -Path (Join-Path $Root '*.json') -CompressionLevel Fastest -DestinationPath $Destination
+
+        Test-Path -LiteralPath $Destination -PathType Leaf | Should -BeTrue
+        $Rows = @(Get-ZipEntrySummary $Destination)
+        $Rows.Name | Should -Be @('a.json', 'b.json')
+        foreach ($Row in $Rows)
+        {
+            $Row.Sha256 | Should -Be (Get-FileHash -LiteralPath (Join-Path $Root $Row.Name) -Algorithm SHA256).Hash
+        }
+        @(Get-ChildItem -LiteralPath $Root -Force).Name | Sort-Object | Should -Be (@('a.json', 'b.json', $Name) | Sort-Object)
+    }
+
+    It 'leaves no zip at the final name and no temporary file when it fails part-way with a 250-character name' {
+        $Root = Join-Path $TestDrive 'long-failing'
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 2000 -Seed 13)
+        $Locked = Join-Path $Root 'z.json'
+        New-FixtureFile $Locked '{}'
+        $Paths = @((Join-Path $Root 'a.json'), $Locked)
+        $Before = Get-FolderListing $Root
+        $Destination = Join-Path $Root (New-LongZipName -Length 250)
+
+        # z.json is held open without sharing, so the failure comes after
+        # a.json has been written to the temporary archive.
+        $Hold = [System.IO.File]::Open($Locked, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try
+        {
+            $Caught = & {
+                $ErrorActionPreference = 'SilentlyContinue'
+                try
+                {
+                    Compress-RdaReportArchive -Path $Paths -CompressionLevel Fastest -DestinationPath $Destination
+                    'not caught'
+                }
+                catch
+                {
+                    $_.Exception.Message
+                }
+            }
+        }
+        finally
+        {
+            $Hold.Dispose()
+        }
+        $Caught | Should -BeLike '*z.json*'
+        Test-Path -LiteralPath $Destination | Should -BeFalse
+        Get-FolderListing $Root | Should -Be $Before
+    }
+}
+
 Describe 'ResourceInventory.ps1 report packaging' {
     It 'zips the report with Compress-RdaReportArchive, not Compress-Archive' {
         $ScriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
