@@ -1143,6 +1143,15 @@ if ($ParallelStreams -le 1)
             catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
 
             $FailedSubscriptions += $Sub.Name
+            # A failed attempt ends an earlier run's completion of this sub: take
+            # it off the completed list and drop its report record, so a later
+            # -Resume collects it again instead of skipping it and carrying the
+            # older report.
+            if ($CompletedIds -contains $Sub.Id)
+            {
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+            }
             # Persist the failure to the resume-state file so a future run with
             # -ResumeFailedOnly can target it. Use the exception message as the
             # Reason so the operator can see at a glance why each sub failed
@@ -1263,6 +1272,13 @@ else
                 try { $DiagLines | Out-File -FilePath $DiagFile -Append -Encoding utf8 }
                 catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
                 $FailedSubscriptions += $Sub.Name
+                # Same as the sequential branch: a failed attempt takes the sub
+                # off the completed list and drops its report record.
+                if ($CompletedIds -contains $Sub.Id)
+                {
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                }
                 # Mirror the sequential branch: persist failure to the
                 # resume-state file so -ResumeFailedOnly works even for the
                 # single-sub-collapses-to-inline corner case.
@@ -1430,6 +1446,7 @@ else
             # Aggregate per-stream summaries into the wrapper's existing
             # accumulators so the consolidated summary at end-of-run looks the
             # same shape as a sequential run.
+            $StreamFailedIds = @()
             foreach ($S in $StreamSummaries)
             {
                 if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
@@ -1478,6 +1495,13 @@ else
                     foreach ($f in $StreamSummary.Failed)
                     {
                         $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $f.Name, $S.StreamId, $f.Reason)
+                    }
+                    # The subs this stream attempted and failed this run, for the
+                    # merge of per-stream state below. A stream that did not start
+                    # lists its whole slice as failed but attempted none of it.
+                    if ($StreamSummary.Status -ne 'failed-to-start')
+                    {
+                        $StreamFailedIds += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
                     }
                 }
 
@@ -1600,10 +1624,20 @@ else
             }
             # Last, so a report a stream recorded this run replaces an earlier one.
             $CompletedReports = @(@($CompletedReports) + @($AllReportsFromStreams))
+            # A sub a stream failed this run is not completed, even when an earlier
+            # run completed it: take it off the list and drop its report record,
+            # as the sequential branch does, so Merge-FailedAttempts keeps the
+            # failure and a later -Resume collects the sub again.
+            $FailedThisRun = @($StreamFailedIds | Where-Object { $_ })
+            if ($FailedThisRun.Count -gt 0)
+            {
+                $CompletedIds = @($CompletedIds | Where-Object { $FailedThisRun -notcontains $_ })
+                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and $FailedThisRun -notcontains [string]$_.Id })
+            }
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0)
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $FailedThisRun.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
