@@ -516,6 +516,22 @@ Describe 'Resource group runs (-ResourceGroup)' {
         Test-ConsumptionResourceUriInResourceGroup -ResourceUri $script:InRg -ResourceGroup '' | Should -BeFalse
     }
 
+    It 'does not match a resource or provider of another resource group whose name equals the resource group (<Case>)' -TestCases @(
+        @{ Case = 'web app slot named like the resource group'; Uri = '/subscriptions/sub-a/resourceGroups/prod/providers/Microsoft.Web/sites/web/slots/staging'; Rg = 'web' }
+        @{ Case = 'SQL server named like the resource group'; Uri = '/subscriptions/sub-a/resourceGroups/prod/providers/Microsoft.Sql/servers/web/databases/db1'; Rg = 'web' }
+        @{ Case = 'provider namespace equal to the resource group'; Uri = '/subscriptions/sub-a/resourceGroups/prod/providers/Microsoft.Web/sites/app1'; Rg = 'microsoft.web' }
+        @{ Case = 'not a resource URI'; Uri = 'resourceGroups/web/providers/Microsoft.Web/sites/app1'; Rg = 'web' }
+        @{ Case = 'resource group segment missing'; Uri = '/subscriptions/sub-a/providers/Microsoft.Web/sites/web/x'; Rg = 'web' }
+    ) {
+        param($Case, $Uri, $Rg)
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $Uri -ResourceGroup $Rg | Should -BeFalse
+    }
+
+    It 'matches the resource group''s own resources and the resource group itself' {
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri '/subscriptions/sub-a/resourceGroups/web/providers/Microsoft.Web/sites/app1' -ResourceGroup 'web' | Should -BeTrue
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri '/subscriptions/sub-a/resourcegroups/WEB' -ResourceGroup 'web' | Should -BeTrue
+    }
+
     It 'reads the resource URI from InstanceData, and nothing from missing or malformed InstanceData (<Case>)' -TestCases @(
         @{ Case = 'missing'; Raw = $null }
         @{ Case = 'empty'; Raw = '' }

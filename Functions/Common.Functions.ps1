@@ -1217,15 +1217,19 @@ function Get-SubscriptionResourceCounts
 }
 
 # Pure: does a usage row's resource URI belong to resource group
-# $ResourceGroup? The URI must contain '/<resource group>/', compared without
-# case. The consumption phase (GetResorceConsumption in ResourceInventory.ps1)
-# keeps a row for a -ResourceGroup run by this same test, and the consumption
-# data check counts a row by it, so the check and the sheet agree.
+# $ResourceGroup? The URI must start with
+# '/subscriptions/<id>/resourceGroups/<name>' and <name> must equal
+# $ResourceGroup, compared without case. A resource or provider name equal to
+# the resource group's name elsewhere in the URI does not count. The
+# consumption phase (GetResorceConsumption in ResourceInventory.ps1) keeps a
+# row for a -ResourceGroup run by this same test, and the consumption data
+# check counts a row by it, so the check and the sheet agree.
 function Test-ConsumptionResourceUriInResourceGroup
 {
     param([string]$ResourceUri, [string]$ResourceGroup)
     if ([string]::IsNullOrEmpty($ResourceUri) -or [string]::IsNullOrEmpty($ResourceGroup)) { return $false }
-    return $ResourceUri.ToLowerInvariant().Contains('/' + $ResourceGroup.ToLowerInvariant() + '/')
+    if ($ResourceUri -match '^/subscriptions/[^/]+/resourceGroups/([^/]+)(/|$)') { return $Matches[1] -ieq $ResourceGroup }
+    return $false
 }
 
 # Pure: the resource URI ('Microsoft.Resources'.resourceUri) in a usage row's
