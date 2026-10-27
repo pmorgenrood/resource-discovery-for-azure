@@ -325,9 +325,8 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
 Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
     # Pure decision function behind the wrapper's up-front access gate. Given the
     # per-sub role check records (State in Readable/NoAccess/Disagree/Unknown),
-    # it decides whether the run must STOP (default) or may proceed skipping the
-    # inaccessible subs
-    # (-AllowPartialAccess). 'Readable' means the identity CAN read the sub.
+    # it decides which subs the run skips, and that the run must STOP when none
+    # is readable. 'Readable' means the identity CAN read the sub.
     It 'does not block when every subscription is readable (all Readable)' {
         $Probed = @(
             [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
@@ -338,15 +337,26 @@ Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
         @($D.Inaccessible).Count | Should -Be 0
     }
 
-    It 'blocks by default when any subscription is NoAccess' {
+    It 'skips a NoAccess subscription and does not block while another is readable' {
         $Probed = @(
             [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
             [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'NoAccess' }
         )
         $D = Resolve-AccessPreflight -Probed $Probed
-        $D.ShouldBlock | Should -BeTrue -Because 'the default gate must stop the run when the identity cannot read a sub'
+        $D.ShouldBlock | Should -BeFalse -Because 'the run skips the unreadable sub and collects the readable one'
         @($D.Inaccessible).Count | Should -Be 1
         $D.InaccessibleIds | Should -Contain 's2'
+        $D.ReadableCount | Should -Be 1
+    }
+
+    It 'blocks when no checked subscription is readable' {
+        $Probed = @(
+            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'NoAccess' }
+            [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'Disagree' }
+        )
+        $D = Resolve-AccessPreflight -Probed $Probed
+        $D.ShouldBlock | Should -BeTrue -Because 'with nothing readable the run stops with exit 1'
+        $D.ReadableCount | Should -Be 0
     }
 
     It 'treats a persistent Unknown as inaccessible (never silently skipped)' {
@@ -356,14 +366,14 @@ Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
         $D.InaccessibleIds | Should -Contain 's1'
     }
 
-    It 'does NOT block when -AllowPartialAccess is set, but still reports the inaccessible subs to skip' {
+    It 'does not block while one subscription is readable, and reports every inaccessible sub to skip' {
         $Probed = @(
             [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
             [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'NoAccess' }
             [pscustomobject]@{ Id = 's3'; Name = 'Three'; State = 'Unknown' }
         )
-        $D = Resolve-AccessPreflight -Probed $Probed -AllowPartialAccess
-        $D.ShouldBlock | Should -BeFalse -Because '-AllowPartialAccess lets the run proceed with the accessible subs'
+        $D = Resolve-AccessPreflight -Probed $Probed
+        $D.ShouldBlock | Should -BeFalse -Because 'the run proceeds with the accessible subs'
         @($D.Inaccessible).Count | Should -Be 2
         $D.InaccessibleIds | Should -Contain 's2'
         $D.InaccessibleIds | Should -Contain 's3'

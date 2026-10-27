@@ -949,40 +949,42 @@ function Test-SubscriptionRoleAccessAll
     return $RoleRecords.ToArray()
 }
 
-# Decide, from the up-front role check records, whether the run may proceed.
-# Pure (no Azure calls) so the policy is unit-testable. A subscription is
-# "inaccessible" unless its State is 'Readable', so a record that is not
-# understood also stops the run. Returns:
-#   Inaccessible    - the records the identity cannot (or may not) read
-#   InaccessibleIds - the ids to drop from scope when -AllowPartialAccess is set
-#   ShouldBlock     - $true when there is >=1 inaccessible sub AND
-#                     -AllowPartialAccess was NOT set: the caller must STOP.
+# Decide, from the up-front role check records, which subscriptions the run
+# skips and whether it may proceed. Pure (no Azure calls) so the policy is
+# unit-testable. A subscription is not readable unless its State is
+# 'Readable', so a record that is not understood is skipped too. Returns:
+#   Inaccessible    - the records the identity cannot (or may not) read; the
+#                     run skips them
+#   InaccessibleIds - their ids, to drop from scope
+#   ReadableCount   - how many checked subscriptions are readable
+#   ShouldBlock     - $true when subscriptions were checked and none is
+#                     readable: the caller must STOP with exit code 1.
 function Resolve-AccessPreflight
 {
-    param(
-        [object]$Probed,
-        [switch]$AllowPartialAccess
-    )
-    $Inaccessible = @(@($Probed) | Where-Object { $_ -and $_.State -ne 'Readable' })
+    param([object]$Probed)
+    $Checked = @(@($Probed) | Where-Object { $_ })
+    $Inaccessible = @($Checked | Where-Object { $_.State -ne 'Readable' })
     return [pscustomobject]@{
         Inaccessible    = $Inaccessible
         InaccessibleIds = @($Inaccessible | ForEach-Object { $_.Id })
-        ShouldBlock     = ($Inaccessible.Count -gt 0 -and -not $AllowPartialAccess)
+        ReadableCount   = $Checked.Count - $Inaccessible.Count
+        ShouldBlock     = ($Inaccessible.Count -gt 0 -and $Inaccessible.Count -eq $Checked.Count)
     }
 }
 
 # Print the result of the up-front role check. Shared by Run-AllSubscriptions.ps1
 # and direct runs of ResourceInventory.ps1 so the wording is the same in both.
-# Prints only: the caller exits with code 1 when $Decision.ShouldBlock is $true.
-# -DirectRun leaves out the -AllowPartialAccess hint (only Run-AllSubscriptions.ps1
-# has that switch); -ResourceGroup words the lines for that resource group.
+# Lists every subscription that is not readable with its reason and the fix
+# for each cause; then says they are skipped, or, when none is readable
+# ($Decision.ShouldBlock), that the run stops. Prints only: the caller skips
+# them or exits with code 1. -ResourceGroup words the lines for that resource
+# group.
 function Write-AccessPreflightReport
 {
     param(
         [Parameter(Mandatory = $true)]$Decision,
         [Parameter(Mandatory = $true)][int]$ScopeCount,
-        [string]$ResourceGroup,
-        [switch]$DirectRun
+        [string]$ResourceGroup
     )
     $ForResourceGroup = -not [string]::IsNullOrEmpty($ResourceGroup)
     $Inaccessible = @($Decision.Inaccessible)
@@ -1012,44 +1014,65 @@ function Write-AccessPreflightReport
         $Label = if (-not [string]::IsNullOrEmpty([string]$NA.Reason)) { [string]$NA.Reason } else { 'not readable' }
         Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
     }
+
+    # The fix depends on why each subscription failed: a missing role
+    # (NoAccess, including NotFound for a resource group run), a check that
+    # could not finish (Unknown), or the two answers disagreeing (Disagree).
+    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' } else { 'Grant the identity Reader on these subscriptions, then re-run.' }
+    $Remedies = [ordered]@{
+        NoAccess = $NoAccessText
+        Unknown  = 'The role check could not finish (the reason above says why); re-run.'
+        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.'
+    }
+    $ByCause = [ordered]@{}
+    foreach ($NA in $Inaccessible)
+    {
+        $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
+        if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
+        $ByCause[$Cause] += [string]$NA.Name
+    }
+    $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
     if ($Decision.ShouldBlock)
     {
-        # The fix depends on why each subscription failed: a missing role
-        # (NoAccess, including NotFound for a resource group run), a check that
-        # could not finish (Unknown), or the two answers disagreeing (Disagree).
-        $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' } else { 'Grant the identity Reader on these subscriptions, then re-run.' }
-        $Remedies = [ordered]@{
-            NoAccess = $NoAccessText
-            Unknown  = 'The role check could not finish (the reason above says why); re-run.'
-            Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.'
-        }
-        $ByCause = [ordered]@{}
-        foreach ($NA in $Inaccessible)
-        {
-            $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
-            if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
-            $ByCause[$Cause] += [string]$NA.Name
-        }
-        $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
-        if ($Causes.Count -eq 1)
-        {
-            Write-Host ('  Stopping before any work. {0}' -f $Remedies[$Causes[0]]) -ForegroundColor Red
-        }
-        else
-        {
-            Write-Host '  Stopping before any work.' -ForegroundColor Red
-            foreach ($Cause in $Causes)
-            {
-                Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor Red
-            }
-        }
-        if (-not $DirectRun)
-        {
-            Write-Host "  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)" -ForegroundColor Red
-        }
-        return
+        $Lead = '  No subscription is readable. Stopping before any work.'
+        $Colour = 'Red'
     }
-    Write-Host "  -AllowPartialAccess set: skipping the above and continuing with the accessible subscription(s)." -ForegroundColor Yellow
+    else
+    {
+        $Lead = '  Skipping them and continuing with the {0} readable subscription(s). To include them:' -f $Decision.ReadableCount
+        $Colour = 'Yellow'
+    }
+    if ($Causes.Count -eq 1)
+    {
+        Write-Host ('{0} {1}' -f $Lead, $Remedies[$Causes[0]]) -ForegroundColor $Colour
+    }
+    else
+    {
+        Write-Host $Lead -ForegroundColor $Colour
+        foreach ($Cause in $Causes)
+        {
+            Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
+        }
+    }
+}
+
+# End-of-run list of the subscriptions the up-front role check skipped
+# because the identity cannot read them, so a report without them is not
+# taken for a complete one. Shared by Run-AllSubscriptions.ps1 and direct
+# runs of ResourceInventory.ps1. Prints nothing when none was skipped.
+function Write-SkippedSubscriptionSummary
+{
+    param($Decision)
+    $Skipped = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ } })
+    if ($Skipped.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host ('Subscriptions skipped (not readable by the signed-in identity): {0} - they are not in this report:' -f $Skipped.Count) -ForegroundColor Yellow
+    foreach ($Sub in $Skipped)
+    {
+        $Label = if (-not [string]::IsNullOrEmpty([string]$Sub.Reason)) { [string]$Sub.Reason } else { 'not readable' }
+        Write-Host ('  - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
+    }
+    Write-Host '  To include them, fix the access as the start of the run says, then re-run.' -ForegroundColor Yellow
 }
 
 # After a consumption data check refusal, say per failing subscription what the

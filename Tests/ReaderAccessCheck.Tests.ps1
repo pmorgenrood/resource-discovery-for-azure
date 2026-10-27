@@ -6,7 +6,8 @@
 # read, so Run-AllSubscriptions.ps1 and direct runs of ResourceInventory.ps1
 # decide read access per subscription from two answers - the identity's own
 # role assignments (with their role definitions) and Azure's caller-permissions
-# answer - and stop with exit code 1 unless the combination shows read access.
+# answer - and skip every subscription the combination does not show as
+# readable, stopping with exit code 1 only when none is readable.
 #
 # The Az cmdlets are replaced by local stub functions and Pester mocks, so the
 # tests run offline and without the Az modules installed.
@@ -600,15 +601,17 @@ Describe 'Get-RoleCheckCallerObjectId' {
 }
 
 Describe 'Resolve-AccessPreflight' {
-    It 'treats every state other than Readable as not readable' {
+    It 'treats every state other than Readable as not readable, and blocks only when none is readable' {
         $Probed = @(
             [pscustomobject]@{ Id = 's1'; State = 'Readable' }
             [pscustomobject]@{ Id = 's2'; State = 'Disagree' }
             [pscustomobject]@{ Id = 's3'; State = 'SomethingNew' }
         )
         $D = Resolve-AccessPreflight -Probed $Probed
-        $D.ShouldBlock | Should -BeTrue
+        $D.ShouldBlock | Should -BeFalse
         $D.InaccessibleIds | Should -Be @('s2', 's3')
+        $D.ReadableCount | Should -Be 1
+        (Resolve-AccessPreflight -Probed @($Probed[1], $Probed[2])).ShouldBlock | Should -BeTrue
     }
 }
 
@@ -623,17 +626,27 @@ Describe 'Write-AccessPreflightReport' {
         }
     }
 
-    It 'does not offer -AllowPartialAccess to a direct run' {
-        Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1 -DirectRun
+    It 'stops when no subscription is readable, and offers no switch' {
+        Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1
         @($script:Lines) | Should -Be @(
             '  1 subscription(s) are NOT readable by the signed-in identity:'
             '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
-            '  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
+            '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
+        )
+    }
+
+    It 'skips the subscriptions that are not readable and says how to include them' {
+        $Decision = [pscustomobject]@{ Inaccessible = $script:Blocked.Inaccessible; InaccessibleIds = @('sub-b'); ReadableCount = 2; ShouldBlock = $false }
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 3
+        @($script:Lines) | Should -Be @(
+            '  1 subscription(s) are NOT readable by the signed-in identity:'
+            '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
+            '  Skipping them and continuing with the 2 readable subscription(s). To include them: Grant the identity Reader on these subscriptions, then re-run.'
         )
     }
 
     It 'words a resource group run' {
-        Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1 -ResourceGroup 'rg-one' -DirectRun
+        Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1 -ResourceGroup 'rg-one'
         $script:Lines[0] | Should -Be "  Resource group 'rg-one' is NOT readable by the signed-in identity in 1 subscription(s):"
         ($script:Lines -join "`n") | Should -Not -Match 'AllowPartialAccess'
     }
@@ -652,9 +665,8 @@ Describe 'Write-AccessPreflightReport' {
             ShouldBlock     = $true
         }
         Write-AccessPreflightReport -Decision $Decision -ScopeCount 1 -ResourceGroup $Rg
-        $script:Lines[2] | Should -Be $Fix
-        $script:Lines[3] | Should -Be '  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)'
-        $script:Lines.Count | Should -Be 4
+        $script:Lines[2] | Should -Be ('  No subscription is readable. ' + $Fix.TrimStart())
+        $script:Lines.Count | Should -Be 3
     }
 
     It 'gives one fix per cause, naming the subscriptions, when the causes differ' {
@@ -665,14 +677,20 @@ Describe 'Write-AccessPreflightReport' {
                 [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; State = 'Unknown'; Verdict = 'Unknown'; Reason = 'role check inconclusive after retries (caller permissions: HTTP 429)' }
             )
             InaccessibleIds = @('sub-b', 'sub-c', 'sub-d')
-            ShouldBlock     = $true
+            ReadableCount   = 1
+            ShouldBlock     = $false
         }
-        Write-AccessPreflightReport -Decision $Decision -ScopeCount 4 -DirectRun
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 4
         @($script:Lines | Select-Object -Skip 4) | Should -Be @(
-            '  Stopping before any work.'
+            '  Skipping them and continuing with the 1 readable subscription(s). To include them:'
             '    Charlie: Grant the identity Reader on these subscriptions, then re-run.'
             '    Bravo, Delta: The role check could not finish (the reason above says why); re-run.'
         )
+        $script:Lines.Clear()
+        $Decision.ShouldBlock = $true
+        $Decision.ReadableCount = 0
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 3
+        $script:Lines[4] | Should -Be '  No subscription is readable. Stopping before any work.'
     }
 }
 
@@ -807,23 +825,25 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         Get-Command Get-SubscriptionAccessState -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
 
-    It 'prints the stop lines, with the fix for each cause, and exits 1' {
-        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+    It 'skips the subscriptions that are not readable, with the fix for each cause, and continues' {
+        . $script:GateBlock
+        Should -Invoke Exit-Wrapper -Times 0 -Exactly
         $Summary = @($script:Lines | Where-Object { $_ -notlike '  `[*' })
         $Summary | Should -Be @(
             'Verifying subscription access up front for 3 subscription(s)...'
             '  2 subscription(s) are NOT readable by the signed-in identity:'
             '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
             '    - Charlie (sub-c) - role check inconclusive after retries (caller permissions: HTTP 429)'
-            '  Stopping before any work.'
+            '  Skipping them and continuing with the 1 readable subscription(s). To include them:'
             '    Bravo: Grant the identity Reader on these subscriptions, then re-run.'
             '    Charlie: The role check could not finish (the reason above says why); re-run.'
-            '  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)'
         )
         $script:Lines[1] | Should -BeLike '  `[Pass`] Alpha - Read access: Reader at subscription (*s)'
+        @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
+        @($AccessDecision.InaccessibleIds) | Should -Be @('sub-b', 'sub-c')
     }
 
-    It 'stops for a role that reads all but some resource types, and skips it under -AllowPartialAccess' {
+    It 'skips a role that reads all but some resource types, with or without -AllowPartialAccess' {
         Set-RoleScenario -Assignments @(
             @{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }
             @{ Role = 'NoComputeRead'; Scope = '/subscriptions/sub-b' }
@@ -832,8 +852,9 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
             '/subscriptions/sub-b' = @{ Status = 200; Roles = @('NoComputeRead') }
         }
         $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
-        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+        . $script:GateBlock
         $script:Lines | Should -Contain "    - Bravo (sub-b) - role 'Reader without Compute' at subscription excludes 'Microsoft.Compute/*/read'; the inventory would miss those resources"
+        @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
 
         $script:Lines.Clear()
         $script:AllowPartialAccess = $true
@@ -842,20 +863,21 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
     }
 
-    It 'skips the failing subscriptions under -AllowPartialAccess' {
+    It 'skips the failing subscriptions the same way under -AllowPartialAccess' {
         $script:AllowPartialAccess = $true
         . $script:GateBlock
         Should -Invoke Exit-Wrapper -Times 0 -Exactly
-        $script:Lines[-1] | Should -Be '  -AllowPartialAccess set: skipping the above and continuing with the accessible subscription(s).'
+        $script:Lines[-1] | Should -Be '    Charlie: The role check could not finish (the reason above says why); re-run.'
         @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
         @($AccessProbed).Count | Should -Be 3
     }
 
-    It 'stops when -AllowPartialAccess leaves no subscription' {
-        $script:AllowPartialAccess = $true
-        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
+    It 'stops with exit 1 when no subscription is readable (<Case>)' -TestCases @(@{ Case = 'default'; Allow = $false }, @{ Case = '-AllowPartialAccess'; Allow = $true }) {
+        param($Case, $Allow)
+        $script:AllowPartialAccess = $Allow
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' })
         { . $script:GateBlock } | Should -Throw 'EXIT 1'
-        $script:Lines[-1] | Should -Be 'No accessible subscriptions remain in scope; nothing to process.'
+        $script:Lines | Should -Contain '  No subscription is readable. Stopping before any work.'
     }
 
     It 'confirms when every subscription is readable, with the usage verdict when consumption is requested' {
@@ -921,18 +943,43 @@ Describe 'ResourceInventory.ps1 direct run' {
         # nothing past it runs.
         $script:Harness = Join-Path $TestDrive 'harness.ps1'
         @'
-param([string]$Root, [string]$Out, [string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd)
+param([string]$Root, [string]$Out, [string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd, [int]$SubCount = 1, [string]$Unreadable = '', [switch]$GraphData)
 $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
 $Global:PlatformOS = 'PowerShell Unix'
+# The stand-ins below are functions of this runspace, so the up-front checks
+# run one subscription at a time here (parallel runspaces would not see them).
+$Global:PSDefaultParameterValues = @{ 'Test-SubscriptionRoleAccessAll:ThrottleLimit' = 1; 'Invoke-ConsumptionDataCheck:ThrottleLimit' = 1 }
 $TestSub = '12345678-1234-1234-1234-123456789012'
+# Subscription N (from 1): ...1234567890<11+N>, so subscription 1 is $TestSub.
+$Global:TestSubs = @(1..$SubCount | ForEach-Object { [pscustomobject]@{ id = ('12345678-1234-1234-1234-1234567890{0:d2}' -f (11 + $_)); name = $(if ($SubCount -eq 1) { 'Placeholder subscription' } else { 'Placeholder subscription {0}' -f $_ }); tenantId = $TestSub } })
+$Global:UnreadableIds = @(($Unreadable -split ',') | Where-Object { $_ } | ForEach-Object { $Global:TestSubs[[int]$_ - 1].id })
 function global:az
 {
     $Joined = $args -join ' '
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
-    if ($Joined -like 'account list*') { return ('[{{"id":"{0}","name":"Placeholder subscription","tenantId":"{0}"}}]' -f $TestSub) }
-    if ($Joined -like 'graph*') { Set-Content -Path $env:RDA_TEST_INVENTORY_MARKER -Value 'inventory started'; exit 3 }
+    if ($Joined -like 'account list*') { return (ConvertTo-Json -InputObject @($Global:TestSubs) -Compress) }
+    if ($Joined -like 'graph*' -and -not $env:RDA_TEST_GRAPH_DATA) { Set-Content -Path $env:RDA_TEST_INVENTORY_MARKER -Value 'inventory started'; exit 3 }
+    if ($Joined -like 'graph*')
+    {
+        # One resource in each visible subscription; no AVD resources.
+        Set-Content -Path $env:RDA_TEST_INVENTORY_MARKER -Value 'inventory started'
+        $global:LASTEXITCODE = 0
+        if ($Joined -match 'desktopvirtualizationresources') { return '{"data":[{"count_":0}],"count":1}' }
+        if ($Joined -match 'summarize count\(\)') { return ('{{"data":[{{"count_":{0}}}],"count":1}}' -f $Global:TestSubs.Count) }
+        $Rows = @($Global:TestSubs | ForEach-Object { @{ id = ('/subscriptions/{0}/resourcegroups/rg-1/providers/microsoft.network/networksecuritygroups/nsg-1' -f $_.id); name = 'nsg-1'; type = 'microsoft.network/networksecuritygroups'; subscriptionId = $_.id; resourceGroup = 'rg-1' } })
+        return (@{ data = $Rows; count = $Rows.Count } | ConvertTo-Json -Depth 5 -Compress)
+    }
     return $null
+}
+# Reached right after the setup phase (inventory collected): records what was
+# collected, then stops the run.
+function global:Start-Transcript
+{
+    param($Path, [switch]$UseMinimalHeader)
+    @{ ResourceSubscriptions = @($Global:Resources | ForEach-Object { [string]$_.subscriptionId } | Sort-Object -Unique); Subscriptions = @($Global:Subscriptions | ForEach-Object { [string]$_.id }) } |
+        ConvertTo-Json -Compress | Set-Content -Path $env:RDA_TEST_COLLECTED
+    exit 4
 }
 function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
@@ -942,10 +989,12 @@ function global:Invoke-AzRestMethod
     param($Method, $Path, $Payload, $Uri)
     $Target = if ($Path) { $Path } else { $Uri }
     $Json = { param($Obj) [pscustomobject]@{ StatusCode = 200; Content = ($Obj | ConvertTo-Json -Depth 10) } }
+    $CallSub = if ($Target -match '^/subscriptions/([^/?]+)') { $Matches[1] } else { $TestSub }
+    $Unreadable = $Global:UnreadableIds -contains $CallSub
     if ($Target -match '/roleAssignments\?')
     {
         Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'roles'
-        $Scope = switch ($env:RDA_TEST_ROLES) { 'reader' { "/subscriptions/$TestSub" } 'nocompute' { "/subscriptions/$TestSub" } 'rg' { "/subscriptions/$TestSub/resourceGroups/rg-one" } default { $null } }
+        $Scope = switch ($(if ($Unreadable) { 'none' } else { $env:RDA_TEST_ROLES })) { 'reader' { "/subscriptions/$CallSub" } 'nocompute' { "/subscriptions/$CallSub" } 'rg' { "/subscriptions/$CallSub/resourceGroups/rg-one" } default { $null } }
         $Definition = if ($env:RDA_TEST_ROLES -eq 'nocompute') { 'nocompute' } else { 'reader' }
         $Items = if ($Scope) { @(@{ properties = @{ roleDefinitionId = "/subscriptions/$TestSub/providers/Microsoft.Authorization/roleDefinitions/$Definition"; scope = $Scope; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) } else { @() }
         return (& $Json @{ value = $Items })
@@ -962,7 +1011,7 @@ function global:Invoke-AzRestMethod
     {
         $OnRg = $Target -match '/resourceGroups/'
         Add-Content -Path $env:RDA_TEST_CALL_LOG -Value ('permissions ' + $(if ($OnRg) { 'rg' } else { 'sub' }))
-        $Mode = if ($OnRg) { $env:RDA_TEST_PERM_RG } else { $env:RDA_TEST_PERM_SUB }
+        $Mode = if ($Unreadable) { 'none' } elseif ($OnRg) { $env:RDA_TEST_PERM_RG } else { $env:RDA_TEST_PERM_SUB }
         if ($Mode -eq '404') { return [pscustomobject]@{ StatusCode = 404; Content = '{}' } }
         $Entries = switch ($Mode) { 'read' { @(@{ actions = @('*/read'); notActions = @() }) } 'nocompute' { @(@{ actions = @('*/read'); notActions = @('Microsoft.Compute/*/read') }) } default { @() } }
         return (& $Json @{ value = $Entries })
@@ -970,6 +1019,7 @@ function global:Invoke-AzRestMethod
     if ($Target -match '/providers/Microsoft\.Commerce/UsageAggregates\?')
     {
         Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'usage'
+        Add-Content -Path ($env:RDA_TEST_CALL_LOG + '.usage-subs') -Value $CallSub
         $Query = [System.Web.HttpUtility]::ParseQueryString(([uri]('https://management.example.test' + $Target)).Query)
         Add-Content -Path $env:RDA_TEST_USAGE_WINDOW -Value ('{0} {1}' -f $Query['reportedStartTime'].Substring(0, 10), $Query['reportedEndTime'].Substring(0, 10))
         # 'in-rg' and 'other-rg' rows carry a resource in resource group RG-ONE or rg-two.
@@ -980,7 +1030,7 @@ function global:Invoke-AzRestMethod
         return (& $Json @{ value = $Rows })
     }
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'resource counts'
-    [pscustomobject]@{ StatusCode = 200; Content = ('{{"data":[{{"subscriptionId":"{0}","ResourceCount":4}}]}}' -f $TestSub) }
+    & $Json @{ data = @(@(($Payload | ConvertFrom-Json).subscriptions) | ForEach-Object { @{ subscriptionId = $_; ResourceCount = 4 } }) }
 }
 $env:RDA_TEST_ROLES = $Roles
 $env:RDA_TEST_PERM_SUB = $PermSub
@@ -993,18 +1043,20 @@ if ($SkipConsumption) { $Extra.SkipConsumption = $true }
 if ($RunAllSubs) { $Extra.RunAllSubs = $true }
 if ($WindowStart) { $Extra.ConsumptionWindowStart = $WindowStart }
 if ($WindowEnd) { $Extra.ConsumptionWindowEnd = $WindowEnd }
+if ($GraphData) { $env:RDA_TEST_GRAPH_DATA = '1' }
 & (Join-Path $Root 'ResourceInventory.ps1') -OutputDirectory $Out @Extra
 exit $LASTEXITCODE
 '@ | Set-Content -Path $script:Harness -Encoding utf8
 
         function Invoke-DirectRun
         {
-            param([string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd)
+            param([string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd, [int]$SubCount = 1, [string]$Unreadable = '', [switch]$GraphData)
             $Out = Join-Path $TestDrive ('out-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             New-Item -ItemType Directory -Path $Out -Force | Out-Null
             $env:RDA_TEST_INVENTORY_MARKER = Join-Path $Out 'inventory.marker'
             $env:RDA_TEST_CALL_LOG = Join-Path $Out 'calls.log'
             $env:RDA_TEST_USAGE_WINDOW = Join-Path $Out 'usage-window.log'
+            $env:RDA_TEST_COLLECTED = Join-Path $Out 'collected.json'
             $PwshArgs = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Root', $script:RepoRoot, '-Out', $Out, '-Roles', $Roles, '-PermSub', $PermSub, '-PermRg', $PermRg, '-Usage', $Usage)
             if ($ResourceGroup) { $PwshArgs += @('-ResourceGroup', $ResourceGroup) }
             if ($SkipConsumption) { $PwshArgs += '-SkipConsumption' }
@@ -1012,6 +1064,8 @@ exit $LASTEXITCODE
             if ($NoSubscriptionId) { $PwshArgs += '-NoSubscriptionId' }
             if ($WindowStart) { $PwshArgs += @('-WindowStart', $WindowStart) }
             if ($WindowEnd) { $PwshArgs += @('-WindowEnd', $WindowEnd) }
+            $PwshArgs += @('-SubCount', $SubCount, '-Unreadable', $Unreadable)
+            if ($GraphData) { $PwshArgs += '-GraphData' }
             Push-Location $script:RepoRoot
             try { $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String }
             finally { Pop-Location }
@@ -1023,12 +1077,14 @@ exit $LASTEXITCODE
                 Calls            = $Calls
                 RoleCalls        = @($Calls | Where-Object { $_ -eq 'roles' -or $_ -like 'permissions *' })
                 UsageWindows     = $(if (Test-Path -Path $env:RDA_TEST_USAGE_WINDOW) { @(Get-Content -Path $env:RDA_TEST_USAGE_WINDOW) } else { @() })
+                UsageSubs        = $(if (Test-Path -Path ($env:RDA_TEST_CALL_LOG + '.usage-subs')) { @(Get-Content -Path ($env:RDA_TEST_CALL_LOG + '.usage-subs')) } else { @() })
+                Collected        = $(if (Test-Path -Path $env:RDA_TEST_COLLECTED) { Get-Content -Path $env:RDA_TEST_COLLECTED -Raw | ConvertFrom-Json } else { $null })
             }
         }
     }
 
     AfterAll {
-        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_CALL_LOG, Env:\RDA_TEST_USAGE_WINDOW -ErrorAction SilentlyContinue
+        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_CALL_LOG, Env:\RDA_TEST_USAGE_WINDOW, Env:\RDA_TEST_COLLECTED -ErrorAction SilentlyContinue
     }
 
     It 'checks the roles before the consumption check, then continues into inventory' {
@@ -1153,5 +1209,86 @@ exit $LASTEXITCODE
         $Own = Format-ConsumptionWindow -Window (Get-ConsumptionWindow)
         $Run.UsageWindows | Should -Be @($Own -replace ' to ', ' ')
         $Run.Output | Should -Match 'Ignoring -ConsumptionWindowStart'
+    }
+
+    It 'skips an unreadable subscription in a run over every visible subscription, checks usage for the others, and continues' {
+        # The harness's subscription N.
+        $SubId = { param($N) '12345678-1234-1234-1234-1234567890{0:d2}' -f (11 + $N) }
+        $Run = Invoke-DirectRun -NoSubscriptionId -SubCount 3 -Unreadable '2'
+        $Run.InventoryReached | Should -BeTrue
+        $Run.ExitCode | Should -Be 3
+        $Run.Output | Should -Match ([regex]::Escape('1 subscription(s) are NOT readable by the signed-in identity:'))
+        $Run.Output | Should -Match ([regex]::Escape(('- Placeholder subscription 2 ({0}) - no read access (role assignments not visible to this identity)' -f (& $SubId 2))))
+        $Run.Output | Should -Match ([regex]::Escape('Skipping them and continuing with the 2 readable subscription(s). To include them: Grant the identity Reader on these subscriptions, then re-run.'))
+        $Run.UsageSubs | Should -Be @((& $SubId 1), (& $SubId 3))
+        $Run.Output | Should -Match ([regex]::Escape('Verifying consumption data (usage values for'))
+        $Run.Output | Should -Match ([regex]::Escape(') for 2 subscription(s)...'))
+    }
+
+    It 'leaves a skipped subscription out of the subscriptions and the collected resources' {
+        $SubId = { param($N) '12345678-1234-1234-1234-1234567890{0:d2}' -f (11 + $N) }
+        $Run = Invoke-DirectRun -NoSubscriptionId -SubCount 3 -Unreadable '2' -GraphData -SkipConsumption
+        $Run.ExitCode | Should -Be 4
+        @($Run.Collected.Subscriptions) | Should -Be @((& $SubId 1), (& $SubId 3))
+        @($Run.Collected.ResourceSubscriptions) | Should -Be @((& $SubId 1), (& $SubId 3))
+    }
+
+    It 'collects every subscription when all are readable' {
+        $Run = Invoke-DirectRun -NoSubscriptionId -SubCount 3 -GraphData -SkipConsumption
+        $Run.ExitCode | Should -Be 4
+        @($Run.Collected.ResourceSubscriptions).Count | Should -Be 3
+        $Run.Output | Should -Match ([regex]::Escape('Access verified: all 3 in-scope subscription(s) are readable.'))
+    }
+
+    It 'stops with exit 1 before inventory when no visible subscription is readable' {
+        $Run = Invoke-DirectRun -NoSubscriptionId -SubCount 2 -Unreadable '1,2'
+        $Run.ExitCode | Should -Be 1
+        $Run.InventoryReached | Should -BeFalse
+        $Run.Calls | Should -Not -Contain 'usage'
+        $Run.Output | Should -Match ([regex]::Escape('No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'))
+    }
+
+    It 'stops with exit 1 for an unreadable -SubscriptionID even when other subscriptions are readable' {
+        $Run = Invoke-DirectRun -SubCount 3 -Unreadable '1'
+        $Run.ExitCode | Should -Be 1
+        $Run.InventoryReached | Should -BeFalse
+        $Run.RoleCalls | Should -Be @('roles', 'permissions sub')
+        $Run.Output | Should -Match ([regex]::Escape('No subscription is readable. Stopping before any work.'))
+    }
+}
+
+Describe 'Write-SkippedSubscriptionSummary (end-of-run list)' {
+    BeforeEach {
+        $script:Lines = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Lines.Add([string]$Object) }
+    }
+
+    It 'lists every skipped subscription with its reason' {
+        $Decision = Resolve-AccessPreflight -Probed @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha'; State = 'Readable' }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = 'NoAccess'; Reason = 'no role grants read access (roles visible: none)' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; State = 'Unknown'; Reason = 'role check inconclusive after retries (caller permissions: HTTP 429)' }
+        )
+        Write-SkippedSubscriptionSummary -Decision $Decision
+        @($script:Lines) | Should -Be @(
+            ''
+            'Subscriptions skipped (not readable by the signed-in identity): 2 - they are not in this report:'
+            '  - Bravo (sub-b) - no role grants read access (roles visible: none)'
+            '  - Charlie (sub-c) - role check inconclusive after retries (caller permissions: HTTP 429)'
+            '  To include them, fix the access as the start of the run says, then re-run.'
+        )
+    }
+
+    It 'prints nothing when none was skipped or there was no check' {
+        Write-SkippedSubscriptionSummary -Decision (Resolve-AccessPreflight -Probed @([pscustomobject]@{ Id = 'sub-a'; State = 'Readable' }))
+        Write-SkippedSubscriptionSummary -Decision $null
+        $script:Lines.Count | Should -Be 0
+    }
+
+    It 'is called at the end of both scripts with the role check decision, after the counts in the wrapper' {
+        $Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green') + '\s*\r?\n(#[^\n]*\n)*Write-SkippedSubscriptionSummary -Decision \$AccessDecision')
+        $Direct = Get-Content -Path (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $Direct.TrimEnd() | Should -Match 'Write-SkippedSubscriptionSummary -Decision \$script:AccessSkipped$'
     }
 }

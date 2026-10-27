@@ -28,7 +28,8 @@ Per subscription, the collector:
 ### Up-front consumption data check
 
 Before any inventory or metrics work, both entry points check that every
-subscription in the run returns at least one usage row with a quantity above
+subscription in the run (every one the up-front role check found readable;
+the others are skipped) returns at least one usage row with a quantity above
 zero for this same window, and stop with exit code 1 if one does not, unless
 the up-front role check confirmed the usage permission for it (it then passes
 with a warning and an empty consumption sheet). The window is worked out

@@ -19,16 +19,12 @@ param (
     [switch]$ResumeFailedOnly,
     [switch]$IncludeDisabled,
 
-    # By DEFAULT the wrapper verifies control-plane read access to EVERY in-scope
-    # subscription up front (one cheap native ARM resource-group read per sub)
-    # and HARD-STOPS
-    # before doing any work if the signed-in identity cannot read one or more of
-    # them - so an auth/permission gap is surfaced and fixed up front instead of
-    # producing a report silently missing subscriptions (and risking the
-    # consumption cross-attribution class of bug). Pass -AllowPartialAccess to
-    # override that gate: the inaccessible subscriptions are SKIPPED (listed
-    # loudly in the summary) and the run proceeds with the accessible ones. Use
-    # this only when you intentionally have Reader on a subset of the tenant.
+    # Accepted so existing command lines keep working; it changes nothing.
+    # Skipping is the default: the wrapper checks up front that the signed-in
+    # identity can read every in-scope subscription (its role assignments and
+    # Azure's effective permissions), SKIPS each one it cannot read (listed
+    # with the reason right after the check and again at the end of the run)
+    # and collects the rest. When none is readable the run stops with exit 1.
     [switch]$AllowPartialAccess,
 
     # DEPRECATED / no-op: the aggregate "main" HTML summary (run-wide totals, a
@@ -831,19 +827,22 @@ if ($ResumeFailedOnly)
 # assignments and Azure's caller-permissions answer, combined). Azure Resource
 # Graph returns 0 rows (not a 403) for a subscription the identity cannot read,
 # so a permission gap is otherwise invisible until the report comes back
-# silently missing subscriptions. By default any subscription that fails
-# HARD-STOPS the run so the operator fixes access first; -AllowPartialAccess
-# overrides that to skip the failing ones and continue. On -Resume only the
-# subscriptions this run will actually process (not already-completed ones) are
-# checked. Runs once in the parent, before the sequential/parallel split, so it
-# gates both. The records are kept for the end-of-run 0-resource labels.
+# silently missing subscriptions. A subscription that fails is skipped: it is
+# listed with the reason and the fix right after the check, and again at the
+# end of the run (Write-SkippedSubscriptionSummary). When none of the checked
+# subscriptions is readable the run stops with exit 1. -AllowPartialAccess is
+# accepted and changes nothing. On -Resume only the subscriptions this run will
+# actually process (not already-completed ones) are checked. Runs once in the
+# parent, before the sequential/parallel split, so it gates both. The records
+# are kept for the end-of-run 0-resource labels.
 $AccessProbed = @()
+$AccessDecision = $null
 $ScopeForProbe = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
 if ($ScopeForProbe.Count -gt 0)
 {
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $ScopeForProbe.Count) -ForegroundColor Cyan
     $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ScopeForProbe -IncludeUsage:(-not $SkipConsumption))
-    $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed -AllowPartialAccess:$AllowPartialAccess
+    $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed
     Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount $ScopeForProbe.Count
     if ($AccessDecision.ShouldBlock)
     {
@@ -852,11 +851,6 @@ if ($ScopeForProbe.Count -gt 0)
     if ($AccessDecision.Inaccessible.Count -gt 0)
     {
         $Subscriptions = @($Subscriptions | Where-Object { $AccessDecision.InaccessibleIds -notcontains $_.Id })
-        if ($Subscriptions.Count -eq 0)
-        {
-            Write-Host "No accessible subscriptions remain in scope; nothing to process." -ForegroundColor Yellow
-            Exit-Wrapper -Code 1
-        }
     }
 }
 
@@ -879,8 +873,8 @@ if ($ScopeForProbe.Count -gt 0)
 # (outcome NoUsage, listed again in the summary) only when its role
 # assignments AND Azure's caller permissions both grant the usage permission
 # at the subscription or above; otherwise it stops the run as above.
-# -AllowPartialAccess does not bypass it. On -Resume only the subscriptions
-# this run will process are checked.
+# Subscriptions the role check skipped are not checked. On -Resume only the
+# subscriptions this run will process are checked.
 #
 # The window is computed once here and passed to every ResourceInventory.ps1
 # this run starts (-ConsumptionWindowStart/-ConsumptionWindowEnd in
@@ -1786,6 +1780,9 @@ if ($Resume)
     Write-Host ("Subscriptions Skipped:   {0} (already completed)" -f $SkippedCount) -ForegroundColor Green
 }
 Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green
+# Subscriptions the up-front role check skipped (not readable), listed again
+# so a report without them is not taken for a complete one.
+Write-SkippedSubscriptionSummary -Decision $AccessDecision
 
 # Surface the per-subscription resource-count result so the user does not have
 # to scan individual transcripts to find subs that came back empty.
@@ -1794,9 +1791,8 @@ $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
 # Initialised here (not only inside the 0-resource branch below) so the
 # run-summary finalization can read them unconditionally even when there
 # were no empty subscriptions to classify. $NoAccessSubs stays empty: a
-# subscription the identity cannot read is stopped (or, with
-# -AllowPartialAccess, skipped) by the up-front role check and never reaches
-# this point.
+# subscription the identity cannot read is skipped by the up-front role check
+# and never reaches this point.
 $NoAccessSubs = @()
 $GenuinelyEmptySubs = @()
 $UnknownSubs = @()

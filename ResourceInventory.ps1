@@ -715,7 +715,11 @@ Function RunInventorySetup()
     #    that resource group is enough for such a run. -ResourceGroup without
     #    -SubscriptionID is refused by ResourceInventoryLoop, so it is not
     #    checked here. When consumption is requested the usage permission is
-    #    printed too, for information.
+    #    printed too, for information. A subscription that is not readable is
+    #    skipped: listed with the reason right after the check and again at
+    #    the end of the run, left out of the consumption check, and its
+    #    resources are left out of the inventory. When none is readable (for
+    #    example the one -SubscriptionID names) the run stops with exit 1.
     # 2. Consumption: unless -SkipConsumption, every in-scope subscription must
     #    return usage values (Invoke-ConsumptionDataCheck) for the run's
     #    window. With -ResourceGroup only that resource group's usage rows
@@ -750,10 +754,16 @@ Function RunInventorySetup()
             }
             $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ConsumptionCheckScope -ResourceGroup $ResourceGroup -IncludeUsage:(-not $SkipConsumption.IsPresent))
             $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed
-            Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount @($ConsumptionCheckScope).Count -ResourceGroup $ResourceGroup -DirectRun
+            Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount @($ConsumptionCheckScope).Count -ResourceGroup $ResourceGroup
             if ($AccessDecision.ShouldBlock)
             {
                 exit 1
+            }
+            if ($AccessDecision.Inaccessible.Count -gt 0)
+            {
+                $script:AccessSkipped = $AccessDecision
+                $ConsumptionCheckScope = @($ConsumptionCheckScope | Where-Object { $AccessDecision.InaccessibleIds -notcontains [string]$_.Id })
+                $Global:Subscriptions = @($Global:Subscriptions | Where-Object { $AccessDecision.InaccessibleIds -notcontains [string]$_.Id })
             }
         }
 
@@ -772,6 +782,15 @@ Function RunInventorySetup()
 
     ResourceInventoryLoop
     ResourceInventoryAvd
+
+    # A run over every visible subscription queries Resource Graph tenant-wide,
+    # which also returns whatever a skipped subscription's identity can partly
+    # read; leave those resources out, so a skipped subscription is not half
+    # reported.
+    if ($null -ne $script:AccessSkipped)
+    {
+        $Global:Resources = @($Global:Resources | Where-Object { $script:AccessSkipped.InaccessibleIds -notcontains [string]$_.subscriptionId })
+    }
 
     if ($Obfuscate.IsPresent)
     {
@@ -1926,5 +1945,7 @@ Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Succe
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
 
 # Direct runs only (the wrapper prints its own): subscriptions the up-front
-# consumption data check passed with no usage values.
+# consumption data check passed with no usage values, and subscriptions the
+# up-front role check skipped.
 Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult
+Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
