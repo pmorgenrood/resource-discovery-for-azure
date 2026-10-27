@@ -16,6 +16,14 @@ BeforeAll {
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
+    # These tests replace Azure with Pester mocks, which exist only in this
+    # runspace, so the up-front checks run one subscription at a time here.
+    # UpFrontChecksParallel.Tests.ps1 covers the parallel path.
+    $script:PSDefaultParameterValues = @{
+        'Test-SubscriptionRoleAccessAll:ThrottleLimit' = 1
+        'Invoke-ConsumptionDataCheck:ThrottleLimit'    = 1
+    }
+
     # Stubs so the mocks below have a command to replace when Az is absent.
     function Invoke-AzRestMethod { param($Method, $Path, $Payload, $Uri) }
     function Get-AzAccessToken { param($ResourceUrl) }
@@ -714,7 +722,7 @@ Describe 'Role check records feed the consumption data check' {
             if ($Target -like '/providers/Microsoft.ResourceGraph/*') { return (New-Response -Status 200 -Body @{ data = @(@{ subscriptionId = 'sub-a'; ResourceCount = 1 }) }) }
             Get-ScenarioResponse -Target $Target
         }
-        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
+        Mock Get-UsageAggregatesPage { [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
     }
 
     It '<Case>: outcome <Expected>' -TestCases @(
@@ -959,21 +967,20 @@ function global:Invoke-AzRestMethod
         $Entries = switch ($Mode) { 'read' { @(@{ actions = @('*/read'); notActions = @() }) } 'nocompute' { @(@{ actions = @('*/read'); notActions = @('Microsoft.Compute/*/read') }) } default { @() } }
         return (& $Json @{ value = $Entries })
     }
+    if ($Target -match '/providers/Microsoft\.Commerce/UsageAggregates\?')
+    {
+        Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'usage'
+        $Query = [System.Web.HttpUtility]::ParseQueryString(([uri]('https://management.example.test' + $Target)).Query)
+        Add-Content -Path $env:RDA_TEST_USAGE_WINDOW -Value ('{0} {1}' -f $Query['reportedStartTime'].Substring(0, 10), $Query['reportedEndTime'].Substring(0, 10))
+        # 'in-rg' and 'other-rg' rows carry a resource in resource group RG-ONE or rg-two.
+        $Uri = switch ($env:RDA_TEST_USAGE) { 'in-rg' { "/subscriptions/$TestSub/resourceGroups/RG-ONE/providers/Microsoft.Network/networkSecurityGroups/nsg-1" } 'other-rg' { "/subscriptions/$TestSub/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2" } default { $null } }
+        $Rows = if ($env:RDA_TEST_USAGE -eq 'values') { @(@{ properties = @{ quantity = 2 } }) }
+        elseif ($Uri) { @(@{ properties = @{ quantity = 2; instanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $Uri } } | ConvertTo-Json -Compress) } }) }
+        else { @() }
+        return (& $Json @{ value = $Rows })
+    }
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'resource counts'
     [pscustomobject]@{ StatusCode = 200; Content = ('{{"data":[{{"subscriptionId":"{0}","ResourceCount":4}}]}}' -f $TestSub) }
-}
-function global:Get-UsageAggregates
-{
-    param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
-    Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'usage'
-    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
-    Add-Content -Path $env:RDA_TEST_USAGE_WINDOW -Value ('{0} {1}' -f ([datetime]$ReportedStartTime).ToString('yyyy-MM-dd', $Invariant), ([datetime]$ReportedEndTime).ToString('yyyy-MM-dd', $Invariant))
-    # 'in-rg' and 'other-rg' rows carry a resource in resource group RG-ONE or rg-two.
-    $Uri = switch ($env:RDA_TEST_USAGE) { 'in-rg' { "/subscriptions/$TestSub/resourceGroups/RG-ONE/providers/Microsoft.Network/networkSecurityGroups/nsg-1" } 'other-rg' { "/subscriptions/$TestSub/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2" } default { $null } }
-    $Rows = if ($env:RDA_TEST_USAGE -eq 'values') { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2 } }) }
-    elseif ($Uri) { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2; InstanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $Uri } } | ConvertTo-Json -Compress) } }) }
-    else { @() }
-    [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
 }
 $env:RDA_TEST_ROLES = $Roles
 $env:RDA_TEST_PERM_SUB = $PermSub

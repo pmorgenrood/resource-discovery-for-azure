@@ -17,6 +17,14 @@ BeforeAll {
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
+    # These tests replace Azure with Pester mocks, which exist only in this
+    # runspace, so the up-front checks run one subscription at a time here.
+    # UpFrontChecksParallel.Tests.ps1 covers the parallel path.
+    $script:PSDefaultParameterValues = @{
+        'Test-SubscriptionRoleAccessAll:ThrottleLimit' = 1
+        'Invoke-ConsumptionDataCheck:ThrottleLimit'    = 1
+    }
+
     foreach ($Fn in @('Get-ConsumptionWindow', 'Get-ConsumptionCheckVerdict', 'Invoke-ConsumptionValueProbe', 'Invoke-ConsumptionDataCheck', 'Write-ConsumptionDataCheckReport'))
     {
         if (-not (Get-Command $Fn -CommandType Function -ErrorAction SilentlyContinue))
@@ -313,7 +321,7 @@ Describe 'Invoke-ConsumptionValueProbe and Get-ConsumptionCheckVerdict' {
     }
 
     It 'refuses an empty result (no error, zero rows)' {
-        Mock Get-UsageAggregates { New-UsagePage }
+        Mock Get-UsageAggregatesPage { New-UsagePage }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
         $Verdict.Outcome | Should -Be 'NoRows'
@@ -321,80 +329,154 @@ Describe 'Invoke-ConsumptionValueProbe and Get-ConsumptionCheckVerdict' {
     }
 
     It 'refuses when rows come back but every quantity is 0' {
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0, 0, 0) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0, 0, 0) }
         $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
         $Verdict.Outcome | Should -Be 'NoPositiveQuantity'
         $Verdict.Passed | Should -BeFalse
     }
 
     It 'passes on one positive row and queries the billing phase window with the same options' {
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0, 2.5) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0, 2.5) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Outcome | Should -Be 'Pass'
-        Should -Invoke Get-UsageAggregates -Times 1 -Exactly -ParameterFilter {
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly -ParameterFilter {
             $ReportedStartTime -eq $script:Window.Start -and $ReportedEndTime -eq $script:Window.End -and
             $AggregationGranularity -eq 'Daily' -and $ShowDetails -eq $true
         }
-        Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $Subscription -eq 'sub-a' -and $Scope -eq 'Process' }
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-a' }
     }
 
     It 'passes when the only positive row is on page 2, and stops paging there' {
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0, 0) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0, 7) -Token 'page3' } -ParameterFilter { $ContinuationToken -eq 'page2' }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(9) } -ParameterFilter { $ContinuationToken -eq 'page3' }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0, 0) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0, 7) -Token 'page3' } -ParameterFilter { $ContinuationToken -eq 'page2' }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(9) } -ParameterFilter { $ContinuationToken -eq 'page3' }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Outcome | Should -Be 'Pass'
         $Probe.PagesRead | Should -Be 2
-        Should -Invoke Get-UsageAggregates -Times 0 -Exactly -ParameterFilter { $ContinuationToken -eq 'page3' }
+        Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly -ParameterFilter { $ContinuationToken -eq 'page3' }
     }
 
     It 'refuses a permission error without retrying it' {
-        Mock Get-UsageAggregates { throw (New-StatusException -Message "The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'" -Status Forbidden) }
+        Mock Get-UsageAggregatesPage { throw (New-StatusException -Message "The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'" -Status Forbidden) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
         $Verdict.Outcome | Should -Be 'Denied'
         $Verdict.Passed | Should -BeFalse
-        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly
     }
 
     It 'passes when a transient failure is followed by success' {
         $script:Calls = 0
-        Mock Get-UsageAggregates {
+        Mock Get-UsageAggregatesPage {
             $script:Calls++
             if ($script:Calls -le 2) { throw (New-StatusException -Message 'Too many requests' -Status TooManyRequests) }
             New-UsagePage -Quantities @(1)
         }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Outcome | Should -Be 'Pass'
-        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
     It 'refuses a transient failure that persists after the bounded retries' {
-        Mock Get-UsageAggregates { throw (New-StatusException -Message 'Service unavailable' -Status ServiceUnavailable) }
+        Mock Get-UsageAggregatesPage { throw (New-StatusException -Message 'Service unavailable' -Status ServiceUnavailable) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxRetries 3
         $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
         $Verdict.Outcome | Should -Be 'Error'
         $Verdict.Passed | Should -BeFalse
-        Should -Invoke Get-UsageAggregates -Times 4 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 4 -Exactly
     }
 
     It 'refuses a 400 without retrying it' {
-        Mock Get-UsageAggregates { throw (New-CloudShapedException -Message 'InvalidInput: The reportedstarttime must have the time set to midnight (0:00:00Z).' -Status BadRequest) }
+        Mock Get-UsageAggregatesPage { throw (New-CloudShapedException -Message 'InvalidInput: The reportedstarttime must have the time set to midnight (0:00:00Z).' -Status BadRequest) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
         $Verdict.Outcome | Should -Be 'Error'
         $Verdict.Detail | Should -Match 'HTTP 400'
-        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly
         Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 
-    It 'refuses when the context cannot be switched to the subscription, without querying usage' {
-        Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'some-other-sub' } } }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(1) }
+    It 'names the subscription in its usage request and does not switch the Azure context' {
+        Mock Set-AzContext { throw 'no context switch expected' }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(1) }
         $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
+        $Verdict.Outcome | Should -Be 'Pass'
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-a' }
+        Should -Invoke Set-AzContext -Times 0 -Exactly
+    }
+}
+
+Describe 'Get-UsageAggregatesPage (the usage API Get-UsageAggregates wraps)' {
+    BeforeEach {
+        Mock Start-Sleep { }
+        $script:Paths = [System.Collections.Generic.List[string]]::new()
+        $script:Answers = [System.Collections.Generic.Queue[object]]::new()
+        Mock Invoke-AzRestMethod { $script:Paths.Add([string]$Path); $script:Answers.Dequeue() }
+        function New-RestAnswer
+        {
+            param([int]$Status = 200, $Body = @{ value = @() }, [string]$Raw)
+            $Content = if ($PSBoundParameters.ContainsKey('Raw')) { $Raw } else { $Body | ConvertTo-Json -Depth 10 -Compress }
+            [pscustomobject]@{ StatusCode = $Status; Content = $Content }
+        }
+        $script:NextLink = 'https://management.azure.com/subscriptions/sub-a/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview&reportedStartTime=2026-09-25T00%3a00%3a00Z&continuationToken=abc%2Bdef%3D'
+    }
+
+    It 'names the subscription in the path and sends the cmdlet''s window and options' {
+        $script:Answers.Enqueue((New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 2.5; instanceData = '{"Microsoft.Resources":{"resourceUri":"/subscriptions/sub-a/resourceGroups/rg-one/x"}}' } }) }))
+        $Page = Get-UsageAggregatesPage -SubscriptionId 'sub-a' -ReportedStartTime $script:Window.Start -ReportedEndTime $script:Window.End -AggregationGranularity 'Daily' -ShowDetails
+        $script:Paths[0] | Should -Be '/subscriptions/sub-a/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview&reportedStartTime=2026-09-25T00%3A00%3A00Z&reportedEndTime=2026-10-25T00%3A00%3A00Z&aggregationGranularity=Daily&showDetails=true'
+        @($Page.UsageAggregations).Count | Should -Be 1
+        $Page.UsageAggregations[0].Properties.Quantity | Should -Be 2.5
+        Get-ConsumptionRowResourceUri -InstanceData $Page.UsageAggregations[0].Properties.InstanceData | Should -Be '/subscriptions/sub-a/resourceGroups/rg-one/x'
+        $Page.ContinuationToken | Should -BeNullOrEmpty
+    }
+
+    It 'takes the continuation token from nextLink and asks for the next page with it on the same path' {
+        $script:Answers.Enqueue((New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $script:NextLink }))
+        $script:Answers.Enqueue((New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 3 } }) }))
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        $Probe.PositiveFound | Should -BeTrue
+        $Probe.PagesRead | Should -Be 2
+        $script:Paths[1] | Should -Be ($script:Paths[0] + '&continuationToken=abc%2Bdef%3D')
+    }
+
+    It 'turns an answer outside 2xx into an error with its HTTP status and Azure''s message: <Status> -> <Outcome> after <Calls> call(s)' -TestCases @(
+        @{ Status = 403; Outcome = 'Denied'; Calls = 1 }
+        @{ Status = 400; Outcome = 'Error'; Calls = 1 }
+        @{ Status = 429; Outcome = 'Error'; Calls = 4 }
+        @{ Status = 503; Outcome = 'Error'; Calls = 4 }
+    ) {
+        param($Status, $Outcome, $Calls)
+        1..4 | ForEach-Object { $script:Answers.Enqueue((New-RestAnswer -Status $Status -Body @{ error = @{ code = 'SomeCode'; message = 'Azure says no.' } })) }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
+        $Verdict.Outcome | Should -Be $Outcome
         $Verdict.Passed | Should -BeFalse
-        Should -Invoke Get-UsageAggregates -Times 0 -Exactly
+        $Verdict.Detail | Should -Be ('query failed (HTTP {0}, {1} attempt(s)): SomeCode: Azure says no.' -f $Status, $Calls)
+        $script:Paths.Count | Should -Be $Calls
+    }
+
+    It 'says which HTTP status came back when the error answer is not JSON' {
+        $script:Answers.Enqueue((New-RestAnswer -Status 403 -Raw '<html>denied</html>'))
+        $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
+        $Verdict.Outcome | Should -Be 'Denied'
+        $Verdict.Detail | Should -Be 'query failed (HTTP 403, 1 attempt(s)): the usage API answered HTTP 403'
+    }
+
+    It 'stops the subscription (Error), without retrying, on a malformed answer: <Case>' -TestCases @(
+        @{ Case = 'a 200 that is not JSON'; Raw = '{"value": [' ; NextLink = $null }
+        @{ Case = 'a nextLink that is not a URL'; Raw = $null; NextLink = 'not a url' }
+        @{ Case = 'a nextLink without a continuationToken'; Raw = $null; NextLink = 'https://management.azure.com/subscriptions/sub-a/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview' }
+    ) {
+        param($Case, $Raw, $NextLink)
+        $Answer = if ($Raw) { New-RestAnswer -Raw $Raw } else { New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $NextLink } }
+        $script:Answers.Enqueue($Answer)
+        $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
+        $Verdict.Outcome | Should -Be 'Error'
+        $Verdict.Passed | Should -BeFalse
+        $script:Paths.Count | Should -Be 1
+        Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 }
 
@@ -405,7 +487,7 @@ Describe 'Usage probe page cap' {
         # Offers 60 pages of zero quantities, so a reader without a cap reads all
         # 60 and one with the default cap of 50 stops at 50.
         $script:PageCalls = 0
-        Mock Get-UsageAggregates {
+        Mock Get-UsageAggregatesPage {
             $script:PageCalls++
             $Next = if ($script:PageCalls -lt 60) { 'more' } else { $null }
             New-UsagePage -Quantities @(0) -Token $Next
@@ -416,7 +498,7 @@ Describe 'Usage probe page cap' {
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
         $Probe.PagesRead | Should -Be 50
         $Probe.PageCapReached | Should -BeTrue
-        Should -Invoke Get-UsageAggregates -Times 50 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 50 -Exactly
         $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5
         $Verdict.Outcome | Should -Be 'NoPositiveQuantity'
         $Verdict.Passed | Should -BeFalse
@@ -427,12 +509,12 @@ Describe 'Usage probe page cap' {
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxPages 3
         $Probe.PagesRead | Should -Be 3
         $Probe.PageCapReached | Should -BeTrue
-        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
     }
 
     It 'is not reached when the last page is exactly the cap' {
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0) } -ParameterFilter { $ContinuationToken -eq 'page2' }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0) } -ParameterFilter { $ContinuationToken -eq 'page2' }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxPages 2
         $Probe.PagesRead | Should -Be 2
         $Probe.PageCapReached | Should -BeFalse
@@ -546,7 +628,7 @@ Describe 'Resource group runs (-ResourceGroup)' {
     }
 
     It 'does not pass on usage rows of other resource groups' {
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $null; Raw = 'not json'; Quantity = 7 }) }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $null; Raw = 'not json'; Quantity = 7 }) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -ResourceGroup 'rg-one'
         $Probe.PositiveFound | Should -BeFalse
         $Probe.RowsSeen | Should -Be 0
@@ -557,8 +639,8 @@ Describe 'Resource group runs (-ResourceGroup)' {
     }
 
     It 'passes on a positive usage row of the resource group, matched without case, on a later page' {
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $script:InRg; Quantity = 0 }) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:InRg.ToLowerInvariant(); Quantity = 1.5 }) } -ParameterFilter { $ContinuationToken -eq 'page2' }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $script:InRg; Quantity = 0 }) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:InRg.ToLowerInvariant(); Quantity = 1.5 }) } -ParameterFilter { $ContinuationToken -eq 'page2' }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -ResourceGroup 'RG-ONE'
         $Probe.PositiveFound | Should -BeTrue
         $Probe.PagesRead | Should -Be 2
@@ -572,13 +654,13 @@ Describe 'Resource group runs (-ResourceGroup)' {
         Mock Invoke-AzRestMethod { $script:Payloads.Add([string]$Payload); New-ResourceCountResponse -Counts @{} }
         Mock Get-AzContext { $null }
         Mock Write-Host { }
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @() }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @() }
         $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'RG-One'
         ($script:Payloads[0] | ConvertFrom-Json).query | Should -Be "resources | where resourceGroup == 'rg-one' | summarize ResourceCount = count() by subscriptionId"
         $Result.Results[0].Outcome | Should -Be 'Exempt'
         $Result.Results[0].Detail | Should -Be "no resources in resource group 'RG-One' in Resource Graph; not checked (nothing to price)"
         $Result.ShouldBlock | Should -BeFalse
-        Should -Invoke Get-UsageAggregates -Times 0 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly
     }
 
     It 'does not exempt anything for a resource group name that is not valid, and does not put it in a query' {
@@ -593,7 +675,7 @@ Describe 'Resource group runs (-ResourceGroup)' {
         Mock Write-Host { $script:Printed.Add([string]$Object) }
         Mock Get-AzContext { $null }
         Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1 } }
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
         $Role = @([pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } })
         $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'rg-one' -RoleCheck $Role
         $Result.ShouldBlock | Should -BeFalse
@@ -614,7 +696,7 @@ Describe 'Resource group runs (-ResourceGroup)' {
         Mock Write-Host { $script:Printed.Add([string]$Object) }
         Mock Get-AzContext { $null }
         Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1 } }
-        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
+        Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
         $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'rg-one'
         $Result.ShouldBlock | Should -BeTrue
         Write-ConsumptionDataCheckReport -Result $Result
@@ -710,9 +792,7 @@ Describe 'Zero usage with the usage permission confirmed by the role check' {
             )
             # Alpha has usage; Bravo and Charlie return none. Bravo's usage
             # permission is confirmed by both answers, Charlie's only by Azure.
-            $script:LastSub = $null
-            Mock Set-AzContext { $script:LastSub = $Subscription; [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
-            Mock Get-UsageAggregates { if ($script:LastSub -eq 'sub-a') { New-UsagePage -Quantities @(2) } else { New-UsagePage } }
+            Mock Get-UsageAggregatesPage { if ($SubscriptionId -eq 'sub-a') { New-UsagePage -Quantities @(2) } else { New-UsagePage } }
             $script:Roles = @(
                 (New-RoleRecord -Id 'sub-a' -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Reader at subscription'))
                 (New-RoleRecord -Id 'sub-b' -Assignments 'Yes' -Permissions 'Yes' -GrantedBy @('Billing Reader at management group'))
@@ -836,15 +916,13 @@ Describe 'Invoke-ConsumptionDataCheck across subscriptions' {
 
     It 'checks every subscription and lists all failures, not just the first' {
         Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 3; 'sub-b' = 4; 'sub-c' = 5 } }
-        $script:LastSub = $null
-        Mock Get-UsageAggregates { if ($script:LastSub -eq 'sub-b') { New-UsagePage -Quantities @(2) } else { New-UsagePage } }
-        Mock Set-AzContext { $script:LastSub = $Subscription; [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } } -ParameterFilter { $null -ne $Subscription }
+        Mock Get-UsageAggregatesPage { if ($SubscriptionId -eq 'sub-b') { New-UsagePage -Quantities @(2) } else { New-UsagePage } }
 
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.ShouldBlock | Should -BeTrue
         @($Result.Results).Count | Should -Be 3
         @($Result.Failed | ForEach-Object { $_.Name }) | Should -Be @('Alpha', 'Charlie')
-        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
 
         $script:Printed = [System.Collections.Generic.List[string]]::new()
         Mock Write-Host { $script:Printed.Add([string]$Object) }
@@ -862,29 +940,29 @@ Describe 'Invoke-ConsumptionDataCheck across subscriptions' {
 
     It 'exempts a subscription with zero resources without querying its usage' {
         Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 3; 'sub-b' = 0; 'sub-c' = 5 } }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(1) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(1) }
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.ShouldBlock | Should -BeFalse
         @($Result.Exempt | ForEach-Object { $_.Id }) | Should -Be @('sub-b')
-        Should -Invoke Set-AzContext -Times 0 -Exactly -ParameterFilter { $Subscription -eq 'sub-b' }
-        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-b' }
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly
     }
 
     It 'checks every subscription when the resource count query fails (no exemption on unknown counts)' {
         Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 403; Content = '{}' } }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(1) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(1) }
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.Exempt.Count | Should -Be 0
-        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
     }
 
-    It 'passes when every subscription returns a positive quantity, and restores the original process context' {
+    It 'passes when every subscription returns a positive quantity, and leaves the Azure context alone' {
         Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1; 'sub-b' = 1; 'sub-c' = 1 } }
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(0.5) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(0.5) }
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.ShouldBlock | Should -BeFalse
-        Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $null -ne $Context -and $Context.Name -eq 'original' -and $Scope -eq 'Process' }
-        Should -Invoke Set-AzContext -Times 0 -Exactly -ParameterFilter { $Scope -ne 'Process' }
+        Should -Invoke Set-AzContext -Times 0 -Exactly
+        Should -Invoke Get-AzContext -Times 0 -Exactly
     }
 }
 
@@ -938,9 +1016,9 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
 
     It 'checks the window computed once before it (the one passed to every subscription)' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-01-15T23:59:00')
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(3) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(3) }
         { . $script:CheckBlock } | Should -Not -Throw
-        Should -Invoke Get-UsageAggregates -Times 2 -Exactly -ParameterFilter { $ReportedStartTime -eq [datetime]'2025-12-15' -and $ReportedEndTime -eq [datetime]'2026-01-14' }
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly -ParameterFilter { $ReportedStartTime -eq [datetime]'2025-12-15' -and $ReportedEndTime -eq [datetime]'2026-01-14' }
         $Text = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $Text.IndexOf('$ConsumptionWindow = Get-ConsumptionWindow') | Should -BeLessThan $Text.IndexOf('$ConsumptionCheckScope =')
         $Text.IndexOf('$ConsumptionWindow = Get-ConsumptionWindow') | Should -BeGreaterThan 0
@@ -952,32 +1030,32 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
     }
 
     It 'exits 1 (before inventory starts) when consumption returns no values' {
-        Mock Get-UsageAggregates { New-UsagePage }
+        Mock Get-UsageAggregatesPage { New-UsagePage }
         { . $script:CheckBlock } | Should -Throw 'EXIT 1'
-        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly
     }
 
     It 'continues when every subscription returns values' {
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(3) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(3) }
         { . $script:CheckBlock } | Should -Not -Throw
         Should -Invoke Exit-Wrapper -Times 0 -Exactly
     }
 
     It 'skips the check entirely under -SkipConsumption' {
         $script:SkipConsumption = $true
-        Mock Get-UsageAggregates { New-UsagePage }
+        Mock Get-UsageAggregatesPage { New-UsagePage }
         { . $script:CheckBlock } | Should -Not -Throw
-        Should -Invoke Get-UsageAggregates -Times 0 -Exactly
+        Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly
         Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly
     }
 
     It 'on -Resume checks only the subscriptions this run will process' {
         $script:Resume = $true
         $script:CompletedIds = @('sub-a')
-        Mock Get-UsageAggregates { New-UsagePage -Quantities @(3) }
+        Mock Get-UsageAggregatesPage { New-UsagePage -Quantities @(3) }
         { . $script:CheckBlock } | Should -Not -Throw
-        Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $Subscription -eq 'sub-b' }
-        Should -Invoke Set-AzContext -Times 0 -Exactly -ParameterFilter { $Subscription -eq 'sub-a' }
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-b' }
+        Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-a' }
     }
 
     It 'passes the role check records in: no usage with the permission confirmed by both answers continues' {
@@ -985,7 +1063,7 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
             [pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
             [pscustomobject]@{ Id = 'sub-b'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
         )
-        Mock Get-UsageAggregates { New-UsagePage }
+        Mock Get-UsageAggregatesPage { New-UsagePage }
         . $script:CheckBlock
         Should -Invoke Exit-Wrapper -Times 0 -Exactly
         @($ConsumptionCheck.NoUsage | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b')
@@ -996,7 +1074,7 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
             [pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } }
             [pscustomobject]@{ Id = 'sub-b'; UsageVerdict = 'YesPermissionsOnly'; Assignments = [pscustomobject]@{ UsageGrantedBy = @() } }
         )
-        Mock Get-UsageAggregates { New-UsagePage }
+        Mock Get-UsageAggregatesPage { New-UsagePage }
         { . $script:CheckBlock } | Should -Throw 'EXIT 1'
     }
 }
@@ -1035,14 +1113,13 @@ function global:Invoke-AzRestMethod
     if ($Path -match '/roleAssignments\?') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ properties = @{ roleDefinitionId = "/subscriptions/$TestSub/providers/Microsoft.Authorization/roleDefinitions/reader"; scope = "/subscriptions/$TestSub"; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) } | ConvertTo-Json -Depth 10) } }
     if ($Path -match '/roleDefinitions/') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } } | ConvertTo-Json -Depth 10) } }
     if ($Path -match '/providers/Microsoft\.Authorization/permissions\?') { return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = @(@{ actions = @('*/read'); notActions = @() }) } | ConvertTo-Json -Depth 10) } }
+    if ($Path -match '/providers/Microsoft\.Commerce/UsageAggregates\?')
+    {
+        Add-Content -Path $env:RDA_TEST_USAGE_MARKER -Value 'usage queried'
+        $Rows = if ($env:RDA_TEST_MODE -eq 'values') { @(@{ properties = @{ quantity = 2 } }) } else { @() }
+        return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = $Rows } | ConvertTo-Json -Depth 10) }
+    }
     [pscustomobject]@{ StatusCode = 200; Content = ('{{"data":[{{"subscriptionId":"{0}","ResourceCount":4}}]}}' -f $TestSub) }
-}
-function global:Get-UsageAggregates
-{
-    param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
-    Add-Content -Path $env:RDA_TEST_USAGE_MARKER -Value 'usage queried'
-    $Rows = if ($env:RDA_TEST_MODE -eq 'values') { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2 } }) } else { @() }
-    [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
 }
 $env:RDA_TEST_MODE = $Mode
 $Extra = @{}

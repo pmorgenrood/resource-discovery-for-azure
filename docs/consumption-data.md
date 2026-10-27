@@ -40,7 +40,10 @@ and passes it to every `ResourceInventory.ps1` it starts
 collected after midnight, hours after the check, still collects the window
 that was checked. For a direct `-ResourceGroup` run, the check counts only
 the usage rows of that resource group, by the same test the phase uses to
-keep rows (`Test-ConsumptionResourceUriInResourceGroup`). See
+keep rows (`Test-ConsumptionResourceUriInResourceGroup`). The check calls the
+API that `Get-UsageAggregates` wraps, with the same window and options and the
+subscription in the request path, up to 8 subscriptions at a time, so it
+switches no Azure context. See
 [Consumption data check](../README.md#consumption-data-check-up-front) in the
 README.
 

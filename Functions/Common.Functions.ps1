@@ -512,8 +512,9 @@ function Invoke-RoleCheckGet
 }
 
 # Answer A for one subscription: the identity's role assignments and their
-# definitions. $DefinitionCache (shared across subscriptions) keeps every role
-# definition read successfully, by its id, so each is read once per run. A
+# definitions. $DefinitionCache (shared across subscriptions, synchronized when
+# they are checked in parallel) keeps every role definition read successfully,
+# by its id, so each is read once per run. A
 # definition whose read was refused (HTTP 401, 403 or 404) is kept as $null,
 # so it is not read again for later subscriptions; after any other failure
 # (throttling, a server error, a timeout) it is read again.
@@ -579,14 +580,28 @@ function Get-RoleAssignmentAccess
         $Key = ($DefinitionId.TrimEnd('/') -split '/')[-1].ToLowerInvariant()
         if (-not $DefinitionCache.ContainsKey($Key))
         {
-            $Definition = Invoke-RoleCheckGet -MaxRetries $MaxRetries -Path ($DefinitionId + '?api-version=2022-04-01')
-            if ($null -eq $Definition.Error -and $null -ne $Definition.Body.properties)
+            # Subscriptions may be checked in parallel (Test-SubscriptionRoleAccessAll):
+            # a definition not yet cached is read under the cache's lock and
+            # looked up again first, so each is read once per run.
+            [System.Threading.Monitor]::Enter($DefinitionCache.SyncRoot)
+            try
             {
-                $DefinitionCache[$Key] = $Definition.Body.properties
+                if (-not $DefinitionCache.ContainsKey($Key))
+                {
+                    $Definition = Invoke-RoleCheckGet -MaxRetries $MaxRetries -Path ($DefinitionId + '?api-version=2022-04-01')
+                    if ($null -eq $Definition.Error -and $null -ne $Definition.Body.properties)
+                    {
+                        $DefinitionCache[$Key] = $Definition.Body.properties
+                    }
+                    elseif ($Definition.Status -in @(401, 403, 404))
+                    {
+                        $DefinitionCache[$Key] = $null
+                    }
+                }
             }
-            elseif ($Definition.Status -in @(401, 403, 404))
+            finally
             {
-                $DefinitionCache[$Key] = $null
+                [System.Threading.Monitor]::Exit($DefinitionCache.SyncRoot)
             }
         }
         $Role = $DefinitionCache[$Key]
@@ -759,78 +774,179 @@ function Format-UsageRoleText
     }
 }
 
+# Runs '& $Command -Item <item> @Arguments' for every item of $Items, at most
+# $ThrottleLimit at a time (ForEach-Object -Parallel), and passes each result
+# to $OnResult in the order of $Items, as soon as it and every earlier result
+# are in, so the output reads the same as a one-after-another run. $Command
+# must be a function of this file: runspaces do not inherit the caller's
+# functions, so each one dot-sources this file once. $Arguments is shared by
+# all runspaces, so it may only hold values that are safe to share between
+# threads. An exception in one item becomes that item's result,
+# { Failed = $true; Item; Message }, so no item is ever left without one. With
+# $ThrottleLimit 1, or one item, it runs in the caller's runspace.
+function Invoke-SubscriptionCheckInOrder
+{
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory = $true)][string]$Command,
+        [hashtable]$Arguments = @{},
+        [int]$ThrottleLimit = 8,
+        [Parameter(Mandatory = $true)][scriptblock]$OnResult
+    )
+    if ($ThrottleLimit -le 1 -or $Items.Count -le 1)
+    {
+        foreach ($Item in $Items)
+        {
+            $Value = try { & $Command -Item $Item @Arguments }
+            catch { [pscustomobject]@{ Failed = $true; Item = $Item; Message = $_.Exception.Message } }
+            & $OnResult $Value
+        }
+        return
+    }
+
+    $FunctionsFile = $PSCommandPath
+    $Indexed = for ($Index = 0; $Index -lt $Items.Count; $Index++) { [pscustomobject]@{ Index = $Index; Item = $Items[$Index] } }
+    $Pending = @{}
+    $NextIndex = 0
+    $Indexed | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        $Entry = $_
+        $Name = $using:Command
+        try
+        {
+            if (-not (Get-Command -Name $Name -CommandType Function -ErrorAction Ignore)) { . $using:FunctionsFile }
+            $Splat = $using:Arguments
+            $Value = & $Name -Item $Entry.Item @Splat
+        }
+        catch
+        {
+            $Value = [pscustomobject]@{ Failed = $true; Item = $Entry.Item; Message = $_.Exception.Message }
+        }
+        [pscustomobject]@{ Index = $Entry.Index; Value = $Value }
+    } | ForEach-Object {
+        $Pending[$_.Index] = $_.Value
+        while ($Pending.ContainsKey($NextIndex))
+        {
+            & $OnResult $Pending[$NextIndex]
+            $Pending.Remove($NextIndex)
+            $NextIndex++
+        }
+    }
+}
+
+# The role check for one subscription ($Item: an object with Id and Name).
+# Every Azure call names the subscription in its path, so nothing here reads
+# or changes the Azure context and several subscriptions can be checked at the
+# same time. Returns the record described at Test-SubscriptionRoleAccessAll.
+function Get-SubscriptionRoleAccess
+{
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [string]$ResourceGroup,
+        [switch]$IncludeUsage,
+        [string]$CallerObjectId,
+        [hashtable]$DefinitionCache = @{},
+        [int]$MaxRetries = 3
+    )
+    $ForResourceGroup = -not [string]::IsNullOrEmpty($ResourceGroup)
+    $Id = [string]$Item.Id
+    $Name = if ([string]::IsNullOrWhiteSpace([string]$Item.Name)) { $Id } else { [string]$Item.Name }
+    $Timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $SubPath = '/subscriptions/{0}' -f $Id
+    $Assignments = Get-RoleAssignmentAccess -SubscriptionId $Id -ResourceGroup $ResourceGroup -CallerObjectId $CallerObjectId -DefinitionCache $DefinitionCache -MaxRetries $MaxRetries
+    $TargetPath = if ($ForResourceGroup) { '{0}/resourceGroups/{1}' -f $SubPath, $ResourceGroup } else { $SubPath }
+    $Permissions = Get-CallerPermissionsAccess -ScopePath $TargetPath -ResourceGroupTarget:$ForResourceGroup -MaxRetries $MaxRetries
+    $Verdict = Resolve-RoleCheckVerdict -Assignments $Assignments.Resources -Permissions $Permissions.Resources
+
+    $UsageVerdict = $null
+    $UsageText = $null
+    if ($IncludeUsage)
+    {
+        $UsagePermissions = if ($ForResourceGroup) { Get-CallerPermissionsAccess -ScopePath $SubPath -MaxRetries $MaxRetries } else { $Permissions }
+        $UsageVerdict = Resolve-RoleCheckVerdict -Assignments $Assignments.Usage -Permissions $UsagePermissions.Usage
+        $UsageText = Format-UsageRoleText -Verdict $UsageVerdict -Assignments $Assignments -Permissions $UsagePermissions
+    }
+    $Timer.Stop()
+
+    $State = switch ($Verdict)
+    {
+        'Yes' { 'Readable' }
+        'YesPermissionsOnly' { 'Readable' }
+        'Disagree' { 'Disagree' }
+        'Unknown' { 'Unknown' }
+        default { 'NoAccess' }
+    }
+    return [pscustomobject]@{
+        Id           = $Id
+        Name         = $Name
+        State        = $State
+        Verdict      = $Verdict
+        Reason       = (Format-RoleCheckReason -Verdict $Verdict -Assignments $Assignments -Permissions $Permissions -ResourceGroup $ResourceGroup)
+        UsageVerdict = $UsageVerdict
+        UsageText    = $UsageText
+        Assignments  = $Assignments
+        Permissions  = $Permissions
+        Seconds      = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
+    }
+}
+
 # Runs the role check for every subscription in $Subscriptions (objects with Id
-# and Name) and prints one line per subscription as it goes. With
-# -ResourceGroup the resource verdict is for that resource group in each
-# subscription. With -IncludeUsage (consumption requested) the usage verdict is
-# added. Returns one record per subscription:
+# and Name), at most $ThrottleLimit subscriptions at a time, and prints one
+# line per subscription in the order given. With -ResourceGroup the resource
+# verdict is for that resource group in each subscription. With -IncludeUsage
+# (consumption requested) the usage verdict is added. The caller's object id
+# is read once, and each role definition once (a shared cache), for the whole
+# run. Returns one record per subscription, in the order given:
 #   { Id; Name; State; Verdict; Reason; UsageVerdict; UsageText; Assignments;
 #     Permissions; Seconds }
 # State is 'Readable' (the run may read it), 'NoAccess', 'Disagree' or
 # 'Unknown'; Resolve-AccessPreflight treats anything but 'Readable' as not
-# readable.
+# readable. A subscription whose check failed unexpectedly is 'Unknown'.
 function Test-SubscriptionRoleAccessAll
 {
     param(
         [Parameter(Mandatory = $true)]$Subscriptions,
         [string]$ResourceGroup,
         [switch]$IncludeUsage,
-        [int]$MaxRetries = 3
+        [int]$MaxRetries = 3,
+        [int]$ThrottleLimit = 8
     )
     $CallerObjectId = Get-RoleCheckCallerObjectId
-    $DefinitionCache = @{}
-    $ForResourceGroup = -not [string]::IsNullOrEmpty($ResourceGroup)
-    $Records = @()
-    foreach ($Sub in @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) }))
-    {
-        $Id = [string]$Sub.Id
-        $Name = if ([string]::IsNullOrWhiteSpace([string]$Sub.Name)) { $Id } else { [string]$Sub.Name }
-        $Timer = [System.Diagnostics.Stopwatch]::StartNew()
-        $SubPath = '/subscriptions/{0}' -f $Id
-        $Assignments = Get-RoleAssignmentAccess -SubscriptionId $Id -ResourceGroup $ResourceGroup -CallerObjectId $CallerObjectId -DefinitionCache $DefinitionCache -MaxRetries $MaxRetries
-        $TargetPath = if ($ForResourceGroup) { '{0}/resourceGroups/{1}' -f $SubPath, $ResourceGroup } else { $SubPath }
-        $Permissions = Get-CallerPermissionsAccess -ScopePath $TargetPath -ResourceGroupTarget:$ForResourceGroup -MaxRetries $MaxRetries
-        $Verdict = Resolve-RoleCheckVerdict -Assignments $Assignments.Resources -Permissions $Permissions.Resources
-
-        $UsageVerdict = $null
-        $UsageText = $null
+    $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
+    $Arguments = @{
+        ResourceGroup   = $ResourceGroup
+        IncludeUsage    = [bool]$IncludeUsage
+        CallerObjectId  = $CallerObjectId
+        DefinitionCache = [hashtable]::Synchronized(@{})
+        MaxRetries      = $MaxRetries
+    }
+    $RoleRecords = [System.Collections.Generic.List[object]]::new()
+    Invoke-SubscriptionCheckInOrder -Items $Subs -Command 'Get-SubscriptionRoleAccess' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
+        param($RoleRecord)
+        if ($RoleRecord.Failed)
+        {
+            $FailedId = [string]$RoleRecord.Item.Id
+            $RoleRecord = [pscustomobject]@{
+                Id           = $FailedId
+                Name         = $(if ([string]::IsNullOrWhiteSpace([string]$RoleRecord.Item.Name)) { $FailedId } else { [string]$RoleRecord.Item.Name })
+                State        = 'Unknown'
+                Verdict      = 'Unknown'
+                Reason       = ('role check inconclusive ({0})' -f $RoleRecord.Message)
+                UsageVerdict = $(if ($IncludeUsage) { 'Unknown' } else { $null })
+                UsageText    = $(if ($IncludeUsage) { Format-UsageRoleText -Verdict 'Unknown' } else { $null })
+                Assignments  = $null
+                Permissions  = $null
+                Seconds      = 0
+            }
+        }
+        $RoleRecords.Add($RoleRecord)
+        $Tag = if ($RoleRecord.State -eq 'Readable') { 'Pass' } else { $RoleRecord.State }
+        Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $Tag, $RoleRecord.Name, $RoleRecord.Reason, $RoleRecord.Seconds) -ForegroundColor $(if ($RoleRecord.State -eq 'Readable') { 'Green' } else { 'Red' })
         if ($IncludeUsage)
         {
-            $UsagePermissions = if ($ForResourceGroup) { Get-CallerPermissionsAccess -ScopePath $SubPath -MaxRetries $MaxRetries } else { $Permissions }
-            $UsageVerdict = Resolve-RoleCheckVerdict -Assignments $Assignments.Usage -Permissions $UsagePermissions.Usage
-            $UsageText = Format-UsageRoleText -Verdict $UsageVerdict -Assignments $Assignments -Permissions $UsagePermissions
-        }
-        $Timer.Stop()
-
-        $State = switch ($Verdict)
-        {
-            'Yes' { 'Readable' }
-            'YesPermissionsOnly' { 'Readable' }
-            'Disagree' { 'Disagree' }
-            'Unknown' { 'Unknown' }
-            default { 'NoAccess' }
-        }
-        $Record = [pscustomobject]@{
-            Id           = $Id
-            Name         = $Name
-            State        = $State
-            Verdict      = $Verdict
-            Reason       = (Format-RoleCheckReason -Verdict $Verdict -Assignments $Assignments -Permissions $Permissions -ResourceGroup $ResourceGroup)
-            UsageVerdict = $UsageVerdict
-            UsageText    = $UsageText
-            Assignments  = $Assignments
-            Permissions  = $Permissions
-            Seconds      = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
-        }
-        $Records += $Record
-        $Tag = if ($State -eq 'Readable') { 'Pass' } else { $State }
-        Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $Tag, $Name, $Record.Reason, $Record.Seconds) -ForegroundColor $(if ($State -eq 'Readable') { 'Green' } else { 'Red' })
-        if ($IncludeUsage)
-        {
-            Write-Host ('      usage permission (Microsoft.Commerce/UsageAggregates/read): {0}' -f $UsageText) -ForegroundColor DarkGray
+            Write-Host ('      usage permission (Microsoft.Commerce/UsageAggregates/read): {0}' -f $RoleRecord.UsageText) -ForegroundColor DarkGray
         }
     }
-    return $Records
+    return $RoleRecords.ToArray()
 }
 
 # Decide, from the up-front role check records, whether the run may proceed.
@@ -1246,15 +1362,80 @@ function Get-ConsumptionRowResourceUri
     return $Uri
 }
 
-# Queries one subscription's usage with the billing phase's cmdlet, window and
-# options, following ContinuationToken until a row with a positive quantity is
-# found, the pages run out, or $MaxPages pages have been read (PageCapReached:
-# more pages were offered but not read). With -ResourceGroup only rows whose
+# One page of one subscription's usage from the API that Get-UsageAggregates
+# wraps (GET /subscriptions/<id>/providers/Microsoft.Commerce/UsageAggregates,
+# api-version 2015-06-01-preview), with the cmdlet's parameters. The
+# subscription is named in the request path, so no Azure context is switched
+# and several subscriptions can be read at the same time: the cmdlet reads the
+# subscription of the current context, and Az has no supported way to make a
+# context for another subscription without selecting it for the whole
+# process. The window's midnights (Kind=Unspecified) are sent as UTC midnights,
+# which is how the API reads the cmdlet's. Returns the page shaped like the
+# cmdlet's answer: { UsageAggregations (each with Properties);
+# ContinuationToken }, the token read from the answer's nextLink. Throws on an
+# answer outside 2xx (an HttpRequestException carrying the HTTP status, so the
+# retry policy and the Denied verdict treat it as they treat the cmdlet's
+# errors), on an answer that is not JSON, and on a nextLink that has no
+# continuationToken.
+function Get-UsageAggregatesPage
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$SubscriptionId,
+        [Parameter(Mandatory = $true)][datetime]$ReportedStartTime,
+        [Parameter(Mandatory = $true)][datetime]$ReportedEndTime,
+        [string]$AggregationGranularity = 'Daily',
+        [switch]$ShowDetails,
+        [string]$ContinuationToken
+    )
+    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $Start = [uri]::EscapeDataString($ReportedStartTime.ToString("yyyy-MM-dd'T'HH:mm:ss", $Invariant) + 'Z')
+    $End = [uri]::EscapeDataString($ReportedEndTime.ToString("yyyy-MM-dd'T'HH:mm:ss", $Invariant) + 'Z')
+    $Path = '/subscriptions/{0}/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview&reportedStartTime={1}&reportedEndTime={2}&aggregationGranularity={3}&showDetails={4}' -f $SubscriptionId, $Start, $End, $AggregationGranularity, $(if ($ShowDetails) { 'true' } else { 'false' })
+    if (-not [string]::IsNullOrEmpty($ContinuationToken)) { $Path += '&continuationToken=' + [uri]::EscapeDataString($ContinuationToken) }
+
+    $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+    $Status = [int]$Response.StatusCode
+    if ($Status -lt 200 -or $Status -ge 300)
+    {
+        $Reason = 'the usage API answered HTTP {0}' -f $Status
+        try
+        {
+            $AzureError = ([string]$Response.Content | ConvertFrom-Json -ErrorAction Stop).error
+            if ($null -ne $AzureError -and -not [string]::IsNullOrEmpty([string]$AzureError.message)) { $Reason = '{0}: {1}' -f $AzureError.code, $AzureError.message }
+        }
+        catch
+        {
+            Write-Verbose 'The usage API error answer was not JSON.'
+        }
+        throw [System.Net.Http.HttpRequestException]::new($Reason, $null, [System.Net.HttpStatusCode]$Status)
+    }
+    $Body = [string]$Response.Content | ConvertFrom-Json -ErrorAction Stop
+
+    # The next page is asked for with the token alone, as the cmdlet does, so
+    # the request never goes to a host named in the answer.
+    $Token = $null
+    $NextLink = [string]$Body.nextLink
+    if (-not [string]::IsNullOrEmpty($NextLink))
+    {
+        $NextUri = $null
+        if ([uri]::TryCreate($NextLink, [System.UriKind]::Absolute, [ref]$NextUri)) { $Token = [System.Web.HttpUtility]::ParseQueryString($NextUri.Query)['continuationToken'] }
+        if ([string]::IsNullOrEmpty($Token)) { throw 'The usage answer''s nextLink has no continuationToken, so the next page cannot be read.' }
+    }
+    return [pscustomobject]@{
+        UsageAggregations = @(@($Body.value) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Properties = $_.properties } })
+        ContinuationToken = $Token
+    }
+}
+
+# Queries one subscription's usage with the billing phase's window and options
+# (Get-UsageAggregatesPage: the API the billing phase's cmdlet wraps),
+# following ContinuationToken until a row with a positive quantity is found,
+# the pages run out, or $MaxPages pages have been read (PageCapReached: more
+# pages were offered but not read). With -ResourceGroup only rows whose
 # resource URI belongs to that resource group count
 # (Test-ConsumptionResourceUriInResourceGroup), as in the consumption phase;
-# RowsSeen counts only those. The context switch is process-scoped so the
-# operator's saved default subscription is left alone. Returns
-# { PositiveFound; RowsSeen; PagesRead; PageCapReached; Attempts; Error }.
+# RowsSeen counts only those. The Azure context is neither read nor changed.
+# Returns { PositiveFound; RowsSeen; PagesRead; PageCapReached; Attempts; Error }.
 function Invoke-ConsumptionValueProbe
 {
     param(
@@ -1266,26 +1447,11 @@ function Invoke-ConsumptionValueProbe
     )
     $Probe = [pscustomobject]@{ PositiveFound = $false; RowsSeen = 0; PagesRead = 0; PageCapReached = $false; Attempts = 0; Error = $null }
 
-    $ContextSwitch = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $SubscriptionId -Operation {
-        param($Id)
-        $Context = Set-AzContext -Subscription $Id -Scope Process -ErrorAction Stop
-        if ($null -eq $Context -or [string]$Context.Subscription.Id -ne $Id)
-        {
-            throw ('The Azure context did not switch to subscription {0}.' -f $Id)
-        }
-        $Context
-    }
-    $Probe.Attempts += $ContextSwitch.Attempts
-    if ($null -ne $ContextSwitch.Error)
-    {
-        $Probe.Error = $ContextSwitch.Error
-        return $Probe
-    }
-
     $Token = $null
     do
     {
         $Params = @{
+            SubscriptionId         = $SubscriptionId
             ReportedStartTime      = $Window.Start
             ReportedEndTime        = $Window.End
             AggregationGranularity = 'Daily'
@@ -1295,7 +1461,7 @@ function Invoke-ConsumptionValueProbe
 
         $Page = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $Params -Operation {
             param($QueryParams)
-            Get-UsageAggregates @QueryParams -ErrorAction Stop
+            Get-UsageAggregatesPage @QueryParams -ErrorAction Stop
         }
         $Probe.Attempts += $Page.Attempts
         if ($null -ne $Page.Error)
@@ -1425,16 +1591,55 @@ function Format-ConsumptionCheckTarget
     return (" for resource group '{0}'" -f $ResourceGroup)
 }
 
-# Checks every subscription in $Subscriptions (objects with Id and Name) and
-# returns the Resolve-ConsumptionDataCheck decision. Every subscription is
-# checked, so a refusal lists all failing ones at once. The process context in
-# effect before the check is restored afterwards. $RoleCheck is the record list
-# from Test-SubscriptionRoleAccessAll for this run; a subscription's record
+# The consumption data check for one subscription. $Item carries Id, Name,
+# ResourceCount (from Resource Graph, $null when unknown) and UsageRole (this
+# subscription's role check record, or $null). A subscription with zero
+# resources is not queried. Returns the per-subscription result described at
+# Invoke-ConsumptionDataCheck. The Azure context is neither read nor changed,
+# so several subscriptions can be checked at the same time.
+function Get-SubscriptionConsumptionCheck
+{
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)]$Window,
+        [string]$ResourceGroup,
+        [int]$MaxRetries = 3
+    )
+    $Timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $Probe = $null
+    if ($null -eq $Item.ResourceCount -or [int]$Item.ResourceCount -gt 0)
+    {
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId ([string]$Item.Id) -Window $Window -ResourceGroup $ResourceGroup -MaxRetries $MaxRetries
+    }
+    $Timer.Stop()
+    $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $Item.ResourceCount -UsageRole $Item.UsageRole -ResourceGroup $ResourceGroup
+    return [pscustomobject]@{
+        Id             = [string]$Item.Id
+        Name           = [string]$Item.Name
+        ResourceCount  = $Item.ResourceCount
+        Outcome        = $Verdict.Outcome
+        Passed         = $Verdict.Passed
+        Detail         = $Verdict.Detail
+        PageCapReached = ($null -ne $Probe -and [bool]$Probe.PageCapReached)
+        PagesRead      = $(if ($null -ne $Probe) { [int]$Probe.PagesRead } else { 0 })
+        Seconds        = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
+    }
+}
+
+# Checks every subscription in $Subscriptions (objects with Id and Name), at
+# most $ThrottleLimit subscriptions at a time, prints one line per
+# subscription in the order given, and returns the Resolve-ConsumptionDataCheck
+# decision. Every subscription is checked, so a refusal lists all failing ones
+# at once. Resource counts come from one Resource Graph query per 1,000
+# subscriptions. $RoleCheck is the record list from
+# Test-SubscriptionRoleAccessAll for this run; a subscription's record
 # decides whether an empty answer is 'NoUsage' (Get-ConsumptionCheckVerdict).
 # $Window is the run's window: the caller computes it once and the
 # consumption phase collects the same one. -ResourceGroup (a direct
 # -ResourceGroup run) checks only that resource group's usage rows and
-# resources, the rows the consumption phase keeps for such a run.
+# resources, the rows the consumption phase keeps for such a run. A
+# subscription whose check failed unexpectedly is an 'Error' (it stops the
+# run). The Azure context is neither read nor changed.
 function Invoke-ConsumptionDataCheck
 {
     param(
@@ -1442,7 +1647,8 @@ function Invoke-ConsumptionDataCheck
         $Window = (Get-ConsumptionWindow),
         [object[]]$RoleCheck = @(),
         [string]$ResourceGroup,
-        [int]$MaxRetries = 3
+        [int]$MaxRetries = 3,
+        [int]$ThrottleLimit = 8
     )
     $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
     $WindowText = Format-ConsumptionWindow -Window $Window
@@ -1457,66 +1663,60 @@ function Invoke-ConsumptionDataCheck
     }
 
     $Counts = Get-SubscriptionResourceCounts -SubscriptionIds @($Subs | ForEach-Object { [string]$_.Id }) -ResourceGroup $ResourceGroup
-    $OriginalContext = $null
-    try { $OriginalContext = Get-AzContext -ErrorAction Stop }
-    catch { Write-Verbose ('Could not read the current Azure context: {0}' -f $_.Exception.Message) }
-
-    $Results = @()
-    try
+    # The first role check record per subscription id.
+    $RoleById = @{}
+    foreach ($Record in @($RoleCheck))
     {
-        foreach ($Sub in $Subs)
+        if ($null -ne $Record -and -not $RoleById.ContainsKey([string]$Record.Id)) { $RoleById[[string]$Record.Id] = $Record }
+    }
+    $Items = @(foreach ($Sub in $Subs)
         {
             $Id = [string]$Sub.Id
-            $Name = if ([string]::IsNullOrWhiteSpace([string]$Sub.Name)) { $Id } else { [string]$Sub.Name }
-            $ResourceCount = if ($Counts.ContainsKey($Id)) { [int]$Counts[$Id] } else { $null }
-            $Timer = [System.Diagnostics.Stopwatch]::StartNew()
-            $Probe = $null
-            if ($null -eq $ResourceCount -or $ResourceCount -gt 0)
-            {
-                $Probe = Invoke-ConsumptionValueProbe -SubscriptionId $Id -Window $Window -ResourceGroup $ResourceGroup -MaxRetries $MaxRetries
+            [pscustomobject]@{
+                Id            = $Id
+                Name          = $(if ([string]::IsNullOrWhiteSpace([string]$Sub.Name)) { $Id } else { [string]$Sub.Name })
+                ResourceCount = $(if ($Counts.ContainsKey($Id)) { [int]$Counts[$Id] } else { $null })
+                UsageRole     = $RoleById[$Id]
             }
-            $Timer.Stop()
-            $UsageRole = @(@($RoleCheck) | Where-Object { $null -ne $_ -and [string]$_.Id -eq $Id })[0]
-            $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $ResourceCount -UsageRole $UsageRole -ResourceGroup $ResourceGroup
-            $Result = [pscustomobject]@{
-                Id             = $Id
-                Name           = $Name
-                ResourceCount  = $ResourceCount
-                Outcome        = $Verdict.Outcome
-                Passed         = $Verdict.Passed
-                Detail         = $Verdict.Detail
-                PageCapReached = ($null -ne $Probe -and [bool]$Probe.PageCapReached)
-                PagesRead      = $(if ($null -ne $Probe) { [int]$Probe.PagesRead } else { 0 })
-                Seconds        = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
-            }
-            $Results += $Result
-            $Colour = switch ($Result.Outcome) { 'Pass' { 'Green' } 'NoUsage' { 'Yellow' } default { if ($Result.Passed) { 'DarkGray' } else { 'Red' } } }
-            Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $Result.Outcome, $Name, $Result.Detail, $Result.Seconds) -ForegroundColor $Colour
-            if ($Result.Outcome -eq 'NoUsage' -and $Result.PageCapReached)
-            {
-                # Only the first pages were read, so nothing is known about the
-                # rest; the consumption phase reads every page.
-                Write-Host ('      WARNING: no usage above zero{0} in the first {1} page(s) read for {2}; later pages were not checked. The run continues and the consumption phase reads every page.' -f $ForRg, $Result.PagesRead, $WindowText) -ForegroundColor Yellow
-            }
-            elseif ($Result.Outcome -eq 'NoUsage' -and -not [string]::IsNullOrEmpty($ResourceGroup))
-            {
-                Write-Host ("      WARNING: no usage above zero in resource group '{0}' for {1}. Typical causes: new resources, only free resources, or paused resources. The run continues; the consumption sheet for resource group '{0}' will be empty." -f $ResourceGroup, $WindowText) -ForegroundColor Yellow
-            }
-            elseif ($Result.Outcome -eq 'NoUsage')
-            {
-                Write-Host ('      WARNING: no usage above zero for {0}. Typical causes: a new subscription, only free resources, or paused resources. The run continues; this subscription''s consumption sheet will be empty.' -f $WindowText) -ForegroundColor Yellow
-            }
-        }
-    }
-    finally
-    {
-        if ($null -ne $OriginalContext)
+        })
+
+    $CheckResults = [System.Collections.Generic.List[object]]::new()
+    $Arguments = @{ Window = $Window; ResourceGroup = $ResourceGroup; MaxRetries = $MaxRetries }
+    Invoke-SubscriptionCheckInOrder -Items $Items -Command 'Get-SubscriptionConsumptionCheck' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
+        param($CheckResult)
+        if ($CheckResult.Failed)
         {
-            try { $null = Set-AzContext -Context $OriginalContext -Scope Process -ErrorAction Stop }
-            catch { Write-Verbose ('Could not restore the Azure context: {0}' -f $_.Exception.Message) }
+            $CheckResult = [pscustomobject]@{
+                Id             = [string]$CheckResult.Item.Id
+                Name           = [string]$CheckResult.Item.Name
+                ResourceCount  = $CheckResult.Item.ResourceCount
+                Outcome        = 'Error'
+                Passed         = $false
+                Detail         = ('the check failed: {0}' -f $CheckResult.Message)
+                PageCapReached = $false
+                PagesRead      = 0
+                Seconds        = 0
+            }
+        }
+        $CheckResults.Add($CheckResult)
+        $Colour = switch ($CheckResult.Outcome) { 'Pass' { 'Green' } 'NoUsage' { 'Yellow' } default { if ($CheckResult.Passed) { 'DarkGray' } else { 'Red' } } }
+        Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $CheckResult.Outcome, $CheckResult.Name, $CheckResult.Detail, $CheckResult.Seconds) -ForegroundColor $Colour
+        if ($CheckResult.Outcome -eq 'NoUsage' -and $CheckResult.PageCapReached)
+        {
+            # Only the first pages were read, so nothing is known about the
+            # rest; the consumption phase reads every page.
+            Write-Host ('      WARNING: no usage above zero{0} in the first {1} page(s) read for {2}; later pages were not checked. The run continues and the consumption phase reads every page.' -f $ForRg, $CheckResult.PagesRead, $WindowText) -ForegroundColor Yellow
+        }
+        elseif ($CheckResult.Outcome -eq 'NoUsage' -and -not [string]::IsNullOrEmpty($ResourceGroup))
+        {
+            Write-Host ("      WARNING: no usage above zero in resource group '{0}' for {1}. Typical causes: new resources, only free resources, or paused resources. The run continues; the consumption sheet for resource group '{0}' will be empty." -f $ResourceGroup, $WindowText) -ForegroundColor Yellow
+        }
+        elseif ($CheckResult.Outcome -eq 'NoUsage')
+        {
+            Write-Host ('      WARNING: no usage above zero for {0}. Typical causes: a new subscription, only free resources, or paused resources. The run continues; this subscription''s consumption sheet will be empty.' -f $WindowText) -ForegroundColor Yellow
         }
     }
-    return (Resolve-ConsumptionDataCheck -Results $Results -Window $Window -ResourceGroup $ResourceGroup)
+    return (Resolve-ConsumptionDataCheck -Results $CheckResults.ToArray() -Window $Window -ResourceGroup $ResourceGroup)
 }
 
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
