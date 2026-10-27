@@ -3,8 +3,8 @@
 # Runs Extension/Metrics.ps1 end to end against a stand-in Get-AzMetric and
 # checks the diagnostics it writes: the per-batch verbose lines and the
 # end-of-phase summary in the debug log (counts by outcome, every non-success
-# call, the five slowest calls). It also checks that the per-call diagnostics
-# records are not kept for the whole phase.
+# call, the five slowest calls). It also checks that each batch's per-call
+# diagnostics records are dropped once that batch is done.
 #
 # The stand-in is a small module put first on PSModulePath, so the parallel
 # workers and their thread jobs load it instead of Az.Monitor. No Azure call is
@@ -84,7 +84,7 @@ Export-ModuleMember -Function Get-AzMetric
     }
 
     # Dot-sources the script in a child scope so its collections can be read
-    # once the phase has finished.
+    # while each batch finishes and once the phase has finished.
     function Invoke-MetricsPhase([object[]]$Resources, [string]$Tag)
     {
         $DebugLog = Join-Path $TestDrive ('Debug_' + $Tag + '.log')
@@ -103,11 +103,23 @@ Export-ModuleMember -Function Get-AzMetric
                 param($ScriptPath, $ScriptParams)
                 $ProgressPreference = 'SilentlyContinue'
                 $VerbosePreference = 'Continue'
+                # The script dispatches the next batch, and ends the phase, only
+                # after folding the previous batch's call records into the summary,
+                # so the number of records still held at those two points is what
+                # each batch left behind. The first batch has no batch before it.
+                $RetainedAfterBatch = [System.Collections.Generic.List[int]]::new()
+                $ShowProgress = ${function:Write-RdaProgress}
+                function Write-RdaProgress
+                {
+                    param([string]$Activity, [string]$CurrentItem, [int]$Index, [int]$Total, [switch]$BarOnly, [switch]$Completed)
+                    if ($Completed -or $CurrentItem -notlike 'batch 1 *') { $RetainedAfterBatch.Add($MetricDiagnostics.Count) }
+                    & $ShowProgress @PSBoundParameters
+                }
                 $Records = @(. $ScriptPath @ScriptParams 4>&1)
                 [pscustomobject]@{
-                    Output              = @($Records | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] })
-                    Verbose             = @($Records | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } | ForEach-Object { $_.Message } | Where-Object { $_ -like '`[Metrics`]*' })
-                    RetainedCallRecords = $MetricDiagnostics.Count
+                    Output             = @($Records | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] })
+                    Verbose            = @($Records | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } | ForEach-Object { $_.Message } | Where-Object { $_ -like '`[Metrics`]*' })
+                    RetainedAfterBatch = @($RetainedAfterBatch)
                 }
             } $script:MetricsScript $Params
         }
@@ -245,7 +257,8 @@ Describe 'Metrics phase diagnostics across several batches' {
     }
 
     It 'does not keep every call record until the end of the phase' {
-        $script:Run.RetainedCallRecords | Should -BeLessOrEqual 250 -Because 'call records are folded into the summary after each batch of 250 calls'
+        # One value per batch: the records still held when that batch is done.
+        ($script:Run.RetainedAfterBatch -join ',') | Should -Be '0,0,0,0' -Because 'each batch''s call records are folded into the summary and dropped before the next batch starts'
     }
 }
 
