@@ -681,6 +681,68 @@ Function RunInventorySetup()
     CheckCliRequirements
     CheckPowerShell
     GetSubscriptionsData
+
+    # Direct runs check two things up front, before any inventory, collector or
+    # metrics work (both in Functions/Common.Functions.ps1). Under -RunAllSubs
+    # the wrapper has already checked every subscription, so neither is repeated.
+    #
+    # 1. The identity's roles, with or without -SkipConsumption
+    #    (Test-SubscriptionRoleAccessAll). Resource Graph returns 0 rows rather
+    #    than an error for a subscription the identity cannot read, so without
+    #    this check such a run is exempted from the consumption check
+    #    (0 resources) and finishes with an empty report. With -ResourceGroup
+    #    the read verdict is for that resource group, because Reader on only
+    #    that resource group is enough for such a run. -ResourceGroup without
+    #    -SubscriptionID is refused by ResourceInventoryLoop, so it is not
+    #    checked here. When consumption is requested the usage permission is
+    #    printed too, for information.
+    # 2. Consumption: unless -SkipConsumption, every in-scope subscription must
+    #    return usage values (Invoke-ConsumptionDataCheck). On a refusal the
+    #    role check's usage verdict is printed with the fix.
+    if (-not $RunAllSubs.IsPresent)
+    {
+        $AccessProbed = @()
+        $ConsumptionCheckScope = if (![string]::IsNullOrEmpty($SubscriptionID))
+        {
+            $Match = @($Global:Subscriptions | Where-Object { $_.id -eq $SubscriptionID })
+            if ($Match.Count -gt 0) { $Match } else { @([pscustomobject]@{ Id = $SubscriptionID; Name = $SubscriptionID }) }
+        }
+        else
+        {
+            @($Global:Subscriptions)
+        }
+
+        if (@($ConsumptionCheckScope).Count -gt 0 -and ([string]::IsNullOrEmpty($ResourceGroup) -or ![string]::IsNullOrEmpty($SubscriptionID)))
+        {
+            if ([string]::IsNullOrEmpty($ResourceGroup))
+            {
+                Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f @($ConsumptionCheckScope).Count) -ForegroundColor Cyan
+            }
+            else
+            {
+                Write-Host ("Verifying access to resource group '{0}' up front..." -f $ResourceGroup) -ForegroundColor Cyan
+            }
+            $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ConsumptionCheckScope -ResourceGroup $ResourceGroup -IncludeUsage:(-not $SkipConsumption.IsPresent))
+            $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed
+            Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount @($ConsumptionCheckScope).Count -ResourceGroup $ResourceGroup -DirectRun
+            if ($AccessDecision.ShouldBlock)
+            {
+                exit 1
+            }
+        }
+
+        if (-not $SkipConsumption.IsPresent)
+        {
+            $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope
+            Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
+            Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
+            if ($ConsumptionCheck.ShouldBlock)
+            {
+                exit 1
+            }
+        }
+    }
+
     ResourceInventoryLoop
     ResourceInventoryAvd
 
@@ -1215,8 +1277,11 @@ function ExecuteInventoryProcessing()
         [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
         [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
 
-        $ReportedStartTime = (Get-Date).AddDays(-31).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
-        $ReportedEndTime = (Get-Date).AddDays(-1).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
+        # Same window the up-front consumption data check queried
+        # (Get-ConsumptionWindow in Functions/Common.Functions.ps1).
+        $ConsumptionWindow = Get-ConsumptionWindow
+        $ReportedStartTime = $ConsumptionWindow.Start
+        $ReportedEndTime = $ConsumptionWindow.End
 
         if (-not (Test-DataPlaneAuthReady -Phase 'Consumption'))
         {

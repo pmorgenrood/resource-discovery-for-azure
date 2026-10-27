@@ -25,6 +25,16 @@ Per subscription, the collector:
 - Writes each page to the CSV as it goes (`Export-Csv -Append`), so rows are
   flushed incrementally rather than held in memory to the end.
 
+### Up-front consumption data check
+
+Before any inventory or metrics work, both entry points check that every
+subscription in the run returns at least one usage row with a quantity above
+zero for this same window, and stop with exit code 1 if one does not. The phase
+and the check take the window from one helper (`Get-ConsumptionWindow` in
+`Functions/Common.Functions.ps1`), so the two cannot drift. See
+[Consumption data check](../README.md#consumption-data-check-up-front) in the
+README.
+
 ### Authentication pre-check
 
 Before paging, the phase verifies a usable Azure context/token exists

@@ -825,37 +825,32 @@ if ($ResumeFailedOnly)
 }
 
 # ---------------------------------------------------------------------------
-# Up-front access gate. Before ANY per-subscription work, verify the signed-in
-# identity can actually read every in-scope subscription. Azure Resource Graph
-# returns 0 rows (not a 403) for a subscription the identity has no role on, so a
-# permission gap is otherwise invisible until the report comes back silently
-# missing subscriptions - and can feed the consumption cross-attribution class of
-# bug. Catch it here instead. By default any inaccessible subscription HARD-STOPS
-# the run so the operator fixes access first; -AllowPartialAccess overrides that
-# to skip the inaccessible ones and continue. On -Resume only the subscriptions
-# this run will actually process (not already-completed ones) are probed. Runs
-# once in the parent, before the sequential/parallel split, so it gates both.
+# Up-front role check. Before ANY per-subscription work, verify from the
+# signed-in identity's roles that it can read every in-scope subscription
+# (Test-SubscriptionRoleAccessAll in Functions/Common.Functions.ps1: its role
+# assignments and Azure's caller-permissions answer, combined). Azure Resource
+# Graph returns 0 rows (not a 403) for a subscription the identity cannot read,
+# so a permission gap is otherwise invisible until the report comes back
+# silently missing subscriptions. By default any subscription that fails
+# HARD-STOPS the run so the operator fixes access first; -AllowPartialAccess
+# overrides that to skip the failing ones and continue. On -Resume only the
+# subscriptions this run will actually process (not already-completed ones) are
+# checked. Runs once in the parent, before the sequential/parallel split, so it
+# gates both. The records are kept for the end-of-run 0-resource labels.
+$AccessProbed = @()
 $ScopeForProbe = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
 if ($ScopeForProbe.Count -gt 0)
 {
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $ScopeForProbe.Count) -ForegroundColor Cyan
-    $AccessProbed = Test-SubscriptionAccessAll -Subscriptions $ScopeForProbe
+    $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ScopeForProbe -IncludeUsage:(-not $SkipConsumption))
     $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed -AllowPartialAccess:$AllowPartialAccess
+    Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount $ScopeForProbe.Count
+    if ($AccessDecision.ShouldBlock)
+    {
+        Exit-Wrapper -Code 1
+    }
     if ($AccessDecision.Inaccessible.Count -gt 0)
     {
-        Write-Host ("  {0} subscription(s) are NOT readable by the signed-in identity:" -f $AccessDecision.Inaccessible.Count) -ForegroundColor Red
-        foreach ($NA in $AccessDecision.Inaccessible)
-        {
-            $Label = if ($NA.State -eq 'Unknown') { 'access probe inconclusive after retries' } else { 'no role on the subscription' }
-            Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
-        }
-        if ($AccessDecision.ShouldBlock)
-        {
-            Write-Host "  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run." -ForegroundColor Red
-            Write-Host "  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)" -ForegroundColor Red
-            Exit-Wrapper -Code 1
-        }
-        Write-Host "  -AllowPartialAccess set: skipping the above and continuing with the accessible subscription(s)." -ForegroundColor Yellow
         $Subscriptions = @($Subscriptions | Where-Object { $AccessDecision.InaccessibleIds -notcontains $_.Id })
         if ($Subscriptions.Count -eq 0)
         {
@@ -863,59 +858,34 @@ if ($ScopeForProbe.Count -gt 0)
             Exit-Wrapper -Code 1
         }
     }
-    else
-    {
-        Write-Host ("  Access verified: all {0} in-scope subscription(s) are readable." -f $ScopeForProbe.Count) -ForegroundColor Green
-    }
 }
 
 # ---------------------------------------------------------------------------
-# Up-front consumption (billing) access gate. Consumption was REQUESTED unless
-# -SkipConsumption was passed. If the signed-in identity is not authorized to
-# read consumption data, every subscription's consumption phase would fail and
-# the run would produce reports silently missing the billing data the operator
-# explicitly asked for. That is a HARD failure - fail fast, before spending
-# time on inventory and metrics, rather than hand back an incomplete report.
+# Up-front consumption data check. Consumption was REQUESTED unless
+# -SkipConsumption was passed, and a run without usage values cannot price the
+# business case, so before any inventory or metrics work every subscription
+# this run will process must return at least one usage row with a quantity
+# above zero for the billing phase's own window (Invoke-ConsumptionDataCheck in
+# Functions/Common.Functions.ps1). Zero rows, all-zero rows, a permission
+# error, or an error that persists after retries stops the run with exit 1,
+# listing every failing subscription and the fix. Subscriptions with no
+# resources in Resource Graph are not checked (nothing to price).
 #
-# Runs AFTER the access gate above, so $Subscriptions[0] is already known to be
-# control-plane-readable (inaccessible subs have either hard-stopped the run or,
-# under -AllowPartialAccess, been removed from $Subscriptions) - a 403 here is
-# therefore a genuine BILLING-RBAC denial, not just "no role on that sub".
-# consumption/billing RBAC is usually uniform across a tenant, so we probe the
-# FIRST subscription as the access signal. We hard-fail ONLY on a clear
-# authorization denial; a transient/token error (Conditional Access, expired
-# token, throttling) is NOT treated as a hard failure here - that is the
-# recoverable class the per-subscription consumption phase already handles and
-# reports. Operators who genuinely have mixed per-subscription billing access
-# can use -SkipConsumption.
-if (-not $SkipConsumption -and $Subscriptions.Count -gt 0)
+# Runs AFTER the role check above, so a failure here is about consumption
+# data, not about reading the subscription; on a refusal the role check's usage
+# verdict for each failing subscription is printed with the fix
+# (Write-UsageRoleReport). The role check never passes or blocks consumption.
+# -AllowPartialAccess does not bypass it. On -Resume only the subscriptions
+# this run will process are checked.
+$ConsumptionCheckScope = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
+if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)
 {
-    $ConsumptionProbeSub = $Subscriptions[0]
-    Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $ConsumptionProbeSub.Name) -ForegroundColor Cyan
-    $ConsumptionAccess = Test-ConsumptionAccess -SubscriptionId $ConsumptionProbeSub.Id
-    if ($ConsumptionAccess.Outcome -eq 'Denied')
+    $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope
+    Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
+    Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
+    if ($ConsumptionCheck.ShouldBlock)
     {
-        Write-Host ""
-        Write-Host "ERROR: Consumption data was requested (no -SkipConsumption), but the signed-in identity is not authorized to read consumption/billing data." -ForegroundColor Red
-        Write-Host ("Probed subscription: {0}" -f $ConsumptionProbeSub.Name) -ForegroundColor Red
-        if (-not [string]::IsNullOrWhiteSpace($ConsumptionAccess.Detail))
-        {
-            Write-Host ("Reason: {0}" -f $ConsumptionAccess.Detail) -ForegroundColor Red
-        }
-        Write-Host "Grant this identity 'Cost Management Reader' (or 'Billing Reader' on the billing scope), or re-run with -SkipConsumption to inventory without billing data." -ForegroundColor Yellow
         Exit-Wrapper -Code 1
-    }
-    elseif ($ConsumptionAccess.Outcome -eq 'Unavailable')
-    {
-        Write-Host "WARNING: Could not verify consumption access up front (a transient/token issue, not an authorization denial). Continuing; per-subscription consumption health is reported at the end of the run." -ForegroundColor Yellow
-        if (-not [string]::IsNullOrWhiteSpace($ConsumptionAccess.Detail))
-        {
-            Write-Host ("  Probe error (why it could not be verified): {0}" -f $ConsumptionAccess.Detail) -ForegroundColor DarkYellow
-        }
-    }
-    else
-    {
-        Write-Host "Consumption access confirmed." -ForegroundColor Green
     }
 }
 
@@ -1800,14 +1770,15 @@ if ($Resume)
 Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green
 
 # Surface the per-subscription resource-count result so the user does not have
-# to scan individual transcripts to find subs that came back empty. Empty subs
-# are shown distinctly because they almost always indicate a permission gap;
-# treating them as "successful" in the summary is misleading.
+# to scan individual transcripts to find subs that came back empty.
 $EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 })
 $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
 # Initialised here (not only inside the 0-resource branch below) so the
 # run-summary finalization can read them unconditionally even when there
-# were no empty subscriptions to classify.
+# were no empty subscriptions to classify. $NoAccessSubs stays empty: a
+# subscription the identity cannot read is stopped (or, with
+# -AllowPartialAccess, skipped) by the up-front role check and never reaches
+# this point.
 $NoAccessSubs = @()
 $GenuinelyEmptySubs = @()
 $UnknownSubs = @()
@@ -1818,51 +1789,34 @@ if ($SubResourceCounts.Count -gt 0)
 }
 if ($EmptySubs.Count -gt 0)
 {
-    # A sub that returned 0 resources is either a permission gap (no role on the
-    # sub) or genuinely empty. Probe each one to label it precisely so the user
-    # knows whether to fix access or ignore it. The probe is one cheap ARM call
-    # per empty sub (only empties, so no cost on normal runs).
-    $NoAccessSubs = @()
-    $GenuinelyEmptySubs = @()
-    $UnknownSubs = @()
-    foreach ($e in $EmptySubs)
-    {
-        switch (Get-SubscriptionAccessState -SubscriptionId $e.Id)
-        {
-            'NoAccess' { $NoAccessSubs += $e }
-            'Empty' { $GenuinelyEmptySubs += $e }
-            default { $UnknownSubs += $e }
-        }
-    }
+    # Every subscription this run processed passed the up-front role check, so
+    # one that returned 0 resources is genuinely empty. Any the role check did
+    # not cover are listed as undetermined rather than guessed at.
+    $EmptySplit = Split-EmptySubscriptionsByRoleCheck -EmptySubscriptions $EmptySubs -RoleCheck $AccessProbed
+    $GenuinelyEmptySubs = @($EmptySplit.Empty)
+    $UnknownSubs = @($EmptySplit.Undetermined)
 
     Write-Host ""
     Write-Host ("Subscriptions with 0 resources: {0}" -f $EmptySubs.Count) -ForegroundColor Yellow
 
-    if ($NoAccessSubs.Count -gt 0)
-    {
-        Write-Host ("  NO ACCESS ({0}) - the signed-in identity has no role on these subscriptions:" -f $NoAccessSubs.Count) -ForegroundColor Red
-        foreach ($e in $NoAccessSubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Red }
-        Write-Host "    Fix: grant the identity Reader on these subscriptions, then re-run." -ForegroundColor Red
-    }
     if ($GenuinelyEmptySubs.Count -gt 0)
     {
-        Write-Host ("  GENUINELY EMPTY ({0}) - access confirmed, the subscription has no resources:" -f $GenuinelyEmptySubs.Count) -ForegroundColor Yellow
+        Write-Host ("  GENUINELY EMPTY ({0}) - the up-front role check found read access; the subscription has no resources:" -f $GenuinelyEmptySubs.Count) -ForegroundColor Yellow
         foreach ($e in $GenuinelyEmptySubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Yellow }
         Write-Host "    No action needed - these are expected to be empty in the report." -ForegroundColor DarkGray
     }
     if ($UnknownSubs.Count -gt 0)
     {
-        Write-Host ("  UNDETERMINED ({0}) - access probe was inconclusive (transient error / throttling):" -f $UnknownSubs.Count) -ForegroundColor Yellow
+        Write-Host ("  UNDETERMINED ({0}) - not covered by this run's up-front role check:" -f $UnknownSubs.Count) -ForegroundColor Yellow
         foreach ($e in $UnknownSubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Yellow }
-        Write-Host "    Verify manually (PowerShell): (Invoke-AzRestMethod -Method GET -Path '/subscriptions/<id>/resourcegroups?api-version=2021-04-01').StatusCode" -ForegroundColor Yellow
+        Write-Host "    Re-run for these subscriptions so the role check covers them." -ForegroundColor Yellow
     }
 
-    # Persist the per-subscription access verdict to the diagnostic log so it
+    # Persist the per-subscription verdict to the diagnostic log so it
     # outlives the console/transcript and can be attached to a ticket or e-mail.
-    # This is the durable record behind the on-screen labels above: which
-    # 0-resource subs are a permission gap (fix: grant Reader, re-run -Resume)
-    # vs genuinely empty (no action). Reuses the run's $DiagFile if one already
-    # exists (e.g. from a failure), otherwise creates one.
+    # This is the durable record behind the on-screen labels above. Reuses the
+    # run's $DiagFile if one already exists (e.g. from a failure), otherwise
+    # creates one.
     if ($null -eq $DiagFile)
     {
         $DiagFile = Join-Path $InventoryRoot ("RunAllSubscriptions_diagnostics_{0}_{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'), [guid]::NewGuid().ToString().Substring(0, 4))
@@ -1870,17 +1824,13 @@ if ($EmptySubs.Count -gt 0)
     $EmptyDiag = @()
     $EmptyDiag += "==== Subscriptions with 0 resources - access verdict ===="
     $EmptyDiag += "Timestamp: $(Get-Date -Format 'o')"
-    foreach ($e in $NoAccessSubs)
-    {
-        $EmptyDiag += ("NO_ACCESS {0} ({1}) - identity has no role on the subscription; grant Reader and re-run with -Resume" -f $e.Name, $e.Id)
-    }
     foreach ($e in $GenuinelyEmptySubs)
     {
-        $EmptyDiag += ("EMPTY {0} ({1}) - access confirmed, no resources; no action needed" -f $e.Name, $e.Id)
+        $EmptyDiag += ("EMPTY {0} ({1}) - read access found by the up-front role check, no resources; no action needed" -f $e.Name, $e.Id)
     }
     foreach ($e in $UnknownSubs)
     {
-        $EmptyDiag += ("UNDETERMINED   {0} ({1}) - access probe inconclusive; verify (PowerShell): (Invoke-AzRestMethod -Method GET -Path '/subscriptions/{1}/resourcegroups?api-version=2021-04-01').StatusCode" -f $e.Name, $e.Id)
+        $EmptyDiag += ("UNDETERMINED   {0} ({1}) - not covered by this run's up-front role check; re-run for it" -f $e.Name, $e.Id)
     }
     $EmptyDiag += ""
     try
