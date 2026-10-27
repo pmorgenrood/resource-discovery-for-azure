@@ -64,7 +64,9 @@ BeforeAll {
     }
 
     # Stand-in for ResourceInventory.ps1: one report per call under the test's
-    # inventory root, and the two globals the wrapper reads afterwards.
+    # inventory root, and the globals the wrapper reads afterwards. The resource
+    # count is set both as the list and as the count, so the stand-in reports one
+    # resource whichever of the two the wrapper reads.
     $script:FakeRoot = Join-Path $script:TestBase 'fake-tool'
     New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
     $FakeInner = @'
@@ -83,6 +85,7 @@ Copy-Item -Path (Join-Path $Stage '*') -Destination $Folder
 Remove-Item -LiteralPath $Stage -Recurse -Force
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
+$Global:ResourceCount = 1
 '@
     Set-Content -LiteralPath (Join-Path $script:FakeRoot 'ResourceInventory.ps1') -Value $FakeInner -Encoding utf8
 
