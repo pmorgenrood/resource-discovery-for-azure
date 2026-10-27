@@ -16,7 +16,13 @@ param ($TenantID,
     $ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
-    $OutputDirectory)
+    $OutputDirectory,
+    # Internal, set by Run-AllSubscriptions.ps1 (with -RunAllSubs): the
+    # consumption window its up-front check queried, as 'yyyy-MM-dd' dates, so
+    # this run collects the same window even after midnight. When absent (or
+    # not valid) the run computes the window itself.
+    [string]$ConsumptionWindowStart,
+    [string]$ConsumptionWindowEnd)
 
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
 if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
@@ -682,6 +688,20 @@ Function RunInventorySetup()
     CheckPowerShell
     GetSubscriptionsData
 
+    # One consumption window per run, used by the up-front consumption data
+    # check below and by the consumption phase (GetResorceConsumption), so a
+    # run that crosses midnight still collects the window it checked. Under
+    # -RunAllSubs the wrapper passes the window its own check used.
+    $script:ConsumptionWindow = ConvertFrom-ConsumptionWindowArgument -Start $ConsumptionWindowStart -End $ConsumptionWindowEnd
+    if ($null -eq $script:ConsumptionWindow)
+    {
+        if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart) -or -not [string]::IsNullOrEmpty($ConsumptionWindowEnd))
+        {
+            Write-Log -Message ("Ignoring -ConsumptionWindowStart '{0}' / -ConsumptionWindowEnd '{1}': both must be yyyy-MM-dd dates, start not after end. Using this run's own consumption window." -f $ConsumptionWindowStart, $ConsumptionWindowEnd) -Severity 'Warning'
+        }
+        $script:ConsumptionWindow = Get-ConsumptionWindow
+    }
+
     # Direct runs check two things up front, before any inventory, collector or
     # metrics work (both in Functions/Common.Functions.ps1). Under -RunAllSubs
     # the wrapper has already checked every subscription, so neither is repeated.
@@ -697,12 +717,14 @@ Function RunInventorySetup()
     #    checked here. When consumption is requested the usage permission is
     #    printed too, for information.
     # 2. Consumption: unless -SkipConsumption, every in-scope subscription must
-    #    return usage values (Invoke-ConsumptionDataCheck). The role check
-    #    records are passed in: a subscription with no usage above zero passes
-    #    with a warning (NoUsage, listed again at the end of the run) only when
-    #    both role-check answers grant the usage permission at the subscription
-    #    or above. On a refusal the role check's usage verdict is printed with
-    #    the fix.
+    #    return usage values (Invoke-ConsumptionDataCheck) for the run's
+    #    window. With -ResourceGroup only that resource group's usage rows
+    #    count, the rows the consumption phase keeps for such a run. The role
+    #    check records are passed in: a subscription with no usage above zero
+    #    passes with a warning (NoUsage, listed again at the end of the run)
+    #    only when both role-check answers grant the usage permission at the
+    #    subscription or above. On a refusal the role check's usage verdict is
+    #    printed with the fix.
     if (-not $RunAllSubs.IsPresent)
     {
         $AccessProbed = @()
@@ -737,7 +759,7 @@ Function RunInventorySetup()
 
         if (-not $SkipConsumption.IsPresent)
         {
-            $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed
+            $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed -Window $script:ConsumptionWindow -ResourceGroup $ResourceGroup
             Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
             Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
             if ($ConsumptionCheck.ShouldBlock)
@@ -1282,11 +1304,10 @@ function ExecuteInventoryProcessing()
         [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
         [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
 
-        # Same window the up-front consumption data check queried
-        # (Get-ConsumptionWindow in Functions/Common.Functions.ps1).
-        $ConsumptionWindow = Get-ConsumptionWindow
-        $ReportedStartTime = $ConsumptionWindow.Start
-        $ReportedEndTime = $ConsumptionWindow.End
+        # The run's window (RunInventorySetup): the one the up-front
+        # consumption data check queried, or under -RunAllSubs the wrapper's.
+        $ReportedStartTime = $script:ConsumptionWindow.Start
+        $ReportedEndTime = $script:ConsumptionWindow.End
 
         if (-not (Test-DataPlaneAuthReady -Phase 'Consumption'))
         {
@@ -1401,7 +1422,8 @@ function ExecuteInventoryProcessing()
 
                         if (![string]::IsNullOrEmpty($ResourceGroup))
                         {
-                            if (!$InstanceInfo.'Microsoft.Resources'.resourceUri.toLower().Contains("/" + $ResourceGroup.toLower() + "/"))
+                            # Same test the up-front consumption data check counts rows by.
+                            if (-not (Test-ConsumptionResourceUriInResourceGroup -ResourceUri $InstanceInfo.'Microsoft.Resources'.resourceUri -ResourceGroup $ResourceGroup))
                             {
                                 continue;
                             }

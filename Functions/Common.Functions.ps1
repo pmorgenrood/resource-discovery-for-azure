@@ -265,11 +265,14 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
 #   B. Azure's answer for the caller's effective permissions at the target
 #      scope (Microsoft.Authorization/permissions).
 #
-# Both are evaluated with the same rule (Test-RoleActionAllowed). The target is
+# Both are evaluated with the same rule (Get-RoleGrantsAllowing). The target is
 # the subscription, or the resource group for a direct -ResourceGroup run.
 # A subscription passes when A and B both find read access, or when A is not
 # visible (an identity without Microsoft.Authorization read gets an empty list)
-# and B finds read access. Any other combination stops the run.
+# and B finds read access. Any other combination stops the run. Read access
+# means one role (one permission block) that reads every resource type: a
+# role whose notActions remove reads of some resource types does not count,
+# because Resource Graph would leave those resources out without an error.
 #
 # Usage permission (Microsoft.Commerce/UsageAggregates/read) is evaluated the
 # same way, at the subscription only: the usage API is per subscription, so a
@@ -304,7 +307,9 @@ function Test-RoleActionAllowed
 
 # The two actions the role check evaluates. Reading resources is tested with a
 # read action of a provider that does not exist, so only a pattern that covers
-# any read action (such as '*/read' or '*') grants it.
+# any read action (such as '*/read' or '*') grants it; Get-RoleGrantsAllowing
+# also requires that no notAction of the same role removes reads of some
+# resource type.
 function Get-RoleCheckAction
 {
     param([ValidateSet('Resources', 'Usage')][string]$Kind)
@@ -312,13 +317,59 @@ function Get-RoleCheckAction
     return 'Rda.AnyProvider/anyResourceType/read'
 }
 
+# Pure: the first notAction of one permission block that can remove read
+# access to some resource type, or $null. A pattern counts when its last
+# segment is '*' or 'read' (ignoring case), unless it is confined to a
+# namespace the inventory never reads resources from: Microsoft.Authorization
+# (a role that cannot read role assignments is handled as 'not visible' by the
+# role check) and the billing namespaces, which the consumption data check
+# covers. Resource Graph silently leaves out resources the caller cannot read,
+# so a role such as '*/read' minus 'Microsoft.Compute/*/read' would otherwise
+# pass the check and produce an inventory without those resources.
+function Get-RoleReadExclusion
+{
+    param([object[]]$NotActions)
+    $Exempt = @('Microsoft.Authorization', 'Microsoft.Commerce', 'Microsoft.Consumption', 'Microsoft.Billing')
+    foreach ($Pattern in @($NotActions))
+    {
+        $Text = [string]$Pattern
+        if ([string]::IsNullOrEmpty($Text)) { continue }
+        $Segments = $Text.Split('/')
+        if ($Segments[-1] -ne '*' -and $Segments[-1] -ne 'read') { continue }
+        if ($Segments.Count -gt 1 -and $Exempt -contains $Segments[0]) { continue }
+        return $Text
+    }
+    return $null
+}
+
 # Pure: labels of the grants (objects with Label, Actions, NotActions) that
-# allow $Action.
+# allow $Action. For the resource read action (Get-RoleCheckAction -Kind
+# Resources) a grant also needs no notAction that removes read access to some
+# resource type (Get-RoleReadExclusion): each grant is one role, so Reader
+# beside a narrower custom role still passes.
 function Get-RoleGrantsAllowing
 {
     param([object[]]$Grants, [string]$Action)
-    return @(@($Grants) | Where-Object { $null -ne $_ -and (Test-RoleActionAllowed -Actions $_.Actions -NotActions $_.NotActions -Action $Action) } |
-            ForEach-Object { [string]$_.Label } | Select-Object -Unique)
+    $ReadCheck = $Action -eq (Get-RoleCheckAction -Kind Resources)
+    return @(@($Grants) | Where-Object {
+            $null -ne $_ -and (Test-RoleActionAllowed -Actions $_.Actions -NotActions $_.NotActions -Action $Action) -and
+            (-not $ReadCheck -or $null -eq (Get-RoleReadExclusion -NotActions $_.NotActions))
+        } | ForEach-Object { [string]$_.Label } | Select-Object -Unique)
+}
+
+# Pure: for grants that allow reading resources except for some resource
+# types, one entry per grant: { Grant; Pattern } with the first excluding
+# notAction. Used to say why the resource read check failed.
+function Get-RoleReadExclusions
+{
+    param([object[]]$Grants)
+    $Action = Get-RoleCheckAction -Kind Resources
+    foreach ($Grant in @($Grants))
+    {
+        if ($null -eq $Grant -or -not (Test-RoleActionAllowed -Actions $Grant.Actions -NotActions $Grant.NotActions -Action $Action)) { continue }
+        $Pattern = Get-RoleReadExclusion -NotActions $Grant.NotActions
+        if ($null -ne $Pattern) { [pscustomobject]@{ Grant = $Grant; Pattern = $Pattern } }
+    }
 }
 
 # Pure: where a role assignment's scope sits for a check on $SubscriptionId
@@ -386,7 +437,9 @@ function Get-RoleCheckCallerObjectId
 # One ARM GET through Invoke-AzRestMethod with the consumption check's retry
 # policy (Invoke-ConsumptionCallWithRetry): throttling (429), timeouts and 5xx
 # are retried with backoff; any other status is returned at once, so a 400 is
-# not retried. List answers are followed through nextLink. Returns
+# not retried. List answers are followed through nextLink, for at most
+# $MaxPages pages; past that the answer is an error ('more than N pages'),
+# which leaves the check inconclusive and stops the run. Returns
 # { Status; Items; Body; Error }: Status is the last HTTP status ($null for a
 # client-side failure), Items the 'value' entries of every page, Body the last
 # page.
@@ -395,7 +448,7 @@ function Invoke-RoleCheckGet
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [int]$MaxRetries = 3,
-        [int]$MaxPages = 50
+        [int]$MaxPages = 1000
     )
     $Items = @()
     $Body = $null
@@ -441,10 +494,16 @@ function Invoke-RoleCheckGet
 
 # Answer A for one subscription: the identity's role assignments and their
 # definitions. $DefinitionCache (shared across subscriptions) keeps every role
-# definition read successfully, by its id, so each is read once per run.
-# Returns { Resources; Usage; ResourcesGrantedBy; UsageGrantedBy; VisibleRoles;
-# Detail } with Resources and Usage each 'Yes', 'No', 'NotVisible' (the list is
-# empty or refused) or 'Unknown' (the answer stayed inconclusive).
+# definition read successfully, by its id, so each is read once per run. A
+# definition whose read was refused (HTTP 401, 403 or 404) is kept as $null,
+# so it is not read again for later subscriptions; after any other failure
+# (throttling, a server error, a timeout) it is read again.
+# Returns { Resources; Usage; ResourcesGrantedBy; UsageGrantedBy;
+# ResourcesExcluded; VisibleRoles; Detail } with Resources and Usage each
+# 'Yes', 'No', 'NotVisible' (the list is empty or refused) or 'Unknown' (the
+# answer stayed inconclusive). ResourcesExcluded, filled when Resources is
+# 'No', names each role that reads resources except for some resource types
+# (Get-RoleReadExclusion).
 function Get-RoleAssignmentAccess
 {
     param(
@@ -459,6 +518,7 @@ function Get-RoleAssignmentAccess
         Usage              = 'Unknown'
         ResourcesGrantedBy = @()
         UsageGrantedBy     = @()
+        ResourcesExcluded  = @()
         VisibleRoles       = @()
         Detail             = $null
     }
@@ -505,6 +565,10 @@ function Get-RoleAssignmentAccess
             {
                 $DefinitionCache[$Key] = $Definition.Body.properties
             }
+            elseif ($Definition.Status -in @(401, 403, 404))
+            {
+                $DefinitionCache[$Key] = $null
+            }
         }
         $Role = $DefinitionCache[$Key]
         $ScopeText = switch ($Kind)
@@ -516,6 +580,7 @@ function Get-RoleAssignmentAccess
             default { $Kind }
         }
         $Through = if ([string]$Props.principalId -ne $CallerObjectId) { ' through a group' } else { '' }
+        $Where = '{0}{1}' -f $ScopeText, $Through
         if ($null -eq $Role)
         {
             $Visible += ('a role that could not be read at {0}{1}' -f $ScopeText, $Through)
@@ -523,11 +588,11 @@ function Get-RoleAssignmentAccess
             continue
         }
         $RoleText = if ([string]$Role.type -eq 'CustomRole') { '{0} (custom role)' -f $Role.roleName } else { [string]$Role.roleName }
-        $Label = '{0} at {1}{2}' -f $RoleText, $ScopeText, $Through
+        $Label = '{0} at {1}' -f $RoleText, $Where
         $Visible += $Label
         foreach ($Block in @($Role.permissions))
         {
-            $Grants += [pscustomobject]@{ Label = $Label; Kind = $Kind; Actions = @($Block.actions); NotActions = @($Block.notActions) }
+            $Grants += [pscustomobject]@{ Label = $Label; RoleName = [string]$Role.roleName; Where = $Where; Kind = $Kind; Actions = @($Block.actions); NotActions = @($Block.notActions) }
         }
     }
     $Result.VisibleRoles = @($Visible | Select-Object -Unique)
@@ -537,7 +602,16 @@ function Get-RoleAssignmentAccess
         $Kinds = Get-RoleCheckCountedScopeKinds -Kind $Check
         $By = @(Get-RoleGrantsAllowing -Grants @($Grants | Where-Object { $Kinds -contains $_.Kind }) -Action (Get-RoleCheckAction -Kind $Check))
         $Verdict = if ($By.Count -gt 0) { 'Yes' } elseif (@($Unreadable | Where-Object { $Kinds -contains $_ }).Count -gt 0) { 'Unknown' } else { 'No' }
-        if ($Check -eq 'Resources') { $Result.Resources = $Verdict; $Result.ResourcesGrantedBy = $By }
+        if ($Check -eq 'Resources')
+        {
+            $Result.Resources = $Verdict
+            $Result.ResourcesGrantedBy = $By
+            if ($Verdict -eq 'No')
+            {
+                $Result.ResourcesExcluded = @(Get-RoleReadExclusions -Grants @($Grants | Where-Object { $Kinds -contains $_.Kind }) |
+                        ForEach-Object { "role '{0}' at {1} excludes '{2}'" -f $_.Grant.RoleName, $_.Grant.Where, $_.Pattern } | Select-Object -Unique)
+            }
+        }
         else { $Result.Usage = $Verdict; $Result.UsageGrantedBy = $By }
     }
     if ($Result.Resources -eq 'Unknown' -or $Result.Usage -eq 'Unknown') { $Result.Detail = 'a role definition could not be read' }
@@ -545,8 +619,10 @@ function Get-RoleAssignmentAccess
 }
 
 # Answer B: Azure's effective permissions for the caller at $ScopePath.
-# Returns { Resources; Usage; Detail } with values 'Yes', 'No', 'NotFound' (a
-# -ResourceGroup target that answered 404) or 'Unknown'.
+# Returns { Resources; Usage; ResourcesExcluded; Detail } with values 'Yes',
+# 'No', 'NotFound' (a -ResourceGroup target that answered 404) or 'Unknown'.
+# ResourcesExcluded, filled when Resources is 'No', lists the notActions that
+# keep an entry from reading every resource type (Get-RoleReadExclusion).
 function Get-CallerPermissionsAccess
 {
     param(
@@ -557,20 +633,22 @@ function Get-CallerPermissionsAccess
     $Answer = Invoke-RoleCheckGet -MaxRetries $MaxRetries -Path ($ScopePath + '/providers/Microsoft.Authorization/permissions?api-version=2022-04-01')
     if ($Answer.Status -eq 404 -and $ResourceGroupTarget)
     {
-        return [pscustomobject]@{ Resources = 'NotFound'; Usage = 'NotFound'; Detail = 'HTTP 404' }
+        return [pscustomobject]@{ Resources = 'NotFound'; Usage = 'NotFound'; ResourcesExcluded = @(); Detail = 'HTTP 404' }
     }
     if ($Answer.Status -in @(401, 403, 404))
     {
-        return [pscustomobject]@{ Resources = 'No'; Usage = 'No'; Detail = ('HTTP {0}' -f $Answer.Status) }
+        return [pscustomobject]@{ Resources = 'No'; Usage = 'No'; ResourcesExcluded = @(); Detail = ('HTTP {0}' -f $Answer.Status) }
     }
     if ($null -ne $Answer.Error)
     {
-        return [pscustomobject]@{ Resources = 'Unknown'; Usage = 'Unknown'; Detail = ('caller permissions: {0}' -f $Answer.Error) }
+        return [pscustomobject]@{ Resources = 'Unknown'; Usage = 'Unknown'; ResourcesExcluded = @(); Detail = ('caller permissions: {0}' -f $Answer.Error) }
     }
     $Entry = 0
     $Grants = @(@($Answer.Items) | ForEach-Object { $Entry++; [pscustomobject]@{ Label = ('entry {0}' -f $Entry); Actions = @($_.actions); NotActions = @($_.notActions) } })
     $Has = { param($Kind) if (@(Get-RoleGrantsAllowing -Grants $Grants -Action (Get-RoleCheckAction -Kind $Kind)).Count -gt 0) { 'Yes' } else { 'No' } }
-    return [pscustomobject]@{ Resources = (& $Has 'Resources'); Usage = (& $Has 'Usage'); Detail = $null }
+    $Resources = & $Has 'Resources'
+    $Excluded = if ($Resources -eq 'No') { @(Get-RoleReadExclusions -Grants $Grants | ForEach-Object { $_.Pattern } | Select-Object -Unique) } else { @() }
+    return [pscustomobject]@{ Resources = $Resources; Usage = (& $Has 'Usage'); ResourcesExcluded = $Excluded; Detail = $null }
 }
 
 # Pure: combine answer A (role assignments) and answer B (caller permissions)
@@ -601,16 +679,25 @@ function Format-RoleCheckReason
     param([string]$Verdict, $Assignments, $Permissions, [string]$ResourceGroup)
     $Target = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " to resource group '{0}'" -f $ResourceGroup }
     $Visible = @($Assignments.VisibleRoles)
+    $RolesExcluding = @($Assignments.ResourcesExcluded | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $AzureExcludes = @($Permissions.ResourcesExcluded | Where-Object { -not [string]::IsNullOrEmpty([string]$_) } | ForEach-Object { "'{0}'" -f $_ })
+    $Miss = 'the inventory would miss those resources'
     switch ($Verdict)
     {
         'Yes' { return ('Read access: {0}' -f (@($Assignments.ResourcesGrantedBy) -join '; ')) }
         'YesPermissionsOnly' { return 'role assignments are not visible to this identity; Azure reports read access' }
         'No'
         {
+            if ($RolesExcluding.Count -gt 0) { return ('{0}; {1}' -f ($RolesExcluding -join '; '), $Miss) }
+            if ($AzureExcludes.Count -gt 0) { return ('Azure reports read access{0} that excludes {1}; {2}' -f $Target, ($AzureExcludes -join ', '), $Miss) }
             $Seen = if ($Visible.Count -gt 0) { $Visible -join '; ' } else { 'none' }
             return ('no role grants read access{0} (roles visible: {1})' -f $Target, $Seen)
         }
-        'NoNotVisible' { return ('no read access{0} (role assignments not visible to this identity)' -f $Target) }
+        'NoNotVisible'
+        {
+            if ($AzureExcludes.Count -gt 0) { return ('Azure reports read access{0} that excludes {1} (role assignments not visible to this identity); {2}' -f $Target, ($AzureExcludes -join ', '), $Miss) }
+            return ('no read access{0} (role assignments not visible to this identity)' -f $Target)
+        }
         'NotFound' { return ("resource group '{0}' not found or not readable" -f $ResourceGroup) }
         'Disagree'
         {
@@ -618,9 +705,13 @@ function Format-RoleCheckReason
             {
                 'Yes' { 'read access ({0})' -f (@($Assignments.ResourcesGrantedBy) -join '; ') }
                 'NotVisible' { 'not visible' }
-                default { 'no read access (roles visible: {0})' -f $(if ($Visible.Count -gt 0) { $Visible -join '; ' } else { 'none' }) }
+                default
+                {
+                    if ($RolesExcluding.Count -gt 0) { 'no read access to every resource type ({0})' -f ($RolesExcluding -join '; ') }
+                    else { 'no read access (roles visible: {0})' -f $(if ($Visible.Count -gt 0) { $Visible -join '; ' } else { 'none' }) }
+                }
             }
-            $BText = if ($Permissions.Resources -eq 'Yes') { 'read access' } else { 'no read access' }
+            $BText = if ($Permissions.Resources -eq 'Yes') { 'read access' } elseif ($AzureExcludes.Count -gt 0) { 'read access that excludes {0}' -f ($AzureExcludes -join ', ') } else { 'no read access' }
             return ('role assignments show {0}, but Azure reports {1}{2}; if roles changed in the last few minutes, wait 5 minutes and re-run' -f $AText, $BText, $Target)
         }
         default
@@ -788,13 +879,34 @@ function Write-AccessPreflightReport
     }
     if ($Decision.ShouldBlock)
     {
-        if ($ForResourceGroup)
+        # The fix depends on why each subscription failed: a missing role
+        # (NoAccess, including NotFound for a resource group run), a check that
+        # could not finish (Unknown), or the two answers disagreeing (Disagree).
+        $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' } else { 'Grant the identity Reader on these subscriptions, then re-run.' }
+        $Remedies = [ordered]@{
+            NoAccess = $NoAccessText
+            Unknown  = 'The role check could not finish (the reason above says why); re-run.'
+            Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.'
+        }
+        $ByCause = [ordered]@{}
+        foreach ($NA in $Inaccessible)
         {
-            Write-Host "  Stopping before any work. Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run." -ForegroundColor Red
+            $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
+            if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
+            $ByCause[$Cause] += [string]$NA.Name
+        }
+        $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
+        if ($Causes.Count -eq 1)
+        {
+            Write-Host ('  Stopping before any work. {0}' -f $Remedies[$Causes[0]]) -ForegroundColor Red
         }
         else
         {
-            Write-Host "  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run." -ForegroundColor Red
+            Write-Host '  Stopping before any work.' -ForegroundColor Red
+            foreach ($Cause in $Causes)
+            {
+                Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor Red
+            }
         }
         if (-not $DirectRun)
         {
@@ -877,6 +989,40 @@ function Format-ConsumptionWindow
     param([Parameter(Mandatory = $true)]$Window)
     $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
     return ('{0} to {1}' -f $Window.Start.ToString('yyyy-MM-dd', $Invariant), $Window.End.ToString('yyyy-MM-dd', $Invariant))
+}
+
+# The window as the two 'yyyy-MM-dd' strings Run-AllSubscriptions.ps1 passes to
+# each ResourceInventory.ps1 it runs (-ConsumptionWindowStart and
+# -ConsumptionWindowEnd), so the check and every collection use one window
+# even when a subscription is collected after midnight. Plain invariant
+# strings survive a background job's serialisation and do not depend on the
+# host culture.
+function ConvertTo-ConsumptionWindowArgument
+{
+    param([Parameter(Mandatory = $true)]$Window)
+    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    return @{
+        ConsumptionWindowStart = $Window.Start.ToString('yyyy-MM-dd', $Invariant)
+        ConsumptionWindowEnd   = $Window.End.ToString('yyyy-MM-dd', $Invariant)
+    }
+}
+
+# Pure: the window from those two strings, as Get-ConsumptionWindow returns it
+# (midnights, Kind=Unspecified), or $null when either is missing, is not a
+# 'yyyy-MM-dd' date, or the start is after the end.
+function ConvertFrom-ConsumptionWindowArgument
+{
+    param([string]$Start, [string]$End)
+    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $Dates = @()
+    foreach ($Text in @($Start, $End))
+    {
+        $Value = [datetime]::MinValue
+        if ([string]::IsNullOrWhiteSpace($Text) -or -not [datetime]::TryParseExact($Text, 'yyyy-MM-dd', $Invariant, [System.Globalization.DateTimeStyles]::None, [ref]$Value)) { return $null }
+        $Dates += [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Unspecified)
+    }
+    if ($Dates[0] -gt $Dates[1]) { return $null }
+    return [pscustomobject]@{ Start = $Dates[0]; End = $Dates[1] }
 }
 
 # Pure: $true when at least one row carries a Quantity that is a number > 0.
@@ -989,25 +1135,41 @@ function Invoke-ConsumptionCallWithRetry
 }
 
 # Resource counts per subscription from Resource Graph, used to exempt
-# subscriptions that hold no resources (nothing to price). Resource Graph
-# returns no row for a subscription with zero resources, so every id in a
-# batch that answered successfully gets a count (0 when absent). Ids in a batch
-# that failed after retries are left out, so the caller checks their
-# consumption instead of exempting them.
+# subscriptions that hold no resources (nothing to price). With
+# -ResourceGroup only that resource group's resources are counted, matched the
+# way the inventory's own query matches it (lower-cased name, '=='). Resource
+# Graph returns no row for a subscription with zero resources, so every id in
+# a batch that answered successfully gets a count (0 when absent). Ids in a
+# batch that failed after retries are left out, so the caller checks their
+# consumption instead of exempting them; so is every id when -ResourceGroup is
+# not a valid resource group name.
 function Get-SubscriptionResourceCounts
 {
     param(
         [Parameter(Mandatory = $true)][string[]]$SubscriptionIds,
+        [string]$ResourceGroup,
         [int]$BatchSize = 1000
     )
     $Counts = @{}
+    $Query = 'resources | summarize ResourceCount = count() by subscriptionId'
+    if (-not [string]::IsNullOrEmpty($ResourceGroup))
+    {
+        # Same pattern ResourceInventory.ps1 validates -ResourceGroup with; it
+        # also keeps the name safe inside the query's quotes.
+        if ($ResourceGroup -notmatch '^[A-Za-z0-9._()-]{1,90}$')
+        {
+            Write-Verbose 'Resource count query skipped: the resource group name is not valid.'
+            return $Counts
+        }
+        $Query = "resources | where resourceGroup == '{0}' | summarize ResourceCount = count() by subscriptionId" -f $ResourceGroup.ToLowerInvariant()
+    }
     $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     for ($Offset = 0; $Offset -lt $Ids.Count; $Offset += $BatchSize)
     {
         $Batch = @($Ids[$Offset..([math]::Min($Offset + $BatchSize, $Ids.Count) - 1)])
         $Payload = @{
             subscriptions = $Batch
-            query         = 'resources | summarize ResourceCount = count() by subscriptionId'
+            query         = $Query
             options       = @{ resultFormat = 'objectArray'; '$top' = 1000 }
         } | ConvertTo-Json -Depth 4 -Compress
         $Call = Invoke-ConsumptionCallWithRetry -Argument $Payload -Operation {
@@ -1035,17 +1197,47 @@ function Get-SubscriptionResourceCounts
     return $Counts
 }
 
+# Pure: does a usage row's resource URI belong to resource group
+# $ResourceGroup? The URI must contain '/<resource group>/', compared without
+# case. The consumption phase (GetResorceConsumption in ResourceInventory.ps1)
+# keeps a row for a -ResourceGroup run by this same test, and the consumption
+# data check counts a row by it, so the check and the sheet agree.
+function Test-ConsumptionResourceUriInResourceGroup
+{
+    param([string]$ResourceUri, [string]$ResourceGroup)
+    if ([string]::IsNullOrEmpty($ResourceUri) -or [string]::IsNullOrEmpty($ResourceGroup)) { return $false }
+    return $ResourceUri.ToLowerInvariant().Contains('/' + $ResourceGroup.ToLowerInvariant() + '/')
+}
+
+# Pure: the resource URI ('Microsoft.Resources'.resourceUri) in a usage row's
+# InstanceData JSON, or $null when the InstanceData is missing, is not valid
+# JSON or has no URI.
+function Get-ConsumptionRowResourceUri
+{
+    param($InstanceData)
+    if ([string]::IsNullOrWhiteSpace([string]$InstanceData)) { return $null }
+    try { $Info = [string]$InstanceData | ConvertFrom-Json -ErrorAction Stop }
+    catch { return $null }
+    $Uri = $Info.'Microsoft.Resources'.resourceUri
+    if ($Uri -isnot [string]) { return $null }
+    return $Uri
+}
+
 # Queries one subscription's usage with the billing phase's cmdlet, window and
 # options, following ContinuationToken until a row with a positive quantity is
 # found, the pages run out, or $MaxPages pages have been read (PageCapReached:
-# more pages were offered but not read). The context switch is process-scoped
-# so the operator's saved default subscription is left alone. Returns
+# more pages were offered but not read). With -ResourceGroup only rows whose
+# resource URI belongs to that resource group count
+# (Test-ConsumptionResourceUriInResourceGroup), as in the consumption phase;
+# RowsSeen counts only those. The context switch is process-scoped so the
+# operator's saved default subscription is left alone. Returns
 # { PositiveFound; RowsSeen; PagesRead; PageCapReached; Attempts; Error }.
 function Invoke-ConsumptionValueProbe
 {
     param(
         [Parameter(Mandatory = $true)][string]$SubscriptionId,
         [Parameter(Mandatory = $true)]$Window,
+        [string]$ResourceGroup,
         [int]$MaxRetries = 3,
         [int]$MaxPages = 50
     )
@@ -1091,6 +1283,10 @@ function Invoke-ConsumptionValueProbe
 
         $Probe.PagesRead++
         $Rows = @(@($Page.Value.UsageAggregations) | Where-Object { $null -ne $_ } | ForEach-Object { $_.Properties } | Where-Object { $null -ne $_ })
+        if (-not [string]::IsNullOrEmpty($ResourceGroup))
+        {
+            $Rows = @($Rows | Where-Object { Test-ConsumptionResourceUriInResourceGroup -ResourceUri (Get-ConsumptionRowResourceUri -InstanceData $_.InstanceData) -ResourceGroup $ResourceGroup })
+        }
         $Probe.RowsSeen += $Rows.Count
         if (Test-ConsumptionRowsHavePositiveQuantity -Rows $Rows)
         {
@@ -1123,16 +1319,21 @@ function Invoke-ConsumptionValueProbe
 # empty answer then reflects no billed usage in the window (a new
 # subscription, only free resources, paused resources) rather than a missing
 # permission. Any other usage verdict, or no record, keeps the refusal.
+# With -ResourceGroup the counts and rows are that resource group's, and the
+# text says so.
 function Get-ConsumptionCheckVerdict
 {
     param(
         $Probe,
         $ResourceCount,
-        $UsageRole
+        $UsageRole,
+        [string]$ResourceGroup
     )
+    $ForRg = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " for resource group '{0}'" -f $ResourceGroup }
+    $InRg = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " in resource group '{0}'" -f $ResourceGroup }
     if ($null -ne $ResourceCount -and [int]$ResourceCount -eq 0)
     {
-        return [pscustomobject]@{ Outcome = 'Exempt'; Passed = $true; Detail = 'no resources in Resource Graph; not checked (nothing to price)' }
+        return [pscustomobject]@{ Outcome = 'Exempt'; Passed = $true; Detail = ('no resources{0} in Resource Graph; not checked (nothing to price)' -f $InRg) }
     }
     if ($null -eq $Probe)
     {
@@ -1140,7 +1341,7 @@ function Get-ConsumptionCheckVerdict
     }
     if ($Probe.PositiveFound)
     {
-        return [pscustomobject]@{ Outcome = 'Pass'; Passed = $true; Detail = ('usage values found ({0} row(s) read over {1} page(s))' -f $Probe.RowsSeen, $Probe.PagesRead) }
+        return [pscustomobject]@{ Outcome = 'Pass'; Passed = $true; Detail = ('usage values found{0} ({1} row(s) read over {2} page(s))' -f $ForRg, $Probe.RowsSeen, $Probe.PagesRead) }
     }
     if ($null -ne $Probe.Error)
     {
@@ -1153,15 +1354,15 @@ function Get-ConsumptionCheckVerdict
     }
     $Empty = if ($Probe.PageCapReached)
     {
-        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s) came back, none with a quantity above zero; only the first {1} page(s) were read' -f $Probe.RowsSeen, $Probe.PagesRead) }
+        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s){1} came back, none with a quantity above zero; only the first {2} page(s) were read' -f $Probe.RowsSeen, $ForRg, $Probe.PagesRead) }
     }
     elseif ([int]$Probe.RowsSeen -eq 0)
     {
-        [pscustomobject]@{ Outcome = 'NoRows'; Passed = $false; Detail = 'the query succeeded but returned no usage rows' }
+        [pscustomobject]@{ Outcome = 'NoRows'; Passed = $false; Detail = ('the query succeeded but returned no usage rows{0}' -f $ForRg) }
     }
     else
     {
-        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s) came back, none with a quantity above zero' -f $Probe.RowsSeen) }
+        [pscustomobject]@{ Outcome = 'NoPositiveQuantity'; Passed = $false; Detail = ('{0} usage row(s){1} came back, none with a quantity above zero' -f $Probe.RowsSeen, $ForRg) }
     }
     if ($null -ne $UsageRole -and [string]$UsageRole.UsageVerdict -eq 'Yes')
     {
@@ -1177,18 +1378,28 @@ function Resolve-ConsumptionDataCheck
 {
     param(
         [object[]]$Results,
-        $Window
+        $Window,
+        [string]$ResourceGroup
     )
     $All = @(@($Results) | Where-Object { $null -ne $_ })
     $Failed = @($All | Where-Object { -not $_.Passed })
     return [pscustomobject]@{
-        Window      = $Window
-        Results     = $All
-        Failed      = $Failed
-        Exempt      = @($All | Where-Object { $_.Outcome -eq 'Exempt' })
-        NoUsage     = @($All | Where-Object { $_.Outcome -eq 'NoUsage' })
-        ShouldBlock = ($Failed.Count -gt 0)
+        Window        = $Window
+        ResourceGroup = $ResourceGroup
+        Results       = $All
+        Failed        = $Failed
+        Exempt        = @($All | Where-Object { $_.Outcome -eq 'Exempt' })
+        NoUsage       = @($All | Where-Object { $_.Outcome -eq 'NoUsage' })
+        ShouldBlock   = ($Failed.Count -gt 0)
     }
+}
+
+# Pure: ' for resource group '<name>'' for a resource group check, else ''.
+function Format-ConsumptionCheckTarget
+{
+    param([string]$ResourceGroup)
+    if ([string]::IsNullOrEmpty($ResourceGroup)) { return '' }
+    return (" for resource group '{0}'" -f $ResourceGroup)
 }
 
 # Checks every subscription in $Subscriptions (objects with Id and Name) and
@@ -1197,19 +1408,32 @@ function Resolve-ConsumptionDataCheck
 # effect before the check is restored afterwards. $RoleCheck is the record list
 # from Test-SubscriptionRoleAccessAll for this run; a subscription's record
 # decides whether an empty answer is 'NoUsage' (Get-ConsumptionCheckVerdict).
+# $Window is the run's window: the caller computes it once and the
+# consumption phase collects the same one. -ResourceGroup (a direct
+# -ResourceGroup run) checks only that resource group's usage rows and
+# resources, the rows the consumption phase keeps for such a run.
 function Invoke-ConsumptionDataCheck
 {
     param(
         [Parameter(Mandatory = $true)][object[]]$Subscriptions,
         $Window = (Get-ConsumptionWindow),
         [object[]]$RoleCheck = @(),
+        [string]$ResourceGroup,
         [int]$MaxRetries = 3
     )
     $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
     $WindowText = Format-ConsumptionWindow -Window $Window
-    Write-Host ('Verifying consumption data (usage values for {0}) for {1} subscription(s)...' -f $WindowText, $Subs.Count) -ForegroundColor Cyan
+    $ForRg = Format-ConsumptionCheckTarget -ResourceGroup $ResourceGroup
+    if ([string]::IsNullOrEmpty($ResourceGroup))
+    {
+        Write-Host ('Verifying consumption data (usage values for {0}) for {1} subscription(s)...' -f $WindowText, $Subs.Count) -ForegroundColor Cyan
+    }
+    else
+    {
+        Write-Host ("Verifying consumption data (usage values for {0}) for resource group '{1}' in {2} subscription(s)..." -f $WindowText, $ResourceGroup, $Subs.Count) -ForegroundColor Cyan
+    }
 
-    $Counts = Get-SubscriptionResourceCounts -SubscriptionIds @($Subs | ForEach-Object { [string]$_.Id })
+    $Counts = Get-SubscriptionResourceCounts -SubscriptionIds @($Subs | ForEach-Object { [string]$_.Id }) -ResourceGroup $ResourceGroup
     $OriginalContext = $null
     try { $OriginalContext = Get-AzContext -ErrorAction Stop }
     catch { Write-Verbose ('Could not read the current Azure context: {0}' -f $_.Exception.Message) }
@@ -1226,24 +1450,36 @@ function Invoke-ConsumptionDataCheck
             $Probe = $null
             if ($null -eq $ResourceCount -or $ResourceCount -gt 0)
             {
-                $Probe = Invoke-ConsumptionValueProbe -SubscriptionId $Id -Window $Window -MaxRetries $MaxRetries
+                $Probe = Invoke-ConsumptionValueProbe -SubscriptionId $Id -Window $Window -ResourceGroup $ResourceGroup -MaxRetries $MaxRetries
             }
             $Timer.Stop()
             $UsageRole = @(@($RoleCheck) | Where-Object { $null -ne $_ -and [string]$_.Id -eq $Id })[0]
-            $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $ResourceCount -UsageRole $UsageRole
+            $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount $ResourceCount -UsageRole $UsageRole -ResourceGroup $ResourceGroup
             $Result = [pscustomobject]@{
-                Id            = $Id
-                Name          = $Name
-                ResourceCount = $ResourceCount
-                Outcome       = $Verdict.Outcome
-                Passed        = $Verdict.Passed
-                Detail        = $Verdict.Detail
-                Seconds       = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
+                Id             = $Id
+                Name           = $Name
+                ResourceCount  = $ResourceCount
+                Outcome        = $Verdict.Outcome
+                Passed         = $Verdict.Passed
+                Detail         = $Verdict.Detail
+                PageCapReached = ($null -ne $Probe -and [bool]$Probe.PageCapReached)
+                PagesRead      = $(if ($null -ne $Probe) { [int]$Probe.PagesRead } else { 0 })
+                Seconds        = [math]::Round($Timer.Elapsed.TotalSeconds, 1)
             }
             $Results += $Result
             $Colour = switch ($Result.Outcome) { 'Pass' { 'Green' } 'NoUsage' { 'Yellow' } default { if ($Result.Passed) { 'DarkGray' } else { 'Red' } } }
             Write-Host ('  [{0}] {1} - {2} ({3:N1}s)' -f $Result.Outcome, $Name, $Result.Detail, $Result.Seconds) -ForegroundColor $Colour
-            if ($Result.Outcome -eq 'NoUsage')
+            if ($Result.Outcome -eq 'NoUsage' -and $Result.PageCapReached)
+            {
+                # Only the first pages were read, so nothing is known about the
+                # rest; the consumption phase reads every page.
+                Write-Host ('      WARNING: no usage above zero{0} in the first {1} page(s) read for {2}; later pages were not checked. The run continues and the consumption phase reads every page.' -f $ForRg, $Result.PagesRead, $WindowText) -ForegroundColor Yellow
+            }
+            elseif ($Result.Outcome -eq 'NoUsage' -and -not [string]::IsNullOrEmpty($ResourceGroup))
+            {
+                Write-Host ("      WARNING: no usage above zero in resource group '{0}' for {1}. Typical causes: new resources, only free resources, or paused resources. The run continues; the consumption sheet for resource group '{0}' will be empty." -f $ResourceGroup, $WindowText) -ForegroundColor Yellow
+            }
+            elseif ($Result.Outcome -eq 'NoUsage')
             {
                 Write-Host ('      WARNING: no usage above zero for {0}. Typical causes: a new subscription, only free resources, or paused resources. The run continues; this subscription''s consumption sheet will be empty.' -f $WindowText) -ForegroundColor Yellow
             }
@@ -1257,45 +1493,61 @@ function Invoke-ConsumptionDataCheck
             catch { Write-Verbose ('Could not restore the Azure context: {0}' -f $_.Exception.Message) }
         }
     }
-    return (Resolve-ConsumptionDataCheck -Results $Results -Window $Window)
+    return (Resolve-ConsumptionDataCheck -Results $Results -Window $Window -ResourceGroup $ResourceGroup)
 }
 
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
 # every failing subscription with its outcome and the window queried, then the
-# fix. The caller exits with code 1 when $Result.ShouldBlock is $true.
+# fix. The caller exits with code 1 when $Result.ShouldBlock is $true. A
+# subscription whose check stopped at the page cap is described by the pages
+# read only: its consumption sheet may still have values.
 function Write-ConsumptionDataCheckReport
 {
     param([Parameter(Mandatory = $true)]$Result)
     $WindowText = Format-ConsumptionWindow -Window $Result.Window
+    $ForRg = Format-ConsumptionCheckTarget -ResourceGroup $Result.ResourceGroup
+    $InRg = if ([string]::IsNullOrEmpty($Result.ResourceGroup)) { '' } else { " in resource group '{0}'" -f $Result.ResourceGroup }
     $Checked = @($Result.Results | Where-Object { $_.Outcome -ne 'Exempt' })
     $NoUsage = @($Result.NoUsage)
+    $NoUsageCapped = @($NoUsage | Where-Object { $_.PageCapReached })
+    $NoUsageEmpty = @($NoUsage | Where-Object { -not $_.PageCapReached })
     if ($Result.Exempt.Count -gt 0)
     {
-        Write-Host ('  {0} subscription(s) have no resources in Resource Graph and were not checked (nothing to price).' -f $Result.Exempt.Count) -ForegroundColor DarkGray
+        Write-Host ('  {0} subscription(s) have no resources{1} in Resource Graph and were not checked (nothing to price).' -f $Result.Exempt.Count, $InRg) -ForegroundColor DarkGray
     }
     if (-not $Result.ShouldBlock)
     {
         $WithValues = $Checked.Count - $NoUsage.Count
         if ($WithValues -gt 0 -or $NoUsage.Count -eq 0)
         {
-            Write-Host ('Consumption data confirmed: {0} subscription(s) returned usage values for {1}.' -f $WithValues, $WindowText) -ForegroundColor Green
+            Write-Host ('Consumption data confirmed: {0} subscription(s) returned usage values{1} for {2}.' -f $WithValues, $ForRg, $WindowText) -ForegroundColor Green
         }
-        if ($NoUsage.Count -gt 0)
+        if ($NoUsageEmpty.Count -gt 0)
         {
-            Write-Host ('{0} subscription(s) returned no usage values for {1} and continue with an empty consumption sheet, because the role check confirmed the usage permission (see the warnings above).' -f $NoUsage.Count, $WindowText) -ForegroundColor Yellow
+            Write-Host ('{0} subscription(s) returned no usage values{1} for {2} and continue with an empty consumption sheet, because the role check confirmed the usage permission (see the warnings above).' -f $NoUsageEmpty.Count, $ForRg, $WindowText) -ForegroundColor Yellow
+        }
+        if ($NoUsageCapped.Count -gt 0)
+        {
+            Write-Host ('{0} subscription(s) showed no usage above zero{1} in the first {2} page(s) read for {3} and continue, because the role check confirmed the usage permission; the consumption phase reads every page (see the warnings above).' -f $NoUsageCapped.Count, $ForRg, $NoUsageCapped[0].PagesRead, $WindowText) -ForegroundColor Yellow
         }
         return
     }
+    $FailedCapped = @($Result.Failed | Where-Object { $_.PageCapReached })
+    $CappedText = if ($FailedCapped.Count -gt 0) { ' ({0} of them: none above zero in the first {1} page(s) read; later pages were not checked)' -f $FailedCapped.Count, $FailedCapped[0].PagesRead } else { '' }
     Write-Host ''
-    Write-Host ('ERROR: Consumption data was requested (no -SkipConsumption), but {0} of {1} checked subscription(s) returned no usage values for {2}.' -f $Result.Failed.Count, $Checked.Count, $WindowText) -ForegroundColor Red
+    Write-Host ('ERROR: Consumption data was requested (no -SkipConsumption), but {0} of {1} checked subscription(s) returned no usage values{2} for {3}{4}.' -f $Result.Failed.Count, $Checked.Count, $ForRg, $WindowText, $CappedText) -ForegroundColor Red
     Write-Host 'Without consumption the business case cannot be priced, so the run stops before any inventory or metrics work.' -ForegroundColor Red
     foreach ($Fail in $Result.Failed)
     {
         Write-Host ('  - {0} ({1}): {2} - {3}; window {4}' -f $Fail.Name, $Fail.Id, $Fail.Outcome, $Fail.Detail, $WindowText) -ForegroundColor Red
     }
-    if ($NoUsage.Count -gt 0)
+    if ($NoUsageEmpty.Count -gt 0)
     {
-        Write-Host ('  ({0} other subscription(s) returned no usage values too, but passed because the role check confirmed the usage permission.)' -f $NoUsage.Count) -ForegroundColor Yellow
+        Write-Host ('  ({0} other subscription(s) returned no usage values too, but passed because the role check confirmed the usage permission.)' -f $NoUsageEmpty.Count) -ForegroundColor Yellow
+    }
+    if ($NoUsageCapped.Count -gt 0)
+    {
+        Write-Host ('  ({0} other subscription(s) showed no usage above zero in the first {1} page(s) read, but passed because the role check confirmed the usage permission.)' -f $NoUsageCapped.Count, $NoUsageCapped[0].PagesRead) -ForegroundColor Yellow
     }
     Write-Host 'To fix:' -ForegroundColor Yellow
     Write-Host '  1. Give the signed-in identity Microsoft.Commerce/UsageAggregates/read on each subscription above. The built-in Reader and Billing Reader roles include it; Cost Management Reader does NOT.' -ForegroundColor Yellow
@@ -1305,19 +1557,37 @@ function Write-ConsumptionDataCheckReport
 
 # End-of-run list of the subscriptions the consumption data check passed with
 # outcome 'NoUsage', so their empty consumption sheet is not read as a
-# collection failure. Shared by Run-AllSubscriptions.ps1 and direct runs of
-# ResourceInventory.ps1. Prints nothing when there are none.
+# collection failure. Those whose check stopped at the page cap are listed
+# apart: only the pages read are known to hold no usage above zero. Shared by
+# Run-AllSubscriptions.ps1 and direct runs of ResourceInventory.ps1. Prints
+# nothing when there are none.
 function Write-NoUsageSummary
 {
     param($ConsumptionResult)
     if ($null -eq $ConsumptionResult -or $null -eq $ConsumptionResult.Window) { return }
     $NoUsage = @(@($ConsumptionResult.Results) | Where-Object { $null -ne $_ -and $_.Outcome -eq 'NoUsage' })
     if ($NoUsage.Count -eq 0) { return }
+    $WindowText = Format-ConsumptionWindow -Window $ConsumptionResult.Window
+    $ForRg = Format-ConsumptionCheckTarget -ResourceGroup $ConsumptionResult.ResourceGroup
+    $Empty = @($NoUsage | Where-Object { -not $_.PageCapReached })
+    $Capped = @($NoUsage | Where-Object { $_.PageCapReached })
     Write-Host ''
-    Write-Host ('Subscriptions with no usage values: {0} - the usage permission was confirmed, but no usage above zero came back for {1}, so their consumption sheet is empty:' -f $NoUsage.Count, (Format-ConsumptionWindow -Window $ConsumptionResult.Window)) -ForegroundColor Yellow
-    foreach ($Sub in $NoUsage)
+    if ($Empty.Count -gt 0)
     {
-        Write-Host ('  - {0} ({1})' -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+        Write-Host ('Subscriptions with no usage values{0}: {1} - the usage permission was confirmed, but no usage above zero came back for {2}, so their consumption sheet is empty:' -f $ForRg, $Empty.Count, $WindowText) -ForegroundColor Yellow
+        foreach ($Sub in $Empty)
+        {
+            Write-Host ('  - {0} ({1})' -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+        }
+        $Causes = if ([string]::IsNullOrEmpty($ConsumptionResult.ResourceGroup)) { 'a new subscription, only free resources, or paused resources' } else { 'new resources, only free resources, or paused resources' }
+        Write-Host ('  Typical causes: {0}. If usage was expected, the subscription may be partner-managed (CSP) without cost visibility for this identity.' -f $Causes) -ForegroundColor Yellow
     }
-    Write-Host '  Typical causes: a new subscription, only free resources, or paused resources. If usage was expected, the subscription may be partner-managed (CSP) without cost visibility for this identity.' -ForegroundColor Yellow
+    if ($Capped.Count -gt 0)
+    {
+        Write-Host ('Subscriptions with no usage above zero{0} in the first {1} page(s) the check read: {2} - the usage permission was confirmed; later pages were not checked, and the consumption phase reads every page:' -f $ForRg, $Capped[0].PagesRead, $Capped.Count) -ForegroundColor Yellow
+        foreach ($Sub in $Capped)
+        {
+            Write-Host ('  - {0} ({1})' -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+        }
+    }
 }

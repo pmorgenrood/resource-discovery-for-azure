@@ -30,8 +30,9 @@ BeforeAll {
         'SubRead'        = @{ Actions = @('Microsoft.Resources/subscriptions/read'); NotActions = @() }
         'NoCommerce'     = @{ Actions = @('*/read'); NotActions = @('Microsoft.Commerce/*') }
         'NoAuthorization' = @{ Actions = @('*/read'); NotActions = @('Microsoft.Authorization/*') }
+        'NoComputeRead'   = @{ Actions = @('*/read'); NotActions = @('Microsoft.Compute/*/read') }
     }
-    $script:RoleNames = @{ 'SubRead' = 'Subscription read only'; 'NoCommerce' = 'Reader without Commerce'; 'NoAuthorization' = 'Reader without Authorization' }
+    $script:RoleNames = @{ 'SubRead' = 'Subscription read only'; 'NoCommerce' = 'Reader without Commerce'; 'NoAuthorization' = 'Reader without Authorization'; 'NoComputeRead' = 'Reader without Compute' }
 
     function New-Grant
     {
@@ -60,9 +61,9 @@ BeforeAll {
             [object[]]$Assignments = @(),
             $ListStatus = 200,
             [hashtable]$Permissions = @{},
-            [int]$DefinitionStatus = 200
+            $DefinitionStatus = 200
         )
-        $script:Scenario = @{ Assignments = $Assignments; ListStatus = @($ListStatus); Permissions = $Permissions; DefinitionStatus = $DefinitionStatus; ListCalls = 0; PermCalls = @{} }
+        $script:Scenario = @{ Assignments = $Assignments; ListStatus = @($ListStatus); Permissions = $Permissions; DefinitionStatus = @($DefinitionStatus); DefinitionCalls = 0; ListCalls = 0; PermCalls = @{} }
         $script:Calls = [System.Collections.Generic.List[string]]::new()
     }
 
@@ -92,7 +93,9 @@ BeforeAll {
         {
             $Role = $Matches[1]
             $script:Calls.Add('definition ' + $Role)
-            if ($S.DefinitionStatus -ne 200) { return (New-Response -Status $S.DefinitionStatus) }
+            $Status = $S.DefinitionStatus[[math]::Min($S.DefinitionCalls, $S.DefinitionStatus.Count - 1)]
+            $S.DefinitionCalls++
+            if ($Status -ne 200) { return (New-Response -Status $Status) }
             $Name = if ($script:RoleNames.ContainsKey($Role)) { $script:RoleNames[$Role] } else { $Role }
             $Type = if ($script:RoleNames.ContainsKey($Role)) { 'CustomRole' } else { 'BuiltInRole' }
             return (New-Response -Status 200 -Body @{ properties = @{ roleName = $Name; type = $Type; permissions = @(@{ actions = $script:BuiltIn[$Role].Actions; notActions = $script:BuiltIn[$Role].NotActions }) } })
@@ -124,6 +127,7 @@ Describe 'Role action evaluation' {
         @{ Role = 'SubRead'; Res = $false; Use = $false }
         @{ Role = 'NoCommerce'; Res = $true; Use = $false }
         @{ Role = 'NoAuthorization'; Res = $true; Use = $true }
+        @{ Role = 'NoComputeRead'; Res = $false; Use = $true }
     ) {
         param($Role, $Res, $Use)
         Test-Allows -Grants @(New-Grant $Role) -Kind Resources | Should -Be $Res
@@ -145,6 +149,55 @@ Describe 'Role action evaluation' {
         Test-RoleActionPatternMatch -Pattern 'Microsoft.Commerce/*/read' -Action 'Microsoft.Compute/virtualMachines/read' | Should -BeFalse
         Test-RoleActionPatternMatch -Pattern 'Microsoft.Resources/subscriptions/read' -Action 'Microsoft.Resources/subscriptions/resourceGroups/read' | Should -BeFalse
         Test-RoleActionPatternMatch -Pattern 'Microsoft.Resources/subscriptions.read' -Action 'Microsoft.Resources/subscriptionsXread' | Should -BeFalse
+    }
+}
+
+Describe 'Read access that leaves out some resource types' {
+    It 'a notAction <Pattern> next to <Actions> removes read access' -TestCases @(
+        @{ Actions = '*/read'; Pattern = 'Microsoft.Compute/*' }
+        @{ Actions = '*/read'; Pattern = 'Microsoft.Compute/*/read' }
+        @{ Actions = '*/read'; Pattern = 'Microsoft.Compute/virtualMachines/read' }
+        @{ Actions = '*/read'; Pattern = 'MICROSOFT.COMPUTE/VIRTUALMACHINES/READ' }
+        @{ Actions = '*'; Pattern = 'Microsoft.Storage/storageAccounts/*' }
+        @{ Actions = '*'; Pattern = 'Microsoft.Network/*/Read' }
+    ) {
+        param($Actions, $Pattern)
+        Test-Allows -Grants @([pscustomobject]@{ Label = 'custom'; Actions = @($Actions); NotActions = @($Pattern) }) -Kind Resources | Should -BeFalse
+        Get-RoleReadExclusion -NotActions @('Microsoft.Compute/virtualMachines/write', $Pattern) | Should -Be $Pattern
+    }
+
+    It 'a notAction confined to <Pattern> keeps read access' -TestCases @(
+        @{ Pattern = 'Microsoft.Authorization/*' }
+        @{ Pattern = 'microsoft.authorization/roleAssignments/read' }
+        @{ Pattern = 'Microsoft.Commerce/*' }
+        @{ Pattern = 'Microsoft.Consumption/*/read' }
+        @{ Pattern = 'Microsoft.Billing/*' }
+    ) {
+        param($Pattern)
+        Get-RoleReadExclusion -NotActions @($Pattern) | Should -BeNullOrEmpty
+        Test-Allows -Grants @([pscustomobject]@{ Label = 'custom'; Actions = @('*/read'); NotActions = @($Pattern) }) -Kind Resources | Should -BeTrue
+    }
+
+    It 'a notAction that is not a read (<Pattern>) keeps read access' -TestCases @(
+        @{ Pattern = 'Microsoft.Compute/virtualMachines/write' }
+        @{ Pattern = 'Microsoft.Compute/*/delete' }
+        @{ Pattern = '*/action' }
+    ) {
+        param($Pattern)
+        Get-RoleReadExclusion -NotActions @($Pattern) | Should -BeNullOrEmpty
+        Test-Allows -Grants @([pscustomobject]@{ Label = 'custom'; Actions = @('*'); NotActions = @($Pattern) }) -Kind Resources | Should -BeTrue
+    }
+
+    It 'Reader beside a role that leaves out some types still reads everything (each role counts on its own)' {
+        Test-Allows -Grants @((New-Grant 'NoComputeRead'), (New-Grant 'Reader')) -Kind Resources | Should -BeTrue
+        Test-Allows -Grants @(New-Grant 'NoComputeRead') -Kind Usage | Should -BeTrue
+    }
+
+    It 'lists the excluding pattern per role that would otherwise read everything' {
+        $Found = @(Get-RoleReadExclusions -Grants @((New-Grant 'NoComputeRead' -Label 'one'), (New-Grant 'Billing Reader' -Label 'two'), (New-Grant 'Reader' -Label 'three')))
+        $Found.Count | Should -Be 1
+        $Found[0].Grant.Label | Should -Be 'one'
+        $Found[0].Pattern | Should -Be 'Microsoft.Compute/*/read'
     }
 }
 
@@ -255,6 +308,31 @@ Describe 'Get-RoleAssignmentAccess (role assignments)' {
         $null = Get-RoleAssignmentAccess -SubscriptionId 'sub-a' -CallerObjectId 'caller-oid' -DefinitionCache $Cache
         $null = Get-RoleAssignmentAccess -SubscriptionId 'sub-b' -CallerObjectId 'caller-oid' -DefinitionCache $Cache
         @($script:Calls | Where-Object { $_ -like 'definition *' }).Count | Should -Be 1
+    }
+
+    It 'does not read a refused role definition again (HTTP <Status>), and the verdict stays Unknown' -TestCases @(@{ Status = 401 }, @{ Status = 403 }, @{ Status = 404 }) {
+        param($Status)
+        Set-RoleScenario -Assignments @(@{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }, @{ Role = 'Reader'; Scope = '/subscriptions/sub-b' }, @{ Role = 'Reader'; Scope = '/subscriptions/sub-c' }) -DefinitionStatus $Status
+        $Cache = @{}
+        $Verdicts = foreach ($Sub in @('sub-a', 'sub-b', 'sub-c')) { (Get-RoleAssignmentAccess -SubscriptionId $Sub -CallerObjectId 'caller-oid' -DefinitionCache $Cache).Resources }
+        @($Verdicts) | Should -Be @('Unknown', 'Unknown', 'Unknown')
+        @($script:Calls | Where-Object { $_ -like 'definition *' }).Count | Should -Be 1
+    }
+
+    It 'reads a role definition again after a server error, so a later subscription can pass' {
+        Set-RoleScenario -Assignments @(@{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }, @{ Role = 'Reader'; Scope = '/subscriptions/sub-b' }) -DefinitionStatus @(503, 503, 503, 503, 200)
+        $Cache = @{}
+        (Get-RoleAssignmentAccess -SubscriptionId 'sub-a' -CallerObjectId 'caller-oid' -DefinitionCache $Cache -MaxRetries 3).Resources | Should -Be 'Unknown'
+        (Get-RoleAssignmentAccess -SubscriptionId 'sub-b' -CallerObjectId 'caller-oid' -DefinitionCache $Cache -MaxRetries 3).Resources | Should -Be 'Yes'
+        @($script:Calls | Where-Object { $_ -like 'definition *' }).Count | Should -Be 5
+    }
+
+    It 'names the role and the excluded pattern when a role reads all but some resource types' {
+        Set-RoleScenario -Assignments @(@{ Role = 'NoComputeRead'; Scope = '/subscriptions/sub-a'; Group = $true })
+        $A = Get-RoleAssignmentAccess -SubscriptionId 'sub-a' -CallerObjectId 'caller-oid'
+        $A.Resources | Should -Be 'No'
+        $A.Usage | Should -Be 'Yes'
+        $A.ResourcesExcluded | Should -Be @("role 'Reader without Compute' at subscription through a group excludes 'Microsoft.Compute/*/read'")
     }
 }
 
@@ -402,6 +480,76 @@ Describe 'Test-SubscriptionRoleAccessAll' {
         $R[0].UsageVerdict | Should -Be 'Yes'
         $script:Lines[1] | Should -Be '      usage permission (Microsoft.Commerce/UsageAggregates/read): yes - Billing Reader at subscription'
     }
+
+    It 'stops a role that reads all but some resource types, naming the role and the pattern (<Case>)' -TestCases @(
+        @{ Case = 'both answers'; Assign = @(@{ Role = 'NoComputeRead'; Scope = '/subscriptions/sub-a' }); Reason = "role 'Reader without Compute' at subscription excludes 'Microsoft.Compute/*/read'; the inventory would miss those resources" }
+        @{ Case = 'role assignments not visible'; Assign = @(); Reason = "Azure reports read access that excludes 'Microsoft.Compute/*/read' (role assignments not visible to this identity); the inventory would miss those resources" }
+    ) {
+        param($Case, $Assign, $Reason)
+        Set-RoleScenario -Assignments $Assign -Permissions @{ '/subscriptions/sub-a' = @{ Status = 200; Roles = @('NoComputeRead') } }
+        $R = @(Test-SubscriptionRoleAccessAll -Subscriptions @($script:SubA))
+        $R[0].State | Should -Be 'NoAccess'
+        $R[0].Reason | Should -Be $Reason
+        (Resolve-AccessPreflight -Probed $R).ShouldBlock | Should -BeTrue
+    }
+
+    It 'passes Reader beside a role that reads all but some resource types' {
+        Set-RoleScenario -Assignments @(@{ Role = 'NoComputeRead'; Scope = '/subscriptions/sub-a' }, @{ Role = 'Reader'; Scope = '/providers/Microsoft.Management/managementGroups/mg-1' }) -Permissions @{ '/subscriptions/sub-a' = @{ Status = 200; Roles = @('NoComputeRead', 'Reader') } }
+        $R = @(Test-SubscriptionRoleAccessAll -Subscriptions @($script:SubA))
+        $R[0].State | Should -Be 'Readable'
+        $R[0].Reason | Should -Be 'Read access: Reader at management group'
+    }
+
+    It 'reads a refused role definition once for the whole run, with the same verdicts' {
+        Set-RoleScenario -Assignments @(@{ Role = 'Reader'; Scope = '/providers/Microsoft.Management/managementGroups/mg-1' }) -DefinitionStatus 403 -Permissions @{
+            '/subscriptions/sub-a' = @{ Status = 200; Roles = @('Reader') }
+            '/subscriptions/sub-b' = @{ Status = 200; Roles = @('Reader') }
+            '/subscriptions/sub-c' = @{ Status = 200; Roles = @('Reader') }
+        }
+        $Subs = @('sub-a', 'sub-b', 'sub-c') | ForEach-Object { [pscustomobject]@{ Id = $_; Name = $_ } }
+        $R = @(Test-SubscriptionRoleAccessAll -Subscriptions $Subs)
+        @($R | ForEach-Object { $_.State }) | Should -Be @('Unknown', 'Unknown', 'Unknown')
+        @($R | ForEach-Object { $_.Reason }) | Should -Be @(1..3 | ForEach-Object { 'role check inconclusive after retries (a role definition could not be read)' })
+        @($script:Calls | Where-Object { $_ -like 'definition *' }).Count | Should -Be 1
+    }
+
+    It 'reads a role definition again after a server error on the first subscription' {
+        Set-RoleScenario -Assignments @(@{ Role = 'Reader'; Scope = '/providers/Microsoft.Management/managementGroups/mg-1' }) -DefinitionStatus @(503, 503, 503, 503, 200) -Permissions @{
+            '/subscriptions/sub-a' = @{ Status = 200; Roles = @('Reader') }
+            '/subscriptions/sub-b' = @{ Status = 200; Roles = @('Reader') }
+        }
+        $Subs = @('sub-a', 'sub-b') | ForEach-Object { [pscustomobject]@{ Id = $_; Name = $_ } }
+        $R = @(Test-SubscriptionRoleAccessAll -Subscriptions $Subs)
+        @($R | ForEach-Object { $_.State }) | Should -Be @('Unknown', 'Readable')
+    }
+}
+
+Describe 'Invoke-RoleCheckGet page cap' {
+    BeforeEach {
+        Mock Start-Sleep { }
+        # A list answer of $script:PageCount pages joined by nextLink.
+        Mock Invoke-AzRestMethod {
+            $N = if ($Uri -match 'page=(\d+)$') { [int]$Matches[1] } else { 1 }
+            $Body = @{ value = @(@{ id = $N }) }
+            if ($N -lt $script:PageCount) { $Body.nextLink = 'https://management.example.test/list?page={0}' -f ($N + 1) }
+            New-Response -Status 200 -Body $Body
+        }
+    }
+
+    It 'follows more than 50 pages by default' {
+        $script:PageCount = 60
+        $Answer = Invoke-RoleCheckGet -Path '/subscriptions/sub-a/list'
+        $Answer.Error | Should -BeNullOrEmpty
+        @($Answer.Items).Count | Should -Be 60
+    }
+
+    It 'still stops after 1000 pages by default, as an error' {
+        $script:PageCount = 1001
+        $Answer = Invoke-RoleCheckGet -Path '/subscriptions/sub-a/list'
+        $Answer.Error | Should -Be 'more than 1000 pages'
+        $Answer.Status | Should -BeNullOrEmpty
+        Should -Invoke Invoke-AzRestMethod -Times 1000 -Exactly
+    }
 }
 
 Describe 'Get-RoleCheckCallerObjectId' {
@@ -457,6 +605,43 @@ Describe 'Write-AccessPreflightReport' {
         Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1 -ResourceGroup 'rg-one' -DirectRun
         $script:Lines[0] | Should -Be "  Resource group 'rg-one' is NOT readable by the signed-in identity in 1 subscription(s):"
         ($script:Lines -join "`n") | Should -Not -Match 'AllowPartialAccess'
+    }
+
+    It 'gives the fix for why the check failed: <Verdict>' -TestCases @(
+        @{ State = 'NoAccess'; Verdict = 'No'; Rg = ''; Fix = '  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.' }
+        @{ State = 'NoAccess'; Verdict = 'NoNotVisible'; Rg = ''; Fix = '  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.' }
+        @{ State = 'NoAccess'; Verdict = 'NotFound'; Rg = 'rg-one'; Fix = '  Stopping before any work. Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' }
+        @{ State = 'Unknown'; Verdict = 'Unknown'; Rg = ''; Fix = '  Stopping before any work. The role check could not finish (the reason above says why); re-run.' }
+        @{ State = 'Disagree'; Verdict = 'Disagree'; Rg = ''; Fix = '  Stopping before any work. The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.' }
+    ) {
+        param($State, $Verdict, $Rg, $Fix)
+        $Decision = [pscustomobject]@{
+            Inaccessible    = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = $State; Verdict = $Verdict; Reason = 'reason' })
+            InaccessibleIds = @('sub-b')
+            ShouldBlock     = $true
+        }
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 1 -ResourceGroup $Rg
+        $script:Lines[2] | Should -Be $Fix
+        $script:Lines[3] | Should -Be '  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)'
+        $script:Lines.Count | Should -Be 4
+    }
+
+    It 'gives one fix per cause, naming the subscriptions, when the causes differ' {
+        $Decision = [pscustomobject]@{
+            Inaccessible    = @(
+                [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = 'Unknown'; Verdict = 'Unknown'; Reason = 'role check inconclusive after retries (role assignment list: more than 1000 pages)' }
+                [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; State = 'NoAccess'; Verdict = 'No'; Reason = 'no role grants read access (roles visible: none)' }
+                [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; State = 'Unknown'; Verdict = 'Unknown'; Reason = 'role check inconclusive after retries (caller permissions: HTTP 429)' }
+            )
+            InaccessibleIds = @('sub-b', 'sub-c', 'sub-d')
+            ShouldBlock     = $true
+        }
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 4 -DirectRun
+        @($script:Lines | Select-Object -Skip 4) | Should -Be @(
+            '  Stopping before any work.'
+            '    Charlie: Grant the identity Reader on these subscriptions, then re-run.'
+            '    Bravo, Delta: The role check could not finish (the reason above says why); re-run.'
+        )
     }
 }
 
@@ -591,7 +776,7 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         Get-Command Get-SubscriptionAccessState -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
 
-    It 'prints the stop lines and exits 1' {
+    It 'prints the stop lines, with the fix for each cause, and exits 1' {
         { . $script:GateBlock } | Should -Throw 'EXIT 1'
         $Summary = @($script:Lines | Where-Object { $_ -notlike '  `[*' })
         $Summary | Should -Be @(
@@ -599,10 +784,31 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
             '  2 subscription(s) are NOT readable by the signed-in identity:'
             '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
             '    - Charlie (sub-c) - role check inconclusive after retries (caller permissions: HTTP 429)'
-            '  Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
+            '  Stopping before any work.'
+            '    Bravo: Grant the identity Reader on these subscriptions, then re-run.'
+            '    Charlie: The role check could not finish (the reason above says why); re-run.'
             '  (Or pass -AllowPartialAccess to skip them and inventory only the accessible subscriptions.)'
         )
         $script:Lines[1] | Should -BeLike '  `[Pass`] Alpha - Read access: Reader at subscription (*s)'
+    }
+
+    It 'stops for a role that reads all but some resource types, and skips it under -AllowPartialAccess' {
+        Set-RoleScenario -Assignments @(
+            @{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }
+            @{ Role = 'NoComputeRead'; Scope = '/subscriptions/sub-b' }
+        ) -Permissions @{
+            '/subscriptions/sub-a' = @{ Status = 200; Roles = @('Reader') }
+            '/subscriptions/sub-b' = @{ Status = 200; Roles = @('NoComputeRead') }
+        }
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
+        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+        $script:Lines | Should -Contain "    - Bravo (sub-b) - role 'Reader without Compute' at subscription excludes 'Microsoft.Compute/*/read'; the inventory would miss those resources"
+
+        $script:Lines.Clear()
+        $script:AllowPartialAccess = $true
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
+        . $script:GateBlock
+        @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
     }
 
     It 'skips the failing subscriptions under -AllowPartialAccess' {
@@ -684,7 +890,7 @@ Describe 'ResourceInventory.ps1 direct run' {
         # nothing past it runs.
         $script:Harness = Join-Path $TestDrive 'harness.ps1'
         @'
-param([string]$Root, [string]$Out, [string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId)
+param([string]$Root, [string]$Out, [string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd)
 $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
 $Global:PlatformOS = 'PowerShell Unix'
@@ -708,9 +914,14 @@ function global:Invoke-AzRestMethod
     if ($Target -match '/roleAssignments\?')
     {
         Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'roles'
-        $Scope = switch ($env:RDA_TEST_ROLES) { 'reader' { "/subscriptions/$TestSub" } 'rg' { "/subscriptions/$TestSub/resourceGroups/rg-one" } default { $null } }
-        $Items = if ($Scope) { @(@{ properties = @{ roleDefinitionId = "/subscriptions/$TestSub/providers/Microsoft.Authorization/roleDefinitions/reader"; scope = $Scope; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) } else { @() }
+        $Scope = switch ($env:RDA_TEST_ROLES) { 'reader' { "/subscriptions/$TestSub" } 'nocompute' { "/subscriptions/$TestSub" } 'rg' { "/subscriptions/$TestSub/resourceGroups/rg-one" } default { $null } }
+        $Definition = if ($env:RDA_TEST_ROLES -eq 'nocompute') { 'nocompute' } else { 'reader' }
+        $Items = if ($Scope) { @(@{ properties = @{ roleDefinitionId = "/subscriptions/$TestSub/providers/Microsoft.Authorization/roleDefinitions/$Definition"; scope = $Scope; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) } else { @() }
         return (& $Json @{ value = $Items })
+    }
+    if ($Target -match '/roleDefinitions/nocompute')
+    {
+        return (& $Json @{ properties = @{ roleName = 'Reader without Compute'; type = 'CustomRole'; permissions = @(@{ actions = @('*/read'); notActions = @('Microsoft.Compute/*/read') }) } })
     }
     if ($Target -match '/roleDefinitions/')
     {
@@ -722,7 +933,7 @@ function global:Invoke-AzRestMethod
         Add-Content -Path $env:RDA_TEST_CALL_LOG -Value ('permissions ' + $(if ($OnRg) { 'rg' } else { 'sub' }))
         $Mode = if ($OnRg) { $env:RDA_TEST_PERM_RG } else { $env:RDA_TEST_PERM_SUB }
         if ($Mode -eq '404') { return [pscustomobject]@{ StatusCode = 404; Content = '{}' } }
-        $Entries = if ($Mode -eq 'read') { @(@{ actions = @('*/read'); notActions = @() }) } else { @() }
+        $Entries = switch ($Mode) { 'read' { @(@{ actions = @('*/read'); notActions = @() }) } 'nocompute' { @(@{ actions = @('*/read'); notActions = @('Microsoft.Compute/*/read') }) } default { @() } }
         return (& $Json @{ value = $Entries })
     }
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'resource counts'
@@ -732,7 +943,13 @@ function global:Get-UsageAggregates
 {
     param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'usage'
-    $Rows = if ($env:RDA_TEST_USAGE -eq 'values') { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2 } }) } else { @() }
+    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    Add-Content -Path $env:RDA_TEST_USAGE_WINDOW -Value ('{0} {1}' -f ([datetime]$ReportedStartTime).ToString('yyyy-MM-dd', $Invariant), ([datetime]$ReportedEndTime).ToString('yyyy-MM-dd', $Invariant))
+    # 'in-rg' and 'other-rg' rows carry a resource in resource group RG-ONE or rg-two.
+    $Uri = switch ($env:RDA_TEST_USAGE) { 'in-rg' { "/subscriptions/$TestSub/resourceGroups/RG-ONE/providers/Microsoft.Network/networkSecurityGroups/nsg-1" } 'other-rg' { "/subscriptions/$TestSub/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2" } default { $null } }
+    $Rows = if ($env:RDA_TEST_USAGE -eq 'values') { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2 } }) }
+    elseif ($Uri) { @([pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = 2; InstanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $Uri } } | ConvertTo-Json -Compress) } }) }
+    else { @() }
     [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
 }
 $env:RDA_TEST_ROLES = $Roles
@@ -744,22 +961,27 @@ if (-not $NoSubscriptionId) { $Extra.SubscriptionID = $TestSub }
 if ($ResourceGroup) { $Extra.ResourceGroup = $ResourceGroup }
 if ($SkipConsumption) { $Extra.SkipConsumption = $true }
 if ($RunAllSubs) { $Extra.RunAllSubs = $true }
+if ($WindowStart) { $Extra.ConsumptionWindowStart = $WindowStart }
+if ($WindowEnd) { $Extra.ConsumptionWindowEnd = $WindowEnd }
 & (Join-Path $Root 'ResourceInventory.ps1') -OutputDirectory $Out @Extra
 exit $LASTEXITCODE
 '@ | Set-Content -Path $script:Harness -Encoding utf8
 
         function Invoke-DirectRun
         {
-            param([string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId)
+            param([string]$Roles = 'reader', [string]$PermSub = 'read', [string]$PermRg = 'read', [string]$Usage = 'values', [string]$ResourceGroup, [switch]$SkipConsumption, [switch]$RunAllSubs, [switch]$NoSubscriptionId, [string]$WindowStart, [string]$WindowEnd)
             $Out = Join-Path $TestDrive ('out-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
             New-Item -ItemType Directory -Path $Out -Force | Out-Null
             $env:RDA_TEST_INVENTORY_MARKER = Join-Path $Out 'inventory.marker'
             $env:RDA_TEST_CALL_LOG = Join-Path $Out 'calls.log'
+            $env:RDA_TEST_USAGE_WINDOW = Join-Path $Out 'usage-window.log'
             $PwshArgs = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Root', $script:RepoRoot, '-Out', $Out, '-Roles', $Roles, '-PermSub', $PermSub, '-PermRg', $PermRg, '-Usage', $Usage)
             if ($ResourceGroup) { $PwshArgs += @('-ResourceGroup', $ResourceGroup) }
             if ($SkipConsumption) { $PwshArgs += '-SkipConsumption' }
             if ($RunAllSubs) { $PwshArgs += '-RunAllSubs' }
             if ($NoSubscriptionId) { $PwshArgs += '-NoSubscriptionId' }
+            if ($WindowStart) { $PwshArgs += @('-WindowStart', $WindowStart) }
+            if ($WindowEnd) { $PwshArgs += @('-WindowEnd', $WindowEnd) }
             Push-Location $script:RepoRoot
             try { $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String }
             finally { Pop-Location }
@@ -770,12 +992,13 @@ exit $LASTEXITCODE
                 InventoryReached = (Test-Path -Path $env:RDA_TEST_INVENTORY_MARKER)
                 Calls            = $Calls
                 RoleCalls        = @($Calls | Where-Object { $_ -eq 'roles' -or $_ -like 'permissions *' })
+                UsageWindows     = $(if (Test-Path -Path $env:RDA_TEST_USAGE_WINDOW) { @(Get-Content -Path $env:RDA_TEST_USAGE_WINDOW) } else { @() })
             }
         }
     }
 
     AfterAll {
-        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_CALL_LOG -ErrorAction SilentlyContinue
+        Remove-Item Env:\RDA_TEST_INVENTORY_MARKER, Env:\RDA_TEST_CALL_LOG, Env:\RDA_TEST_USAGE_WINDOW -ErrorAction SilentlyContinue
     }
 
     It 'checks the roles before the consumption check, then continues into inventory' {
@@ -848,5 +1071,57 @@ exit $LASTEXITCODE
         $Run.InventoryReached | Should -BeFalse
         $Run.Output | Should -Match 'usage permission \(Microsoft\.Commerce/UsageAggregates/read\): no - the roles on this subscription do not include it'
         $Run.Output | Should -Match 'Placeholder subscription: the roles on this subscription do not include Microsoft\.Commerce/UsageAggregates/read: add Reader or Billing Reader at the subscription'
+    }
+
+    It 'exits 1 before the consumption check for a role that reads all but some resource types' {
+        $Run = Invoke-DirectRun -Roles 'nocompute' -PermSub 'nocompute'
+        $Run.ExitCode | Should -Be 1
+        $Run.InventoryReached | Should -BeFalse
+        $Run.Calls | Should -Not -Contain 'usage'
+        $Run.Output | Should -Match ([regex]::Escape("Placeholder subscription (12345678-1234-1234-1234-123456789012) - role 'Reader without Compute' at subscription excludes 'Microsoft.Compute/*/read'; the inventory would miss those resources"))
+        $Run.Output | Should -Match 'Grant the identity Reader on these subscriptions, then re-run\.'
+    }
+
+    It 'checks a -ResourceGroup run against usage rows of that resource group only (rows elsewhere -> stop)' {
+        $Run = Invoke-DirectRun -Roles 'rg' -PermSub 'none' -PermRg 'read' -ResourceGroup 'rg-one' -Usage 'other-rg'
+        $Run.ExitCode | Should -Be 1
+        $Run.InventoryReached | Should -BeFalse
+        $Run.Output | Should -Match "Placeholder subscription \(12345678-1234-1234-1234-123456789012\): NoRows - the query succeeded but returned no usage rows for resource group 'rg-one'"
+    }
+
+    It 'passes a -ResourceGroup run on a usage row of that resource group, matched without case' {
+        $Run = Invoke-DirectRun -Roles 'rg' -PermSub 'none' -PermRg 'read' -ResourceGroup 'rg-one' -Usage 'in-rg'
+        $Run.InventoryReached | Should -BeTrue
+        $Run.ExitCode | Should -Be 3
+        $Run.Output | Should -Match "\[Pass\] Placeholder subscription - usage values found for resource group 'rg-one'"
+        $Run.Output | Should -Match "Consumption data confirmed: 1 subscription\(s\) returned usage values for resource group 'rg-one'"
+    }
+
+    It 'passes a -ResourceGroup run with no usage in it, with a warning, when the usage permission is confirmed' {
+        $Run = Invoke-DirectRun -Roles 'reader' -PermSub 'read' -PermRg 'read' -ResourceGroup 'rg-one' -Usage 'other-rg'
+        $Run.InventoryReached | Should -BeTrue
+        $Run.Output | Should -Match "\[NoUsage\] Placeholder subscription - the query succeeded but returned no usage rows for resource group 'rg-one'; the usage permission is confirmed"
+        $Run.Output | Should -Match "WARNING: no usage above zero in resource group 'rg-one' for "
+        $Run.Output | Should -Match "the consumption sheet for resource group 'rg-one' will be empty"
+    }
+
+    It 'checks the consumption window passed in (one window per wrapper run)' {
+        $Run = Invoke-DirectRun -WindowStart '2026-01-01' -WindowEnd '2026-01-31'
+        $Run.InventoryReached | Should -BeTrue
+        $Run.UsageWindows | Should -Be @('2026-01-01 2026-01-31')
+        $Run.Output | Should -Match 'usage values for 2026-01-01 to 2026-01-31'
+    }
+
+    It 'ignores a consumption window that is not valid (<Start> / <End>), with a warning, and uses its own' -TestCases @(
+        @{ Start = '2026-02-30'; End = '2026-03-02' }
+        @{ Start = '2026-03-02'; End = '2026-02-01' }
+        @{ Start = '2026-01-01'; End = '' }
+    ) {
+        param($Start, $End)
+        $Run = Invoke-DirectRun -WindowStart $Start -WindowEnd $End
+        $Run.InventoryReached | Should -BeTrue
+        $Own = Format-ConsumptionWindow -Window (Get-ConsumptionWindow)
+        $Run.UsageWindows | Should -Be @($Own -replace ' to ', ' ')
+        $Run.Output | Should -Match 'Ignoring -ConsumptionWindowStart'
     }
 }

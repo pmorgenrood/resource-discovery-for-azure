@@ -85,10 +85,193 @@ Describe 'Get-ConsumptionWindow' {
         $W.Start.Kind | Should -Be $Converted.Kind
     }
 
-    It 'is the window the billing phase uses (ResourceInventory.ps1 calls Get-ConsumptionWindow)' {
+    It 'is the window of the whole run: ResourceInventory.ps1 computes it once, before the up-front check, and the consumption phase reuses it' {
+        $Tokens = $null
+        $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$Tokens, [ref]$Errors)
+        $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Get-ConsumptionWindow' }, $true))
+        $Calls.Count | Should -Be 1
+        $Setup = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true))[0]
+        $Setup.Extent.StartOffset | Should -BeLessThan $Calls[0].Extent.StartOffset
+        $Setup.Extent.EndOffset | Should -BeGreaterThan $Calls[0].Extent.EndOffset
+        $Check = @($Setup.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Invoke-ConsumptionDataCheck' }, $true))
+        $Check.Count | Should -Be 1
+        $Check[0].Extent.Text | Should -Match '-Window \$script:ConsumptionWindow'
+        $Check[0].Extent.StartOffset | Should -BeGreaterThan $Calls[0].Extent.StartOffset
         $Text = Get-Content -Path (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
-        $Text | Should -Match '\$ConsumptionWindow = Get-ConsumptionWindow'
         $Text | Should -Not -Match 'AddDays\(-31\)\.Date'
+    }
+}
+
+Describe 'Passing the consumption window to child runs' {
+    It 'writes the window as invariant yyyy-MM-dd strings, whatever the host culture' {
+        $Saved = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        try
+        {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('th-TH')
+            $Arg = ConvertTo-ConsumptionWindowArgument -Window (Get-ConsumptionWindow -Now ([datetime]'2026-10-27T23:59:00'))
+        }
+        finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $Saved }
+        $Arg.ConsumptionWindowStart | Should -Be '2026-09-26'
+        $Arg.ConsumptionWindowEnd | Should -Be '2026-10-26'
+    }
+
+    It 'reads them back as the same window (midnights, Kind=Unspecified)' {
+        $Window = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T23:59:00')
+        $Arg = ConvertTo-ConsumptionWindowArgument -Window $Window
+        $Back = ConvertFrom-ConsumptionWindowArgument -Start $Arg.ConsumptionWindowStart -End $Arg.ConsumptionWindowEnd
+        $Back.Start | Should -Be $Window.Start
+        $Back.End | Should -Be $Window.End
+        $Back.Start.Kind | Should -Be ([System.DateTimeKind]::Unspecified)
+        $Back.End.Kind | Should -Be ([System.DateTimeKind]::Unspecified)
+    }
+
+    It 'returns nothing for a missing or invalid value (<Start> / <End>)' -TestCases @(
+        @{ Start = ''; End = '' }
+        @{ Start = '2026-09-26'; End = '' }
+        @{ Start = ''; End = '2026-10-26' }
+        @{ Start = '2026-02-30'; End = '2026-03-30' }
+        @{ Start = '26-09-2026'; End = '2026-10-26' }
+        @{ Start = '2026-09-26T00:00:00'; End = '2026-10-26' }
+        @{ Start = '2026-10-27'; End = '2026-10-26' }
+    ) {
+        param($Start, $End)
+        ConvertFrom-ConsumptionWindowArgument -Start $Start -End $End | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Run-AllSubscriptions.ps1 passes one consumption window to every subscription' {
+    BeforeAll {
+        $script:Parsed = @{}
+        foreach ($File in @('Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1'))
+        {
+            $Tokens = $null
+            $Errors = $null
+            $script:Parsed[$File] = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot $File), [ref]$Tokens, [ref]$Errors)
+        }
+        # Runs the top-level statements of $File from the one matching $From to
+        # the one matching $To, and returns the $InventoryPassthrough they build.
+        function Invoke-PassthroughStatements
+        {
+            param([string]$File, [string]$From, [string]$To, [hashtable]$Variables)
+            $Top = @($script:Parsed[$File].EndBlock.Statements)
+            $First = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match $From })[0]
+            $Last = @(0..($Top.Count - 1) | Where-Object { $_ -gt $First -and $Top[$_].Extent.Text -match $To })[0]
+            if ($null -eq $First -or $null -eq $Last) { throw ('Statements not found in {0}.' -f $File) }
+            $Text = (@($Top[$First..$Last] | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n`$InventoryPassthrough"
+            $Block = [scriptblock]::Create('param($Vars) foreach ($K in $Vars.Keys) { Set-Variable -Name $K -Value $Vars[$K] }' + "`n" + $Text)
+            return (& $Block $Variables)
+        }
+    }
+
+    It 'every ResourceInventory.ps1 call site (sequential, parallel with one subscription, stream worker) splats $InventoryPassthrough' {
+        $Sites = foreach ($File in $script:Parsed.Keys)
+        {
+            $script:Parsed[$File].FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.Extent.Text -match "^& \(Join-Path [^)]+ .ResourceInventory\.ps1.\)" }, $true) |
+                ForEach-Object { [pscustomobject]@{ File = $File; Text = $_.Extent.Text } }
+        }
+        @($Sites | Where-Object { $_.File -eq 'Run-AllSubscriptions.ps1' }).Count | Should -Be 2
+        @($Sites | Where-Object { $_.File -eq 'Run-AllSubscriptions.Stream.ps1' }).Count | Should -Be 1
+        foreach ($Site in $Sites) { $Site.Text | Should -Match '@InventoryPassthrough' }
+    }
+
+    It 'adds the checked window to the wrapper''s $InventoryPassthrough' {
+        $Window = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T23:59:00')
+        $Pass = Invoke-PassthroughStatements -File 'Run-AllSubscriptions.ps1' -From '^\$InventoryPassthrough = @\{\}' -To 'ConsumptionWindowEnd' -Variables @{ ConsumptionWindow = $Window; ConcurrencyLimit = 6 }
+        $Pass['ConsumptionWindowStart'] | Should -Be '2026-09-26'
+        $Pass['ConsumptionWindowEnd'] | Should -Be '2026-10-26'
+    }
+
+    It 'gives the window to every parallel worker, which adds it to its own $InventoryPassthrough' {
+        $Worker = @($script:Parsed['Run-AllSubscriptions.ps1'].FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left.Extent.Text -eq '$WorkerArgs' }, $true))
+        $Worker.Count | Should -Be 1
+        $Worker[0].Right.Extent.Text | Should -Match 'ConsumptionWindowStart\s*=\s*\$ConsumptionWindowArgs\.ConsumptionWindowStart'
+        $Worker[0].Right.Extent.Text | Should -Match 'ConsumptionWindowEnd\s*=\s*\$ConsumptionWindowArgs\.ConsumptionWindowEnd'
+        $Params = @($script:Parsed['Run-AllSubscriptions.Stream.ps1'].ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        $Params | Should -Contain 'ConsumptionWindowStart'
+        $Params | Should -Contain 'ConsumptionWindowEnd'
+        $Pass = Invoke-PassthroughStatements -File 'Run-AllSubscriptions.Stream.ps1' -From '^\$InventoryPassthrough = @\{\}' -To 'ConsumptionWindowEnd' -Variables @{ ConsumptionWindowStart = '2026-09-26'; ConsumptionWindowEnd = '2026-10-26'; ConcurrencyLimit = 6 }
+        $Pass['ConsumptionWindowStart'] | Should -Be '2026-09-26'
+        $Pass['ConsumptionWindowEnd'] | Should -Be '2026-10-26'
+    }
+}
+
+Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
+    BeforeAll {
+        $Tokens = $null
+        $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$Tokens, [ref]$Errors)
+        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'GetResorceConsumption' }, $true))
+        if ($Fn.Count -ne 1) { throw 'GetResorceConsumption was not found in ResourceInventory.ps1.' }
+        $script:CollectionAst = $Fn[0]
+        . ([scriptblock]::Create($Fn[0].Extent.Text))
+        function Test-DataPlaneAuthReady { param($Phase) $true }
+
+        function New-UsageRow
+        {
+            param([string]$ResourceUri, $Quantity = 1)
+            [pscustomobject]@{ Properties = [pscustomobject]@{
+                    InstanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $ResourceUri; location = 'westeurope' } } | ConvertTo-Json -Compress)
+                    MeterCategory = 'Networking'; MeterId = 'meter-1'; MeterName = 'Meter'; MeterRegion = 'EU West'; MeterSubCategory = ''
+                    Quantity = $Quantity; Unit = '1 Hour'; UsageStartTime = [datetime]'2026-10-01'; UsageEndTime = [datetime]'2026-10-02'
+                }
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:SavedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        $script:SavedUICulture = [System.Threading.Thread]::CurrentThread.CurrentUICulture
+        $script:SavedGlobals = @{}
+        foreach ($Name in @('Subscriptions', 'ConsumptionFileCsv', 'ConsumptionRecordCount', 'ConsumptionFailedSubs'))
+        {
+            $script:SavedGlobals[$Name] = Get-Variable -Name $Name -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        }
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' })
+        $Global:ConsumptionFileCsv = Join-Path $TestDrive ('consumption-{0}.csv' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Global:ConsumptionRecordCount = $null
+        $Global:ConsumptionFailedSubs = $null
+        $script:SubscriptionID = 'sub-a'
+        $script:ResourceGroup = $null
+        Mock Write-Log { }
+        Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'sub-a' } } }
+    }
+
+    AfterEach {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = $script:SavedCulture
+        [System.Threading.Thread]::CurrentThread.CurrentUICulture = $script:SavedUICulture
+        foreach ($Name in $script:SavedGlobals.Keys) { Set-Variable -Name $Name -Scope Global -Value $script:SavedGlobals[$Name] }
+        Remove-Variable -Name SubscriptionID, ResourceGroup, ConsumptionWindow -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    It 'collects the window the check queried at 23:59 when it runs after midnight' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T23:59:00')
+        Mock Get-Date { [datetime]'2026-10-28T00:01:00' }
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly -ParameterFilter {
+            $ReportedStartTime -eq [datetime]'2026-09-26' -and $ReportedEndTime -eq [datetime]'2026-10-26'
+        }
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'keeps only the resource group''s rows by the check''s own test (Test-ConsumptionResourceUriInResourceGroup)' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        Mock Get-UsageAggregates {
+            $Rows = @(
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/RG-ONE/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        $Rows = @(Import-Csv -Path $Global:ConsumptionFileCsv)
+        $Rows.Count | Should -Be 1
+        $Rows[0].ResourceId | Should -Be '/subscriptions/sub-a/resourcegroups/rg-one/providers/microsoft.network/networksecuritygroups/nsg-1'
+        $Uses = @($script:CollectionAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Test-ConsumptionResourceUriInResourceGroup' }, $true))
+        $Uses.Count | Should -Be 1
     }
 }
 
@@ -246,6 +429,163 @@ Describe 'Usage probe page cap' {
         $Verdict.Outcome | Should -Be 'NoUsage'
         $Verdict.Passed | Should -BeTrue
         $Verdict.Detail | Should -Match 'only the first 3 page\(s\) were read'
+    }
+
+    Context 'what the run says when the cap was reached' {
+        BeforeEach {
+            $script:Printed = [System.Collections.Generic.List[string]]::new()
+            Mock Write-Host { $script:Printed.Add([string]$Object) }
+            Mock Get-AzContext { $null }
+            Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 3 } }
+            $script:SubAlpha = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' })
+            $script:Confirmed = @([pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } })
+        }
+
+        It 'with the usage permission confirmed, says only the first 50 pages had no usage above zero, never that the sheet is empty' {
+            $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:SubAlpha -Window $script:Window -RoleCheck $script:Confirmed
+            $Result.ShouldBlock | Should -BeFalse
+            $Result.NoUsage[0].PageCapReached | Should -BeTrue
+            Write-ConsumptionDataCheckReport -Result $Result
+            Write-NoUsageSummary -ConsumptionResult $Result
+            $Text = $script:Printed -join "`n"
+            $Text | Should -Match 'WARNING: no usage above zero in the first 50 page\(s\) read for 2026-09-25 to 2026-10-25; later pages were not checked\. The run continues and the consumption phase reads every page\.'
+            $Text | Should -Match '1 subscription\(s\) showed no usage above zero in the first 50 page\(s\) read for 2026-09-25 to 2026-10-25 and continue'
+            $Text | Should -Match 'Subscriptions with no usage above zero in the first 50 page\(s\) the check read: 1'
+            $Text | Should -Not -Match 'sheet (will be|is) empty|empty consumption sheet'
+            $Text | Should -Not -Match 'Typical causes'
+        }
+
+        It 'on a stop, says the subscription had no usage above zero in the pages read' {
+            $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:SubAlpha -Window $script:Window
+            $Result.ShouldBlock | Should -BeTrue
+            $script:Printed.Clear()
+            Write-ConsumptionDataCheckReport -Result $Result
+            $Text = $script:Printed -join "`n"
+            $Text | Should -Match '1 of 1 checked subscription\(s\) returned no usage values for 2026-09-25 to 2026-10-25 \(1 of them: none above zero in the first 50 page\(s\) read; later pages were not checked\)\.'
+            $Text | Should -Match 'Alpha \(sub-a\): NoPositiveQuantity - 50 usage row\(s\) came back, none with a quantity above zero; only the first 50 page\(s\) were read'
+            $Text | Should -Not -Match 'sheet (will be|is) empty'
+        }
+    }
+}
+
+Describe 'Resource group runs (-ResourceGroup)' {
+    BeforeAll {
+        function New-RgUsagePage
+        {
+            param([object[]]$Rows, [string]$Token = $null)
+            [pscustomobject]@{
+                UsageAggregations = @($Rows | ForEach-Object {
+                        $Instance = if ($null -eq $_.Uri) { $_.Raw } else { @{ 'Microsoft.Resources' = @{ resourceUri = $_.Uri } } | ConvertTo-Json -Compress }
+                        [pscustomobject]@{ Properties = [pscustomobject]@{ Quantity = $_.Quantity; InstanceData = $Instance } }
+                    })
+                ContinuationToken = $Token
+            }
+        }
+        $script:InRg = '/subscriptions/sub-a/resourceGroups/RG-One/providers/Microsoft.CognitiveServices/accounts/acct-1'
+        $script:OtherRg = '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.CognitiveServices/accounts/acct-2'
+    }
+
+    BeforeEach {
+        Mock Start-Sleep { }
+        Mock Set-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+    }
+
+    It 'matches a resource URI to the resource group without case, by its /<name>/ segment' {
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $script:InRg -ResourceGroup 'rg-one' | Should -BeTrue
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $script:InRg.ToUpperInvariant() -ResourceGroup 'Rg-One' | Should -BeTrue
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $script:OtherRg -ResourceGroup 'rg-one' | Should -BeFalse
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one-b/providers/x/y/z' -ResourceGroup 'rg-one' | Should -BeFalse
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $null -ResourceGroup 'rg-one' | Should -BeFalse
+        Test-ConsumptionResourceUriInResourceGroup -ResourceUri $script:InRg -ResourceGroup '' | Should -BeFalse
+    }
+
+    It 'reads the resource URI from InstanceData, and nothing from missing or malformed InstanceData (<Case>)' -TestCases @(
+        @{ Case = 'missing'; Raw = $null }
+        @{ Case = 'empty'; Raw = '' }
+        @{ Case = 'not JSON'; Raw = '{"Microsoft.Resources": {"resourceUri": ' }
+        @{ Case = 'a JSON string'; Raw = '"/subscriptions/sub-a/resourceGroups/rg-one/x"' }
+        @{ Case = 'no URI'; Raw = '{"Microsoft.Resources": {"location": "westeurope"}}' }
+        @{ Case = 'URI not a string'; Raw = '{"Microsoft.Resources": {"resourceUri": 5}}' }
+    ) {
+        param($Case, $Raw)
+        Get-ConsumptionRowResourceUri -InstanceData $Raw | Should -BeNullOrEmpty
+        Get-ConsumptionRowResourceUri -InstanceData (@{ 'Microsoft.Resources' = @{ resourceUri = $script:InRg } } | ConvertTo-Json -Compress) | Should -Be $script:InRg
+    }
+
+    It 'does not pass on usage rows of other resource groups' {
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $null; Raw = 'not json'; Quantity = 7 }) }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -ResourceGroup 'rg-one'
+        $Probe.PositiveFound | Should -BeFalse
+        $Probe.RowsSeen | Should -Be 0
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 2 -ResourceGroup 'rg-one'
+        $Verdict.Outcome | Should -Be 'NoRows'
+        $Verdict.Passed | Should -BeFalse
+        $Verdict.Detail | Should -Be "the query succeeded but returned no usage rows for resource group 'rg-one'"
+    }
+
+    It 'passes on a positive usage row of the resource group, matched without case, on a later page' {
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $script:InRg; Quantity = 0 }) -Token 'page2' } -ParameterFilter { [string]::IsNullOrEmpty($ContinuationToken) }
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:InRg.ToLowerInvariant(); Quantity = 1.5 }) } -ParameterFilter { $ContinuationToken -eq 'page2' }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -ResourceGroup 'RG-ONE'
+        $Probe.PositiveFound | Should -BeTrue
+        $Probe.PagesRead | Should -Be 2
+        $Verdict = Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 2 -ResourceGroup 'RG-ONE'
+        $Verdict.Outcome | Should -Be 'Pass'
+        $Verdict.Detail | Should -Be "usage values found for resource group 'RG-ONE' (2 row(s) read over 2 page(s))"
+    }
+
+    It 'counts the resource group''s resources only, and exempts it when Resource Graph has none there' {
+        $script:Payloads = [System.Collections.Generic.List[string]]::new()
+        Mock Invoke-AzRestMethod { $script:Payloads.Add([string]$Payload); New-ResourceCountResponse -Counts @{} }
+        Mock Get-AzContext { $null }
+        Mock Write-Host { }
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @() }
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'RG-One'
+        ($script:Payloads[0] | ConvertFrom-Json).query | Should -Be "resources | where resourceGroup == 'rg-one' | summarize ResourceCount = count() by subscriptionId"
+        $Result.Results[0].Outcome | Should -Be 'Exempt'
+        $Result.Results[0].Detail | Should -Be "no resources in resource group 'RG-One' in Resource Graph; not checked (nothing to price)"
+        $Result.ShouldBlock | Should -BeFalse
+        Should -Invoke Get-UsageAggregates -Times 0 -Exactly
+    }
+
+    It 'does not exempt anything for a resource group name that is not valid, and does not put it in a query' {
+        Mock Invoke-AzRestMethod { throw 'no query expected' }
+        $Counts = Get-SubscriptionResourceCounts -SubscriptionIds @('sub-a') -ResourceGroup "rg' or 1==1 //"
+        $Counts.Count | Should -Be 0
+        Should -Invoke Invoke-AzRestMethod -Times 0 -Exactly
+    }
+
+    It 'with the usage permission confirmed, passes a resource group with no usage with a warning that names it' {
+        $script:Printed = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Printed.Add([string]$Object) }
+        Mock Get-AzContext { $null }
+        Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1 } }
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
+        $Role = @([pscustomobject]@{ Id = 'sub-a'; UsageVerdict = 'Yes'; Assignments = [pscustomobject]@{ UsageGrantedBy = @('Reader at subscription') } })
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'rg-one' -RoleCheck $Role
+        $Result.ShouldBlock | Should -BeFalse
+        $Result.ResourceGroup | Should -Be 'rg-one'
+        Write-ConsumptionDataCheckReport -Result $Result
+        Write-NoUsageSummary -ConsumptionResult $Result
+        $Text = $script:Printed -join "`n"
+        $Text | Should -Match "Verifying consumption data \(usage values for 2026-09-25 to 2026-10-25\) for resource group 'rg-one' in 1 subscription\(s\)\.\.\."
+        $Text | Should -Match "WARNING: no usage above zero in resource group 'rg-one' for 2026-09-25 to 2026-10-25\."
+        $Text | Should -Match "the consumption sheet for resource group 'rg-one' will be empty"
+        $Text | Should -Match "1 subscription\(s\) returned no usage values for resource group 'rg-one' for 2026-09-25 to 2026-10-25 and continue"
+        $Text | Should -Match "Subscriptions with no usage values for resource group 'rg-one': 1"
+        $Text | Should -Match 'Typical causes: new resources, only free resources, or paused resources\. If usage was expected'
+    }
+
+    It 'without a confirmed usage permission, stops a resource group with usage only elsewhere' {
+        $script:Printed = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Printed.Add([string]$Object) }
+        Mock Get-AzContext { $null }
+        Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1 } }
+        Mock Get-UsageAggregates { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }) }
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'rg-one'
+        $Result.ShouldBlock | Should -BeTrue
+        Write-ConsumptionDataCheckReport -Result $Result
+        ($script:Printed -join "`n") | Should -Match "1 of 1 checked subscription\(s\) returned no usage values for resource group 'rg-one' for 2026-09-25 to 2026-10-25\."
     }
 }
 
@@ -555,10 +895,22 @@ Describe 'Run-AllSubscriptions.ps1 consumption data check block' {
         $script:Resume = $false
         $script:SkipConsumption = $false
         $script:AccessProbed = @()
+        # Computed once by the wrapper just before this block.
+        $script:ConsumptionWindow = $script:Window
     }
 
     AfterAll {
-        Remove-Variable -Name Subscriptions, CompletedIds, Resume, SkipConsumption, AccessProbed -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name Subscriptions, CompletedIds, Resume, SkipConsumption, AccessProbed, ConsumptionWindow -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    It 'checks the window computed once before it (the one passed to every subscription)' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-01-15T23:59:00')
+        Mock Get-UsageAggregates { New-UsagePage -Quantities @(3) }
+        { . $script:CheckBlock } | Should -Not -Throw
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly -ParameterFilter { $ReportedStartTime -eq [datetime]'2025-12-15' -and $ReportedEndTime -eq [datetime]'2026-01-14' }
+        $Text = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Text.IndexOf('$ConsumptionWindow = Get-ConsumptionWindow') | Should -BeLessThan $Text.IndexOf('$ConsumptionCheckScope =')
+        $Text.IndexOf('$ConsumptionWindow = Get-ConsumptionWindow') | Should -BeGreaterThan 0
     }
 
     It 'runs before parallelism tuning and before any inventory invocation, and replaces the first-subscription gate' {

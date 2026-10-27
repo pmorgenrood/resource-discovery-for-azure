@@ -881,11 +881,18 @@ if ($ScopeForProbe.Count -gt 0)
 # at the subscription or above; otherwise it stops the run as above.
 # -AllowPartialAccess does not bypass it. On -Resume only the subscriptions
 # this run will process are checked.
+#
+# The window is computed once here and passed to every ResourceInventory.ps1
+# this run starts (-ConsumptionWindowStart/-ConsumptionWindowEnd in
+# $InventoryPassthrough and the parallel workers' arguments), so a
+# subscription collected after midnight still collects the window checked
+# here.
+$ConsumptionWindow = Get-ConsumptionWindow
 $ConsumptionCheck = $null
 $ConsumptionCheckScope = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
 if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)
 {
-    $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed
+    $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed -Window $ConsumptionWindow
     Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
     Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
     if ($ConsumptionCheck.ShouldBlock)
@@ -929,6 +936,10 @@ if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 # behavior is unchanged for runs that don't pass it.
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 if ($PSBoundParameters.ContainsKey('Debug')) { $InventoryPassthrough['Debug'] = $true }
+# The consumption window of the up-front check above, for every subscription.
+$ConsumptionWindowArgs = ConvertTo-ConsumptionWindowArgument -Window $ConsumptionWindow
+$InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowArgs.ConsumptionWindowStart
+$InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowArgs.ConsumptionWindowEnd
 
 # Loop through each subscription and run ResourceInventory
 $SkippedCount = 0
@@ -1316,6 +1327,8 @@ else
                     SubscriptionIds    = $SliceIds
                     SubscriptionNames  = $SliceNames
                     ConcurrencyLimit   = $ConcurrencyLimit
+                    ConsumptionWindowStart = $ConsumptionWindowArgs.ConsumptionWindowStart
+                    ConsumptionWindowEnd   = $ConsumptionWindowArgs.ConsumptionWindowEnd
                 }
                 if ($Resume) { $WorkerArgs.Resume = $true }
                 if ($ResumeFailedOnly) { $WorkerArgs.ResumeFailedOnly = $true }

@@ -31,9 +31,16 @@ Before any inventory or metrics work, both entry points check that every
 subscription in the run returns at least one usage row with a quantity above
 zero for this same window, and stop with exit code 1 if one does not, unless
 the up-front role check confirmed the usage permission for it (it then passes
-with a warning and an empty consumption sheet). The phase
-and the check take the window from one helper (`Get-ConsumptionWindow` in
-`Functions/Common.Functions.ps1`), so the two cannot drift. See
+with a warning and an empty consumption sheet). The window is worked out
+once per run (`Get-ConsumptionWindow` in `Functions/Common.Functions.ps1`)
+and both the check and the phase use that one value: a direct run computes it
+before the check, and `Run-AllSubscriptions.ps1` computes it before its check
+and passes it to every `ResourceInventory.ps1` it starts
+(`-ConsumptionWindowStart` / `-ConsumptionWindowEnd`). So a subscription
+collected after midnight, hours after the check, still collects the window
+that was checked. For a direct `-ResourceGroup` run, the check counts only
+the usage rows of that resource group, by the same test the phase uses to
+keep rows (`Test-ConsumptionResourceUriInResourceGroup`). See
 [Consumption data check](../README.md#consumption-data-check-up-front) in the
 README.
 
