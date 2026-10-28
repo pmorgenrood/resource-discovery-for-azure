@@ -838,6 +838,10 @@ if ($ResumeFailedOnly)
     }
     $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
     $BeforeCount = $Subscriptions.Count
+    # Kept for the resume-state cleanup at the end, which names any of these that
+    # no run has completed. Copied here because in the sequential path the inner
+    # script can replace $Subscriptions.
+    $EligibleBeforeRetryFilter = @($Subscriptions)
     $Subscriptions = @($Subscriptions | Where-Object { $FailedIds -contains $_.Id })
     Write-Host ("ResumeFailedOnly: filtered to {0} previously-failed subscription(s) (was {1})." -f $Subscriptions.Count, $BeforeCount) -ForegroundColor Cyan
     if ($Subscriptions.Count -eq 0)
@@ -1943,7 +1947,17 @@ if ($null -ne $OuterZipFile)
 # Clean up resume state on a fully successful run (all subs processed, no failures
 # this run AND no pending retries from a prior run). Otherwise leave it so a
 # future -Resume / -ResumeFailedOnly invocation can pick up where this stopped.
-if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
+# -ResumeFailedOnly collects only the retry list, so an eligible subscription
+# that is neither completed nor on the retry list (one an interrupted run never
+# reached) is still owed: the state is kept, so a later -Resume collects it and
+# still skips the completed ones. The summary below names them.
+$NotCollected = @()
+if ($ResumeFailedOnly)
+{
+    $RetryListIds = @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
+    $NotCollected = @($EligibleBeforeRetryFilter | Where-Object { $CompletedIds -notcontains $_.Id -and $RetryListIds -notcontains $_.Id })
+}
+if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
     try
     {
@@ -2193,6 +2207,13 @@ elseif ($FailedAttempts.Count -gt 0)
     # because the most recent run was clean.
     Write-Host ("Pending Retries:         {0} subscription(s) from a prior run still in FailedAttempts" -f $FailedAttempts.Count) -ForegroundColor Yellow
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
+}
+if ($NotCollected.Count -gt 0)
+{
+    # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
+    Write-Host ("Not Collected:           {0} ({1}) - no run has completed these and -ResumeFailedOnly retries only the retry list" -f $NotCollected.Count, (@($NotCollected | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    Write-Host ("Resume State:            {0} (kept)" -f $ResumeStateFile) -ForegroundColor Yellow
+    Write-Host "Re-run with -Resume to collect them; it skips the subscriptions already completed." -ForegroundColor Yellow
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($OuterZipFile)
