@@ -172,8 +172,10 @@ git clone https://github.com/awslabs/resource-discovery-for-azure.git
 
 - **Azure Cloud Shell:** Authentication is automatic
 - **Local PowerShell:** Run `az login` and `Connect-AzAccount` before executing the script. If you plan to scan all subscriptions in a tenant, use `Run-AllSubscriptions.ps1`, which prompts you to sign in once and then reuses the session for every subscription.
-- **Existing sign-in:** A direct run of `ResourceInventory.ps1` checks az CLI and Az PowerShell separately and reuses each one that is signed in to the target tenant and can still get a token without a prompt; only a side that cannot is signed in again. Without `-TenantID` the target tenant is the one the working sign-in is on (az CLI's when both work but differ, with a warning).
-- **Azure VM with a managed identity:** Pass `-UseManagedIdentity` to sign in with the machine's identity instead of a user.
+- **Existing sign-in:** A direct run of `ResourceInventory.ps1` checks az CLI and Az PowerShell separately and reuses each one that is signed in to the target tenant and can still get a token without a prompt; only a side that cannot is signed in again. Without `-TenantID` the target tenant is the one the working sign-in is on (az CLI's when both work but differ, with a warning), and only that tenant's subscriptions are collected.
+- **One sign-in attempt per side:** if a sign-in fails, or still gives no token without a prompt (for example because of MFA or Conditional Access), the run stops with exit code `1` and says which command to run yourself; it does not prompt again or continue with an empty inventory.
+- **Service principal:** `-Appid`, `-Secret` and `-TenantID` always sign in as the service principal, even when a user is already signed in; `-Appid` without the other two stops with exit code `1`.
+- **Azure VM with a managed identity:** Pass `-UseManagedIdentity` to sign in with the machine's identity instead of a user. If the token is lost later in the run, metrics and consumption reconnect with the same identity once; they never fall back to a user sign-in.
 
 You might get more than one authentication request due to different collector processes running in parallel.
 
