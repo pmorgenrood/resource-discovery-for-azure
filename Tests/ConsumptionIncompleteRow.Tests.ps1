@@ -6,16 +6,23 @@
 # When a subscription's usage pages could not be read, the main summary of a
 # Run-AllSubscriptions.ps1 run still marked its row "ok". The consumption banner
 # only gives a count under -Obfuscate, so the shareable summary could not say
-# which subscription was missing its cost data.
+# which subscription was missing its cost data. In a -ParallelStreams run the
+# stream worker also kept one consumption failure per stream (Select-Object
+# -Unique treats any two of these entries as equal), so the banner undercounted.
 #
 # The test copies the scripts to a temp folder and runs, in a child pwsh with
 # HOME pointed at a temp folder and offline stand-ins for the Azure CLI and the
-# Az cmdlets, the REAL ResourceInventory.ps1 once per subscription, the way the
-# wrapper's sequential loop calls it, then the main summary the way the wrapper
-# builds it. One subscription's usage page fails on every attempt. The metrics
-# phase is skipped (-SkipMetrics): it is not part of this behaviour and its
-# thread jobs would not see the stand-ins. Retry waits are skipped by a
-# Start-Sleep stand-in. Placeholder ids only; no live Azure.
+# Az cmdlets:
+#   - the REAL ResourceInventory.ps1 once per subscription, the way the
+#     wrapper's sequential loop calls it, then the main summary the way the
+#     wrapper builds it;
+#   - the REAL Run-AllSubscriptions.Stream.ps1 for one stream, which calls the
+#     real ResourceInventory.ps1 per subscription, then the main summary from
+#     that stream's summary file.
+# One subscription's usage page fails on every attempt in the first case, two
+# in the second. The metrics phase is skipped (-SkipMetrics): it is not part of
+# this behaviour and its thread jobs would not see the stand-ins. Retry waits
+# are skipped by a Start-Sleep stand-in. Placeholder ids only; no live Azure.
 #
 # Not run on Windows: without -OutputDirectory the inner script writes to
 # C:\InventoryReports there, which a test cannot isolate.
@@ -29,14 +36,14 @@ BeforeAll {
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ConsumptionIncompleteRow_' + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
     New-Item -ItemType Directory -Path $script:Tree -Force | Out-Null
-    foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
+    foreach ($Item in @('ResourceInventory.ps1', 'Run-AllSubscriptions.Stream.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
     {
         Copy-Item -Path (Join-Path $script:RepoRoot $Item) -Destination $script:Tree -Recurse -Force
     }
 
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
-param([string]$Tree, [ValidateSet('Sequential')][string]$Mode, [string]$FailIds = '', [switch]$Obfuscate)
+param([string]$Tree, [ValidateSet('Sequential', 'Stream')][string]$Mode, [string]$FailIds = '', [switch]$Obfuscate)
 $PSStyle.OutputRendering = 'PlainText'
 $ErrorActionPreference = 'Continue'
 $Global:RdaSessionInitialized = $true
@@ -90,6 +97,12 @@ function global:Get-AzUsageAggregate
 # Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is loaded.
 function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Start-Sleep { param($Seconds, $Milliseconds) }
+# The stream worker imports Az.Accounts before it imports the saved context.
+function global:Import-Module
+{
+    if ($args -contains 'Az.Accounts') { return }
+    Microsoft.PowerShell.Core\Import-Module @args
+}
 
 $Root = Join-Path $HOME 'InventoryReports'
 New-Item -ItemType Directory -Path $Root -Force | Out-Null
@@ -106,6 +119,26 @@ if ($Mode -eq 'Sequential')
         & (Join-Path $Tree 'ResourceInventory.ps1') -TenantID $Tenant -SubscriptionID $Sub.Id @Passthrough -RunAllSubs *> (Join-Path $HOME ('inner-' + $Sub.Name + '.log'))
     }
     $Entries = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ })
+}
+else
+{
+    $WorkerArgs = @{
+        TenantID           = $Tenant
+        StreamId           = '0'
+        InventoryRoot      = $Root
+        ScriptRoot         = $Tree
+        AzContextPath      = (Join-Path $Root '.ctx.json')
+        StreamSummaryPath  = (Join-Path $Root '.rda-stream-0-summary.json')
+        StreamFailuresPath = (Join-Path $Root 'failures-stream-0.log')
+        SubscriptionIds    = @($Global:StandInSubs | ForEach-Object Id)
+        SubscriptionNames  = @($Global:StandInSubs | ForEach-Object Name)
+        SkipMetrics        = $true
+        ConcurrencyLimit   = 2
+    }
+    if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
+    & (Join-Path $Tree 'Run-AllSubscriptions.Stream.ps1') @WorkerArgs *> (Join-Path $HOME 'worker.log')
+    # What the parent wrapper appends to its run-wide list from this stream.
+    $Entries = @((Get-Content -LiteralPath $WorkerArgs.StreamSummaryPath -Raw | ConvertFrom-Json).ConsumptionFailedSubs | Where-Object { $null -ne $_ })
 }
 
 # The main summary, built the way the wrapper builds it.
@@ -154,6 +187,7 @@ $Folders = foreach ($F in @(Get-ChildItem -LiteralPath $Root -Directory -Filter 
     if (-not $IsWindows)
     {
         $script:Seq = Invoke-Harness -Mode Sequential -FailIds 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' -Obfuscate
+        $script:Par = Invoke-Harness -Mode Stream -FailIds 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb,cccccccc-cccc-cccc-cccc-cccccccccccc' -Obfuscate
     }
 }
 
@@ -184,5 +218,18 @@ Describe 'Obfuscated run, one subscription at a time: Sub B''s usage page cannot
     It 'no subscription name or id reaches the obfuscated summary' {
         $script:Seq.Html | Should -Not -Match 'Sub [AB]\b'
         $script:Seq.Html | Should -Not -Match 'aaaaaaaa-aaaa|bbbbbbbb-bbbb'
+    }
+}
+
+Describe 'Obfuscated stream of three subscriptions: Sub B''s and Sub C''s usage pages cannot be read' -Skip:([bool]$script:SkipReason) {
+    It 'the stream summary keeps both consumption failure entries, each with its own report folder' {
+        @($script:Par.Entries | ForEach-Object Id) | Should -Be @('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'cccccccc-cccc-cccc-cccc-cccccccccccc')
+        @($script:Par.Entries | ForEach-Object ReportFolder) | Should -Be @($script:Par.Folders[1].Name, $script:Par.Folders[2].Name)
+    }
+
+    It 'the main summary marks the rows of Sub B and Sub C, and the banner counts both' {
+        @($script:Par.Folders | ForEach-Object ConsumptionRows) | Should -Be @(1, 0, 0)
+        @($script:Par.Folders | ForEach-Object Health) | Should -Be @('ok', 'consumption incomplete', 'consumption incomplete')
+        $script:Par.Banner | Should -Be '2'
     }
 }
