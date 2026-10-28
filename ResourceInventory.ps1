@@ -488,21 +488,81 @@ Function RunInventorySetup()
             Write-Host $CurrentCloudEnvName.name -ForegroundColor Green
         }
 
-        # Direct run (not -RunAllSubs, not a service principal): az CLI and Az
-        # PowerShell keep separate sign-ins, so each side is checked on its own.
-        # A side is reused when it is signed in to the target tenant AND can
-        # still acquire a token silently (a cached account alone may hold an
-        # expired or Conditional Access gated token); only a side that fails
-        # that check is signed in again. Each side gets at most one sign-in
-        # attempt: if its token probe still fails afterwards the run stops with
-        # exit 1 rather than prompting again.
-        if (!$RunAllSubs.IsPresent -and !$Appid)
+        # Direct run (not -RunAllSubs): az CLI and Az PowerShell keep separate
+        # sign-ins. On every path below each side is signed in at most once,
+        # and its token for the tenant the run collects from is then checked;
+        # if a sign-in fails or gives no usable token the run stops with exit 1
+        # instead of prompting again or collecting an empty inventory. The
+        # next run starts from the same checks, so it cannot loop either.
+        #  - -Appid/-Secret/-TenantID: always the service principal, never a
+        #    user that happens to be signed in.
+        #  - -UseManagedIdentity: the identity of the machine.
+        #  - Otherwise a side that is signed in to the target tenant and can
+        #    acquire a token is reused and only the other side is signed in.
+        #    With nothing usable and no -TenantID, each side is signed in once
+        #    without a tenant and the tenant is chosen afterwards.
+        if (!$RunAllSubs.IsPresent)
         {
             function Stop-UnusableSignIn([string]$Side, [string]$Tenant, [string]$Advice)
             {
                 Write-Log -Message ("{0}: sign-in to tenant {1} did not give a usable token; stopping instead of prompting again." -f $Side, $Tenant) -Severity 'Error'
                 Write-Log -Message $Advice -Severity 'Error'
                 exit 1
+            }
+
+            function Get-UserSignInAdvice([string]$Side, [string]$Tenant)
+            {
+                $Command = if ($Side -eq 'az CLI') { 'az login' } else { 'Connect-AzAccount' }
+                if ($Tenant) { $Command = if ($Side -eq 'az CLI') { "az login --tenant $Tenant" } else { "Connect-AzAccount -Tenant $Tenant" } }
+                return ("Run '{0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $Command)
+            }
+
+            # One user sign-in for az CLI; the caller checks $LASTEXITCODE.
+            function Invoke-AzCliUserSignIn([string]$Tenant)
+            {
+                $TenantArgs = if ($Tenant) { @('-t', $Tenant) } else { @() }
+                if ($DeviceLogin.IsPresent) { az login --use-device-code @TenantArgs | Out-Host }
+                else { az login @TenantArgs --only-show-errors | Out-Null }
+            }
+
+            # One user sign-in for Az PowerShell.
+            function Invoke-AzPsUserSignIn([string]$Tenant)
+            {
+                $TenantArgs = if ($Tenant) { @{ Tenant = $Tenant } } else { @{} }
+                if ($DeviceLogin.IsPresent) { Connect-AzAccount -UseDeviceAuthentication @TenantArgs | Out-Null }
+                else { Connect-AzAccount @TenantArgs | Out-Null }
+            }
+
+            if ($Appid)
+            {
+                if ($UseManagedIdentity.IsPresent)
+                {
+                    Write-Log -Message ('-UseManagedIdentity is ignored because -Appid is given; signing in as the Service Principal.') -Severity 'Warning'
+                }
+                if (!$Secret -or !$TenantID)
+                {
+                    Write-Log -Message ("You are trying to use Service Principal Authentication Method in a wrong way.") -Severity 'Error'
+                    Write-Log -Message ("It's Mandatory to specify Application ID, Secret and Tenant ID in Azure Resource Inventory") -Severity 'Error'
+                    Write-Log -Message (".\ResourceInventory.ps1 -appid <SP AppID> -secret <SP Secret> -tenant <TenantID>") -Severity 'Error'
+                    exit 1
+                }
+
+                Write-Log -Message ("Using Service Principal Authentication Method") -Severity 'Success'
+                $SpAdvice = 'Check the -Appid, -Secret and -TenantID values and that the Service Principal can sign in to the tenant, then re-run.'
+                az account clear | Out-Null
+                $UnsecuredSecret = [System.Net.NetworkCredential]::new('', $Secret).Password
+                $UnsecuredSecret | az login --service-principal -u $Appid --tenant $TenantID --password-stdin --only-show-errors | Out-Null
+                $SpLoginExit = $LASTEXITCODE
+                Remove-Variable -Name UnsecuredSecret -ErrorAction SilentlyContinue
+                if ($SpLoginExit -ne 0 -or !(Test-AzCliTokenSilent -Tenant $TenantID)) { Stop-UnusableSignIn -Side 'az CLI' -Tenant $TenantID -Advice $SpAdvice }
+
+                $Credential = New-Object System.Management.Automation.PSCredential($Appid, $Secret)
+                Connect-AzAccount -ServicePrincipal -Credential $Credential -Tenant $TenantID | Out-Null
+                if (!(Test-AzPsTokenSilent -Tenant $TenantID)) { Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TenantID -Advice $SpAdvice }
+
+                $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
+                $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TenantID })
+                return
             }
 
             if ($UseManagedIdentity.IsPresent)
@@ -540,66 +600,130 @@ Function RunInventorySetup()
             }
             elseif ($PsTokenOk) { $TargetTenant = $PsTenant }
 
-            # Nothing usable and no -TenantID: fall through to the full sign-in
-            # and tenant selection below.
-            if ($TargetTenant)
+            if (!$TargetTenant)
             {
-                $CliOk = $CliTokenOk -and $CliTenant -eq $TargetTenant
-                $PsOk = $PsTokenOk -and $PsTenant -eq $TargetTenant
+                # Nothing usable and no -TenantID: sign each side in once without
+                # a tenant, choose the tenant, then check both tokens on it.
+                Write-Log -Message ('Tenant ID not specified. Use -TenantID parameter if you want to specify directly.') -Severity 'Warning'
+                Write-Log -Message ('Authenticating Azure') -Severity 'Info'
+                Write-Log -Message ('Clearing account cache') -Severity 'Info'
+                az account clear | Out-Null
 
-                if ($CliOk)
+                $DebugPreference = "SilentlyContinue"
+                Write-Log -Message ('Calling Login, the browser will open and prompt you to login.') -Severity 'Info'
+                if ($DeviceLogin.IsPresent) { Write-Log -Message ('Using device login') -Severity 'Info' }
+                else { Write-Log -Message ('Using browser login') -Severity 'Info' }
+
+                Invoke-AzCliUserSignIn
+                if ($LASTEXITCODE -ne 0) { Stop-UnusableSignIn -Side 'az CLI' -Tenant '(none given)' -Advice (Get-UserSignInAdvice -Side 'az CLI') }
+                Invoke-AzPsUserSignIn
+                $DebugPreference = "Continue"
+
+                $Tenants = @((Get-AzSubscription -WarningAction SilentlyContinue).HomeTenantId | Where-Object { $_ } | Sort-Object -Unique)
+
+                Write-Log -Message ('Checking number of Tenants') -Severity 'Info'
+
+                if ($Tenants.Count -eq 0)
                 {
-                    Write-Log -Message ("az CLI: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+                    Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant '(none given)' -Advice (Get-UserSignInAdvice -Side 'Az PowerShell')
+                }
+                elseif ($Tenants.Count -eq 1)
+                {
+                    Write-Log -Message ('You have privileges only in One Tenant') -Severity 'Success'
+                    $TargetTenant = $Tenants[0]
                 }
                 else
                 {
-                    if ($null -eq $CliTenant) { Write-Log -Message ('az CLI: not signed in; signing in.') -Severity 'Info' }
-                    elseif ($CliTenant -ne $TargetTenant) { Write-Log -Message ("az CLI: signed in to tenant {0}; signing in to {1}." -f $CliTenant, $TargetTenant) -Severity 'Warning' }
-                    else { Write-Log -Message ("az CLI: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
+                    Write-Log -Message ('Select the the Azure Tenant ID that you want to connect: ') -Severity 'Warning'
 
-                    # The az account cache is only wiped when neither side can be reused.
-                    if (!$PsOk) { az account clear | Out-Null }
-                    if ($DeviceLogin.IsPresent) { az login --use-device-code -t $TargetTenant }
-                    else { az login -t $TargetTenant --only-show-errors | Out-Null }
-
-                    if (!(Test-AzCliTokenSilent -Tenant $TargetTenant))
+                    $SequenceID = 1
+                    foreach ($ListedTenant in $Tenants)
                     {
-                        Stop-UnusableSignIn -Side 'az CLI' -Tenant $TargetTenant -Advice ("Run 'az login --tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $TargetTenant)
+                        write-host "$SequenceID)  $ListedTenant"
+                        $SequenceID ++
+                    }
+
+                    if (-not (Test-RdaInteractiveSession))
+                    {
+                        $TargetTenant = $Tenants[0]
+                        Write-Log -Message ("Non-interactive session with multiple tenants and no -TenantID: defaulting to the first tenant ({0}). Pass -TenantID to choose explicitly." -f $TargetTenant) -Severity 'Warning'
+                    }
+                    else
+                    {
+                        [int]$SelectTenant = read-host "Select Tenant (Default 1)"
+                        if ($SelectTenant -lt 1) { $SelectTenant = 1 }
+                        $TargetTenant = $Tenants[$SelectTenant - 1]
                     }
                 }
 
-                if ($PsOk)
+                # Point Az PowerShell at the chosen tenant (no new sign-in); this
+                # process only, so the user's saved context is left alone.
+                if ($TargetTenant -and (Get-AzPsSignedInTenant) -ne $TargetTenant)
                 {
-                    Write-Log -Message ("Az PowerShell: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+                    Set-AzContext -Tenant $TargetTenant -Scope Process | Out-Null
                 }
-                else
-                {
-                    if ($null -eq $PsTenant) { Write-Log -Message ('Az PowerShell: not signed in; signing in.') -Severity 'Info' }
-                    elseif ($PsTenant -ne $TargetTenant) { Write-Log -Message ("Az PowerShell: signed in to tenant {0}; signing in to {1}." -f $PsTenant, $TargetTenant) -Severity 'Warning' }
-                    else { Write-Log -Message ("Az PowerShell: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
 
-                    if ($DeviceLogin.IsPresent) { Connect-AzAccount -UseDeviceAuthentication -Tenant $TargetTenant | Out-Null }
-                    else { Connect-AzAccount -Tenant $TargetTenant | Out-Null }
+                if (!(Test-AzCliTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Side 'az CLI' -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Side 'az CLI' -Tenant $TargetTenant) }
+                if (!(Test-AzPsTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Side 'Az PowerShell' -Tenant $TargetTenant) }
 
-                    if (!(Test-AzPsTokenSilent -Tenant $TargetTenant))
-                    {
-                        Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TargetTenant -Advice ("Run 'Connect-AzAccount -Tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $TargetTenant)
-                    }
-                }
+                Write-Log -Message ("Extracting from Tenant $TargetTenant") -Severity 'Info'
+                Write-Log -Message ("Extracting Subscriptions") -Severity 'Info'
 
                 $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
                 $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TargetTenant })
                 return
             }
+
+            $CliOk = $CliTokenOk -and $CliTenant -eq $TargetTenant
+            $PsOk = $PsTokenOk -and $PsTenant -eq $TargetTenant
+
+            if ($CliOk)
+            {
+                Write-Log -Message ("az CLI: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+            }
+            else
+            {
+                if ($null -eq $CliTenant) { Write-Log -Message ('az CLI: not signed in; signing in.') -Severity 'Info' }
+                elseif ($CliTenant -ne $TargetTenant) { Write-Log -Message ("az CLI: signed in to tenant {0}; signing in to {1}." -f $CliTenant, $TargetTenant) -Severity 'Warning' }
+                else { Write-Log -Message ("az CLI: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
+
+                # The az account cache is only wiped when neither side can be reused.
+                if (!$PsOk) { az account clear | Out-Null }
+                Invoke-AzCliUserSignIn -Tenant $TargetTenant
+
+                if (!(Test-AzCliTokenSilent -Tenant $TargetTenant))
+                {
+                    Stop-UnusableSignIn -Side 'az CLI' -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Side 'az CLI' -Tenant $TargetTenant)
+                }
+            }
+
+            if ($PsOk)
+            {
+                Write-Log -Message ("Az PowerShell: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+            }
+            else
+            {
+                if ($null -eq $PsTenant) { Write-Log -Message ('Az PowerShell: not signed in; signing in.') -Severity 'Info' }
+                elseif ($PsTenant -ne $TargetTenant) { Write-Log -Message ("Az PowerShell: signed in to tenant {0}; signing in to {1}." -f $PsTenant, $TargetTenant) -Severity 'Warning' }
+                else { Write-Log -Message ("Az PowerShell: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
+
+                Invoke-AzPsUserSignIn -Tenant $TargetTenant
+
+                if (!(Test-AzPsTokenSilent -Tenant $TargetTenant))
+                {
+                    Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Side 'Az PowerShell' -Tenant $TargetTenant)
+                }
+            }
+
+            $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
+            $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TargetTenant })
+            return
         }
 
-        # -RunAllSubs and service principal runs: an existing az CLI account is
-        # taken as the session, as before.
-        $ExistingAccount = $null
-        if ($RunAllSubs.IsPresent -or $Appid)
-        {
-            $ExistingAccount = az account show --output json --only-show-errors 2>$null | ConvertFrom-Json
-        }
+        # -RunAllSubs: Run-AllSubscriptions.ps1 has already signed both sides
+        # in to -TenantID before it starts this script, so the existing az CLI
+        # session is used as it is.
+        $ExistingAccount = az account show --output json --only-show-errors 2>$null | ConvertFrom-Json
         if ($null -ne $ExistingAccount)
         {
             if (-not $Global:RdaSessionInitialized)
@@ -641,34 +765,6 @@ Function RunInventorySetup()
             Write-Log -Message ('Tenant ID not specified. Use -TenantID parameter if you want to specify directly.') -Severity 'Warning'
             Write-Log -Message ('Authenticating Azure') -Severity 'Info'
 
-            Write-Log -Message ('Clearing account cache') -Severity 'Info'
-
-            if (!$RunAllSubs.IsPresent)
-            {
-                az account clear | Out-Null
-            }
-
-            $DebugPreference = "SilentlyContinue"
-
-            if (!$RunAllSubs.IsPresent)
-            {
-                Write-Log -Message ('Calling Login, the browser will open and prompt you to login.') -Severity 'Info'
-                if ($DeviceLogin.IsPresent)
-                {
-                    Write-Log -Message ('Using device login') -Severity 'Info'
-                    az login --use-device-code
-                    Connect-AzAccount -UseDeviceAuthentication | Out-Null
-                }
-                else
-                {
-                    Write-Log -Message ('Using browser login') -Severity 'Info'
-                    az login --only-show-errors | Out-Null
-                    Connect-AzAccount | Out-Null
-                }
-            }
-
-            $DebugPreference = "Continue"
-
             $Tenants = (Get-AzSubscription -WarningAction SilentlyContinue).HomeTenantId | Sort-Object -Unique
 
             Write-Log -Message ('Checking number of Tenants') -Severity 'Info'
@@ -683,87 +779,22 @@ Function RunInventorySetup()
                 Write-Log -Message ('Select the the Azure Tenant ID that you want to connect: ') -Severity 'Warning'
 
                 $SequenceID = 1
-                foreach ($TenantID in $Tenants)
+                foreach ($ListedTenant in $Tenants)
                 {
-                    write-host "$SequenceID)  $TenantID"
+                    write-host "$SequenceID)  $ListedTenant"
                     $SequenceID ++
                 }
 
-                $IsInteractiveSession = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
-                if ($RunAllSubs.IsPresent -or -not $IsInteractiveSession)
-                {
-                    $TenantID = $Tenants[0]
-                    Write-Log -Message ("Non-interactive session with multiple tenants and no -TenantID: defaulting to the first tenant ({0}). Pass -TenantID to choose explicitly." -f $TenantID) -Severity 'Warning'
-                }
-                else
-                {
-                    [int]$SelectTenant = read-host "Select Tenant (Default 1)"
-                    if ($SelectTenant -lt 1) { $SelectTenant = 1 }
-                    $TenantID = $Tenants[$SelectTenant - 1]
-                }
-
-                if (!$RunAllSubs.IsPresent)
-                {
-                    if ($DeviceLogin.IsPresent)
-                    {
-                        az login --use-device-code -t $TenantID
-                        Connect-AzAccount -UseDeviceAuthentication -Tenant $TenantID | Out-Null
-                    }
-                    else
-                    {
-                        az login -t $TenantID --only-show-errors | Out-Null
-                        Connect-AzAccount -Tenant $TenantID | Out-Null
-                    }
-                }
+                $TenantID = $Tenants[0]
+                Write-Log -Message ("Non-interactive session with multiple tenants and no -TenantID: defaulting to the first tenant ({0}). Pass -TenantID to choose explicitly." -f $TenantID) -Severity 'Warning'
             }
 
             Write-Log -Message ("Extracting from Tenant $TenantID") -Severity 'Info'
             Write-Log -Message ("Extracting Subscriptions") -Severity 'Info'
-
-            $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
-            $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TenantID })
         }
-        else
-        {
 
-            if (!$RunAllSubs.IsPresent)
-            {
-                az account clear | Out-Null
-
-                if (!$Appid)
-                {
-                    if ($DeviceLogin.IsPresent)
-                    {
-                        az login --use-device-code -t $TenantID
-                        Connect-AzAccount -UseDeviceAuthentication -Tenant $TenantID | Out-Null
-                    }
-                    else
-                    {
-                        az login -t $TenantID --only-show-errors | Out-Null
-                        Connect-AzAccount -Tenant $TenantID | Out-Null
-                    }
-                }
-                elseif ($Appid -and $Secret -and $tenantid)
-                {
-                    Write-Log -Message ("Using Service Principal Authentication Method") -Severity 'Success'
-                    $UnsecuredSecret = [System.Net.NetworkCredential]::new('', $Secret).Password
-                    $UnsecuredSecret | az login --service-principal -u $appid --tenant $TenantID --password-stdin --only-show-errors | Out-Null
-                    Remove-Variable -Name unsecuredSecret -ErrorAction SilentlyContinue
-                    $Credential = New-Object System.Management.Automation.PSCredential($Appid, $Secret)
-                    Connect-AzAccount -ServicePrincipal -Credential $Credential -Tenant $TenantID | Out-Null
-                }
-                else
-                {
-                    Write-Log -Message ("You are trying to use Service Principal Authentication Method in a wrong way.") -Severity 'Error'
-                    Write-Log -Message ("It's Mandatory to specify Application ID, Secret and Tenant ID in Azure Resource Inventory") -Severity 'Error'
-                    Write-Log -Message (".\ResourceInventory.ps1 -appid <SP AppID> -secret <SP Secret> -tenant <TenantID>") -Severity 'Error'
-                    Exit
-                }
-            }
-
-            $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
-            $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TenantID })
-        }
+        $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
+        $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TenantID })
     }
 
     function GetSubscriptionsData()
@@ -1189,6 +1220,23 @@ function ExecuteInventoryProcessing()
                 Write-Log -Message ("{0}: reconnecting via Service Principal." -f $Phase) -Severity 'Info'
                 $Credential = New-Object System.Management.Automation.PSCredential($Appid, $Secret)
                 Connect-AzAccount -ServicePrincipal -Credential $Credential -Tenant $TenantID -ErrorAction Stop | Out-Null
+            }
+            elseif ($UseManagedIdentity.IsPresent)
+            {
+                # One managed identity reconnect per run, never a user sign-in:
+                # after a failed attempt later phases are skipped without trying.
+                if ($script:RdaManagedIdentityReconnectTried)
+                {
+                    Write-Log -Message ("{0}: the managed identity reconnect already failed in this run; not trying again. Check the machine's managed identity, then re-run." -f $Phase) -Severity 'Error'
+                    return $false
+                }
+                $script:RdaManagedIdentityReconnectTried = $true
+                Write-Log -Message ("{0}: reconnecting with the managed identity." -f $Phase) -Severity 'Info'
+                if ($TenantID) { Connect-AzAccount -Identity -Tenant $TenantID -ErrorAction Stop | Out-Null }
+                else { Connect-AzAccount -Identity -ErrorAction Stop | Out-Null }
+                if (& $TokenOk) { return $true }
+                Write-Log -Message ("{0}: the managed identity reconnect did not give a usable token. Check that this machine has a managed identity with access to the tenant, then re-run." -f $Phase) -Severity 'Error'
+                return $false
             }
             elseif ($RunAllSubs.IsPresent)
             {

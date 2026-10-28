@@ -1861,6 +1861,12 @@ function Write-NoUsageSummary
 # ResourceInventory.ps1, so both decide the same way whether an existing az CLI
 # or Az PowerShell sign-in can be reused.
 
+# $true when a person can answer a prompt in this console.
+function Test-RdaInteractiveSession
+{
+    return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected)
+}
+
 function Get-AzCliSignedInTenant
 {
     $Raw = az account show --output json 2>$null
