@@ -37,6 +37,9 @@ BeforeAll {
         if (-not (Test-Path -LiteralPath $Required -PathType Leaf)) { throw "Required file not found: $Required" }
     }
 
+    # Something for Mock to replace if Common.Functions.ps1 does not define it.
+    function Test-RdaInteractiveSession { $false }
+
     # ResourceInventory.ps1 dot-sources Common.Functions.ps1 at the top, so the
     # sign-in helpers it uses must come from there.
     . $script:CommonFunctions
@@ -95,20 +98,23 @@ Describe 'LoginSession on a direct run' {
                 '^account get-access-token'
                 {
                     $Asked = $args[[array]::IndexOf($args, '--tenant') + 1]
-                    if (-not ($Sim.CliTenant -and $Sim.CliTokenOk -and $Asked -eq $Sim.CliTenant)) { $global:LASTEXITCODE = 1 }
+                    if (-not ($Sim.CliTenant -and $Sim.CliTokenOk -and $Asked -in $Sim.CliReach)) { $global:LASTEXITCODE = 1 }
                     return
                 }
-                '^account clear' { $Sim.CliTenant = $null; $Sim.CliTokenOk = $false; return }
+                '^account clear' { $Sim.CliTenant = $null; $Sim.CliTokenOk = $false; $Sim.CliReach = @(); return }
                 '^account list'
                 {
                     if (-not $Sim.CliTenant) { return '[]' }
-                    return (ConvertTo-Json -InputObject @(@{ id = 'sub-1'; name = 'sub-1'; tenantId = $Sim.CliTenant }))
+                    return (ConvertTo-Json -InputObject @($Sim.CliReach | ForEach-Object { @{ id = ('sub-' + $_); name = ('sub-' + $_); tenantId = $_ } }))
                 }
                 '^login'
                 {
+                    # A sign-in without a tenant reaches every tenant the account
+                    # belongs to; one with a tenant reaches only that tenant.
                     $TIndex = [array]::IndexOf($args, '-t')
                     if ($TIndex -lt 0) { $TIndex = [array]::IndexOf($args, '--tenant') }
-                    $Sim.CliTenant = if ($TIndex -ge 0) { $args[$TIndex + 1] } else { $Sim.HomeTenant }
+                    if ($TIndex -ge 0) { $Sim.CliTenant = $args[$TIndex + 1]; $Sim.CliReach = @($Sim.CliTenant) }
+                    else { $Sim.CliTenant = $Sim.HomeTenant; $Sim.CliReach = @($Sim.Tenants) }
                     $Sim.CliTokenOk = $true
                     return
                 }
@@ -122,10 +128,18 @@ Describe 'LoginSession on a direct run' {
             [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'user@example.com' }; Tenant = [pscustomobject]@{ Id = $script:Sim.PsTenant } }
         }
 
+        function Set-AzContext
+        {
+            [CmdletBinding(SupportsShouldProcess = $true)]
+            param([string]$Tenant, [string]$Subscription, [ValidateSet('Process', 'CurrentUser')][string]$Scope)
+            $null = $Subscription, $Scope
+            if ($Tenant -and $Tenant -in $script:Sim.PsReach) { $script:Sim.PsTenant = $Tenant }
+        }
+
         function Get-AzAccessToken
         {
             [CmdletBinding()] param([string]$TenantId, [string]$ResourceUrl)
-            if ($script:Sim.PsTenant -and $script:Sim.PsTokenOk -and $TenantId -eq $script:Sim.PsTenant) { return [pscustomobject]@{ Token = 'token' } }
+            if ($script:Sim.PsTenant -and $script:Sim.PsTokenOk -and $TenantId -in $script:Sim.PsReach) { return [pscustomobject]@{ Token = 'token' } }
             throw 'Unable to acquire token for tenant. User interaction is required.'
         }
 
@@ -133,20 +147,33 @@ Describe 'LoginSession on a direct run' {
         {
             [CmdletBinding()]
             param([string]$Tenant, [switch]$UseDeviceAuthentication, [switch]$Identity, [switch]$ServicePrincipal, [pscredential]$Credential)
-            $script:Sim.PsTenant = if ($Tenant) { $Tenant } else { $script:Sim.HomeTenant }
+            $null = $UseDeviceAuthentication, $Identity, $ServicePrincipal, $Credential
+            Invoke-SimPsSignIn -Tenant $Tenant
+        }
+
+        function Invoke-SimPsSignIn
+        {
+            param([string]$Tenant)
+            if ($Tenant) { $script:Sim.PsTenant = $Tenant; $script:Sim.PsReach = @($Tenant) }
+            else { $script:Sim.PsTenant = $script:Sim.HomeTenant; $script:Sim.PsReach = @($script:Sim.Tenants) }
             $script:Sim.PsTokenOk = $true
         }
 
         function Get-AzSubscription
         {
             [CmdletBinding()] param()
-            [pscustomobject]@{ HomeTenantId = $script:Sim.HomeTenant }
+            foreach ($T in $script:Sim.Tenants) { [pscustomobject]@{ HomeTenantId = $T } }
         }
 
         function Set-SignInState
         {
-            param([string]$CliTenant, [bool]$CliTokenOk = $true, [string]$PsTenant, [bool]$PsTokenOk = $true, [string]$HomeTenant = $script:TenantA)
-            $script:Sim = @{ CliTenant = $CliTenant; CliTokenOk = $CliTokenOk; PsTenant = $PsTenant; PsTokenOk = $PsTokenOk; HomeTenant = $HomeTenant }
+            param([string]$CliTenant, [bool]$CliTokenOk = $true, [string]$PsTenant, [bool]$PsTokenOk = $true, [string]$HomeTenant = $script:TenantA, [string[]]$Tenants)
+            if (-not $Tenants) { $Tenants = @($HomeTenant) }
+            $script:Sim = @{
+                CliTenant = $CliTenant; CliTokenOk = $CliTokenOk; CliReach = @($CliTenant | Where-Object { $_ })
+                PsTenant = $PsTenant; PsTokenOk = $PsTokenOk; PsReach = @($PsTenant | Where-Object { $_ })
+                HomeTenant = $HomeTenant; Tenants = $Tenants
+            }
         }
 
         function Get-AzLogins { @($script:AzCalls | Where-Object { $_ -match '^login' }) }
@@ -159,10 +186,9 @@ Describe 'LoginSession on a direct run' {
         $Global:RdaSessionInitialized = $true
         $Global:Subscriptions = @()
         Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
-        Mock -CommandName Connect-AzAccount -MockWith {
-            $script:Sim.PsTenant = if ($Tenant) { $Tenant } else { $script:Sim.HomeTenant }
-            $script:Sim.PsTokenOk = $true
-        }
+        Mock -CommandName Connect-AzAccount -MockWith { Invoke-SimPsSignIn -Tenant $Tenant }
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $false }
+        Mock -CommandName Read-Host -MockWith { throw 'Read-Host was not expected in this test' }
 
         # Script parameters LoginSession reads from its caller's scope.
         $TenantID = $null
@@ -327,6 +353,64 @@ Describe 'LoginSession on a direct run' {
         Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $ServicePrincipal.IsPresent -and $Tenant -eq $script:TenantA }
     }
 
+    It 'signs in as the service principal even when a user is already signed in to the tenant on both sides' {
+        $TenantID = $script:TenantA
+        $Appid = [guid]::NewGuid().ToString()
+        $Secret = ConvertTo-SecureString -String 'not-a-real-secret' -AsPlainText -Force
+        $null = $TenantID, $Appid, $Secret
+        Set-SignInState -CliTenant $script:TenantA -PsTenant $script:TenantA
+
+        LoginSession 6>$null
+
+        @(Get-AzLogins).Count | Should -Be 1 -Because 'explicit service principal credentials replace a cached user'
+        @(Get-AzLogins)[0] | Should -Match '--service-principal'
+        @(Get-AzLogins)[0] | Should -Match ([regex]::Escape($Appid))
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $ServicePrincipal.IsPresent -and $Tenant -eq $script:TenantA }
+        @($script:AzCalls | Where-Object { $_ -match '^account get-access-token' -and $_ -match [regex]::Escape($script:TenantA) }).Count | Should -BeGreaterThan 0 -Because 'the service principal token is checked after signing in'
+    }
+
+    It 'checks both tokens on the tenant after signing in, when nothing was signed in (single tenant)' {
+        Set-SignInState
+
+        LoginSession 6>$null
+
+        @(Get-AzLogins).Count | Should -Be 1
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        @($script:AzCalls | Where-Object { $_ -match '^account get-access-token' -and $_ -match [regex]::Escape($script:TenantA) }).Count | Should -BeGreaterThan 0
+        @($Global:Subscriptions).Count | Should -Be 1
+    }
+
+    It 'signs each side in once and uses the first tenant when nothing was signed in, several tenants, no console' {
+        $Sorted = @($script:TenantA, $script:TenantB | Sort-Object)
+        Set-SignInState -Tenants $script:TenantA, $script:TenantB
+
+        LoginSession 6>$null
+
+        @(Get-AzLogins).Count | Should -Be 1 -Because 'a side is never signed in twice in one run'
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        Should -Invoke -CommandName Read-Host -Times 0 -Exactly
+        @($Global:Subscriptions).Count | Should -Be 1
+        $Global:Subscriptions[0].tenantId | Should -Be $Sorted[0]
+        Get-AzPsSignedInTenant | Should -Be $Sorted[0]
+    }
+
+    It 'signs each side in once and uses the picked tenant when nothing was signed in, several tenants, interactive' {
+        $Sorted = @($script:TenantA, $script:TenantB | Sort-Object)
+        Set-SignInState -Tenants $script:TenantA, $script:TenantB
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $true }
+        Mock -CommandName Read-Host -MockWith { '2' }
+
+        LoginSession 6>$null
+
+        Should -Invoke -CommandName Read-Host -Times 1 -Exactly
+        @(Get-AzLogins).Count | Should -Be 1 -Because 'a side is never signed in twice in one run'
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        @($Global:Subscriptions).Count | Should -Be 1
+        $Global:Subscriptions[0].tenantId | Should -Be $Sorted[1]
+        Get-AzPsSignedInTenant | Should -Be $Sorted[1]
+    }
+
     It 'signs in nothing under -RunAllSubs' {
         $RunAllSubs = [switch]$true
         $TenantID = $script:TenantA
@@ -364,7 +448,17 @@ $Global:Sim = switch ($Scenario)
     'az-token-fails' { @{ CliTenant = $Tenant; CliToken = $false; PsTenant = $Tenant; PsToken = $true } }
     'ps-token-fails' { @{ CliTenant = $Tenant; CliToken = $true; PsTenant = $Tenant; PsToken = $false } }
     'mi-token-fails' { @{ CliTenant = $null; CliToken = $false; PsTenant = $null; PsToken = $false } }
+    # Nothing signed in and no -TenantID: az login itself fails.
+    'fresh-az-login-fails' { @{ CliTenant = $null; CliToken = $false; PsTenant = $null; PsToken = $false; LoginFails = $true } }
+    # Nothing signed in and no -TenantID: both sign-ins succeed, no token follows.
+    'fresh-token-fails' { @{ CliTenant = $null; CliToken = $false; PsTenant = $null; PsToken = $false } }
+    # Service principal sign-in succeeds, no token follows.
+    'sp-token-fails' { @{ CliTenant = $null; CliToken = $false; PsTenant = $null; PsToken = $false } }
+    # -Appid without -Secret while a user is signed in to the tenant.
+    'sp-missing-secret' { @{ CliTenant = $Tenant; CliToken = $true; PsTenant = $Tenant; PsToken = $true } }
 }
+# Never prompt for a tenant number in the child process.
+function global:Test-RdaInteractiveSession { $false }
 function global:Write-Log { param($Message, $Severity) Write-Output ('{0}: {1}' -f $Severity, $Message) }
 function global:az
 {
@@ -375,21 +469,26 @@ function global:az
     if ($Line -like 'account show*') { if ($Global:Sim.CliTenant) { return ('{{"tenantId":"{0}"}}' -f $Global:Sim.CliTenant) }; $global:LASTEXITCODE = 1; return }
     if ($Line -like 'account get-access-token*') { if (-not $Global:Sim.CliToken) { $global:LASTEXITCODE = 1 }; return }
     if ($Line -like 'account list*') { return ('[{{"id":"sub-1","tenantId":"{0}"}}]' -f $Global:Sim.CliTenant) }
-    if ($Line -like 'login*') { $Global:Sim.CliTenant = $Tenant; return }
+    if ($Line -like 'login*') { if ($Global:Sim.LoginFails) { $global:LASTEXITCODE = 1; return }; $Global:Sim.CliTenant = $Tenant; return }
 }
 function global:Get-AzContext { [CmdletBinding()] param() if ($Global:Sim.PsTenant) { [pscustomobject]@{ Account = 'user'; Tenant = [pscustomobject]@{ Id = $Global:Sim.PsTenant } } } }
 function global:Get-AzAccessToken { [CmdletBinding()] param($TenantId) if ($Global:Sim.PsToken) { [pscustomobject]@{ Token = 'token' } } else { throw 'User interaction is required.' } }
 function global:Connect-AzAccount
 {
-    [CmdletBinding()] param([string]$Tenant, [switch]$Identity, [switch]$UseDeviceAuthentication)
-    Add-Content -Path $CallLog -Value ('Connect-AzAccount' + $(if ($Identity) { ' -Identity' }) + $(if ($Tenant) { ' -Tenant ' + $Tenant }))
-    $Global:Sim.PsTenant = $Tenant
+    [CmdletBinding()] param([string]$Tenant, [switch]$Identity, [switch]$UseDeviceAuthentication, [switch]$ServicePrincipal, [pscredential]$Credential)
+    Add-Content -Path $CallLog -Value ('Connect-AzAccount' + $(if ($Identity) { ' -Identity' }) + $(if ($ServicePrincipal) { ' -ServicePrincipal' }) + $(if ($Tenant) { ' -Tenant ' + $Tenant }))
+    $Global:Sim.PsTenant = if ($Tenant) { $Tenant } else { $Global:HarnessTenant }
 }
+function global:Get-AzSubscription { [CmdletBinding()] param() [pscustomobject]@{ HomeTenantId = $Global:HarnessTenant } }
+function global:Set-AzContext { [CmdletBinding()] param([string]$Tenant, [string]$Scope) if ($Tenant) { $Global:Sim.PsTenant = $Tenant } }
 
 $Global:RdaSessionInitialized = $true
-$TenantID = if ($Scenario -eq 'mi-token-fails') { $Tenant } else { $null }
+$Global:HarnessTenant = $Tenant
+$TenantID = if ($Scenario -in 'mi-token-fails', 'sp-token-fails', 'sp-missing-secret') { $Tenant } else { $null }
 $UseManagedIdentity = [switch]($Scenario -eq 'mi-token-fails')
-$Appid = $null; $DeviceLogin = [switch]$false; $RunAllSubs = [switch]$false
+$Appid = if ($Scenario -like 'sp-*') { [guid]::NewGuid().ToString() } else { $null }
+$Secret = if ($Scenario -eq 'sp-token-fails') { ConvertTo-SecureString -String 'not-a-real-secret' -AsPlainText -Force } else { $null }
+$DeviceLogin = [switch]$false; $RunAllSubs = [switch]$false
 LoginSession
 Add-Content -Path $CallLog -Value 'returned'
 exit 0
@@ -408,6 +507,7 @@ exit 0
                 Calls    = $Calls
                 AzLogins = @($Calls | Where-Object { $_ -like 'az login*' })
                 Connects = @($Calls | Where-Object { $_ -like 'Connect-AzAccount*' })
+                Probes   = @($Calls | Where-Object { $_ -like 'az account get-access-token*' })
             }
         }
     }
@@ -441,5 +541,114 @@ exit 0
         $Run.AzLogins[0] | Should -Match '--identity'
         $Run.Connects.Count | Should -Be 1
         $Run.Calls | Should -Not -Contain 'returned'
+    }
+
+    It 'stops with exit 1, without signing in Az PowerShell, when az login fails and nothing was signed in' {
+        $Run = Invoke-LoginHarness -Scenario 'fresh-az-login-fails'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.AzLogins.Count | Should -Be 1 -Because 'one sign-in attempt per side, never a second prompt'
+        $Run.Connects.Count | Should -Be 0
+        $Run.Calls | Should -Not -Contain 'returned'
+    }
+
+    It 'signs each side in once and stops with exit 1 when no token follows, nothing was signed in and no -TenantID' {
+        $Run = Invoke-LoginHarness -Scenario 'fresh-token-fails'
+
+        $Run.ExitCode | Should -Be 1 -Because 'an unusable sign-in must not continue into an empty inventory'
+        $Run.AzLogins.Count | Should -Be 1
+        $Run.Connects.Count | Should -Be 1
+        $Run.Probes.Count | Should -BeGreaterThan 0
+        $Run.Calls | Should -Not -Contain 'returned'
+        $Run.Output | Should -Match 'did not give a usable token'
+    }
+
+    It 'signs in as the service principal once and stops with exit 1 when no token follows' {
+        $Run = Invoke-LoginHarness -Scenario 'sp-token-fails'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.AzLogins.Count | Should -Be 1
+        $Run.AzLogins[0] | Should -Match '--service-principal'
+        @($Run.Connects | Where-Object { $_ -notlike '*-ServicePrincipal*' }).Count | Should -Be 0 -Because 'never falls back to a user sign-in'
+        $Run.Calls | Should -Not -Contain 'returned'
+    }
+
+    It 'stops with exit 1 for -Appid without -Secret instead of using the signed-in user' {
+        $Run = Invoke-LoginHarness -Scenario 'sp-missing-secret'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.AzLogins.Count | Should -Be 0
+        $Run.Connects.Count | Should -Be 0
+        $Run.Calls | Should -Not -Contain 'returned'
+    }
+}
+
+# The reconnect before metrics and consumption (Test-DataPlaneAuthReady, nested
+# in ExecuteInventoryProcessing). With -UseManagedIdentity it reconnects with
+# the machine's identity at most once per run and never with a user sign-in.
+Describe 'Data-plane reconnect with -UseManagedIdentity' {
+
+    BeforeAll {
+        $ReadyFn = $Ast.FindAll({
+                param($Node)
+                $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Test-DataPlaneAuthReady'
+            }, $true) | Select-Object -First 1
+        if ($null -eq $ReadyFn) { throw 'Test-DataPlaneAuthReady was not found in ResourceInventory.ps1. Has it been renamed or removed?' }
+        . ([scriptblock]::Create($ReadyFn.Extent.Text))
+
+        function Get-AzContext { [CmdletBinding()] param() }
+        function Get-AzAccessToken { [CmdletBinding()] param([string]$TenantId, [string]$ResourceUrl) $null = $TenantId, $ResourceUrl }
+        function Connect-AzAccount
+        {
+            [CmdletBinding()]
+            param([string]$Tenant, [switch]$UseDeviceAuthentication, [switch]$Identity, [switch]$ServicePrincipal, [pscredential]$Credential)
+            $null = $Tenant, $UseDeviceAuthentication, $Identity, $ServicePrincipal, $Credential
+        }
+    }
+
+    BeforeEach {
+        $script:LogLines = [System.Collections.Generic.List[string]]::new()
+        $script:Connected = $false
+        $script:IdentityGivesToken = $true
+        $script:RdaManagedIdentityReconnectTried = $null
+        Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
+        Mock -CommandName Get-AzContext -MockWith { if ($script:Connected) { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'identity' } } } }
+        Mock -CommandName Get-AzAccessToken -MockWith { [pscustomobject]@{ Token = 'token' } }
+        Mock -CommandName Connect-AzAccount -MockWith { if ($Identity.IsPresent -and $script:IdentityGivesToken) { $script:Connected = $true } }
+
+        $UseManagedIdentity = [switch]$true
+        $TenantID = $script:TenantA
+        $Appid = $null
+        $Secret = $null
+        $DeviceLogin = [switch]$false
+        $RunAllSubs = [switch]$false
+        $null = $UseManagedIdentity, $TenantID, $Appid, $Secret, $DeviceLogin, $RunAllSubs
+    }
+
+    It 'reconnects once with the managed identity on the tenant when the token was dropped' {
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $Identity.IsPresent -and $Tenant -eq $script:TenantA }
+    }
+
+    It 'reconnects with the managed identity without a tenant when -TenantID is not given' {
+        $TenantID = $null
+        $null = $TenantID
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $Identity.IsPresent -and -not $Tenant }
+    }
+
+    It 'skips the phase with an error, and does not try again for the next phase, when the identity gives no token' {
+        $script:IdentityGivesToken = $false
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeFalse
+        Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeFalse
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -Because 'one managed identity reconnect per run, then stop trying'
+        Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly -ParameterFilter { -not $Identity.IsPresent }
+        @($script:LogLines | Where-Object { $_ -match '^Error:' -and $_ -match 'managed identity' }).Count | Should -BeGreaterThan 0
     }
 }
