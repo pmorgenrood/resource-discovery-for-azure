@@ -37,7 +37,7 @@ BeforeAll {
 }
 
 AfterAll {
-    foreach ($Name in @('Subscriptions', 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'ObfuscationSubscriptionIndex'))
+    foreach ($Name in @('Subscriptions', 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'ObfuscationSubscriptionIndex', 'Resources'))
     {
         Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
     }
@@ -106,5 +106,42 @@ Describe 'Get-ObfuscatedResourceId' {
     It 'returns ''obfuscated'' for an empty id and one token for an id that is not subscription-scoped' {
         Get-ObfuscatedResourceId -ResourceId '' | Should -BeExactly 'obfuscated'
         Get-ObfuscatedResourceId -ResourceId 'not-an-arm-id' | Should -Match ('^' + $script:Token + '$')
+    }
+}
+
+Describe 'The dictionary build writes the name token New-ObfuscatedNameToken writes' {
+    BeforeAll {
+        # The -Obfuscate dictionary build of RunInventorySetup, run as a function. Its
+        # per-resource loop builds the name token inline.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$Global:Resources\)' }, $true))
+        if ($Build.Count -ne 1) { throw 'The -Obfuscate dictionary build was not found in RunInventorySetup.' }
+        . ([scriptblock]::Create("function Invoke-DictionaryBuild { `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$null; $($Build[0].Extent.Text) }"))
+
+        $script:Cases = @(
+            @{ Id = "$script:Base/microsoft.compute/virtualmachines/vm-a"; Name = 'vm-a' }
+            @{ Id = "$script:Base/microsoft.compute/virtualmachines/vm-dev-a"; Name = 'vm-dev-a' }
+            @{ Id = "$script:Base/microsoft.compute/virtualmachines/VM-TEST-B"; Name = 'VM-TEST-B' }
+            @{ Id = "$script:Base/microsoft.web/sites/t-web"; Name = 't-web' }
+            @{ Id = "$script:Base/microsoft.compute/disks/disk-noname"; Name = $null }
+            @{ Id = "$script:Base/microsoft.databricks/workspaces/dbw-a"; Name = 'dbw-a' }
+            @{ Id = "$script:Base/microsoft.databricks/workspaces/dbw-dev"; Name = 'dbw-dev' }
+            @{ Id = "/subscriptions/$script:Sub/resourcegroups/mc_rg_aks/providers/microsoft.compute/disks/osdisk-b"; Name = 'osdisk-b' }
+            @{ Id = "$script:Base/microsoft.compute/virtualmachinescalesets/vmss-a"; Name = 'vmss-a' }
+        )
+        Reset-ObfuscationState
+        $Global:Resources = @(foreach ($C in $script:Cases) { [pscustomobject]@{ id = $C.Id; name = $C.Name; subscriptionId = $script:Sub; resourceGroup = ($C.Id -split '/')[4] } })
+        Invoke-DictionaryBuild
+    }
+
+    It 'gives <Id> the prefix and hint New-ObfuscatedNameToken gives it' -ForEach @(
+        @{ Id = 'vm-a' }, @{ Id = 'vm-dev-a' }, @{ Id = 'VM-TEST-B' }, @{ Id = 't-web' }, @{ Id = 'disk-noname' }, @{ Id = 'dbw-a' }, @{ Id = 'dbw-dev' }, @{ Id = 'osdisk-b' }, @{ Id = 'vmss-a' }
+    ) {
+        $Case = @($script:Cases | Where-Object { $_.Id.EndsWith('/' + $Id) })[0]
+        $Expected = (New-ObfuscatedNameToken -ResourceId $Case.Id -Name $Case.Name) -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', '<guid>'
+        $Written = $Global:ResourceNameDictionary[$Case.Id]
+        $Written | Should -Match ('^' + $script:Token + '$')
+        ($Written -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', '<guid>') | Should -BeExactly $Expected
     }
 }

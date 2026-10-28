@@ -171,7 +171,9 @@ function Get-ObfuscationPrefix
 }
 
 # A new token for the resource name $Name of resource $ResourceId, with the type
-# hint the report uses for Databricks, AKS-managed and scale set resources.
+# hint the report uses for Databricks, AKS-managed and scale set resources. This
+# defines the name token format; the per-resource loop of RunInventorySetup builds
+# the same token inline.
 function New-ObfuscatedNameToken
 {
     param([string]$ResourceId, [string]$Name)
@@ -210,10 +212,12 @@ function Get-ObfuscationSubscriptionIndex
 # child's id holds its parent's masked name and ids join across the inventory,
 # metrics and consumption files. A segment with no token yet gets one, recorded
 # in the run's dictionaries (a name keyed by the real id up to that segment), so
-# the obfuscation dictionary can reverse every segment.
+# the obfuscation dictionary can reverse every segment. A caller that masks many
+# ids passes the index from Get-ObfuscationSubscriptionIndex once as
+# $SubscriptionIndex; without it the function gets the index itself.
 function Get-ObfuscatedResourceId
 {
-    param([string]$ResourceId)
+    param([string]$ResourceId, [hashtable]$SubscriptionIndex)
 
     if ([string]::IsNullOrEmpty($ResourceId)) { return 'obfuscated' }
     $Parts = $ResourceId.Split('/')
@@ -222,7 +226,8 @@ function Get-ObfuscatedResourceId
         return (Get-ObfuscationPrefix $ResourceId) + [guid]::NewGuid().ToString()
     }
 
-    $SubEntries = (Get-ObfuscationSubscriptionIndex).ById[$Parts[2]]
+    if ($null -eq $SubscriptionIndex) { $SubscriptionIndex = Get-ObfuscationSubscriptionIndex }
+    $SubEntries = $SubscriptionIndex.ById[$Parts[2]]
     $SubName = if ($null -ne $SubEntries) { [string]$SubEntries[0].name } else { '' }
     if ([string]::IsNullOrEmpty($SubName)) { $SubName = $Parts[2] }
     if (-not $Global:ObfuscationSubscriptionTokens.ContainsKey($SubName)) { $Global:ObfuscationSubscriptionTokens[$SubName] = (Get-ObfuscationPrefix $SubName) + [guid]::NewGuid().ToString() }
@@ -843,7 +848,13 @@ Function RunInventorySetup()
         {
             if ($IdsToMask.Contains($resourceItem.ID)) { continue }
 
-            $ObfuscatedName = New-ObfuscatedNameToken -ResourceId $resourceItem.id -Name $resourceItem.name
+            # The token New-ObfuscatedNameToken writes, built inline because this loop
+            # runs once per resource.
+            $TokenId = [string]$resourceItem.id
+            $TokenName = [string]$resourceItem.name
+            $Hint = if ($TokenId -match 'databricks') { 'databricks_' } elseif ($TokenId -match '/resourcegroups/mc_') { 'aks_' } elseif ($TokenId -match 'virtualmachinescalesets') { 'vmss_' } else { '' }
+            $Prefix = if ($TokenName -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $TokenName -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+            $ObfuscatedName = $Prefix + $Hint + [guid]::NewGuid().ToString()
 
             $SubEntries = if ($null -eq $resourceItem.subscriptionId) { $SubIndex.NoId } else { $SubIndex.ById[[string]$resourceItem.subscriptionId] }
             $RealSub = $SubEntries.Name
@@ -886,7 +897,7 @@ Function RunInventorySetup()
 
         foreach ($MaskId in $IdsToMask)
         {
-            $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId
+            $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId -SubscriptionIndex $SubIndex
         }
     }
 }
