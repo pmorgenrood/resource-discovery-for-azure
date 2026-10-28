@@ -1232,6 +1232,10 @@ function ExecuteInventoryProcessing()
             return
         }
 
+        # Name of the report folder this run writes to, recorded on a subscription's
+        # consumption failure so the wrapper's main summary can mark that report's row.
+        $ConsumptionReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
+
         foreach ($sub in $Global:Subscriptions)
         {
             if (![string]::IsNullOrEmpty($SubscriptionID))
@@ -1274,6 +1278,7 @@ function ExecuteInventoryProcessing()
                     Complete         = $false
                     PageAtFailure    = 0
                     RecordsCollected = 0
+                    ReportFolder     = $ConsumptionReportFolder
                 }
 
                 continue
@@ -1445,6 +1450,7 @@ function ExecuteInventoryProcessing()
                     Complete         = $false
                     PageAtFailure    = $ConsumptionPageIndex
                     RecordsCollected = $ConsumptionRecordsThisSub
+                    ReportFolder     = $ConsumptionReportFolder
                 }
             }
         }

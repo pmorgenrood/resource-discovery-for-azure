@@ -256,6 +256,11 @@ Footer:  RDA version, generator note
 The per-sub links use relative paths so the main page travels with the report
 folder (matching the self-contained/portable contract).
 
+Health is `ok`, `0 resources`, or `consumption incomplete` when the
+subscription's consumption collection failed (the same subscriptions the
+consumption banner counts; the row is matched through the `ReportFolder` of
+the failure entry, which also works when names are obfuscated).
+
 ## 11. Edge cases & failure handling
 
 - **A per-sub Inventory JSON is missing/unreadable (Tier 2).** Skip that sub's

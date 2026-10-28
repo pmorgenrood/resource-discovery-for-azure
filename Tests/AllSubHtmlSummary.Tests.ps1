@@ -409,3 +409,83 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
         $Html | Should -Match 'Fabrikam-Billing' -Because 'an identifiable bundle names the affected subs'
     }
 }
+
+# A consumption failure entry names the report folder its run writes to
+# (ReportFolder, set by ResourceInventory.ps1). The row of that folder says
+# 'consumption incomplete', so the summary says which subscription is missing
+# cost data even when every name on it is an obfuscation token.
+Describe 'New-RdaAllSubHtmlSummary marks the row of a subscription whose consumption failed' {
+    BeforeAll {
+        # Health tag of the row whose report link points into the given folder.
+        function Get-RowHealth
+        {
+            param([string]$Html, [string]$Folder)
+            $M = [regex]::Match($Html, ('<td><span class="tag [a-z]+">([^<]*)</span></td><td><a href="' + [regex]::Escape($Folder) + '[/\\]'))
+            if ($M.Success) { return $M.Groups[1].Value }
+            return '<no row for this folder>'
+        }
+    }
+
+    It 'under -Obfuscated, only the failed subscription''s row says consumption incomplete and no real name appears' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam-Billing'; Id = '12345678-1234-1234-1234-123456789012'; Message = 'usage page failed'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+        $Html | Should -Match '<b>1 subscription\(s\) had consumption \(billing\) issues\.</b>' -Because 'the banner is unchanged'
+        $Html | Should -Not -Match 'Fabrikam-Billing'
+        $Html | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+    }
+
+    It 'without -Obfuscated, the row is marked the same way' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -SubName 'Contoso Production')
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -SubName 'Fabrikam Billing')
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam Billing'; Id = '12345678-1234-1234-1234-123456789012'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+    }
+
+    It 'a subscription with 0 resources whose consumption failed says consumption incomplete and still counts as empty' {
+        $Run = New-Run
+        $E = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{} -Obfuscated)
+        New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'x'; Id = 'sub-e'; ReportFolder = $E }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $E | Should -Be 'consumption incomplete'
+        Get-Card $Html 'Empty (0 resources)' | Should -Be '1'
+    }
+
+    It 'an entry with no usable ReportFolder marks no row: <Case>' -TestCases @(
+        @{ Case = 'no ReportFolder field (an entry written before the field existed)'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x' } } },
+        @{ Case = 'null'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = $null } } },
+        @{ Case = 'empty'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = '' } } },
+        @{ Case = 'whitespace'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = '   ' } } },
+        @{ Case = 'a number'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 5 } } },
+        @{ Case = 'a folder of another run'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 'ResourcesReport000000000000' } } },
+        @{ Case = 'the folder name with a path in front'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = ('/somewhere/' + $A) } } },
+        @{ Case = 'the sign-in skip entry, which the banner does not count either'; Entry = { param($A) [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; ReportFolder = $A } } }
+    ) {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        { New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated -ConsumptionFailedSubs @((& $Entry $A)) | Out-Null } | Should -Not -Throw
+        Get-RowHealth -Html (Get-Content -Path $Out -Raw) -Folder $A | Should -Be 'ok'
+    }
+}
