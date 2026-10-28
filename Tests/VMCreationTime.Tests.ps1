@@ -16,6 +16,11 @@
 # CreatedTime is 'Unknown' when the value is missing or not a date, and that
 # every other column is unchanged. Get-AzComputeResourceSku is mocked, so no
 # live Azure is needed.
+#
+# Azure returns timeCreated in UTC (with a Z or an offset). The column is written
+# as UTC text on every host; a value with no zone is taken as UTC. A [datetime]
+# cast would turn it into the host's local time with no zone shown, so the same
+# virtual machine got a different CreatedTime depending on where the tool ran.
 
 BeforeAll {
     $script:Collector = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Services', 'Compute', 'VirtualMachines.ps1' | Resolve-Path | Select-Object -ExpandProperty Path
@@ -123,6 +128,49 @@ BeforeAll {
         param($Resources)
         return @(& $script:Collector -Sub $script:Subs -Resources (@($Resources) + $script:OsDisk) -Task 'Processing' -ResourceIdDictionary $null)
     }
+
+    # The host-zone case runs the collector in a child pwsh process with TZ set,
+    # once at UTC+14 (Pacific/Kiritimati) and once at UTC-11 (Pacific/Pago_Pago),
+    # so a time written in host local time always differs between the two. A host
+    # whose child pwsh does not apply TZ skips that case.
+    # The first two values are lowercase because Resource Graph answers are
+    # lowercased before the collectors see them (Invoke-AzGraphQuerySafe -Lowercase).
+    $script:ChildScript = Join-Path $TestDrive 'vm-zone.ps1'
+    Set-Content -LiteralPath $script:ChildScript -Encoding utf8 -Value @"
+function Get-AzComputeResourceSku { }
+`$Guid = '$($script:DocGuid)'
+`$Values = @('2024-03-15t09:41:27.1234567z', '2024-03-15t09:41:27.1234567+00:00', '2024-03-15T11:41:27.1234567+02:00', '2024-03-15T09:41:27.1234567')
+`$Vms = for (`$i = 0; `$i -lt `$Values.Count; `$i++)
+{
+    [pscustomobject]@{
+        TYPE           = 'microsoft.compute/virtualmachines'
+        id             = "/subscriptions/`$Guid/resourcegroups/rg-vm/providers/microsoft.compute/virtualmachines/vm-`$i"
+        NAME           = "vm-`$i"
+        RESOURCEGROUP  = 'rg-vm'
+        LOCATION       = 'eastus'
+        subscriptionId = `$Guid
+        PROPERTIES     = [pscustomobject]@{ timeCreated = `$Values[`$i]; hardwareProfile = [pscustomobject]@{ vmSize = 'Standard_D2s_v3' } }
+    }
+}
+`$Rows = @(& '$($script:Collector.Replace("'", "''"))' -Sub @([pscustomobject]@{ id = `$Guid; Name = 'sub-placeholder' }) -Resources `$Vms -Task 'Processing' -ResourceIdDictionary `$null)
+'{0}|{1}' -f [System.TimeZoneInfo]::Local.BaseUtcOffset.TotalHours, ((`$Rows | ForEach-Object { `$_.CreatedTime }) -join ',')
+"@
+    $script:Pwsh = (Get-Process -Id $PID).Path
+
+    function Invoke-VmCollectorInZone
+    {
+        param([string]$Zone)
+        $Saved = $env:TZ
+        try
+        {
+            $env:TZ = $Zone
+            return [string](& $script:Pwsh -NoProfile -NonInteractive -File $script:ChildScript)
+        }
+        finally
+        {
+            if ($null -eq $Saved) { Remove-Item -Path 'Env:TZ' -ErrorAction SilentlyContinue } else { $env:TZ = $Saved }
+        }
+    }
 }
 
 Describe 'VM collector CreatedTime' {
@@ -166,11 +214,25 @@ Describe 'VM collector CreatedTime' {
         $Rec.CreatedTime | Should -BeExactly '2024-03-15 09:41'
     }
 
-    It 'formats a UTC timeCreated (as Azure returns it) in local time' {
+    It 'formats a UTC timeCreated (as Azure returns it) in UTC' {
         $Iso = '2024-03-15T09:41:27.1234567Z'
         $Rec = @(Invoke-VmCollector -Resources (New-VmRecord -Name 'vm-utc' -TimeCreatedMode Value -TimeCreated $Iso))[0]
-        $Expected = [System.DateTimeOffset]::Parse($Iso, [System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime.ToString('yyyy-MM-dd HH:mm')
+        $Expected = [System.DateTimeOffset]::Parse($Iso, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime.ToString('yyyy-MM-dd HH:mm')
         $Rec.CreatedTime | Should -BeExactly $Expected
+    }
+
+    It 'writes the same UTC text on hosts at UTC+14 and UTC-11' {
+        $East = Invoke-VmCollectorInZone 'Pacific/Kiritimati'
+        $West = Invoke-VmCollectorInZone 'Pacific/Pago_Pago'
+        $EastParts = $East -split '\|'
+        $WestParts = $West -split '\|'
+        if ($EastParts[0] -ne '14' -or $WestParts[0] -ne '-11')
+        {
+            Set-ItResult -Skipped -Because 'this host does not apply the TZ variable to a child pwsh'
+            return
+        }
+        $EastParts[1] | Should -BeExactly '2024-03-15 09:41,2024-03-15 09:41,2024-03-15 09:41,2024-03-15 09:41'
+        $WestParts[1] | Should -BeExactly $EastParts[1]
     }
 
     It "writes 'Unknown' when properties.timeCreated is present but not a date (<Name>)" -ForEach @(

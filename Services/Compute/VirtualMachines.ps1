@@ -38,7 +38,8 @@ If ($Task -eq 'Processing')
             $Data = $vm.PROPERTIES
             # A missing timeCreated, or one that does not convert to a date, is
             # 'Unknown' rather than an exception that fails every virtual machine.
-            $Timecreated = try { if ($null -ne $Data.timeCreated) { [datetime]($Data.timeCreated) | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' } } catch { 'Unknown' }
+            # A valid value is written in UTC on every host; one with no zone is taken as UTC.
+            $Timecreated = try { if ($null -ne $Data.timeCreated) { [datetime]::Parse($Data.timeCreated, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal') | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' } } catch { 'Unknown' }
 
             $Lic = ''
 
