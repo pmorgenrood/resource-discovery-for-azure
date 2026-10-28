@@ -33,7 +33,9 @@ records when the token is missing, which would otherwise leave an empty
 consumption sheet that looks like "this tenant has no billing data." If the
 check fails, RDA attempts **one** reconnect; if that still fails it logs a loud
 error, records the subscription in the run health, and skips only the
-consumption phase (the rest of the inventory continues).
+consumption phase (the rest of the inventory continues). In a
+`Run-AllSubscriptions.ps1` run, the main summary marks that subscription's row
+**consumption incomplete** (see below).
 
 ### Transient-failure retry
 

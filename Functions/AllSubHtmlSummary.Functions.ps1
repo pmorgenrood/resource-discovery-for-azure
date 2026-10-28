@@ -378,10 +378,11 @@ function New-RdaAllSubHtmlSummary
         $ChartsHtml = "<div class='charts'><div class='chart-card'><h3>Resources by service (run-wide)</h3>$DonutSvg</div><div class='chart-card'><h3>Top services</h3>$BarSvg</div></div>"
     }
 
-    # Report folders whose subscription's consumption collection failed, from the
-    # same entries the consumption banner counts. The folder ties an entry to its
-    # row: under -Obfuscate the row's name is a token, so a name cannot.
-    $ConsumpFolders = @($ConsumpList | ForEach-Object { [string]$_.ReportFolder } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    # Report folders whose subscription's consumption collection failed or was
+    # skipped for sign-in. The banner does not count a sign-in skip ('(auth)'
+    # entry), but its row is marked too. The folder ties an entry to its row:
+    # under -Obfuscate the row's name is a token, so a name cannot.
+    $ConsumpFolders = @(@($ConsumptionFailedSubs) | Where-Object { $_ } | ForEach-Object { [string]$_.ReportFolder } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
     # Per-subscription table.
     $Rows = New-Object System.Text.StringBuilder

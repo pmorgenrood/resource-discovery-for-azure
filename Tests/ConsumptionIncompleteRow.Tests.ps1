@@ -9,6 +9,8 @@
 # which subscription was missing its cost data. In a -ParallelStreams run the
 # stream worker also kept one consumption failure per stream (Select-Object
 # -Unique treats any two of these entries as equal), so the banner undercounted.
+# A consumption phase skipped because the Azure sign-in could no longer be
+# refreshed was recorded without its report folder, so that row said "ok" too.
 #
 # The test copies the scripts to a temp folder and runs, in a child pwsh with
 # HOME pointed at a temp folder and offline stand-ins for the Azure CLI and the
@@ -20,9 +22,11 @@
 #     real ResourceInventory.ps1 per subscription, then the main summary from
 #     that stream's summary file.
 # One subscription's usage page fails on every attempt in the first case, two
-# in the second. The metrics phase is skipped (-SkipMetrics): it is not part of
-# this behaviour and its thread jobs would not see the stand-ins. Retry waits
-# are skipped by a Start-Sleep stand-in. Placeholder ids only; no live Azure.
+# in the second; in the third, one subscription's Az token cannot be refreshed
+# in the consumption phase. The metrics phase is skipped (-SkipMetrics): it is
+# not part of this behaviour and its thread jobs would not see the stand-ins.
+# Retry waits are skipped by a Start-Sleep stand-in. Placeholder ids only; no
+# live Azure.
 #
 # Not run on Windows: without -OutputDirectory the inner script writes to
 # C:\InventoryReports there, which a test cannot isolate.
@@ -43,7 +47,7 @@ BeforeAll {
 
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
-param([string]$Tree, [ValidateSet('Sequential', 'Stream')][string]$Mode, [string]$FailIds = '', [switch]$Obfuscate)
+param([string]$Tree, [ValidateSet('Sequential', 'Stream')][string]$Mode, [string]$FailIds = '', [string]$LapseIds = '', [switch]$Obfuscate)
 $PSStyle.OutputRendering = 'PlainText'
 $ErrorActionPreference = 'Continue'
 $Global:RdaSessionInitialized = $true
@@ -55,6 +59,8 @@ $Global:StandInSubs = @(
     [pscustomobject]@{ Id = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'; Name = 'Sub B' },
     [pscustomobject]@{ Id = 'cccccccc-cccc-cccc-cccc-cccccccccccc'; Name = 'Sub C' })
 $Global:StandInFailIds = @($FailIds -split ',' | Where-Object { $_ })
+$Global:StandInLapseIds = @($LapseIds -split ',' | Where-Object { $_ })
+$Global:StandInCurrentSub = $null
 $Global:StandInContextSub = $Global:StandInSubs[0].Id
 
 function global:az
@@ -77,7 +83,14 @@ function global:az
 }
 function global:Get-AzContext { [CmdletBinding()] param() [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012' }; Subscription = [pscustomobject]@{ Id = $Global:StandInContextSub; Name = 'stand-in' }; Account = [pscustomobject]@{ Id = 'tester' } } }
 function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $Context, $Tenant) $Global:StandInContextSub = [string]$Subscription; $null }
-function global:Get-AzAccessToken { [CmdletBinding()] param($ResourceUrl, $TenantId) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
+# For the subscriptions in -LapseIds the token cannot be refreshed once the
+# consumption phase starts: a sign-in that stopped working part-way through.
+function global:Get-AzAccessToken
+{
+    [CmdletBinding()] param($ResourceUrl, $TenantId)
+    if ($Global:StandInLapseIds -contains $Global:StandInCurrentSub -and @(Get-PSCallStack | ForEach-Object FunctionName) -contains 'GetResorceConsumption') { throw 'stand-in: the sign-in can no longer be refreshed' }
+    [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') }
+}
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Import-AzContext { [CmdletBinding()] param($Path) }
 function global:Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
@@ -116,6 +129,7 @@ if ($Mode -eq 'Sequential')
     # As the wrapper's sequential loop calls it, for Sub A and Sub B.
     foreach ($Sub in @($Global:StandInSubs | Select-Object -First 2))
     {
+        $Global:StandInCurrentSub = $Sub.Id
         & (Join-Path $Tree 'ResourceInventory.ps1') -TenantID $Tenant -SubscriptionID $Sub.Id @Passthrough -RunAllSubs *> (Join-Path $HOME ('inner-' + $Sub.Name + '.log'))
     }
     $Entries = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ })
@@ -164,10 +178,10 @@ $Folders = foreach ($F in @(Get-ChildItem -LiteralPath $Root -Directory -Filter 
     # One harness run in a child pwsh with its own HOME; returns the result it wrote.
     function Invoke-Harness
     {
-        param([string]$Mode, [string]$FailIds, [switch]$Obfuscate)
+        param([string]$Mode, [string]$FailIds, [string]$LapseIds = '', [switch]$Obfuscate)
         $CaseHome = Join-Path $script:WorkDir ('home_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
-        $ArgList = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Tree', $script:Tree, '-Mode', $Mode, '-FailIds', $FailIds)
+        $ArgList = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Tree', $script:Tree, '-Mode', $Mode, '-FailIds', $FailIds, '-LapseIds', $LapseIds)
         if ($Obfuscate) { $ArgList += '-Obfuscate' }
         $SavedHome = $env:HOME
         try
@@ -188,6 +202,7 @@ $Folders = foreach ($F in @(Get-ChildItem -LiteralPath $Root -Directory -Filter 
     {
         $script:Seq = Invoke-Harness -Mode Sequential -FailIds 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' -Obfuscate
         $script:Par = Invoke-Harness -Mode Stream -FailIds 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb,cccccccc-cccc-cccc-cccc-cccccccccccc' -Obfuscate
+        $script:Lapse = Invoke-Harness -Mode Sequential -LapseIds 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' -Obfuscate
     }
 }
 
@@ -231,5 +246,23 @@ Describe 'Obfuscated stream of three subscriptions: Sub B''s and Sub C''s usage 
         @($script:Par.Folders | ForEach-Object ConsumptionRows) | Should -Be @(1, 0, 0)
         @($script:Par.Folders | ForEach-Object Health) | Should -Be @('ok', 'consumption incomplete', 'consumption incomplete')
         $script:Par.Banner | Should -Be '2'
+    }
+}
+
+Describe 'Obfuscated run, one subscription at a time: Sub B''s sign-in cannot be refreshed in the consumption phase' -Skip:([bool]$script:SkipReason) {
+    It 'Sub B''s report has no consumption rows and Sub A''s has its row' {
+        @($script:Lapse.Folders).Count | Should -Be 2
+        @($script:Lapse.Folders | ForEach-Object ConsumptionRows) | Should -Be @(1, 0)
+    }
+
+    It 'the sign-in skip entry names Sub B''s report folder' {
+        @($script:Lapse.Entries).Count | Should -Be 1
+        $script:Lapse.Entries[0].Id | Should -Be '(auth)'
+        $script:Lapse.Entries[0].ReportFolder | Should -Be $script:Lapse.Folders[1].Name
+    }
+
+    It 'the main summary marks Sub B''s row consumption incomplete and Sub A''s row ok; the banner does not count a sign-in skip (unchanged)' {
+        @($script:Lapse.Folders | ForEach-Object Health) | Should -Be @('ok', 'consumption incomplete')
+        $script:Lapse.Banner | Should -BeNullOrEmpty
     }
 }

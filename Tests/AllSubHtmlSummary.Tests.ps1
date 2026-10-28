@@ -479,7 +479,7 @@ Describe 'New-RdaAllSubHtmlSummary marks the row of a subscription whose consump
         @{ Case = 'a number'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 5 } } },
         @{ Case = 'a folder of another run'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 'ResourcesReport000000000000' } } },
         @{ Case = 'the folder name with a path in front'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = ('/somewhere/' + $A) } } },
-        @{ Case = 'the sign-in skip entry, which the banner does not count either'; Entry = { param($A) [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; ReportFolder = $A } } }
+        @{ Case = 'the sign-in skip entry without a ReportFolder'; Entry = { param($A) [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)' } } }
     ) {
         $Run = New-Run
         $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
@@ -487,5 +487,20 @@ Describe 'New-RdaAllSubHtmlSummary marks the row of a subscription whose consump
 
         { New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated -ConsumptionFailedSubs @((& $Entry $A)) | Out-Null } | Should -Not -Throw
         Get-RowHealth -Html (Get-Content -Path $Out -Raw) -Folder $A | Should -Be 'ok'
+    }
+
+    It 'a consumption phase skipped for sign-in marks the row of the folder it names, and the banner still does not count it' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+        $Html | Should -Not -Match 'had consumption \(billing\) issues' -Because 'the banner does not count a sign-in skip (unchanged)'
     }
 }
