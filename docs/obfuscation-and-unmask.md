@@ -24,7 +24,7 @@ they appear in the report:
 
 | Class | Example real value | Example obfuscated token |
 |---|---|---|
-| Resource ID | `/subscriptions/<guid>/resourceGroups/rg-app/providers/.../vm01` | `prod_a1b2c3d4-...` |
+| Resource ID | `/subscriptions/<guid>/resourceGroups/rg-app/providers/.../vm01` | `/subscriptions/prod_2b2b.../resourcegroups/prod_4c4c.../providers/.../prod_9f8e...` |
 | Resource Name | `vm01` | `prod_9f8e7d6c-...` |
 | Subscription | `Contoso Production` | `prod_2b2b2b2b-...` |
 | Resource Group | `rg-app` | `prod_4c4c4c4c-...` |
@@ -112,6 +112,15 @@ obfuscation.
 - **Resource ID** and **Resource Name** tokens are generated once per real
   resource ID during the build pass, so each resource keeps one stable ID token
   and one stable name token for the rest of the run.
+- A masked **Resource ID** keeps the ARM shape: every name segment is replaced
+  with the token of what it names (the subscription, the resource group, and
+  each resource, a parent included), and the type and provider segments are
+  kept. A child's id therefore carries its parent's own name token
+  (`.../servers/<server token>/databases/<database token>`), so ids still join
+  across the inventory, metrics and consumption files. A consumption row for a
+  resource that is not in the inventory is masked the same way, reusing the
+  inventory's tokens where they exist; any new segment token is stored in the
+  dictionary (a name token is keyed by the real id up to that segment).
 - **Tag values** are looked up by the real value, so the same value always
   yields the same token across every resource that carries it.
 
