@@ -1,5 +1,6 @@
 #
-# Run-AllSubscriptions.ps1 starts every run from zero run-wide totals.
+# Run-AllSubscriptions.ps1, and ResourceInventory.ps1 run directly, start every
+# run from zero run-wide totals.
 #
 # A PowerShell window (Azure Cloud Shell included) keeps its globals between
 # runs, and the run-wide consumption totals are only ever added to: by
@@ -7,11 +8,14 @@
 # aggregation on the parallel path. A second run in the same window, for example
 # after signing in again as the "FAILED (auth)" banner advises, must not report
 # the first run's consumption failures, exit 3 because of them, or add the first
-# run's record count to its own.
+# run's record count to its own. A second direct ResourceInventory.ps1 run must
+# not list the first run's collector, metrics or consumption failures in its
+# diagnostics log.
 #
-# The wrapper needs Azure to run end to end, so its own statements are lifted
-# from its AST and run as written: the top-level resets, the per-stream summary
-# aggregation, and the end-of-run consumption summary and exit code.
+# The scripts need Azure to run end to end, so their own statements are lifted
+# from their AST and run as written: the wrapper's top-level resets, the
+# per-stream summary aggregation, and the end-of-run consumption summary and
+# exit code; and the direct-run resets in ResourceInventory.ps1.
 #
 # Run with: Invoke-Pester ./Tests/RunTotalsReset.Tests.ps1 -Output Detailed
 
@@ -194,6 +198,90 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
             ($Lines -join "`n") | Should -Match 'Consumption Failures:\s+1 subscription\(s\)'
             ($Lines -join "`n") | Should -Match 'Could not collect: Consumption'
             $WrapperExitCode | Should -Be 3
+        }
+    }
+}
+
+Describe 'ResourceInventory.ps1 run directly starts each run with zero run-wide totals' {
+
+    BeforeAll {
+        # Write-RdaShareableDiagnosticsLog: the diagnostics log a direct run writes into its zip.
+        . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
+
+        $InventoryErrors = $null
+        $InventoryAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$InventoryErrors)
+        if ($InventoryErrors) { throw ('ResourceInventory.ps1 does not parse: ' + (($InventoryErrors | ForEach-Object { $_.Message }) -join '; ')) }
+        $InventoryTop = @($InventoryAst.EndBlock.Statements)
+
+        # The run starts here; every phase that adds to the totals runs inside it or after it.
+        $RunStart = $InventoryTop | Where-Object {
+            $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $_.Left.Extent.Text -eq '$Global:Runtime'
+        } | Select-Object -First 1
+        if (-not $RunStart) { throw 'The run start ($Global:Runtime = Measure-Command ...) was not found at the top level of ResourceInventory.ps1.' }
+
+        # The direct-run block ahead of the run start; a -RunAllSubs run skips it.
+        $DirectBlock = $InventoryTop | Where-Object {
+            $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -eq '-not $RunAllSubs.IsPresent' -and
+            $_.Extent.EndOffset -le $RunStart.Extent.StartOffset
+        } | Select-Object -First 1
+        if (-not $DirectBlock) { throw 'The direct-run block (if (-not $RunAllSubs.IsPresent)) was not found ahead of the run start in ResourceInventory.ps1.' }
+
+        $script:DirectResets = @($DirectBlock.Clauses[0].Item2.Statements | Where-Object {
+                $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Operator -eq 'Equals' -and
+                $_.Left.Extent.Text -match '^\$Global:\w+$'
+            })
+        # The resets under the block's own condition, as written.
+        $script:DirectResetText = ("if ({0})`n{{`n{1}`n}}" -f $DirectBlock.Clauses[0].Item1.Extent.Text, (@($script:DirectResets | ForEach-Object { $_.Extent.Text }) -join "`n"))
+
+        # What an earlier run in the same window leaves behind when its metrics and
+        # consumption steps were skipped for sign-in and one collector failed.
+        function script:Set-EarlierDirectRunTotals
+        {
+            $Global:ConsumptionRecordCount = 2
+            $Global:ConsumptionFailedSubs = @([pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' })
+            $Global:MetricsFailedSubs = @([pscustomobject]@{ Name = 'Sub A'; Id = '12345678-1234-1234-1234-123456789012'; Message = 'Metrics phase skipped: no usable Azure context/token after one reconnect attempt.' })
+            $Global:CollectorFailures = @([pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012'; Module = 'VMSS'; Message = 'Cannot convert null to type "System.DateTime".' })
+        }
+    }
+
+    It 'resets $Global:<Name> in the direct-run block before the run starts, as the stream worker does' -ForEach $script:WorkerResets {
+        @($script:DirectResets | Where-Object { $_.Left.Extent.Text -eq ('$Global:' + $Name) }).Count | Should -BeGreaterThan 0 -Because "without it a second direct run in the same window inherits the previous run's $Name"
+    }
+
+    Context 'a second direct run in the same window, after the first lost metrics, consumption and a collector' {
+
+        BeforeEach {
+            Set-EarlierDirectRunTotals
+        }
+
+        It 'writes a diagnostics log that lists only this run''s failures' {
+            # Set-Variable: only the lifted text reads it.
+            Set-Variable -Name RunAllSubs -Value ([switch]$false)
+            . ([scriptblock]::Create($script:DirectResetText))
+
+            $DiagDir = Join-Path $script:TestRoot ('direct-' + [guid]::NewGuid().ToString().Substring(0, 8))
+            New-Item -ItemType Directory -Path $DiagDir -Force | Out-Null
+            $DiagFile = Write-RdaShareableDiagnosticsLog -DefaultPath ($DiagDir + [IO.Path]::DirectorySeparatorChar) -ReportName 'ResourcesReport' -RunDateTime '20261028000000000' -Version '0.0.0' -PhaseTimings $null 6>$null
+            $DiagFile | Should -Not -BeNullOrEmpty
+            $Text = Get-Content -LiteralPath $DiagFile -Raw
+
+            $Text | Should -Match '(?m)^Collector failures: 0\s*$'
+            $Text | Should -Match '(?m)^Metrics auth-skipped subscriptions: 0\s*$'
+            $Text | Should -Match '(?m)^Consumption failed/incomplete subscriptions: 0\s*$'
+            $Global:ConsumptionRecordCount | Should -Be 0
+        }
+
+        It 'under -RunAllSubs leaves the totals to the wrapper' {
+            Set-Variable -Name RunAllSubs -Value ([switch]$true)
+            . ([scriptblock]::Create($script:DirectResetText))
+
+            @($Global:CollectorFailures).Count | Should -Be 1
+            @($Global:MetricsFailedSubs).Count | Should -Be 1
+            @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+            $Global:ConsumptionRecordCount | Should -Be 2
         }
     }
 }
