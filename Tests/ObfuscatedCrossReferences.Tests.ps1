@@ -1,4 +1,4 @@
-# Obfuscated cross-reference tests: Front Door WAF policy
+# Obfuscated cross-reference tests: Front Door WAF policy and AVD session host name
 # Run with: Invoke-Pester ./Tests/ObfuscatedCrossReferences.Tests.ps1 -Output Detailed
 #
 # WHY THIS TEST EXISTS
@@ -11,10 +11,13 @@
 #     endpoint. Two or more linked endpoints (a default endpoint and a custom
 #     domain, say) gave an array, which missed the dictionary lookup and wrote
 #     'obfuscated'.
+#   - AVD Hostname: in a plain run it is the backing VM's name, so under
+#     -Obfuscate it must be the name token that VM's own row gets. It was a hash
+#     of the VM id, which matched no row and no dictionary entry.
 #
-# The test invokes the REAL collector with records shaped the way the
+# The test invokes the REAL collectors with records shaped the way the
 # inventory builds them (JSON text lowercased, then ConvertFrom-Json) and the
-# id dictionary keyed by real resource id, as RunInventorySetup in
+# id and name dictionaries keyed by real resource id, as RunInventorySetup in
 # ResourceInventory.ps1 fills them before any collector runs. Tokens are made
 # at run time; the subscription id is the documentation placeholder. No live
 # Azure.
@@ -118,5 +121,66 @@ Describe 'Front Door WAF policy column' {
         $Other = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Other['/subscriptions/x/other'] = New-Token
         Get-WafColumn (New-FrontDoor 'fd-two' @($script:WafA, $script:WafA)) $Other | Should -BeExactly 'obfuscated'
+    }
+}
+
+Describe 'AVD session host Hostname' {
+    BeforeAll {
+        $Avd = "/subscriptions/$($script:SubId)/resourcegroups/rg-avd/providers"
+        $script:VmId = "$Avd/microsoft.compute/virtualmachines/avdhost-0"
+        $script:AvdRecords = @(
+            [ordered]@{
+                id = "$Avd/microsoft.desktopvirtualization/hostpools/hp-demo"; name = 'hp-demo'; type = 'microsoft.desktopvirtualization/hostpools'; location = 'eastus'
+                subscriptionId = $script:SubId; resourceGroup = 'rg-avd'; properties = [ordered]@{ hostPoolType = 'Pooled'; loadBalancerType = 'BreadthFirst'; maxSessionLimit = 10 }
+            }
+            [ordered]@{
+                id = "$Avd/microsoft.desktopvirtualization/hostpools/hp-demo/sessionhosts/avdhost-0.contoso.example"; name = 'hp-demo/avdhost-0.contoso.example'
+                type = 'microsoft.desktopvirtualization/hostpools/sessionhosts'; location = 'eastus'; subscriptionId = $script:SubId; resourceGroup = 'rg-avd'
+                properties = [ordered]@{ resourceId = $script:VmId; agentVersion = '1.0.9'; status = 'Available' }
+            }
+            [ordered]@{
+                id = $script:VmId; name = 'avdhost-0'; type = 'microsoft.compute/virtualmachines'; location = 'eastus'; subscriptionId = $script:SubId; resourceGroup = 'rg-avd'
+                properties = [ordered]@{ hardwareProfile = @{ vmSize = 'Standard_D4s_v5' }; storageProfile = @{ osDisk = @{ osType = 'Windows'; managedDisk = @{ storageAccountType = 'Premium_LRS' } } } }
+            }
+        )
+        $script:SavedNameDictionary = $Global:ResourceNameDictionary
+    }
+
+    AfterAll {
+        $Global:ResourceNameDictionary = $script:SavedNameDictionary
+    }
+
+    BeforeEach {
+        $script:VmName = New-Token
+        $script:IdDict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $script:IdDict[$script:VmId] = New-MaskedId $script:VmId $script:VmName
+        $Global:ResourceNameDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $Global:ResourceNameDictionary[$script:VmId] = $script:VmName
+    }
+
+    It "is the backing VM's name token, the Name that VM's row gets (obfuscated)" {
+        $Row = @(Invoke-Collector -Path 'Compute/AVD.ps1' -Records $script:AvdRecords -IdDictionary $script:IdDict)[0]
+        $Row.Hostname | Should -BeExactly $script:VmName
+        $Row.HostId | Should -BeExactly $script:IdDict[$script:VmId]
+    }
+
+    It "is 'obfuscated' when the VM has no name token (obfuscated)" {
+        $Global:ResourceNameDictionary.Clear()
+        $Row = @(Invoke-Collector -Path 'Compute/AVD.ps1' -Records $script:AvdRecords -IdDictionary $script:IdDict)[0]
+        $Row.Hostname | Should -BeExactly 'obfuscated'
+        $Row.HostId | Should -BeExactly $script:IdDict[$script:VmId]
+    }
+
+    It "is 'obfuscated' when there is no name dictionary (obfuscated)" {
+        $Global:ResourceNameDictionary = $null
+        $Row = @(Invoke-Collector -Path 'Compute/AVD.ps1' -Records $script:AvdRecords -IdDictionary $script:IdDict)[0]
+        $Row.Hostname | Should -BeExactly 'obfuscated'
+    }
+
+    It "is the VM's name, and HostId its id (plain)" {
+        $Global:ResourceNameDictionary = $null
+        $Row = @(Invoke-Collector -Path 'Compute/AVD.ps1' -Records $script:AvdRecords -IdDictionary $null)[0]
+        $Row.Hostname | Should -BeExactly 'avdhost-0'
+        $Row.HostId | Should -BeExactly $script:VmId
     }
 }
