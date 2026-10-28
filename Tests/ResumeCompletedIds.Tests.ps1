@@ -7,7 +7,8 @@
 #     the list from the state file, folding in per-stream state, the resume
 #     message) and its sequential loop are lifted from its AST and run as
 #     written, against a stand-in ResourceInventory.ps1 that records which
-#     subscriptions it was asked to process.
+#     subscriptions it was asked to process and writes a report zip for each,
+#     as a successful run of the real script does.
 #   - The other places that add to the same list: the startup fold of state
 #     left by an interrupted parallel run, the one-subscription fallback of
 #     -ParallelStreams, and the end-of-run merge of per-stream state.
@@ -36,15 +37,23 @@ BeforeAll {
     $script:C = script:New-TestSub -N 3 -Name 'Sub C'
     $script:All = @($script:A, $script:B, $script:C)
 
-    # Stand-in for ResourceInventory.ps1: records the subscription it was given
-    # and leaves the globals the wrapper reads afterwards. The resource count is
-    # set both as the list and as the count, so the stand-in reports one
-    # resource whichever of the two the wrapper reads.
+    # Stand-in for ResourceInventory.ps1: records the subscription it was given,
+    # writes a report zip under the case folder and leaves the globals the
+    # wrapper reads afterwards, $Global:ZipOutputFile naming that zip as a
+    # successful run of the real script does. The resource count is set both as
+    # the list and as the count, so the stand-in reports one resource whichever
+    # of the two the wrapper reads.
     $script:FakeRoot = Join-Path $script:TestBase 'fake-tool'
     New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
     $FakeInner = @'
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit)
 $Global:RdaIdsTestProcessed += @($SubscriptionID)
+$Folder = Join-Path $Global:RdaIdsTestRoot ('ResourcesReport' + $SubscriptionID)
+New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+$Inv = Join-Path $Folder ('Inventory_ResourcesReport_' + $SubscriptionID + '.json')
+Set-Content -LiteralPath $Inv -Value '{}' -Encoding utf8
+$Global:ZipOutputFile = Join-Path $Folder ('ResourcesReport_' + $SubscriptionID + '.zip')
+Compress-Archive -LiteralPath $Inv -DestinationPath $Global:ZipOutputFile -Force
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
 $Global:LASTEXITCODE = 0
@@ -123,6 +132,7 @@ $Global:LASTEXITCODE = 0
     {
         param([scriptblock]$Block, [string]$Root, [object[]]$Subs, [bool]$Resume = $false)
         $Global:RdaIdsTestProcessed = @()
+        $Global:RdaIdsTestRoot = $Root
         $Out = @(& $Block $script:FakeRoot $Root (Join-Path $Root '.resume-state-t.json') 't' $Subs $Resume 6>&1)
         $Text = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Names = @($Global:RdaIdsTestProcessed | ForEach-Object { $Id = $_; ($script:All | Where-Object { $_.Id -eq $Id }).Name })
@@ -174,7 +184,7 @@ $Global:LASTEXITCODE = 0
 }
 
 AfterAll {
-    Remove-Variable -Name RdaIdsTestProcessed -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaIdsTestProcessed, RdaIdsTestRoot -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
