@@ -52,12 +52,11 @@ if ($Task -eq 'Processing')
             # A valid value is written in UTC on every host; one with no zone is taken as UTC.
             $Timecreated = try { if ($null -ne $Data.timeCreated) { [datetime]::Parse($Data.timeCreated, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal') | Get-Date -Format "yyyy-MM-dd HH:mm" } else { 'Unknown' } } catch { 'Unknown' }
 
+            # A missing size, or one the SKU list does not know, leaves vCPUs and RAM
+            # empty rather than 0.
             $SkuName = $1.sku.name
             $Cpus = if ($null -ne $SkuName) { $Vmsizemap[$SkuName].CPU } else { $null }
             $Ram = if ($null -ne $SkuName) { $Vmsizemap[$SkuName].RAM } else { $null }
-
-            $Cpus = if ($null -ne $Cpus) { $Cpus } else { '0' }
-            $Ram = if ($null -ne $Ram) { $Ram } else { '0' }
 
             $Obj = @{
                 'ID'                            = $1.id;

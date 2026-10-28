@@ -256,8 +256,18 @@ Describe 'VMSS collector CreatedTime' {
         $Rec.Name | Should -BeExactly 'vmss-empty'
         $Rec.CreatedTime | Should -BeExactly 'Unknown'
         $Rec.VMSize | Should -BeNullOrEmpty
-        $Rec.vCPUs | Should -Be '0'
-        $Rec.RAM | Should -Be '0'
+        $Rec.vCPUs | Should -Be $null
+        $Rec.RAM | Should -Be $null
+    }
+
+    It 'leaves vCPUs and RAM empty for a size the SKU list does not return' {
+        $Record = New-VmssRecord -Name 'vmss-unlisted' -TimeCreatedMode Value -TimeCreated '2024-03-15T09:41:27.1234567'
+        $Record.sku = [pscustomobject]@{ name = 'Standard_NotInList_v1'; tier = 'Standard'; capacity = 3 }
+        $Rec = @(Invoke-VmssCollector -Resources @($Record))[0]
+        $Rec.VMSize | Should -BeExactly 'Standard_NotInList_v1'
+        $Rec.Instances | Should -Be 3
+        $Rec.vCPUs | Should -Be $null
+        $Rec.RAM | Should -Be $null
     }
 
     It 'emits one record per scale set when only some lack timeCreated or sku' {
@@ -265,7 +275,7 @@ Describe 'VMSS collector CreatedTime' {
         $Recs.Count | Should -Be 4
         ($Recs | ForEach-Object { $_.Name }) | Should -Be @('vmss-absent', 'vmss-null', 'vmss-valid', 'vmss-empty')
         ($Recs | ForEach-Object { $_.CreatedTime }) | Should -Be @('Unknown', 'Unknown', '2024-03-15 09:41', 'Unknown')
-        ($Recs | ForEach-Object { $_.vCPUs }) | Should -Be @(2, 2, 2, '0')
+        ($Recs | ForEach-Object { $_.vCPUs }) | Should -Be @(2, 2, 2, $null)
     }
 
     It 'leaves every other column unchanged for <Name>' -ForEach @(
