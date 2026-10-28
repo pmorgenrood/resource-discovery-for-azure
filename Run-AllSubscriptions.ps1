@@ -13,7 +13,8 @@ param (
     # subs), use this to re-run just those without walking the whole tenant
     # again. (Use -Resume instead to continue an interrupted run - that covers
     # both failures and subscriptions not yet reached.) If there are no recorded
-    # failures, prints "Nothing to retry" and exits 0. Works with
+    # failures, prints "Nothing to retry", names any subscription an interrupted
+    # run never reached, and exits 0. Works with
     # -ParallelStreams; the failed-only filter is applied before the
     # subscriptions are split across streams.
     [switch]$ResumeFailedOnly,
@@ -834,6 +835,13 @@ if ($ResumeFailedOnly)
     {
         Write-Host "ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry." -ForegroundColor Green
         Write-Host ("If you expected failures here, verify {0} has a non-empty FailedAttempts array." -f $ResumeStateFile) -ForegroundColor DarkGray
+        # After an interrupted run the state still lists what completed, so name
+        # the subscriptions it never reached. Without a state file (a clean run
+        # deleted it) there is nothing to name.
+        if (Test-Path -Path $ResumeStateFile -PathType Leaf)
+        {
+            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds) -ResumeStateFile $ResumeStateFile
+        }
         Exit-Wrapper -Code 0
     }
     $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
@@ -1955,7 +1963,7 @@ $NotCollected = @()
 if ($ResumeFailedOnly)
 {
     $RetryListIds = @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
-    $NotCollected = @($EligibleBeforeRetryFilter | Where-Object { $CompletedIds -notcontains $_.Id -and $RetryListIds -notcontains $_.Id })
+    $NotCollected = @(Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds $RetryListIds)
 }
 if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
@@ -2211,9 +2219,7 @@ elseif ($FailedAttempts.Count -gt 0)
 if ($NotCollected.Count -gt 0)
 {
     # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
-    Write-Host ("Not Collected:           {0} ({1}) - no run has completed these and -ResumeFailedOnly retries only the retry list" -f $NotCollected.Count, (@($NotCollected | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
-    Write-Host ("Resume State:            {0} (kept)" -f $ResumeStateFile) -ForegroundColor Yellow
-    Write-Host "Re-run with -Resume to collect them; it skips the subscriptions already completed." -ForegroundColor Yellow
+    Write-NotCollectedSummary -NotCollected $NotCollected -ResumeStateFile $ResumeStateFile
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($OuterZipFile)
