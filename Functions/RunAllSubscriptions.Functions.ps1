@@ -681,34 +681,6 @@ function Remove-FailedAttempt
     return @($Existing | Where-Object { $_ -and $_.Id -ne $Id })
 }
 
-# The eligible subscriptions that no run has completed and that are not on the
-# retry list: after an interrupted run, the ones it never reached.
-# -ResumeFailedOnly retries only the retry list, so it does not collect these;
-# -Resume does. A subscription the up-front access check skipped as not readable
-# (-NotReadableIds) is left out: -Resume would skip it too, and the run that
-# skipped it already listed it.
-function Get-NotCollectedSubscriptions
-{
-    param([object]$Eligible, [object]$CompletedIds, [object]$RetryIds, [object]$NotReadableIds)
-    $Done = @(@($CompletedIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $Retry = @(@($RetryIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $NotReadable = @(@($NotReadableIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    return @(@($Eligible) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id -and $Retry -notcontains [string]$_.Id -and $NotReadable -notcontains [string]$_.Id })
-}
-
-# Name the subscriptions Get-NotCollectedSubscriptions returned on a
-# -ResumeFailedOnly run, which keeps the resume state for them. Prints nothing
-# for an empty list.
-function Write-NotCollectedSummary
-{
-    param([object]$NotCollected, [string]$ResumeStateFile)
-    $List = @(@($NotCollected) | Where-Object { $null -ne $_ })
-    if ($List.Count -eq 0) { return }
-    Write-Host ("Not Collected:           {0} ({1}) - no run has completed these and -ResumeFailedOnly retries only the retry list" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
-    Write-Host ("Resume State:            {0} (kept)" -f $ResumeStateFile) -ForegroundColor Yellow
-    Write-Host "Re-run with -Resume to collect them; it skips the subscriptions already completed." -ForegroundColor Yellow
-}
-
 # Discover every per-stream resume-state file on disk for a tenant, rather
 # than iterating 0..($StreamCount-1). $StreamCount reflects THIS run's
 # -ParallelStreams value; if an earlier interrupted run used a LARGER value,
@@ -766,6 +738,34 @@ function Merge-FailedAttempts
         $Reconciled += $Best
     }
     return $Reconciled
+}
+
+# The eligible subscriptions that no run has completed and that are not on the
+# retry list: after an interrupted run, the ones it never reached.
+# -ResumeFailedOnly retries only the retry list, so it does not collect these;
+# -Resume does. A subscription the up-front access check skipped as not readable
+# (-NotReadableIds) is left out: -Resume would skip it too, and the run that
+# skipped it already listed it.
+function Get-NotCollectedSubscriptions
+{
+    param([object]$Eligible, [object]$CompletedIds, [object]$RetryIds, [object]$NotReadableIds)
+    $Done = @(@($CompletedIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $Retry = @(@($RetryIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $NotReadable = @(@($NotReadableIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    return @(@($Eligible) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id -and $Retry -notcontains [string]$_.Id -and $NotReadable -notcontains [string]$_.Id })
+}
+
+# Name the subscriptions Get-NotCollectedSubscriptions returned on a
+# -ResumeFailedOnly run, which keeps the resume state for them. Prints nothing
+# for an empty list.
+function Write-NotCollectedSummary
+{
+    param([object]$NotCollected, [string]$ResumeStateFile)
+    $List = @(@($NotCollected) | Where-Object { $null -ne $_ })
+    if ($List.Count -eq 0) { return }
+    Write-Host ("Not Collected:           {0} ({1}) - no run has completed these and -ResumeFailedOnly retries only the retry list" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    Write-Host ("Resume State:            {0} (kept)" -f $ResumeStateFile) -ForegroundColor Yellow
+    Write-Host "Re-run with -Resume to collect them; it skips the subscriptions already completed." -ForegroundColor Yellow
 }
 
 # The resume-state record for one completed subscription's report zip:
