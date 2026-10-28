@@ -107,12 +107,15 @@ BeforeAll {
         )
     }
 
-    # Consumption CSV with the sub + rg tokens embedded inside an ARM-path field,
-    # so revealing the comma-bearing subscription name must not break columns.
+    # Consumption CSV with the sub + rg tokens embedded inside an ARM-path field
+    # (where the subscription token stands for the subscription id) and the sub
+    # token on its own (the comma-bearing display name), so revealing it must
+    # not break columns.
     $ConsumptionRows = @(
         [pscustomobject]@{
-            InstanceId = "/subscriptions/$($script:TokSub)/resourceGroups/$($script:TokRg)/providers/Microsoft.Compute/virtualMachines/vm01"
-            Cost       = '12.34'
+            InstanceId   = "/subscriptions/$($script:TokSub)/resourceGroups/$($script:TokRg)/providers/Microsoft.Compute/virtualMachines/vm01"
+            Subscription = $script:TokSub
+            Cost         = '12.34'
         }
     )
 
@@ -226,8 +229,12 @@ Describe "Reveal-Obfuscation default fields (ResourceGroup + Subscription)" {
     It "keeps the Consumption CSV columns intact despite a comma in the revealed subscription name" {
         @($Script:R.Csv).Count | Should -Be 1
         $Script:R.Csv[0].Cost | Should -Be '12.34'
-        $Script:R.Csv[0].InstanceId | Should -Match ([regex]::Escape($script:RealSubName))
+        $Script:R.Csv[0].Subscription | Should -BeExactly $script:RealSubName
         $Script:R.Csv[0].InstanceId | Should -Match ([regex]::Escape($script:RealRgName))
+    }
+
+    It "reveals the subscription id, not the display name, inside an ARM path" {
+        $Script:R.Csv[0].InstanceId | Should -BeExactly "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/$($script:RealRgName)/providers/Microsoft.Compute/virtualMachines/vm01"
     }
 }
 

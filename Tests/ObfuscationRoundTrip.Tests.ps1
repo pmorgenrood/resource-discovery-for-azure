@@ -5,8 +5,10 @@
 # --------------------
 # -Obfuscate must mask every identifying segment of every resource id in the
 # shareable files, including a parent resource's name inside a child's id
-# (a SQL database id holds its server's name), in the inventory, metrics and
-# consumption files alike.
+# (a SQL database id holds its server's name), and Reveal.ps1 -All must give
+# back what a run without -Obfuscate writes: ids with the subscription id,
+# short names where the plain run writes short names, and consumption rows for
+# resources that are not in the inventory.
 #
 # The test copies the scripts to a temp dir and runs the REAL
 # ResourceInventory.ps1 twice in a child pwsh, once plain and once with
@@ -16,7 +18,11 @@
 # usage rows that include resources not in the inventory (a database of the
 # same server, a Service Bus '$system' topic in another resource group, a disk
 # in an AKS-managed 'mc_' group, a subscription-level resource). The Azure CLI,
-# the Az cmdlets and Get-AzMetric are offline stand-ins. Generic names and the
+# the Az cmdlets and Get-AzMetric are offline stand-ins. It then runs
+# Reveal.ps1 -All on the obfuscated zip and compares every inventory, metrics
+# and consumption value with the plain run. Cross-reference columns that hold
+# another resource's short name in a plain run (DatabaseServer, ElasticPoolID,
+# AssociatedResource) are compared by that name. Generic names and the
 # documentation placeholder subscription id only; no live Azure.
 
 BeforeAll {
@@ -24,7 +30,7 @@ BeforeAll {
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ObfuscationRoundTrip_" + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
     New-Item -ItemType Directory -Path $script:Tree -Force | Out-Null
-    foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
+    foreach ($Item in @('ResourceInventory.ps1', 'Reveal.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
     {
         Copy-Item -Path (Join-Path $script:RepoRoot $Item) -Destination $script:Tree -Recurse -Force
     }
@@ -201,9 +207,15 @@ exit $LASTEXITCODE
 
     $script:Plain = Invoke-InventoryRun -Label 'plain'
     $script:Obf = Invoke-InventoryRun -Label 'obf' -Obfuscate
+    $script:RevealedZip = Join-Path $script:WorkDir 'revealed.zip'
+    if ($null -ne $script:Obf.Zip -and $null -ne $script:Obf.Dictionary)
+    {
+        $null = & pwsh -NoProfile -NonInteractive -File (Join-Path $script:Tree 'Reveal.ps1') -InputZip $script:Obf.Zip.FullName -DictionaryPath $script:Obf.Dictionary.FullName -All -OutputZip $script:RevealedZip 2>&1
+    }
     # A run that wrote no zip leaves its report $null, so each test reports it.
     $script:P = if ($null -ne $script:Plain.Zip) { Read-Report $script:Plain.Zip.FullName } else { $null }
     $script:O = if ($null -ne $script:Obf.Zip) { Read-Report $script:Obf.Zip.FullName } else { $null }
+    $script:R = if (Test-Path -LiteralPath $script:RevealedZip) { Read-Report $script:RevealedZip } else { $null }
 
     # Every real identifying value of the synthetic estate.
     $script:RealValues = @('12345678-1234-1234-1234-123456789012', 'Demo Subscription', 'rg-demo', 'sqlsrv-demo', 'sqldb-demo', 'pool-demo', 'vm-demo', 'disk-demo',
@@ -224,6 +236,7 @@ Describe 'The two runs' {
         $script:Plain.Zip | Should -Not -BeNullOrEmpty -Because $script:Plain.Console
         $script:Obf.Zip | Should -Not -BeNullOrEmpty -Because $script:Obf.Console
         $script:Obf.Dictionary | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath $script:RevealedZip | Should -BeTrue
     }
 
     It 'collect the same records: 4 inventory, metrics for the database and the VM, 5 usage rows' {
@@ -273,3 +286,104 @@ Describe '-Obfuscate masks every identifying segment' {
     }
 }
 
+Describe 'Reveal.ps1 -All gives back the plain run' {
+    It 'restores every inventory record exactly' {
+        $script:R.Inventory | Should -Be $script:P.Inventory
+    }
+
+    It 'restores every metrics record exactly' {
+        $script:R.Metrics | Should -Be $script:P.Metrics
+    }
+
+    It 'restores every consumption row exactly, including resources not in the inventory' {
+        $script:R.Csv | Should -Be $script:P.Csv
+    }
+
+    It 'restores the subscription id, not its display name, inside resource ids' {
+        foreach ($Row in $script:R.CsvRows) { $Row.ResourceId | Should -Match '^/subscriptions/12345678-1234-1234-1234-123456789012(/|$)' }
+        @($script:R.Raw.SQLDB)[0].Subscription | Should -Be 'Demo Subscription'
+    }
+
+    It 'replaces the obfuscated-report banner in the revealed HTML' {
+        $script:O.Html | Should -Match 'privacy-banner obfuscated'
+        $script:R.Html | Should -Not -Match 'privacy-banner obfuscated'
+        $script:R.Html | Should -Not -Match 'Real identifiers are not present'
+        $script:R.Html | Should -Match 'privacy-banner identifiable'
+    }
+}
+
+Describe 'Reveal.ps1 -All on a report and dictionary in the format earlier versions wrote' {
+    # Earlier versions kept a child's parent name in its masked id, used the
+    # subscription display-name token for the subscription segment, and gave a
+    # consumption row for a resource not in the inventory tokens that only the
+    # whole masked id in ResourceIdMap could reverse (an AKS 'mc_' group got a
+    # 'prod_rg_mc_' token there). Tokens are generated at runtime.
+    BeforeAll {
+        $G = '12345678-1234-1234-1234-123456789012'
+        $New = { param([string]$Hint) 'prod_' + $Hint + [guid]::NewGuid().ToString() }
+        $Sub = & $New ''; $Rg = & $New ''; $Srv = & $New ''; $Db = & $New ''
+        $GoneSub = & $New 'sub_'; $GoneRg = & $New 'rg_mc_'; $GoneName = & $New ''; $AksRg = & $New 'rg_mc_'
+        $RealSrv = "/subscriptions/$G/resourcegroups/rg-old/providers/microsoft.sql/servers/sqlsrv-old"
+        $RealDb = "$RealSrv/databases/sqldb-old"
+        $RealGone = "/subscriptions/$G/resourcegroups/mc_rg-aks_aks-old_eastus/providers/microsoft.compute/disks/osdisk-old"
+        $MaskSrv = "/subscriptions/$Sub/resourcegroups/$Rg/providers/microsoft.sql/servers/$Srv"
+        $MaskDb = "/subscriptions/$Sub/resourcegroups/$Rg/providers/microsoft.sql/servers/sqlsrv-old/databases/$Db"
+        $MaskGone = "/subscriptions/$GoneSub/resourcegroups/$GoneRg/providers/microsoft.compute/disks/$GoneName"
+        $script:OldExpected = @{ Srv = $RealSrv; Db = $RealDb; Gone = $RealGone }
+
+        $Dir = Join-Path $script:WorkDir 'old-format'
+        $Stage = Join-Path $Dir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        [ordered]@{
+            SQLSERVER = @([ordered]@{ ID = $MaskSrv; Subscription = $Sub; ResourceGroup = $Rg; Name = $Srv })
+            SQLDB     = @([ordered]@{ ID = $MaskDb; Subscription = $Sub; ResourceGroup = $Rg; Name = $Db; DatabaseServer = $MaskSrv })
+            AKS       = @([ordered]@{ ID = $MaskSrv; Subscription = $Sub; ResourceGroup = $AksRg; Name = $Srv })
+        } | ConvertTo-Json -Depth 6 -Compress | Set-Content -Path (Join-Path $Stage 'Inventory_Old.json') -Encoding utf8
+        @(
+            [pscustomobject]@{ InstanceData = (@{ 'Microsoft.Resources' = @{ ResourceUri = $MaskDb } } | ConvertTo-Json -Compress); ResourceId = $MaskDb; Quantity = '24' }
+            [pscustomobject]@{ InstanceData = (@{ 'Microsoft.Resources' = @{ ResourceUri = $MaskGone } } | ConvertTo-Json -Compress); ResourceId = $MaskGone; Quantity = '1' }
+        ) | Export-Csv -Path (Join-Path $Stage 'Consumption_Old.csv') -NoTypeInformation -Encoding utf8
+        $script:OldZip = Join-Path $Dir 'ResourcesReport_Old.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $script:OldZip -Force
+        $OldDict = Join-Path $Dir 'ObfuscationDictionary_Old.json'
+        [ordered]@{
+            GeneratedAt         = '2026-10-01 00:00:00'
+            ResourceIdMap       = [ordered]@{ $MaskSrv = $RealSrv; $MaskDb = $RealDb; $MaskGone = $RealGone }
+            ResourceNameMap     = [ordered]@{ $Srv = $RealSrv; $Db = $RealDb }
+            SubscriptionMap     = [ordered]@{ $Sub = $RealDb }
+            ResourceGroupMap    = [ordered]@{ $Rg = $RealDb; $AksRg = $RealGone }
+            SubscriptionNameMap = [ordered]@{ $Sub = 'Demo Subscription' }
+            TagMap              = [ordered]@{}
+            FreeTextMap         = [ordered]@{}
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path $OldDict -Encoding utf8
+
+        $Out = Join-Path $Dir 'revealed.zip'
+        $null = & pwsh -NoProfile -NonInteractive -File (Join-Path $script:Tree 'Reveal.ps1') -InputZip $script:OldZip -DictionaryPath $OldDict -All -OutputZip $Out 2>&1
+        $Ex = Join-Path $Dir 'ex'
+        Expand-Archive -Path $Out -DestinationPath $Ex -Force
+        $script:OldInv = Get-Content -Raw -Path (Join-Path $Ex 'Inventory_Old.json') | ConvertFrom-Json
+        $script:OldCsv = @(Import-Csv -Path (Join-Path $Ex 'Consumption_Old.csv'))
+        $script:OldText = (Get-Content -Raw -Path (Join-Path $Ex 'Inventory_Old.json')) + (Get-Content -Raw -Path (Join-Path $Ex 'Consumption_Old.csv'))
+    }
+
+    It 'restores the ids with the subscription id, and the subscription display name' {
+        $script:OldInv.SQLSERVER[0].ID | Should -BeExactly $script:OldExpected.Srv
+        $script:OldInv.SQLDB[0].ID | Should -BeExactly $script:OldExpected.Db
+        $script:OldInv.SQLDB[0].DatabaseServer | Should -BeExactly $script:OldExpected.Srv
+        $script:OldInv.SQLDB[0].Subscription | Should -BeExactly 'Demo Subscription'
+    }
+
+    It 'restores a consumption row of a resource not in the inventory from its whole masked id' {
+        $script:OldCsv[0].ResourceId | Should -BeExactly $script:OldExpected.Db
+        $script:OldCsv[1].ResourceId | Should -BeExactly $script:OldExpected.Gone
+        ($script:OldCsv[1].InstanceData | ConvertFrom-Json).'Microsoft.Resources'.ResourceUri | Should -BeExactly $script:OldExpected.Gone
+    }
+
+    It 'reveals a resource group token with two hint words (AKS ''mc_'' group)' {
+        $script:OldInv.AKS[0].ResourceGroup | Should -BeExactly 'mc_rg-aks_aks-old_eastus'
+    }
+
+    It 'leaves no token in the revealed inventory or consumption file' {
+        $script:OldText | Should -Not -Match '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-'
+    }
+}

@@ -180,6 +180,9 @@ value** directly; and `FreeTextMap` stores the real **free-text value**
 That is how the reveal step derives the friendly values:
 - Resource Group name is parsed from `/resourceGroups/<name>` in the ID.
 - Subscription name is read from `SubscriptionNameMap` when present (offline).
+  Inside a resource id (after `/subscriptions/`) the subscription token is
+  revealed as the subscription GUID from the `SubscriptionMap` id instead, as
+  a run without `-Obfuscate` writes it.
   Older dictionaries that predate this map only carry the `/subscriptions/<guid>`
   GUID, so the reveal step falls back to the subscription **GUID**.
 - Tag value is read directly from `TagMap`. Older dictionaries that predate tag
@@ -243,7 +246,16 @@ By default only `ResourceGroup` and `Subscription` are revealed; anything you do
 not name in `-Fields` stays masked. Tokens that are not part of a selected
 dimension are left untouched, so selecting one dimension never bleeds another.
 Revealing `ResourceId` un-masks the full ARM path, which embeds the real
-subscription GUID and resource group name for that resource.
+subscription GUID and resource group name for that resource: every segment
+token inside a resource id is revealed, and a whole masked id found in
+`ResourceIdMap` is replaced by its real id (this also restores ids from older
+dictionaries whose segment tokens were not stored one by one). The other
+dimensions reveal their tokens inside ids too: `Subscription` the subscription
+GUID, `ResourceGroup` the group, `ResourceName` the name segments.
+
+The report HTML's "Obfuscated report" banner is replaced with one that names
+the dimensions revealed. The HTML is not re-rendered: it still lacks the ID
+column an obfuscated report leaves out.
 
 ### How it stays valid
 
