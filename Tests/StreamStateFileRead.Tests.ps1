@@ -23,7 +23,7 @@ BeforeAll {
     if ($Fold.Count -ne 1) { throw "Expected one startup fold in the wrapper, found $($Fold.Count)." }
     $script:FoldBlock = [scriptblock]::Create(
         "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$Resume, `$ResumeFailedOnly)`n" +
-        "`$CompletedIds = @(); `$FailedAttempts = @(); `$FoldedStreamFiles = @(); `$UnreadableStreamFiles = @()`n" +
+        "`$CompletedIds = @(); `$FailedAttempts = @(); `$FoldedStreamFiles = @(); `$UnreadableStreamFiles = @(); `$CompletedReports = @()`n" +
         $Fold[0].Extent.Text + "`n" +
         "[pscustomobject]@{ CompletedIds = @(`$CompletedIds); FailedAttempts = @(`$FailedAttempts); Folded = @(`$FoldedStreamFiles); Unreadable = @(`$UnreadableStreamFiles) }")
 
@@ -35,7 +35,7 @@ BeforeAll {
     $MergeText = (@($Siblings[$From..($Siblings.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
     $script:MergeBlock = [scriptblock]::Create(
         "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$SeedCompleted = @(), `$Slices = @())`n" +
-        "`$CompletedIds = @(`$SeedCompleted); `$FailedAttempts = @(); `$UnreadableStreamFiles = @(); `$StreamStateNotMoved = @(); `$LeftStreamFiles = @()`n" +
+        "`$CompletedIds = @(`$SeedCompleted); `$FailedAttempts = @(); `$UnreadableStreamFiles = @(); `$StreamStateNotMoved = @(); `$LeftStreamFiles = @(); `$CompletedReports = @(); `$StreamFailedIds = @(); `$StreamNoReportIds = @()`n" +
         $MergeText + "`n" +
         "[pscustomobject]@{ CompletedIds = @(`$CompletedIds); FailedAttempts = @(`$FailedAttempts); Unreadable = @(`$UnreadableStreamFiles); NotMoved = @(`$StreamStateNotMoved); Left = @(`$LeftStreamFiles); RunEndUnreadable = `$RunEndUnreadable }")
 
