@@ -16,7 +16,8 @@
 # A run that stops during setup (output folder not writable, Azure CLI not
 # installed, service principal sign-in without a secret, -ResourceGroup without
 # -SubscriptionID, Version.json missing) exits 1, also under -RunAllSubs, where
-# the wrapper then records a failed subscription.
+# the wrapper then records a failed subscription. Version.json is read from the
+# script's own folder, so a run started from another folder writes its report.
 #
 # This test is SELF-CONTAINED: it copies the script and its folders to a temp
 # dir, adds small collectors there (one returns a record, the others throw),
@@ -81,12 +82,13 @@ if ($Task -eq 'Processing')
     # Child-process harness: stand-ins for the az CLI and Az cmdlets, then the
     # real script. -Service arrives as one comma-separated string because
     # pwsh -File does not bind arrays. -NoResources makes Resource Graph report
-    # an empty subscription. -SignedOut means no saved sign-in, and -NoAzCli removes the Azure CLI from
+    # an empty subscription. -Cwd starts the script from another folder,
+    # -SignedOut means no saved sign-in, and -NoAzCli removes the Azure CLI from
     # PATH (and its stand-in) so the script's own CLI check runs.
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
 param([string]$Tree, [string]$Out, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources, [string]$StateFile,
-    [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid, [switch]$SignedOut, [switch]$NoAzCli)
+    [string]$Cwd, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid, [switch]$SignedOut, [switch]$NoAzCli)
 $PSStyle.OutputRendering = 'PlainText'
 $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = -not $NoAzCli.IsPresent
@@ -162,7 +164,7 @@ if ($RunAllSubs) { $Params.RunAllSubs = $true }
 if ($ResourceGroup) { $Params.ResourceGroup = $ResourceGroup }
 if ($TenantID) { $Params.TenantID = $TenantID }
 if ($Appid) { $Params.Appid = $Appid }
-Set-Location $Tree
+Set-Location $(if ($Cwd) { $Cwd } else { $Tree })
 $global:LASTEXITCODE = 0
 & (Join-Path $Tree 'ResourceInventory.ps1') @Params
 $Code = $LASTEXITCODE
@@ -177,7 +179,7 @@ exit $Code
     function Invoke-StandInRun
     {
         param([string]$Tree = $script:Tree, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources,
-            [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid,
+            [switch]$FromOtherFolder, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid,
             [switch]$SignedOut, [switch]$NoAzCli, [switch]$UnwritableOut)
 
         $Name = [guid]::NewGuid().ToString('N')
@@ -198,6 +200,12 @@ exit $Code
         if ($Service) { $ArgList += @('-Service', $Service) }
         if ($RunAllSubs) { $ArgList += '-RunAllSubs' }
         if ($NoResources) { $ArgList += '-NoResources' }
+        if ($FromOtherFolder)
+        {
+            $Cwd = Join-Path $script:WorkDir ('cwd_' + $Name)
+            New-Item -ItemType Directory -Path $Cwd -Force | Out-Null
+            $ArgList += @('-Cwd', $Cwd)
+        }
         if ($ResourceGroup) { $ArgList += @('-ResourceGroup', $ResourceGroup) }
         if ($NoSubscriptionID) { $ArgList += '-NoSubscriptionID' }
         if ($TenantID) { $ArgList += @('-TenantID', $TenantID) }
@@ -326,6 +334,23 @@ Describe 'Direct run that stops during setup' {
         $Run.Console | Should -Match 'Local Version.json not found'
         $Run.Zip.Count | Should -Be 0
         $Run.ProcessExit | Should -Be 1
+    }
+}
+
+Describe 'Run started from another folder' {
+    It 'finds Version.json next to the script and writes its report' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -FromOtherFolder
+        $Run.Console | Should -Not -Match 'Version.json not found'
+        $Run.Zip.Count | Should -Be 1
+        $Run.LastLine | Should -Match 'Reporting Data File: '
+        $Run.ProcessExit | Should -Be 0
+    }
+
+    It 'writes its report under -RunAllSubs too' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -FromOtherFolder -RunAllSubs
+        $Run.Console | Should -Not -Match 'Version.json not found'
+        $Run.Zip.Count | Should -Be 1
+        $Run.State.ExitCode | Should -Be 0
     }
 }
 
