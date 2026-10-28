@@ -58,6 +58,7 @@ function Variables
     $Global:FreeTextDictionary = $null
     $Global:ObfuscationSubscriptionTokens = $null
     $Global:ObfuscationResourceGroupTokens = $null
+    $Global:ObfuscationSubscriptionIndex = $null
 
     if ($Obfuscate.IsPresent)
     {
@@ -178,6 +179,29 @@ function New-ObfuscatedNameToken
     return (Get-ObfuscationPrefix $Name) + $Hint + [guid]::NewGuid().ToString()
 }
 
+# The $Global:Subscriptions entries by subscription id, in list order, so a lookup
+# per resource does not scan the list. Built once per list, and again when the list
+# is replaced. Ids compare as the -eq scans this replaces did (ignoring case,
+# invariant culture); entries with no id are kept apart in NoId, the entries a
+# missing subscription id matched.
+function Get-ObfuscationSubscriptionIndex
+{
+    $Index = $Global:ObfuscationSubscriptionIndex
+    if ($null -ne $Index -and [object]::ReferenceEquals($Index.Source, $Global:Subscriptions)) { return $Index }
+
+    $ById = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $NoId = [System.Collections.Generic.List[object]]::new()
+    foreach ($Sub in @($Global:Subscriptions))
+    {
+        if ($null -eq $Sub -or $null -eq $Sub.id) { $NoId.Add($Sub); continue }
+        $Key = [string]$Sub.id
+        if (-not $ById.ContainsKey($Key)) { $ById[$Key] = [System.Collections.Generic.List[object]]::new() }
+        $ById[$Key].Add($Sub)
+    }
+    $Global:ObfuscationSubscriptionIndex = @{ Source = $Global:Subscriptions; ById = $ById; NoId = $NoId }
+    return $Global:ObfuscationSubscriptionIndex
+}
+
 # The masked form of a resource id. Every name segment is replaced (the
 # subscription, the resource group and each resource name, a parent's
 # included) and the 'subscriptions', 'resourcegroups', 'providers', namespace
@@ -198,7 +222,8 @@ function Get-ObfuscatedResourceId
         return (Get-ObfuscationPrefix $ResourceId) + [guid]::NewGuid().ToString()
     }
 
-    $SubName = [string](@($Global:Subscriptions) | Where-Object { $null -ne $_ -and [string]$_.id -eq $Parts[2] } | Select-Object -First 1).name
+    $SubEntries = (Get-ObfuscationSubscriptionIndex).ById[$Parts[2]]
+    $SubName = if ($null -ne $SubEntries) { [string]$SubEntries[0].name } else { '' }
     if ([string]::IsNullOrEmpty($SubName)) { $SubName = $Parts[2] }
     if (-not $Global:ObfuscationSubscriptionTokens.ContainsKey($SubName)) { $Global:ObfuscationSubscriptionTokens[$SubName] = (Get-ObfuscationPrefix $SubName) + [guid]::NewGuid().ToString() }
     $SubToken = $Global:ObfuscationSubscriptionTokens[$SubName]
@@ -812,13 +837,16 @@ Function RunInventorySetup()
             Write-Log -Message ("Obfuscation dictionary seeded from '{0}': {1} id, {2} name, {3} subscription, {4} resource-group, {5} tag, {6} free-text mappings preloaded; matching real values will reuse their existing tokens." -f $ObfuscationDictionary, @($ResourceIdDictionary.Keys).Count, @($ResourceNameDictionary.Keys).Count, @($SubLookup.Keys).Count, @($RgLookup.Keys).Count, @($Global:TagValueDictionary.Keys).Count, @($Global:FreeTextDictionary.Keys).Count) -Severity 'Info'
         }
 
+        $SubIndex = Get-ObfuscationSubscriptionIndex
+
         foreach ($resourceItem in $Global:Resources)
         {
             if ($IdsToMask.Contains($resourceItem.ID)) { continue }
 
             $ObfuscatedName = New-ObfuscatedNameToken -ResourceId $resourceItem.id -Name $resourceItem.name
 
-            $RealSub = ($Global:Subscriptions | Where-Object { $_.id -eq $resourceItem.subscriptionId }).Name
+            $SubEntries = if ($null -eq $resourceItem.subscriptionId) { $SubIndex.NoId } else { $SubIndex.ById[[string]$resourceItem.subscriptionId] }
+            $RealSub = $SubEntries.Name
             if ([string]::IsNullOrEmpty($RealSub)) { $RealSub = $resourceItem.subscriptionId }
             if (-not $SubLookup.ContainsKey($RealSub))
             {
