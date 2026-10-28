@@ -1831,4 +1831,15 @@ catch
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
+
+# A direct run reaches this point even when it wrote no report (collection stopped,
+# or the HTML report or the zip failed), so it must not end as a success. Under
+# -RunAllSubs the exit code is left alone: the wrapper treats any non-zero exit as a
+# failed subscription and checks each subscription's zip itself.
+if (-not $RunAllSubs.IsPresent -and ([string]::IsNullOrEmpty($Global:ZipOutputFile) -or -not (Test-Path -LiteralPath $Global:ZipOutputFile)))
+{
+    Write-Log -Message ("No report was written: {0} was not created. See the errors above, fix the cause and re-run." -f $Global:ZipOutputFile) -Severity 'Error'
+    exit 2
+}
+
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
