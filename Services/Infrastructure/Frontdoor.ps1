@@ -49,7 +49,12 @@ if ($Task -eq 'Processing')
             $WAF = $false
             if ($1.TYPE -eq 'microsoft.network/frontdoors')
             {
-                $WafId = $Data.frontendendpoints.properties.webApplicationFirewallPolicyLink.id
+                # Each frontend endpoint has its own WAF policy link, so this walk gives one id
+                # per linked endpoint. The dictionary lookup and the name split below need one
+                # id: take the first.
+                $WafId = $Data.frontendendpoints.properties.webApplicationFirewallPolicyLink.id |
+                    Where-Object { -not [string]::IsNullOrEmpty($_) } |
+                    Select-Object -First 1
                 if (![string]::IsNullOrEmpty($WafId))
                 {
                     $WAF = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0)
