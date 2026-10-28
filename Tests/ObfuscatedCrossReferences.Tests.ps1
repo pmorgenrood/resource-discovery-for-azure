@@ -144,6 +144,10 @@ Describe 'Front Door WAF policy column' {
         Get-WafColumn (New-FrontDoor 'fd-two' @($script:WafA, $script:WafA)) $null | Should -BeExactly 'wafpolicya'
     }
 
+    It 'names the policy when one endpoint links it (plain)' {
+        Get-WafColumn (New-FrontDoor 'fd-one' @($script:WafA)) $null | Should -BeExactly 'wafpolicya'
+    }
+
     It "writes 'obfuscated' for a policy that is not in the dictionary (obfuscated)" {
         $Other = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Other['/subscriptions/x/other'] = New-Token
