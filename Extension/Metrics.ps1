@@ -484,7 +484,16 @@ if ($Task -eq 'Processing')
     # lock (Monitor) on the array itself.
     $MetricRequestCounts = [long[]]::new(2)
 
-    $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
+    # $MetricCount is the number of definitions to send. With none, build no
+    # groups, so the batch loop below makes no call.
+    if ($MetricCount -gt 0)
+    {
+        $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
+    }
+    else
+    {
+        $MetricGroups = [System.Collections.Generic.List[object]]::new()
+    }
 
     # Running state for the phase summary. Each batch's call records are folded in
     # here and then dropped, so retained memory does not grow with the call count.
