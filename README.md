@@ -172,6 +172,8 @@ git clone https://github.com/awslabs/resource-discovery-for-azure.git
 
 - **Azure Cloud Shell:** Authentication is automatic
 - **Local PowerShell:** Run `az login` and `Connect-AzAccount` before executing the script. If you plan to scan all subscriptions in a tenant, use `Run-AllSubscriptions.ps1`, which prompts you to sign in once and then reuses the session for every subscription.
+- **Existing sign-in:** A direct run of `ResourceInventory.ps1` checks az CLI and Az PowerShell separately and reuses each one that is signed in to the target tenant and can still get a token without a prompt; only a side that cannot is signed in again. Without `-TenantID` the target tenant is the one the working sign-in is on (az CLI's when both work but differ, with a warning).
+- **Azure VM with a managed identity:** Pass `-UseManagedIdentity` to sign in with the machine's identity instead of a user.
 
 You might get more than one authentication request due to different collector processes running in parallel.
 
@@ -510,6 +512,7 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 | `Appid` | String | Service Principal application ID | `-Appid "app-id-here"` |
 | `Secret` | String | Service Principal client secret | `-Secret "secret-here"` |
 | `DeviceLogin` | Switch | Use device code authentication | `-DeviceLogin` |
+| `UseManagedIdentity` | Switch | Sign in az CLI (`az login --identity`) and Az PowerShell (`Connect-AzAccount -Identity`, with `-Tenant` when `-TenantID` is given) with the managed identity of the Azure VM or service the script runs on. Direct runs of `ResourceInventory.ps1` only. | `-UseManagedIdentity` |
 
 ### Debugging Parameters
 
