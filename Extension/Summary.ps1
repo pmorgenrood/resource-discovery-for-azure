@@ -129,10 +129,11 @@ $TotalResources = ($ServiceSummary | Measure-Object -Property Count -Sum).Sum
 
 # Detect obfuscation so the header can carry a privacy-posture banner. Sample
 # resource Names and Subscription values across the first few populated
-# services; if most match the obfuscation signature treat the report as
-# obfuscated, else identifiable (the safe default for an unclear posture).
+# services; if most are whole obfuscation tokens (Get-RdaObfuscationTokenPattern)
+# treat the report as obfuscated, else identifiable (the safe default for an
+# unclear posture).
 $ObfuscationStatus = 'identifiable'
-$ObfPattern = '^(prod_|nonprod_)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+$ObfPattern = '^(?:' + (Get-RdaObfuscationTokenPattern) + ')$'
 $Samples = New-Object System.Collections.Generic.List[string]
 foreach ($svc in $ServiceSummary | Select-Object -First 5)
 {
@@ -250,10 +251,10 @@ if ([string]::IsNullOrWhiteSpace([string]$Version) -and $null -ne $Inventory.Ver
 # fields blow out the column list.
 
 # The text of one table cell: at most 200 characters, then '...'. In an
-# obfuscated report a cut that would split a masked token (prod_/nonprod_ with
-# any hint words and a GUID, the shape Reveal.ps1 matches) ends after that token
-# instead, so Reveal can still replace it; a value whose cut reaches its end is
-# shown whole. Other reports are cut at 200 characters as before.
+# obfuscated report a cut that would split a masked token
+# (Get-RdaObfuscationTokenPattern) ends after that token instead, so Reveal can
+# still replace it; a value whose cut reaches its end is shown whole. Other
+# reports are cut at 200 characters as before.
 function Get-ReportCellText
 {
     param([string]$Text, [string]$ObfuscationStatus)
@@ -262,7 +263,7 @@ function Get-ReportCellText
     $Cut = $Limit
     if ($ObfuscationStatus -eq 'obfuscated')
     {
-        foreach ($Token in [regex]::Matches($Text, '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'))
+        foreach ($Token in [regex]::Matches($Text, (Get-RdaObfuscationTokenPattern)))
         {
             if ($Token.Index -lt $Limit -and ($Token.Index + $Token.Length) -gt $Limit)
             {
