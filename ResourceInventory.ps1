@@ -210,35 +210,6 @@ Function RunInventorySetup()
             return
         }
 
-        Write-Log -Message ('Verifying Azure CLI is installed...') -Severity 'Info'
-
-        $AzCliVersion = az --version
-
-        if ($null -eq $AzCliVersion)
-        {
-            Write-Log -Message ("Azure CLI Not Found. Please install and run the script again.") -Severity 'Error'
-            Read-Host "Press <Enter> to exit"
-            Exit
-        }
-
-        Write-Log -Message ('CLI Version: {0}' -f $AzCliVersion[0]) -Severity 'Success'
-
-        Write-Log -Message ('Verifying Azure CLI Extension...') -Severity 'Info'
-
-        $AzCliExtension = az extension list --output json | ConvertFrom-Json
-        $AzCliExtension = $AzCliExtension | Where-Object { $_.name -eq 'resource-graph' }
-
-        Write-Log -Message ('Current Resource-Graph Extension Version: {0}' -f $AzCliExtension.Version) -Severity 'Success'
-
-        $AzCliExtensionVersion = $AzCliExtension | Where-Object { $_.name -eq 'resource-graph' }
-
-        if (!$AzCliExtensionVersion)
-        {
-            Write-Log -Message ('Azure CLI Extension not found') -Severity 'Warning'
-            Write-Log -Message ('Installing Azure CLI Extension...') -Severity 'Info'
-            az extension add --name resource-graph
-        }
-
         Write-Log -Message ('Checking Azure PowerShell Module...') -Severity 'Info'
 
         $RequiredAzSubModules = @('Az.Accounts', 'Az.Compute', 'Az.Monitor', 'Az.Billing')
@@ -257,7 +228,10 @@ Function RunInventorySetup()
             Write-Log -Message ('  Install-Module -Name {0} -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck' -f ($RequiredAzSubModules -join ',')) -Severity 'Error'
             Write-Log -Message ('Or install the full rollup (larger, slower first import): Install-Module -Name Az -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck') -Severity 'Error'
             Write-Log -Message ('Or in Cloud Shell, the Az module is already preinstalled - if it is missing your shell environment is broken.') -Severity 'Error'
-            throw ('Required Azure PowerShell submodule(s) not found: {0}. See log above for installation instructions.' -f ($MissingAzSubModules -join ', '))
+            # exit, not throw: the production 'SilentlyContinue' preference
+            # suppresses a bare throw and the run would go on to sign in and
+            # collect without the modules its collectors need.
+            exit 1
         }
 
         try
@@ -276,7 +250,8 @@ Function RunInventorySetup()
             Write-Log -Message ('Reinstall with: Install-Module -Name Az -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck') -Severity 'Error'
             Write-Log -Message ('If the broken install was created by a previous run of this script, also run: Get-Module Az* -ListAvailable | Uninstall-Module -Force') -Severity 'Error'
             $Global:AzPowerShellLoaded = $false
-            throw "Azure PowerShell (Az) module is broken on disk and cannot be loaded. See log above for remediation."
+            # exit, not throw, for the same reason as above.
+            exit 1
         }
 
     }
@@ -1665,7 +1640,10 @@ if (-not $RunAllSubs.IsPresent)
             $FreeMB = [math]::Round($Drive.Free / 1MB, 0)
             if ($FreeMB -lt 100)
             {
-                throw ("Pre-flight: free disk space at {0} is {1} MB; the script needs at least 100 MB to start. Free space and re-run." -f $PreFlightInventoryRoot, $FreeMB)
+                # exit, not throw: the production 'SilentlyContinue' preference
+                # suppresses a bare throw, and the run would go on.
+                Write-Host ("ERROR: Pre-flight: free disk space at {0} is {1} MB; the script needs at least 100 MB to start. Free space and re-run." -f $PreFlightInventoryRoot, $FreeMB) -ForegroundColor Red
+                exit 1
             }
             elseif ($FreeMB -lt 500)
             {
@@ -1679,7 +1657,6 @@ if (-not $RunAllSubs.IsPresent)
     }
     catch
     {
-        if ($_.Exception.Message -match '^Pre-flight:') { throw }
         Write-Host ("WARNING: Could not determine free disk space at {0}: {1}" -f $PreFlightInventoryRoot, $_.Exception.Message) -ForegroundColor Yellow
     }
 
@@ -1697,9 +1674,11 @@ if (-not $RunAllSubs.IsPresent)
     }
     catch
     {
+        $ProbeError = $_.Exception.Message
         try { if (Test-Path $ProbePath) { Remove-Item -Path $ProbePath -Force -ErrorAction SilentlyContinue } }
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
-        throw ("Pre-flight: cannot write to {0}: {1}. This usually means readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle. Verify the directory is writable and re-run." -f $PreFlightInventoryRoot, $_.Exception.Message)
+        Write-Host ("ERROR: Pre-flight: cannot write to {0}: {1}. This usually means readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle. Verify the directory is writable and re-run." -f $PreFlightInventoryRoot, $ProbeError) -ForegroundColor Red
+        exit 1
     }
 
     Write-Host "Pre-flight checks passed." -ForegroundColor Green
