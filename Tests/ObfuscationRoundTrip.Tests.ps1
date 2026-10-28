@@ -22,8 +22,11 @@
 # Reveal.ps1 -All on the obfuscated zip and compares every inventory, metrics
 # and consumption value with the plain run. Cross-reference columns that hold
 # another resource's short name in a plain run (DatabaseServer, ElasticPoolID,
-# AssociatedResource) are compared by that name. Generic names and the
-# documentation placeholder subscription id only; no live Azure.
+# AssociatedResource) are compared by that name. The VM's name looks like a
+# test one, so its masked id (the disk's AssociatedResource) is longer than the
+# report's 200-character cell limit; the revealed HTML must hold no masked token,
+# whole or cut. Generic names and the documentation placeholder subscription id
+# only; no live Azure.
 
 BeforeAll {
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
@@ -70,8 +73,8 @@ $Global:StandInRows = @(
     @{ id = "$Base/Microsoft.Sql/servers/sqlsrv-demo/databases/sqldb-demo"; name = 'sqldb-demo'; type = 'microsoft.sql/servers/databases'; kind = 'v12.0,user,vcore'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
         properties = @{ status = 'Online'; maxSizeBytes = 34359738368; currentSku = @{ tier = 'GeneralPurpose'; capacity = 2 }; currentBackupStorageRedundancy = 'Geo'; elasticPoolId = "$Base/Microsoft.Sql/servers/sqlsrv-demo/elasticPools/pool-demo" } }
     @{ id = "$Base/Microsoft.Sql/servers/sqlsrv-demo/elasticPools/pool-demo"; name = 'pool-demo'; type = 'microsoft.sql/servers/elasticpools'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; properties = @{ state = 'Ready' } }
-    @{ id = "$Base/Microsoft.Compute/virtualMachines/vm-demo"; name = 'vm-demo'; type = 'microsoft.compute/virtualmachines'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; properties = @{ hardwareProfile = @{ vmSize = 'Standard_D2s_v3' }; storageProfile = @{ osDisk = @{ osType = 'Linux' } } } }
-    @{ id = "$Base/Microsoft.Compute/disks/disk-demo"; name = 'disk-demo'; type = 'microsoft.compute/disks'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; managedBy = "$Base/Microsoft.Compute/virtualMachines/vm-demo"
+    @{ id = "$Base/Microsoft.Compute/virtualMachines/vm-test-demo"; name = 'vm-test-demo'; type = 'microsoft.compute/virtualmachines'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; properties = @{ hardwareProfile = @{ vmSize = 'Standard_D2s_v3' }; storageProfile = @{ osDisk = @{ osType = 'Linux' } } } }
+    @{ id = "$Base/Microsoft.Compute/disks/disk-demo"; name = 'disk-demo'; type = 'microsoft.compute/disks'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; managedBy = "$Base/Microsoft.Compute/virtualMachines/vm-test-demo"
         sku = @{ name = 'Premium_LRS' }; properties = @{ diskSizeGB = 32; diskState = 'Attached'; timeCreated = '2024-03-15T09:41:27Z' } }
 )
 # Usage rows: the database in the inventory, and resources that are not in it.
@@ -218,7 +221,7 @@ exit $LASTEXITCODE
     $script:R = if (Test-Path -LiteralPath $script:RevealedZip) { Read-Report $script:RevealedZip } else { $null }
 
     # Every real identifying value of the synthetic estate.
-    $script:RealValues = @('12345678-1234-1234-1234-123456789012', 'Demo Subscription', 'rg-demo', 'sqlsrv-demo', 'sqldb-demo', 'pool-demo', 'vm-demo', 'disk-demo',
+    $script:RealValues = @('12345678-1234-1234-1234-123456789012', 'Demo Subscription', 'rg-demo', 'sqlsrv-demo', 'sqldb-demo', 'pool-demo', 'vm-test-demo', 'disk-demo',
         'sqldb-gone', 'rg-gone', 'sb-gone', 'mc_rg-aks_aks-gone_eastus', 'osdisk-gone', 'insights-gone')
 }
 
@@ -385,5 +388,25 @@ Describe 'Reveal.ps1 -All on a report and dictionary in the format earlier versi
 
     It 'leaves no token in the revealed inventory or consumption file' {
         $script:OldText | Should -Not -Match '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-'
+    }
+}
+
+Describe 'The report HTML of the obfuscated run and its Reveal.ps1 -All copy' {
+    It 'keeps a cell longer than 200 characters whole when its cut would split a masked token' {
+        $Masked = @($script:O.Raw.VMDisk)[0].AssociatedResource
+        $Masked.Length | Should -BeGreaterThan 200
+        $Masked | Should -Match '/nonprod_[0-9a-f-]{36}$'
+        $script:O.Html.Contains('<td>' + $Masked + '</td>') | Should -BeTrue -Because "the cell should hold '$Masked' whole"
+    }
+
+    It 'leaves no masked token, whole or cut, in the revealed HTML' {
+        $Left = @([regex]::Matches($script:R.Html, '(?:non)?prod_[0-9a-z_-]*') | ForEach-Object { $_.Value })
+        $Left.Count | Should -Be 0 -Because ('these remain: ' + ($Left -join ', '))
+    }
+
+    It 'shows the revealed disk''s AssociatedResource cell as the revealed inventory holds it' {
+        $Revealed = @($script:R.Raw.VMDisk)[0].AssociatedResource
+        $Revealed | Should -Match '/virtualmachines/vm-test-demo$'
+        $script:R.Html.Contains('<td>' + $Revealed + '</td>') | Should -BeTrue -Because "the cell should read '$Revealed'"
     }
 }
