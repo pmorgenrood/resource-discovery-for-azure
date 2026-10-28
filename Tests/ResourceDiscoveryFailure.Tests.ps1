@@ -97,6 +97,30 @@ function global:Start-Sleep
 }
 function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'tenant-demo' }; Subscription = [pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012'; Name = 'Demo Subscription' }; Account = [pscustomobject]@{ Id = 'tester' } } }
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
+# Where the script checks the identity's roles up front, the calls answer as
+# for a Reader assignment on the subscription. Any other Resource Manager call
+# fails, so a new one shows up here.
+function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
+function global:Invoke-AzRestMethod
+{
+    param($Method, $Path, $Payload, $Uri)
+    $Target = if ($Path) { $Path } else { $Uri }
+    $Sub = $Global:StandInSubs[0].id
+    $Json = { param($Obj) [pscustomobject]@{ StatusCode = 200; Content = ($Obj | ConvertTo-Json -Depth 10) } }
+    if ($Target -match '/roleAssignments\?')
+    {
+        return (& $Json @{ value = @(@{ properties = @{ roleDefinitionId = "/subscriptions/$Sub/providers/Microsoft.Authorization/roleDefinitions/reader"; scope = "/subscriptions/$Sub"; principalId = 'test-oid'; principalType = 'ServicePrincipal' } }) })
+    }
+    if ($Target -match '/roleDefinitions/')
+    {
+        return (& $Json @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } })
+    }
+    if ($Target -match '/providers/Microsoft\.Authorization/permissions\?')
+    {
+        return (& $Json @{ value = @(@{ actions = @('*/read'); notActions = @() }) })
+    }
+    throw ('no stand-in for {0} {1}' -f $Method, $Target)
+}
 
 $Params = @{ SubscriptionID = $SubId; SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out; Service = @('PublicIP') }
 Set-Location $Tree
