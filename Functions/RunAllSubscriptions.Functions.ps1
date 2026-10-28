@@ -653,6 +653,33 @@ function Remove-FailedAttempt
     return @($Existing | Where-Object { $_ -and $_.Id -ne $Id })
 }
 
+# The retry-list reason for a subscription whose report was written but whose
+# metrics or consumption were skipped or left incomplete, or $null when they
+# were not. ResourceInventory.ps1 appends one entry to $Global:MetricsFailedSubs
+# or $Global:ConsumptionFailedSubs for each such gap; -MetricsBefore and
+# -ConsumptionBefore are the sizes of those lists just before the call for this
+# subscription, so only the entries that call appended count. Entries are not
+# matched by Id because a consumption sign-in skip is recorded as '(auth)'.
+function Get-IncompleteDataReason
+{
+    param(
+        # [object]: same single-element collapse as Add-FailedAttempt.
+        [object]$MetricsEntries,
+        [int]$MetricsBefore = 0,
+        [object]$ConsumptionEntries,
+        [int]$ConsumptionBefore = 0
+    )
+    $NewMetrics = @(@($MetricsEntries | Where-Object { $null -ne $_ }) | Select-Object -Skip ([Math]::Max($MetricsBefore, 0)))
+    $NewConsumption = @(@($ConsumptionEntries | Where-Object { $null -ne $_ }) | Select-Object -Skip ([Math]::Max($ConsumptionBefore, 0)))
+    $Phases = @()
+    if ($NewMetrics.Count -gt 0) { $Phases += 'Metrics' }
+    if ($NewConsumption.Count -gt 0) { $Phases += 'Consumption' }
+    if ($Phases.Count -eq 0) { return $null }
+    $Messages = @(@($NewMetrics) + @($NewConsumption) | ForEach-Object { [string]$_.Message } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($Messages.Count -eq 0) { return ('{0} incomplete.' -f ($Phases -join ' and ')) }
+    return ('{0} incomplete: {1}' -f ($Phases -join ' and '), ($Messages -join ' '))
+}
+
 # Discover every per-stream resume-state file on disk for a tenant, rather
 # than iterating 0..($StreamCount-1). $StreamCount reflects THIS run's
 # -ParallelStreams value; if an earlier interrupted run used a LARGER value,

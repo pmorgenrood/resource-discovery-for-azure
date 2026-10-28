@@ -1022,6 +1022,9 @@ if ($ParallelStreams -le 1)
         {
             # Cleared first so a stale path from the previous subscription is never recorded as this one's.
             $Global:ZipOutputFile = $null
+            # Counted before the call, so Get-IncompleteDataReason sees only what this call appends.
+            $MetricsGapsBefore = @($Global:MetricsFailedSubs | Where-Object { $null -ne $_ }).Count
+            $ConsumptionGapsBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
             & (Join-Path $PSScriptRoot "ResourceInventory.ps1") -TenantID $TenantID -SubscriptionID $Sub.Id @InventoryPassthrough -RunAllSubs
             # Only treat as failure if the inner script set a non-zero exit code.
             # Some completion paths leave $LASTEXITCODE unset ($null), and
@@ -1065,6 +1068,7 @@ if ($ParallelStreams -le 1)
             $StateChanged = $false
             # Record the zip this run wrote, replacing any earlier record for the sub.
             $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
+            $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
             if ($null -eq $NewReport)
             {
                 # The run left no zip, so there is no report a later -Resume could
@@ -1077,6 +1081,18 @@ if ($ParallelStreams -le 1)
                     $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                     $StateChanged = $true
                 }
+            }
+            elseif ($null -ne $IncompleteReason)
+            {
+                # The report was written without some of its metrics or consumption,
+                # so the sub is not completed: it goes into the retry list, and an
+                # earlier run's completion of it ends here, so both -Resume and
+                # -ResumeFailedOnly collect it again. It is not a failed subscription.
+                Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
+                $StateChanged = $true
             }
             else
             {
@@ -1252,6 +1268,9 @@ else
             {
                 # Cleared first so a stale path is never recorded as this subscription's zip.
                 $Global:ZipOutputFile = $null
+                # Same as the sequential branch: counted before the call.
+                $MetricsGapsBefore = @($Global:MetricsFailedSubs | Where-Object { $null -ne $_ }).Count
+                $ConsumptionGapsBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
                 & (Join-Path $PSScriptRoot "ResourceInventory.ps1") -TenantID $TenantID -SubscriptionID $Sub.Id @InventoryPassthrough -RunAllSubs
                 # Same null-guard as the sequential branch above.
                 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Script exited with code $LASTEXITCODE" }
@@ -1266,6 +1285,7 @@ else
                     Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
                 }
                 $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
+                $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
                 if ($null -ne $NewReport) { $CompletedReports = @(@($CompletedReports) + $NewReport) }
                 if ($null -eq $NewReport)
                 {
@@ -1277,6 +1297,16 @@ else
                         $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                         Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                     }
+                }
+                elseif ($null -ne $IncompleteReason)
+                {
+                    # Same as the sequential branch: metrics or consumption left
+                    # incomplete puts the sub in the retry list, not the completed list.
+                    Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                    $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
                 elseif (-not ($CompletedIds -contains $Sub.Id))
                 {
@@ -1488,6 +1518,7 @@ else
             # same shape as a sequential run.
             $StreamFailedIds = @()
             $StreamNoReportIds = @()
+            $StreamIncompleteIds = @()
             foreach ($S in $StreamSummaries)
             {
                 if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
@@ -1550,6 +1581,12 @@ else
                 if ($StreamSummary.NoReport)
                 {
                     $StreamNoReportIds += @($StreamSummary.NoReport | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
+                }
+
+                # The subs this stream collected this run with metrics or consumption left incomplete.
+                if ($StreamSummary.Incomplete)
+                {
+                    $StreamIncompleteIds += @($StreamSummary.Incomplete | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
                 }
 
                 # Each stream skips (on -Resume) the subs its own state file lists
@@ -1675,9 +1712,10 @@ else
             # run completed it: take it off the list and drop its report record,
             # as the sequential branch does, so Merge-FailedAttempts keeps the
             # failure and a later -Resume collects the sub again. The same goes for
-            # a sub a stream collected this run without a zip being written.
+            # a sub a stream collected this run without a zip being written, and
+            # for one whose metrics or consumption were left incomplete.
             $FailedThisRun = @($StreamFailedIds | Where-Object { $_ })
-            $NotCompletedThisRun = @(@($FailedThisRun) + @($StreamNoReportIds | Where-Object { $_ }))
+            $NotCompletedThisRun = @(@($FailedThisRun) + @($StreamNoReportIds | Where-Object { $_ }) + @($StreamIncompleteIds | Where-Object { $_ }))
             if ($NotCompletedThisRun.Count -gt 0)
             {
                 $CompletedIds = @($CompletedIds | Where-Object { $NotCompletedThisRun -notcontains $_ })
@@ -2187,11 +2225,11 @@ if ($FailedSubscriptions.Count -gt 0)
 }
 elseif ($FailedAttempts.Count -gt 0)
 {
-    # No new failures this run, but the resume-state file still has lingering
-    # FailedAttempts from a prior run that have not yet been retried. Surface
-    # them so the operator does not lose track of historical failures simply
-    # because the most recent run was clean.
-    Write-Host ("Pending Retries:         {0} subscription(s) from a prior run still in FailedAttempts" -f $FailedAttempts.Count) -ForegroundColor Yellow
+    # No subscription failed this run, but the retry list is not empty: entries
+    # from a prior run that were not retried, or subscriptions whose metrics or
+    # consumption this run left incomplete. Surface them so the operator does
+    # not lose track of them simply because no subscription failed outright.
+    Write-Host ("Pending Retries:         {0} subscription(s) in the retry list (FailedAttempts)" -f $FailedAttempts.Count) -ForegroundColor Yellow
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
