@@ -1504,11 +1504,20 @@ function FinalizeOutputs
         }
 
         $ReportTenantId = if ($Obfuscate.IsPresent) { $null } else { $TenantID }
+        # The header's subscription, for a run of one subscription: a subscription
+        # with no resources has no record for Summary.ps1 to take the name from.
+        # Under -Obfuscate, and for a run of several subscriptions, Summary.ps1
+        # keeps taking it from the first record (the masked name under -Obfuscate).
+        $ReportSubscriptionName = $null
+        if (-not $Obfuscate.IsPresent -and -not [string]::IsNullOrEmpty($SubscriptionID))
+        {
+            $ReportSubscriptionName = [string](@($Global:Subscriptions) | Where-Object { $null -ne $_ -and [string]$_.id -eq $SubscriptionID } | Select-Object -First 1).name
+        }
         $ReportTitle = ('Azure Resource Inventory - {0}' -f $Global:ReportName)
 
         try
         {
-            $null = & $SummaryPath -JsonFile $Global:JsonFile -HtmlFile $Global:HtmlFile -Title $ReportTitle -TenantId $ReportTenantId -Version $Global:Version -ExtractionRunTime $Runtime -ReportingRunTime $ReportingRunTime -PhaseTimings $script:PhaseTimings -PlatOS $PlatformOS -ConsumptionFile $Global:ConsumptionFileCsv -CollectorFailures $script:CollectorFailuresThisRun
+            $null = & $SummaryPath -JsonFile $Global:JsonFile -HtmlFile $Global:HtmlFile -Title $ReportTitle -SubscriptionName $ReportSubscriptionName -TenantId $ReportTenantId -Version $Global:Version -ExtractionRunTime $Runtime -ReportingRunTime $ReportingRunTime -PhaseTimings $script:PhaseTimings -PlatOS $PlatformOS -ConsumptionFile $Global:ConsumptionFileCsv -CollectorFailures $script:CollectorFailuresThisRun
         }
         catch
         {

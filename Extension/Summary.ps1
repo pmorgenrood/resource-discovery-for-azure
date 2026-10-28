@@ -133,6 +133,8 @@ foreach ($prop in $Inventory.PSObject.Properties)
 }
 $ServiceSummary = $ServiceSummary | Sort-Object -Property Count -Descending
 $TotalResources = ($ServiceSummary | Measure-Object -Property Count -Sum).Sum
+# Measure-Object gives no sum for no input: an inventory with no records has 0.
+if ($null -eq $TotalResources) { $TotalResources = 0 }
 
 # Detect obfuscation so the header can carry a privacy-posture banner. Sample
 # resource Names and Subscription values across the first few populated
