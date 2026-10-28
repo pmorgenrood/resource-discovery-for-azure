@@ -1143,16 +1143,18 @@ function Split-EmptySubscriptionsByRoleCheck
 # Microsoft.Commerce/UsageAggregates/read, so "no error" and "some rows" are
 # not proof of access; only a positive quantity is.
 
-# The window the billing phase queries: local midnight 31 days ago to local
-# midnight yesterday, both with Kind=Unspecified. Unspecified is what the
-# phase's earlier '.DateTime' strings converted to, and it serialises without a
+# The window the billing phase queries: midnight 31 days ago to midnight
+# yesterday, by the date of $Now, which is the UTC clock by default so every
+# host gets the same days for the same moment (usage days are UTC days). Both
+# have Kind=Unspecified. Unspecified is what the phase's earlier '.DateTime'
+# strings converted to, and it serialises without a
 # UTC offset, which the Daily-granularity API accepts on any host time zone
 # (a Kind=Local midnight carries the host offset and is rejected outside UTC).
 # Returning DateTime values instead of culture-formatted strings keeps the
 # conversion independent of the host culture.
 function Get-ConsumptionWindow
 {
-    param([datetime]$Now = (Get-Date))
+    param([datetime]$Now = [datetime]::UtcNow)
     return [pscustomobject]@{
         Start = [datetime]::SpecifyKind($Now.AddDays(-31).Date, [System.DateTimeKind]::Unspecified)
         End   = [datetime]::SpecifyKind($Now.AddDays(-1).Date, [System.DateTimeKind]::Unspecified)

@@ -17,7 +17,8 @@ Per subscription, the collector:
 
 - Sets the time window to the **last 31 days, ending at the start of yesterday**
   (`ReportedStartTime = today − 31 days`, `ReportedEndTime = yesterday`, both
-  floored to midnight).
+  floored to midnight), where today is the UTC date of the run, so every host
+  collects the same days for the same moment.
 - Requests **`Daily`** aggregation granularity with **`ShowDetails = $true`**
   (so per-resource instance data is included).
 - Pages through the results using the API's **`ContinuationToken`** until there

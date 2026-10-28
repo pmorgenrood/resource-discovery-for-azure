@@ -74,7 +74,7 @@ BeforeAll {
 }
 
 Describe 'Get-ConsumptionWindow' {
-    It 'is the billing phase window: local midnight 31 days ago to local midnight yesterday' {
+    It 'is the billing phase window: midnight 31 days ago to midnight yesterday of the clock''s date' {
         $W = Get-ConsumptionWindow -Now ([datetime]'2026-10-26T15:30:00')
         $W.Start | Should -Be ([datetime]'2026-09-25T00:00:00')
         $W.End | Should -Be ([datetime]'2026-10-25T00:00:00')
