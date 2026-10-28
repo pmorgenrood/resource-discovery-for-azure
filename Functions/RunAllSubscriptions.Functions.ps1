@@ -535,6 +535,28 @@ function Get-CompletedReports
     }
 }
 
+# True when the resume-state file for this tenant has no CompletedReports key at
+# all: it was written by a version that did not record report zips, so a -Resume
+# run has no report to carry for any subscription it lists as completed. A key
+# holding an empty list does not count. A file that is absent, malformed or for a
+# different tenant reads as false, as it reads as no state in Get-CompletedReports.
+function Test-ResumeStateWithoutReports
+{
+    param([string]$Path, [string]$Tenant)
+
+    if (-not (Test-Path -Path $Path -PathType Leaf)) { return $false }
+    try
+    {
+        $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        if ($State.TenantID -ne $Tenant) { return $false }
+        return ($null -eq $State.PSObject.Properties['CompletedReports'])
+    }
+    catch
+    {
+        return $false
+    }
+}
+
 function Save-CompletedSubscriptionIds
 {
     param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), $Reports = @())

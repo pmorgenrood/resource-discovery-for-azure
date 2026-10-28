@@ -204,6 +204,21 @@ Describe 'Resume state: the report zip of each completed subscription' {
         @(Get-CompletedReports -Path $State -Tenant 't').Count | Should -Be 0
     }
 
+    It 'Test-ResumeStateWithoutReports is true only for a state file of this tenant that has no CompletedReports key' {
+        $State = Join-Path $script:Root '.resume-state-t.json'
+        Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeFalse -Because 'there is no state file'
+        @{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a'); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath $State
+        Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeTrue
+        Test-ResumeStateWithoutReports -Path $State -Tenant 'other' | Should -BeFalse -Because 'the file is for another tenant'
+        Save-CompletedSubscriptionIds -Path $State -Tenant 't' -Ids @('sub-a')
+        (Get-Content -LiteralPath $State -Raw) | Should -Match '"CompletedReports":\s*\[\s*\]'
+        Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeFalse -Because 'an empty CompletedReports list is not a missing key'
+        '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"CompletedReports":null}' | Set-Content -LiteralPath $State
+        Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeFalse -Because 'the key is present, even with a null value'
+        '{ not json' | Set-Content -LiteralPath $State
+        Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeFalse -Because 'an unparseable file reads as no state'
+    }
+
     It 'an unparseable state file, or one for another tenant, reads as no reports' {
         $State = Join-Path $script:Root '.resume-state-t.json'
         Set-Content -Path $State -Value '{ "TenantID": "t", "CompletedReports": [ {' -Encoding utf8
@@ -783,5 +798,104 @@ Describe 'The -Resume output shows when each carried report was written' {
         $Expected = '  - Sub A: report written {0}, {1} day(s) ago' -f (Get-Item -LiteralPath $script:Zip).LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $Days
         @($Post.Text | Where-Object { $_ -like '  - Sub A: *' }) | Should -Be @($Expected)
         ($Post.Text -join "`n") | Should -Match 'verification: OK \(1 zip\(s\) match 0 successful sub\(s\) this run \+ 1 carried'
+    }
+}
+
+Describe 'A -Resume run on a state file written before CompletedReports existed' {
+    BeforeAll {
+        # The resume-state loading at startup, from reading the state file through
+        # the "Resume mode" lines, lifted from the wrapper's AST and run as written.
+        $Tokens = $null
+        $ParseErrors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:WrapperPath, [ref]$Tokens, [ref]$ParseErrors)
+        $Top = @($Ast.EndBlock.Statements)
+        $From = -1
+        $To = -1
+        for ($i = 0; $i -lt $Top.Count; $i++)
+        {
+            if ($From -lt 0 -and $Top[$i] -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Top[$i].Left.Extent.Text -eq '$CompletedIds') { $From = $i }
+            if ($From -ge 0 -and $Top[$i] -is [System.Management.Automation.Language.IfStatementAst] -and $Top[$i].Clauses[0].Item1.Extent.Text -eq '$Resume') { $To = $i; break }
+        }
+        if ($From -lt 0 -or $To -lt 0) { throw 'Expected the resume-state loading at startup in the wrapper.' }
+        $StartText = (@($Top[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n")
+        $script:StartupBlock = [scriptblock]::Create(
+            "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$Resume)`n`$ResumeFailedOnly = `$false`n" +
+            $StartText + "`n[pscustomobject]@{ CompletedIds = @(`$CompletedIds); FailedAttempts = @(`$FailedAttempts); CompletedReports = @(`$CompletedReports) }")
+
+        # Startup, then the sequential loop over sub-a and sub-b, then the post-processing.
+        function script:Invoke-ResumeFromState
+        {
+            param($Root, $State)
+            $Start = @(& $script:StartupBlock $Root 't' $State $true 6>&1)
+            $Loaded = $Start | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['CompletedIds'] } | Select-Object -Last 1
+            $StartText = @($Start | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+            $Since = Get-Date
+            $Run = & $script:SequentialBlock $script:FakeRoot @($script:A, $script:B) $true @($Loaded.CompletedIds) @($Loaded.FailedAttempts) @($Loaded.CompletedReports) $Root $State 't' $false 6>$null
+            $Post = script:Invoke-Post -Root $Root -Since $Since -ThisRun $Run.SubResourceCounts -Skipped $Run.SkippedSubscriptions -Reports $Run.CompletedReports
+            return [pscustomobject]@{ Loaded = $Loaded; StartText = $StartText; Run = $Run; Post = $Post }
+        }
+    }
+
+    BeforeEach {
+        $script:Root = script:New-CaseRoot
+        $Global:RdaCarryTestRoot = $script:Root
+        $global:LASTEXITCODE = 0
+        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
+        $script:B = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' }
+        # An older version completed sub-a (its zip is on disk, two hours old) and
+        # recorded a failed attempt at sub-c, without a CompletedReports key.
+        $OldZip = script:New-TestReport -Root $script:Root -Stamp '1aaaa' -SubName 'Sub A'
+        script:Set-ReportAge -Zip $OldZip -When (Get-Date).AddHours(-2)
+        [ordered]@{
+            TenantID                 = 't'
+            CompletedSubscriptionIds = @('sub-a')
+            FailedAttempts           = @([ordered]@{ Id = 'sub-c'; Name = 'Sub C'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'stand-in'; Attempts = 1 })
+            LastUpdated              = '2026-01-01T00:00:00Z'
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+    }
+
+    It 'collects the subscriptions it lists as completed again, says so in one line, and ships a report for each' {
+        $R = script:Invoke-ResumeFromState -Root $script:Root -State $script:State
+
+        @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'no report of sub-a is recorded, so skipping it would leave it out of the bundle'
+        @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
+        @($R.StartText | Where-Object { $_ -like 'Resume mode:*' }) | Should -Be @('Resume mode: the resume state was written by an older version, so 1 subscription(s) will be collected again for the bundle to hold their reports.')
+        @($R.Post.Result.Uncarried).Count | Should -Be 0
+        ($R.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 2 successful sub\(s\)\)'
+        @(script:Get-InnerZipNames -OuterZip $R.Post.Result.OuterZipFile).Count | Should -Be 2
+        @($R.Loaded.FailedAttempts | ForEach-Object Id) | Should -Be @('sub-c') -Because 'failed attempts are read as before'
+        @(Get-FailedAttempts -Path $script:State -Tenant 't' | ForEach-Object Id) | Should -Be @('sub-c')
+    }
+
+    It 'counts only what the state file lists, not the per-stream state an interrupted parallel run left' {
+        # Two ids in the state file (the fold joins a one-id list and the stranded ids
+        # into one string), and an older version's stream file: sub-x completed, no
+        # Reports. The stream that owns it skips sub-x on -Resume, so it is not one this
+        # run collects again.
+        [ordered]@{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a', 'sub-b'); FailedAttempts = @(); LastUpdated = '2026-01-01T00:00:00Z' } | ConvertTo-Json | Set-Content -LiteralPath $script:State -Encoding utf8
+        @{ Tenant = 't'; StreamId = '0'; Completed = @('sub-x'); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t-stream-0.json') -Encoding utf8
+        $Start = @(& $script:StartupBlock $script:Root 't' $script:State $true 6>&1)
+        $Loaded = $Start | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['CompletedIds'] } | Select-Object -Last 1
+        $Lines = @($Start | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData } | Where-Object { $_ -like 'Resume mode:*' })
+
+        $Lines | Should -Be @(
+            'Resume mode: the resume state was written by an older version, so 2 subscription(s) will be collected again for the bundle to hold their reports.',
+            'Resume mode: 1 previously completed subscription(s) will be skipped.')
+        @($Loaded.CompletedIds) | Should -Be @('sub-x')
+    }
+
+    It 'the next -Resume run skips them as usual and carries the reports this run recorded' {
+        $null = script:Invoke-ResumeFromState -Root $script:Root -State $script:State
+        Get-ChildItem -LiteralPath $script:Root -Directory -Filter 'ResourcesReport*' | ForEach-Object {
+            $Zip = Get-ChildItem -LiteralPath $_.FullName -Filter '*.zip' | Select-Object -First 1
+            if ($Zip) { script:Set-ReportAge -Zip $Zip.FullName -When (Get-Date).AddHours(-1) }
+        }
+        $R3 = script:Invoke-ResumeFromState -Root $script:Root -State $script:State
+
+        @($R3.StartText | Where-Object { $_ -like 'Resume mode:*' }) | Should -Be @('Resume mode: 2 previously completed subscription(s) will be skipped.')
+        @($R3.Run.SkippedSubscriptions | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
+        @($R3.Post.Result.Uncarried).Count | Should -Be 0
+        ($R3.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 0 successful sub\(s\) this run \+ 2 carried'
     }
 }

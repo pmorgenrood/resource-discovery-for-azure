@@ -725,6 +725,10 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # A -Resume run carries these into the consolidated zip for the subscriptions it
 # skips; every save below writes them back.
 $CompletedReports = Get-CompletedReports -Path $ResumeStateFile -Tenant $TenantID
+# The subscriptions a state file written before CompletedReports existed lists as
+# completed (see the -Resume block below). Read now, before the fold of per-stream
+# state can rewrite the file with the key.
+$IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -Tenant $TenantID) { @($CompletedIds) } else { @() }
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -782,11 +786,26 @@ if ($Resume -or $ResumeFailedOnly)
 
 if ($Resume)
 {
+    # A state file written by a version without CompletedReports records no report
+    # zip for its completed subscriptions, so none of them could be carried into
+    # this run's consolidated zip. Collect those again instead of skipping them;
+    # this run saves their records, so the next -Resume skips them as usual.
+    $RecollectIds = @()
+    if ($IdsWithoutReports.Count -gt 0)
+    {
+        $RecordedReports = Get-LatestCompletedReports -Reports $CompletedReports
+        $RecollectIds = @($IdsWithoutReports | Where-Object { -not $RecordedReports.ContainsKey([string]$_) })
+        $CompletedIds = @($CompletedIds | Where-Object { $RecollectIds -notcontains $_ })
+    }
+    if ($RecollectIds.Count -gt 0)
+    {
+        Write-Host ("Resume mode: the resume state was written by an older version, so {0} subscription(s) will be collected again for the bundle to hold their reports." -f $RecollectIds.Count) -ForegroundColor Cyan
+    }
     if ($CompletedIds.Count -gt 0)
     {
         Write-Host ("Resume mode: {0} previously completed subscription(s) will be skipped." -f $CompletedIds.Count) -ForegroundColor Cyan
     }
-    else
+    elseif ($RecollectIds.Count -eq 0)
     {
         Write-Host "Resume mode: no previous state found; processing all subscriptions." -ForegroundColor Cyan
     }
