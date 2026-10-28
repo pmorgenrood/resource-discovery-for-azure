@@ -39,6 +39,10 @@ if ($Task -eq 'Processing')
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
             $OS = $Data.virtualMachineProfile.storageProfile.osDisk.osType
+            # The image version, as VirtualMachines.ps1 reads exactVersion; a scale
+            # set model usually carries only the requested version (e.g. 'latest').
+            $ImageReference = $Data.virtualMachineProfile.storageProfile.imageReference
+            $ImageVersion = if (-not [string]::IsNullOrEmpty($ImageReference.exactVersion)) { $ImageReference.exactVersion } elseif (-not [string]::IsNullOrEmpty($ImageReference.version)) { $ImageReference.version } else { $null }
             $Scaling = ($AutoScale | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
 
             if ([string]::IsNullOrEmpty($Scaling)) { $AutoSc = $false }else { $AutoSc = $true }
@@ -74,7 +78,7 @@ if ($Task -eq 'Processing')
                 'RAM'                           = $Ram;
                 'VMOS'                          = $OS;
                 'OSImage'                       = $Data.virtualMachineProfile.storageProfile.imageReference.offer;
-                'ImageVersion'                  = $Data.virtualMachineProfile.storageProfile.imageReference.sku;
+                'ImageVersion'                  = $ImageVersion;
                 'DiskSizeGB'                    = $Data.virtualMachineProfile.storageProfile.osDisk.diskSizeGB;
                 'StorageAccountType'            = $Data.virtualMachineProfile.storageProfile.osDisk.managedDisk.storageAccountType;
                 'AcceleratedNetworkingEnabled'  = $Data.virtualMachineProfile.networkProfile.networkInterfaceConfigurations.properties.enableAcceleratedNetworking;
