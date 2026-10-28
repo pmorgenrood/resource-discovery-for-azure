@@ -627,11 +627,12 @@ A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) also sets an exit c
 
 | Code | Meaning |
 |---|---|
-| `0` | Completed; no collector failed. A run that stopped before writing its zip, for example after 5 collectors failed in a row, can also end with `0`, so check that the zip named on the `Reporting Data File:` line exists. |
+| `0` | Completed and the report and zip were written; no collector failed. |
 | `1` | A pre-flight check stopped the run before collection (for example `-Service` matched no collector, or the `-ObfuscationDictionary` file is missing or not valid JSON). |
+| `2` | No report was written: the run ended without its zip, for example because 5 collectors failed in a row and collection stopped, or because the HTML report or the zip could not be written. The last console line says `No report was written`; the errors printed before it give the cause. |
 | `4` | Completed and the report and zip were written, but one or more `Services/*/*.ps1` collectors failed. Those resource types are missing (not empty) from the report; its "Incomplete collection" banner names them. |
 
-Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `4` when a collector failed; the wrapper reports the failure with its own code `4` above.
+Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script exits neither `2` nor `4`; the wrapper reports a missing zip with its own code `2` and collector failures with its own code `4` above.
 
 ### Important Notes
 
