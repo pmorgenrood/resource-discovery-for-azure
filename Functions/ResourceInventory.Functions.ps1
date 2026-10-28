@@ -31,7 +31,7 @@ function GetLocalVersion()
     else
     {
         Write-Host "Local Version.json not found. Clone the repo and execute the script from the root. Exiting." -ForegroundColor Red
-        Exit
+        exit 1
     }
 }
 
