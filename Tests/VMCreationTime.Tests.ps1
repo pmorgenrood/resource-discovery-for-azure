@@ -251,6 +251,19 @@ Describe 'VM collector CreatedTime' {
         ($Recs | ForEach-Object { $_.CreatedTime }) | Should -Be @('Unknown', 'Unknown', '2024-03-15 09:41', 'Unknown', 'Unknown')
     }
 
+    It 'leaves CPU and Memory empty for a size the size list does not return' {
+        $Record = New-VmRecord -Name 'vm-unlisted' -TimeCreatedMode Value -TimeCreated '2024-03-15T09:41:27.1234567'
+        $Record.PROPERTIES.hardwareProfile = [pscustomobject]@{ vmSize = 'Basic_A1' }
+        $Recs = @(Invoke-VmCollector -Resources @($script:Records['vm-valid'], $Record))
+        $Recs.Count | Should -Be 2
+        $Recs[0].CPU | Should -Be 2
+        $Recs[0].Memory | Should -Be 8
+        $Recs[1].Name | Should -BeExactly 'vm-unlisted'
+        $Recs[1].Size | Should -BeExactly 'Basic_A1'
+        $Recs[1].CPU | Should -Be $null
+        $Recs[1].Memory | Should -Be $null
+    }
+
     It 'leaves every other column unchanged for <Name>' -ForEach @(
         @{ Name = 'vm-absent' }
         @{ Name = 'vm-null' }

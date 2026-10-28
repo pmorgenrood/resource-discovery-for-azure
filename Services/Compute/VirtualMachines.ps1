@@ -64,11 +64,10 @@ If ($Task -eq 'Processing')
                 $OSDiskSize = $Data.storageProfile.osDisk.diskSizeGB
             }
 
+            # A size the size list for the region does not return (a retired size, for
+            # example) leaves CPU and Memory empty rather than 0.
             $Cpus = $Vmsizemap[$Data.hardwareProfile.vmSize].CPU;
             $Ram = $Vmsizemap[$Data.hardwareProfile.vmSize].RAM;
-
-            $Cpus = if ($null -ne $Cpus) { $Cpus } else { '0' }
-            $Ram = if ($null -ne $Ram) { $Ram } else { '0' }
 
             $PowerState = if ($null -ne $Data.extended.instanceView.powerState.displayStatus) { $Data.extended.instanceView.powerState.displayStatus } else { 'vm unknown' }
 
