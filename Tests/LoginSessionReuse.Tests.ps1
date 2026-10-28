@@ -75,8 +75,6 @@ Describe 'LoginSession on a direct run' {
     BeforeAll {
         . ([scriptblock]::Create($script:LoginFunctionText))
 
-        function Write-Log { param($Message, $Severity) $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
-
         # Simulated az CLI. Records each call as one space-joined string and
         # sets $LASTEXITCODE the way the real executable would.
         function az
@@ -160,6 +158,7 @@ Describe 'LoginSession on a direct run' {
         $script:LogLines = [System.Collections.Generic.List[string]]::new()
         $Global:RdaSessionInitialized = $true
         $Global:Subscriptions = @()
+        Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
         Mock -CommandName Connect-AzAccount -MockWith {
             $script:Sim.PsTenant = if ($Tenant) { $Tenant } else { $script:Sim.HomeTenant }
             $script:Sim.PsTokenOk = $true
@@ -232,6 +231,7 @@ Describe 'LoginSession on a direct run' {
     It 'signs in with the managed identity on both sides with -UseManagedIdentity' {
         $UseManagedIdentity = [switch]$true
         $TenantID = $script:TenantA
+        $null = $UseManagedIdentity, $TenantID
         Set-SignInState
 
         LoginSession 6>$null
@@ -245,6 +245,7 @@ Describe 'LoginSession on a direct run' {
 
     It 'signs in with the managed identity without a tenant when -TenantID is not given' {
         $UseManagedIdentity = [switch]$true
+        $null = $UseManagedIdentity
         Set-SignInState
 
         LoginSession 6>$null
@@ -257,6 +258,7 @@ Describe 'LoginSession on a direct run' {
 
     It 're-authenticates only az CLI when it is on a different tenant than -TenantID' {
         $TenantID = $script:TenantB
+        $null = $TenantID
         Set-SignInState -CliTenant $script:TenantA -PsTenant $script:TenantB
 
         LoginSession 6>$null
@@ -269,6 +271,7 @@ Describe 'LoginSession on a direct run' {
 
     It 're-authenticates only Az PowerShell when it is on a different tenant than -TenantID' {
         $TenantID = $script:TenantB
+        $null = $TenantID
         Set-SignInState -CliTenant $script:TenantB -PsTenant $script:TenantA
 
         LoginSession 6>$null
@@ -289,6 +292,7 @@ Describe 'LoginSession on a direct run' {
 
     It 'uses device code sign-in for the side it signs in when -DeviceLogin is given' {
         $DeviceLogin = [switch]$true
+        $null = $DeviceLogin
         Set-SignInState -PsTenant $script:TenantA
 
         LoginSession 6>$null
@@ -313,6 +317,7 @@ Describe 'LoginSession on a direct run' {
         $TenantID = $script:TenantA
         $Appid = [guid]::NewGuid().ToString()
         $Secret = ConvertTo-SecureString -String 'not-a-real-secret' -AsPlainText -Force
+        $null = $TenantID, $Appid, $Secret
         Set-SignInState
 
         LoginSession 6>$null
@@ -325,6 +330,7 @@ Describe 'LoginSession on a direct run' {
     It 'signs in nothing under -RunAllSubs' {
         $RunAllSubs = [switch]$true
         $TenantID = $script:TenantA
+        $null = $RunAllSubs, $TenantID
         Set-SignInState -CliTenant $script:TenantA -PsTenant $script:TenantA
 
         LoginSession 6>$null
@@ -333,5 +339,107 @@ Describe 'LoginSession on a direct run' {
         @(Get-AzClears).Count | Should -Be 0
         Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly
         @($Global:Subscriptions).Count | Should -Be 1
+    }
+}
+
+# A side whose token probe still fails after its one sign-in attempt must stop
+# the run (exit 1) instead of prompting again. The stop is a real `exit`, so
+# these cases run LoginSession in a child pwsh process with file-logged fakes.
+Describe 'LoginSession when a sign-in does not give a usable token' {
+
+    BeforeAll {
+        $script:Harness = Join-Path $TestDrive 'login-harness.ps1'
+        @'
+param([string]$Root, [string]$CallLog, [string]$Scenario, [string]$Tenant)
+$ErrorActionPreference = 'SilentlyContinue'
+. (Join-Path $Root 'Functions/Common.Functions.ps1')
+$Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+$Fn = $Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'LoginSession' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($Fn.Extent.Text))
+
+# Simulated sign-in state. A sign-in "succeeds" but never yields a token for
+# the failing side, so its probe fails again afterwards.
+$Global:Sim = switch ($Scenario)
+{
+    'az-token-fails' { @{ CliTenant = $Tenant; CliToken = $false; PsTenant = $Tenant; PsToken = $true } }
+    'ps-token-fails' { @{ CliTenant = $Tenant; CliToken = $true; PsTenant = $Tenant; PsToken = $false } }
+    'mi-token-fails' { @{ CliTenant = $null; CliToken = $false; PsTenant = $null; PsToken = $false } }
+}
+function global:Write-Log { param($Message, $Severity) Write-Output ('{0}: {1}' -f $Severity, $Message) }
+function global:az
+{
+    $Line = ($args | ForEach-Object { [string]$_ }) -join ' '
+    Add-Content -Path $CallLog -Value ('az ' + $Line)
+    $global:LASTEXITCODE = 0
+    if ($Line -like 'cloud list*') { return '[{"name":"AzureCloud","isActive":true}]' }
+    if ($Line -like 'account show*') { if ($Global:Sim.CliTenant) { return ('{{"tenantId":"{0}"}}' -f $Global:Sim.CliTenant) }; $global:LASTEXITCODE = 1; return }
+    if ($Line -like 'account get-access-token*') { if (-not $Global:Sim.CliToken) { $global:LASTEXITCODE = 1 }; return }
+    if ($Line -like 'account list*') { return ('[{{"id":"sub-1","tenantId":"{0}"}}]' -f $Global:Sim.CliTenant) }
+    if ($Line -like 'login*') { $Global:Sim.CliTenant = $Tenant; return }
+}
+function global:Get-AzContext { [CmdletBinding()] param() if ($Global:Sim.PsTenant) { [pscustomobject]@{ Account = 'user'; Tenant = [pscustomobject]@{ Id = $Global:Sim.PsTenant } } } }
+function global:Get-AzAccessToken { [CmdletBinding()] param($TenantId) if ($Global:Sim.PsToken) { [pscustomobject]@{ Token = 'token' } } else { throw 'User interaction is required.' } }
+function global:Connect-AzAccount
+{
+    [CmdletBinding()] param([string]$Tenant, [switch]$Identity, [switch]$UseDeviceAuthentication)
+    Add-Content -Path $CallLog -Value ('Connect-AzAccount' + $(if ($Identity) { ' -Identity' }) + $(if ($Tenant) { ' -Tenant ' + $Tenant }))
+    $Global:Sim.PsTenant = $Tenant
+}
+
+$Global:RdaSessionInitialized = $true
+$TenantID = if ($Scenario -eq 'mi-token-fails') { $Tenant } else { $null }
+$UseManagedIdentity = [switch]($Scenario -eq 'mi-token-fails')
+$Appid = $null; $DeviceLogin = [switch]$false; $RunAllSubs = [switch]$false
+LoginSession
+Add-Content -Path $CallLog -Value 'returned'
+exit 0
+'@ | Set-Content -Path $script:Harness -Encoding utf8
+
+        function Invoke-LoginHarness
+        {
+            param([string]$Scenario)
+            $CallLog = Join-Path $TestDrive ('calls-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log')
+            $Output = & (Join-Path $PSHOME 'pwsh') -NoProfile -NonInteractive -File $script:Harness -Root $script:RepoRoot -CallLog $CallLog -Scenario $Scenario -Tenant $script:TenantA 2>&1 | Out-String
+            $Code = $LASTEXITCODE
+            $Calls = if (Test-Path -LiteralPath $CallLog) { @(Get-Content -LiteralPath $CallLog) } else { @() }
+            [pscustomobject]@{
+                ExitCode = $Code
+                Output   = $Output
+                Calls    = $Calls
+                AzLogins = @($Calls | Where-Object { $_ -like 'az login*' })
+                Connects = @($Calls | Where-Object { $_ -like 'Connect-AzAccount*' })
+            }
+        }
+    }
+
+    It 'signs in az CLI once and stops with exit 1 when its token probe still fails' {
+        $Run = Invoke-LoginHarness -Scenario 'az-token-fails'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.AzLogins.Count | Should -Be 1 -Because 'one sign-in attempt per side, never a second prompt'
+        $Run.Connects.Count | Should -Be 0
+        $Run.Calls | Should -Not -Contain 'returned'
+        $Run.Calls | Should -Not -Contain 'az account list --output json --only-show-errors'
+        $Run.Output | Should -Match 'az CLI: sign-in to tenant .* did not give a usable token'
+    }
+
+    It 'connects Az PowerShell once and stops with exit 1 when its token probe still fails' {
+        $Run = Invoke-LoginHarness -Scenario 'ps-token-fails'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.Connects.Count | Should -Be 1 -Because 'one sign-in attempt per side, never a second prompt'
+        $Run.AzLogins.Count | Should -Be 0
+        $Run.Calls | Should -Not -Contain 'returned'
+        $Run.Output | Should -Match 'Az PowerShell: sign-in to tenant .* did not give a usable token'
+    }
+
+    It 'signs in with the managed identity once and stops with exit 1 when no token can be acquired' {
+        $Run = Invoke-LoginHarness -Scenario 'mi-token-fails'
+
+        $Run.ExitCode | Should -Be 1
+        $Run.AzLogins.Count | Should -Be 1
+        $Run.AzLogins[0] | Should -Match '--identity'
+        $Run.Connects.Count | Should -Be 1
+        $Run.Calls | Should -Not -Contain 'returned'
     }
 }
