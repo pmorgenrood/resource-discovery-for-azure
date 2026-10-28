@@ -1062,6 +1062,9 @@ function global:Start-Transcript
     exit 4
 }
 function global:Get-AzContext { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'tester' }; Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
+# A sign-in must never reach the real Az module from these runs.
+function global:Connect-AzAccount { throw 'Connect-AzAccount was called by a test run' }
+function global:Get-AzSubscription { throw 'Get-AzSubscription was called by a test run' }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
 function global:Invoke-AzRestMethod

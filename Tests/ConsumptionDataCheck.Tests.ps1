@@ -1141,6 +1141,9 @@ function global:az
     return $null
 }
 function global:Get-AzContext { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'tester' }; Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
+# A sign-in must never reach the real Az module from these runs.
+function global:Connect-AzAccount { throw 'Connect-AzAccount was called by a test run' }
+function global:Get-AzSubscription { throw 'Get-AzSubscription was called by a test run' }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
 # The up-front role check sees Reader at the subscription, so these runs reach
 # the consumption check. RDA_TEST_ROLES 'permissions-only' hides the role
