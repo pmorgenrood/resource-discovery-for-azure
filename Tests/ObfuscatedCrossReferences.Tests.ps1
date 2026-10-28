@@ -10,7 +10,9 @@
 #     link per frontend endpoint, so the property walk returns one id per linked
 #     endpoint. Two or more linked endpoints (a default endpoint and a custom
 #     domain, say) gave an array, which missed the dictionary lookup and wrote
-#     'obfuscated'.
+#     'obfuscated'. The column names every distinct policy (sorted by id, joined
+#     with ', '), each its own token under -Obfuscate, and says how many
+#     endpoints have no policy, in plain runs too.
 #   - AVD Hostname: in a plain run it is the backing VM's name, so under
 #     -Obfuscate it must be the name token that VM's own row gets. It was a hash
 #     of the VM id, which matched no row and no dictionary entry.
@@ -56,18 +58,21 @@ BeforeAll {
     $Edge = "/subscriptions/$($script:SubId)/resourcegroups/rg-edge/providers"
     $script:WafA = "$Edge/microsoft.network/frontdoorwebapplicationfirewallpolicies/wafpolicya"
     $script:WafB = "$Edge/microsoft.network/frontdoorwebapplicationfirewallpolicies/wafpolicyb"
+    $script:WafC = "$Edge/microsoft.network/frontdoorwebapplicationfirewallpolicies/wafpolicyc"
 
     function New-FrontDoor
     {
         # $Links: one entry per frontend endpoint; $null = no WAF link object,
-        # '' = a link object with an empty id, else the linked policy id.
+        # 'null' = the link set to null, '' = a link object with an empty id,
+        # else the linked policy id.
         param([string]$Name, [object[]]$Links)
         $i = 0
         $Endpoints = foreach ($Link in $Links)
         {
             $i++
             $Props = [ordered]@{ hostName = "$Name-$i.azurefd.net"; sessionAffinityEnabledState = 'Disabled' }
-            if ($null -ne $Link) { $Props.webApplicationFirewallPolicyLink = @{ id = $Link } }
+            if ($Link -eq 'null') { $Props.webApplicationFirewallPolicyLink = $null }
+            elseif ($null -ne $Link) { $Props.webApplicationFirewallPolicyLink = @{ id = $Link } }
             [ordered]@{ name = "endpoint$i"; properties = $Props }
         }
         [ordered]@{
@@ -98,19 +103,41 @@ Describe 'Front Door WAF policy column' {
         Get-WafColumn (New-FrontDoor 'fd-one' @($script:WafA)) $script:WafDict | Should -BeExactly $script:WafATok
     }
 
-    It 'holds the first linked policy when endpoints link different policies (obfuscated and plain)' {
-        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafA, $script:WafB)) $script:WafDict | Should -BeExactly $script:WafATok
-        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafA, $script:WafB)) $null | Should -BeExactly 'wafpolicya'
+    It 'names every policy, sorted by id, when endpoints link different policies (obfuscated and plain)' {
+        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafA, $script:WafB)) $script:WafDict | Should -BeExactly "$($script:WafATok), $($script:WafBTok)"
+        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafA, $script:WafB)) $null | Should -BeExactly 'wafpolicya, wafpolicyb'
+        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafB, $script:WafA, $script:WafB)) $script:WafDict | Should -BeExactly "$($script:WafATok), $($script:WafBTok)"
+        Get-WafColumn (New-FrontDoor 'fd-split' @($script:WafB, $script:WafA, $script:WafB)) $null | Should -BeExactly 'wafpolicya, wafpolicyb'
     }
 
-    It 'skips an endpoint with no link or an empty link id' {
-        Get-WafColumn (New-FrontDoor 'fd-mixed' @($null, '', $script:WafB)) $script:WafDict | Should -BeExactly $script:WafBTok
-        Get-WafColumn (New-FrontDoor 'fd-mixed' @($null, '', $script:WafB)) $null | Should -BeExactly 'wafpolicyb'
+    It 'counts an endpoint with no link or an empty link id as without WAF' {
+        Get-WafColumn (New-FrontDoor 'fd-mixed' @($null, '', $script:WafB)) $script:WafDict | Should -BeExactly "$($script:WafBTok) (2 of 3 endpoints without WAF)"
+        Get-WafColumn (New-FrontDoor 'fd-mixed' @($null, '', $script:WafB)) $null | Should -BeExactly 'wafpolicyb (2 of 3 endpoints without WAF)'
+    }
+
+    It 'says how many endpoints have no policy when two of three are unlinked (obfuscated and plain)' {
+        $Fd = New-FrontDoor 'fd-partial' @('null', $null, $script:WafB)
+        Get-WafColumn $Fd $script:WafDict | Should -BeExactly "$($script:WafBTok) (2 of 3 endpoints without WAF)"
+        Get-WafColumn $Fd $null | Should -BeExactly 'wafpolicyb (2 of 3 endpoints without WAF)'
+    }
+
+    It 'writes the policy, not its resource type, when an empty link comes first (obfuscated and plain)' {
+        $Fd = New-FrontDoor 'fd-emptyfirst' @('', $script:WafB)
+        Get-WafColumn $Fd $script:WafDict | Should -BeExactly "$($script:WafBTok) (1 of 2 endpoints without WAF)"
+        Get-WafColumn $Fd $null | Should -BeExactly 'wafpolicyb (1 of 2 endpoints without WAF)'
+    }
+
+    It 'names both policies and the endpoint without one together (obfuscated and plain)' {
+        $Fd = New-FrontDoor 'fd-both' @($script:WafB, 'null', $script:WafA)
+        Get-WafColumn $Fd $script:WafDict | Should -BeExactly "$($script:WafATok), $($script:WafBTok) (1 of 3 endpoints without WAF)"
+        Get-WafColumn $Fd $null | Should -BeExactly 'wafpolicya, wafpolicyb (1 of 3 endpoints without WAF)'
     }
 
     It "writes 'False' when no endpoint has a link id" {
         Get-WafColumn (New-FrontDoor 'fd-none' @($null, '')) $script:WafDict | Should -BeExactly 'False'
         Get-WafColumn (New-FrontDoor 'fd-none' @($null)) $null | Should -BeExactly 'False'
+        Get-WafColumn (New-FrontDoor 'fd-none' @('null', 'null')) $null | Should -BeExactly 'False'
+        Get-WafColumn (New-FrontDoor 'fd-none' @()) $null | Should -BeExactly 'False'
     }
 
     It 'names the policy when two endpoints link it (plain)' {
@@ -121,6 +148,78 @@ Describe 'Front Door WAF policy column' {
         $Other = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Other['/subscriptions/x/other'] = New-Token
         Get-WafColumn (New-FrontDoor 'fd-two' @($script:WafA, $script:WafA)) $Other | Should -BeExactly 'obfuscated'
+    }
+
+    It "writes 'obfuscated' only for the policy that is not in the dictionary (obfuscated)" {
+        Get-WafColumn (New-FrontDoor 'fd-other' @($script:WafC, $script:WafA)) $script:WafDict | Should -BeExactly "$($script:WafATok), obfuscated"
+    }
+
+    It "keeps a link id that is not a resource id whole (plain), and writes 'obfuscated' for it (obfuscated)" {
+        Get-WafColumn (New-FrontDoor 'fd-bad' @('not-a-resource-id')) $null | Should -BeExactly 'not-a-resource-id'
+        Get-WafColumn (New-FrontDoor 'fd-bad' @('not-a-resource-id')) $script:WafDict | Should -BeExactly 'obfuscated'
+    }
+
+    It "keeps 'Unknown' for a Standard or Premium profile" {
+        $AfdProfile = [ordered]@{
+            id = "$Edge/microsoft.cdn/profiles/afd-std"; name = 'afd-std'; type = 'microsoft.cdn/profiles'; location = 'global'
+            subscriptionId = $script:SubId; resourceGroup = 'rg-edge'; sku = @{ name = 'Standard_AzureFrontDoor' }; properties = @{ provisioningState = 'Succeeded' }
+        }
+        Get-WafColumn $AfdProfile $script:WafDict | Should -BeExactly 'Unknown'
+        Get-WafColumn $AfdProfile $null | Should -BeExactly 'Unknown'
+    }
+}
+
+Describe 'Front Door WAF policy column after Reveal.ps1 -All' {
+    BeforeAll {
+        # An obfuscated report and dictionary in the shapes ResourceInventory.ps1 writes:
+        # masked ids share the subscription and resource group tokens, and the
+        # dictionary maps each token back to the real resource id.
+        $script:RevealDir = Join-Path ([System.IO.Path]::GetTempPath()) ('WafReveal_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $script:RevealDir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        $SubTok = New-Token
+        $RgTok = New-Token
+        $IdDict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        $Dict = [ordered]@{
+            GeneratedAt = '2026-10-28 00:00:00'; ResourceIdMap = [ordered]@{}; ResourceNameMap = [ordered]@{}
+            SubscriptionMap = [ordered]@{ $SubTok = $script:WafA }; ResourceGroupMap = [ordered]@{ $RgTok = $script:WafA }
+            SubscriptionNameMap = [ordered]@{ $SubTok = 'sub-demo' }; TagMap = [ordered]@{}; FreeTextMap = [ordered]@{}
+        }
+        foreach ($Id in @($script:WafA, $script:WafB))
+        {
+            $NameTok = New-Token
+            $Masked = ($Id -replace '/subscriptions/[^/]+', "/subscriptions/$SubTok" -replace '/resourcegroups/[^/]+', "/resourcegroups/$RgTok") -replace '/[^/]+$', "/$NameTok"
+            $IdDict[$Id] = $Masked
+            $Dict.ResourceIdMap[$Masked] = $Id
+            $Dict.ResourceNameMap[$NameTok] = $Id
+        }
+        $script:RevealIdDict = $IdDict
+        $Row = @(Invoke-Collector -Path 'Infrastructure/Frontdoor.ps1' -Records @(New-FrontDoor 'fd-reveal' @($script:WafB, $null, $script:WafA)) -IdDictionary $IdDict)[0]
+        $script:ObfuscatedWaf = $Row.WebApplicationFirewall
+        [ordered]@{ Frontdoor = @($Row) } | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $Stage 'Inventory_Test.json') -Encoding utf8
+        $Zip = Join-Path $script:RevealDir 'ResourcesReport_Test.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+        $DictPath = Join-Path $script:RevealDir 'ObfuscationDictionary_Test.json'
+        $Dict | ConvertTo-Json -Depth 6 | Set-Content -Path $DictPath -Encoding utf8
+        $Out = Join-Path $script:RevealDir 'revealed.zip'
+        & (Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Reveal.ps1') -InputZip $Zip -DictionaryPath $DictPath -All -OutputZip $Out *>&1 | Out-Null
+        $Ex = Join-Path $script:RevealDir 'revealed'
+        Expand-Archive -Path $Out -DestinationPath $Ex -Force
+        $script:RevealedWaf = (Get-Content -Raw -Path (Join-Path $Ex 'Inventory_Test.json') | ConvertFrom-Json).Frontdoor[0].WebApplicationFirewall
+    }
+
+    AfterAll {
+        if ($script:RevealDir -and (Test-Path $script:RevealDir)) { Remove-Item -Path $script:RevealDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'holds each policy as its own masked id (obfuscated)' {
+        $script:ObfuscatedWaf | Should -BeExactly ("{0}, {1} (1 of 3 endpoints without WAF)" -f $script:RevealIdDict[$script:WafA], $script:RevealIdDict[$script:WafB])
+    }
+
+    It 'restores every policy and keeps the endpoint count' {
+        $script:RevealedWaf | Should -Not -Match '(?:prod|nonprod)_(?:[a-z0-9]+_)?[0-9a-f]{8}-'
+        $Policy = '/subscriptions/[^/,]+/resourcegroups/rg-edge/providers/microsoft\.network/frontdoorwebapplicationfirewallpolicies/'
+        $script:RevealedWaf | Should -Match ('^{0}wafpolicya, {0}wafpolicyb \(1 of 3 endpoints without WAF\)$' -f $Policy)
     }
 }
 
