@@ -39,10 +39,14 @@ BeforeAll {
     }
     . $script:FunctionsPath
 
+    # Resolve-AccessPreflight (tested below) lives in Common.Functions.ps1,
+    # which the wrapper also dot-sources.
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
+
     # Guard: the functions under test must be defined by the shared file. If a
     # future change renames or removes one, fail loudly here rather than with a
     # confusing "command not found" mid-test.
-    $TargetFunctions = @('Get-StreamResumeStateFiles', 'Merge-FailedAttempts', 'Get-WrapperExitCode', 'Add-FailedAttempt', 'Remove-FailedAttempt', 'Get-ConsumptionAccessOutcome', 'Resolve-AccessPreflight', 'Test-SubscriptionAccessAll')
+    $TargetFunctions = @('Get-StreamResumeStateFiles', 'Merge-FailedAttempts', 'Get-WrapperExitCode', 'Add-FailedAttempt', 'Remove-FailedAttempt')
     foreach ($Fn in $TargetFunctions)
     {
         if (-not (Get-Command $Fn -CommandType Function -ErrorAction SilentlyContinue))
@@ -239,30 +243,16 @@ Describe 'Merge-FailedAttempts single-element handling' {
     }
 }
 
-Describe 'Get-ConsumptionAccessOutcome classification' {
-    # Drives the up-front consumption (billing) access gate in Run-AllSubscriptions.ps1.
-    # 'Denied' -> hard fail (consumption was requested but the identity lacks access).
-    # 'Unavailable' -> transient/token class; NOT a hard failure (warn + continue).
-    # 'Ok' -> access confirmed.
+Describe 'Consumption check is not part of the wrapper functions file' {
+    # The up-front consumption check is the consumption data check in
+    # Functions/Common.Functions.ps1 (tested in ConsumptionDataCheck.Tests.ps1),
+    # shared by Run-AllSubscriptions.ps1 and direct runs of ResourceInventory.ps1.
+    # The earlier first-subscription gate treated "no error" as access confirmed
+    # and continued on transient errors; it must not come back beside the new check.
 
-    It 'Returns Ok for a null/empty message (successful probe)' {
-        Get-ConsumptionAccessOutcome -ErrorMessage $null | Should -Be 'Ok'
-        Get-ConsumptionAccessOutcome -ErrorMessage ''   | Should -Be 'Ok'
-    }
-
-    It 'Classifies authorization / RBAC denials as Denied' {
-        Get-ConsumptionAccessOutcome -ErrorMessage "The client 'x' does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'" | Should -Be 'Denied'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'AuthorizationFailed' | Should -Be 'Denied'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'Response status code 403 (Forbidden)' | Should -Be 'Denied'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'The user is not authorized to access this resource' | Should -Be 'Denied'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'Access is denied' | Should -Be 'Denied'
-    }
-
-    It 'Classifies transient / token / throttle errors as Unavailable (not a hard fail)' {
-        Get-ConsumptionAccessOutcome -ErrorMessage 'Unable to acquire token for tenant; user interaction is required' | Should -Be 'Unavailable'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'Response status code 429 (TooManyRequests)' | Should -Be 'Unavailable'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'A task was canceled (timeout)' | Should -Be 'Unavailable'
-        Get-ConsumptionAccessOutcome -ErrorMessage 'The remote name could not be resolved' | Should -Be 'Unavailable'
+    It 'no longer defines the first-subscription consumption gate' {
+        Get-Command 'Get-ConsumptionAccessOutcome' -CommandType Function -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        Get-Command 'Test-ConsumptionAccess' -CommandType Function -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
 }
 
@@ -334,28 +324,39 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
 
 Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
     # Pure decision function behind the wrapper's up-front access gate. Given the
-    # per-sub probe results (State in Empty/NoAccess/Unknown), it decides whether
-    # the run must STOP (default) or may proceed skipping the inaccessible subs
-    # (-AllowPartialAccess). 'Empty' means the identity CAN read the sub.
-    It 'does not block when every subscription is readable (all Empty)' {
+    # per-sub role check records (State in Readable/NoAccess/Disagree/Unknown),
+    # it decides which subs the run skips, and that the run must STOP when none
+    # is readable. 'Readable' means the identity CAN read the sub.
+    It 'does not block when every subscription is readable (all Readable)' {
         $Probed = @(
-            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Empty' }
-            [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'Empty' }
+            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
+            [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'Readable' }
         )
         $D = Resolve-AccessPreflight -Probed $Probed
         $D.ShouldBlock | Should -BeFalse
         @($D.Inaccessible).Count | Should -Be 0
     }
 
-    It 'blocks by default when any subscription is NoAccess' {
+    It 'skips a NoAccess subscription and does not block while another is readable' {
         $Probed = @(
-            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Empty' }
+            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
             [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'NoAccess' }
         )
         $D = Resolve-AccessPreflight -Probed $Probed
-        $D.ShouldBlock | Should -BeTrue -Because 'the default gate must stop the run when the identity cannot read a sub'
+        $D.ShouldBlock | Should -BeFalse -Because 'the run skips the unreadable sub and collects the readable one'
         @($D.Inaccessible).Count | Should -Be 1
         $D.InaccessibleIds | Should -Contain 's2'
+        $D.ReadableCount | Should -Be 1
+    }
+
+    It 'blocks when no checked subscription is readable' {
+        $Probed = @(
+            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'NoAccess' }
+            [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'Disagree' }
+        )
+        $D = Resolve-AccessPreflight -Probed $Probed
+        $D.ShouldBlock | Should -BeTrue -Because 'with nothing readable the run stops with exit 1'
+        $D.ReadableCount | Should -Be 0
     }
 
     It 'treats a persistent Unknown as inaccessible (never silently skipped)' {
@@ -365,14 +366,14 @@ Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
         $D.InaccessibleIds | Should -Contain 's1'
     }
 
-    It 'does NOT block when -AllowPartialAccess is set, but still reports the inaccessible subs to skip' {
+    It 'does not block while one subscription is readable, and reports every inaccessible sub to skip' {
         $Probed = @(
-            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Empty' }
+            [pscustomobject]@{ Id = 's1'; Name = 'One'; State = 'Readable' }
             [pscustomobject]@{ Id = 's2'; Name = 'Two'; State = 'NoAccess' }
             [pscustomobject]@{ Id = 's3'; Name = 'Three'; State = 'Unknown' }
         )
-        $D = Resolve-AccessPreflight -Probed $Probed -AllowPartialAccess
-        $D.ShouldBlock | Should -BeFalse -Because '-AllowPartialAccess lets the run proceed with the accessible subs'
+        $D = Resolve-AccessPreflight -Probed $Probed
+        $D.ShouldBlock | Should -BeFalse -Because 'the run proceeds with the accessible subs'
         @($D.Inaccessible).Count | Should -Be 2
         $D.InaccessibleIds | Should -Contain 's2'
         $D.InaccessibleIds | Should -Contain 's3'
