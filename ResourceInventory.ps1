@@ -572,26 +572,16 @@ Function RunInventorySetup()
             $Subscri = $SubscriptionID
 
             $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--subscriptions', $Subscri)
-            $EnvSizeNum = $EnvSize.data.'count_'
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri)
+            $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
-                $Loop = $EnvSizeNum / 1000
-                $Loop = [math]::ceiling($Loop)
-                $Looper = 0
-                $Limit = 0
+                # Every page, read with the skip token.
+                $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase
 
-                while ($Looper -lt $Loop)
-                {
-                    $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                    $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--subscriptions', $Subscri, '--skip', $Limit, '--first', 1000) -Lowercase
-
-                    $Global:Resources += $Resource.data
-                    Start-Sleep 2
-                    $Looper ++
-                    $Limit = $Limit + 1000
-                }
+                $Global:Resources += $Resource.data
             }
         }
         elseif ([string]::IsNullOrEmpty($ResourceGroup) -and ![string]::IsNullOrEmpty($SubscriptionID))
@@ -599,81 +589,57 @@ Function RunInventorySetup()
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID) -Severity 'Success'
 
             $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--subscriptions', $SubscriptionID)
-            $EnvSizeNum = $EnvSize.data.'count_'
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID)
+            $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
-                $Loop = $EnvSizeNum / 1000
-                $Loop = [math]::ceiling($Loop)
-                $Looper = 0
-                $Limit = 0
+                # Every page, read with the skip token.
+                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase
 
-                while ($Looper -lt $Loop)
-                {
-                    $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                    $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--subscriptions', $SubscriptionID, '--skip', $Limit, '--first', 1000) -Lowercase
-
-                    $Global:Resources += $Resource.data
-                    Start-Sleep 2
-                    $Looper ++
-                    $Limit = $Limit + 1000
-                }
+                $Global:Resources += $Resource.data
             }
         }
         else
         {
+            # Every subscription of the run, named explicitly (in batches of
+            # 1000), rather than whatever scope Resource Graph defaults to.
+            $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
             $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery
-            $EnvSizeCount = $EnvSize.Data.'count_'
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds
+            $EnvSizeCount = Get-AzGraphCount -Result $EnvSize
 
             Write-Log -Message ("Resources Output: {0} Resources Identified" -f $EnvSizeCount) -Severity 'Success'
 
             if ($EnvSizeCount -ge 1)
             {
-                $Loop = $EnvSizeCount / 1000
-                $Loop = [math]::Ceiling($Loop)
-                $Looper = 0
-                $Limit = 0
+                # Every page, read with the skip token.
+                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase
 
-                while ($Looper -lt $Loop)
-                {
-                    $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                    $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--skip', $Limit, '--first', 1000) -Lowercase
-
-                    $Global:Resources += $Resource.Data
-                    Start-Sleep 2
-                    $Looper++
-                    $Limit = $Limit + 1000
-                }
+                $Global:Resources += $Resource.Data
             }
         }
     }
 
     function ResourceInventoryAvd()
     {
-        $AVDSize = Invoke-AzGraphQuerySafe -Query "desktopvirtualizationresources | summarize count()"
-        $AVDSizeCount = $AVDSize.data.'count_'
+        # Like the az CLI call it replaces, not limited to -SubscriptionID: every
+        # subscription of the run, named explicitly (in batches of 1000).
+        $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
+        $AVDSize = Invoke-AzGraphQuerySafe -Query "desktopvirtualizationresources | summarize count()" -SubscriptionId $RunSubscriptionIds
+        $AVDSizeCount = Get-AzGraphCount -Result $AVDSize
 
         Write-Host ("AVD Resources Output: {0} AVD Resources Identified" -f $AVDSizeCount) -BackgroundColor Black -ForegroundColor Green
 
         if ($AVDSizeCount -ge 1)
         {
-            $Loop = $AVDSizeCount / 1000
-            $Loop = [math]::ceiling($Loop)
-            $Looper = 0
-            $Limit = 0
+            # Every page, read with the skip token.
+            $GraphQuery = "desktopvirtualizationresources | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+            $AVD = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase
 
-            while ($Looper -lt $Loop)
-            {
-                $GraphQuery = "desktopvirtualizationresources | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                $AVD = Invoke-AzGraphQuerySafe -Query $GraphQuery -ExtraArgs @('--skip', $Limit, '--first', 1000) -Lowercase
-
-                $Global:Resources += $AVD.data
-                Start-Sleep 2
-                $Looper++
-                $Limit = $Limit + 1000
-            }
+            $Global:Resources += $AVD.data
         }
     }
 
