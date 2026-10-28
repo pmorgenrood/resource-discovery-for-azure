@@ -53,7 +53,7 @@ BeforeAll {
                         diskSizeGB  = 128
                         managedDisk = [pscustomobject]@{ storageAccountType = 'Premium_LRS' }
                     }
-                    imageReference = [pscustomobject]@{ offer = 'WindowsServer'; sku = '2022-datacenter' }
+                    imageReference = [pscustomobject]@{ offer = 'WindowsServer'; sku = '2022-datacenter'; version = 'latest' }
                 }
                 networkProfile = [pscustomobject]@{
                     networkInterfaceConfigurations = @(
@@ -118,7 +118,7 @@ BeforeAll {
             'RAM'                          = 8
             'VMOS'                         = 'Windows'
             'OSImage'                      = 'WindowsServer'
-            'ImageVersion'                 = '2022-datacenter'
+            'ImageVersion'                 = 'latest'
             'DiskSizeGB'                   = 128
             'StorageAccountType'           = 'Premium_LRS'
             'AcceleratedNetworkingEnabled' = $true
