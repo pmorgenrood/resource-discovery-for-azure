@@ -650,7 +650,7 @@ function Add-FailedAttempt
     if ($null -ne $ExistingEntry)
     {
         $List = @($List | Where-Object { $_.Id -ne $Id })
-        $Attempts = if ($ExistingEntry.Attempts) { [int]$ExistingEntry.Attempts + 1 } else { 2 }
+        $Attempts = (Get-FailedAttemptCount -Entry $ExistingEntry) + 1
     }
     else
     {
@@ -766,6 +766,48 @@ function Write-NotCollectedSummary
     Write-Host ("Not Collected:           {0} ({1}) - no run has completed these and -ResumeFailedOnly retries only the retry list" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
     Write-Host ("Resume State:            {0} (kept)" -f $ResumeStateFile) -ForegroundColor Yellow
     Write-Host "Re-run with -Resume to collect them; it skips the subscriptions already completed." -ForegroundColor Yellow
+}
+
+# The number of failed runs a retry-list entry records (its Attempts): one more
+# for each run that failed the subscription, removed when it completes. An entry
+# without a whole number of at least 1 there (written by hand, or damaged) counts
+# as one failed run, so it is retried as before instead of stopping the run.
+function Get-FailedAttemptCount
+{
+    param([object]$Entry)
+    $Count = 0
+    if ($null -ne $Entry -and [int]::TryParse([string]$Entry.Attempts, [ref]$Count) -and $Count -ge 1) { return $Count }
+    return 1
+}
+
+# The retry-list entries of the subscriptions that failed $RetryLimit runs in a
+# row. -Resume and -ResumeFailedOnly do not collect these; a run without either
+# still does, and so does ./ResourceInventory.ps1 -SubscriptionID on its own.
+function Get-RetryLimitedAttempts
+{
+    param([object]$FailedAttempts)
+    $RetryLimit = 3
+    return @(@($FailedAttempts) | Where-Object { $null -ne $_ -and (Get-FailedAttemptCount -Entry $_) -ge $RetryLimit })
+}
+
+# Name the retry-list entries Get-RetryLimitedAttempts returned at the end of a
+# run, with their count and last reason, as incomplete. Prints nothing for an
+# empty list.
+function Write-RetryLimitSummary
+{
+    param([object]$RetryLimited, [string]$TenantID)
+    $List = @(@($RetryLimited) | Where-Object { $null -ne $_ })
+    if ($List.Count -eq 0) { return }
+    Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; -Resume and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    foreach ($Entry in $List)
+    {
+        Write-Host ("  - {0} ({1}): failed {2} runs in a row; last reason: {3}" -f $Entry.Name, $Entry.Id, (Get-FailedAttemptCount -Entry $Entry), $Entry.Reason) -ForegroundColor Yellow
+    }
+    Write-Host "  To try one again, run it on its own, or start a run without -Resume:" -ForegroundColor Yellow
+    foreach ($Entry in $List)
+    {
+        Write-Host ("    ./ResourceInventory.ps1 -TenantID {0} -SubscriptionID {1}" -f $TenantID, $Entry.Id) -ForegroundColor Yellow
+    }
 }
 
 # The resume-state record for one completed subscription's report zip:
@@ -1228,6 +1270,9 @@ function Get-RunSummaryLogContent
         $CollectorFailures = @(),
         $MetricsFailedSubs = @(),
         $ConsumptionFailedSubs = @(),
+        # Retry-list entries past the retry limit ({ Name; Id; Attempts; Reason }),
+        # from Get-RetryLimitedAttempts.
+        $RetryLimited = @(),
         [int]$ConsumptionRecordCount = 0,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
@@ -1260,6 +1305,7 @@ function Get-RunSummaryLogContent
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+    $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -1366,6 +1412,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Skipped   : {0} (already completed / resume)' -f $Skipped))
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
+    $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
@@ -1389,6 +1436,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Failed subscriptions (detail):')
             foreach ($FailedSub in $Failed) { $Lines.Add(('  - {0} ({1})' -f [string]$FailedSub.Name, [string]$FailedSub.Id)) }
+        }
+        if ($Limited.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Retry limit reached (detail; run each on its own with ./ResourceInventory.ps1 -SubscriptionID, or start a run without -Resume):')
+            foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
         }
         if ($NoAccess.Count -gt 0)
         {

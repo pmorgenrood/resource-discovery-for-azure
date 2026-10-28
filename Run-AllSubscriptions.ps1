@@ -867,6 +867,34 @@ if ($ResumeFailedOnly)
     }
 }
 
+# A subscription past the retry limit (Get-RetryLimitedAttempts) is not
+# collected by -Resume or -ResumeFailedOnly; a run without either still
+# collects it. Its entry stays on the retry list, so the summary keeps listing
+# it as incomplete and the count goes on if a later run fails it again.
+$SkippedForRetryLimit = @()
+if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
+{
+    $EligibleIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+    $SkippedForRetryLimit = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $EligibleIds -contains [string]$_.Id })
+    foreach ($Limited in $SkippedForRetryLimit)
+    {
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. To try it again, run ./ResourceInventory.ps1 -TenantID {4} -SubscriptionID {1} on its own, or start a run without -Resume." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason, $TenantID) -ForegroundColor Yellow
+    }
+    if ($SkippedForRetryLimit.Count -gt 0)
+    {
+        $SkippedLimitIds = @($SkippedForRetryLimit | ForEach-Object { [string]$_.Id })
+        $Subscriptions = @($Subscriptions | Where-Object { $SkippedLimitIds -notcontains [string]$_.Id })
+        if ($ResumeFailedOnly -and $Subscriptions.Count -eq 0)
+        {
+            Write-Host "ResumeFailedOnly: nothing left to retry; the subscriptions on the retry list are past the retry limit (named above)." -ForegroundColor Green
+            # As when the retry list is empty: name the subscriptions no run has
+            # reached. Those past the limit are on the retry list, so not among them.
+            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id }) -NotReadableIds $NotReadableIds) -ResumeStateFile $ResumeStateFile
+            Exit-Wrapper -Code 0
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Up-front access gate. Before ANY per-subscription work, verify the signed-in
 # identity can actually read every in-scope subscription. Azure Resource Graph
@@ -1459,6 +1487,9 @@ else
                     StreamSummaryPath  = $SummaryPath
                     StreamFailuresPath = $FailuresPath
                     SubscriptionIds    = $SliceIds
+                    # The retry-list entries for this slice, so a stream that fails
+                    # a subscription adds one run to its count (Add-FailedAttempt).
+                    PriorFailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $SliceIds -contains [string]$_.Id })
                     SubscriptionNames  = $SliceNames
                     ConcurrencyLimit   = $ConcurrencyLimit
                 }
@@ -1986,7 +2017,14 @@ if ($ResumeFailedOnly)
     $RetryListIds = @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
     $NotCollected = @(Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds $RetryListIds -NotReadableIds $NotReadableIds)
 }
-if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
+# The retry-list entries past the retry limit, listed as incomplete in the
+# summary. One this run skipped for the limit does not keep the state, so it is
+# cleared once everything else is done; one this run collected and failed again
+# keeps it, so the next -Resume or -ResumeFailedOnly run skips it.
+$RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
+$SkippedLimitIds = @($SkippedForRetryLimit | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+$RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ -and $SkippedLimitIds -notcontains [string]$_.Id }).Count
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
     try
     {
@@ -2228,7 +2266,7 @@ if ($FailedSubscriptions.Count -gt 0)
         Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Red
     }
 }
-elseif ($FailedAttempts.Count -gt 0)
+elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)
 {
     # No new failures this run, but the resume-state file still has lingering
     # FailedAttempts from a prior run that have not yet been retried. Surface
@@ -2241,6 +2279,11 @@ if ($NotCollected.Count -gt 0)
 {
     # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
     Write-NotCollectedSummary -NotCollected $NotCollected -ResumeStateFile $ResumeStateFile
+}
+if ($RetryLimited.Count -gt 0)
+{
+    # Set by the resume-state cleanup above.
+    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($OuterZipFile)
@@ -2296,6 +2339,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -CollectorFailures $Global:CollectorFailures `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
+            -RetryLimited $RetryLimited `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
