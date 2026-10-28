@@ -1683,6 +1683,9 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
 
 # Consolidate per-subscription ZIPs into a single outer ZIP
 $OuterZipFile = $null
+# Set when the consolidated ZIP could not be built or was lost afterwards;
+# named in the FAILED (consolidated zip) banner and gives exit code 2.
+$BundleBuildError = $null
 
 if (Test-Path -Path $InventoryRoot -PathType Container)
 {
@@ -1693,8 +1696,24 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $OuterZipFile = Join-Path $InventoryRoot "AllSubscriptions_ResourcesReport_$Timestamp.zip"
         Write-Host ("Compressing {0} per-subscription report(s) into: {1}" -f $SubZips.Count, $OuterZipFile) -ForegroundColor Cyan
-        Compress-Archive -Path $SubZips.FullName -DestinationPath $OuterZipFile -Force
-        Write-Host ("Reporting Data File: {0}" -f $OuterZipFile) -ForegroundColor Green
+        try
+        {
+            Compress-Archive -Path $SubZips.FullName -DestinationPath $OuterZipFile -Force -ErrorAction Stop
+            $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
+            if ($ZipProblem)
+            {
+                throw $ZipProblem
+            }
+            Write-Host ("Reporting Data File: {0}" -f $OuterZipFile) -ForegroundColor Green
+        }
+        catch
+        {
+            $BundleBuildError = "Could not build {0}: {1}" -f $OuterZipFile, $_.Exception.Message
+            Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
+            # The main summary, the summary block and the fold below all key on
+            # $OuterZipFile, so none of them may point at the missing zip.
+            $OuterZipFile = $null
+        }
     }
     else
     {
@@ -2121,6 +2140,27 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
     {
         Write-Host ("WARNING: Could not fold run-summary / main-summary into the consolidated zip: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
+    # A failed fold can remove the zip itself (a full disk does), so it is
+    # checked again: the extras are optional, the per-subscription zips are not.
+    $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
+    if ($ZipProblem)
+    {
+        $BundleBuildError = "{0} was lost while the run summary was added to it: {1}" -f $OuterZipFile, $ZipProblem
+        Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
+    }
+}
+
+# The consolidated zip is the run's output. When it could not be built, or was
+# lost afterwards, this banner says so after the summary and the run exits 2
+# below, even though every per-subscription report was written.
+if ($null -ne $BundleBuildError)
+{
+    Write-Host ""
+    Write-Host "================ FAILED (consolidated zip) ================" -ForegroundColor Red
+    Write-Host $BundleBuildError -ForegroundColor Red
+    Write-Host ("The per-subscription report zips of this run are still on disk under {0}." -f $InventoryRoot) -ForegroundColor Red
+    Write-Host "Fix the cause (for example, free up disk space), then run again." -ForegroundColor Red
+    Write-Host "=========================================================" -ForegroundColor Red
 }
 
 # Final, last-thing-the-user-sees banner when a requested data phase could not
@@ -2175,6 +2215,12 @@ if ($WrapperTranscriptStarted)
     catch { Write-Verbose ("Stop-Transcript on normal completion failed: {0}" -f $_.Exception.Message) }
 }
 
+# No consolidated zip means no report of this run is in it: exit 2, as for the
+# per-subscription verification gap, ahead of codes 3-5.
+if ($null -ne $BundleBuildError)
+{
+    exit 2
+}
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
