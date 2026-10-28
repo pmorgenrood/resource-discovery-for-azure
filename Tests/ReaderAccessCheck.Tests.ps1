@@ -1035,6 +1035,8 @@ $Global:UnreadableIds = @(($Unreadable -split ',') | Where-Object { $_ } | ForEa
 function global:az
 {
     $Joined = $args -join ' '
+    # Like the real az CLI, every call sets an exit code (0 = success).
+    $global:LASTEXITCODE = 0
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
     if ($Joined -like 'account list*') { return (ConvertTo-Json -InputObject @($Global:TestSubs) -Compress) }
     if ($Joined -like 'graph*' -and -not $env:RDA_TEST_GRAPH_DATA) { Set-Content -Path $env:RDA_TEST_INVENTORY_MARKER -Value 'inventory started'; exit 3 }
@@ -1059,7 +1061,7 @@ function global:Start-Transcript
         ConvertTo-Json -Compress | Set-Content -Path $env:RDA_TEST_COLLECTED
     exit 4
 }
-function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
+function global:Get-AzContext { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'tester' }; Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
 function global:Invoke-AzRestMethod

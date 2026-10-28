@@ -11,6 +11,7 @@ param ($TenantID,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
     [switch]$DeviceLogin,
+    [switch]$UseManagedIdentity,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
     $ConcurrencyLimit = 6,
@@ -487,7 +488,118 @@ Function RunInventorySetup()
             Write-Host $CurrentCloudEnvName.name -ForegroundColor Green
         }
 
-        $ExistingAccount = az account show --output json --only-show-errors 2>$null | ConvertFrom-Json
+        # Direct run (not -RunAllSubs, not a service principal): az CLI and Az
+        # PowerShell keep separate sign-ins, so each side is checked on its own.
+        # A side is reused when it is signed in to the target tenant AND can
+        # still acquire a token silently (a cached account alone may hold an
+        # expired or Conditional Access gated token); only a side that fails
+        # that check is signed in again. Each side gets at most one sign-in
+        # attempt: if its token probe still fails afterwards the run stops with
+        # exit 1 rather than prompting again.
+        if (!$RunAllSubs.IsPresent -and !$Appid)
+        {
+            function Stop-UnusableSignIn([string]$Side, [string]$Tenant, [string]$Advice)
+            {
+                Write-Log -Message ("{0}: sign-in to tenant {1} did not give a usable token; stopping instead of prompting again." -f $Side, $Tenant) -Severity 'Error'
+                Write-Log -Message $Advice -Severity 'Error'
+                exit 1
+            }
+
+            if ($UseManagedIdentity.IsPresent)
+            {
+                Write-Log -Message ('Using Managed Identity Authentication Method') -Severity 'Info'
+                az login --identity --only-show-errors | Out-Null
+                if ($TenantID) { Connect-AzAccount -Identity -Tenant $TenantID | Out-Null }
+                else { Connect-AzAccount -Identity | Out-Null }
+
+                $MiAdvice = 'Check that this machine has a managed identity with access to the tenant (and pass -TenantID for a specific tenant), then re-run.'
+                $TargetTenant = if ($TenantID) { $TenantID } else { Get-AzCliSignedInTenant }
+                if (!$TargetTenant) { Stop-UnusableSignIn -Side 'az CLI' -Tenant '(managed identity)' -Advice $MiAdvice }
+                if (!(Test-AzCliTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Side 'az CLI' -Tenant $TargetTenant -Advice $MiAdvice }
+                if (!(Test-AzPsTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TargetTenant -Advice $MiAdvice }
+
+                $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
+                $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TargetTenant })
+                return
+            }
+
+            $CliTenant = Get-AzCliSignedInTenant
+            $PsTenant = Get-AzPsSignedInTenant
+            $CliTokenOk = if ($CliTenant) { Test-AzCliTokenSilent -Tenant $CliTenant } else { $false }
+            $PsTokenOk = if ($PsTenant) { Test-AzPsTokenSilent -Tenant $PsTenant } else { $false }
+
+            $TargetTenant = $null
+            if ($TenantID) { $TargetTenant = $TenantID }
+            elseif ($CliTokenOk)
+            {
+                $TargetTenant = $CliTenant
+                if ($PsTokenOk -and $PsTenant -ne $CliTenant)
+                {
+                    Write-Log -Message ("az CLI is signed in to tenant {0} and Az PowerShell to tenant {1}; using {0}. Pass -TenantID to choose explicitly." -f $CliTenant, $PsTenant) -Severity 'Warning'
+                }
+            }
+            elseif ($PsTokenOk) { $TargetTenant = $PsTenant }
+
+            # Nothing usable and no -TenantID: fall through to the full sign-in
+            # and tenant selection below.
+            if ($TargetTenant)
+            {
+                $CliOk = $CliTokenOk -and $CliTenant -eq $TargetTenant
+                $PsOk = $PsTokenOk -and $PsTenant -eq $TargetTenant
+
+                if ($CliOk)
+                {
+                    Write-Log -Message ("az CLI: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+                }
+                else
+                {
+                    if ($null -eq $CliTenant) { Write-Log -Message ('az CLI: not signed in; signing in.') -Severity 'Info' }
+                    elseif ($CliTenant -ne $TargetTenant) { Write-Log -Message ("az CLI: signed in to tenant {0}; signing in to {1}." -f $CliTenant, $TargetTenant) -Severity 'Warning' }
+                    else { Write-Log -Message ("az CLI: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
+
+                    # The az account cache is only wiped when neither side can be reused.
+                    if (!$PsOk) { az account clear | Out-Null }
+                    if ($DeviceLogin.IsPresent) { az login --use-device-code -t $TargetTenant }
+                    else { az login -t $TargetTenant --only-show-errors | Out-Null }
+
+                    if (!(Test-AzCliTokenSilent -Tenant $TargetTenant))
+                    {
+                        Stop-UnusableSignIn -Side 'az CLI' -Tenant $TargetTenant -Advice ("Run 'az login --tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $TargetTenant)
+                    }
+                }
+
+                if ($PsOk)
+                {
+                    Write-Log -Message ("Az PowerShell: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+                }
+                else
+                {
+                    if ($null -eq $PsTenant) { Write-Log -Message ('Az PowerShell: not signed in; signing in.') -Severity 'Info' }
+                    elseif ($PsTenant -ne $TargetTenant) { Write-Log -Message ("Az PowerShell: signed in to tenant {0}; signing in to {1}." -f $PsTenant, $TargetTenant) -Severity 'Warning' }
+                    else { Write-Log -Message ("Az PowerShell: session for tenant {0} cannot acquire a token silently; signing in again." -f $TargetTenant) -Severity 'Warning' }
+
+                    if ($DeviceLogin.IsPresent) { Connect-AzAccount -UseDeviceAuthentication -Tenant $TargetTenant | Out-Null }
+                    else { Connect-AzAccount -Tenant $TargetTenant | Out-Null }
+
+                    if (!(Test-AzPsTokenSilent -Tenant $TargetTenant))
+                    {
+                        Stop-UnusableSignIn -Side 'Az PowerShell' -Tenant $TargetTenant -Advice ("Run 'Connect-AzAccount -Tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $TargetTenant)
+                    }
+                }
+
+                $Global:Subscriptions = @(az account list --output json --only-show-errors | ConvertFrom-Json)
+                $Global:Subscriptions = @($Subscriptions | Where-Object { $_.tenantID -eq $TargetTenant })
+                return
+            }
+        }
+
+        # -RunAllSubs and service principal runs: an existing az CLI account is
+        # taken as the session, as before.
+        $ExistingAccount = $null
+        if ($RunAllSubs.IsPresent -or $Appid)
+        {
+            $ExistingAccount = az account show --output json --only-show-errors 2>$null | ConvertFrom-Json
+        }
         if ($null -ne $ExistingAccount)
         {
             if (-not $Global:RdaSessionInitialized)

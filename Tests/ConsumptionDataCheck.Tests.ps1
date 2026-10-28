@@ -1133,12 +1133,14 @@ $TestSub = '12345678-1234-1234-1234-123456789012'
 function global:az
 {
     $Joined = $args -join ' '
+    # Like the real az CLI, every call sets an exit code (0 = success).
+    $global:LASTEXITCODE = 0
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
     if ($Joined -like 'account list*') { return ('[{{"id":"{0}","name":"Placeholder subscription","tenantId":"{0}"}}]' -f $TestSub) }
     if ($Joined -like 'graph*') { Set-Content -Path $env:RDA_TEST_INVENTORY_MARKER -Value 'inventory started'; exit 3 }
     return $null
 }
-function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
+function global:Get-AzContext { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'tester' }; Tenant = [pscustomobject]@{ Id = $TestSub }; Subscription = [pscustomobject]@{ Id = $TestSub } } }
 function global:Set-AzContext { param($Subscription, $Context, $Scope) [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $(if ($Subscription) { $Subscription } else { $TestSub }) } } }
 # The up-front role check sees Reader at the subscription, so these runs reach
 # the consumption check. RDA_TEST_ROLES 'permissions-only' hides the role
