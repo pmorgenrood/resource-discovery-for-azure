@@ -85,9 +85,7 @@ The script runs in either Azure Cloud Shell or a local PowerShell 7 install. Pic
 #### Option 2: Local Environment
 - **[Git](https://git-scm.com/downloads)** — required first. The recommended way to get the script is `git clone`, which also avoids Windows' Mark-of-the-Web / execution-policy friction. On a fresh Windows box without Git, install it before anything else (see [Step 2: Get the Script](#step-2-get-the-script) for the BITS-based silent install).
 - [PowerShell 7 or later](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell)
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
-- Azure CLI Resource-Graph Extension (auto-installed by script)
-- **Az PowerShell module** — only four submodules are needed (install before running — see below)
+- **Az PowerShell module** — only four submodules are needed: `Az.Accounts`, `Az.Compute`, `Az.Monitor` and `Az.Billing` (install before running — see below). The Azure CLI is not needed, and neither is `Az.ResourceGraph`: Resource Graph is queried through `Invoke-AzRestMethod` from `Az.Accounts`.
 
 > **On Windows with only Windows PowerShell 5.1?** The tool requires PowerShell 7. If you launch `Run-AllSubscriptions.ps1` from Windows PowerShell 5.1, it detects the old version and automatically re-launches itself under PowerShell 7, forwarding your arguments. If PowerShell 7 isn't installed, it offers to install it first (official Microsoft MSI) when run interactively. Nothing extra to do — just run the same command:
 > ```powershell
@@ -100,7 +98,7 @@ The script runs in either Azure Cloud Shell or a local PowerShell 7 install. Pic
 
 **You normally don't need to install anything by hand.** When you run `Run-AllSubscriptions.ps1`, its pre-flight bootstrap checks for the four Az submodules it needs (`Az.Accounts`, `Az.Compute`, `Az.Monitor`, `Az.Billing`) and, if any are missing, offers to install just those for you on interactive runs. It does this **before** any Az call — not mid-run — and then **verifies the module actually loads** (by importing `Az.Accounts`) before proceeding, so a broken/partial install is caught up front with a clear repair message instead of failing much later with confusing errors like "no consumption records". The tool needs only those four submodules, not the full ~80-submodule `Az` rollup (the full rollup works too — it loads only the four it needs). The report is a self-contained HTML file with no Excel/ImportExcel dependency, so there is nothing else to install.
 
-**Optional — install by hand.** Do this only if you want to skip the prompt, are running **non-interactively** (the bootstrap won't prompt then, it fails loud with this same command), or are calling `ResourceInventory.ps1` **directly** — the inner script does *not* auto-install (by design, to avoid half-installed modules). From a **PowerShell 7** prompt (`pwsh`); `-Scope CurrentUser` needs no administrator elevation:
+**Optional — install by hand.** Do this only if you want to skip the prompt, are running **non-interactively** (the bootstrap won't prompt then, it fails loud with this same command), or are calling `ResourceInventory.ps1` **directly** — the inner script does *not* auto-install (by design, to avoid half-installed modules); if one of the four is missing or does not load, a direct run says which and stops with exit code `1` before it signs in. From a **PowerShell 7** prompt (`pwsh`); `-Scope CurrentUser` needs no administrator elevation:
 
 ```powershell
 Install-Module -Name Az.Accounts,Az.Compute,Az.Monitor,Az.Billing -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck -Scope CurrentUser
@@ -128,7 +126,7 @@ Install-Module -Name Az.Accounts,Az.Compute,Az.Monitor,Az.Billing -Repository PS
 
 **For Local Environment:**
 1. Open PowerShell 7 as Administrator
-2. Ensure Azure CLI is installed and configured
+2. Ensure the four Az PowerShell submodules are installed (see [Installing the required PowerShell modules](#installing-the-required-powershell-modules))
 
 ### Step 2: Get the Script
 
@@ -166,7 +164,15 @@ git clone https://github.com/awslabs/resource-discovery-for-azure.git
 ### Authentication Notes
 
 - **Azure Cloud Shell:** Authentication is automatic
-- **Local PowerShell:** Run `az login` and `Connect-AzAccount` before executing the script. If you plan to scan all subscriptions in a tenant, use `Run-AllSubscriptions.ps1`, which prompts you to sign in once and then reuses the session for every subscription.
+- **Local PowerShell:** The tool signs in with Az PowerShell only (`Connect-AzAccount`); the Azure CLI is not used. You can sign in beforehand with `Connect-AzAccount -Tenant <tenant>` or let the script do it. If you plan to scan all subscriptions in a tenant, use `Run-AllSubscriptions.ps1`, which signs in once and then reuses the session for every subscription.
+
+Sign-in follows three rules, in this order:
+
+1. **Service principal:** `-Appid`, `-Secret` and `-TenantID` always sign in as the service principal (`Connect-AzAccount -ServicePrincipal`, the secret kept as a SecureString), even when a user is already signed in; `-Appid` without the other two stops with exit code `1`.
+2. **Existing sign-in:** otherwise an Az PowerShell sign-in that is on the target tenant and can still get a token without a prompt is reused, with no prompt. Without `-TenantID` the target tenant is the one that sign-in is on, and only that tenant's subscriptions are collected (listed with `Get-AzSubscription -TenantId`, so subscriptions delegated to the tenant are included).
+3. **One sign-in attempt:** otherwise the script signs in once (`Connect-AzAccount`; `-DeviceLogin` uses the device-code flow, `-UseManagedIdentity` the identity of the Azure VM or service it runs on) and checks the token. If the sign-in fails, or still gives no token without a prompt (for example because of MFA or Conditional Access), the run stops with exit code `1` and says which command to run yourself; it does not prompt again or continue with an empty inventory. With no usable sign-in and no `-TenantID`, the sign-in is made without a tenant and you pick the tenant afterwards (the first one in a non-interactive session).
+
+A usable sign-in is never signed out; switching to the chosen tenant applies to the script's own process only (`Set-AzContext -Scope Process`). Service principal and managed identity sign-ins are kept to the script's process too (`Connect-AzAccount -Scope Process`), so a later run without `-Appid` or `-UseManagedIdentity` does not reuse them. With `-UseManagedIdentity`, if the token is lost later in the run, metrics and consumption reconnect with the same identity once; they never fall back to a user sign-in.
 
 You might get more than one authentication request due to different collector processes running in parallel.
 
@@ -486,6 +492,7 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 | `Appid` | String | Service Principal application ID | `-Appid "app-id-here"` |
 | `Secret` | String | Service Principal client secret | `-Secret "secret-here"` |
 | `DeviceLogin` | Switch | Use device code authentication | `-DeviceLogin` |
+| `UseManagedIdentity` | Switch | Sign in Az PowerShell (`Connect-AzAccount -Identity`, with `-Tenant` when `-TenantID` is given) with the managed identity of the Azure VM or service the script runs on. Direct runs of `ResourceInventory.ps1` only. | `-UseManagedIdentity` |
 
 ### Debugging Parameters
 
@@ -524,13 +531,13 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 
 **Authentication Errors:**
 - Ensure you have the required Azure roles assigned
-- For local environments, run `az login` before executing the script
+- For local environments, run `Connect-AzAccount -Tenant <tenant>` before executing the script, or let the script sign you in
 - Multiple authentication prompts may appear due to parallel processing
 - "Get-AzSubscription returned no subscriptions" — usually a Conditional Access / MFA gate. Re-run with `-DeviceLogin` to use the browser-based device-code flow.
 - Tenant-domain-style `-TenantID` (e.g. `contoso.onmicrosoft.com`) is resolved via Microsoft's public OIDC discovery endpoint, no sign-in needed. Pass the tenant GUID directly if discovery fails.
 
 **Subscription returned 0 resources:**
-- Almost always a permission gap: the signed-in identity does not have Reader on that specific subscription. The wrapper prints the exact `az graph query` acid-test command to confirm.
+- Almost always a permission gap: the signed-in identity does not have Reader on that specific subscription. The wrapper prints a `Search-AzGraph` command to confirm it (that command needs the `Az.ResourceGraph` module, which the tool itself does not use).
 - Less commonly, the subscription is genuinely empty.
 - Failed subs are listed at the end of the wrapper transcript and in `InventoryReports/RunAllSubscriptions_failures_<timestamp>.log`.
 
@@ -589,7 +596,6 @@ Codes `3`–`5` still mean the report was produced — they flag that it is **in
 ### Important Notes
 
 - The script does not upgrade existing PowerShell modules
-- Resource-Graph extension installs automatically if missing
 - All operations are read-only and safe to execute
 - Historical data covers the previous 31 days
 
