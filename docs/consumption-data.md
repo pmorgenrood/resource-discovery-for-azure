@@ -83,8 +83,8 @@ five are derived from the `InstanceData` JSON on each record.
 | `MeterSubCategory` | usage record | Meter sub-grouping, e.g. `Dv2 Series`. |
 | `Quantity` | usage record | **Amount of usage** in the meter's unit (not a cost). |
 | `Unit` | usage record | Unit for `Quantity`, e.g. `1 Hour`, `10000 GB`. |
-| `UsageStartTime` | usage record | Start of the aggregation interval. |
-| `UsageEndTime` | usage record | End of the aggregation interval. |
+| `UsageStartTime` | usage record | Start of the aggregation interval, written as `M/d/yyyy h:mm:ss tt` with a plain space before `AM`/`PM` (e.g. `3/15/2024 12:00:00 AM`) on every host. |
+| `UsageEndTime` | usage record | End of the aggregation interval, in the same format. |
 | `ResourceId` | `InstanceData.Microsoft.Resources.resourceUri` | ARM resource URI the usage is attributed to. Under `-Obfuscate`, identifying segments are masked but the ARM path *structure* is preserved (see below). |
 | `ResourceLocation` | `InstanceData.Microsoft.Resources.location` | Location of the resource. |
 | `ConsumptionMeter` | `InstanceData.Microsoft.Resources.additionalInfo.ConsumptionMeter` | Meter identifier from the resource's additional info (may be empty). |

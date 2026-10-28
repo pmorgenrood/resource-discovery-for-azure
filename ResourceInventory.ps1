@@ -1323,6 +1323,13 @@ function ExecuteInventoryProcessing()
         [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
         [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
 
+        # UsageStartTime / UsageEndTime are written in this format with the
+        # invariant culture, so the text is the same on every host. The en-US
+        # culture's own time pattern comes from the host's culture data: with
+        # ICU (on Linux, for example) it can have U+202F, not a space, before AM/PM.
+        $UsageDateFormat = 'M/d/yyyy h:mm:ss tt'
+        $InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
+
         # The run's window (RunInventorySetup): the one the up-front
         # consumption data check queried, or under -RunAllSubs the wrapper's.
         $ReportedStartTime = $script:ConsumptionWindow.Start
@@ -1446,6 +1453,13 @@ function ExecuteInventoryProcessing()
                             {
                                 continue;
                             }
+                        }
+
+                        # The clock value as Get-UsageAggregates returned it, no time-zone conversion.
+                        foreach ($DateField in @('UsageStartTime', 'UsageEndTime'))
+                        {
+                            $DateValue = $UsageDataExport[$Item].$DateField
+                            if ($DateValue -is [datetime]) { $UsageDataExport[$Item].$DateField = $DateValue.ToString($UsageDateFormat, $InvariantCulture) }
                         }
 
                         $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ResourceId -Value NotSet

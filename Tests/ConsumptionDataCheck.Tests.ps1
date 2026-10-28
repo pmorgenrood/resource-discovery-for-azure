@@ -298,6 +298,44 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
         @($Global:ConsumptionFailedSubs).Count | Should -Be 0
     }
+
+    # On an ICU host (Linux, macOS) the en-US time pattern has U+202F before
+    # AM/PM, so the culture's default date text is not the same on every host.
+    It 'writes UsageStartTime and UsageEndTime as M/d/yyyy h:mm:ss tt with a plain space, in ASCII' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Get-UsageAggregates {
+            $A = New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'
+            $B = New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-2'
+            $B.Properties.UsageStartTime = [datetime]'2026-10-01T13:05:09'
+            $B.Properties.UsageEndTime = [datetime]'2026-12-31T23:59:59'
+            [pscustomobject]@{ UsageAggregations = @($A, $B); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        $Rows = @(Import-Csv -Path $Global:ConsumptionFileCsv)
+        $Rows[0].UsageStartTime | Should -BeExactly '10/1/2026 12:00:00 AM'
+        $Rows[0].UsageEndTime | Should -BeExactly '10/2/2026 12:00:00 AM'
+        $Rows[1].UsageStartTime | Should -BeExactly '10/1/2026 1:05:09 PM'
+        $Rows[1].UsageEndTime | Should -BeExactly '12/31/2026 11:59:59 PM'
+        $Bytes = [System.IO.File]::ReadAllBytes($Global:ConsumptionFileCsv)
+        @($Bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0 -Because 'the date text holds no U+202F or other non-ASCII character'
+    }
+
+    It 'writes the clock value of the date as it came, whatever its Kind' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Get-UsageAggregates {
+            $Rows = foreach ($Kind in @('Utc', 'Local', 'Unspecified'))
+            {
+                $Row = New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'
+                $Row.Properties.UsageStartTime = [datetime]::SpecifyKind([datetime]'2026-10-05T00:00:00', $Kind)
+                $Row
+            }
+            [pscustomobject]@{ UsageAggregations = @($Rows); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        # Compared ordinally: a culture-aware comparison can treat U+202F as a space.
+        $Text = (@(Import-Csv -Path $Global:ConsumptionFileCsv) | ForEach-Object { $_.UsageStartTime }) -join '|'
+        [string]::Equals($Text, '10/5/2026 12:00:00 AM|10/5/2026 12:00:00 AM|10/5/2026 12:00:00 AM', [System.StringComparison]::Ordinal) | Should -BeTrue -Because "the text was '$Text'"
+    }
 }
 
 Describe 'Test-ConsumptionRowsHavePositiveQuantity' {
