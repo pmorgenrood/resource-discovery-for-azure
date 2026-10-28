@@ -187,6 +187,9 @@ $FailedSubs = @()
 # Subs this stream skipped on -Resume as completed; reported in the summary so
 # the parent can carry their recorded reports into the consolidated zip.
 $SkippedSubs = @()
+# Subs this stream collected without a zip being written; reported in the
+# summary so the parent takes them off the unified completed list.
+$NoReportSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -260,7 +263,20 @@ for ($i = 0; $i -lt $PairCount; $i++)
             $Reports = @(@($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId }) + $NewReport)
         }
 
-        if (-not ($Completed -contains $SubId))
+        if ($null -eq $NewReport)
+        {
+            # The run left no zip, so there is no report a later -Resume could
+            # carry: the sub is not completed. Named in the summary so the parent
+            # also ends an earlier run's completion of it in the unified state.
+            $NoReportSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
+            if ($Completed -contains $SubId)
+            {
+                $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+                $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+                Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
+            }
+        }
+        elseif (-not ($Completed -contains $SubId))
         {
             $Completed += $SubId
             # If this is a retry that finally succeeded, drop the sub from
@@ -268,7 +284,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
             $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $SubId
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
-        elseif ($null -ne $NewReport)
+        else
         {
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
@@ -348,6 +364,7 @@ $Summary = [pscustomobject]@{
     Completed              = @($Completed)
     Failed                 = $FailedSubs
     Skipped                = @($SkippedSubs)
+    NoReport               = @($NoReportSubs)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
     ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)

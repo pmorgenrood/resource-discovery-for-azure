@@ -1044,21 +1044,31 @@ if ($ParallelStreams -le 1)
             # finally succeeded), remove its entry so the resume-state file reflects
             # current truth.
             $StateChanged = $false
-            if (-not ($CompletedIds -contains $Sub.Id))
-            {
-                $CompletedIds += $Sub.Id
-                $StateChanged = $true
-            }
             # Record the zip this run wrote, replacing any earlier record for the sub.
             $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
-            if ($null -ne $NewReport)
+            if ($null -eq $NewReport)
             {
+                # The run left no zip, so there is no report a later -Resume could
+                # carry: the sub is not completed. As after a failed attempt, an
+                # earlier run's completion of it ends here, so the next -Resume
+                # collects it again instead of carrying the older report.
+                if ($CompletedIds -contains $Sub.Id)
+                {
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                    $StateChanged = $true
+                }
+            }
+            else
+            {
+                if (-not ($CompletedIds -contains $Sub.Id))
+                {
+                    $CompletedIds += $Sub.Id
+                }
                 $CompletedReports = @(@($CompletedReports) + $NewReport)
                 $StateChanged = $true
+                $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
             }
-            $BeforeFailedCount = @($FailedAttempts).Count
-            $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
-            if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
             if ($StateChanged)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
@@ -1238,13 +1248,24 @@ else
                 }
                 $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
                 if ($null -ne $NewReport) { $CompletedReports = @(@($CompletedReports) + $NewReport) }
-                if (-not ($CompletedIds -contains $Sub.Id))
+                if ($null -eq $NewReport)
+                {
+                    # Same as the sequential branch: a run that left no zip does not
+                    # complete the sub, and ends an earlier run's completion of it.
+                    if ($CompletedIds -contains $Sub.Id)
+                    {
+                        $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                        $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+                    }
+                }
+                elseif (-not ($CompletedIds -contains $Sub.Id))
                 {
                     $CompletedIds += $Sub.Id
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
-                elseif ($null -ne $NewReport)
+                else
                 {
                     # Already recorded as completed: still save, so this run's zip replaces the earlier one.
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
@@ -1447,6 +1468,7 @@ else
             # accumulators so the consolidated summary at end-of-run looks the
             # same shape as a sequential run.
             $StreamFailedIds = @()
+            $StreamNoReportIds = @()
             foreach ($S in $StreamSummaries)
             {
                 if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
@@ -1503,6 +1525,12 @@ else
                     {
                         $StreamFailedIds += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
                     }
+                }
+
+                # The subs this stream collected this run without a zip being written.
+                if ($StreamSummary.NoReport)
+                {
+                    $StreamNoReportIds += @($StreamSummary.NoReport | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
                 }
 
                 # Each stream skips (on -Resume) the subs its own state file lists
@@ -1627,17 +1655,19 @@ else
             # A sub a stream failed this run is not completed, even when an earlier
             # run completed it: take it off the list and drop its report record,
             # as the sequential branch does, so Merge-FailedAttempts keeps the
-            # failure and a later -Resume collects the sub again.
+            # failure and a later -Resume collects the sub again. The same goes for
+            # a sub a stream collected this run without a zip being written.
             $FailedThisRun = @($StreamFailedIds | Where-Object { $_ })
-            if ($FailedThisRun.Count -gt 0)
+            $NotCompletedThisRun = @(@($FailedThisRun) + @($StreamNoReportIds | Where-Object { $_ }))
+            if ($NotCompletedThisRun.Count -gt 0)
             {
-                $CompletedIds = @($CompletedIds | Where-Object { $FailedThisRun -notcontains $_ })
-                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and $FailedThisRun -notcontains [string]$_.Id })
+                $CompletedIds = @($CompletedIds | Where-Object { $NotCompletedThisRun -notcontains $_ })
+                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and $NotCompletedThisRun -notcontains [string]$_.Id })
             }
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $FailedThisRun.Count -gt 0)
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }

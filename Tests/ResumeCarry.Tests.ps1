@@ -514,17 +514,21 @@ Describe 'Parallel path, end to end: interrupted stream, then -Resume' {
     }
 }
 
-Describe 'A failed attempt clears the completed record of a subscription an earlier run completed' {
+Describe 'A failed attempt, or a run that leaves no zip, clears the completed record of a subscription an earlier run completed' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
         Mock Import-AzContext -MockWith { }
 
-        # The same stand-in, except that it throws for the ids in $Global:RdaCarryTestFailIds.
+        # The same stand-in, except that it throws for the ids in $Global:RdaCarryTestFailIds,
+        # and for the ids in $Global:RdaCarryTestNoZipIds ends without writing a zip, as the
+        # real script does when collection stops early: exit code 0, the resources counted,
+        # $Global:ZipOutputFile naming a zip that is not on disk.
         $script:FailRoot = Join-Path $script:TestBase 'fake-tool-fail'
         New-Item -ItemType Directory -Path $script:FailRoot -Force | Out-Null
         $Parts = (Get-Content -LiteralPath (Join-Path $script:FakeRoot 'ResourceInventory.ps1') -Raw) -split "`r?`n", 2
-        $FailInner = $Parts[0] + "`nif (@(`$Global:RdaCarryTestFailIds) -contains `$SubscriptionID) { throw 'stand-in failure for this subscription' }`n" + $Parts[1]
+        $NoZipLine = "if (@(`$Global:RdaCarryTestNoZipIds) -contains `$SubscriptionID) { `$Global:ZipOutputFile = Join-Path `$Global:RdaCarryTestRoot ('ResourcesReport_' + `$SubscriptionID + '.zip'); `$Global:Resources = @(1); `$Global:ResourceCount = 1; return }`n"
+        $FailInner = $Parts[0] + "`nif (@(`$Global:RdaCarryTestFailIds) -contains `$SubscriptionID) { throw 'stand-in failure for this subscription' }`n" + $NoZipLine + $Parts[1]
         Set-Content -LiteralPath (Join-Path $script:FailRoot 'ResourceInventory.ps1') -Value $FailInner -Encoding utf8
 
         # The sequential catch writes its failure log under $HOME/InventoryReports;
@@ -582,11 +586,30 @@ Describe 'A failed attempt clears the completed record of a subscription an earl
             }
         }
 
+        # The post-processing of a run that ends at the output verification: the lines
+        # it printed up to that point and the exit code it ended with.
+        function script:Invoke-PostUntilExit
+        {
+            param($Root, $Since, $ThisRun)
+            $Lines = [System.Collections.Generic.List[string]]::new()
+            $Code = $null
+            try
+            {
+                & $script:PostBlock $script:RepoRoot $Root $Since @($ThisRun) @() @() $false $false (Join-Path $Root '.resume-state-t.json') 't' 6>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.InformationRecord]) { $Lines.Add([string]$_.MessageData) } }
+            }
+            catch
+            {
+                if ($_.Exception.Message -match '^Exit-Wrapper (\d+)$') { $Code = [int]$Matches[1] } else { throw }
+            }
+            return [pscustomobject]@{ Text = @($Lines); ExitCode = $Code }
+        }
+
         # Run 3: sequential -Resume over sub-a and sub-b, then the post-processing.
         function script:Invoke-ResumeRun
         {
             param($Root, $State)
             $Global:RdaCarryTestFailIds = @()
+            $Global:RdaCarryTestNoZipIds = @()
             $Since = Get-Date
             $S = script:Read-State -Path $State
             $Run = & $script:SeqBlock $script:FailRoot @($script:A, $script:B) $true $S.Completed @(Get-FailedAttempts -Path $State -Tenant 't') $S.Reports $Root $State 't' $false 6>$null
@@ -599,6 +622,7 @@ Describe 'A failed attempt clears the completed record of a subscription an earl
         $script:Root = script:New-CaseRoot
         $Global:RdaCarryTestRoot = $script:Root
         $Global:RdaCarryTestFailIds = @()
+        $Global:RdaCarryTestNoZipIds = @()
         $global:LASTEXITCODE = 0
         $script:State = Join-Path $script:Root '.resume-state-t.json'
         $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
@@ -607,7 +631,7 @@ Describe 'A failed attempt clears the completed record of a subscription an earl
     }
 
     AfterAll {
-        Remove-Variable -Name RdaCarryTestFailIds, RdaCarryTestHome -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable -Name RdaCarryTestFailIds, RdaCarryTestNoZipIds, RdaCarryTestHome -Scope Global -ErrorAction SilentlyContinue
     }
 
     It 'sequential: a run without -Resume fails sub-a, and the next -Resume collects it again' {
@@ -669,6 +693,77 @@ Describe 'A failed attempt clears the completed record of a subscription an earl
         @($Agg.CompletedIds) | Should -Be @('sub-a')
         @($Agg.CompletedReports | ForEach-Object Id) | Should -Be @('sub-a')
         @($Agg.FailedSubscriptions).Count | Should -Be 1
+    }
+
+    It 'sequential: a run without -Resume leaves no zip for sub-a, and the next -Resume collects it again' {
+        $Run1Zip = Split-Path -Path (script:Read-State -Path $script:State).Reports[0].Zip -Leaf
+        $Global:RdaCarryTestNoZipIds = @('sub-a')
+        $S = script:Read-State -Path $script:State
+        $Since2 = Get-Date
+        $Run2 = & $script:SeqBlock $script:FailRoot @($script:A) $false $S.Completed @() $S.Reports $script:Root $script:State 't' $false 6>$null
+        $Post2 = script:Invoke-PostUntilExit -Root $script:Root -Since $Since2 -ThisRun $Run2.SubResourceCounts
+        $After2 = script:Read-State -Path $script:State
+        $R = script:Invoke-ResumeRun -Root $script:Root -State $script:State
+
+        $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
+        $After2.Reports | Should -BeNullOrEmpty
+        $After2.Failed | Should -BeNullOrEmpty -Because 'a run that left no zip is not recorded as a failed attempt'
+        $Post2.ExitCode | Should -Be 2 -Because 'the run that left no zip still ends at the output verification, as before'
+        ($Post2.Text -join "`n") | Should -Match 'ERROR: Per-subscription output verification failed'
+        @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
+        ($R.Post.Text -join "`n") | Should -Not -Match 'Resume: carrying'
+        @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
+        ($R.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 2 successful sub\(s\)\)'
+        @(script:Get-InnerZipNames -OuterZip $R.Post.Result.OuterZipFile) | Should -Not -Contain $Run1Zip -Because 'the earlier run''s report of sub-a is no longer its latest'
+    }
+
+    It 'sequential: a run that leaves no zip keeps an earlier failed attempt of the subscription' {
+        $Global:RdaCarryTestFailIds = @('sub-b')
+        $S = script:Read-State -Path $script:State
+        $null = & $script:SeqBlock $script:FailRoot @($script:B) $false $S.Completed @() $S.Reports $script:Root $script:State 't' $false 6>$null
+        $Global:RdaCarryTestFailIds = @()
+        $Global:RdaCarryTestNoZipIds = @('sub-b')
+        $S = script:Read-State -Path $script:State
+        $null = & $script:SeqBlock $script:FailRoot @($script:B) $false $S.Completed @(Get-FailedAttempts -Path $script:State -Tenant 't') $S.Reports $script:Root $script:State 't' $false 6>$null
+        $After = script:Read-State -Path $script:State
+
+        $After.Failed | Should -Be @('sub-b') -Because 'sub-b still has no report, so -ResumeFailedOnly must still retry it'
+        $After.Completed | Should -Be @('sub-a')
+    }
+
+    It 'parallel: a stream leaves no zip for sub-a in a run without -Resume, the merge ends its completion, and the next -Resume collects it again' {
+        $Global:RdaCarryTestNoZipIds = @('sub-a')
+        $S = script:Read-State -Path $script:State
+        script:Invoke-FailWorker -Root $script:Root -Ids @('sub-a', 'sub-b') -Names @('Sub A', 'Sub B')
+        $Summary = Get-Content -LiteralPath (Join-Path $script:Root '.rda-stream-0-summary.json') -Raw | ConvertFrom-Json
+        $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = (Join-Path $script:Root '.rda-stream-0-summary.json'); FailuresPath = (Join-Path $script:Root 'failures-stream-0.log'); SubCount = 2 })
+        $Agg = & $script:AggregateBlock $Streams $script:Root 't' $script:State $S.Completed @(Get-FailedAttempts -Path $script:State -Tenant 't') $S.Reports 6>$null
+        $After2 = script:Read-State -Path $script:State
+        $R = script:Invoke-ResumeRun -Root $script:Root -State $script:State
+
+        $After2.Completed | Should -Be @('sub-b') -Because 'the latest run of sub-a left no report'
+        @($After2.Reports | ForEach-Object Id) | Should -Be @('sub-b')
+        $After2.Failed | Should -BeNullOrEmpty
+        @($Summary.Completed) | Should -Be @('sub-b') -Because 'the stream does not count sub-a as completed either'
+        @($Summary.NoReport | ForEach-Object Id) | Should -Be @('sub-a')
+        @($Agg.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b') -Because 'sub-a still counts as collected this run, so the verification still sees its zip missing'
+        @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -Be @('sub-b')
+        @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a') -Because 'the -Resume run must collect sub-a again'
+        ($R.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 1 successful sub\(s\) this run \+ 1 carried'
+    }
+
+    It 'one-subscription fallback: a run that leaves no zip for sub-a clears its record, and the next -Resume collects it again' {
+        $Global:RdaCarryTestNoZipIds = @('sub-a')
+        $S = script:Read-State -Path $script:State
+        $null = & $script:FallbackBlock $script:FailRoot @($script:A) $S.Completed @() $S.Reports $script:Root $script:State 't' 6>$null
+        $After2 = script:Read-State -Path $script:State
+        $R = script:Invoke-ResumeRun -Root $script:Root -State $script:State
+
+        $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
+        $After2.Reports | Should -BeNullOrEmpty
+        $After2.Failed | Should -BeNullOrEmpty
+        @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
+        @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
     }
 }
 
