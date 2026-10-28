@@ -484,6 +484,11 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# The tenant's subscription list ResourceInventory.ps1 -RunAllSubs keeps for
+# the rest of this process (see LoginSession). Cleared here so a second run in
+# the same PowerShell session lists the subscriptions again.
+Remove-Variable -Name RdaTenantSubscriptionCache -Scope Global -ErrorAction SilentlyContinue
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
@@ -556,100 +561,17 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Tenant
 
 # Authenticate, but only if needed.
 #
-# In environments like Azure Cloud Shell the shell already has a valid az CLI
-# and Az PowerShell session for the signed-in user. Unconditionally calling
-# `az login` and `Connect-AzAccount` from the wrapper produces a redundant
-# browser/device-code prompt every run.
-#
-# Two things have to be true to skip the interactive login:
-#   1. The cached context for each side must be on the requested tenant.
-#   2. That cached context must still be able to *acquire a token* silently.
-# Condition 1 alone is not enough: a context can persist on disk (e.g. in
-# ~/.Azure/AzureRmContext.json) with the right tenant ID but an expired or
-# revoked refresh token. In that state Azure AD requires user interaction
-# (typically driven by Conditional Access or MFA), so any data-plane call
-# from inside the script will emit a warning like "Unable to acquire token
-# for tenant ... User interaction is required" and silently return nothing -
-# producing an empty inventory rather than failing loudly.
-#
-# Therefore the gate probes token acquisition for the requested tenant on both
-# sides. Only if both probes succeed do we skip the login.
-
-
-
-
-
+# In environments like Azure Cloud Shell the shell already has a valid Az
+# PowerShell session for the signed-in user, and signing in again from the
+# wrapper would produce a redundant browser/device-code prompt every run.
+# Connect-RdaWrapperSession (Functions/Common.Functions.ps1) reuses a sign-in
+# that is on -TenantID and can still acquire a token silently, otherwise signs
+# in once and checks the token again. When that sign-in gives no usable token
+# it throws and the run stops here with exit 1, instead of prompting again or
+# collecting an empty inventory.
 try
 {
-    $CliTenant = Get-AzCliSignedInTenant
-    $PsTenant = Get-AzPsSignedInTenant
-
-    $CliTenantOk = ($CliTenant -eq $TenantID)
-    $PsTenantOk = ($PsTenant -eq $TenantID)
-
-    $CliTokenOk = $false
-    $PsTokenOk = $false
-    if ($CliTenantOk) { $CliTokenOk = Test-AzCliTokenSilent -Tenant $TenantID }
-    if ($PsTenantOk) { $PsTokenOk = Test-AzPsTokenSilent  -Tenant $TenantID }
-
-    $CliOk = $CliTenantOk -and $CliTokenOk
-    $PsOk = $PsTenantOk -and $PsTokenOk
-
-    if ($CliOk -and $PsOk)
-    {
-        Write-Host ("Existing session detected for tenant {0} (token probe ok); skipping interactive login." -f $TenantID) -ForegroundColor Green
-    }
-    else
-    {
-        if (-not $CliOk)
-        {
-            if ($null -eq $CliTenant)
-            {
-                Write-Host "az CLI is not signed in; authenticating..." -ForegroundColor Cyan
-            }
-            elseif (-not $CliTenantOk)
-            {
-                Write-Host ("az CLI is signed in to tenant {0}; switching to {1}..." -f $CliTenant, $TenantID) -ForegroundColor Cyan
-            }
-            else
-            {
-                Write-Host ("az CLI session for tenant {0} cannot acquire a token silently (likely expired or CA/MFA-gated); re-authenticating..." -f $TenantID) -ForegroundColor Cyan
-            }
-            if ($DeviceLogin)
-            {
-                az login -t $TenantID --use-device-code --only-show-errors | Out-Null
-            }
-            else
-            {
-                az login -t $TenantID --only-show-errors | Out-Null
-            }
-            if ($LASTEXITCODE -ne 0) { throw "az login failed with exit code $LASTEXITCODE" }
-        }
-
-        if (-not $PsOk)
-        {
-            if ($null -eq $PsTenant)
-            {
-                Write-Host "Az PowerShell is not signed in; authenticating..." -ForegroundColor Cyan
-            }
-            elseif (-not $PsTenantOk)
-            {
-                Write-Host ("Az PowerShell is signed in to tenant {0}; switching to {1}..." -f $PsTenant, $TenantID) -ForegroundColor Cyan
-            }
-            else
-            {
-                Write-Host ("Az PowerShell session for tenant {0} cannot acquire a token silently (likely expired or CA/MFA-gated); re-authenticating..." -f $TenantID) -ForegroundColor Cyan
-            }
-            if ($DeviceLogin)
-            {
-                Connect-AzAccount -Tenant $TenantID -UseDeviceAuthentication | Out-Null
-            }
-            else
-            {
-                Connect-AzAccount -Tenant $TenantID | Out-Null
-            }
-        }
-    }
+    Connect-RdaWrapperSession -TenantID $TenantID -DeviceLogin:$DeviceLogin
 }
 catch
 {
