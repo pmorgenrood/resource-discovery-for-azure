@@ -1704,13 +1704,14 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             {
                 throw $ZipProblem
             }
-            Write-Host ("Reporting Data File: {0}" -f $OuterZipFile) -ForegroundColor Green
+            # Its path is printed after the run summary is added to it, once
+            # the zip passed the same check again (below the summary block).
         }
         catch
         {
             $BundleBuildError = "Could not build {0}: {1}" -f $OuterZipFile, $_.Exception.Message
             Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
-            # The main summary, the summary block and the fold below all key on
+            # The main summary, the fold and the final check below all key on
             # $OuterZipFile, so none of them may point at the missing zip.
             $OuterZipFile = $null
         }
@@ -2031,10 +2032,6 @@ elseif ($FailedAttempts.Count -gt 0)
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
-if ($OuterZipFile)
-{
-    Write-Host ("Consolidated Report:     {0}" -f $OuterZipFile) -ForegroundColor Green
-}
 if ($WrapperTranscriptStarted)
 {
     Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Green
@@ -2140,13 +2137,23 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
     {
         Write-Host ("WARNING: Could not fold run-summary / main-summary into the consolidated zip: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
-    # A failed fold can remove the zip itself (a full disk does), so it is
-    # checked again: the extras are optional, the per-subscription zips are not.
+}
+
+# A failed fold can remove the zip itself (a full disk does), so it is checked
+# again: the extras are optional, the per-subscription zips are not. The zip's
+# path is printed only here, once this last check passed.
+if ($null -ne $OuterZipFile)
+{
     $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
     if ($ZipProblem)
     {
         $BundleBuildError = "{0} was lost while the run summary was added to it: {1}" -f $OuterZipFile, $ZipProblem
         Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host ("Reporting Data File: {0}" -f $OuterZipFile) -ForegroundColor Green
+        Write-Host ("Consolidated Report:     {0}" -f $OuterZipFile) -ForegroundColor Green
     }
 }
 
