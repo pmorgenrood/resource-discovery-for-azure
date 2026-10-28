@@ -77,6 +77,18 @@ $Global:ResourceCount = 1
     $TimeAt = script:Find-TopIndex -After $AdviceAt -What 'the execution-time line' -Match { param($s) $s.Extent.Text.StartsWith('Write-Host ("Execution Time:') }
     $AdviceText = script:Join-Top -From $AdviceAt -To $TimeAt
 
+    # The up-front access check: its scope is lifted as written; the check itself
+    # is a stand-in that finds the ids in $Unreadable not readable, skips them and
+    # reports them as both access checks do (InaccessibleIds). Then the record of
+    # what it skipped and the startup read of that record, as written. Either is
+    # empty in a wrapper that does not record them.
+    $ScopeAt = script:Find-TopIndex -What 'the access-check scope' -Match { param($s) $s.Extent.Text.StartsWith('$ScopeForProbe = ') }
+    $GateText = $Top[$ScopeAt].Extent.Text + "`n" +
+    "`$AccessDecision = [pscustomobject]@{ InaccessibleIds = @(`$ScopeForProbe | Where-Object { @(`$Unreadable) -contains `$_.Id } | ForEach-Object { `$_.Id }) }`n" +
+    "`$Subscriptions = @(`$Subscriptions | Where-Object { `$AccessDecision.InaccessibleIds -notcontains `$_.Id })`n"
+    $RecordText = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$ScopeForProbe.Count -gt 0' -and $_.Extent.Text.Contains('-NotReadable $NotReadableIds') } | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $ReadText = @($Top | Where-Object { $_.Extent.Text.StartsWith('$NotReadableIds = ') } | ForEach-Object { $_.Extent.Text }) -join "`n"
+
     # The startup reads of the resume state. The completed ids are read as an
     # array: a one-id list comes back from Get-CompletedSubscriptionIds as a bare
     # string, and `+=` would then join the next id onto it.
@@ -85,14 +97,15 @@ $Global:ResourceCount = 1
     "`$InventoryPassthrough = @{ ConcurrencyLimit = 6 }; `$WrapperTranscriptStarted = `$false; `$Elapsed = [timespan]::Zero`n" +
     "`$CompletedIds = @(Get-CompletedSubscriptionIds -Path `$ResumeStateFile -Tenant `$TenantID | Where-Object { `$_ })`n" +
     "`$FailedAttempts = Get-FailedAttempts -Path `$ResumeStateFile -Tenant `$TenantID`n" +
-    "`$CompletedReports = Get-CompletedReports -Path `$ResumeStateFile -Tenant `$TenantID`n"
-    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly)`n"
+    "`$CompletedReports = Get-CompletedReports -Path `$ResumeStateFile -Tenant `$TenantID`n" +
+    $ReadText + "`n"
+    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$Unreadable)`n"
     $Result = "`n[pscustomobject]@{ SkippedSubscriptions = @(`$SkippedSubscriptions); SubResourceCounts = @(`$SubResourceCounts) }"
 
-    # A run that ends before the cleanup (the session ended): the loop only.
-    $script:InterruptedRunBlock = [scriptblock]::Create($Params + $Prologue + ". " + $SeqText + $Result)
+    # A run that ends before the cleanup (the session ended): the access check and the loop only.
+    $script:InterruptedRunBlock = [scriptblock]::Create($Params + $Prologue + $GateText + $RecordText + "`n. " + $SeqText + $Result)
     # A sequential run from the filter to the summary's retry advice.
-    $script:RunBlock = [scriptblock]::Create($Params + $Prologue + $FilterText + "`n. " + $SeqText + "`n" + $CleanupText + "`n" + $AdviceText + $Result)
+    $script:RunBlock = [scriptblock]::Create($Params + $Prologue + $FilterText + "`n" + $GateText + $RecordText + "`n. " + $SeqText + "`n" + $CleanupText + "`n" + $AdviceText + $Result)
 
     # Runs a block and returns its result object and the lines it printed. A
     # run that ends through Exit-Wrapper returns its exit code instead.
@@ -118,9 +131,9 @@ $Global:ResourceCount = 1
 
     function script:Invoke-Run
     {
-        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [switch]$Interrupted)
+        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [switch]$Interrupted, [string[]]$Unreadable = @())
         $Block = if ($Interrupted) { $script:InterruptedRunBlock } else { $script:RunBlock }
-        return script:Invoke-Captured -Block $Block -Arguments @($script:FakeRoot, @($Subs), $script:Root, $script:State, 't', [bool]$Resume, [bool]$ResumeFailedOnly)
+        return script:Invoke-Captured -Block $Block -Arguments @($script:FakeRoot, @($Subs), $script:Root, $script:State, 't', [bool]$Resume, [bool]$ResumeFailedOnly, @($Unreadable))
     }
 
     function script:Read-State
@@ -128,15 +141,18 @@ $Global:ResourceCount = 1
         param([string]$Path)
         if (-not (Test-Path -LiteralPath $Path)) { return $null }
         return [pscustomobject]@{
-            Completed = @(Get-CompletedSubscriptionIds -Path $Path -Tenant 't' | Where-Object { $_ })
-            Failed    = @(Get-FailedAttempts -Path $Path -Tenant 't' | Where-Object { $null -ne $_ })
-            Reports   = @(Get-CompletedReports -Path $Path -Tenant 't' | Where-Object { $null -ne $_ })
+            Completed   = @(Get-CompletedSubscriptionIds -Path $Path -Tenant 't' | Where-Object { $_ })
+            Failed      = @(Get-FailedAttempts -Path $Path -Tenant 't' | Where-Object { $null -ne $_ })
+            Reports     = @(Get-CompletedReports -Path $Path -Tenant 't' | Where-Object { $null -ne $_ })
+            # Straight from the file, so the check does not depend on the reader.
+            NotReadable = @((Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json).NotReadableSubscriptionIds | Where-Object { $_ })
         }
     }
 
     $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
     $script:B = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' }
     $script:C = [pscustomobject]@{ Id = 'sub-c'; Name = 'Sub C' }
+    $script:D = [pscustomobject]@{ Id = 'sub-d'; Name = 'Sub D' }
 
     # A fresh home, inventory root and resume-state path for each test. The root is
     # <home>/InventoryReports, the path the wrapper's sequential catch also uses.
@@ -246,5 +262,66 @@ Describe '-ResumeFailedOnly with nothing on the retry list' {
 
         $R.ExitCode | Should -Be 0
         @($R.Text | Where-Object { $_ -like 'Not Collected:*' }).Count | Should -Be 0
+    }
+}
+
+Describe '-ResumeFailedOnly and a subscription the access check skipped as not readable' {
+    BeforeEach { script:New-Case }
+    It 'does not name it as not collected, and clears the state once the retries succeed' {
+        # Run 1: Sub C is not readable and is skipped, Sub A completes, Sub B fails.
+        $Global:RdaRfoFailIds = @('sub-b')
+        $null = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Unreadable 'sub-c' -Interrupted
+        (script:Read-State -Path $script:State).NotReadable | Should -Be @('sub-c')
+        # Run 2: -ResumeFailedOnly; Sub B works now. Only Sub B is checked.
+        $Global:RdaRfoFailIds = @()
+        $R = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Unreadable 'sub-c' -ResumeFailedOnly
+
+        @($R.Result.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-b')
+        @($R.Text | Where-Object { $_ -like 'Not Collected:*' }).Count | Should -Be 0
+        @($R.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 1
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+
+    It 'after an interrupted run, names only the subscription the run never reached' {
+        # Run 1: Sub C is skipped, Sub A completes, Sub B fails, the session ends before Sub D.
+        $Global:RdaRfoFailIds = @('sub-b')
+        $null = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Unreadable 'sub-c' -Interrupted
+        $Global:RdaRfoFailIds = @()
+        $R = script:Invoke-Run -Subs @($script:A, $script:B, $script:C, $script:D) -Unreadable 'sub-c' -ResumeFailedOnly
+        $S = script:Read-State -Path $script:State
+
+        @($R.Text | Where-Object { $_ -eq 'Not Collected:           1 (Sub D) - no run has completed these and -ResumeFailedOnly retries only the retry list' }).Count | Should -Be 1
+        @($S.Completed | Sort-Object) | Should -Be @('sub-a', 'sub-b')
+        $S.NotReadable | Should -Be @('sub-c')
+    }
+
+    It 'with nothing on the retry list, names only the subscription the run never reached' {
+        # Run 1: Sub C is skipped, Sub A completes, the session ends before Sub B.
+        $null = script:Invoke-Run -Subs @($script:A, $script:C) -Unreadable 'sub-c' -Interrupted
+        $R = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Unreadable 'sub-c' -ResumeFailedOnly
+
+        $R.ExitCode | Should -Be 0
+        @($R.Text | Where-Object { $_ -eq 'Not Collected:           1 (Sub B) - no run has completed these and -ResumeFailedOnly retries only the retry list' }).Count | Should -Be 1
+    }
+
+    It 'takes it off the record when a later check finds it readable' {
+        $null = script:Invoke-Run -Subs @($script:A, $script:C) -Unreadable 'sub-c' -Interrupted
+        # Run 2: -Resume checks Sub C again (it is not completed) and can read it now.
+        $null = script:Invoke-Run -Subs @($script:A, $script:C) -Resume -Interrupted
+        $S = script:Read-State -Path $script:State
+
+        @($S.NotReadable) | Should -BeNullOrEmpty
+        @($S.Completed | Sort-Object) | Should -Be @('sub-a', 'sub-c')
+    }
+
+    It 'keeps the record across saves that do not pass one, and reads a state without it as empty' {
+        Save-CompletedSubscriptionIds -Path $script:State -Tenant 't' -Ids @('sub-a') -NotReadable @('sub-c')
+        Save-CompletedSubscriptionIds -Path $script:State -Tenant 't' -Ids @('sub-a', 'sub-b')
+        @(Get-NotReadableSubscriptionIds -Path $script:State -Tenant 't') | Should -Be @('sub-c')
+        @(Get-NotReadableSubscriptionIds -Path $script:State -Tenant 'other') | Should -BeNullOrEmpty
+        Save-CompletedSubscriptionIds -Path $script:State -Tenant 't' -Ids @('sub-a', 'sub-b') -NotReadable @()
+        @(Get-NotReadableSubscriptionIds -Path $script:State -Tenant 't') | Should -BeNullOrEmpty
+        Set-Content -LiteralPath $script:State -Value '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"]}' -Encoding utf8
+        @(Get-NotReadableSubscriptionIds -Path $script:State -Tenant 't') | Should -BeNullOrEmpty
     }
 }

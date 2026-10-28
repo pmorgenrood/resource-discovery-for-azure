@@ -726,6 +726,10 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # A -Resume run carries these into the consolidated zip for the subscriptions it
 # skips; every save below writes them back.
 $CompletedReports = Get-CompletedReports -Path $ResumeStateFile -Tenant $TenantID
+# The subscriptions an earlier access check skipped as not readable, so
+# -ResumeFailedOnly does not name them as never collected. Updated after this
+# run's access check below.
+$NotReadableIds = @(Get-NotReadableSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID)
 # The subscriptions a state file written before CompletedReports existed lists as
 # completed (see the -Resume block below). Read now, before the fold of per-stream
 # state can rewrite the file with the key.
@@ -840,7 +844,7 @@ if ($ResumeFailedOnly)
         # deleted it) there is nothing to name.
         if (Test-Path -Path $ResumeStateFile -PathType Leaf)
         {
-            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds) -ResumeStateFile $ResumeStateFile
+            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds -NotReadableIds $NotReadableIds) -ResumeStateFile $ResumeStateFile
         }
         Exit-Wrapper -Code 0
     }
@@ -955,6 +959,23 @@ if (-not $SkipConsumption -and $Subscriptions.Count -gt 0)
     else
     {
         Write-Host "Consumption access confirmed." -ForegroundColor Green
+    }
+}
+
+# Keep the subscriptions the access check above skipped as not readable in the
+# resume state, so a later -ResumeFailedOnly run does not name them as never
+# collected (the run that skipped them lists them). A subscription this run did
+# not check keeps the earlier answer. The state is written only when the list
+# changed.
+if ($ScopeForProbe.Count -gt 0)
+{
+    $NotReadableBefore = (@($NotReadableIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ',')
+    $CheckedIds = @($ScopeForProbe | ForEach-Object { [string]$_.Id })
+    $SkippedNotReadable = @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } })
+    $NotReadableIds = @(@($NotReadableIds | Where-Object { $_ -and $CheckedIds -notcontains [string]$_ }) + $SkippedNotReadable | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    if (($NotReadableIds -join ',') -ne $NotReadableBefore)
+    {
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports -NotReadable $NotReadableIds
     }
 }
 
@@ -1963,7 +1984,7 @@ $NotCollected = @()
 if ($ResumeFailedOnly)
 {
     $RetryListIds = @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
-    $NotCollected = @(Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds $RetryListIds)
+    $NotCollected = @(Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds $RetryListIds -NotReadableIds $NotReadableIds)
 }
 if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
