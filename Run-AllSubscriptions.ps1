@@ -793,6 +793,23 @@ if ($Resume -or $ResumeFailedOnly)
         }
     }
 }
+else
+{
+    # A run without -Resume or -ResumeFailedOnly does not use the per-stream
+    # state files an earlier parallel run left, so they are moved aside before
+    # any stream starts (Move-EarlierStreamStateFiles): neither this run's
+    # end-of-run merge nor a later -Resume reads them.
+    $EarlierStreamFiles = Move-EarlierStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID
+    if (@($EarlierStreamFiles.NotMoved).Count -gt 0)
+    {
+        # A file that could not be moved aside stays in place and is named
+        # here; the sets moved aside before are kept too.
+        foreach ($File in @($EarlierStreamFiles.NotMoved))
+        {
+            Write-Host ("WARNING: Could not move the per-stream state file {0} aside: {1}" -f $File.Name, $File.Reason) -ForegroundColor Yellow
+        }
+    }
+}
 
 if ($Resume)
 {

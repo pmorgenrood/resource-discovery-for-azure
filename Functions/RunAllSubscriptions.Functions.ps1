@@ -792,18 +792,65 @@ function ConvertTo-ResumeRecordText
     return ($Sorted | ConvertTo-Json -Depth 6 -Compress)
 }
 
+# The per-id lists this version keeps in the resume state and in a per-stream
+# state file, and the script variable a run keeps each one in: State is the key
+# in the resume state file, Stream the key in a per-stream state file, Run the
+# variable. CompletedOnly marks a list the resume state keeps for completed
+# subscriptions only. A list a later version adds needs its entry here, or a
+# per-stream state file holding it is kept (Get-StreamStateUntrackedLists).
+function Get-ResumeStateRecordLists
+{
+    return @(
+        [pscustomobject]@{ State = 'CompletedSubscriptionIds'; Stream = 'Completed'; Run = 'CompletedIds'; CompletedOnly = $false }
+        [pscustomobject]@{ State = 'FailedAttempts'; Stream = 'FailedAttempts'; Run = 'FailedAttempts'; CompletedOnly = $false }
+    )
+}
+
+# The value of the script variable $Name, or $null when there is none. The name
+# is taken literally (no wildcard), and only the script scope is read, so a
+# local of the same name in a calling function is not used.
+function Get-ResumeStateRunList
+{
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $Variable = $ExecutionContext.SessionState.PSVariable.Get('script:' + $Name)
+    if ($null -eq $Variable) { return $null }
+    return $Variable.Value
+}
+
+# True for a per-id record: an object with an Id.
+function Test-ResumeStateRecord
+{
+    param([object]$Item)
+    return ($null -ne $Item -and $Item -isnot [string] -and $Item -isnot [ValueType] -and $null -ne $Item.PSObject.Properties['Id'])
+}
+
+# The lists with entries in a per-stream state file ($State, as
+# Read-StreamResumeStateFile returns it) that this version does not keep: keys
+# holding a list other than the Stream names of Get-ResumeStateRecordLists.
+function Get-StreamStateUntrackedLists
+{
+    param([object]$State)
+    if ($null -eq $State) { return @() }
+    $Tracked = @(Get-ResumeStateRecordLists | ForEach-Object { $_.Stream })
+    return @($State.PSObject.Properties | Where-Object {
+            $Tracked -notcontains $_.Name -and $null -ne $_.Value -and $_.Value -isnot [string] -and
+            $_.Value -is [System.Collections.IEnumerable] -and @($_.Value | Where-Object { $null -ne $_ }).Count -gt 0
+        } | ForEach-Object { $_.Name })
+}
+
 # The ids among $Ids whose record in the resume state file on disk is not the
-# one this run holds, compared as whole records: whether the id is completed
-# ($CompletedIds against CompletedSubscriptionIds), its retry entry with every
-# field ($FailedAttempts against FailedAttempts: Name, Reason, LastFailedAt,
-# Attempts), and its record in every other list of per-id records the file
-# holds (each record an object with an Id). Such a list is compared with this
-# run's variable of the same name, for the ids the run holds as completed,
-# since the resume state keeps those records only for completed subscriptions;
-# a list for which the run has no variable is not this run's to check. Every id
-# comes back when the file is missing, cannot be read or is for another tenant.
-# Read before per-stream state files are deleted, so they are deleted only once
-# the resume state holds every record they gave as this run holds it.
+# one this run holds. Compared: whether the id is completed ($CompletedIds
+# against CompletedSubscriptionIds), then, as whole records, every list of
+# per-id records that this version keeps (Get-ResumeStateRecordLists: the retry
+# list $FailedAttempts, and each other list from its script variable) or that
+# the file holds (records with an Id). A list the file does not have, or the
+# run does not keep, reads as none on that side, so a record on only one side is
+# a mismatch. Lists marked CompletedOnly are compared for the ids this run holds
+# as completed, every other list for every id. Each list is indexed by id once,
+# the last record winning, as each writer lets it. Every id comes back when the
+# file is missing, cannot be read or is for another tenant. Read before
+# per-stream state files are deleted, so they are deleted only once the resume
+# state holds every record they gave as this run holds it.
 function Get-ResumeStateRecordMismatch
 {
     param(
@@ -828,34 +875,47 @@ function Get-ResumeStateRecordMismatch
     # A key the file does not have reads as none.
     $Key = { param($Name) $Prop = $OnDisk.PSObject.Properties[$Name]; if ($null -ne $Prop) { $Prop.Value } }
     if ([string](& $Key 'TenantID') -ne $Tenant) { return $Wanted }
-    $OnDiskCompleted = @(& $Key 'CompletedSubscriptionIds' | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $RunCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $IsRecord = { param($Item) $null -ne $Item -and $Item -isnot [string] -and $Item -isnot [ValueType] -and $null -ne $Item.PSObject.Properties['Id'] }
-    $IsRecordList = { param($List) $Items = @($List | Where-Object { $null -ne $_ }); $Items.Count -gt 0 -and @($Items | Where-Object { -not (& $IsRecord $_) }).Count -eq 0 }
-    # The lists to compare: the retry list, then every other list of per-id
-    # records in the file that this run holds a variable for.
-    $Lists = [System.Collections.Generic.List[object]]::new()
-    $Lists.Add([pscustomobject]@{ Name = 'FailedAttempts'; Run = @($FailedAttempts | Where-Object { $null -ne $_ }); CompletedOnly = $false })
+    $OnDiskCompleted = [System.Collections.Generic.HashSet[string]]::new([string[]]@(& $Key 'CompletedSubscriptionIds' | Where-Object { $_ } | ForEach-Object { [string]$_ }))
+    $RunCompleted = [System.Collections.Generic.HashSet[string]]::new([string[]]@($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ }))
+    $Index = {
+        param($List)
+        $ById = @{}
+        foreach ($Item in @($List)) { if (Test-ResumeStateRecord -Item $Item) { $ById[[string]$Item.Id] = $Item } }
+        $ById
+    }
+    # The record lists to compare, by their key in the resume state file.
+    $Lists = [ordered]@{}
+    foreach ($Entry in @(Get-ResumeStateRecordLists))
+    {
+        if ($Entry.State -eq 'CompletedSubscriptionIds') { continue }
+        $RunList = if ($Entry.Run -eq 'FailedAttempts') { $FailedAttempts } else { Get-ResumeStateRunList -Name $Entry.Run }
+        $Lists[$Entry.State] = [pscustomobject]@{ Run = $RunList; CompletedOnly = [bool]$Entry.CompletedOnly }
+    }
     foreach ($Prop in @($OnDisk.PSObject.Properties))
     {
-        if (@('FailedAttempts', 'CompletedSubscriptionIds') -contains $Prop.Name) { continue }
-        $RunVariable = Get-Variable -Name $Prop.Name -ErrorAction SilentlyContinue
-        if ($null -eq $RunVariable) { continue }
-        $RunList = @($RunVariable.Value | Where-Object { $null -ne $_ })
-        if (-not ((& $IsRecordList $Prop.Value) -or (& $IsRecordList $RunList))) { continue }
-        $Lists.Add([pscustomobject]@{ Name = $Prop.Name; Run = $RunList; CompletedOnly = $true })
+        if ($Prop.Name -eq 'CompletedSubscriptionIds' -or $Lists.Contains($Prop.Name)) { continue }
+        if (@($Prop.Value | Where-Object { Test-ResumeStateRecord -Item $_ }).Count -gt 0)
+        {
+            $Lists[$Prop.Name] = [pscustomobject]@{ Run = $null; CompletedOnly = $false }
+        }
     }
-    $Mismatch = @()
+    $Mismatch = [System.Collections.Generic.List[string]]::new()
     foreach ($Id in $Wanted)
     {
-        if (($OnDiskCompleted -contains $Id) -ne ($RunCompleted -contains $Id)) { $Mismatch += $Id; continue }
-        foreach ($List in $Lists)
+        if ($OnDiskCompleted.Contains($Id) -ne $RunCompleted.Contains($Id)) { $Mismatch.Add($Id) }
+    }
+    foreach ($Name in @($Lists.Keys))
+    {
+        $RunById = & $Index $Lists[$Name].Run
+        $DiskById = & $Index (& $Key $Name)
+        foreach ($Id in $Wanted)
         {
-            if ($List.CompletedOnly -and $RunCompleted -notcontains $Id) { continue }
-            # The last record for the id on each side, as each side lets the last one win.
-            $RunRecord = @($List.Run | Where-Object { (& $IsRecord $_) -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
-            $DiskRecord = @(& $Key $List.Name | Where-Object { (& $IsRecord $_) -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
-            if ((ConvertTo-ResumeRecordText -Record $RunRecord) -ne (ConvertTo-ResumeRecordText -Record $DiskRecord)) { $Mismatch += $Id; break }
+            if ($Mismatch.Contains($Id)) { continue }
+            if ($Lists[$Name].CompletedOnly -and -not $RunCompleted.Contains($Id)) { continue }
+            $InRun = $RunById.ContainsKey($Id)
+            $OnFile = $DiskById.ContainsKey($Id)
+            if (-not $InRun -and -not $OnFile) { continue }
+            if ($InRun -ne $OnFile -or (ConvertTo-ResumeRecordText -Record $RunById[$Id]) -ne (ConvertTo-ResumeRecordText -Record $DiskById[$Id])) { $Mismatch.Add($Id) }
         }
     }
     return @($Mismatch | Sort-Object -Unique)
@@ -866,10 +926,12 @@ function Get-ResumeStateRecordMismatch
 # them (Get-ResumeStateRecordMismatch); each removal is checked
 # (Remove-StreamStateFiles), and the resume state file is kept while one is
 # left. Otherwise keep them, with a warning naming them, so a later -Resume
-# folds them in again and nothing is lost. Used for the files a run folded in
-# at startup when it keeps the resume state or ends early, and for the files of
-# a parallel run's streams at its end-of-run merge ($Source says which, for the
-# warning). Returns the paths left on disk.
+# folds them in again and nothing is lost. A file holding a list this version
+# does not keep (Get-StreamStateUntrackedLists) is kept as well, with its own
+# warning, since the resume state cannot hold those records. Used for the files
+# a run folded in at startup when it keeps the resume state or ends early, and
+# for the files of a parallel run's streams at its end-of-run merge ($Source
+# says which, for the warning). Returns the paths left on disk.
 function Invoke-FoldedStreamStateCleanup
 {
     param(
@@ -883,13 +945,93 @@ function Invoke-FoldedStreamStateCleanup
     )
     $Left = @($Files | Where-Object { $null -ne $_ -and (Test-Path -LiteralPath $_.FullName -PathType Leaf) })
     if ($Left.Count -eq 0) { return @() }
+    $Kept = @()
+    $Untracked = @()
+    foreach ($File in $Left)
+    {
+        $Names = @(Get-StreamStateUntrackedLists -State (Read-StreamResumeStateFile -Path $File.FullName))
+        if ($Names.Count -gt 0) { $Untracked += [pscustomobject]@{ File = $File; Lists = $Names } }
+    }
+    if ($Untracked.Count -gt 0)
+    {
+        foreach ($Item in $Untracked)
+        {
+            Write-Host ("WARNING: The per-stream state file {0} holds records this version does not keep ({1}), so it is kept and a later -Resume reads it again." -f $Item.File.Name, ($Item.Lists -join ', ')) -ForegroundColor Yellow
+            $Kept += $Item.File.FullName
+        }
+        $Left = @($Left | Where-Object { $Kept -notcontains $_.FullName })
+        if ($Left.Count -eq 0) { return $Kept }
+    }
     $NotHeld = @(Get-ResumeStateRecordMismatch -Path $ResumeStateFile -Tenant $Tenant -Ids $Ids -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts)
     if ($NotHeld.Count -gt 0)
     {
         Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f (Split-Path -Path $ResumeStateFile -Leaf), $Source, (@($Left | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
-        return @($Left | ForEach-Object { $_.FullName })
+        return @($Kept) + @($Left | ForEach-Object { $_.FullName })
     }
-    return @(Remove-StreamStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }) -StateFile $ResumeStateFile)
+    return @($Kept) + @(Remove-StreamStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }) -StateFile $ResumeStateFile)
+}
+
+# At the start of a run without -Resume or -ResumeFailedOnly: the per-stream
+# state files of this tenant that an earlier parallel run left
+# (Get-StreamResumeStateFiles) are not used by this run, and a later -Resume
+# must not fold them in either, or it would count what they record as this
+# cycle's. They are renamed in place, as one set, to <name>.earlier-<UTC time>
+# (one time for the whole set), with a warning naming them. Such a name ends
+# neither in '.json' nor matches Get-StreamResumeStateFiles, so no run reads
+# it, and it stays a dot-file in the inventory root like the resume state file,
+# which no zip step takes. Once a set is moved and no file was left, the sets
+# an earlier run moved aside are removed, so only the newest set is kept. Files named
+# <name>.unreadable-<time> (Move-UnreadableStreamStateFile) and every other
+# name are left alone. Returns { Moved; NotMoved (each { Name; Reason }); Removed }.
+function Move-EarlierStreamStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    $Suffix = '.earlier-' + $Now.ToString('yyyyMMdd-HHmmss')
+    $Moved = @()
+    $NotMoved = @()
+    $Removed = @()
+    $Files = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name)
+    foreach ($File in $Files)
+    {
+        try
+        {
+            Rename-Item -LiteralPath $File.FullName -NewName ($File.Name + $Suffix) -ErrorAction Stop
+            $Moved += $File.Name
+        }
+        catch
+        {
+            $NotMoved += [pscustomobject]@{ Name = $File.Name; Reason = $_.Exception.Message }
+        }
+    }
+    if ($Moved.Count -gt 0)
+    {
+        Write-Host ("WARNING: A run without -Resume or -ResumeFailedOnly does not use the per-stream state files an earlier parallel run left, so they were moved aside with {0} added to each name, and no later run reads them: {1}" -f $Suffix, ($Moved -join ', ')) -ForegroundColor Yellow
+    }
+    if ($Moved.Count -gt 0 -and $NotMoved.Count -eq 0)
+    {
+        $Earlier = '^' + [regex]::Escape('.resume-state-{0}-stream-' -f $Tenant) + '.+\.json\.earlier-\d{8}-\d{6}$'
+        foreach ($Old in @(Get-ChildItem -LiteralPath $InventoryRoot -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Earlier -and -not $_.Name.EndsWith($Suffix) }))
+        {
+            try
+            {
+                Remove-Item -LiteralPath $Old.FullName -Force -ErrorAction Stop
+                $Removed += $Old.Name
+            }
+            catch
+            {
+                Write-Host ("WARNING: Could not remove {0}, a per-stream state file an earlier run moved aside: {1}" -f $Old.Name, $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+        if ($Removed.Count -gt 0)
+        {
+            Write-Host ("Removed the per-stream state files an earlier run moved aside: {0}" -f ($Removed -join ', ')) -ForegroundColor DarkGray
+        }
+    }
+    return [pscustomobject]@{ Moved = $Moved; NotMoved = $NotMoved; Removed = $Removed }
 }
 
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
