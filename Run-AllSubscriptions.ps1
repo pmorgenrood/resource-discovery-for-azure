@@ -1798,7 +1798,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # when a per-stream file could not be read, so the state reported as
         # cleared below is cleared. Only files that were read are deleted; one
         # that could not be read was moved aside and is kept.
-        if ($NothingLeftToCollect -or @($UnreadableStreamFiles).Count -gt 0)
+        if ($NothingLeftToCollect -or @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
         {
             foreach ($StreamFile in @($FoldedStreamFiles | Where-Object { $null -ne $_ }))
             {
@@ -1806,7 +1806,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
                 try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
             }
         }
-        if (@($UnreadableStreamFiles).Count -eq 0)
+        if (@($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
         }

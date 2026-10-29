@@ -2348,16 +2348,18 @@ exit 1
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
     }
 
-    It 'keeps a subscription whose check cannot finish, or whose two answers disagree, on the retry list until it is collected (<Cause>)' -TestCases @(
-        @{ Cause = 'Unknown'; Fix = 'The role check could not finish (the reason above says why); run -ResumeFailedOnly.' }
-        @{ Cause = 'Disagree'; Fix = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.' }
+    It 'keeps a subscription whose check cannot finish, or whose two answers disagree, on the retry list until it is collected (<Cause>, <Route>)' -TestCases @(
+        @{ Cause = 'Unknown'; Route = '-Resume'; Fix = 'The role check could not finish (the reason above says why); run -ResumeFailedOnly.' }
+        @{ Cause = 'Unknown'; Route = '-ResumeFailedOnly'; Fix = 'The role check could not finish (the reason above says why); run -ResumeFailedOnly.' }
+        @{ Cause = 'Disagree'; Route = '-Resume'; Fix = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.' }
+        @{ Cause = 'Disagree'; Route = '-ResumeFailedOnly'; Fix = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.' }
     ) {
-        param($Cause, $Fix)
+        param($Cause, $Route, $Fix)
         $Subs = @($script:SubA, $script:SubX)
         $Temporary = @{ $Cause = @($script:SubX.Id) }
         $AttemptsOf = { @((script:Read-WrapperState).Attempts | Where-Object { $_.Id -eq $script:SubX.Id } | ForEach-Object { [int]$_.Attempts }) }
 
-        # Run 0, no -Resume: Sub A is collected, Sub X skipped.
+        # Run 0, no -Resume: Sub A is collected, Sub X skipped and put on the retry list.
         script:Set-WrapperScenario -Subs $Subs @Temporary
         $R0 = script:Invoke-WrapperRun -Arguments '-Obfuscate'
         $R0.ExitCode | Should -Be 0
@@ -2369,25 +2371,29 @@ exit 1
         $R0.Text[$At + 1] | Should -Be '  1 of them were skipped by this run''s role check:'
         $R0.Text[$At + 3] | Should -Be ('  To retry them: {0}' -f $Fix)
 
-        # -Resume: nothing else left to collect; Sub X is skipped again and counted.
-        $R1 = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
-        $R1.ExitCode | Should -Be 0
-        $R1.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        if ($Route -eq '-Resume')
+        {
+            # -Resume: nothing else left to collect; Sub X is skipped again and counted.
+            $R1 = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
+            $R1.ExitCode | Should -Be 0
+            $R1.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        }
+        else
+        {
+            # -ResumeFailedOnly: nothing on its retry list can be read, so it stops,
+            # and the stopped run is counted too.
+            $R1 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
+            $R1.ExitCode | Should -Be 1
+            @(script:Get-AccessStopLines $R1).Count | Should -BeGreaterThan 0
+        }
         & $AttemptsOf | Should -Be @(2)
 
-        # -ResumeFailedOnly: nothing on its retry list can be read, so it stops,
-        # and the stopped run is counted too.
-        $R2 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
-        $R2.ExitCode | Should -Be 1
-        @(script:Get-AccessStopLines $R2).Count | Should -BeGreaterThan 0
-        & $AttemptsOf | Should -Be @(3)
-
-        # The cause is gone: -ResumeFailedOnly collects Sub X and clears the state.
+        # The cause is gone: the same kind of run collects Sub X and clears the state.
         script:Set-WrapperScenario -Subs $Subs
-        $R3 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
-        $R3.ExitCode | Should -Be 0
-        $R3.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
-        $R3.Text | Should -Contain 'Resume state cleared (clean run).'
+        $R2 = script:Invoke-WrapperRun -Arguments $Route, '-Obfuscate'
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
+        $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
         @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains('skipped by the up-front role check') -or $_.Name -like '*.resume-state*' } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
     }
