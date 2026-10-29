@@ -125,7 +125,9 @@ $Global:LASTEXITCODE = 0
     $script:SequentialRun = [scriptblock]::Create($Prelude + '. ' + $SeqText)
     # The fallback takes the pending list, which the wrapper builds just before it.
     $script:FallbackRun = [scriptblock]::Create($Prelude + "`$PendingSubscriptions = @(`$Subscriptions)`n" + $OneText)
-    $script:StreamMergeRun = [scriptblock]::Create($Prelude + $MergeText)
+    # The streams write their files after startup (a run without -Resume moves
+    # aside any it finds at startup), so the test's writes run between the two.
+    $script:StreamMergeRun = [scriptblock]::Create($Prelude + "& `$Global:RdaIdsTestStreamsWrite`n" + $MergeText)
 
     # Run one lifted block against a case folder. Returns the host lines it
     # printed and the names of the subscriptions the stand-in processed.
@@ -185,7 +187,7 @@ $Global:LASTEXITCODE = 0
 }
 
 AfterAll {
-    Remove-Variable -Name RdaIdsTestProcessed, RdaIdsTestRoot -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaIdsTestProcessed, RdaIdsTestRoot, RdaIdsTestStreamsWrite -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -260,8 +262,10 @@ Describe 'Other places that add to the completed list, starting from one earlier
     }
 
     It 'the end-of-run merge of per-stream state adds each stream''s ids separately' {
-        script:Save-TestStreamState -Root $script:Root -StreamId 0 -Subs @($script:B)
-        script:Save-TestStreamState -Root $script:Root -StreamId 1 -Subs @($script:C)
+        $Global:RdaIdsTestStreamsWrite = {
+            script:Save-TestStreamState -Root $script:Root -StreamId 0 -Subs @($script:B)
+            script:Save-TestStreamState -Root $script:Root -StreamId 1 -Subs @($script:C)
+        }
         $null = script:Invoke-Wrapper -Block $script:StreamMergeRun -Root $script:Root -Subs $script:All
         script:Get-StateIds -Root $script:Root | Should -Be '3 id(s): Sub A, Sub B, Sub C'
         # The merge itself no longer deletes the per-stream files: the wrapper

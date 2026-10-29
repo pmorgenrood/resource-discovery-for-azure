@@ -676,7 +676,78 @@ function Move-UnreadableStreamStateFile
         $MovedTo = $null
         Write-Host ('{0} It could not be moved aside ({1}), so {2} finds it again.' -f $Lead, $_.Exception.Message, $Again) -ForegroundColor Yellow
     }
-    return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
+    return [pscustomobject]@{ Name = $File.Name; Path = $File.FullName; MovedTo = $MovedTo }
+}
+
+# A per-stream state file that cannot be moved aside stays under its active
+# name, so every later run would find it again and warn about it again, with
+# no end. The run stops instead: this names each such file and prints the
+# command that removes it. Each item is { Name; Path } (Path is the full path).
+# The caller exits 1; the next run goes on once the files are gone.
+function Write-StreamStateFileStop
+{
+    param([object[]]$Files, [string]$Why = 'could not be read')
+    $Stuck = @($Files | Where-Object { $null -ne $_ })
+    if ($Stuck.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '============== STOPPED (per-stream state file left in place) ==============' -ForegroundColor Red
+    foreach ($File in $Stuck)
+    {
+        Write-Host ('The per-stream state file {0} {1} and could not be moved aside, so every run would find it again.' -f $File.Path, $Why) -ForegroundColor Red
+    }
+    Write-Host 'Remove it (or let this account rename files in that folder), then run again:' -ForegroundColor Red
+    foreach ($File in $Stuck)
+    {
+        Write-Host ("  Remove-Item -LiteralPath '{0}' -Force" -f ([string]$File.Path).Replace("'", "''")) -ForegroundColor Red
+    }
+    Write-Host '==========================================================================' -ForegroundColor Red
+}
+
+# The per-stream state files a run WITHOUT -Resume or -ResumeFailedOnly finds
+# at startup: an interrupted parallel run left them, and their records belong to
+# that earlier run. This run collects every subscription again, so they are not
+# folded in; left under their active names, a later -Resume would fold them in
+# and skip a subscription they list as completed, carrying an old report. Each
+# is renamed to <name>.stranded-<UTC time>, which ends neither in '.json' nor
+# matches Get-StreamResumeStateFiles, so no later run reads it and no zip step
+# takes it. They are never deleted; only the newest set is kept, so the moved-
+# aside sets of earlier runs are removed once this set is in place. Returns the
+# files that could not be renamed ({ Name; Path }), for Write-StreamStateFileStop.
+function Move-StrandedStreamStateFiles
+{
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    $Suffix = '.stranded-{0}' -f $Now.ToString('yyyyMMdd-HHmmss')
+    $Moved = @()
+    $Stuck = @()
+    foreach ($File in @($Files | Where-Object { $null -ne $_ }))
+    {
+        try
+        {
+            Rename-Item -LiteralPath $File.FullName -NewName ($File.Name + $Suffix) -ErrorAction Stop
+            $Moved += ($File.Name + $Suffix)
+        }
+        catch
+        {
+            $Stuck += [pscustomobject]@{ Name = $File.Name; Path = $File.FullName }
+        }
+    }
+    if ($Moved.Count -gt 0)
+    {
+        Write-Host ('Moved aside {0} per-stream state file(s) an interrupted parallel run left: this run collects every subscription again, so their records are not used. Kept as: {1}' -f $Moved.Count, ($Moved -join ', ')) -ForegroundColor Yellow
+        $Pattern = [System.Management.Automation.WildcardPattern]::Escape(('.resume-state-{0}-stream-' -f $Tenant)) + '*.json.stranded-*'
+        $Older = @(Get-ChildItem -LiteralPath $InventoryRoot -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like $Pattern -and -not $_.Name.EndsWith($Suffix) })
+        foreach ($Old in $Older)
+        {
+            try { Remove-Item -LiteralPath $Old.FullName -Force -ErrorAction Stop }
+            catch { Write-Host ('WARNING: Could not remove {0}, an older moved-aside per-stream state file: {1}' -f $Old.Name, $_.Exception.Message) -ForegroundColor Yellow }
+        }
+    }
+    return $Stuck
 }
 
 # The end-of-run line for each per-stream state file this run could not read
