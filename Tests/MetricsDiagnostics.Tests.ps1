@@ -232,7 +232,7 @@ Describe 'Metrics phase diagnostics across several batches' {
     }
 
     It 'counts every call by outcome, including a status seen only in the first batch' {
-        Hide-Seconds $script:Run.Log[2] | Should -Be '[Metrics] Total calls: 800 | Success: 797 | Timeout: 0 | Throttled: 1 | Error: 2 | Elapsed: <s>s'
+        Hide-Seconds $script:Run.Log[2] | Should -Be '[Metrics] Metric definitions: 800 | Success: 797 | Timeout: 0 | Throttled: 1 | Error: 2 | Elapsed: <s>s'
     }
 
     It 'lists every non-success call from every batch, slowest first' {
@@ -288,7 +288,7 @@ Describe 'Metrics phase diagnostics with no metric definitions' {
         @($Run.Log | ForEach-Object { Hide-Seconds $_ }) | Should -Be @(
             '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
             '[Metrics] ===== Metrics phase summary ====='
-            '[Metrics] Total calls: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
+            '[Metrics] Metric definitions: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
             '[Metrics] Azure Monitor requests: 0 for 0 metric definition(s), of which 0 single-metric fallback request(s); retries not counted'
         )
     }
