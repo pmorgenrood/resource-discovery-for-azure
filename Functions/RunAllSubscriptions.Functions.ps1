@@ -656,6 +656,40 @@ function Test-StreamStateRunId
     return ($FileRunId -eq [string]$RunId)
 }
 
+# At the end of a run that ends clean: remove the per-stream state files of this
+# tenant that another run wrote (readable, with a run id other than $RunId,
+# Test-StreamStateRunId). No run can resume them. Each removal stops on an error
+# and is then checked; a file that is still there is named in a warning. Files
+# that cannot be read are left for the -Resume that handles them. Returns
+# { Removed; Left } (file names).
+function Remove-OtherRunStreamStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    $Removed = @()
+    $Left = @()
+    foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name))
+    {
+        $Obj = Read-StreamResumeStateFile -Path $File.FullName
+        if ($null -eq $Obj -or (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
+        $Reason = $null
+        try { Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $File.FullName)) { $Removed += $File.Name; continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        Write-Host ('WARNING: Could not remove the per-stream state file {0}, which another run wrote: {1}' -f $File.Name, $Reason) -ForegroundColor Yellow
+        $Left += $File.Name
+    }
+    if ($Removed.Count -gt 0)
+    {
+        Write-Host ('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Removed -join ', ')) -ForegroundColor DarkGray
+    }
+    return [pscustomobject]@{ Removed = $Removed; Left = $Left }
+}
+
 # Discover every per-stream resume-state file on disk for a tenant, rather
 # than iterating 0..($StreamCount-1). $StreamCount reflects THIS run's
 # -ParallelStreams value; if an earlier interrupted run used a LARGER value,
@@ -839,7 +873,8 @@ function ConvertTo-ResumeRecordText
 # in the resume state file, Stream the key in a per-stream state file, Run the
 # variable. CompletedOnly marks a list the resume state keeps for completed
 # subscriptions only. A list a later version adds needs its entry here, or a
-# per-stream state file holding it is kept (Get-StreamStateUntrackedLists).
+# per-stream state file holding it is renamed aside once its other records are
+# held (Get-StreamStateUntrackedLists, Move-UntrackedStreamStateFiles).
 function Get-ResumeStateRecordLists
 {
     return @(
@@ -963,17 +998,55 @@ function Get-ResumeStateRecordMismatch
     return @($Mismatch | Sort-Object -Unique)
 }
 
+# A per-stream state file holding a list this version does not keep
+# (Get-StreamStateUntrackedLists) is not deleted where the others are: its
+# completed and failed subscriptions were used, and the file is renamed in place
+# to <name>.unused-<UTC time> with a warning naming the list, kept for
+# inspection. That name ends neither in '.json' nor matches
+# Get-StreamResumeStateFiles, so no run reads it, and it stays a dot-file in the
+# inventory root, which no zip step takes. $Files are file objects or paths.
+# Returns { Left = the paths of the other files; Moved = @({ Name; MovedTo;
+# Lists }); NotMoved = the paths that could not be renamed }.
+function Move-UntrackedStreamStateFiles
+{
+    param([object]$Files, [datetime]$Now = [datetime]::UtcNow)
+    $Left = @()
+    $Moved = @()
+    $NotMoved = @()
+    foreach ($File in @($Files | Where-Object { $null -ne $_ }))
+    {
+        $Path = if ($File -is [string]) { $File } else { $File.FullName }
+        $Lists = @(Get-StreamStateUntrackedLists -State (Read-StreamResumeStateFile -Path $Path))
+        if ($Lists.Count -eq 0) { $Left += $Path; continue }
+        $Name = Split-Path -Path $Path -Leaf
+        $MovedTo = '{0}.unused-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+        $Lead = 'WARNING: The per-stream state file {0} holds records this version does not keep ({1}); its completed and failed subscriptions were used.' -f $Name, ($Lists -join ', ')
+        try
+        {
+            Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
+            Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
+            $Moved += [pscustomobject]@{ Name = $Name; MovedTo = $MovedTo; Lists = $Lists }
+        }
+        catch
+        {
+            Write-Host ('{0} It could not be moved aside ({1}), so a later -Resume reads it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+            $NotMoved += $Path
+        }
+    }
+    return [pscustomobject]@{ Left = $Left; Moved = $Moved; NotMoved = $NotMoved }
+}
+
 # Delete per-stream state files ($Files, the ids they hold records for in $Ids)
 # once the resume state file on disk holds those records as this run holds
 # them (Get-ResumeStateRecordMismatch); each removal is checked
 # (Remove-StreamStateFiles), and the resume state file is kept while one is
-# left. Otherwise keep them, with a warning naming them, so a later -Resume
-# folds them in again and nothing is lost. A file holding a list this version
-# does not keep (Get-StreamStateUntrackedLists) is kept as well, with its own
-# warning, since the resume state cannot hold those records. Used for the files
-# a run folded in at startup when it keeps the resume state or ends early, and
-# for the files of a parallel run's streams at its end-of-run merge ($Source
-# says which, for the warning). Returns the paths left on disk.
+# left. A file holding a list this version does not keep is renamed aside
+# instead (Move-UntrackedStreamStateFiles); -Moved, when given, collects those.
+# Otherwise keep them all, with a warning naming them, so a later -Resume folds
+# them in again and nothing is lost. Used for the files a run folded in at
+# startup when it keeps the resume state or ends early, and for the files of a
+# parallel run's streams at its end-of-run merge ($Source says which, for the
+# warning). Returns the paths left on disk.
 function Invoke-FoldedStreamStateCleanup
 {
     param(
@@ -983,34 +1056,20 @@ function Invoke-FoldedStreamStateCleanup
         [object]$Ids,
         [object]$CompletedIds,
         [object]$FailedAttempts,
-        [string]$Source = 'this run read at startup'
+        [string]$Source = 'this run read at startup',
+        [System.Collections.Generic.List[object]]$Moved
     )
     $Left = @($Files | Where-Object { $null -ne $_ -and (Test-Path -LiteralPath $_.FullName -PathType Leaf) })
     if ($Left.Count -eq 0) { return @() }
-    $Kept = @()
-    $Untracked = @()
-    foreach ($File in $Left)
-    {
-        $Names = @(Get-StreamStateUntrackedLists -State (Read-StreamResumeStateFile -Path $File.FullName))
-        if ($Names.Count -gt 0) { $Untracked += [pscustomobject]@{ File = $File; Lists = $Names } }
-    }
-    if ($Untracked.Count -gt 0)
-    {
-        foreach ($Item in $Untracked)
-        {
-            Write-Host ("WARNING: The per-stream state file {0} holds records this version does not keep ({1}), so it is kept and a later -Resume reads it again." -f $Item.File.Name, ($Item.Lists -join ', ')) -ForegroundColor Yellow
-            $Kept += $Item.File.FullName
-        }
-        $Left = @($Left | Where-Object { $Kept -notcontains $_.FullName })
-        if ($Left.Count -eq 0) { return $Kept }
-    }
     $NotHeld = @(Get-ResumeStateRecordMismatch -Path $ResumeStateFile -Tenant $Tenant -Ids $Ids -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts)
     if ($NotHeld.Count -gt 0)
     {
         Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f (Split-Path -Path $ResumeStateFile -Leaf), $Source, (@($Left | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
-        return @($Kept) + @($Left | ForEach-Object { $_.FullName })
+        return @($Left | ForEach-Object { $_.FullName })
     }
-    return @($Kept) + @(Remove-StreamStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }) -StateFile $ResumeStateFile)
+    $Untracked = Move-UntrackedStreamStateFiles -Files $Left
+    if ($null -ne $Moved) { foreach ($Item in @($Untracked.Moved)) { $Moved.Add($Item) } }
+    return @($Untracked.NotMoved) + @(Remove-StreamStateFiles -StreamFiles @($Untracked.Left) -StateFile $ResumeStateFile)
 }
 
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any

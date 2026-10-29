@@ -782,6 +782,9 @@ $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
 $StreamFilesLeft = @()
 $UnreadableStreamFiles = @()
+# The per-stream files renamed aside because they hold a list this version does
+# not keep (Move-UntrackedStreamStateFiles); such a run is not a clean run.
+$UnusedListStreamFiles = [System.Collections.Generic.List[object]]::new()
 if ($Resume -or $ResumeFailedOnly)
 {
     $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
@@ -1662,7 +1665,7 @@ else
             # is left is named, the resume state is kept for it below, and the
             # next -Resume reads it again. This read covers the files folded in
             # at startup too, so they are done.
-            $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName -and $OtherRunAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote")
+            $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName -and $OtherRunAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote" -Moved $UnusedListStreamFiles)
             $FoldedStreamFiles = @()
             $FoldedRecordIds = @()
         }
@@ -1868,6 +1871,7 @@ if ($null -ne $OuterZipFile)
 # its warning said. A run in which a per-stream file could not be read is not a
 # clean run, so it says so instead.
 $ResumeStateClearTried = $false
+$CleanRun = $false
 if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
     $ResumeStateClearTried = $true
@@ -1876,17 +1880,22 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # The per-stream files first, then the resume state file, each removal
         # checked (Remove-ResumeStateFiles). While one is left the resume state
         # is kept and the run does not say it cleared the state.
-        $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
+        # A file holding a list this version does not keep is renamed aside
+        # instead; one that cannot be renamed keeps the state, like a file left.
+        $Untracked = Move-UntrackedStreamStateFiles -Files @($FoldedStreamFiles | Where-Object { $null -ne $_ })
+        foreach ($Item in @($Untracked.Moved)) { $UnusedListStreamFiles.Add($Item) }
+        $StreamFilesToRemove = @($Untracked.Left)
         $FoldedStreamFiles = @()
-        $MergeFilesLeft = @($StreamFilesLeft | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Test-Path -LiteralPath $_) })
+        $MergeFilesLeft = @(@($StreamFilesLeft) + @($Untracked.NotMoved) | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Test-Path -LiteralPath $_) })
         $StateFilesLeft = @($MergeFilesLeft + $ResumeStateFile)
         if ($MergeFilesLeft.Count -eq 0)
         {
             $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
         }
-        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
+        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0 -and $UnusedListStreamFiles.Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+            $CleanRun = $true
         }
     }
     catch
@@ -1909,10 +1918,16 @@ if (-not $ResumeStateClearTried)
 # whether the state was cleared or kept, and where that file went.
 Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
 
-# The per-stream state files of another run that the startup fold or the
-# end-of-run merge found: not used by this run, and left in place.
+# The per-stream state files of another run: never used by this run. A run that
+# ends clean removes them, since no run can resume them
+# (Remove-OtherRunStreamStateFiles); any other run leaves them and names the
+# ones its startup fold or end-of-run merge found.
 $OtherRunStreamFiles = @($OtherRunStreamFiles | Sort-Object -Unique)
-if ($OtherRunStreamFiles.Count -gt 0)
+if ($CleanRun)
+{
+    $null = Remove-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
+}
+elseif ($OtherRunStreamFiles.Count -gt 0)
 {
     Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
 }
