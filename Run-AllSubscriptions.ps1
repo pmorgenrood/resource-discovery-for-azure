@@ -67,8 +67,9 @@ param (
     # separate `pwsh` background process with its own Az PowerShell context
     # and its own resume-state file (.resume-state-<TenantID>-stream-<N>.json),
     # so they cannot race on the shared Az static state or the resume file.
-    # The wrapper splits the eligible subscription list into N approximately
-    # equal chunks at the start and assigns one chunk per stream.
+    # The wrapper splits the eligible subscriptions left to process (on -Resume,
+    # those no earlier run completed) into N approximately equal chunks at the
+    # start and assigns one chunk per stream.
     #
     # Practical guidance:
     #   1   = sequential (default, lowest memory, easiest to debug)
@@ -554,10 +555,19 @@ $IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -
 # end-of-run merge still owns per-stream cleanup. Safe on non-interrupted runs: a
 # cleanly-finished parallel run deletes its per-stream files, so this finds none.
 # Runs at startup before any stream is launched, so it cannot race live streams.
-# A file that cannot be read is moved aside with a warning
-# (Move-UnreadableStreamStateFile) and its records are not used; only the files
-# read here are deleted when the run clears the state.
+# The files that were read and folded in are kept in $FoldedStreamFiles, and
+# the ids they hold records for in $FoldedRecordIds: the clean-up at the end of
+# the run, or Exit-Wrapper when the run ends early, deletes them once the resume
+# state no longer needs them (cleared, or written and read back holding those
+# records), or a later run would recover them again from a cycle that already
+# finished. After the end-of-run merge of a parallel run they are the files
+# its streams wrote, deleted at the same points ($FoldedSource names them in
+# the warning). A file that cannot be read, here or in the end-of-run merge of
+# a parallel run, is moved aside with a warning (Move-UnreadableStreamStateFile)
+# and collected in $UnreadableStreamFiles; its records are not used.
 $FoldedStreamFiles = @()
+$FoldedRecordIds = @()
+$FoldedSource = 'this run read at startup'
 $UnreadableStreamFiles = @()
 if ($Resume -or $ResumeFailedOnly)
 {
@@ -569,20 +579,18 @@ if ($Resume -or $ResumeFailedOnly)
         $StrandedReports = @()
         foreach ($StreamFile in $StrandedStreamFiles)
         {
-            try
+            $Obj = Read-StreamResumeStateFile -Path $StreamFile.FullName
+            if ($null -eq $Obj)
             {
-                $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
-                if ($null -eq $Obj -or $Obj -isnot [pscustomobject]) { throw 'not a per-stream state record' }
-                $FoldedStreamFiles = @(@($FoldedStreamFiles | Where-Object { $null -ne $_ }) + $StreamFile)
-                if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
-                if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
-                if ($null -ne $Obj.Reports) { $StrandedReports += @($Obj.Reports) }
-            }
-            catch
-            {
-                Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
+                Write-Verbose ("Could not read stranded stream resume file {0}" -f $StreamFile.FullName)
                 $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile -ResumeFailedOnly:$ResumeFailedOnly))
+                continue
             }
+            if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
+            if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
+            if ($null -ne $Obj.Reports) { $StrandedReports += @($Obj.Reports) }
+            $FoldedStreamFiles += $StreamFile
+            $FoldedRecordIds += @(@($Obj.Completed) + @($Obj.FailedAttempts | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
         }
         if ($StrandedCompleted.Count -gt 0)
         {
@@ -1139,25 +1147,53 @@ else
     # `[stream-N]`). The final summary is consolidated from the per-stream
     # summary JSON files.
 
-    $StreamCount = [Math]::Min($ParallelStreams, $Subscriptions.Count)
-    Write-Host ""
-    Write-Host ("Parallel-streams mode: {0} streams across {1} eligible subscription(s)" -f $StreamCount, $Subscriptions.Count) -ForegroundColor Cyan
-    if ($ParallelStreams -gt $Subscriptions.Count)
+    # On -Resume, leave out what an earlier run completed before the streams
+    # are counted and sliced, as the sequential loop does. A stream worker
+    # knows only its own per-stream state file, which the end-of-run merge
+    # folds in and deletes, and the one-subscription path below has no resume
+    # check of its own, so left to them every subscription is collected again.
+    $PendingSubscriptions = @()
+    foreach ($Sub in $Subscriptions)
     {
-        Write-Host ("Note: -ParallelStreams {0} clamped to {1} (one stream per subscription is the practical limit)." -f $ParallelStreams, $StreamCount) -ForegroundColor DarkGray
+        if ($Resume -and ($CompletedIds -contains $Sub.Id))
+        {
+            Write-Host ("Skipping (already completed): {0} ({1})" -f $Sub.Name, $Sub.Id) -ForegroundColor DarkGray
+            $SkippedCount++
+            continue
+        }
+        $PendingSubscriptions += $Sub
     }
-    Write-Host "Each stream is a separate pwsh background job with its own Az context and resume-state file." -ForegroundColor DarkGray
+
+    $StreamCount = [Math]::Min($ParallelStreams, $PendingSubscriptions.Count)
     Write-Host ""
+    if ($StreamCount -ge 2)
+    {
+        Write-Host ("Parallel-streams mode: {0} streams across {1} subscription(s) to process" -f $StreamCount, $PendingSubscriptions.Count) -ForegroundColor Cyan
+        if ($ParallelStreams -gt $PendingSubscriptions.Count)
+        {
+            Write-Host ("Note: -ParallelStreams {0} clamped to {1} (one stream per subscription is the practical limit)." -f $ParallelStreams, $StreamCount) -ForegroundColor DarkGray
+        }
+        Write-Host "Each stream is a separate pwsh background job with its own Az context and resume-state file." -ForegroundColor DarkGray
+        Write-Host ""
+    }
 
     if ($StreamCount -le 1)
     {
-        # User asked for parallel but only one (or zero) sub is eligible.
-        # Process it inline using the same per-sub logic the sequential
-        # branch uses, instead of bailing and asking the user to re-run.
-        Write-Host "Only one eligible subscription; running sequentially." -ForegroundColor Yellow
-        if ($Subscriptions.Count -gt 0)
+        # User asked for parallel but only one (or zero) sub is left to
+        # process. Process it inline using the same per-sub logic the
+        # sequential branch uses, instead of bailing and asking the user to
+        # re-run.
+        if ($PendingSubscriptions.Count -eq 0)
         {
-            $Sub = $Subscriptions[0]
+            Write-Host "Nothing left to process: every eligible subscription was completed by an earlier run." -ForegroundColor Green
+        }
+        else
+        {
+            Write-Host "Only one subscription to process; running sequentially." -ForegroundColor Yellow
+        }
+        if ($PendingSubscriptions.Count -gt 0)
+        {
+            $Sub = $PendingSubscriptions[0]
             Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
             try
             {
@@ -1312,9 +1348,9 @@ else
             {
                 $Slices += , (New-Object 'System.Collections.Generic.List[object]')
             }
-            for ($i = 0; $i -lt $Subscriptions.Count; $i++)
+            for ($i = 0; $i -lt $PendingSubscriptions.Count; $i++)
             {
-                $Slices[$i % $StreamCount].Add($Subscriptions[$i])
+                $Slices[$i % $StreamCount].Add($PendingSubscriptions[$i])
             }
 
             # Build per-stream output paths up front so we know where to look later.
@@ -1571,35 +1607,38 @@ else
             $AllCompletedFromStreams = @()
             $AllFailedFromStreams = @()
             $AllReportsFromStreams = @()
+            $UnreadableAtMerge = @()
             foreach ($StreamFile in $AllStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
-                try
+                $Obj = Read-StreamResumeStateFile -Path $PerStreamFile
+                if ($null -eq $Obj)
                 {
-                    $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
-                    if ($null -ne $Obj.Completed)
-                    {
-                        $AllCompletedFromStreams += @($Obj.Completed)
-                    }
-                    # The report zip each stream recorded per completed sub.
-                    if ($null -ne $Obj.Reports)
-                    {
-                        $AllReportsFromStreams += @($Obj.Reports)
-                    }
-                    # Per-stream files written by workers also carry their
-                    # FailedAttempts entries. Merge by Id so the unified
-                    # state file reflects every stream's failures, with the
-                    # most-recent attempt's Reason/LastFailedAt winning when
-                    # the same sub appears in multiple streams (which would
-                    # only happen across re-runs with different slicing).
-                    if ($null -ne $Obj.FailedAttempts)
-                    {
-                        $AllFailedFromStreams += @($Obj.FailedAttempts)
-                    }
+                    # Its records are not used, so none of the subscriptions it
+                    # lists counts as completed and a later -Resume collects
+                    # them. Moved aside with a warning, not deleted.
+                    $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile -AtRunEnd))
+                    $UnreadableAtMerge += $PerStreamFile
+                    continue
                 }
-                catch
+                if ($null -ne $Obj.Completed)
                 {
-                    Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
+                    $AllCompletedFromStreams += @($Obj.Completed)
+                }
+                # Per-stream files written by workers also carry their
+                # FailedAttempts entries. Merge by Id so the unified
+                # state file reflects every stream's failures, with the
+                # most-recent attempt's Reason/LastFailedAt winning when
+                # the same sub appears in multiple streams (which would
+                # only happen across re-runs with different slicing).
+                if ($null -ne $Obj.FailedAttempts)
+                {
+                    $AllFailedFromStreams += @($Obj.FailedAttempts | Where-Object { $_ })
+                }
+                # The report zip each stream recorded per completed sub.
+                if ($null -ne $Obj.Reports)
+                {
+                    $AllReportsFromStreams += @($Obj.Reports)
                 }
             }
             if ($AllCompletedFromStreams.Count -gt 0)
@@ -1628,17 +1667,21 @@ else
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
-            # Also delete per-stream resume files now that the unified file holds
-            # the truth - this prevents drift if a future run uses a different
-            # stream count. Reuses the same on-disk discovery ($AllStreamFiles)
-            # as the merge loop above, so every file that was just merged is also
-            # the one that gets cleaned up here - regardless of this run's
-            # -ParallelStreams value.
-            foreach ($StreamFile in $AllStreamFiles)
-            {
-                $PerStreamFile = $StreamFile.FullName
-                try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
-            }
+            # The per-stream resume files are deleted now that the unified file
+            # holds the truth - this prevents drift if a future run uses a
+            # different stream count. They are the same on-disk discovery
+            # ($AllStreamFiles) as the merge loop above, so every file that was
+            # just merged is the one that gets cleaned up, regardless of this
+            # run's -ParallelStreams value. A file that could not be read was
+            # moved aside above and is kept. The others are deleted with the
+            # resume state at the end of the run, or at an early exit, as the
+            # files folded in at startup are: this read covers those too, so it
+            # takes their place. When the run keeps the resume state they are
+            # deleted only once the resume state file on disk holds every record
+            # they gave; each removal is checked, and a file that is left is named.
+            $FoldedStreamFiles = @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName })
+            $FoldedRecordIds = @(@($AllCompletedFromStreams) + @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
+            $FoldedSource = "this run's streams wrote"
         }
         finally
         {
@@ -1918,25 +1961,24 @@ if ($ResumeFailedOnly)
 $RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
 $SkippedLimitIds = @($SkippedForRetryLimit | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ -and $SkippedLimitIds -notcontains [string]$_.Id }).Count
+# The per-stream files this run read and folded in at startup are deleted with
+# it: their records belong to the run this one has just finished, and a later
+# -Resume or -ResumeFailedOnly would otherwise recover them again, skipping a
+# subscription an old file lists as completed or retrying one from an old
+# failure record. After the parallel merge above they are the files its
+# streams wrote. A run in which a per-stream file could not be read is not a
+# clean run, so it says so instead.
+$ResumeStateClearTried = $false
 if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
+    $ResumeStateClearTried = $true
     try
     {
-        # A -Resume run with nothing left to collect uses one stream, so the
-        # parallel merge, which deletes the per-stream state files an
-        # interrupted parallel run left, does not run. Those files were folded
-        # into the state at startup; delete them the same way, or every later
-        # -Resume would recover and skip their subscriptions again. The same
-        # when a per-stream file could not be read, so the state reported as
-        # cleared below is cleared. Only files that were read are deleted; one
-        # that could not be read was moved aside and is kept. Each removal is
-        # checked (Remove-ResumeStateFiles): a run that leaves a file never
-        # says it cleared the state.
-        $StreamFilesToRemove = @()
-        if ($NothingLeftToCollect -or @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
-        {
-            $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
-        }
+        # The per-stream files first, then the resume state file, each removal
+        # checked (Remove-ResumeStateFiles). While one is left the resume state
+        # is kept and the run does not say it cleared the state.
+        $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
+        $FoldedStreamFiles = @()
         $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
         if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
         {
@@ -1948,6 +1990,18 @@ if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollect
         Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
     }
 }
+# When the resume state is kept, the per-stream files folded in at startup (or
+# that this run's streams wrote) are deleted too, but only once the resume
+# state file on disk holds every record they gave: the startup fold, the merge
+# and each later change wrote it. If it does not (a write failed, or it cannot
+# be read back), they are kept and named, and a later -Resume folds them in
+# again (Invoke-FoldedStreamStateCleanup).
+if (-not $ResumeStateClearTried)
+{
+    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
+    $FoldedStreamFiles = @()
+}
+
 # A run that could not read a per-stream state file is not a clean run: say
 # whether the state was cleared or kept, and where that file went.
 Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
@@ -1962,16 +2016,6 @@ if ($Excluded.Count -gt 0)
     Write-Host ("Subscriptions Excluded:  {0} (non-Enabled; use -IncludeDisabled to inventory them)" -f $Excluded.Count) -ForegroundColor Green
 }
 Write-Host ("Subscriptions Eligible:  {0}" -f $Subscriptions.Count) -ForegroundColor Green
-# In parallel mode, $SkippedCount is not populated by the foreach loop above
-# (each worker skips independently). Derive it from the difference between
-# the number of eligible subs and the number of subs that actually ran in
-# this invocation (the union of $SubResourceCounts entries plus failures).
-if ($ParallelStreams -gt 1 -and $Resume -and $SkippedCount -eq 0)
-{
-    $ActuallyProcessed = ($SubResourceCounts | Measure-Object).Count + $FailedSubscriptions.Count
-    $DerivedSkip = $Subscriptions.Count - $ActuallyProcessed
-    if ($DerivedSkip -gt 0) { $SkippedCount = $DerivedSkip }
-}
 if ($Resume)
 {
     Write-Host ("Subscriptions Skipped:   {0} (already completed)" -f $SkippedCount) -ForegroundColor Green
