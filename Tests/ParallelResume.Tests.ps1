@@ -562,7 +562,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         script:Get-RecoveryLines $R1 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 2 completed, 0 failed subscription record(s).')
         script:Get-Collected $R1 | Should -BeNullOrEmpty
-        $R1.ExitCode | Should -Be 0
+        $R1.ExitCode | Should -Be 2 -Because 'C and D are still owed'
         (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B')
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
 
