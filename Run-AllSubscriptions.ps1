@@ -729,6 +729,7 @@ $CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $Ten
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
 $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
+
 # The shape was checked once, above. A file that is not the right shape and
 # could not be moved aside is still there: its records are not used either.
 if ($WrongShapeStateFiles.Count -gt 0) { $CompletedIds = @(); $FailedAttempts = @() }
