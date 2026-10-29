@@ -744,8 +744,8 @@ function Merge-FailedAttempts
 # retry list: after an interrupted run, the ones it never reached.
 # -ResumeFailedOnly retries only the retry list, so it does not collect these;
 # -Resume does. A subscription the up-front access check skipped as not readable
-# (-NotReadableIds) is left out: -Resume would skip it too, and the run that
-# skipped it already listed it.
+# (-NotReadableIds) is left out: the run that skipped it already listed it, and
+# a later run checks it again.
 function Get-NotCollectedSubscriptions
 {
     param([object]$Eligible, [object]$CompletedIds, [object]$RetryIds, [object]$NotReadableIds)
