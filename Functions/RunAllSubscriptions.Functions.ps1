@@ -685,6 +685,75 @@ function Write-UnreadableStreamStateSummary
     }
 }
 
+# The ids among $Ids whose record in the resume state file on disk is not the
+# one this run holds in $CompletedIds and $FailedAttempts: listed as completed
+# or not, on the retry list or not, and the retry entry's Attempts. Every id
+# comes back when the file is missing, cannot be read or is for another tenant.
+# Read before the per-stream state files folded in at startup are deleted, so
+# they are deleted only once the resume state holds their records.
+function Get-ResumeStateRecordMismatch
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        # [object]: a one-item list arrives as a bare string or object.
+        [object]$Ids,
+        [object]$CompletedIds,
+        [object]$FailedAttempts
+    )
+    $Wanted = @($Ids | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    if ($Wanted.Count -eq 0) { return @() }
+    try
+    {
+        $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $Wanted
+    }
+    if ($State -isnot [System.Management.Automation.PSCustomObject] -or [string]$State.TenantID -ne $Tenant) { return $Wanted }
+    $OnDiskCompleted = @($State.CompletedSubscriptionIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $RunCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $OnDiskRetry = @{}
+    foreach ($Entry in @($State.FailedAttempts | Where-Object { $_ })) { $OnDiskRetry[[string]$Entry.Id] = [string]$Entry.Attempts }
+    $RunRetry = @{}
+    foreach ($Entry in @($FailedAttempts | Where-Object { $_ })) { $RunRetry[[string]$Entry.Id] = [string]$Entry.Attempts }
+    return @($Wanted | Where-Object {
+            (($OnDiskCompleted -contains $_) -ne ($RunCompleted -contains $_)) -or
+            ($OnDiskRetry.ContainsKey($_) -ne $RunRetry.ContainsKey($_)) -or
+            ($RunRetry.ContainsKey($_) -and $OnDiskRetry[$_] -ne $RunRetry[$_])
+        })
+}
+
+# For a run that keeps the resume state: delete the per-stream state files it
+# folded in at startup ($Files, the ids they hold records for in $Ids) once the
+# resume state file on disk holds those records as this run holds them
+# (Get-ResumeStateRecordMismatch). Otherwise keep them, with a warning naming
+# them, so a later -Resume folds them in again and nothing is lost.
+function Invoke-FoldedStreamStateCleanup
+{
+    param(
+        [object]$Files,
+        [Parameter(Mandatory = $true)][string]$ResumeStateFile,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [object]$Ids,
+        [object]$CompletedIds,
+        [object]$FailedAttempts
+    )
+    $Left = @($Files | Where-Object { $null -ne $_ -and (Test-Path -LiteralPath $_.FullName -PathType Leaf) })
+    if ($Left.Count -eq 0) { return }
+    $NotHeld = @(Get-ResumeStateRecordMismatch -Path $ResumeStateFile -Tenant $Tenant -Ids $Ids -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts)
+    if ($NotHeld.Count -gt 0)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}" -f (Split-Path -Path $ResumeStateFile -Leaf), (@($Left | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+        return
+    }
+    foreach ($StreamFile in $Left)
+    {
+        try { Remove-Item -LiteralPath $StreamFile.FullName -Force -ErrorAction Stop } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message) }
+    }
+}
+
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
 # pre-existing entries) against the unified CompletedIds list.
 #   - A sub that now appears in CompletedIds (any stream, or a prior run,
