@@ -996,6 +996,53 @@ function Resolve-AccessPreflight
     }
 }
 
+# Print the fix for each reason the up-front role check found subscriptions
+# not readable ($Inaccessible records, by State): a missing role (NoAccess,
+# including NotFound for a resource group run, and any state not listed
+# here), a check that could not finish (Unknown), or the two answers
+# disagreeing (Disagree). Each fix ends in $ReRun. With one cause the fix
+# follows $Lead on its line; with several, $Lead is a line of its own and each
+# cause gets a line naming its subscriptions. Returns the causes found, in the
+# order printed. Shared by Write-AccessPreflightReport and
+# Write-PendingRetrySkippedSummary so the fixes read the same.
+function Write-AccessRemedyLines
+{
+    param(
+        [object[]]$Inaccessible,
+        [Parameter(Mandatory = $true)][string]$Lead,
+        [string]$ReRun = 're-run',
+        [string]$Colour = 'Yellow',
+        [switch]$ForResourceGroup
+    )
+    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then {0}.' -f $ReRun } else { 'Grant the identity Reader on these subscriptions, then {0}.' -f $ReRun }
+    $Remedies = [ordered]@{
+        NoAccess = $NoAccessText
+        Unknown  = 'The role check could not finish (the reason above says why); {0}.' -f $ReRun
+        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then {0}.' -f $ReRun
+    }
+    $ByCause = [ordered]@{}
+    foreach ($NA in @($Inaccessible | Where-Object { $null -ne $_ }))
+    {
+        $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
+        if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
+        $ByCause[$Cause] += [string]$NA.Name
+    }
+    $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
+    if ($Causes.Count -eq 1)
+    {
+        Write-Host ('{0} {1}' -f $Lead, $Remedies[$Causes[0]]) -ForegroundColor $Colour
+    }
+    else
+    {
+        Write-Host $Lead -ForegroundColor $Colour
+        foreach ($Cause in $Causes)
+        {
+            Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
+        }
+    }
+    return $Causes
+}
+
 # Print the result of the up-front role check. Shared by Run-AllSubscriptions.ps1
 # and direct runs of ResourceInventory.ps1 so the wording is the same in both.
 # Lists every subscription that is not readable with its reason and the fix
@@ -1043,25 +1090,9 @@ function Write-AccessPreflightReport
         Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
     }
 
-    # The fix depends on why each subscription failed: a missing role
-    # (NoAccess, including NotFound for a resource group run), a check that
-    # could not finish (Unknown), or the two answers disagreeing (Disagree).
+    # The fix depends on why each subscription failed (Write-AccessRemedyLines).
     $Stopping = [bool]$Decision.ShouldBlock
     $ReRun = if ($Resume -and $Stopping) { 'run -Resume again' } else { 're-run' }
-    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then {0}.' -f $ReRun } else { 'Grant the identity Reader on these subscriptions, then {0}.' -f $ReRun }
-    $Remedies = [ordered]@{
-        NoAccess = $NoAccessText
-        Unknown  = 'The role check could not finish (the reason above says why); {0}.' -f $ReRun
-        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then {0}.' -f $ReRun
-    }
-    $ByCause = [ordered]@{}
-    foreach ($NA in $Inaccessible)
-    {
-        $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
-        if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
-        $ByCause[$Cause] += [string]$NA.Name
-    }
-    $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
     if ($Stopping)
     {
         $Lead = '  No subscription is readable. Stopping before any work.'
@@ -1079,18 +1110,7 @@ function Write-AccessPreflightReport
         $Lead = '  Skipping them and continuing with the {0} readable subscription(s). To include them:' -f $Decision.ReadableCount
         $Colour = 'Yellow'
     }
-    if ($Causes.Count -eq 1)
-    {
-        Write-Host ('{0} {1}' -f $Lead, $Remedies[$Causes[0]]) -ForegroundColor $Colour
-    }
-    else
-    {
-        Write-Host $Lead -ForegroundColor $Colour
-        foreach ($Cause in $Causes)
-        {
-            Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
-        }
-    }
+    $Causes = @(Write-AccessRemedyLines -Inaccessible $Inaccessible -Lead $Lead -ReRun $ReRun -Colour $Colour -ForResourceGroup:$ForResourceGroup)
     if ($Resume -and $Stopping)
     {
         # With nothing recorded as completed a run without -Resume checks the
@@ -1128,22 +1148,23 @@ function Write-SkippedSubscriptionSummary
 }
 
 # Under the end-of-run "Pending Retries" line: the subscriptions on the retry
-# list that this run's role check skipped as not readable. -ResumeFailedOnly
-# checks access before it retries, so it cannot collect them until the
-# identity can read them. Prints nothing when none of them was skipped.
+# list that this run's role check skipped as not readable, each with its
+# reason, and the fix for each cause (Write-AccessRemedyLines).
+# -ResumeFailedOnly runs the same check before it retries, so it skips them
+# until the cause is fixed. Prints nothing when none of them was skipped.
 function Write-PendingRetrySkippedSummary
 {
     param($FailedAttempts, $Decision)
     $RetryIds = @(@($FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
     $Skipped = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and $RetryIds -contains [string]$_.Id } })
     if ($Skipped.Count -eq 0) { return }
-    Write-Host ('  {0} of them cannot be read by the signed-in identity, so this run skipped them:' -f $Skipped.Count) -ForegroundColor Yellow
+    Write-Host ('  {0} of them were skipped by this run''s role check:' -f $Skipped.Count) -ForegroundColor Yellow
     foreach ($Sub in $Skipped)
     {
         $Label = if (-not [string]::IsNullOrEmpty([string]$Sub.Reason)) { [string]$Sub.Reason } else { 'not readable' }
         Write-Host ('    - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
     }
-    Write-Host '  Grant the identity Reader on these subscriptions before -ResumeFailedOnly can retry them.' -ForegroundColor Yellow
+    $null = Write-AccessRemedyLines -Inaccessible $Skipped -Lead '  To retry them:' -ReRun 'run -ResumeFailedOnly' -Colour Yellow
 }
 
 # After a consumption data check refusal, say per failing subscription what the

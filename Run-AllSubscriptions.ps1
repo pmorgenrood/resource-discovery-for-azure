@@ -925,7 +925,8 @@ Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundCol
 # subscription left to check, and the others were completed by an earlier
 # run), use one stream: the sequential loop skips the completed subscriptions,
 # while the parallel streams and the one-subscription path would collect them
-# again.
+# again. When this run clears the resume state, it also deletes the per-stream
+# state files an interrupted parallel run left (see the clean-up below).
 $NothingLeftToCollect = $Resume -and $null -ne $AccessDecision -and $AccessDecision.ReadableCount -eq 0 -and $AccessDecision.CompletedCount -gt 0
 if ($NothingLeftToCollect -and $ParallelStreams -gt 1)
 {
@@ -1768,6 +1769,19 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
     try
     {
         Remove-Item -Path $ResumeStateFile -Force
+        # A -Resume run with nothing left to collect uses one stream, so the
+        # parallel merge, which deletes the per-stream state files an
+        # interrupted parallel run left, does not run. Those files were folded
+        # into the state at startup; delete them the same way, or every later
+        # -Resume would recover and skip their subscriptions again.
+        if ($NothingLeftToCollect)
+        {
+            foreach ($StreamFile in @($StrandedStreamFiles | Where-Object { $null -ne $_ }))
+            {
+                $PerStreamFile = $StreamFile.FullName
+                try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
+            }
+        }
         Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
     }
     catch

@@ -1496,13 +1496,49 @@ Describe 'Write-PendingRetrySkippedSummary (skipped subscriptions on the retry l
         )
     }
 
-    It 'names the retry-list subscriptions the role check skipped and says to grant Reader first' {
+    It 'names the retry-list subscriptions the role check skipped, with the fix for a missing role' {
         $Retry = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }, [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta' })
         Write-PendingRetrySkippedSummary -FailedAttempts $Retry -Decision $script:Decision
         @($script:Lines) | Should -Be @(
-            '  1 of them cannot be read by the signed-in identity, so this run skipped them:'
+            '  1 of them were skipped by this run''s role check:'
             '    - Bravo (sub-b) - no role grants read access (roles visible: none)'
-            '  Grant the identity Reader on these subscriptions before -ResumeFailedOnly can retry them.'
+            '  To retry them: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.'
+        )
+    }
+
+    It 'gives the fix for why the check failed: <State>' -TestCases @(
+        @{ State = 'NoAccess'; Fix = '  To retry them: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.' }
+        @{ State = 'Unknown'; Fix = '  To retry them: The role check could not finish (the reason above says why); run -ResumeFailedOnly.' }
+        @{ State = 'Disagree'; Fix = '  To retry them: The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.' }
+    ) {
+        param($State, $Fix)
+        $Decision = Resolve-AccessPreflight -Probed @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = $State; Reason = 'reason' })
+        Write-PendingRetrySkippedSummary -FailedAttempts @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }) -Decision $Decision
+        @($script:Lines) | Should -Be @(
+            '  1 of them were skipped by this run''s role check:'
+            '    - Bravo (sub-b) - reason'
+            $Fix
+        )
+        ($script:Lines -join "`n") | Should -Not -Match 'cannot be read'
+    }
+
+    It 'gives one fix per cause, naming the subscriptions, when the causes differ' {
+        $Decision = Resolve-AccessPreflight -Probed @(
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = 'Unknown'; Reason = 'role check inconclusive after retries (caller permissions: HTTP 429)' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; State = 'NoAccess'; Reason = 'no role grants read access (roles visible: none)' }
+            [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; State = 'Disagree'; Reason = 'the two answers disagree' }
+        )
+        $Retry = @('sub-b', 'sub-c', 'sub-d') | ForEach-Object { [pscustomobject]@{ Id = $_ } }
+        Write-PendingRetrySkippedSummary -FailedAttempts $Retry -Decision $Decision
+        @($script:Lines) | Should -Be @(
+            '  3 of them were skipped by this run''s role check:'
+            '    - Bravo (sub-b) - role check inconclusive after retries (caller permissions: HTTP 429)'
+            '    - Charlie (sub-c) - no role grants read access (roles visible: none)'
+            '    - Delta (sub-d) - the two answers disagree'
+            '  To retry them:'
+            '    Charlie: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.'
+            '    Bravo: The role check could not finish (the reason above says why); run -ResumeFailedOnly.'
+            '    Delta: The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.'
         )
     }
 
@@ -1551,6 +1587,9 @@ $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-J
 # The session ends while this subscription is collected.
 if (@($Scenario.EndSessionIds) -contains $SubscriptionID) { [Environment]::Exit(137) }
 if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
+# The session ends while this subscription is collected in a parallel stream:
+# the stand-in marks that it started and waits until the test ends the run.
+if (@($Scenario.HangIds) -contains $SubscriptionID) { Set-Content -LiteralPath (Join-Path $HOME ('waiting-' + $SubscriptionID)) -Value $PID; Start-Sleep -Seconds 600 }
 $Root = Join-Path $HOME 'InventoryReports'
 $Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + $SubscriptionID
 $Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
@@ -1686,24 +1725,25 @@ exit 1
 
         function script:Set-WrapperScenario
         {
-            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @())
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @())
             [pscustomobject]@{
                 Tenant        = $script:WrapperTenant
                 Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
                 Unreadable    = @($Unreadable)
                 FailIds       = @($Fail)
                 EndSessionIds = @($EndSession)
+                HangIds       = @($Hang)
             } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
         }
 
         # One run of the wrapper as its own process, stdin closed: its exit code
         # and the lines it printed. -Streams 0 leaves -ParallelStreams out, so
         # the wrapper picks it from the host; -Environment adds variables to the
-        # process. A run still going after $TimeoutSeconds is stopped and the
-        # test fails.
+        # process; -EndWhen ends the session when its condition holds. A run
+        # still going after $TimeoutSeconds is stopped and the test fails.
         function script:Invoke-WrapperRun
         {
-            param([string[]]$Arguments = @(), [int]$Streams = 1, [hashtable]$Environment = @{}, [int]$TimeoutSeconds = 300)
+            param([string[]]$Arguments = @(), [int]$Streams = 1, [hashtable]$Environment = @{}, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300)
             $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
             $StreamArguments = if ($Streams -gt 0) { @('-ParallelStreams', [string]$Streams) } else { @() }
             foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:WrapperScript, '-TenantID', $script:WrapperTenant) + $StreamArguments + @($Arguments)) { $Info.ArgumentList.Add($Arg) }
@@ -1721,6 +1761,18 @@ exit 1
             $Proc.StandardInput.Close()
             $Out = $Proc.StandardOutput.ReadToEndAsync()
             $Err = $Proc.StandardError.ReadToEndAsync()
+            # -EndWhen: the session ends (the wrapper and its stream processes
+            # are stopped) as soon as the condition holds.
+            $Ended = $false
+            if ($EndWhen)
+            {
+                $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+                while (-not $Proc.HasExited -and (Get-Date) -lt $Deadline)
+                {
+                    if (& $EndWhen) { $Proc.Kill($true); $Ended = $true; break }
+                    Start-Sleep -Milliseconds 250
+                }
+            }
             if (-not $Proc.WaitForExit($TimeoutSeconds * 1000))
             {
                 $Proc.Kill($true)
@@ -1728,7 +1780,19 @@ exit 1
             }
             $Proc.WaitForExit()
             $Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n")
-            return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; Error = [string]$Err.Result; Root = $script:CaseRoot }
+            return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Ended = $Ended; Text = $Text; Error = [string]$Err.Result; Root = $script:CaseRoot }
+        }
+
+        # The per-stream state files a parallel run leaves in the inventory root
+        # until it merges them, and the subscriptions they record as completed.
+        function script:Get-StreamStateFiles
+        {
+            if (-not (Test-Path -LiteralPath $script:CaseRoot)) { return @() }
+            @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:WrapperTenant))
+        }
+        function script:Get-StreamCompletedIds
+        {
+            @(script:Get-StreamStateFiles | ForEach-Object { @((Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Completed) } | Where-Object { $_ } | Sort-Object -Unique)
         }
 
         # The resume state as written, or $null when there is none.
@@ -1958,12 +2022,57 @@ exit 1
         }
     }
 
+    It 'after an interrupted parallel run, clears the main and the per-stream state, and the next -Resume collects fresh (<Label>)' -TestCases @(
+        @{ Label = '-ParallelStreams 2'; Streams = 2 }
+        @{ Label = 'automatic stream count'; Streams = 0 }
+        @{ Label = '-ParallelStreams 1'; Streams = 1 }
+    ) {
+        param($Label, $Streams)
+        $Subs = @($script:SubA, $script:SubB, $script:SubX)
+        # Run 1, two streams: stream 0 collects Sub A then Sub X, stream 1 Sub B.
+        # The session ends while Sub X is collected, once both streams have
+        # recorded their completed subscription in their own state file.
+        script:Set-WrapperScenario -Subs $Subs -Hang $script:SubX.Id
+        $Run1 = script:Invoke-WrapperRun -Streams 2 -EndWhen { (Test-Path -LiteralPath (Join-Path $script:CaseHome ('waiting-' + $script:SubX.Id))) -and (@(script:Get-StreamCompletedIds) -join ',') -eq 'sub-a,sub-b' }
+        $Run1.Ended | Should -BeTrue
+        @(script:Get-StreamStateFiles).Count | Should -Be 2
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse -Because 'a parallel run merges its stream files only at its end'
+
+        # Sub X cannot be read any more.
+        script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id
+        $Four = @{ DOTNET_PROCESSOR_COUNT = '4' }
+        $R1 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams $Streams -Environment $Four
+        $R1.ExitCode | Should -Be 0
+        @($R1.Text | Where-Object { $_ -like 'Recovered per-stream state from an interrupted parallel run: 2 completed, *' }).Count | Should -Be 1
+        $R1.Text | Should -Contain '  Skipping them and finishing the run: the other 2 subscription(s) were completed by an earlier run, so nothing is left to collect. To include them: Grant the identity Reader on these subscriptions, then re-run.'
+        $R1.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        $R1.Text | Should -Contain 'Skipping (already completed): Sub B (sub-b)'
+        @($R1.Text | Where-Object { $_ -match '^(Processing subscription: |\[stream-\d+\] processing )' }) | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'Resume state cleared (clean run).'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        @(script:Get-StreamStateFiles | ForEach-Object { $_.Name }) | Should -BeNullOrEmpty -Because 'the finish case deletes the stream files it folded in'
+
+        # The next -Resume finds no state: nothing to recover, and Sub A and Sub B
+        # are collected again.
+        $R2 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams $Streams -Environment $Four
+        $R2.ExitCode | Should -Be 0
+        @($R2.Text | Where-Object { $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        foreach ($Sub in @($script:SubA, $script:SubB))
+        {
+            @($R2.Text | Where-Object { $_ -match ('^(Processing subscription: |\[stream-\d+\] processing \(\d+ of \d+\): ){0} \({1}\)$' -f [regex]::Escape($Sub.Name), [regex]::Escape($Sub.Id)) }).Count | Should -Be 1
+        }
+        $R2.Text | Should -Contain $script:SkippedXLine
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        @(script:Get-StreamStateFiles) | Should -BeNullOrEmpty
+    }
+
     It 'names a skipped subscription on the retry list under Pending Retries, and -ResumeFailedOnly is unchanged' {
         $Advice = @(
             'Pending Retries:         1 subscription(s) from a prior run still in FailedAttempts'
-            '  1 of them cannot be read by the signed-in identity, so this run skipped them:'
+            '  1 of them were skipped by this run''s role check:'
             $script:SkippedXLine
-            '  Grant the identity Reader on these subscriptions before -ResumeFailedOnly can retry them.'
+            '  To retry them: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.'
             'Re-run with -ResumeFailedOnly to retry them.'
         )
         $AdviceIn = {
