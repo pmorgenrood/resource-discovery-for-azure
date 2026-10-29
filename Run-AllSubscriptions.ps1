@@ -514,6 +514,11 @@ if (-not (Test-Path -Path $InventoryRoot -PathType Container))
 # Start-Transcript is idempotent in the sense that we Stop it on every exit
 # path via Exit-Wrapper.
 $WrapperTranscriptStarted = $false
+# Read by Exit-Wrapper at every early exit. The startup fold of per-stream state
+# fills them (see there); until then they are empty, so an exit before it has
+# nothing to clean up.
+$FoldedStreamFiles = @()
+$FoldedRecordIds = @()
 $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
 try
 {
@@ -717,7 +722,11 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+# @() keeps it an array: an empty or one-id result comes back from the
+# function as $null or a bare string, and `+=` on a string joins the next id
+# onto it. Where-Object drops the null entry that a state file saved after a
+# failed first subscription can hold.
+$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ })
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
@@ -765,7 +774,7 @@ if ($Resume -or $ResumeFailedOnly)
             if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
             if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
             $FoldedStreamFiles += $StreamFile
-            $FoldedRecordIds += @(@($Obj.Completed) + @($Obj.FailedAttempts | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
+            $FoldedRecordIds += @(Get-StreamStateRecordIds -State $Obj)
         }
         if ($StrandedCompleted.Count -gt 0)
         {
@@ -1560,6 +1569,7 @@ else
             $AllCompletedFromStreams = @()
             $AllFailedFromStreams = @()
             $UnreadableAtMerge = @()
+            $MergedRecordIds = @()
             foreach ($StreamFile in $AllStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
@@ -1573,6 +1583,7 @@ else
                     $UnreadableAtMerge += $PerStreamFile
                     continue
                 }
+                $MergedRecordIds += @(Get-StreamStateRecordIds -State $Obj)
                 if ($null -ne $Obj.Completed)
                 {
                     $AllCompletedFromStreams += @($Obj.Completed)
@@ -1611,7 +1622,6 @@ else
             # is left is named, the resume state is kept for it below, and the
             # next -Resume reads it again. This read covers the files folded in
             # at startup too, so they are done.
-            $MergedRecordIds = @(@($AllCompletedFromStreams) + @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
             $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote")
             $FoldedStreamFiles = @()
             $FoldedRecordIds = @()

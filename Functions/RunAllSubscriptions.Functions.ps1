@@ -758,12 +758,52 @@ function Remove-StreamStateFiles
     return $Left.ToArray()
 }
 
+# The subscription ids a per-stream state file holds records for: every id in
+# its lists, whether listed as an id (Completed) or as a record with an Id
+# (FailedAttempts, and any other list of per-id records the file carries).
+function Get-StreamStateRecordIds
+{
+    param([object]$State)
+    if ($null -eq $State) { return @() }
+    $Ids = @()
+    foreach ($Prop in @($State.PSObject.Properties))
+    {
+        if ($null -eq $Prop.Value -or $Prop.Value -is [string] -or $Prop.Value -isnot [System.Collections.IEnumerable]) { continue }
+        foreach ($Item in @($Prop.Value))
+        {
+            if ($Item -is [string]) { $Ids += $Item }
+            elseif ($null -ne $Item -and $null -ne $Item.PSObject.Properties['Id']) { $Ids += [string]$Item.Id }
+        }
+    }
+    return @($Ids | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# One per-id record as a string that two copies of the same record share
+# whether they come from this run's memory or from the file: a round trip
+# through JSON (so a date read from the file and the one this run wrote compare
+# alike), then every field in name order.
+function ConvertTo-ResumeRecordText
+{
+    param([object]$Record)
+    if ($null -eq $Record) { return '' }
+    $Copy = $Record | ConvertTo-Json -Depth 6 -Compress | ConvertFrom-Json
+    $Sorted = [ordered]@{}
+    foreach ($Name in @($Copy.PSObject.Properties.Name | Sort-Object)) { $Sorted[$Name] = $Copy.$Name }
+    return ($Sorted | ConvertTo-Json -Depth 6 -Compress)
+}
+
 # The ids among $Ids whose record in the resume state file on disk is not the
-# one this run holds in $CompletedIds and $FailedAttempts: listed as completed
-# or not, on the retry list or not, and the retry entry's Attempts. Every id
+# one this run holds, compared as whole records: whether the id is completed
+# ($CompletedIds against CompletedSubscriptionIds), its retry entry with every
+# field ($FailedAttempts against FailedAttempts: Name, Reason, LastFailedAt,
+# Attempts), and its record in every other list of per-id records the file
+# holds (each record an object with an Id). Such a list is compared with this
+# run's variable of the same name, for the ids the run holds as completed,
+# since the resume state keeps those records only for completed subscriptions;
+# a list for which the run has no variable is not this run's to check. Every id
 # comes back when the file is missing, cannot be read or is for another tenant.
-# Read before the per-stream state files folded in at startup are deleted, so
-# they are deleted only once the resume state holds their records.
+# Read before per-stream state files are deleted, so they are deleted only once
+# the resume state holds every record they gave as this run holds it.
 function Get-ResumeStateRecordMismatch
 {
     param(
@@ -778,24 +818,43 @@ function Get-ResumeStateRecordMismatch
     if ($Wanted.Count -eq 0) { return @() }
     try
     {
-        $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $OnDisk = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     }
     catch
     {
         return $Wanted
     }
-    if ($State -isnot [System.Management.Automation.PSCustomObject] -or [string]$State.TenantID -ne $Tenant) { return $Wanted }
-    $OnDiskCompleted = @($State.CompletedSubscriptionIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($OnDisk -isnot [System.Management.Automation.PSCustomObject] -or [string]$OnDisk.TenantID -ne $Tenant) { return $Wanted }
+    $OnDiskCompleted = @($OnDisk.CompletedSubscriptionIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $RunCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $OnDiskRetry = @{}
-    foreach ($Entry in @($State.FailedAttempts | Where-Object { $_ })) { $OnDiskRetry[[string]$Entry.Id] = [string]$Entry.Attempts }
-    $RunRetry = @{}
-    foreach ($Entry in @($FailedAttempts | Where-Object { $_ })) { $RunRetry[[string]$Entry.Id] = [string]$Entry.Attempts }
-    return @($Wanted | Where-Object {
-            (($OnDiskCompleted -contains $_) -ne ($RunCompleted -contains $_)) -or
-            ($OnDiskRetry.ContainsKey($_) -ne $RunRetry.ContainsKey($_)) -or
-            ($RunRetry.ContainsKey($_) -and $OnDiskRetry[$_] -ne $RunRetry[$_])
-        })
+    $IsRecordList = { param($List) $Items = @($List | Where-Object { $null -ne $_ }); $Items.Count -gt 0 -and @($Items | Where-Object { $_ -is [string] -or $_ -is [ValueType] -or $null -eq $_.PSObject.Properties['Id'] }).Count -eq 0 }
+    # The lists to compare: the retry list, then every other list of per-id
+    # records in the file that this run holds a variable for.
+    $Lists = [System.Collections.Generic.List[object]]::new()
+    $Lists.Add([pscustomobject]@{ Name = 'FailedAttempts'; Run = @($FailedAttempts | Where-Object { $null -ne $_ }); CompletedOnly = $false })
+    foreach ($Prop in @($OnDisk.PSObject.Properties))
+    {
+        if (@('FailedAttempts', 'CompletedSubscriptionIds') -contains $Prop.Name) { continue }
+        $RunVariable = Get-Variable -Name $Prop.Name -ErrorAction SilentlyContinue
+        if ($null -eq $RunVariable) { continue }
+        $RunList = @($RunVariable.Value | Where-Object { $null -ne $_ })
+        if (-not ((& $IsRecordList $Prop.Value) -or (& $IsRecordList $RunList))) { continue }
+        $Lists.Add([pscustomobject]@{ Name = $Prop.Name; Run = $RunList; CompletedOnly = $true })
+    }
+    $Mismatch = @()
+    foreach ($Id in $Wanted)
+    {
+        if (($OnDiskCompleted -contains $Id) -ne ($RunCompleted -contains $Id)) { $Mismatch += $Id; continue }
+        foreach ($List in $Lists)
+        {
+            if ($List.CompletedOnly -and $RunCompleted -notcontains $Id) { continue }
+            # The last record for the id on each side, as each side lets the last one win.
+            $RunRecord = @($List.Run | Where-Object { [string]$_.Id -eq $Id }) | Select-Object -Last 1
+            $DiskRecord = @($OnDisk.($List.Name) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Id'] -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
+            if ((ConvertTo-ResumeRecordText -Record $RunRecord) -ne (ConvertTo-ResumeRecordText -Record $DiskRecord)) { $Mismatch += $Id; break }
+        }
+    }
+    return @($Mismatch | Sort-Object -Unique)
 }
 
 # Delete per-stream state files ($Files, the ids they hold records for in $Ids)

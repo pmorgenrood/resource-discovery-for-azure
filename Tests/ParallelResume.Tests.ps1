@@ -17,6 +17,12 @@
 #     subscriptions it lists counts as completed; that run does not report a
 #     clean run, and the next -Resume collects what is still missing.
 #   - The recovery line counts real failure records only.
+#   - A resume state that lists one completed subscription stays a list of ids
+#     when the next one completes, so the next -Resume skips both.
+#   - Per-stream files are kept while the resume state on disk holds an older
+#     record for one of their ids, compared as a whole record (a failure reason,
+#     a report path where the state records reports).
+#   - An exit before the startup fold prints no error under strict mode.
 # Each scenario is followed by the next two runs, which end without a repeated
 # recovery line, without collecting a completed subscription again, and with
 # no resume state once nothing is left. The reader, the move-aside helper and
@@ -61,7 +67,7 @@ BeforeAll {
     $StandInInner = @'
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit)
 $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
-if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
+if (@($Scenario.FailIds) -contains $SubscriptionID) { throw $(if ($Scenario.FailReason) { [string]$Scenario.FailReason } else { 'stand-in failure for this subscription' }) }
 # A run of this subscription that ends without writing its zip.
 if (@($Scenario.NoZipIds) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; $Global:Resources = @(1); $Global:ResourceCount = 1; return }
 # Collection of this subscription hangs; the marker file tells the test it started.
@@ -201,7 +207,7 @@ exit 1
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @())
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -210,6 +216,7 @@ exit 1
             HangIds       = @($Hang | ForEach-Object { & $Id $_ })
             NoZipIds      = @($NoZip | ForEach-Object { & $Id $_ })
             ReadOnlyAfterIds = @($ReadOnlyAfter | ForEach-Object { & $Id $_ })
+            FailReason    = $FailReason
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -220,11 +227,15 @@ exit 1
     # stopped and the test fails.
     function script:Invoke-Wrapper
     {
-        param([string[]]$Arguments = @(), [int]$Streams = 1, [hashtable]$Environment = @{}, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300)
+        param([string[]]$Arguments = @(), [int]$Streams = 1, [hashtable]$Environment = @{}, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300, [switch]$StrictMode)
         $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant)
         if ($Streams -gt 0) { $All += @('-ParallelStreams', [string]$Streams) }
+        $All += @($Arguments)
+        # With -StrictMode the wrapper runs under Set-StrictMode -Version Latest,
+        # set by the shell that starts it.
+        if ($StrictMode) { $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ("Set-StrictMode -Version Latest; & '{0}' {1}; exit `$LASTEXITCODE" -f $script:Wrapper, (@($All | Select-Object -Skip 5) -join ' '))) }
         $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
-        foreach ($Arg in @($All) + @($Arguments)) { $Info.ArgumentList.Add($Arg) }
+        foreach ($Arg in @($All)) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
         $Info.RedirectStandardInput = $true
         $Info.RedirectStandardOutput = $true
@@ -312,9 +323,8 @@ exit 1
     function script:Get-StreamWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The per-stream state file*' }) }
     function script:Test-CleanLine { param($Run) @($Run.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count -eq 1 }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $script:Subs[$_].Id } | Sort-Object) }
-    # The ids the resume state lists as completed, split where an id was joined
-    # onto the one before it, or none when there is no state.
-    function script:Get-StateCompleted { $S = script:Read-State; if ($null -eq $S) { return @() } @($S.Completed | ForEach-Object { [regex]::Matches([string]$_, 'sub-[a-f]') | ForEach-Object { $_.Value } } | Sort-Object -Unique) }
+    # The ids the resume state lists as completed, or none when there is no state.
+    function script:Get-StateCompleted { $S = script:Read-State; if ($null -eq $S) { return @() } @($S.Completed | Sort-Object -Unique) }
 
     # Every entry of every zip under the inventory root, the zips inside them
     # included: { Zip; Name; Text }.
@@ -465,6 +475,47 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
     }
 }
 
+Describe 'A resume state that lists one completed subscription' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    It 'stays a list of ids when the next one completes, and the next -Resume collects neither (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        # A one-stream run: A completes and B fails, so the state lists one completed id.
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper -Streams 1
+        @((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).CompletedSubscriptionIds) | Should -Be @('sub-a')
+
+        # Run 1: B completes now, and C fails, which keeps the state.
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B', 'C')
+        $Stored = @((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).CompletedSubscriptionIds)
+        $Stored.Count | Should -Be 2 -Because 'each completed id is its own entry, not joined onto the one before it'
+        @($Stored | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B')
+        (script:Read-State).Failed | Should -Be (script:Get-Ids 'C')
+
+        # Run 2 collects neither A nor B.
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C')
+        $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        $R2.Text | Should -Contain 'Skipping (already completed): Sub B (sub-b)'
+        script:Test-CleanLine $R2 | Should -BeTrue
+    }
+}
+
+Describe 'An exit before the startup fold of per-stream state' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    It 'prints no error under Set-StrictMode -Version Latest' {
+        # No subscriptions in the tenant: the run ends at its first checks.
+        script:Set-Scenario -Subs @()
+        $R = script:Invoke-Wrapper -Streams 1 -StrictMode
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain ('ERROR: Get-AzSubscription returned no subscriptions for tenant {0}.' -f $script:Tenant)
+        $R.Error | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'A one-stream run that clears the resume state deletes the per-stream files it folded in' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
 
@@ -557,6 +608,90 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
             @(script:Get-Collected $R) | Should -Not -Contain 'sub-a'
             @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
         }
+    }
+
+    It 'keeps them, with a warning naming them, while the resume state on disk holds an older record with the same run count (a failure reason)' {
+        # Run 0, one stream: A completes, B fails with an earlier reason.
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B' -FailReason 'earlier reason'
+        $null = script:Invoke-Wrapper -Streams 1
+        # Run 1, two streams, interrupted: stream 0 completes A, stream 1 fails B
+        # with a newer reason (its first failure there), then C and D hang.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -FailReason 'newer reason' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' -and ((script:Get-StreamFailedIds) -join ',') -eq 'sub-b' }
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Names.Count | Should -Be 2
+        # The resume state on disk holds B with one failed run and the earlier reason.
+        $Disk = @((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).FailedAttempts)[0]
+        $Disk.Reason | Should -Be 'earlier reason'
+        [int]$Disk.Attempts | Should -Be 1
+        # Every write of the resume state fails from here (a folder named <state>.tmp).
+        $Block = $script:State + '.tmp'
+        New-Item -ItemType Directory -Path $Block -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Block 'keep') -Value 'x'
+
+        # Run 2: B is disabled, so it is not collected and keeps the state; C and D complete.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
+        script:Test-CleanLine $R2 | Should -BeFalse
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only they hold the newer reason'
+
+        # Run 3, writes work again and B succeeds: recovered once more, then everything cleared.
+        Remove-Item -LiteralPath $Block -Recurse -Force
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R3 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'B', 'C', 'D')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+
+        # Run 4 finds no state.
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R4 | Should -BeNullOrEmpty
+        $R4.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+    }
+
+    It 'keeps them, with a warning naming them, while the resume state on disk holds an older report of a completed subscription' {
+        # Only where the resume state records each completed subscription's report.
+        if ((Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1') -Raw) -notmatch '(?m)^function Get-CompletedReports\b')
+        {
+            Set-ItResult -Skipped -Because 'this version does not record the report of each completed subscription in the resume state'
+            return
+        }
+        # Run 0, one stream: A completes with a report, B fails.
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper -Streams 1
+        $Earlier = [string]@((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).CompletedReports)[0].Zip
+        # Run 1, two streams, interrupted (B disabled): stream 0 collects A again,
+        # with a newer report, then D hangs; stream 1 hangs on C.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Newer = [string]@((Get-Content -LiteralPath (Join-Path $script:Root $Names[0]) -Raw | ConvertFrom-Json).Reports)[0].Zip
+        $Newer | Should -Not -Be $Earlier
+        $Block = $script:State + '.tmp'
+        New-Item -ItemType Directory -Path $Block -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Block 'keep') -Value 'x'
+
+        # Run 2: B stays disabled and failed, which keeps the state; C and D complete.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only it holds the newer report'
+
+        # Run 3, writes work again and B succeeds: the bundle carries A's newer report.
+        Remove-Item -LiteralPath $Block -Recurse -Force
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'B', 'C', 'D')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        $Bundle = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip' | Sort-Object LastWriteTimeUtc | Select-Object -Last 1)
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($Bundle[0].FullName)
+        try { $Entries = @($Archive.Entries | ForEach-Object { $_.FullName }) } finally { $Archive.Dispose() }
+        $Entries | Should -Contain (Split-Path -Path $Newer -Leaf)
+        $Entries | Should -Not -Contain (Split-Path -Path $Earlier -Leaf)
     }
 
     It '-ResumeFailedOnly with nothing to retry, then the same and -Resume: the recovery line prints in the first run only' {
@@ -901,7 +1036,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
     }
 }
 
-Describe 'Read-StreamResumeStateFile, Move-UnreadableStreamStateFile and Get-ResumeStateRecordMismatch' {
+Describe 'Read-StreamResumeStateFile, Move-UnreadableStreamStateFile, Get-ResumeStateRecordMismatch and Get-StreamStateRecordIds' {
     BeforeAll {
         . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
         $script:UnitDir = Join-Path $script:TestBase ('unit-' + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -957,6 +1092,38 @@ Describe 'Read-StreamResumeStateFile, Move-UnreadableStreamStateFile and Get-Res
         Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-d') @Run | Should -Be @('sub-d')
         # No ids: nothing to hold.
         @(Get-ResumeStateRecordMismatch -Path (Join-Path $script:UnitDir 'missing.json') -Tenant 't' -Ids @() @Run) | Should -BeNullOrEmpty
+    }
+
+    It 'Get-ResumeStateRecordMismatch compares whole records: a retry entry with the same run count, and a record in another per-id list' {
+        $Path = Join-Path $script:UnitDir '.resume-state-t2.json'
+        $Earlier = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = '2026-01-01T00:00:00.0000000+00:00'; Reason = 'earlier reason'; Attempts = 1 }
+        $Newer = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = (Get-Date).ToString('o'); Reason = 'newer reason'; Attempts = 1 }
+        [pscustomobject]@{
+            TenantID                 = 't'
+            CompletedSubscriptionIds = @('sub-a')
+            FailedAttempts           = @($Earlier)
+            CompletedReports         = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Zip = 'earlier/report.zip'; Obfuscated = $false })
+            LastUpdated              = (Get-Date).ToString('o')
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding utf8
+        # The same run count with another reason and time: not held.
+        Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -CompletedIds @('sub-a') -FailedAttempts @($Newer) | Should -Be @('sub-b')
+        # The record as it was written (its time reads back as a date): held. The
+        # report list is not compared while the run holds no list of that name.
+        @(Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -CompletedIds @('sub-a') -FailedAttempts @($Earlier)) | Should -BeNullOrEmpty
+        # A list of per-id records the run holds under the same name: an older report path is not held.
+        $CompletedReports = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Zip = 'newer/report.zip'; Obfuscated = $false })
+        Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -CompletedIds @('sub-a') -FailedAttempts @($Earlier) | Should -Be @('sub-a')
+        $CompletedReports = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Zip = 'earlier/report.zip'; Obfuscated = $false })
+        @(Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -CompletedIds @('sub-a') -FailedAttempts @($Earlier)) | Should -BeNullOrEmpty
+        # Such a list is compared for completed ids only.
+        @(Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-c') -CompletedIds @('sub-a') -FailedAttempts @($Earlier)) | Should -BeNullOrEmpty
+        $CompletedReports | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Get-StreamStateRecordIds lists every id a per-stream state file holds a record for' {
+        $State = '{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[{"Id":"sub-b","Attempts":1}],"Reports":[{"Id":"sub-c","Zip":"r.zip"}]}' | ConvertFrom-Json
+        Get-StreamStateRecordIds -State $State | Should -Be @('sub-a', 'sub-b', 'sub-c')
+        @(Get-StreamStateRecordIds -State ('{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
     }
 
     It 'leaves the file in place and says so when it cannot be renamed' {
