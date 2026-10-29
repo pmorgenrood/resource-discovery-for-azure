@@ -27,14 +27,14 @@ function Exit-Wrapper
     param([int]$Code = 0)
     # Every early exit of the wrapper passes here, and the resume state is kept
     # at each of them. The per-stream state files the run folded in at startup
-    # (or, after the end-of-run merge of a parallel run, the ones its streams
-    # wrote) are deleted first, once the resume state holds their records
+    # are deleted first, once the resume state holds their records
     # (Invoke-FoldedStreamStateCleanup), so a run that stops early leaves none
     # behind and no exit needs code of its own. There are none before the fold,
-    # and none after the end-of-run clean-up.
+    # and none after the end-of-run merge of a parallel run or the end-of-run
+    # clean-up, which deal with them.
     if (@($FoldedStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
     {
-        $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
+        $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
     }
     if ($WrapperTranscriptStarted)
     {
@@ -798,14 +798,14 @@ function Get-ResumeStateRecordMismatch
         })
 }
 
-# For a run that keeps the resume state (at the end of the run, or when it
-# ends early): delete per-stream state files ($Files, the ids they hold records
-# for in $Ids) once the resume state file on disk holds those records as this
-# run holds them (Get-ResumeStateRecordMismatch); each removal is checked
-# (Remove-StreamStateFiles). Otherwise keep them, with a warning naming them, so
-# a later -Resume folds them in again and nothing is lost. The files are the
-# ones the run folded in at startup, or, after the end-of-run merge of a
-# parallel run, the ones its streams wrote ($Source says which, for the
+# Delete per-stream state files ($Files, the ids they hold records for in $Ids)
+# once the resume state file on disk holds those records as this run holds
+# them (Get-ResumeStateRecordMismatch); each removal is checked
+# (Remove-StreamStateFiles), and the resume state file is kept while one is
+# left. Otherwise keep them, with a warning naming them, so a later -Resume
+# folds them in again and nothing is lost. Used for the files a run folded in
+# at startup when it keeps the resume state or ends early, and for the files of
+# a parallel run's streams at its end-of-run merge ($Source says which, for the
 # warning). Returns the paths left on disk.
 function Invoke-FoldedStreamStateCleanup
 {

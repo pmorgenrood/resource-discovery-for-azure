@@ -740,13 +740,12 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # the run, or Exit-Wrapper when the run ends early, deletes them once the resume
 # state no longer needs them (cleared, or written and read back holding those
 # records), or a later run would recover them again from a cycle that already
-# finished. After the end-of-run merge of a parallel run they are the files
-# its streams wrote, deleted at the same points ($FoldedSource names them in
-# the warning). $UnreadableStreamFiles collects the per-stream files the
-# end-of-run merge of a parallel run cannot read (Move-UnreadableStreamStateFile).
+# finished. $StreamFilesLeft collects the per-stream files the end-of-run
+# merge of a parallel run could not remove. $UnreadableStreamFiles collects the
+# per-stream files that merge cannot read (Move-UnreadableStreamStateFile).
 $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
-$FoldedSource = 'this run read at startup'
+$StreamFilesLeft = @()
 $UnreadableStreamFiles = @()
 if ($Resume -or $ResumeFailedOnly)
 {
@@ -1600,21 +1599,22 @@ else
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
-            # The per-stream resume files are deleted now that the unified file
-            # holds the truth - this prevents drift if a future run uses a
-            # different stream count. They are the same on-disk discovery
-            # ($AllStreamFiles) as the merge loop above, so every file that was
-            # just merged is the one that gets cleaned up, regardless of this
-            # run's -ParallelStreams value. A file that could not be read was
-            # moved aside above and is kept. The others are deleted with the
-            # resume state at the end of the run, or at an early exit, as the
-            # files folded in at startup are: this read covers those too, so it
-            # takes their place. When the run keeps the resume state they are
-            # deleted only once the resume state file on disk holds every record
-            # they gave; each removal is checked, and a file that is left is named.
-            $FoldedStreamFiles = @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName })
-            $FoldedRecordIds = @(@($AllCompletedFromStreams) + @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
-            $FoldedSource = "this run's streams wrote"
+            # Also delete per-stream resume files now that the unified file holds
+            # the truth - this prevents drift if a future run uses a different
+            # stream count. Reuses the same on-disk discovery ($AllStreamFiles)
+            # as the merge loop above, so every file that was just merged is also
+            # the one that gets cleaned up here - regardless of this run's
+            # -ParallelStreams value. A file that could not be read was moved
+            # aside above and is kept. The others are deleted only once the
+            # resume state file on disk holds every record they gave, and each
+            # removal is checked (Invoke-FoldedStreamStateCleanup): a file that
+            # is left is named, the resume state is kept for it below, and the
+            # next -Resume reads it again. This read covers the files folded in
+            # at startup too, so they are done.
+            $MergedRecordIds = @(@($AllCompletedFromStreams) + @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
+            $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote")
+            $FoldedStreamFiles = @()
+            $FoldedRecordIds = @()
         }
         finally
         {
@@ -1813,8 +1813,9 @@ if ($null -ne $OuterZipFile)
 # it: their records belong to the run this one has just finished, and a later
 # -Resume or -ResumeFailedOnly would otherwise recover them again, skipping a
 # subscription an old file lists as completed or retrying one from an old
-# failure record. After the parallel merge above they are the files its
-# streams wrote. A run in which a per-stream file could not be read is not a
+# failure record. The parallel merge above has already dealt with the ones it
+# read; while one it could not remove is on disk, the resume state is kept, as
+# its warning said. A run in which a per-stream file could not be read is not a
 # clean run, so it says so instead.
 $ResumeStateClearTried = $false
 if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
@@ -1827,7 +1828,11 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # is kept and the run does not say it cleared the state.
         $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
         $FoldedStreamFiles = @()
-        $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
+        $StateFilesLeft = @(@($StreamFilesLeft | Where-Object { Test-Path -LiteralPath $_ }) + $ResumeStateFile)
+        if (@($StreamFilesLeft | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0)
+        {
+            $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
+        }
         if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
@@ -1838,15 +1843,14 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
     }
 }
-# When the resume state is kept, the per-stream files folded in at startup (or
-# that this run's streams wrote) are deleted too, but only once the resume
-# state file on disk holds every record they gave: the startup fold, the merge
-# and each later change wrote it. If it does not (a write failed, or it cannot
-# be read back), they are kept and named, and a later -Resume folds them in
-# again (Invoke-FoldedStreamStateCleanup).
+# When the resume state is kept, the per-stream files folded in at startup are
+# deleted too, but only once the resume state file on disk holds every record
+# they gave: the startup fold and each later change wrote it. If it does not (a
+# write failed, or it cannot be read back), they are kept and named, and a later
+# -Resume folds them in again (Invoke-FoldedStreamStateCleanup).
 if (-not $ResumeStateClearTried)
 {
-    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
+    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
     $FoldedStreamFiles = @()
 }
 
