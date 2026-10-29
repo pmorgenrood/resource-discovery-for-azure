@@ -549,8 +549,10 @@ function Write-UnreadableStreamStateSummary
 # resume state file -StateFile. Each removal stops on an error and is then
 # checked: a file that is still there gets a warning naming it. While a
 # per-stream file is left, the resume state file is kept too, so the next
-# -Resume reads the same state, reads that per-stream file again and retries
-# the removal. Returns the paths left on disk (none when all were removed).
+# -Resume reads the same state and that per-stream file again. Only some runs
+# remove per-stream files, so the warning asks for the named files to be
+# removed once the folder can be written. Returns the paths left on disk (none
+# when all were removed).
 function Remove-ResumeStateFiles
 {
     param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
@@ -560,7 +562,7 @@ function Remove-ResumeStateFiles
         $IsState = $Path -eq $StateFile
         if ($IsState -and $Left.Count -gt 0)
         {
-            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
+            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
             $Left.Add($Path)
             continue
         }

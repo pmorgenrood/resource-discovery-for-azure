@@ -1728,7 +1728,7 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
         Test-Path -LiteralPath $State | Should -BeTrue
         @($script:Lines) | Should -Be @(
             'WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: denied'
-            '  The resume state file .resume-state-t.json is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.'
+            '  The resume state file .resume-state-t.json is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.'
         )
     }
 
@@ -2492,6 +2492,24 @@ exit 1
         $null = script:Invoke-WrapperRun -Streams 2 -EndWhen { (Test-Path -LiteralPath (Join-Path $script:CaseHome ('waiting-' + $script:SubX.Id))) -and (@(script:Get-StreamCompletedIds) -join ',') -eq 'sub-a,sub-b' }
         $StreamNames = @(script:Get-StreamStateFiles | ForEach-Object { $_.Name } | Sort-Object)
         $StreamNames.Count | Should -Be 2
+        # The removal fails only where a read-only folder refuses writes: not for
+        # root, and not on a file system that ignores folder modes. Check first.
+        $Probe = Join-Path $script:CaseRoot '.write-probe'
+        $Refused = $false
+        [System.IO.File]::SetUnixFileMode($script:CaseRoot, [System.IO.UnixFileMode]'UserRead, UserExecute')
+        try
+        {
+            [System.IO.File]::WriteAllText($Probe, 'probe')
+            Remove-Item -LiteralPath $Probe -Force
+        }
+        catch { $Refused = $true }
+        finally { [System.IO.File]::SetUnixFileMode($script:CaseRoot, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute') }
+        if (-not $Refused)
+        {
+            Remove-Item -LiteralPath $Probe -Force -ErrorAction SilentlyContinue
+            Set-ItResult -Skipped -Because 'a read-only folder does not refuse writes here (running as root, or a file system that ignores folder modes)'
+            return
+        }
         # Sub X cannot be read, so nothing is left to collect. The inventory root
         # becomes read-only during the role check, so the removal at the end fails.
         script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id -LockRoot $script:SubX.Id
@@ -2509,7 +2527,7 @@ exit 1
         {
             @($R1.Text | Where-Object { $_ -like ('WARNING: Could not remove the per-stream state file {0}: *' -f $Name) }).Count | Should -Be 1
         }
-        $R1.Text | Should -Contain ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f (Split-Path -Path $script:CaseState -Leaf))
+        $R1.Text | Should -Contain ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $script:CaseState -Leaf))
         Test-Path -LiteralPath $script:CaseState | Should -BeTrue
         @(script:Get-StreamStateFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $StreamNames
 
