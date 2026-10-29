@@ -526,8 +526,12 @@ function Get-FailedAttempts
 
 function Save-CompletedSubscriptionIds
 {
-    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @())
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), [string]$RunId)
 
+    # The id of the run the per-stream state files belong to (Get-ResumeStateRunId).
+    # Every save writes it, so a save that is not given it writes the script's
+    # $RunId, and the per-stream files of this run keep matching.
+    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = [string](Get-ResumeStateRunList -Name 'RunId') }
     $State = [pscustomobject]@{
         TenantID                  = $Tenant
         CompletedSubscriptionIds  = @($Ids)
@@ -539,6 +543,7 @@ function Save-CompletedSubscriptionIds
         FailedAttempts            = @($FailedAttempts)
         LastUpdated               = (Get-Date).ToString('o')
     }
+    if (-not [string]::IsNullOrEmpty($RunId)) { $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId }
     try
     {
         # Atomic write: serialize to a sibling temp file, then swap it into place
@@ -612,6 +617,43 @@ function Remove-FailedAttempt
         [string]$Id
     )
     return @($Existing | Where-Object { $_ -and $_.Id -ne $Id })
+}
+
+# The run id the resume state file for $Tenant holds, or $null when there is no
+# file, it cannot be read, it is for another tenant, or it was written before
+# run ids existed. A run without -Resume or -ResumeFailedOnly writes a new id at
+# its start; -Resume and -ResumeFailedOnly keep this one. The per-stream state
+# files a parallel run writes carry the same id (Write-StreamState).
+function Get-ResumeStateRunId
+{
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Tenant)
+    try
+    {
+        $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $null
+    }
+    if ($State -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $TenantProp = $State.PSObject.Properties['TenantID']
+    if ($null -eq $TenantProp -or [string]$TenantProp.Value -ne $Tenant) { return $null }
+    $Prop = $State.PSObject.Properties['RunId']
+    if ($null -eq $Prop -or [string]::IsNullOrEmpty([string]$Prop.Value)) { return $null }
+    return [string]$Prop.Value
+}
+
+# True when a per-stream state file ($State, as Read-StreamResumeStateFile
+# returns it) belongs to the run with id $RunId: its RunId is the same, or
+# neither has one (files written before run ids existed). A file of another
+# run is never folded in, merged or deleted by this run.
+function Test-StreamStateRunId
+{
+    param([object]$State, [string]$RunId)
+    if ($null -eq $State) { return $false }
+    $Prop = $State.PSObject.Properties['RunId']
+    $FileRunId = if ($null -eq $Prop) { '' } else { [string]$Prop.Value }
+    return ($FileRunId -eq [string]$RunId)
 }
 
 # Discover every per-stream resume-state file on disk for a tenant, rather
@@ -1119,11 +1161,13 @@ function Write-Stream
 
 function Read-StreamState
 {
-    param([string]$Path)
+    # $RunId: a file of another run (Test-StreamStateRunId) reads as empty.
+    param([string]$Path, [string]$RunId)
     if (-not (Test-Path -Path $Path -PathType Leaf)) { return @{ Completed = @(); Failed = @() } }
     try
     {
         $Obj = Get-Content -Path $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { return @{ Completed = @(); Failed = @() } }
         return @{
             Completed = if ($null -eq $Obj.Completed) { @() } else { @($Obj.Completed) }
             # Backward-compatible: state files written by an older worker had
@@ -1147,6 +1191,8 @@ function Write-StreamState
         @{
             Tenant         = $TenantID
             StreamId       = $StreamId
+            # The run this file belongs to (Test-StreamStateRunId).
+            RunId          = $RunId
             Completed      = $Completed
             # Remove-FailedAttempt returns nothing once the list is empty, and
             # @($null) is a one-entry array; drop that entry so the file holds

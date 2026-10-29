@@ -732,6 +732,32 @@ $CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $T
 # uses it to filter the subscription list.
 $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 
+# The run id ties the per-stream state files to the run that wrote them. A run
+# without -Resume or -ResumeFailedOnly starts a new one and writes it into the
+# resume state file before any stream starts; -Resume and -ResumeFailedOnly
+# keep the id the file holds (none for a file written before run ids existed,
+# whose per-stream files carry none either). Every save of the resume state
+# writes $RunId (Save-CompletedSubscriptionIds), each stream gets it, and the
+# startup fold and the end-of-run merge use only the per-stream files that
+# carry it (Test-StreamStateRunId). A failed write costs time, not data: the
+# subscriptions this run's streams record are collected again by a later -Resume.
+if ($Resume -or $ResumeFailedOnly)
+{
+    $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
+}
+else
+{
+    $RunId = [guid]::NewGuid().ToString()
+    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -RunId $RunId
+    if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume does not use this run's per-stream state files and collects the subscriptions they record again." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
+    }
+}
+# The per-stream state files of another run, found by the startup fold or the
+# end-of-run merge; neither uses them (see the end of the run).
+$OtherRunStreamFiles = @()
+
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
 # .resume-state-<tenant>-stream-<N>.json and only merges them into the unified
@@ -769,6 +795,11 @@ if ($Resume -or $ResumeFailedOnly)
             if ($null -eq $Obj)
             {
                 Write-Verbose ("Could not read stranded stream resume file {0}" -f $StreamFile.FullName)
+                continue
+            }
+            if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId))
+            {
+                $OtherRunStreamFiles += $StreamFile.Name
                 continue
             }
             if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
@@ -1391,6 +1422,7 @@ else
                     SubscriptionIds    = $SliceIds
                     SubscriptionNames  = $SliceNames
                     ConcurrencyLimit   = $ConcurrencyLimit
+                    RunId              = $RunId
                 }
                 if ($Resume) { $WorkerArgs.Resume = $true }
                 if ($ResumeFailedOnly) { $WorkerArgs.ResumeFailedOnly = $true }
@@ -1569,6 +1601,7 @@ else
             $AllCompletedFromStreams = @()
             $AllFailedFromStreams = @()
             $UnreadableAtMerge = @()
+            $OtherRunAtMerge = @()
             $MergedRecordIds = @()
             foreach ($StreamFile in $AllStreamFiles)
             {
@@ -1581,6 +1614,13 @@ else
                     # them. Moved aside with a warning, not deleted.
                     $UnreadableStreamFiles += Move-UnreadableStreamStateFile -File $StreamFile
                     $UnreadableAtMerge += $PerStreamFile
+                    continue
+                }
+                if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId))
+                {
+                    # Another run's file: not merged and not deleted here.
+                    $OtherRunStreamFiles += $StreamFile.Name
+                    $OtherRunAtMerge += $PerStreamFile
                     continue
                 }
                 $MergedRecordIds += @(Get-StreamStateRecordIds -State $Obj)
@@ -1622,7 +1662,7 @@ else
             # is left is named, the resume state is kept for it below, and the
             # next -Resume reads it again. This read covers the files folded in
             # at startup too, so they are done.
-            $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote")
+            $StreamFilesLeft += @(Invoke-FoldedStreamStateCleanup -Files @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName -and $OtherRunAtMerge -notcontains $_.FullName }) -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $MergedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source "this run's streams wrote")
             $FoldedStreamFiles = @()
             $FoldedRecordIds = @()
         }
@@ -1868,6 +1908,14 @@ if (-not $ResumeStateClearTried)
 # A run that could not read a per-stream state file is not a clean run: say
 # whether the state was cleared or kept, and where that file went.
 Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
+
+# The per-stream state files of another run that the startup fold or the
+# end-of-run merge found: not used by this run, and left in place.
+$OtherRunStreamFiles = @($OtherRunStreamFiles | Sort-Object -Unique)
+if ($OtherRunStreamFiles.Count -gt 0)
+{
+    Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
+}
 
 # Final summary
 $Elapsed = (Get-Date) - $RunStartTime

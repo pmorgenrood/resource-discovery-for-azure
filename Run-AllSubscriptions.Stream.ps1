@@ -50,7 +50,10 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
-    [int]    $ConcurrencyLimit = 6
+    [int]    $ConcurrencyLimit = 6,
+    # The parent run's id: written into this stream's state file, and an
+    # existing file is read on -Resume only when it carries the same id.
+    [string] $RunId = ''
 )
 
 # ---------------------------------------------------------------------------
@@ -147,7 +150,7 @@ $CompletedIds = @()
 $FailedAttempts = @()
 if ($Resume -or $ResumeFailedOnly)
 {
-    $State = Read-StreamState -Path $StreamStateFile
+    $State = Read-StreamState -Path $StreamStateFile -RunId $RunId
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
     # The parent leaves completed subscriptions out of the slices, so this file
