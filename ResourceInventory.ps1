@@ -66,6 +66,9 @@ function Variables
     $Global:ResourceResourceGroupDictionary = $null
     $Global:TagValueDictionary = $null
     $Global:FreeTextDictionary = $null
+    $Global:ObfuscationSubscriptionTokens = $null
+    $Global:ObfuscationResourceGroupTokens = $null
+    $Global:ObfuscationSubscriptionIndex = $null
 
     if ($Obfuscate.IsPresent)
     {
@@ -75,6 +78,10 @@ function Variables
         $Global:ResourceResourceGroupDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Global:TagValueDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Global:FreeTextDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+        # Subscription display name -> token and resource group name -> token,
+        # shared by the inventory and the consumption rows.
+        $Global:ObfuscationSubscriptionTokens = @{}
+        $Global:ObfuscationResourceGroupTokens = @{}
     }
 
     $Global:RawRepo = 'https://raw.githubusercontent.com/awslabs/resource-discovery-for-azure/main'
@@ -163,6 +170,111 @@ function Build-ObfuscatedResourceUri
     }
 
     return $RebuiltUri
+}
+
+# 'nonprod_' when a name looks like a non-production one, else 'prod_'.
+function Get-ObfuscationPrefix
+{
+    param([string]$Value)
+    if ($Value -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $Value -match '(^|-)([dts])-') { return 'nonprod_' }
+    return 'prod_'
+}
+
+# A new token for the resource name $Name of resource $ResourceId, with the type
+# hint the report uses for Databricks, AKS-managed and scale set resources. This
+# defines the name token format; the per-resource loop of RunInventorySetup builds
+# the same token inline.
+function New-ObfuscatedNameToken
+{
+    param([string]$ResourceId, [string]$Name)
+    $Hint = if ($ResourceId -match 'databricks') { 'databricks_' } elseif ($ResourceId -match '/resourcegroups/mc_') { 'aks_' } elseif ($ResourceId -match 'virtualmachinescalesets') { 'vmss_' } else { '' }
+    return (Get-ObfuscationPrefix $Name) + $Hint + [guid]::NewGuid().ToString()
+}
+
+# The $Global:Subscriptions entries by subscription id, in list order, so a lookup
+# per resource does not scan the list. Built once per list, and again when the list
+# is replaced. Ids compare as the -eq scans this replaces did (ignoring case,
+# invariant culture); entries with no id are kept apart in NoId, the entries a
+# missing subscription id matched.
+function Get-ObfuscationSubscriptionIndex
+{
+    $Index = $Global:ObfuscationSubscriptionIndex
+    if ($null -ne $Index -and [object]::ReferenceEquals($Index.Source, $Global:Subscriptions)) { return $Index }
+
+    $ById = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::InvariantCultureIgnoreCase)
+    $NoId = [System.Collections.Generic.List[object]]::new()
+    foreach ($Sub in @($Global:Subscriptions))
+    {
+        if ($null -eq $Sub -or $null -eq $Sub.id) { $NoId.Add($Sub); continue }
+        $Key = [string]$Sub.id
+        if (-not $ById.ContainsKey($Key)) { $ById[$Key] = [System.Collections.Generic.List[object]]::new() }
+        $ById[$Key].Add($Sub)
+    }
+    $Global:ObfuscationSubscriptionIndex = @{ Source = $Global:Subscriptions; ById = $ById; NoId = $NoId }
+    return $Global:ObfuscationSubscriptionIndex
+}
+
+# The masked form of a resource id. Every name segment is replaced (the
+# subscription, the resource group and each resource name, a parent's
+# included) and the 'subscriptions', 'resourcegroups', 'providers', namespace
+# and type segments are kept, so the id keeps its ARM shape. Each segment uses
+# the token its own subscription, resource group or resource already has, so a
+# child's id holds its parent's masked name and ids join across the inventory,
+# metrics and consumption files. A segment with no token yet gets one, recorded
+# in the run's dictionaries (a name keyed by the real id up to that segment), so
+# the obfuscation dictionary can reverse every segment. A caller that masks many
+# ids passes the index from Get-ObfuscationSubscriptionIndex once as
+# $SubscriptionIndex; without it the function gets the index itself.
+function Get-ObfuscatedResourceId
+{
+    param([string]$ResourceId, [hashtable]$SubscriptionIndex)
+
+    if ([string]::IsNullOrEmpty($ResourceId)) { return 'obfuscated' }
+    $Parts = $ResourceId.Split('/')
+    if ($Parts.Count -lt 3 -or $Parts[0] -ne '' -or $Parts[1] -ine 'subscriptions' -or [string]::IsNullOrEmpty($Parts[2]))
+    {
+        return (Get-ObfuscationPrefix $ResourceId) + [guid]::NewGuid().ToString()
+    }
+
+    if ($null -eq $SubscriptionIndex) { $SubscriptionIndex = Get-ObfuscationSubscriptionIndex }
+    $SubEntries = $SubscriptionIndex.ById[$Parts[2]]
+    $SubName = if ($null -ne $SubEntries) { [string]$SubEntries[0].name } else { '' }
+    if ([string]::IsNullOrEmpty($SubName)) { $SubName = $Parts[2] }
+    if (-not $Global:ObfuscationSubscriptionTokens.ContainsKey($SubName)) { $Global:ObfuscationSubscriptionTokens[$SubName] = (Get-ObfuscationPrefix $SubName) + [guid]::NewGuid().ToString() }
+    $SubToken = $Global:ObfuscationSubscriptionTokens[$SubName]
+    if (-not $ResourceSubscriptionDictionary.ContainsKey($ResourceId)) { $ResourceSubscriptionDictionary[$ResourceId] = $SubToken }
+
+    $Masked = [System.Collections.Generic.List[string]]::new()
+    $Masked.Add('')
+    $Masked.Add($Parts[1])
+    $Masked.Add($SubToken)
+    $i = 3
+    while ($i -lt $Parts.Count)
+    {
+        $Segment = $Parts[$i]
+        $Masked.Add($Segment)
+        if ($i + 1 -ge $Parts.Count) { break }
+        $Next = $Parts[$i + 1]
+        if ($i -eq 3 -and $Segment -ieq 'resourcegroups')
+        {
+            if (-not $Global:ObfuscationResourceGroupTokens.ContainsKey($Next)) { $Global:ObfuscationResourceGroupTokens[$Next] = (Get-ObfuscationPrefix $Next) + [guid]::NewGuid().ToString() }
+            $Masked.Add($Global:ObfuscationResourceGroupTokens[$Next])
+            if (-not $ResourceResourceGroupDictionary.ContainsKey($ResourceId)) { $ResourceResourceGroupDictionary[$ResourceId] = $Global:ObfuscationResourceGroupTokens[$Next] }
+        }
+        elseif ($Segment -ieq 'providers' -or [string]::IsNullOrEmpty($Next) -or $Next -eq '$system')
+        {
+            # A provider namespace, an empty segment, or the fixed name '$system'.
+            $Masked.Add($Next)
+        }
+        else
+        {
+            $UpToName = $Parts[0..($i + 1)] -join '/'
+            if (-not $ResourceNameDictionary.ContainsKey($UpToName)) { $ResourceNameDictionary[$UpToName] = New-ObfuscatedNameToken -ResourceId $UpToName -Name $Next }
+            $Masked.Add($ResourceNameDictionary[$UpToName])
+        }
+        $i += 2
+    }
+    return ($Masked -join '/')
 }
 
 Function RunInventorySetup()
@@ -800,8 +912,11 @@ Function RunInventorySetup()
 
     if ($Obfuscate.IsPresent)
     {
-        $SubLookup = @{}
-        $RgLookup = @{}
+        $SubLookup = $Global:ObfuscationSubscriptionTokens
+        $RgLookup = $Global:ObfuscationResourceGroupTokens
+        # Ids are built once every resource has its name token, so a child's id
+        # can use its parent's token (Get-ObfuscatedResourceId).
+        $IdsToMask = [System.Collections.Generic.HashSet[string]]::new()
 
         if (-not [string]::IsNullOrEmpty($ObfuscationDictionary))
         {
@@ -841,29 +956,22 @@ Function RunInventorySetup()
             Write-Log -Message ("Obfuscation dictionary seeded from '{0}': {1} id, {2} name, {3} subscription, {4} resource-group, {5} tag, {6} free-text mappings preloaded; matching real values will reuse their existing tokens." -f $ObfuscationDictionary, @($ResourceIdDictionary.Keys).Count, @($ResourceNameDictionary.Keys).Count, @($SubLookup.Keys).Count, @($RgLookup.Keys).Count, @($Global:TagValueDictionary.Keys).Count, @($Global:FreeTextDictionary.Keys).Count) -Severity 'Info'
         }
 
+        $SubIndex = Get-ObfuscationSubscriptionIndex
+
         foreach ($resourceItem in $Global:Resources)
         {
-            $IsNonProd = $resourceItem.name -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $resourceItem.name -match '(^|-)([dts])-'
-            $Prefix = if ($IsNonProd) { "nonprod_" } else { "prod_" }
+            if ($IdsToMask.Contains($resourceItem.ID)) { continue }
 
-            if ($resourceItem.id -match 'databricks')
-            {
-                $ObfuscatedName = $Prefix + 'databricks_' + [guid]::NewGuid().ToString()
-            }
-            elseif ($resourceItem.id -match '/resourcegroups/mc_')
-            {
-                $ObfuscatedName = $Prefix + 'aks_' + [guid]::NewGuid().ToString()
-            }
-            elseif ($resourceItem.id -match 'virtualmachinescalesets')
-            {
-                $ObfuscatedName = $Prefix + 'vmss_' + [guid]::NewGuid().ToString()
-            }
-            else
-            {
-                $ObfuscatedName = $Prefix + [guid]::NewGuid().ToString()
-            }
+            # The token New-ObfuscatedNameToken writes, built inline because this loop
+            # runs once per resource.
+            $TokenId = [string]$resourceItem.id
+            $TokenName = [string]$resourceItem.name
+            $Hint = if ($TokenId -match 'databricks') { 'databricks_' } elseif ($TokenId -match '/resourcegroups/mc_') { 'aks_' } elseif ($TokenId -match 'virtualmachinescalesets') { 'vmss_' } else { '' }
+            $Prefix = if ($TokenName -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $TokenName -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+            $ObfuscatedName = $Prefix + $Hint + [guid]::NewGuid().ToString()
 
-            $RealSub = ($Global:Subscriptions | Where-Object { $_.id -eq $resourceItem.subscriptionId }).Name
+            $SubEntries = if ($null -eq $resourceItem.subscriptionId) { $SubIndex.NoId } else { $SubIndex.ById[[string]$resourceItem.subscriptionId] }
+            $RealSub = $SubEntries.Name
             if ([string]::IsNullOrEmpty($RealSub)) { $RealSub = $resourceItem.subscriptionId }
             if (-not $SubLookup.ContainsKey($RealSub))
             {
@@ -890,24 +998,20 @@ Function RunInventorySetup()
             }
             else
             {
-                # Build a structured ARM-shaped obfuscated ID (not a flat GUID token) by
-                # substituting the real subscription/resource-group/name segments with the
-                # SAME tokens stored in the sibling dictionaries below, so a downstream
-                # consumption record that matches this exact resource ID reconstructs an
-                # identically-shaped, identically-tokenized path.
-                $ObfuscatedID = $resourceItem.ID -replace '(?i)/subscriptions/[^/]+', ('/subscriptions/' + $ObfuscatedSubscription)
-                if ($ObfuscatedID -match '(?i)/resourcegroups/[^/]+')
-                {
-                    $ObfuscatedID = $ObfuscatedID -replace '(?i)/resourcegroups/[^/]+', ('/resourcegroups/' + $ObfuscatedResourceGroup)
-                }
-                $ObfuscatedID = $ObfuscatedID -replace '/[^/]+$', ('/' + $ObfuscatedName)
+                $ObfuscatedID = $null
+                [void]$IdsToMask.Add($resourceItem.ID)
             }
 
-            $ResourceIdDictionary[$resourceItem.ID] = $ObfuscatedID
+            if ($null -ne $ObfuscatedID) { $ResourceIdDictionary[$resourceItem.ID] = $ObfuscatedID }
             $ResourceNameDictionary[$resourceItem.ID] = $ObfuscatedName
             $ResourceSubscriptionDictionary[$resourceItem.ID] = $ObfuscatedSubscription
             $ResourceResourceGroupDictionary[$resourceItem.ID] = $ObfuscatedResourceGroup
 
+        }
+
+        foreach ($MaskId in $IdsToMask)
+        {
+            $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId -SubscriptionIndex $SubIndex
         }
     }
 }
@@ -1517,14 +1621,7 @@ function ExecuteInventoryProcessing()
 
                         if ($Obfuscate.IsPresent)
                         {
-                            $Prefix = if ($UsageDataExport[$Item].ResourceId -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $UsageDataExport[$Item].ResourceId -match '(^|/|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-
                             $RawUri = $InstanceObject.'Microsoft.Resources'.resourceUri
-
-                            if (-not $script:ConsumptionSubCache) { $script:ConsumptionSubCache = @{} }
-                            if (-not $script:ConsumptionRgCache) { $script:ConsumptionRgCache = @{} }
-                            if (-not $script:ConsumptionNameCache) { $script:ConsumptionNameCache = @{} }
-
 
                             if (![string]::IsNullOrEmpty($RawUri) -and $ResourceIdDictionary.ContainsKey($RawUri))
                             {
@@ -1532,7 +1629,10 @@ function ExecuteInventoryProcessing()
                             }
                             else
                             {
-                                $ObfuscatedUri = Build-ObfuscatedResourceUri -RawUri $RawUri -Prefix $Prefix -SubscriptionDictionary $ResourceSubscriptionDictionary -ResourceGroupDictionary $ResourceResourceGroupDictionary -NameDictionary $ResourceNameDictionary -SubCache $script:ConsumptionSubCache -RgCache $script:ConsumptionRgCache -NameCache $script:ConsumptionNameCache
+                                # A resource that is not in the inventory: its segments reuse the
+                                # inventory's tokens where they exist (subscription, resource
+                                # group, parent resource), and new ones go into the dictionary.
+                                $ObfuscatedUri = Get-ObfuscatedResourceId -ResourceId $RawUri
 
                                 if (![string]::IsNullOrEmpty($RawUri))
                                 {
