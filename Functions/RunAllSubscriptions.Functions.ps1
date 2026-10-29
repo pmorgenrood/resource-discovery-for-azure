@@ -971,69 +971,6 @@ function Invoke-FoldedStreamStateCleanup
     return @($Kept) + @(Remove-StreamStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }) -StateFile $ResumeStateFile)
 }
 
-# At the start of a run without -Resume or -ResumeFailedOnly: the per-stream
-# state files of this tenant that an earlier parallel run left
-# (Get-StreamResumeStateFiles) are not used by this run, and a later -Resume
-# must not fold them in either, or it would count what they record as this
-# cycle's. They are renamed in place, as one set, to <name>.earlier-<UTC time>
-# (one time for the whole set), with a warning naming them. Such a name ends
-# neither in '.json' nor matches Get-StreamResumeStateFiles, so no run reads
-# it, and it stays a dot-file in the inventory root like the resume state file,
-# which no zip step takes. Once a set is moved and no file was left, the sets
-# an earlier run moved aside are removed, so only the newest set is kept. Files named
-# <name>.unreadable-<time> (Move-UnreadableStreamStateFile) and every other
-# name are left alone. Returns { Moved; NotMoved (each { Name; Reason }); Removed }.
-function Move-EarlierStreamStateFiles
-{
-    param(
-        [Parameter(Mandatory = $true)][string]$InventoryRoot,
-        [Parameter(Mandatory = $true)][string]$Tenant,
-        [datetime]$Now = [datetime]::UtcNow
-    )
-    $Suffix = '.earlier-' + $Now.ToString('yyyyMMdd-HHmmss')
-    $Moved = @()
-    $NotMoved = @()
-    $Removed = @()
-    $Files = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name)
-    foreach ($File in $Files)
-    {
-        try
-        {
-            Rename-Item -LiteralPath $File.FullName -NewName ($File.Name + $Suffix) -ErrorAction Stop
-            $Moved += $File.Name
-        }
-        catch
-        {
-            $NotMoved += [pscustomobject]@{ Name = $File.Name; Reason = $_.Exception.Message }
-        }
-    }
-    if ($Moved.Count -gt 0)
-    {
-        Write-Host ("WARNING: A run without -Resume or -ResumeFailedOnly does not use the per-stream state files an earlier parallel run left, so they were moved aside with {0} added to each name, and no later run reads them: {1}" -f $Suffix, ($Moved -join ', ')) -ForegroundColor Yellow
-    }
-    if ($Moved.Count -gt 0 -and $NotMoved.Count -eq 0)
-    {
-        $Earlier = '^' + [regex]::Escape('.resume-state-{0}-stream-' -f $Tenant) + '.+\.json\.earlier-\d{8}-\d{6}$'
-        foreach ($Old in @(Get-ChildItem -LiteralPath $InventoryRoot -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Earlier -and -not $_.Name.EndsWith($Suffix) }))
-        {
-            try
-            {
-                Remove-Item -LiteralPath $Old.FullName -Force -ErrorAction Stop
-                $Removed += $Old.Name
-            }
-            catch
-            {
-                Write-Host ("WARNING: Could not remove {0}, a per-stream state file an earlier run moved aside: {1}" -f $Old.Name, $_.Exception.Message) -ForegroundColor Yellow
-            }
-        }
-        if ($Removed.Count -gt 0)
-        {
-            Write-Host ("Removed the per-stream state files an earlier run moved aside: {0}" -f ($Removed -join ', ')) -ForegroundColor DarkGray
-        }
-    }
-    return [pscustomobject]@{ Moved = $Moved; NotMoved = $NotMoved; Removed = $Removed }
-}
-
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
 # pre-existing entries) against the unified CompletedIds list.
 #   - A sub that now appears in CompletedIds (any stream, or a prior run,

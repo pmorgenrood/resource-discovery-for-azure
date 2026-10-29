@@ -25,12 +25,9 @@
 #     holds; a per-stream file holding a list this version does not keep is
 #     kept with its own warning.
 #   - An exit before the startup fold prints no error under strict mode.
-#   - A run without -Resume moves the per-stream files an earlier run left
-#     aside as one set, keeps only the newest set, and no zip holds them; the
-#     next -Resume or -ResumeFailedOnly reads none of them.
 # Each scenario is followed by the next two runs, which end without a repeated
 # recovery line, without collecting a completed subscription again, and with
-# no resume state once nothing is left. The reader, the move-aside helpers and
+# no resume state once nothing is left. The reader, the move-aside helper and
 # the read-back of the resume state are also tested on their own, a rename that
 # fails included.
 #
@@ -340,12 +337,6 @@ exit 1
     function script:Get-RemoveWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: Could not remove the *' -or $_ -like '  The resume state file * is kept, so the next -Resume*' -or $_ -like '  The next run reads it again*' -or $_ -like 'WARNING: The resume state file * could not be written or read back*' }) }
     # The ERROR lines of a run, a stream's included.
     function script:Get-ErrorLines { param($Run) @($Run.Text | Where-Object { $_ -match '^(\[stream-\d+\] )?ERROR' }) }
-    # The per-stream state files a run without -Resume moved aside (Move-EarlierStreamStateFiles).
-    function script:Get-AsideFiles
-    {
-        if (-not (Test-Path -LiteralPath $script:Root)) { return @() }
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -match ('^{0}-stream-.+\.json\.earlier-\d{{8}}-\d{{6}}$' -f [regex]::Escape('.resume-state-' + $script:Tenant)) } | Sort-Object -Property Name)
-    }
     # The resume state file as written, or $null.
     function script:Read-StateFile { if (Test-Path -LiteralPath $script:State) { Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json } }
     function script:Get-StreamWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The per-stream state file*' }) }
@@ -1085,9 +1076,11 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
 Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
 
-    It 'is named, moved aside and never reported as a clean run (stream file <Kind>, run 1 -Resume)' -ForEach @(
-        @{ Kind = 'cut short' }
-        @{ Kind = 'empty' }
+    It 'is named, moved aside and never reported as a clean run (stream file <Kind>, run 1 <Run1>)' -ForEach @(
+        @{ Kind = 'cut short'; Run1 = 'without -Resume' }
+        @{ Kind = 'empty'; Run1 = 'without -Resume' }
+        @{ Kind = 'cut short'; Run1 = '-Resume' }
+        @{ Kind = 'empty'; Run1 = '-Resume' }
     ) {
         script:Invoke-InterruptedThreeStreamRun
         # A write of the stream 2 file that was cut short.
@@ -1095,11 +1088,14 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         if ($Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Bad, [byte[]]@()) }
         else { $Raw = Get-Content -LiteralPath $Bad -Raw; Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
 
-        # Run 1 uses 2 streams, so no stream of it rewrites the stream 2 file. C
-        # was recorded only in the unreadable file, so it is collected.
+        # Run 1 uses 2 streams, so no stream of it rewrites the stream 2 file. A
+        # run without -Resume collects everything and reads the per-stream files
+        # only in its end-of-run merge.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
-        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'C', 'D', 'E', 'F')
+        $Resuming = $Run1 -eq '-Resume'
+        $R1 = script:Invoke-Wrapper -Arguments @(if ($Resuming) { '-Resume' }) -Streams 2
+        # On -Resume, C was recorded only in the unreadable file, so it is collected.
+        script:Get-Collected $R1 | Should -Be $(if ($Resuming) { script:Get-Ids 'C', 'D', 'E', 'F' } else { script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F' })
         $Warnings = @(script:Get-StreamWarningLines $R1)
         $Warnings.Count | Should -Be 1
         script:Test-CleanLine $R1 | Should -BeFalse
@@ -1110,7 +1106,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         $Name = '.resume-state-{0}-stream-2.json' -f $script:Tenant
         # The warning names the file and where it went, whichever step found it.
         $Warnings[0] | Should -BeLike ('WARNING: The per-stream state file {0}*could not be read, so its records are not used: the subscriptions it lists are not counted as completed* It was moved aside to {1}.' -f $Name, $Moved[0].Name)
-        if ((Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1') -Raw) -notmatch '\[switch\]\$AtRunEnd')
+        if (-not $Resuming)
         {
             $Warnings[0] | Should -Be ('WARNING: The per-stream state file {0} could not be read, so its records are not used: the subscriptions it lists are not counted as completed, and a later -Resume collects them again. It was moved aside to {1}.' -f $Name, $Moved[0].Name)
         }
@@ -1167,119 +1163,6 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
         $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
         script:Test-CleanLine $R3 | Should -BeTrue
-    }
-}
-
-Describe 'A run without -Resume after an interrupted parallel run' -Skip:$IsWindows {
-    BeforeEach { script:New-Case }
-
-    It 'moves its per-stream files aside, so the next <Next> collects what that run failed (-ParallelStreams <Streams>)' -ForEach @(
-        @{ Streams = 1; Next = '-Resume' }, @{ Streams = 2; Next = '-Resume' }, @{ Streams = 0; Next = '-Resume' },
-        @{ Streams = 1; Next = '-ResumeFailedOnly' }, @{ Streams = 2; Next = '-ResumeFailedOnly' }, @{ Streams = 0; Next = '-ResumeFailedOnly' }) {
-        # Interrupted 3-stream run: A and C complete, B fails, D, E and F hang.
-        script:Invoke-InterruptedThreeStreamRun -Fail 'B'
-        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
-        (script:Get-StreamCompletedIds) | Should -Be (script:Get-Ids 'A', 'C')
-        (script:Get-StreamFailedIds) | Should -Be (script:Get-Ids 'B')
-
-        # A run without -Resume, in which C fails: it collects everything and
-        # moves the per-stream files aside before it starts.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C'
-        $R1 = script:Invoke-Wrapper -Streams $Streams -Environment $script:FourCpu
-        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
-        $Aside = @(script:Get-AsideFiles)
-        $Aside.Count | Should -Be 3
-        $Suffix = $Aside[0].Name.Substring($Names[0].Length)
-        @($Aside | ForEach-Object { $_.Name }) | Should -Be @($Names | ForEach-Object { $_ + $Suffix })
-        @($R1.Text | Where-Object { $_ -like 'WARNING: A run without -Resume*' }) | Should -Be @(('WARNING: A run without -Resume or -ResumeFailedOnly does not use the per-stream state files an earlier parallel run left, so they were moved aside with {0} added to each name, and no later run reads them: {1}' -f $Suffix, ($Names -join ', ')))
-        script:Get-RecoveryLines $R1 | Should -BeNullOrEmpty
-        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
-        (script:Read-State).Failed | Should -Be (script:Get-Ids 'C')
-        (script:Read-State).Completed | Should -Not -Contain 'sub-c'
-        @(script:Get-ZipEntries | Where-Object { $_.Name -like '*resume-state*' -or $_.Name -like '*.earlier-*' -or $_.Text -like '*resume-state*' }) | Should -BeNullOrEmpty
-
-        # The next run collects C, the one the last run failed; the moved files are not read.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R2 = script:Invoke-Wrapper -Arguments $Next -Streams $Streams -Environment $script:FourCpu
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C')
-        script:Get-RecoveryLines $R2 | Should -BeNullOrEmpty
-        script:Test-CleanLine $R2 | Should -BeTrue
-        script:Read-State | Should -BeNullOrEmpty
-        @(script:Get-AsideFiles | ForEach-Object { $_.Name }) | Should -Be @($Aside | ForEach-Object { $_.Name })
-
-        # One more -Resume finds no state.
-        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams -Environment $script:FourCpu
-        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
-        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
-        script:Test-CleanLine $R3 | Should -BeTrue
-    }
-
-    It 'keeps only the newest set, leaves every other file alone, and no zip holds any of them' {
-        script:Invoke-InterruptedThreeStreamRun
-        # Files the move leaves alone: one an end-of-run merge moved aside, and two of another shape.
-        $Other = @(
-            ('.resume-state-{0}-stream-7.json.unreadable-20260101-000000' -f $script:Tenant)
-            ('.resume-state-{0}-stream-8.json.bak' -f $script:Tenant)
-            ('.resume-state-{0}-stream-9.json.earlier-x' -f $script:Tenant)
-        )
-        foreach ($Name in $Other) { Set-Content -LiteralPath (Join-Path $script:Root $Name) -Value '{' -Encoding utf8 }
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R1 = script:Invoke-Wrapper -Streams 1
-        $First = @(script:Get-AsideFiles | ForEach-Object { $_.Name })
-        $First.Count | Should -Be 3
-        script:Test-CleanLine $R1 | Should -BeTrue
-        @($R1.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -BeNullOrEmpty
-
-        # A new interrupted run leaves new files; the next run without -Resume
-        # moves them aside and removes the first set.
-        Get-ChildItem -LiteralPath $script:CaseHome -Filter 'hang-*' -File | Remove-Item -Force
-        script:Invoke-InterruptedThreeStreamRun
-        @(script:Get-AsideFiles | ForEach-Object { $_.Name }) | Should -Be $First -Because 'a run that moves nothing keeps the newest set'
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R2 = script:Invoke-Wrapper -Streams 1
-        $Second = @(script:Get-AsideFiles | ForEach-Object { $_.Name })
-        $Second.Count | Should -Be 3
-        @($Second | Where-Object { $First -contains $_ }) | Should -BeNullOrEmpty
-        @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files an earlier run moved aside: {0}' -f ($First -join ', ')))
-        foreach ($Name in $Other) { Get-Content -LiteralPath (Join-Path $script:Root $Name) -Raw | Should -Be ('{' + [Environment]::NewLine) }
-        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
-        @(script:Get-ZipEntries | Where-Object { $_.Name -like '*resume-state*' -or $_.Name -like '*.earlier-*' -or $_.Name -like '*.unreadable-*' -or $_.Text -like '*resume-state*' }) | Should -BeNullOrEmpty
-
-        # A -Resume next reads none of them.
-        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
-        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
-        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
-        script:Test-CleanLine $R3 | Should -BeTrue
-        @(script:Get-AsideFiles | ForEach-Object { $_.Name }) | Should -Be $Second
-    }
-
-    It 'moves a per-stream file that is <Kind> aside with the rest, without reading it' -ForEach @(@{ Kind = 'cut short' }, @{ Kind = 'empty' }) {
-        script:Invoke-InterruptedThreeStreamRun
-        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f $script:Tenant)
-        if ($Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Bad, [byte[]]@()) }
-        else { $Raw = Get-Content -LiteralPath $Bad -Raw; Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
-        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
-
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R1 = script:Invoke-Wrapper -Streams 2
-        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
-        @(script:Get-AsideFiles).Count | Should -Be 3
-        @($R1.Text | Where-Object { $_ -like 'WARNING: A run without -Resume*' }).Count | Should -Be 1
-        @($R1.Text | Where-Object { $_ -like 'WARNING: A run without -Resume*' })[0] | Should -BeLike ('*: {0}' -f ($Names -join ', '))
-        script:Get-StreamWarningLines $R1 | Should -BeNullOrEmpty
-        script:Test-CleanLine $R1 | Should -BeTrue
-        script:Read-State | Should -BeNullOrEmpty
-        @(script:Get-ZipEntries | Where-Object { $_.Name -like '*resume-state*' -or $_.Name -like '*.earlier-*' -or $_.Text -like '*resume-state*' }) | Should -BeNullOrEmpty
-
-        foreach ($Run in 1..2)
-        {
-            $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
-            script:Get-StreamWarningLines $R | Should -BeNullOrEmpty
-            script:Get-RecoveryLines $R | Should -BeNullOrEmpty
-            $R.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
-            script:Test-CleanLine $R | Should -BeTrue
-            @(script:Get-AsideFiles).Count | Should -Be 3
-        }
     }
 }
 
@@ -1436,31 +1319,6 @@ Describe 'The per-stream and resume state helpers' {
         Get-StreamStateUntrackedLists -State ([pscustomobject]$State | ConvertTo-Json -Depth 4 | ConvertFrom-Json) | Should -Be @('Notes', 'Labels')
         @(Get-StreamStateUntrackedLists -State ('{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
         @(Get-StreamStateUntrackedLists -State $null) | Should -BeNullOrEmpty
-    }
-
-    It 'Move-EarlierStreamStateFiles moves the per-stream files aside as one set, keeps only the newest set and leaves every other file alone' {
-        $Dir = Join-Path $script:UnitDir ('earlier-' + [guid]::NewGuid().ToString().Substring(0, 8))
-        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        $Live = @('.resume-state-t-stream-0.json', '.resume-state-t-stream-1.json')
-        $OlderSet = @('.resume-state-t-stream-0.json.earlier-20260101-000000', '.resume-state-t-stream-5.json.earlier-20260101-000000')
-        $Other = @('.resume-state-t-stream-2.json.unreadable-20260101-000000', '.resume-state-t-stream-3.json.bak', '.resume-state-t-stream-4.json.earlier-x', '.resume-state-u-stream-0.json', '.resume-state-t.json')
-        foreach ($Name in $Live + $OlderSet + $Other) { Set-Content -LiteralPath (Join-Path $Dir $Name) -Value $Name -Encoding utf8 }
-        $Now = [datetime]::new(2026, 10, 29, 12, 0, 0, [DateTimeKind]::Utc)
-        $Out = @(Move-EarlierStreamStateFiles -InventoryRoot $Dir -Tenant 't' -Now $Now 6>&1)
-        $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
-        $Lines | Should -Be @(
-            'WARNING: A run without -Resume or -ResumeFailedOnly does not use the per-stream state files an earlier parallel run left, so they were moved aside with .earlier-20261029-120000 added to each name, and no later run reads them: .resume-state-t-stream-0.json, .resume-state-t-stream-1.json'
-            'Removed the per-stream state files an earlier run moved aside: .resume-state-t-stream-0.json.earlier-20260101-000000, .resume-state-t-stream-5.json.earlier-20260101-000000'
-        )
-        $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
-        $Result.Moved | Should -Be $Live
-        @($Result.NotMoved) | Should -BeNullOrEmpty
-        @(Get-ChildItem -LiteralPath $Dir -Force -File | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @(@($Live | ForEach-Object { $_ + '.earlier-20261029-120000' }) + $Other | Sort-Object)
-        foreach ($Name in $Live) { Get-Content -LiteralPath (Join-Path $Dir ($Name + '.earlier-20261029-120000')) -Raw | Should -Be ($Name + [Environment]::NewLine) }
-        # With nothing to move, the newest set stays.
-        $Out = @(Move-EarlierStreamStateFiles -InventoryRoot $Dir -Tenant 't' -Now $Now.AddMinutes(1) 6>&1)
-        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) | Should -BeNullOrEmpty
-        @(Get-ChildItem -LiteralPath $Dir -Force -File | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @(@($Live | ForEach-Object { $_ + '.earlier-20261029-120000' }) + $Other | Sort-Object)
     }
 
     It 'Get-StreamStateRecordIds lists every id a per-stream state file holds a record for' {
