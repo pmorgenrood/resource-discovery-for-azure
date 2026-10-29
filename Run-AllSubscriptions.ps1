@@ -730,6 +730,11 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # end-of-run merge still owns per-stream cleanup. Safe on non-interrupted runs: a
 # cleanly-finished parallel run deletes its per-stream files, so this finds none.
 # Runs at startup before any stream is launched, so it cannot race live streams.
+# A file that cannot be read is moved aside with a warning
+# (Move-UnreadableStreamStateFile) and its records are not used; only the files
+# read here are deleted when the run clears the state.
+$FoldedStreamFiles = [System.Collections.Generic.List[object]]::new()
+$UnreadableStreamFiles = [System.Collections.Generic.List[object]]::new()
 if ($Resume -or $ResumeFailedOnly)
 {
     $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
@@ -742,12 +747,15 @@ if ($Resume -or $ResumeFailedOnly)
             try
             {
                 $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
+                if ($null -eq $Obj -or $Obj -isnot [pscustomobject]) { throw 'not a per-stream state record' }
+                $FoldedStreamFiles.Add($StreamFile)
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
             }
             catch
             {
                 Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
+                $UnreadableStreamFiles.Add((Move-UnreadableStreamStateFile -File $StreamFile))
             }
         }
         if ($StrandedCompleted.Count -gt 0)
@@ -836,7 +844,9 @@ if ($ResumeFailedOnly)
 # state records some subscriptions in scope as completed, the run does not
 # stop even if none of the checked ones is readable: it skips them as above
 # and finishes with nothing left to collect, with one stream (see
-# $NothingLeftToCollect below). Runs once in the parent, before
+# $NothingLeftToCollect below). A subscription skipped because its check could
+# not finish, or because the two answers disagree, also stays on the retry list
+# (Add-RoleCheckRetryAttempts). Runs once in the parent, before
 # the sequential/parallel split, so it gates both. The records
 # are kept for the end-of-run 0-resource labels.
 $AccessProbed = @()
@@ -849,6 +859,17 @@ if ($ScopeForProbe.Count -gt 0)
     # The subscriptions left out of the check are the completed ones (-Resume only).
     $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed -CompletedCount (@($Subscriptions).Count - $ScopeForProbe.Count)
     Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount $ScopeForProbe.Count -Resume:$Resume
+    # A subscription skipped because the check could not finish, or because the
+    # two answers disagree while a role change takes effect, stays on the retry
+    # list as a failed run, also when the run stops here, so the state is kept
+    # and the retry limit ends its retries (Add-RoleCheckRetryAttempts).
+    $RoleCheckRetry = Add-RoleCheckRetryAttempts -FailedAttempts $FailedAttempts -CompletedIds $CompletedIds -Decision $AccessDecision
+    if ($RoleCheckRetry.Added.Count -gt 0)
+    {
+        $FailedAttempts = $RoleCheckRetry.FailedAttempts
+        $CompletedIds = $RoleCheckRetry.CompletedIds
+        Update-ResumeStateRetryList -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+    }
     if ($AccessDecision.ShouldBlock)
     {
         Exit-Wrapper -Code 1
@@ -1773,22 +1794,31 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # parallel merge, which deletes the per-stream state files an
         # interrupted parallel run left, does not run. Those files were folded
         # into the state at startup; delete them the same way, or every later
-        # -Resume would recover and skip their subscriptions again.
-        if ($NothingLeftToCollect)
+        # -Resume would recover and skip their subscriptions again. The same
+        # when a per-stream file could not be read, so the state reported as
+        # cleared below is cleared. Only files that were read are deleted; one
+        # that could not be read was moved aside and is kept.
+        if ($NothingLeftToCollect -or $UnreadableStreamFiles.Count -gt 0)
         {
-            foreach ($StreamFile in @($StrandedStreamFiles | Where-Object { $null -ne $_ }))
+            foreach ($StreamFile in @($FoldedStreamFiles | Where-Object { $null -ne $_ }))
             {
                 $PerStreamFile = $StreamFile.FullName
                 try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
             }
         }
-        Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+        if ($UnreadableStreamFiles.Count -eq 0)
+        {
+            Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+        }
     }
     catch
     {
         Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
     }
 }
+# A run that could not read a per-stream state file is not a clean run: say
+# whether the state was cleared or kept, and where that file went.
+Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
 
 # Final summary
 $Elapsed = (Get-Date) - $RunStartTime
@@ -2008,11 +2038,12 @@ if ($FailedSubscriptions.Count -gt 0)
 }
 elseif ($FailedAttempts.Count -gt 0)
 {
-    # No new failures this run, but the resume-state file still has lingering
-    # FailedAttempts from a prior run that have not yet been retried. Surface
-    # them so the operator does not lose track of historical failures simply
-    # because the most recent run was clean.
-    Write-Host ("Pending Retries:         {0} subscription(s) from a prior run still in FailedAttempts" -f $FailedAttempts.Count) -ForegroundColor Yellow
+    # No new failures this run, but the retry list still holds subscriptions:
+    # lingering FailedAttempts from a prior run that have not yet been retried,
+    # or ones this run's role check skipped for a cause that can pass on a
+    # later run. Surface them so the operator does not lose track of them
+    # simply because the most recent run was clean.
+    Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $FailedAttempts.Count) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow

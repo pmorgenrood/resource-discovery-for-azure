@@ -496,6 +496,111 @@ function Get-StreamResumeStateFiles
     return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
+# A per-stream state file that a resuming run cannot read (an interrupted
+# write can leave it cut short). Its records are not used, so the
+# subscriptions it lists are not counted as completed and the run collects
+# them again. The file is renamed in place to <name>.unreadable-<UTC time> and
+# kept for inspection: that name ends neither in '.json' nor matches
+# Get-StreamResumeStateFiles, so no later run reads it and no zip step that
+# picks files by '*.json' takes it. Prints a warning naming the file, never its
+# content. Returns { Name; MovedTo } (MovedTo is $null when the rename failed).
+function Move-UnreadableStreamStateFile
+{
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
+    $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again.' -f $File.Name
+    try
+    {
+        Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
+        Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
+    }
+    catch
+    {
+        $MovedTo = $null
+        Write-Host ('{0} It could not be moved aside ({1}), so a later -Resume finds it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+    }
+    return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
+}
+
+# The end-of-run line for each per-stream state file this run could not read
+# (Move-UnreadableStreamStateFile): whether the resume state was cleared or
+# kept, and where the file went. Such a run is not a clean run, whatever else
+# happened, so it never prints "Resume state cleared (clean run).".
+function Write-UnreadableStreamStateSummary
+{
+    param([object[]]$Unreadable, [bool]$StateKept)
+    $Word = if ($StateKept) { 'kept' } else { 'cleared' }
+    foreach ($File in @($Unreadable | Where-Object { $null -ne $_ }))
+    {
+        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'was left in place (it could not be moved aside)' } else { 'was moved aside to {0}' -f $File.MovedTo }
+        Write-Host ('Resume state {0}, but not a clean run: the per-stream state file {1} could not be read and {2}; its records were not used.' -f $Word, $File.Name, $Where) -ForegroundColor Yellow
+    }
+}
+
+# The subscriptions the up-front role check skipped for a cause that can pass
+# on a later run: the check could not finish (Unknown), or the two answers
+# disagree while a role change takes effect (Disagree). Each one is put on the
+# retry list as a failed run (Add-FailedAttempt, so the run count goes up) and
+# taken off the completed list, so the resume state is kept and -Resume and
+# -ResumeFailedOnly check it again; the retry limit ends the retries of one
+# that keeps failing. A subscription skipped for a missing role is not added:
+# it needs Reader first. Pure; the caller persists. Returns
+# { FailedAttempts; CompletedIds; Added }.
+function Add-RoleCheckRetryAttempts
+{
+    param([object]$FailedAttempts, [object]$CompletedIds, $Decision)
+    $Added = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and @('Unknown', 'Disagree') -contains [string]$_.State } })
+    $List = @($FailedAttempts | Where-Object { $_ })
+    foreach ($Skip in $Added)
+    {
+        $List = @(Add-FailedAttempt -Existing $List -Id ([string]$Skip.Id) -Name ([string]$Skip.Name) -Reason ('skipped by the up-front role check: {0}' -f $Skip.Reason))
+    }
+    $AddedIds = @($Added | ForEach-Object { [string]$_.Id })
+    return [pscustomobject]@{
+        FailedAttempts = $List
+        CompletedIds   = @(@($CompletedIds) | Where-Object { $_ -and $AddedIds -notcontains [string]$_ })
+        Added          = $Added
+    }
+}
+
+# Write the retry list and the completed ids into the resume state file and
+# leave every other key the file holds as it is, so records other code keeps
+# there survive. Writes a new file through Save-CompletedSubscriptionIds when
+# there is none (or it is for another tenant or cannot be read). Same atomic
+# write as Save-CompletedSubscriptionIds.
+function Update-ResumeStateRetryList
+{
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @())
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $State = $null
+    if (Test-Path -LiteralPath $Path -PathType Leaf)
+    {
+        try { $State = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $State = $null }
+    }
+    if ($null -eq $State -or $State -isnot [pscustomobject] -or [string]$State.TenantID -ne $Tenant)
+    {
+        Save-CompletedSubscriptionIds -Path $Path -Tenant $Tenant -Ids $Ids -FailedAttempts $FailedAttempts
+        return
+    }
+    $State | Add-Member -NotePropertyName CompletedSubscriptionIds -NotePropertyValue @($Ids) -Force
+    $State | Add-Member -NotePropertyName FailedAttempts -NotePropertyValue @($FailedAttempts) -Force
+    $State | Add-Member -NotePropertyName LastUpdated -NotePropertyValue (Get-Date).ToString('o') -Force
+    try
+    {
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8
+        [System.IO.File]::Move($TmpPath, $Path, $true)
+    }
+    catch
+    {
+        Write-Host ("WARNING: Failed to persist resume state to {0}: $_" -f $Path) -ForegroundColor Yellow
+        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
 # pre-existing entries) against the unified CompletedIds list.
 #   - A sub that now appears in CompletedIds (any stream, or a prior run,

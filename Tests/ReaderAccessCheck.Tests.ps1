@@ -931,6 +931,9 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         if ($Index -lt 0) { throw 'The role check was not found in Run-AllSubscriptions.ps1.' }
         $script:GateIndex = $Index
         $script:GateBlock = [scriptblock]::Create(($script:Top[$Index].Extent.Text + "`n" + $script:Top[$Index + 1].Extent.Text))
+        # The check keeps some skipped subscriptions on the retry list in the
+        # resume state (Add-RoleCheckRetryAttempts, Update-ResumeStateRetryList).
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
     }
 
     BeforeEach {
@@ -958,10 +961,55 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         $script:Resume = $false
         $script:AllowPartialAccess = $false
         $script:SkipConsumption = $true
+        $script:FailedAttempts = @()
+        $script:TenantID = 'tenant-test'
+        $script:ResumeStateFile = Join-Path $TestDrive ('state-{0}.json' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
     }
 
     AfterAll {
-        Remove-Variable -Name Subscriptions, CompletedIds, Resume, AllowPartialAccess, SkipConsumption -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name Subscriptions, CompletedIds, Resume, AllowPartialAccess, SkipConsumption, FailedAttempts, TenantID, ResumeStateFile -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    It 'keeps a subscription whose check could not finish on the retry list as a failed run, but not one without a read role' {
+        . $script:GateBlock
+        @($FailedAttempts | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Attempts, $_.Reason }) | Should -Be @(
+            'sub-c|1|skipped by the up-front role check: role check inconclusive after retries (caller permissions: HTTP 429)'
+        )
+        $Saved = Get-Content -LiteralPath $script:ResumeStateFile -Raw | ConvertFrom-Json
+        @($Saved.FailedAttempts | ForEach-Object { $_.Id }) | Should -Be @('sub-c')
+        @($Saved.CompletedSubscriptionIds) | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a subscription whose two answers disagree on the retry list' {
+        Set-RoleScenario -Assignments @(
+            @{ Role = 'Reader'; Scope = '/subscriptions/sub-a' }
+            @{ Role = 'Reader'; Scope = '/subscriptions/sub-c' }
+        ) -Permissions @{
+            '/subscriptions/sub-a' = @{ Status = 200; Roles = @('Reader') }
+            '/subscriptions/sub-c' = @{ Status = 200; Roles = @() }
+        }
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' })
+        . $script:GateBlock
+        @($AccessDecision.Inaccessible | ForEach-Object { $_.State }) | Should -Be @('Disagree')
+        @($FailedAttempts | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Attempts }) | Should -Be @('sub-c|1')
+        @($FailedAttempts)[0].Reason | Should -BeLike 'skipped by the up-front role check: role assignments show read access*'
+    }
+
+    It 'records the failed run before it stops, so each stopped run counts, and takes the subscription off the completed list' {
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' })
+        $script:FailedAttempts = @([pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'an earlier failure'; Attempts = 2 })
+        $script:CompletedIds = @('sub-c', 'sub-z')
+        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+        $Saved = Get-Content -LiteralPath $script:ResumeStateFile -Raw | ConvertFrom-Json
+        @($Saved.FailedAttempts | ForEach-Object { '{0}|{1}' -f $_.Id, $_.Attempts }) | Should -Be @('sub-c|3')
+        @($Saved.CompletedSubscriptionIds) | Should -Be @('sub-z')
+    }
+
+    It 'adds nothing and writes no state when no subscription was skipped for a cause that can pass later' {
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' })
+        . $script:GateBlock
+        @($FailedAttempts) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:ResumeStateFile | Should -BeFalse
     }
 
     It 'runs before the consumption data check and keeps the records for the end-of-run labels' {
@@ -1555,6 +1603,100 @@ Describe 'Write-PendingRetrySkippedSummary (skipped subscriptions on the retry l
     }
 }
 
+Describe 'Resume-state helpers: the retry list and an unreadable per-stream file' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+    }
+
+    BeforeEach {
+        $script:Lines = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Lines.Add([string]$Object) }
+        $script:Dir = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:Dir -Force | Out-Null
+    }
+
+    It 'Add-RoleCheckRetryAttempts adds the skips that can pass later, counts each run and takes them off the completed list' {
+        $Decision = Resolve-AccessPreflight -Probed @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha'; State = 'Readable' }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = 'NoAccess'; Reason = 'no role grants read access (roles visible: none)' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; State = 'Unknown'; Reason = 'role check inconclusive after retries (caller permissions: HTTP 429)' }
+            [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; State = 'Disagree'; Reason = 'the two answers disagree' }
+        )
+        $Existing = @([pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'an earlier failure'; Attempts = 2 })
+        $R = Add-RoleCheckRetryAttempts -FailedAttempts $Existing -CompletedIds @('sub-a', 'sub-c') -Decision $Decision
+        @($R.Added | ForEach-Object { $_.Id }) | Should -Be @('sub-c', 'sub-d')
+        @($R.FailedAttempts | Sort-Object Id | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Attempts, $_.Reason }) | Should -Be @(
+            'sub-c|1|skipped by the up-front role check: role check inconclusive after retries (caller permissions: HTTP 429)'
+            'sub-d|3|skipped by the up-front role check: the two answers disagree'
+        )
+        @($R.CompletedIds) | Should -Be @('sub-a')
+        $None = Add-RoleCheckRetryAttempts -FailedAttempts @() -CompletedIds 'sub-a' -Decision $null
+        @($None.Added) | Should -BeNullOrEmpty
+        @($None.CompletedIds) | Should -Be @('sub-a')
+    }
+
+    It 'Update-ResumeStateRetryList changes the retry list and completed ids and keeps every other key' {
+        $Path = Join-Path $script:Dir 'state.json'
+        [pscustomobject]@{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a', 'sub-c'); CompletedReports = @(@{ Id = 'sub-a'; Zip = 'r/a.zip' }); FailedAttempts = @(); OtherRecord = @('kept') } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path
+        $Retry = @([pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; Reason = 'r'; Attempts = 1 })
+        Update-ResumeStateRetryList -Path $Path -Tenant 't' -Ids @('sub-a') -FailedAttempts $Retry
+        $Saved = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        @($Saved.CompletedSubscriptionIds) | Should -Be @('sub-a')
+        @($Saved.FailedAttempts | ForEach-Object { $_.Id }) | Should -Be @('sub-c')
+        @($Saved.CompletedReports | ForEach-Object { $_.Zip }) | Should -Be @('r/a.zip')
+        @($Saved.OtherRecord) | Should -Be @('kept')
+        Test-Path -LiteralPath "$Path.tmp" | Should -BeFalse
+
+        $New = Join-Path $script:Dir 'new.json'
+        Update-ResumeStateRetryList -Path $New -Tenant 't' -Ids @() -FailedAttempts $Retry
+        @((Get-Content -LiteralPath $New -Raw | ConvertFrom-Json).FailedAttempts | ForEach-Object { $_.Id }) | Should -Be @('sub-c')
+        Update-ResumeStateRetryList -Path '' -Tenant 't' -Ids @() -FailedAttempts $Retry
+    }
+
+    It 'Move-UnreadableStreamStateFile renames the file to a name no recovery or *.json pattern finds, with a warning that names it' {
+        $File = Join-Path $script:Dir '.resume-state-t-stream-1.json'
+        Set-Content -LiteralPath $File -Value '{ "Completed": [ "sub-b" ]'
+        $R = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now ([datetime]'2026-10-29T14:02:55')
+        $R.Name | Should -Be '.resume-state-t-stream-1.json'
+        $R.MovedTo | Should -Be '.resume-state-t-stream-1.json.unreadable-20261029-140255'
+        Test-Path -LiteralPath $File | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:Dir $R.MovedTo) | Should -BeTrue
+        @($script:Lines) | Should -Be @(
+            'WARNING: The per-stream state file .resume-state-t-stream-1.json from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again. It was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255.'
+        )
+        ($script:Lines -join "`n") | Should -Not -Match 'sub-b'
+        @(Get-StreamResumeStateFiles -InventoryRoot $script:Dir -Tenant 't') | Should -BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath $script:Dir -Force -File -Filter '*.json') | Should -BeNullOrEmpty
+    }
+
+    It 'Move-UnreadableStreamStateFile says so when the file cannot be moved, and keeps the file in place' {
+        $File = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        Set-Content -LiteralPath $File -Value 'cut'
+        $Now = [datetime]'2026-10-29T14:02:55'
+        Set-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Value 'an earlier one'
+        $R = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now $Now
+        $R.MovedTo | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $File | Should -BeTrue
+        Get-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Raw | Should -Match 'an earlier one'
+        $script:Lines[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-t-stream-0.json from an interrupted parallel run could not be read, so its records are not used: * It could not be moved aside (*), so a later -Resume finds it again.'
+    }
+
+    It 'Write-UnreadableStreamStateSummary says whether the state was cleared or kept, and where the file went' {
+        $Files = @(
+            [pscustomobject]@{ Name = '.resume-state-t-stream-1.json'; MovedTo = '.resume-state-t-stream-1.json.unreadable-20261029-140255' }
+            [pscustomobject]@{ Name = '.resume-state-t-stream-2.json'; MovedTo = $null }
+        )
+        Write-UnreadableStreamStateSummary -Unreadable $Files -StateKept $false
+        Write-UnreadableStreamStateSummary -Unreadable $Files[0] -StateKept $true
+        Write-UnreadableStreamStateSummary -Unreadable @() -StateKept $false
+        @($script:Lines) | Should -Be @(
+            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-t-stream-1.json could not be read and was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255; its records were not used.'
+            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-t-stream-2.json could not be read and was left in place (it could not be moved aside); its records were not used.'
+            'Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-1.json could not be read and was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255; its records were not used.'
+        )
+    }
+}
+
 # End to end with Run-AllSubscriptions.ps1 itself: each run is the real wrapper,
 # started as its own pwsh process (stdin closed) from a copy of the tool whose
 # ResourceInventory.ps1 is a stand-in that writes one report folder and zip per
@@ -1663,6 +1805,11 @@ function Invoke-AzRestMethod
     }
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?')
     {
+        # Unknown: the answer is not JSON, so the check cannot finish. Disagree:
+        # the role assignments show Reader, but Azure reports no permissions.
+        $Scenario = Get-RdaStandInScenario
+        if (@($Scenario.Unknown) -contains $Matches[1]) { return [pscustomobject]@{ StatusCode = 200; Content = 'not json'; Headers = @{} } }
+        if (@($Scenario.Disagree) -contains $Matches[1]) { return & $Answer 200 @{ value = @() } }
         if ($Unreadable -contains $Matches[1]) { return & $Answer 200 @{ value = @() } }
         return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) }
     }
@@ -1725,7 +1872,7 @@ exit 1
 
         function script:Set-WrapperScenario
         {
-            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @())
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @())
             [pscustomobject]@{
                 Tenant        = $script:WrapperTenant
                 Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
@@ -1733,6 +1880,8 @@ exit 1
                 FailIds       = @($Fail)
                 EndSessionIds = @($EndSession)
                 HangIds       = @($Hang)
+                Unknown       = @($Unknown)
+                Disagree      = @($Disagree)
             } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
         }
 
@@ -1803,7 +1952,26 @@ exit 1
             return [pscustomobject]@{
                 Completed = @($Raw.CompletedSubscriptionIds | Where-Object { $_ } | Sort-Object)
                 Failed    = @($Raw.FailedAttempts | Where-Object { $_ } | ForEach-Object { $_.Id } | Sort-Object)
+                Attempts  = @($Raw.FailedAttempts | Where-Object { $_ })
             }
+        }
+
+        # The names of the resume-state files in the inventory root.
+        function script:Get-StateFileNames
+        {
+            if (-not (Test-Path -LiteralPath $script:CaseRoot)) { return @() }
+            @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter '.resume-state*' | ForEach-Object { $_.Name } | Sort-Object)
+        }
+
+        # Cut the last '}' off the per-stream state file that records $Id as
+        # completed, as an interrupted write leaves it. Returns its name.
+        function script:Set-StreamStateFileCutShort
+        {
+            param([string]$Id)
+            $File = @(script:Get-StreamStateFiles | Where-Object { @((Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Completed) -contains $Id })[0]
+            $Text = Get-Content -LiteralPath $File.FullName -Raw
+            [IO.File]::WriteAllText($File.FullName, $Text.Substring(0, $Text.LastIndexOf('}')))
+            return $File.Name
         }
 
         function script:Get-AccessStopLines { param($Run) @($Run.Text | Where-Object { $_ -match 'No subscription is readable|Stopping before any work' }) }
@@ -2069,7 +2237,7 @@ exit 1
 
     It 'names a skipped subscription on the retry list under Pending Retries, and -ResumeFailedOnly is unchanged' {
         $Advice = @(
-            'Pending Retries:         1 subscription(s) from a prior run still in FailedAttempts'
+            'Pending Retries:         1 subscription(s) on the retry list (FailedAttempts)'
             '  1 of them were skipped by this run''s role check:'
             $script:SkippedXLine
             '  To retry them: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.'
@@ -2108,6 +2276,127 @@ exit 1
         $Granted = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
         $Granted.ExitCode | Should -Be 0
         $Granted.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+    }
+
+    It 'after a parallel run left a per-stream state file cut short, warns, moves it aside, collects its subscriptions, and the next -Resume ends clean (<Label>)' -TestCases @(
+        @{ Label = '-ParallelStreams 1'; Streams = 1 }
+        @{ Label = '-ParallelStreams 2'; Streams = 2 }
+        @{ Label = 'automatic stream count'; Streams = 0 }
+    ) {
+        param($Label, $Streams)
+        $Subs = @($script:SubA, $script:SubB, $script:SubX)
+        # Run 1, two streams: Sub A and Sub B complete, the session ends while
+        # Sub X is collected. Then the stream file that records Sub B is cut
+        # short, as an interrupted write leaves it. Sub X cannot be read any more.
+        script:Set-WrapperScenario -Subs $Subs -Hang $script:SubX.Id
+        $Run1 = script:Invoke-WrapperRun -Streams 2 -EndWhen { (Test-Path -LiteralPath (Join-Path $script:CaseHome ('waiting-' + $script:SubX.Id))) -and (@(script:Get-StreamCompletedIds) -join ',') -eq 'sub-a,sub-b' }
+        $Run1.Ended | Should -BeTrue
+        $Cut = script:Set-StreamStateFileCutShort -Id $script:SubB.Id
+        script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id
+        $Four = @{ DOTNET_PROCESSOR_COUNT = '4' }
+
+        $R1 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams $Streams -Environment $Four
+        $R1.ExitCode | Should -Be 0
+        $Warning = @($R1.Text | Where-Object { $_ -like 'WARNING: The per-stream state file *' })
+        $Warning.Count | Should -Be 1
+        $Moved = @(script:Get-StateFileNames | Where-Object { $_ -like '*.unreadable-*' })
+        $Moved.Count | Should -Be 1
+        $Moved[0] | Should -Match ('^' + [regex]::Escape($Cut) + '\.unreadable-\d{8}-\d{6}$')
+        $Warning[0] | Should -Be ('WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again. It was moved aside to {1}.' -f $Cut, $Moved[0])
+        ($Warning[0]) | Should -Not -Match 'sub-b'
+        @($R1.Text | Where-Object { $_ -like 'Recovered per-stream state from an interrupted parallel run: 1 completed, *' }).Count | Should -Be 1 -Because 'the other stream file was read'
+        @($R1.Text | Where-Object { $_ -match '^(Skipping \(already completed\): |\[stream-\d+\] skipping \(already completed\): )Sub A \(sub-a\)$' }).Count | Should -Be 1
+        @($R1.Text | Where-Object { $_ -match '^(Processing subscription: |\[stream-\d+\] processing \(\d+ of \d+\): )Sub B \(sub-b\)$' }).Count | Should -Be 1 -Because 'Sub B was recorded only in the file that could not be read'
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        $R1.Text | Should -Contain ('Resume state cleared, but not a clean run: the per-stream state file {0} could not be read and was moved aside to {1}; its records were not used.' -f $Cut, $Moved[0])
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        @(script:Get-StreamStateFiles) | Should -BeNullOrEmpty
+        @(script:Get-StateFileNames) | Should -Be @($Moved[0]) -Because 'only the moved file is left, kept for inspection'
+
+        $R2 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams $Streams -Environment $Four
+        $R2.ExitCode | Should -Be 0
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The per-stream state file *' -or $_ -like 'Recovered per-stream state*' -or $_ -like 'Resume state cleared, but*' -or $_ -like 'Resume state kept*' }) | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        $R2.Text | Should -Contain 'Resume state cleared (clean run).'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        @(script:Get-StateFileNames) | Should -Be @($Moved[0])
+        @(script:Get-WrapperZipEntries | Where-Object { $_.Name -like '*.resume-state*' -or $_.Name -like '*unreadable*' -or $_.Text.Contains('unreadable-') } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'with nothing left to collect after a per-stream state file was cut short, keeps that file aside and deletes only the one it read' {
+        $Subs = @($script:SubA, $script:SubB, $script:SubX)
+        script:Set-WrapperScenario -Subs $Subs -Hang $script:SubX.Id
+        $null = script:Invoke-WrapperRun -Streams 2 -EndWhen { (Test-Path -LiteralPath (Join-Path $script:CaseHome ('waiting-' + $script:SubX.Id))) -and (@(script:Get-StreamCompletedIds) -join ',') -eq 'sub-a,sub-b' }
+        $Cut = script:Set-StreamStateFileCutShort -Id $script:SubB.Id
+        # Sub B and Sub X cannot be read: nothing is left to collect.
+        script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubB.Id, $script:SubX.Id
+
+        $R1 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams 2 -Environment @{ DOTNET_PROCESSOR_COUNT = '4' }
+        $R1.ExitCode | Should -Be 0
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The per-stream state file *' }).Count | Should -Be 1
+        $R1.Text | Should -Contain '  Skipping them and finishing the run: the other 1 subscription(s) were completed by an earlier run, so nothing is left to collect. To include them: Grant the identity Reader on these subscriptions, then re-run.'
+        $R1.Text | Should -Contain '    - Sub B (sub-b) - no read access (role assignments not visible to this identity)'
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        $Moved = @(script:Get-StateFileNames | Where-Object { $_ -like '*.unreadable-*' })
+        $R1.Text | Should -Contain ('Resume state cleared, but not a clean run: the per-stream state file {0} could not be read and was moved aside to {1}; its records were not used.' -f $Cut, $Moved[0])
+        @(script:Get-StateFileNames) | Should -Be @($Moved) -Because 'the stream file that was read is deleted; the one that could not be read is kept aside'
+
+        $R2 = script:Invoke-WrapperRun -Arguments '-Resume' -Streams 2 -Environment @{ DOTNET_PROCESSOR_COUNT = '4' }
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The per-stream state file *' -or $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+    }
+
+    It 'keeps a subscription whose check cannot finish, or whose two answers disagree, on the retry list until it is collected (<Cause>)' -TestCases @(
+        @{ Cause = 'Unknown'; Fix = 'The role check could not finish (the reason above says why); run -ResumeFailedOnly.' }
+        @{ Cause = 'Disagree'; Fix = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -ResumeFailedOnly.' }
+    ) {
+        param($Cause, $Fix)
+        $Subs = @($script:SubA, $script:SubX)
+        $Temporary = @{ $Cause = @($script:SubX.Id) }
+        $AttemptsOf = { @((script:Read-WrapperState).Attempts | Where-Object { $_.Id -eq $script:SubX.Id } | ForEach-Object { [int]$_.Attempts }) }
+
+        # Run 0, no -Resume: Sub A is collected, Sub X skipped.
+        script:Set-WrapperScenario -Subs $Subs @Temporary
+        $R0 = script:Invoke-WrapperRun -Arguments '-Obfuscate'
+        $R0.ExitCode | Should -Be 0
+        $R0.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        & $AttemptsOf | Should -Be @(1)
+        @((script:Read-WrapperState).Attempts)[0].Reason | Should -BeLike 'skipped by the up-front role check: *'
+        $At = [array]::IndexOf($R0.Text, 'Pending Retries:         1 subscription(s) on the retry list (FailedAttempts)')
+        $At | Should -BeGreaterThan -1
+        $R0.Text[$At + 1] | Should -Be '  1 of them were skipped by this run''s role check:'
+        $R0.Text[$At + 3] | Should -Be ('  To retry them: {0}' -f $Fix)
+
+        # -Resume: nothing else left to collect; Sub X is skipped again and counted.
+        $R1 = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
+        $R1.ExitCode | Should -Be 0
+        $R1.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        & $AttemptsOf | Should -Be @(2)
+
+        # -ResumeFailedOnly: nothing on its retry list can be read, so it stops,
+        # and the stopped run is counted too.
+        $R2 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
+        $R2.ExitCode | Should -Be 1
+        @(script:Get-AccessStopLines $R2).Count | Should -BeGreaterThan 0
+        & $AttemptsOf | Should -Be @(3)
+
+        # The cause is gone: -ResumeFailedOnly collects Sub X and clears the state.
+        script:Set-WrapperScenario -Subs $Subs
+        $R3 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
+        $R3.ExitCode | Should -Be 0
+        $R3.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
+        $R3.Text | Should -Contain 'Resume state cleared (clean run).'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains('skipped by the up-front role check') -or $_.Name -like '*.resume-state*' } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'does not put a subscription without a read role on the retry list' {
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubX.Id
+        $R = script:Invoke-WrapperRun
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain 'Resume state cleared (clean run).'
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
     }
 }
