@@ -320,14 +320,11 @@ Function RunInventorySetup()
 
         $Global:DefaultPath = if ($OutputDirectory) { $OutputDirectory } else { $DefaultOutputDir }
 
-        if ($platformOS -eq 'Azure CloudShell')
-        {
-            # Cloud Shell signs Az PowerShell in for the user: list the
-            # subscriptions of -TenantID, or of the tenant it is signed in to.
-            $CloudShellTenant = if ($TenantID) { $TenantID } else { Get-AzPsSignedInTenant }
-            $Global:Subscriptions = if ($CloudShellTenant) { @(Get-RdaTenantSubscriptions -Tenant $CloudShellTenant) } else { @() }
-        }
-        elseif ($platformOS -eq 'PowerShell Unix' -or $platformOS -eq 'PowerShell Desktop')
+        # Every environment signs in through LoginSession. In Cloud Shell the
+        # sign-in Cloud Shell made is a cached sign-in like any other (rule 2),
+        # so -Appid, -UseManagedIdentity, -DeviceLogin and -TenantID are
+        # honoured and its token and tenant are checked there too.
+        if ($platformOS -in 'Azure CloudShell', 'PowerShell Unix', 'PowerShell Desktop')
         {
             LoginSession
         }
@@ -345,28 +342,42 @@ Function RunInventorySetup()
             else { Write-Host 'AzureCloud (not signed in yet)' -ForegroundColor Green }
         }
 
-        # Direct run (not -RunAllSubs). The tool signs in with Az PowerShell
-        # only, by three rules:
+        # Direct run (not -RunAllSubs), Azure Cloud Shell included. The tool
+        # signs in with Az PowerShell only, by three rules:
         #  1. -Appid/-Secret/-TenantID: always the service principal, even
-        #     when a user is already signed in.
-        #  2. Otherwise a cached sign-in that is on the target tenant and can
-        #     acquire a token silently is reused, with no prompt.
-        #  3. Otherwise sign in once (device code with -DeviceLogin, the
-        #     machine's identity with -UseManagedIdentity), then check the
-        #     token; if it still fails the run stops with exit 1 instead of
-        #     prompting again or collecting an empty inventory. The next run
-        #     starts from the same checks, so it cannot loop either.
+        #     when a user is already signed in. If that sign-in fails, or the
+        #     context is then not that service principal, the run stops with
+        #     exit 1; it never goes on as whoever was signed in before. The
+        #     same holds for -UseManagedIdentity and the machine's identity.
+        #  2. Otherwise a cached sign-in that can acquire a token for the
+        #     target tenant silently is reused, with no prompt: as it is when
+        #     it is on that tenant, switched to it for this process when it is
+        #     on another one. Cloud Shell's own sign-in is such a sign-in.
+        #  3. Otherwise sign in once (device code with -DeviceLogin; a
+        #     session with no console stops with exit 1 instead of opening a
+        #     browser), then check the token; if the sign-in fails or the
+        #     token still fails the run stops with exit 1 instead of prompting
+        #     again or collecting an empty inventory. The next run starts from
+        #     the same checks, so it cannot loop either.
+        # Whatever the rule, the run goes on only when the context is on the
+        # target tenant (Invoke-AzRestMethod and Get-AzSubscription use the
+        # context's tenant) and the tenant lists at least one subscription.
         # With nothing usable and no -TenantID, the sign-in is made without a
         # tenant and the tenant is chosen afterwards. A usable sign-in is never
         # disconnected; a tenant switch applies to this process only, and so
         # do service principal and managed identity sign-ins.
         if (!$RunAllSubs.IsPresent)
         {
-            function Stop-UnusableSignIn([string]$Tenant, [string]$Advice)
+            function Stop-SignIn([string]$Message, [string]$Advice)
             {
-                Write-Log -Message ("Az PowerShell: sign-in to tenant {0} did not give a usable token; stopping instead of prompting again." -f $Tenant) -Severity 'Error'
+                Write-Log -Message $Message -Severity 'Error'
                 Write-Log -Message $Advice -Severity 'Error'
                 exit 1
+            }
+
+            function Stop-UnusableSignIn([string]$Tenant, [string]$Advice)
+            {
+                Stop-SignIn -Message ("Az PowerShell: sign-in to tenant {0} did not give a usable token; stopping instead of prompting again." -f $Tenant) -Advice $Advice
             }
 
             function Get-UserSignInAdvice([string]$Tenant)
@@ -375,19 +386,82 @@ Function RunInventorySetup()
                 return ("Run '{0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin, or -UseManagedIdentity on an Azure VM)." -f $Command)
             }
 
-            # The one sign-in of a run; the caller checks the token after it.
-            function Invoke-AzPsSignIn([hashtable]$SignInArgs, [string]$What)
+            # The one sign-in of a run. A failed sign-in stops the run: it is
+            # not tried again, and the run does not go on with whatever was
+            # signed in before it.
+            function Invoke-AzPsSignIn([hashtable]$SignInArgs, [string]$What, [string]$Advice)
             {
                 try { Connect-AzAccount @SignInArgs -ErrorAction Stop | Out-Null }
-                catch { Write-Log -Message ("Az PowerShell: {0} failed: {1}" -f $What, $_.Exception.Message) -Severity 'Error' }
+                catch { Stop-SignIn -Message ("Az PowerShell: {0} failed: {1}" -f $What, $_.Exception.Message) -Advice $Advice }
             }
 
             function Invoke-AzPsUserSignIn([string]$Tenant)
             {
+                $Advice = Get-UserSignInAdvice -Tenant $Tenant
+                if (-not $DeviceLogin.IsPresent -and -not (Test-RdaInteractiveSession))
+                {
+                    Stop-SignIn -Message 'Az PowerShell: no usable sign-in, and this session has no console to sign in from (non-interactive); stopping instead of opening a browser.' -Advice ('Sign in before the run, or pass -Appid/-Secret/-TenantID, -UseManagedIdentity on an Azure VM, or -DeviceLogin. ' + $Advice)
+                }
                 $SignInArgs = @{}
                 if ($Tenant) { $SignInArgs.Tenant = $Tenant }
                 if ($DeviceLogin.IsPresent) { $SignInArgs.UseDeviceAuthentication = $true }
-                Invoke-AzPsSignIn -SignInArgs $SignInArgs -What 'sign-in'
+                # The reconnect before metrics and consumption reads this: a
+                # run prompts a person at most once.
+                $script:RdaUserSignInMade = $true
+                Invoke-AzPsSignIn -SignInArgs $SignInArgs -What 'sign-in' -Advice $Advice
+            }
+
+            # The tenant id (a GUID) of tenant $Tenant, given as an id or a
+            # domain: a domain is resolved through the token Az PowerShell
+            # acquires for it.
+            function Get-AzPsTenantId([string]$Tenant)
+            {
+                $Id = [guid]::Empty
+                if ([guid]::TryParse($Tenant, [ref]$Id)) { return $Tenant }
+                try { return [string](Get-AzAccessToken -TenantId $Tenant -ErrorAction Stop -WarningAction SilentlyContinue).TenantId }
+                catch { return $null }
+            }
+
+            function Test-AzPsContextOnTenant([string]$Tenant)
+            {
+                $Current = Get-AzPsSignedInTenant
+                $Expected = Get-AzPsTenantId -Tenant $Tenant
+                return ([bool]$Current -and [bool]$Expected -and $Current -eq $Expected)
+            }
+
+            # A token for the tenant does not prove the context is on it, and
+            # the collectors use the context. Returns the tenant id.
+            function Confirm-AzPsContextTenant([string]$Tenant, [string]$Advice)
+            {
+                if (-not (Test-AzPsContextOnTenant -Tenant $Tenant))
+                {
+                    $Current = Get-AzPsSignedInTenant
+                    Stop-SignIn -Message ("Az PowerShell: the context is on tenant {0}, not on tenant {1}; stopping instead of collecting another tenant." -f $(if ($Current) { $Current } else { '(none)' }), $Tenant) -Advice $Advice
+                }
+                return (Get-AzPsSignedInTenant)
+            }
+
+            # After a service principal or managed identity sign-in the
+            # context must be that identity, never a cached user.
+            function Confirm-AzPsAccount([string]$Type, [string]$Id, [string]$What, [string]$Advice)
+            {
+                $Account = try { (Get-AzContext -ErrorAction Stop).Account } catch { $null }
+                if ($null -eq $Account -or [string]$Account.Type -ne $Type -or ($Id -and [string]$Account.Id -ne $Id))
+                {
+                    Stop-SignIn -Message ("Az PowerShell: after the {0} the context is not that identity; stopping instead of running as another account." -f $What) -Advice $Advice
+                }
+            }
+
+            # The run's subscriptions. A direct run with none stops instead of
+            # writing an empty report.
+            function Set-RdaRunSubscriptions([string]$Tenant)
+            {
+                $script:RdaRunTenant = $Tenant
+                $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $Tenant)
+                if ($Global:Subscriptions.Count -eq 0)
+                {
+                    Stop-SignIn -Message ("Az PowerShell: tenant {0} lists no subscriptions for this sign-in; stopping instead of writing an empty report." -f $Tenant) -Advice 'Check that the signed-in identity has at least Reader on a subscription of the tenant, and that -TenantID names the right tenant, then re-run.'
+                }
             }
 
             if ($Appid)
@@ -410,27 +484,29 @@ Function RunInventorySetup()
                 $Credential = New-Object System.Management.Automation.PSCredential($Appid, $Secret)
                 # -Scope Process: not saved as the default context, so a later
                 # run without -Appid does not reuse the service principal.
-                Invoke-AzPsSignIn -SignInArgs @{ ServicePrincipal = $true; Credential = $Credential; Tenant = $TenantID; Scope = 'Process' } -What 'service principal sign-in'
+                Invoke-AzPsSignIn -SignInArgs @{ ServicePrincipal = $true; Credential = $Credential; Tenant = $TenantID; Scope = 'Process' } -What 'service principal sign-in' -Advice $SpAdvice
+                Confirm-AzPsAccount -Type 'ServicePrincipal' -Id $Appid -What 'service principal sign-in' -Advice $SpAdvice
                 if (!(Test-AzPsTokenSilent -Tenant $TenantID)) { Stop-UnusableSignIn -Tenant $TenantID -Advice $SpAdvice }
 
-                $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $TenantID)
+                Set-RdaRunSubscriptions -Tenant (Confirm-AzPsContextTenant -Tenant $TenantID -Advice $SpAdvice)
                 return
             }
 
             if ($UseManagedIdentity.IsPresent)
             {
                 Write-Log -Message ('Using Managed Identity Authentication Method') -Severity 'Info'
+                $MiAdvice = 'Check that this machine has a managed identity with access to the tenant (and pass -TenantID for a specific tenant), then re-run.'
                 # -Scope Process, as for the service principal.
                 $MiArgs = @{ Identity = $true; Scope = 'Process' }
                 if ($TenantID) { $MiArgs.Tenant = $TenantID }
-                Invoke-AzPsSignIn -SignInArgs $MiArgs -What 'managed identity sign-in'
+                Invoke-AzPsSignIn -SignInArgs $MiArgs -What 'managed identity sign-in' -Advice $MiAdvice
+                Confirm-AzPsAccount -Type 'ManagedService' -What 'managed identity sign-in' -Advice $MiAdvice
 
-                $MiAdvice = 'Check that this machine has a managed identity with access to the tenant (and pass -TenantID for a specific tenant), then re-run.'
                 $TargetTenant = if ($TenantID) { $TenantID } else { Get-AzPsSignedInTenant }
                 if (!$TargetTenant) { Stop-UnusableSignIn -Tenant '(managed identity)' -Advice $MiAdvice }
                 if (!(Test-AzPsTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Tenant $TargetTenant -Advice $MiAdvice }
 
-                $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $TargetTenant)
+                Set-RdaRunSubscriptions -Tenant (Confirm-AzPsContextTenant -Tenant $TargetTenant -Advice $MiAdvice)
                 return
             }
 
@@ -452,14 +528,18 @@ Function RunInventorySetup()
                 Write-Log -Message ('Authenticating Azure') -Severity 'Info'
 
                 $DebugPreference = "SilentlyContinue"
-                Write-Log -Message ('Calling Login, the browser will open and prompt you to login.') -Severity 'Info'
-                if ($DeviceLogin.IsPresent) { Write-Log -Message ('Using device login') -Severity 'Info' }
-                else { Write-Log -Message ('Using browser login') -Severity 'Info' }
+                if ($DeviceLogin.IsPresent) { Write-Log -Message ('Calling Login, using device login.') -Severity 'Info' }
+                else { Write-Log -Message ('Calling Login, the browser will open and prompt you to login.') -Severity 'Info' }
 
                 Invoke-AzPsUserSignIn
                 $DebugPreference = "Continue"
 
-                $Tenants = @((Get-AzSubscription -WarningAction SilentlyContinue).HomeTenantId | Where-Object { $_ } | Sort-Object -Unique)
+                # The tenants the sign-in reaches, by the tenant each
+                # subscription is accessed through (TenantId, not
+                # HomeTenantId: a subscription delegated with Azure Lighthouse
+                # has the customer's tenant as its home), plus the tenant the
+                # sign-in is on.
+                $Tenants = @(@(@(Get-AzSubscription -WarningAction SilentlyContinue).TenantId) + @(Get-AzPsSignedInTenant) | Where-Object { $_ } | Sort-Object -Unique)
 
                 Write-Log -Message ('Checking number of Tenants') -Severity 'Info'
 
@@ -490,33 +570,58 @@ Function RunInventorySetup()
                     }
                     else
                     {
-                        [int]$SelectTenant = read-host "Select Tenant (Default 1)"
-                        if ($SelectTenant -lt 1) { $SelectTenant = 1 }
-                        $TargetTenant = $Tenants[$SelectTenant - 1]
+                        # Asked at most twice; an answer that is not a number
+                        # of the list stops the run.
+                        for ($Ask = 1; $Ask -le 2 -and !$TargetTenant; $Ask++)
+                        {
+                            $Answer = [string](Read-Host "Select Tenant (Default 1)")
+                            $Number = 0
+                            if ([string]::IsNullOrWhiteSpace($Answer)) { $Number = 1 }
+                            elseif (-not [int]::TryParse($Answer.Trim(), [ref]$Number)) { $Number = 0 }
+                            if ($Number -ge 1 -and $Number -le $Tenants.Count) { $TargetTenant = $Tenants[$Number - 1] }
+                            else { Write-Log -Message ("'{0}' is not a number from 1 to {1}." -f $Answer, $Tenants.Count) -Severity 'Warning' }
+                        }
+                        if (!$TargetTenant)
+                        {
+                            Stop-SignIn -Message 'No tenant was chosen; stopping.' -Advice 'Re-run with -TenantID <tenant> to choose the tenant directly.'
+                        }
                     }
                 }
 
                 # Point Az PowerShell at the chosen tenant (no new sign-in); this
                 # process only, so the user's saved context is left alone.
-                if ($TargetTenant -and (Get-AzPsSignedInTenant) -ne $TargetTenant)
+                if ((Get-AzPsSignedInTenant) -ne $TargetTenant)
                 {
                     Set-AzContext -Tenant $TargetTenant -Scope Process | Out-Null
                 }
 
-                if (!(Test-AzPsTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Tenant $TargetTenant) }
+                $Advice = Get-UserSignInAdvice -Tenant $TargetTenant
+                if (!(Test-AzPsTokenSilent -Tenant $TargetTenant)) { Stop-UnusableSignIn -Tenant $TargetTenant -Advice $Advice }
+                $TargetTenant = Confirm-AzPsContextTenant -Tenant $TargetTenant -Advice $Advice
 
                 Write-Log -Message ("Extracting from Tenant $TargetTenant") -Severity 'Info'
                 Write-Log -Message ("Extracting Subscriptions") -Severity 'Info'
 
-                $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $TargetTenant)
+                Set-RdaRunSubscriptions -Tenant $TargetTenant
                 return
             }
 
+            $Reused = $false
             if ($PsTokenOk -and $PsTenant -eq $TargetTenant)
             {
                 Write-Log -Message ("Az PowerShell: reusing existing sign-in for tenant {0}" -f $TargetTenant) -Severity 'Success'
+                $Reused = $true
             }
-            else
+            elseif ($PsTenant -and $PsTenant -ne $TargetTenant -and (Test-AzPsTokenSilent -Tenant $TargetTenant))
+            {
+                # The cached account reaches the target tenant without a
+                # prompt: switch this process to it instead of signing in.
+                Write-Log -Message ("Az PowerShell: signed in to tenant {0}; switching this process to {1} with the same sign-in." -f $PsTenant, $TargetTenant) -Severity 'Info'
+                Set-AzContext -Tenant $TargetTenant -Scope Process | Out-Null
+                $Reused = Test-AzPsContextOnTenant -Tenant $TargetTenant
+            }
+
+            if (-not $Reused)
             {
                 if ($null -eq $PsTenant) { Write-Log -Message ('Az PowerShell: not signed in; signing in.') -Severity 'Info' }
                 elseif ($PsTenant -ne $TargetTenant) { Write-Log -Message ("Az PowerShell: signed in to tenant {0}; signing in to {1}." -f $PsTenant, $TargetTenant) -Severity 'Warning' }
@@ -530,7 +635,7 @@ Function RunInventorySetup()
                 }
             }
 
-            $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $TargetTenant)
+            Set-RdaRunSubscriptions -Tenant (Confirm-AzPsContextTenant -Tenant $TargetTenant -Advice (Get-UserSignInAdvice -Tenant $TargetTenant))
             return
         }
 
@@ -870,24 +975,29 @@ function ExecuteInventoryProcessing()
 
         Write-Log -Message ("{0}: no usable Azure context/token detected; attempting one reconnect before collecting {0} data." -f $Phase) -Severity 'Warning'
 
+        # At most one reconnect per run, whatever the identity: after it,
+        # later phases are skipped without trying again. A user is never
+        # prompted a second time in a run, and only for the run's tenant.
+        if ($script:RdaReconnectTried)
+        {
+            Write-Log -Message ("{0}: the one reconnect of this run was already made; not trying again. Re-authenticate (Connect-AzAccount), then re-run." -f $Phase) -Severity 'Error'
+            return $false
+        }
+        $RunTenant = if ($TenantID) { $TenantID } else { $script:RdaRunTenant }
+
         try
         {
             if ($Appid -and $Secret -and $TenantID)
             {
+                $script:RdaReconnectTried = $true
                 Write-Log -Message ("{0}: reconnecting via Service Principal." -f $Phase) -Severity 'Info'
                 $Credential = New-Object System.Management.Automation.PSCredential($Appid, $Secret)
                 Connect-AzAccount -ServicePrincipal -Credential $Credential -Tenant $TenantID -Scope Process -ErrorAction Stop | Out-Null
             }
             elseif ($UseManagedIdentity.IsPresent)
             {
-                # One managed identity reconnect per run, never a user sign-in:
-                # after a failed attempt later phases are skipped without trying.
-                if ($script:RdaManagedIdentityReconnectTried)
-                {
-                    Write-Log -Message ("{0}: the managed identity reconnect already failed in this run; not trying again. Check the machine's managed identity, then re-run." -f $Phase) -Severity 'Error'
-                    return $false
-                }
-                $script:RdaManagedIdentityReconnectTried = $true
+                # Never a user sign-in for a managed identity run.
+                $script:RdaReconnectTried = $true
                 Write-Log -Message ("{0}: reconnecting with the managed identity." -f $Phase) -Severity 'Info'
                 if ($TenantID) { Connect-AzAccount -Identity -Tenant $TenantID -Scope Process -ErrorAction Stop | Out-Null }
                 else { Connect-AzAccount -Identity -Scope Process -ErrorAction Stop | Out-Null }
@@ -900,20 +1010,37 @@ function ExecuteInventoryProcessing()
                 Write-Log -Message ("{0}: running under -RunAllSubs without Service Principal credentials - cannot prompt for interactive login in this context. Authenticate before the run (e.g. Connect-AzAccount) or supply -appid/-secret/-tenant." -f $Phase) -Severity 'Error'
                 return $false
             }
-            elseif (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected)
+            elseif ($RunTenant -and (Test-AzPsTokenSilent -Tenant $RunTenant))
+            {
+                # The sign-in still reaches the run's tenant without a prompt:
+                # point this process back at it.
+                $script:RdaReconnectTried = $true
+                Write-Log -Message ("{0}: switching this process back to tenant {1} with the same sign-in." -f $Phase, $RunTenant) -Severity 'Info'
+                Set-AzContext -Tenant $RunTenant -Scope Process -ErrorAction Stop | Out-Null
+            }
+            elseif ($script:RdaUserSignInMade)
+            {
+                Write-Log -Message ("{0}: reconnecting would prompt a second time in this run; not prompting again. Re-authenticate (Connect-AzAccount{1}), then re-run." -f $Phase, $(if ($RunTenant) { " -Tenant $RunTenant" })) -Severity 'Error'
+                return $false
+            }
+            elseif (-not (Test-RdaInteractiveSession))
             {
                 Write-Log -Message ("{0}: no usable Azure context and no interactive console to prompt for login (non-interactive session). Authenticate before the run (Connect-AzAccount) or supply -appid/-secret/-tenant, then re-run." -f $Phase) -Severity 'Error'
                 return $false
             }
-            elseif ($DeviceLogin.IsPresent)
-            {
-                Write-Log -Message ("{0}: reconnecting via device login." -f $Phase) -Severity 'Info'
-                Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop | Out-Null
-            }
             else
             {
-                Write-Log -Message ("{0}: reconnecting via interactive browser login." -f $Phase) -Severity 'Info'
-                Connect-AzAccount -ErrorAction Stop | Out-Null
+                $script:RdaReconnectTried = $true
+                $script:RdaUserSignInMade = $true
+                $SignInArgs = @{}
+                if ($RunTenant) { $SignInArgs.Tenant = $RunTenant }
+                if ($DeviceLogin.IsPresent)
+                {
+                    Write-Log -Message ("{0}: reconnecting via device login." -f $Phase) -Severity 'Info'
+                    $SignInArgs.UseDeviceAuthentication = $true
+                }
+                else { Write-Log -Message ("{0}: reconnecting via interactive browser login." -f $Phase) -Severity 'Info' }
+                Connect-AzAccount @SignInArgs -ErrorAction Stop | Out-Null
             }
         }
         catch

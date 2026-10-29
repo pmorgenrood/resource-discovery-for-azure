@@ -90,7 +90,7 @@ Describe 'LoginSession on a direct run' {
             [CmdletBinding()] param()
             if (-not $script:Sim.PsTenant) { return $null }
             [pscustomobject]@{
-                Account     = [pscustomobject]@{ Id = $script:Sim.Account }
+                Account     = [pscustomobject]@{ Id = $script:Sim.AccountId; Type = $script:Sim.AccountType }
                 Tenant      = [pscustomobject]@{ Id = $script:Sim.PsTenant }
                 Environment = [pscustomobject]@{ Name = 'AzureCloud' }
             }
@@ -108,7 +108,7 @@ Describe 'LoginSession on a direct run' {
         function Get-AzAccessToken
         {
             [CmdletBinding()] param([string]$TenantId, [string]$ResourceUrl)
-            if ($script:Sim.PsTenant -and $script:Sim.PsTokenOk -and $TenantId -in $script:Sim.PsReach) { return [pscustomobject]@{ Token = 'token' } }
+            if ($script:Sim.PsTenant -and $script:Sim.PsTokenOk -and $TenantId -in $script:Sim.PsReach) { return [pscustomobject]@{ Token = 'token'; TenantId = $TenantId } }
             throw 'Unable to acquire token for tenant. User interaction is required.'
         }
 
@@ -122,12 +122,16 @@ Describe 'LoginSession on a direct run' {
 
         function Disconnect-AzAccount { [CmdletBinding()] param() }
 
+        # A sign-in; the context's account is that identity: a service
+        # principal's id is its app id, as in Az PowerShell.
         function Invoke-SimPsSignIn
         {
-            param([string]$Tenant, [string]$Account = 'signed-in')
+            param([string]$Tenant, [string]$Account = 'signed-in', [string]$AppId)
             if ($Tenant) { $script:Sim.PsTenant = $Tenant; $script:Sim.PsReach = @($Tenant) }
             else { $script:Sim.PsTenant = $script:Sim.HomeTenant; $script:Sim.PsReach = @($script:Sim.Tenants) }
             $script:Sim.Account = $Account
+            $script:Sim.AccountType = switch ($Account) { 'service-principal' { 'ServicePrincipal' } 'managed-identity' { 'ManagedService' } default { 'User' } }
+            $script:Sim.AccountId = if ($Account -eq 'service-principal') { $AppId } else { $Account }
             $script:Sim.PsTokenOk = $true
         }
 
@@ -151,7 +155,7 @@ Describe 'LoginSession on a direct run' {
             if (-not $Tenants) { $Tenants = @($HomeTenant) }
             $script:Sim = @{
                 PsTenant = $PsTenant; PsTokenOk = $PsTokenOk; PsReach = @($PsTenant | Where-Object { $_ })
-                HomeTenant = $HomeTenant; Tenants = $Tenants; Account = 'cached-user'
+                HomeTenant = $HomeTenant; Tenants = $Tenants; Account = 'cached-user'; AccountType = 'User'; AccountId = 'cached-user'
             }
         }
     }
@@ -165,9 +169,12 @@ Describe 'LoginSession on a direct run' {
         $Global:Subscriptions = @()
         Remove-Variable -Scope Global -Name RdaTenantSubscriptionCache -ErrorAction SilentlyContinue
         Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
-        Mock -CommandName Connect-AzAccount -MockWith { Invoke-SimPsSignIn -Tenant $Tenant -Account $(if ($ServicePrincipal) { 'service-principal' } else { 'signed-in' }) }
+        Mock -CommandName Connect-AzAccount -MockWith { Invoke-SimPsSignIn -Tenant $Tenant -Account $(if ($ServicePrincipal) { 'service-principal' } elseif ($Identity) { 'managed-identity' } else { 'signed-in' }) -AppId $Credential.UserName }
         Mock -CommandName Disconnect-AzAccount -MockWith { }
-        Mock -CommandName Test-RdaInteractiveSession -MockWith { $false }
+        # A console a person can answer; a browser sign-in in a session with
+        # none stops the run (SignInRules.Tests.ps1 covers that in a child
+        # process, since the stop is a real exit).
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $true }
         Mock -CommandName Read-Host -MockWith { throw 'Read-Host was not expected in this test' }
 
         # Script parameters LoginSession reads from its caller's scope.
@@ -263,9 +270,14 @@ Describe 'LoginSession on a direct run' {
         $Global:Subscriptions[0].tenantId | Should -Be $script:TenantA
     }
 
+    # With no console only the device code can sign in (a browser sign-in
+    # stops the run), and there is nobody to pick the tenant.
     It 'signs in once and uses the first tenant when nothing was signed in, several tenants, no console' {
         $Sorted = @($script:TenantA, $script:TenantB | Sort-Object)
         Set-SignInState -Tenants $script:TenantA, $script:TenantB
+        $DeviceLogin = [switch]$true
+        $null = $DeviceLogin
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $false }
 
         LoginSession 6>$null
 
@@ -376,7 +388,7 @@ Describe 'LoginSession on a direct run' {
         $script:SavedAccount = $null
         Mock -CommandName Connect-AzAccount -MockWith {
             $SignedInAs = if ($ServicePrincipal) { 'service-principal' } elseif ($Identity) { 'managed-identity' } else { 'signed-in' }
-            Invoke-SimPsSignIn -Tenant $Tenant -Account $SignedInAs
+            Invoke-SimPsSignIn -Tenant $Tenant -Account $SignedInAs -AppId $Credential.UserName
             if ($Scope -ne 'Process') { $script:SavedAccount = $SignedInAs }
         }
 
@@ -405,7 +417,7 @@ Describe 'LoginSession on a direct run' {
         $script:SavedAccount = $null
         Mock -CommandName Connect-AzAccount -MockWith {
             $SignedInAs = if ($ServicePrincipal) { 'service-principal' } elseif ($Identity) { 'managed-identity' } else { 'signed-in' }
-            Invoke-SimPsSignIn -Tenant $Tenant -Account $SignedInAs
+            Invoke-SimPsSignIn -Tenant $Tenant -Account $SignedInAs -AppId $Credential.UserName
             if ($Scope -ne 'Process') { $script:SavedAccount = $SignedInAs }
         }
 
@@ -507,11 +519,12 @@ $Global:Sim = switch ($Scenario)
     # -Appid without -Secret while a user is signed in to the tenant.
     'sp-missing-secret' { @{ PsTenant = $Tenant; PsToken = $true } }
 }
-# Never prompt for a tenant number in the child process.
-function global:Test-RdaInteractiveSession { $false }
+# A console is there (a browser sign-in without one stops the run); one
+# tenant only, so no tenant number is asked for.
+function global:Test-RdaInteractiveSession { $true }
 function global:Write-Log { param($Message, $Severity) Write-Output ('{0}: {1}' -f $Severity, $Message) }
 function global:az { Add-Content -Path $CallLog -Value ('az ' + ($args -join ' ')) }
-function global:Get-AzContext { [CmdletBinding()] param() if ($Global:Sim.PsTenant) { [pscustomobject]@{ Account = 'user'; Tenant = [pscustomobject]@{ Id = $Global:Sim.PsTenant }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } } }
+function global:Get-AzContext { [CmdletBinding()] param() if ($Global:Sim.PsTenant) { [pscustomobject]@{ Account = [pscustomobject]@{ Id = $Global:Sim.AccountId; Type = $Global:Sim.AccountType }; Tenant = [pscustomobject]@{ Id = $Global:Sim.PsTenant }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } } }
 function global:Get-AzAccessToken { [CmdletBinding()] param($TenantId) Add-Content -Path $CallLog -Value 'probe'; if ($Global:Sim.PsToken) { [pscustomobject]@{ Token = 'token' } } else { throw 'User interaction is required.' } }
 function global:Connect-AzAccount
 {
@@ -519,11 +532,14 @@ function global:Connect-AzAccount
     Add-Content -Path $CallLog -Value ('Connect-AzAccount' + $(if ($Identity) { ' -Identity' }) + $(if ($ServicePrincipal) { ' -ServicePrincipal' }) + $(if ($Tenant) { ' -Tenant ' + $Tenant }) + $(if ($Scope) { ' -Scope ' + $Scope }))
     if ($Global:Sim.LoginFails) { throw 'sign-in was cancelled' }
     $Global:Sim.PsTenant = if ($Tenant) { $Tenant } else { $Global:HarnessTenant }
+    $Global:Sim.AccountType = if ($ServicePrincipal) { 'ServicePrincipal' } elseif ($Identity) { 'ManagedService' } else { 'User' }
+    $Global:Sim.AccountId = if ($ServicePrincipal) { $Credential.UserName } else { 'signed-in' }
 }
 function global:Disconnect-AzAccount { Add-Content -Path $CallLog -Value 'Disconnect-AzAccount' }
 function global:Get-AzSubscription { [CmdletBinding()] param([string]$TenantId) Add-Content -Path $CallLog -Value ('Get-AzSubscription ' + $TenantId); [pscustomobject]@{ Id = 'sub-1'; TenantId = $Global:HarnessTenant; HomeTenantId = $Global:HarnessTenant; State = 'Enabled' } }
 function global:Set-AzContext { [CmdletBinding()] param([string]$Tenant, [string]$Scope) if ($Tenant) { $Global:Sim.PsTenant = $Tenant } }
 
+$Global:Sim.AccountType = 'User'; $Global:Sim.AccountId = 'cached-user'
 $Global:RdaSessionInitialized = $true
 $Global:HarnessTenant = $Tenant
 $TenantID = if ($Scenario -in 'ps-token-fails', 'mi-token-fails', 'sp-token-fails', 'sp-missing-secret') { $Tenant } else { $null }
@@ -643,7 +659,9 @@ Describe 'Data-plane reconnect with -UseManagedIdentity' {
         $script:LogLines = [System.Collections.Generic.List[string]]::new()
         $script:Connected = $false
         $script:IdentityGivesToken = $true
-        $script:RdaManagedIdentityReconnectTried = $null
+        $script:RdaReconnectTried = $null
+        $script:RdaUserSignInMade = $null
+        $script:RdaRunTenant = $null
         Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
         Mock -CommandName Get-AzContext -MockWith { if ($script:Connected) { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'identity' } } } }
         Mock -CommandName Get-AzAccessToken -MockWith { [pscustomobject]@{ Token = 'token' } }
@@ -704,5 +722,132 @@ Describe 'Data-plane reconnect with -UseManagedIdentity' {
         Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -Because 'one managed identity reconnect per run, then stop trying'
         Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly -ParameterFilter { -not $Identity.IsPresent }
         @($script:LogLines | Where-Object { $_ -match '^Error:' -and $_ -match 'managed identity' }).Count | Should -BeGreaterThan 0
+    }
+}
+
+# The reconnect for a user (no -Appid, no -UseManagedIdentity): only on the
+# run's tenant, at most once per run, and never a second prompt in a run (a
+# run that already signed a person in skips the phase instead).
+Describe 'Data-plane reconnect for a user' {
+
+    BeforeAll {
+        $ReadyFn = $Ast.FindAll({
+                param($Node)
+                $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Test-DataPlaneAuthReady'
+            }, $true) | Select-Object -First 1
+        . ([scriptblock]::Create($ReadyFn.Extent.Text))
+
+        function Get-AzContext { [CmdletBinding()] param() }
+        function Get-AzAccessToken { [CmdletBinding()] param([string]$TenantId, [string]$ResourceUrl) $null = $TenantId, $ResourceUrl }
+        function Set-AzContext { [CmdletBinding()] param([string]$Tenant, [string]$Scope) $null = $Tenant, $Scope }
+        function Connect-AzAccount
+        {
+            [CmdletBinding()]
+            param([string]$Tenant, [switch]$UseDeviceAuthentication, [switch]$Identity, [switch]$ServicePrincipal, [pscredential]$Credential, [ValidateSet('Process', 'CurrentUser')][string]$Scope)
+            $null = $Tenant, $UseDeviceAuthentication, $Identity, $ServicePrincipal, $Credential, $Scope
+        }
+    }
+
+    BeforeEach {
+        $script:LogLines = [System.Collections.Generic.List[string]]::new()
+        $script:Connected = $false
+        $script:SignInGivesToken = $true
+        $script:SilentTenant = $null
+        $script:RdaReconnectTried = $null
+        $script:RdaUserSignInMade = $null
+        $script:RdaRunTenant = $null
+        Mock -CommandName Write-Log -MockWith { $script:LogLines.Add(('{0}: {1}' -f $Severity, $Message)) }
+        Mock -CommandName Get-AzContext -MockWith { if ($script:Connected) { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'user'; Type = 'User' } } } }
+        # A token for the current context once connected; with -TenantId,
+        # only for the tenant the cached account still reaches silently.
+        Mock -CommandName Get-AzAccessToken -MockWith {
+            if ($TenantId) { if ($TenantId -eq $script:SilentTenant) { return [pscustomobject]@{ Token = 'token' } } throw 'User interaction is required.' }
+            [pscustomobject]@{ Token = 'token' }
+        }
+        Mock -CommandName Set-AzContext -MockWith { if ($Tenant -eq $script:SilentTenant) { $script:Connected = $true } }
+        Mock -CommandName Connect-AzAccount -MockWith { if ($script:SignInGivesToken) { $script:Connected = $true } }
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $true }
+
+        $UseManagedIdentity = [switch]$false
+        $TenantID = $script:TenantB
+        $Appid = $null
+        $Secret = $null
+        $DeviceLogin = [switch]$false
+        $RunAllSubs = [switch]$false
+        $null = $UseManagedIdentity, $TenantID, $Appid, $Secret, $DeviceLogin, $RunAllSubs
+    }
+
+    It 'signs in once on -TenantID, not on the home tenant, when the token was dropped' {
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $Tenant -eq $script:TenantB -and -not $Identity -and -not $ServicePrincipal }
+    }
+
+    It 'signs in on the tenant the run chose when -TenantID is not given' {
+        $TenantID = $null
+        $null = $TenantID
+        $script:RdaRunTenant = $script:TenantA
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $Tenant -eq $script:TenantA }
+    }
+
+    It 'signs in with the device code on the tenant with -DeviceLogin' {
+        $DeviceLogin = [switch]$true
+        $null = $DeviceLogin
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $UseDeviceAuthentication.IsPresent -and $Tenant -eq $script:TenantB }
+    }
+
+    It 'switches this process back to the tenant, with no prompt, when the sign-in still reaches it silently' {
+        $script:SilentTenant = $script:TenantB
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeTrue
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly
+        Should -Invoke -CommandName Set-AzContext -Times 1 -Exactly -ParameterFilter { $Tenant -eq $script:TenantB -and $Scope -eq 'Process' }
+    }
+
+    It 'skips the phase instead of prompting a second time when the run already signed a person in' {
+        $script:RdaUserSignInMade = $true
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeFalse
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly
+        @($script:LogLines | Where-Object { $_ -match '^Error:' -and $_ -match 'second time' }).Count | Should -Be 1
+    }
+
+    It 'reconnects at most once per run: the next phase does not prompt again' {
+        $script:SignInGivesToken = $false
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeFalse
+        Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeFalse
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly
+    }
+
+    It 'skips the phase without a sign-in in a session with no console' {
+        Mock -CommandName Test-RdaInteractiveSession -MockWith { $false }
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeFalse
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 0 -Exactly
+        @($script:LogLines | Where-Object { $_ -match '^Error:' -and $_ -match 'non-interactive' }).Count | Should -Be 1
+    }
+
+    It 'reconnects the service principal at most once per run' {
+        $Appid = [guid]::NewGuid().ToString()
+        $Secret = ConvertTo-SecureString -String 'not-a-real-secret' -AsPlainText -Force
+        $null = $Appid, $Secret
+        $script:SignInGivesToken = $false
+
+        Test-DataPlaneAuthReady -Phase 'Metrics' | Should -BeFalse
+        Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeFalse
+
+        Should -Invoke -CommandName Connect-AzAccount -Times 1 -Exactly -ParameterFilter { $ServicePrincipal.IsPresent }
     }
 }
