@@ -212,134 +212,10 @@ if ($PSVersionTable.PSVersion.Major -lt 7)
 }
 
 # ---------------------------------------------------------------------------
-# Azure CLI bootstrap. The authentication flow and Resource Graph queries shell
-# out to `az`; without it the run fails at auth with a confusing "'az' is not
-# recognized". Mirror the PowerShell 7 bootstrap above: detect az, and if it is
-# missing offer to install it (official Microsoft MSI) when interactive, or fail
-# loud with guidance when non-interactive (never hang on a prompt).
-#
-# This only ever executes under PowerShell 7 (the block above re-launches 5.1
-# before reaching here), but it is still kept in the 5.1 + 7 common syntax
-# subset so the whole file continues to parse under Windows PowerShell 5.1.
-# ---------------------------------------------------------------------------
-function Resolve-AzCli
-{
-    $Cmd = Get-Command az -ErrorAction SilentlyContinue
-    if ($Cmd)
-    {
-        return $Cmd.Source
-    }
-    # az may be installed but not yet on PATH in this session (e.g. immediately
-    # after an MSI install). Probe the default install locations and, if found,
-    # prepend to this process's PATH so `az` is usable without reopening.
-    $WbinDirs = @()
-    if ($env:ProgramFiles)
-    {
-        $WbinDirs += (Join-Path $env:ProgramFiles 'Microsoft SDKs\Azure\CLI2\wbin')
-    }
-    $ProgramFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    if ($ProgramFilesX86)
-    {
-        $WbinDirs += (Join-Path $ProgramFilesX86 'Microsoft SDKs\Azure\CLI2\wbin')
-    }
-    foreach ($WbinDir in $WbinDirs)
-    {
-        if (Test-Path -LiteralPath (Join-Path $WbinDir 'az.cmd'))
-        {
-            $env:PATH = $WbinDir + ';' + $env:PATH
-            return (Join-Path $WbinDir 'az.cmd')
-        }
-    }
-    return $null
-}
-
-$AzCliPath = Resolve-AzCli
-if (-not $AzCliPath)
-{
-    # Install guidance is platform-specific. The automatic install below uses the
-    # official Windows MSI (msiexec), which only exists on Windows; on macOS/Linux
-    # there is no MSI to run, so point the operator at the correct install docs for
-    # their platform and let them install it, then re-run.
-    if ($IsMacOS)
-    {
-        $AzManualHint = '  macOS: brew install azure-cli   (docs: https://learn.microsoft.com/cli/azure/install-azure-cli-macos)'
-    }
-    elseif ($IsLinux)
-    {
-        $AzManualHint = '  Linux: https://learn.microsoft.com/cli/azure/install-azure-cli-linux'
-    }
-    else
-    {
-        $AzManualHint = '  https://aka.ms/installazurecliwindows'
-    }
-    $AzInteractive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
-
-    # Automatic install is Windows-only. On macOS/Linux, show the correct link and
-    # exit instead of attempting a Windows MSI install that cannot succeed here.
-    if ($IsMacOS -or $IsLinux)
-    {
-        Write-Host "Azure CLI (az) is required but was not found." -ForegroundColor Red
-        Write-Host "Install the Azure CLI and re-run. See:" -ForegroundColor Yellow
-        Write-Host $AzManualHint -ForegroundColor Yellow
-        exit 1
-    }
-
-    if (-not $AzInteractive)
-    {
-        Write-Host "Azure CLI (az) was not found, and this is a non-interactive session, so I will not prompt to install it." -ForegroundColor Red
-        Write-Host "Install the Azure CLI and re-run. See:" -ForegroundColor Yellow
-        Write-Host $AzManualHint -ForegroundColor Yellow
-        exit 1
-    }
-
-    Write-Host ""
-    $AzAnswer = Read-Host "Azure CLI (az) is required but not installed. Install it now? [y/N]"
-    if ($AzAnswer -notmatch '^(y|yes)$')
-    {
-        Write-Host "Not installing. Install the Azure CLI and re-run. See:" -ForegroundColor Yellow
-        Write-Host $AzManualHint -ForegroundColor Yellow
-        exit 1
-    }
-
-    Write-Host "Installing the Azure CLI via the official Microsoft MSI (this may prompt for elevation and can take a few minutes)..." -ForegroundColor Cyan
-    try
-    {
-        $AzMsiPath = Join-Path $env:TEMP ('AzureCLI-' + [guid]::NewGuid().ToString() + '.msi')
-        $PriorProgress = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri 'https://aka.ms/installazurecliwindowsx64' -OutFile $AzMsiPath
-        $ProgressPreference = $PriorProgress
-        $MsiProc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "' + $AzMsiPath + '" /quiet /norestart') -Wait -PassThru
-        Remove-Item -LiteralPath $AzMsiPath -Force -ErrorAction SilentlyContinue
-        # 0 = success; 3010 = success but a reboot is required (az still works in
-        # this session). Anything else is a genuine failure.
-        if ($MsiProc.ExitCode -ne 0 -and $MsiProc.ExitCode -ne 3010)
-        {
-            throw ("msiexec exited with code {0}." -f $MsiProc.ExitCode)
-        }
-    }
-    catch
-    {
-        Write-Host ("Automatic install failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
-        Write-Host "Install the Azure CLI manually from https://aka.ms/installazurecliwindows then re-run." -ForegroundColor Yellow
-        exit 1
-    }
-
-    $AzCliPath = Resolve-AzCli
-    if (-not $AzCliPath)
-    {
-        Write-Host "Azure CLI was installed but is not visible in this session yet." -ForegroundColor Yellow
-        Write-Host "Close this window, open a new PowerShell 7 (pwsh) prompt, then re-run the same command." -ForegroundColor Yellow
-        exit 1
-    }
-    Write-Host ("Azure CLI is now available: {0}" -f $AzCliPath) -ForegroundColor Green
-}
-
-# ---------------------------------------------------------------------------
 # Az PowerShell module bootstrap. The wrapper (Connect-AzAccount, Get-AzSubscription)
 # and the inner script (Get-AzMetric, consumption) all require the Az module.
 # Detect it, and if missing offer to install it when interactive, or fail loud
-# when non-interactive - the same pre-flight treatment as PowerShell 7 and az.
+# when non-interactive - the same pre-flight treatment as PowerShell 7.
 #
 # Why the verify step (below) matters: an earlier version installed Az from
 # INSIDE the inventory run, mid-collection. That produced a half-installed module
@@ -490,6 +366,11 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# The tenant's subscription list ResourceInventory.ps1 -RunAllSubs keeps for
+# the rest of this process (see LoginSession). Cleared here so a second run in
+# the same PowerShell session lists the subscriptions again.
+Remove-Variable -Name RdaTenantSubscriptionCache -Scope Global -ErrorAction SilentlyContinue
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
@@ -562,100 +443,17 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Tenant
 
 # Authenticate, but only if needed.
 #
-# In environments like Azure Cloud Shell the shell already has a valid az CLI
-# and Az PowerShell session for the signed-in user. Unconditionally calling
-# `az login` and `Connect-AzAccount` from the wrapper produces a redundant
-# browser/device-code prompt every run.
-#
-# Two things have to be true to skip the interactive login:
-#   1. The cached context for each side must be on the requested tenant.
-#   2. That cached context must still be able to *acquire a token* silently.
-# Condition 1 alone is not enough: a context can persist on disk (e.g. in
-# ~/.Azure/AzureRmContext.json) with the right tenant ID but an expired or
-# revoked refresh token. In that state Azure AD requires user interaction
-# (typically driven by Conditional Access or MFA), so any data-plane call
-# from inside the script will emit a warning like "Unable to acquire token
-# for tenant ... User interaction is required" and silently return nothing -
-# producing an empty inventory rather than failing loudly.
-#
-# Therefore the gate probes token acquisition for the requested tenant on both
-# sides. Only if both probes succeed do we skip the login.
-
-
-
-
-
+# In environments like Azure Cloud Shell the shell already has a valid Az
+# PowerShell session for the signed-in user, and signing in again from the
+# wrapper would produce a redundant browser/device-code prompt every run.
+# Connect-RdaWrapperSession (Functions/Common.Functions.ps1) reuses a sign-in
+# that is on -TenantID and can still acquire a token silently, otherwise signs
+# in once and checks the token again. When that sign-in gives no usable token
+# it throws and the run stops here with exit 1, instead of prompting again or
+# collecting an empty inventory.
 try
 {
-    $CliTenant = Get-AzCliSignedInTenant
-    $PsTenant = Get-AzPsSignedInTenant
-
-    $CliTenantOk = ($CliTenant -eq $TenantID)
-    $PsTenantOk = ($PsTenant -eq $TenantID)
-
-    $CliTokenOk = $false
-    $PsTokenOk = $false
-    if ($CliTenantOk) { $CliTokenOk = Test-AzCliTokenSilent -Tenant $TenantID }
-    if ($PsTenantOk) { $PsTokenOk = Test-AzPsTokenSilent  -Tenant $TenantID }
-
-    $CliOk = $CliTenantOk -and $CliTokenOk
-    $PsOk = $PsTenantOk -and $PsTokenOk
-
-    if ($CliOk -and $PsOk)
-    {
-        Write-Host ("Existing session detected for tenant {0} (token probe ok); skipping interactive login." -f $TenantID) -ForegroundColor Green
-    }
-    else
-    {
-        if (-not $CliOk)
-        {
-            if ($null -eq $CliTenant)
-            {
-                Write-Host "az CLI is not signed in; authenticating..." -ForegroundColor Cyan
-            }
-            elseif (-not $CliTenantOk)
-            {
-                Write-Host ("az CLI is signed in to tenant {0}; switching to {1}..." -f $CliTenant, $TenantID) -ForegroundColor Cyan
-            }
-            else
-            {
-                Write-Host ("az CLI session for tenant {0} cannot acquire a token silently (likely expired or CA/MFA-gated); re-authenticating..." -f $TenantID) -ForegroundColor Cyan
-            }
-            if ($DeviceLogin)
-            {
-                az login -t $TenantID --use-device-code --only-show-errors | Out-Null
-            }
-            else
-            {
-                az login -t $TenantID --only-show-errors | Out-Null
-            }
-            if ($LASTEXITCODE -ne 0) { throw "az login failed with exit code $LASTEXITCODE" }
-        }
-
-        if (-not $PsOk)
-        {
-            if ($null -eq $PsTenant)
-            {
-                Write-Host "Az PowerShell is not signed in; authenticating..." -ForegroundColor Cyan
-            }
-            elseif (-not $PsTenantOk)
-            {
-                Write-Host ("Az PowerShell is signed in to tenant {0}; switching to {1}..." -f $PsTenant, $TenantID) -ForegroundColor Cyan
-            }
-            else
-            {
-                Write-Host ("Az PowerShell session for tenant {0} cannot acquire a token silently (likely expired or CA/MFA-gated); re-authenticating..." -f $TenantID) -ForegroundColor Cyan
-            }
-            if ($DeviceLogin)
-            {
-                Connect-AzAccount -Tenant $TenantID -UseDeviceAuthentication | Out-Null
-            }
-            else
-            {
-                Connect-AzAccount -Tenant $TenantID | Out-Null
-            }
-        }
-    }
+    Connect-RdaWrapperSession -TenantID $TenantID -DeviceLogin:$DeviceLogin
 }
 catch
 {
@@ -1149,7 +947,7 @@ if ($ParallelStreams -le 1)
                 # genuinely has no resources. Either way the user almost always wants
                 # to know immediately rather than discover it days later when the
                 # consolidated report turns out to be empty for some subs.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: (Invoke-AzRestMethod -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Payload '{{""subscriptions"":[""{1}""],""query"":""resources | summarize count()""}}').Content" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {
