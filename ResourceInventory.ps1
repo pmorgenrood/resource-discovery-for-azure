@@ -1287,7 +1287,7 @@ function ExecuteInventoryProcessing()
             $ContextSwitchError = $null
             try
             {
-                $null = Set-AzContext -Subscription $sub.id -ErrorAction Stop
+                $null = Set-AzContext -Subscription $sub.id -Scope Process -ErrorAction Stop
                 $ContextOk = ((Get-AzContext).Subscription.Id -eq $sub.id)
             }
             catch

@@ -537,7 +537,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 - Tenant-domain-style `-TenantID` (e.g. `contoso.onmicrosoft.com`) is resolved via Microsoft's public OIDC discovery endpoint, no sign-in needed. Pass the tenant GUID directly if discovery fails.
 
 **Subscription returned 0 resources:**
-- Almost always a permission gap: the signed-in identity does not have Reader on that specific subscription. The wrapper prints a `Search-AzGraph` command to confirm it (that command needs the `Az.ResourceGraph` module, which the tool itself does not use).
+- Almost always a permission gap: the signed-in identity does not have Reader on that specific subscription. The wrapper prints an `Invoke-AzRestMethod` command (Az.Accounts, which the tool already loads) that counts the subscription's resources in Resource Graph, to confirm it.
 - Less commonly, the subscription is genuinely empty.
 - Failed subs are listed at the end of the wrapper transcript and in `InventoryReports/RunAllSubscriptions_failures_<timestamp>.log`.
 

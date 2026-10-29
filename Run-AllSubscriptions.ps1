@@ -813,7 +813,7 @@ if ($ParallelStreams -le 1)
                 # genuinely has no resources. Either way the user almost always wants
                 # to know immediately rather than discover it days later when the
                 # consolidated report turns out to be empty for some subs.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: (Invoke-AzRestMethod -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Payload '{{""subscriptions"":[""{1}""],""query"":""resources | summarize count()""}}').Content" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {

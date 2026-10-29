@@ -785,7 +785,7 @@ function Test-ConsumptionAccess
 
     try
     {
-        $null = Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop
+        $null = Set-AzContext -Subscription $SubscriptionId -Scope Process -ErrorAction Stop
     }
     catch
     {

@@ -64,4 +64,32 @@ Describe 'No Azure CLI in the tool' {
                 }, $true) | ForEach-Object { 'line {0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
         $Hits | Should -BeNullOrEmpty
     }
+
+    # The tool never asks the user to run a cmdlet from a module it does not
+    # install: the advice it prints names Invoke-AzRestMethod instead.
+    It '<Name> does not tell the user to run Search-AzGraph' -TestCases $script:Files {
+        param($Name, $Path)
+        $null = $Name
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Hits = @($Ast.FindAll({
+                    param($Node)
+                    ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and $Node.Value -match 'Search-AzGraph'
+                }, $true) | ForEach-Object { 'line {0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
+        $Hits | Should -BeNullOrEmpty
+    }
+
+    # Set-AzContext without -Scope Process rewrites the user's saved default
+    # context (their default subscription, or a process-only service
+    # principal sign-in made permanent). The tool keeps every switch to its
+    # own process.
+    It '<Name> keeps every Set-AzContext to this process' -TestCases $script:Files {
+        param($Name, $Path)
+        $null = $Name
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Hits = @($Ast.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Set-AzContext' -and $Node.Extent.Text -notmatch '-Scope\s+Process\b'
+                }, $true) | ForEach-Object { 'line {0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
+        $Hits | Should -BeNullOrEmpty
+    }
 }
