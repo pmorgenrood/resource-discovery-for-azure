@@ -575,8 +575,8 @@ if (-not ($Resume -or $ResumeFailedOnly) -and @(Get-StreamResumeStateFiles -Inve
     # A run without -Resume collects every subscription again, so the records
     # of an interrupted parallel run are not folded in. Left under their active
     # names, a later -Resume would fold them in and skip what they list as
-    # completed, so they are moved aside (Move-StrandedStreamStateFiles), never
-    # deleted and never zipped.
+    # completed, so they are moved aside (Move-StrandedStreamStateFiles) and
+    # never zipped; only the newest moved-aside set is kept.
     $StuckStreamFiles = @(Move-StrandedStreamStateFiles -Files @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID) -InventoryRoot $InventoryRoot -Tenant $TenantID)
     if ($StuckStreamFiles.Count -gt 0)
     {
@@ -1721,7 +1721,12 @@ else
             # a sub a stream collected this run without a zip being written, and
             # for one whose metrics or consumption were left incomplete.
             $FailedThisRun = @($StreamFailedIds | Where-Object { $_ })
-            $NotCompletedThisRun = @(@($FailedThisRun) + @($StreamNoReportIds | Where-Object { $_ }) + @($StreamIncompleteIds | Where-Object { $_ }))
+            # A sub of a stream that did not start was not collected either, so an
+            # earlier completion of it ends too (a run without -Resume can slice a
+            # completed sub): a later -Resume collects it instead of carrying an
+            # old report.
+            $NotStartedIds = @($StreamNotStarted | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+            $NotCompletedThisRun = @(@($FailedThisRun) + @($StreamNoReportIds | Where-Object { $_ }) + @($StreamIncompleteIds | Where-Object { $_ }) + @($NotStartedIds | Where-Object { $_ }))
             if ($NotCompletedThisRun.Count -gt 0)
             {
                 $CompletedIds = @($CompletedIds | Where-Object { $NotCompletedThisRun -notcontains $_ })
@@ -1731,14 +1736,13 @@ else
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
             # A stream that did not start wrote no state, so its subs are added
-            # here, one more failed run each (Add-FailedAttempt counts on). One an
-            # earlier run completed keeps that completion and its report, which a
-            # -Resume carries, so it is owed nothing and is not added.
-            foreach ($NotStarted in @($StreamNotStarted | Where-Object { $null -ne $_ -and $CompletedIds -notcontains [string]$_.Id }))
+            # here, one more failed run each (Add-FailedAttempt counts on), after
+            # the merge, which drops entries of completed subs.
+            foreach ($NotStarted in @($StreamNotStarted | Where-Object { $null -ne $_ }))
             {
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$NotStarted.Id) -Name ([string]$NotStarted.Name) -Reason ([string]$NotStarted.Reason)
             }
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0 -or @($StreamNotStarted | Where-Object { $null -ne $_ }).Count -gt 0)
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
@@ -2261,12 +2265,12 @@ elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)
 }
 if ($NotCollected.Count -gt 0)
 {
-    # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
+    # Set before the summary, on a -ResumeFailedOnly run.
     Write-NotCollectedSummary -NotCollected $NotCollected -ResumeStateFile $ResumeStateFile
 }
 if ($RetryLimited.Count -gt 0)
 {
-    # Set by the resume-state cleanup above.
+    # Set before the summary.
     Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
@@ -2552,13 +2556,6 @@ if ($WrapperTranscriptStarted)
     catch { Write-Verbose ("Stop-Transcript on normal completion failed: {0}" -f $_.Exception.Message) }
 }
 
-# A per-stream state file that is left in place would stop the next run at
-# startup: exit 1 now, ahead of every other code, so a caller acts on it.
-if ($StuckStreamFiles.Count -gt 0)
-{
-    exit 1
-}
-
 # No consolidated zip means no report of this run is in it: exit 2, as for the
 # per-subscription verification gap, ahead of codes 3-5.
 if ($null -ne $BundleBuildError)
@@ -2569,6 +2566,14 @@ if ($null -ne $BundleBuildError)
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
 $WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($SkippedForRetryLimit | Where-Object { $null -ne $_ }).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
+# A per-stream state file that is left in place would stop the next run at
+# startup: exit 1, in place of 0 and 3-5, so a caller acts on it. Exit 2
+# (reports missing or subscriptions failed) keeps its code; the banner above
+# names the file either way.
+if ($StuckStreamFiles.Count -gt 0 -and $WrapperExitCode -ne 2)
+{
+    exit 1
+}
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode

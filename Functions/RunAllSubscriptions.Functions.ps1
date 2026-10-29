@@ -710,8 +710,9 @@ function Write-StreamStateFileStop
 # and skip a subscription they list as completed, carrying an old report. Each
 # is renamed to <name>.stranded-<UTC time>, which ends neither in '.json' nor
 # matches Get-StreamResumeStateFiles, so no later run reads it and no zip step
-# takes it. They are never deleted; only the newest set is kept, so the moved-
-# aside sets of earlier runs are removed once this set is in place. Returns the
+# takes it. The files themselves are renamed, not deleted; only the newest
+# moved-aside set is kept, so the sets of earlier runs are removed once this
+# set is in place. Returns the
 # files that could not be renamed ({ Name; Path }), for Write-StreamStateFileStop.
 function Move-StrandedStreamStateFiles
 {
