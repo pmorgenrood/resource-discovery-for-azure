@@ -569,6 +569,21 @@ $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
 $FoldedSource = 'this run read at startup'
 $UnreadableStreamFiles = @()
+$StuckStreamFiles = @()
+if (-not ($Resume -or $ResumeFailedOnly) -and @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID).Count -gt 0)
+{
+    # A run without -Resume collects every subscription again, so the records
+    # of an interrupted parallel run are not folded in. Left under their active
+    # names, a later -Resume would fold them in and skip what they list as
+    # completed, so they are moved aside (Move-StrandedStreamStateFiles), never
+    # deleted and never zipped.
+    $StuckStreamFiles = @(Move-StrandedStreamStateFiles -Files @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID) -InventoryRoot $InventoryRoot -Tenant $TenantID)
+    if ($StuckStreamFiles.Count -gt 0)
+    {
+        Write-StreamStateFileStop -Files $StuckStreamFiles -Why 'was left by an interrupted parallel run'
+        Exit-Wrapper -Code 1
+    }
+}
 if ($Resume -or $ResumeFailedOnly)
 {
     $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
@@ -609,6 +624,17 @@ if ($Resume -or $ResumeFailedOnly)
             # the end-of-run merge to reconcile and clean up.
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         }
+    }
+    # An unreadable file that could not be moved aside keeps its active name,
+    # so every run would find it and warn again, with no end: the run stops
+    # here, before collecting, naming the file and the command that removes
+    # it. Exit-Wrapper still removes the files that were folded in, once the
+    # resume state holds their records.
+    $StuckStreamFiles = @($UnreadableStreamFiles | Where-Object { $null -ne $_ -and [string]::IsNullOrEmpty([string]$_.MovedTo) })
+    if ($StuckStreamFiles.Count -gt 0)
+    {
+        Write-StreamStateFileStop -Files $StuckStreamFiles
+        Exit-Wrapper -Code 1
     }
 }
 
@@ -1487,6 +1513,8 @@ else
             $StreamFailedIds = @()
             $StreamNoReportIds = @()
             $StreamIncompleteIds = @()
+            # The subs of a stream that did not start, for the retry list below.
+            $StreamNotStarted = @()
             foreach ($S in $StreamSummaries)
             {
                 if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
@@ -1542,6 +1570,13 @@ else
                     if ($StreamSummary.Status -ne 'failed-to-start')
                     {
                         $StreamFailedIds += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
+                    }
+                    else
+                    {
+                        # Not collected this run either: each goes on the retry
+                        # list as a failed run (below), so -ResumeFailedOnly
+                        # retries it and the retry limit ends a cause that stays.
+                        $StreamNotStarted += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and [string]$_.Id -ne '<unknown>' })
                     }
                 }
 
@@ -1695,7 +1730,15 @@ else
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0)
+            # A stream that did not start wrote no state, so its subs are added
+            # here, one more failed run each (Add-FailedAttempt counts on). One an
+            # earlier run completed keeps that completion and its report, which a
+            # -Resume carries, so it is owed nothing and is not added.
+            foreach ($NotStarted in @($StreamNotStarted | Where-Object { $null -ne $_ -and $CompletedIds -notcontains [string]$_.Id }))
+            {
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$NotStarted.Id) -Name ([string]$NotStarted.Name) -Reason ([string]$NotStarted.Reason)
+            }
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0 -or @($StreamNotStarted | Where-Object { $null -ne $_ }).Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
@@ -2406,6 +2449,10 @@ if (-not $ResumeStateClearTried)
 # A run that could not read a per-stream state file is not a clean run: say
 # whether the state was cleared or kept, and where that file went.
 Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
+# A per-stream file the end-of-run merge could not read and could not move
+# aside would be found again by every later run: the run ends with exit 1 and
+# says how to remove it (below, after the summary).
+$StuckStreamFiles = @($UnreadableStreamFiles | Where-Object { $null -ne $_ -and [string]::IsNullOrEmpty([string]$_.MovedTo) })
 
 # The consolidated zip is the run's output. When it could not be built, or was
 # lost afterwards, this banner says so after the summary and the run exits 2
@@ -2494,12 +2541,22 @@ if (@($UncarriedSkipped).Count -gt 0)
     Write-Host "=================================================================" -ForegroundColor Red
 }
 
+# A per-stream state file left under its active name (see $StuckStreamFiles).
+Write-StreamStateFileStop -Files $StuckStreamFiles
+
 # Stop the wrapper transcript on the normal-completion path. Error paths take
 # Exit-Wrapper which does the same.
 if ($WrapperTranscriptStarted)
 {
     try { Stop-Transcript | Out-Null }
     catch { Write-Verbose ("Stop-Transcript on normal completion failed: {0}" -f $_.Exception.Message) }
+}
+
+# A per-stream state file that is left in place would stop the next run at
+# startup: exit 1 now, ahead of every other code, so a caller acts on it.
+if ($StuckStreamFiles.Count -gt 0)
+{
+    exit 1
 }
 
 # No consolidated zip means no report of this run is in it: exit 2, as for the
