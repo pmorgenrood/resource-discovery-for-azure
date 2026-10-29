@@ -308,7 +308,7 @@ exit 1
     function script:Get-RecoveryLines { param($Run) @($Run.Text | Where-Object { $_ -like 'Recovered per-stream state*' }) }
     # The stream count the run printed ('Parallelism: -ParallelStreams <n> ...').
     function script:Get-StreamCount { param($Run) foreach ($Line in $Run.Text) { if ($Line -match '^Parallelism: -ParallelStreams (\d+) ') { return [int]$Matches[1] } }; return 0 }
-    function script:Get-RemoveWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: Could not remove the *' -or $_ -like '  The resume state file * is kept, so the next -Resume*' -or $_ -like '  The next -Resume reads the per-stream state file(s) above again*' -or $_ -like 'WARNING: The resume state file * could not be written or read back*' }) }
+    function script:Get-RemoveWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: Could not remove the *' -or $_ -like '  The resume state file * is kept, so the next -Resume*' -or $_ -like '  The next run reads it again*' -or $_ -like 'WARNING: The resume state file * could not be written or read back*' }) }
     function script:Get-StreamWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The per-stream state file*' }) }
     function script:Test-CleanLine { param($Run) @($Run.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count -eq 1 }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $script:Subs[$_].Id } | Sort-Object) }
@@ -683,7 +683,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         $Lines = @(script:Get-RemoveWarningLines $R1)
         $Lines.Count | Should -Be 3
         @($Lines[0..1] | Sort-Object) | Should -Be @($Names | ForEach-Object { 'WARNING: Could not remove the per-stream state file {0}: Access to the path ''{1}'' is denied.' -f $_, (Join-Path $script:Root $_) })
-        $Lines[2] | Should -Be ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f $State)
+        $Lines[2] | Should -Be ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f $State)
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
         Test-Path -LiteralPath $script:State | Should -BeTrue
 
@@ -718,7 +718,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         $Lines = @(script:Get-RemoveWarningLines $R1)
         $Lines.Count | Should -Be 3
         @($Lines[0..1] | Sort-Object) | Should -Be @($Names | ForEach-Object { 'WARNING: Could not remove the per-stream state file {0}: Access to the path ''{1}'' is denied.' -f $_, (Join-Path $script:Root $_) })
-        $Lines[2] | Should -Be '  The next -Resume reads the per-stream state file(s) above again and retries the removal.'
+        $Lines[2] | Should -Be ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $script:State -Leaf))
         script:Test-CleanLine $R1 | Should -BeFalse
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
 
@@ -774,7 +774,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 
-    It 'Remove-ResumeStateFiles names what it cannot remove, keeps the state file while a per-stream file is left, and removes all once it can' {
+    It 'Remove-ResumeStateFiles and Remove-StreamStateFiles name what they cannot remove, keep the state file while a per-stream file is left, and remove all once they can' {
         if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
         . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
         $Dir = Join-Path $script:TestBase ('ro-' + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -783,18 +783,17 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         $State = Join-Path $Dir '.resume-state-t.json'
         Set-Content -LiteralPath $Stream -Value '{}'
         Set-Content -LiteralPath $State -Value '{}'
+        $Denied = 'WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: Access to the path ''{0}'' is denied.' -f $Stream
+        $Kept = '  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f '.resume-state-t.json'
         & chmod 555 $Dir
         try
         {
             $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1)
             @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] }) | Should -Be @($Stream, $State)
-            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(
-                ('WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: Access to the path ''{0}'' is denied.' -f $Stream)
-                '  The resume state file .resume-state-t.json is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.'
-            )
-            $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) 6>&1)
+            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @($Denied, $Kept)
+            $Out = @(Remove-StreamStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1)
             @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] }) | Should -Be @($Stream)
-            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })[1] | Should -Be '  The next -Resume reads the per-stream state file(s) above again and retries the removal.'
+            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @($Denied, $Kept) -Because 'the stream-only removal prints the same lines'
             $Out = @(Remove-ResumeStateFiles -StateFile $State 6>&1)
             @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(
                 ('WARNING: Could not remove the resume state file .resume-state-t.json: Access to the path ''{0}'' is denied.' -f $State)
@@ -802,8 +801,8 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
             )
         }
         finally { & chmod 755 $Dir }
-        $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1)
-        $Out | Should -BeNullOrEmpty
+        @(Remove-StreamStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1) | Should -BeNullOrEmpty
+        @(Remove-ResumeStateFiles -StateFile $State 6>&1) | Should -BeNullOrEmpty
         Test-Path -LiteralPath $Stream | Should -BeFalse
         Test-Path -LiteralPath $State | Should -BeFalse
     }

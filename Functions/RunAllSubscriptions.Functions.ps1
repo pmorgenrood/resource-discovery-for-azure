@@ -25,14 +25,16 @@
 function Exit-Wrapper
 {
     param([int]$Code = 0)
-    # Every early exit of the wrapper passes here. A -Resume or -ResumeFailedOnly
-    # run deletes the per-stream state files it folded in at startup first, once
-    # the resume state holds their records (Invoke-FoldedStreamStateCleanup), so a
-    # run that stops early leaves none behind and no exit needs code of its own.
-    # There are none before the fold, and none after the end-of-run clean-up.
+    # Every early exit of the wrapper passes here, and the resume state is kept
+    # at each of them. The per-stream state files the run folded in at startup
+    # (or, after the end-of-run merge of a parallel run, the ones its streams
+    # wrote) are deleted first, once the resume state holds their records
+    # (Invoke-FoldedStreamStateCleanup), so a run that stops early leaves none
+    # behind and no exit needs code of its own. There are none before the fold,
+    # and none after the end-of-run clean-up.
     if (@($FoldedStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
     {
-        $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
+        $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
     }
     if ($WrapperTranscriptStarted)
     {
@@ -699,22 +701,20 @@ function Write-UnreadableStreamStateSummary
 # resume state file -StateFile. Each removal stops on an error and is then
 # checked: a file that is still there gets a warning naming it. While a
 # per-stream file is left, the resume state file is kept too, so the next
-# -Resume reads the same state, reads that per-stream file again and retries
-# the removal. Without -StateFile only the per-stream files are removed (a run
-# that keeps the resume state, or the end-of-run merge of a parallel run).
-# Returns the paths left on disk (none when all were removed).
+# -Resume reads the same state and that per-stream file again. Only some runs
+# remove per-stream files, so the warning asks for the named files to be
+# removed once the folder can be written. Returns the paths left on disk (none
+# when all were removed).
 function Remove-ResumeStateFiles
 {
-    param([string[]]$StreamFiles = @(), [string]$StateFile)
+    param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
     $Left = [System.Collections.Generic.List[string]]::new()
-    $Paths = @($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) })
-    if (-not [string]::IsNullOrEmpty($StateFile)) { $Paths += $StateFile }
-    foreach ($Path in $Paths)
+    foreach ($Path in @(@($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) }) + $StateFile))
     {
         $IsState = $Path -eq $StateFile
         if ($IsState -and $Left.Count -gt 0)
         {
-            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
+            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
             $Left.Add($Path)
             continue
         }
@@ -728,9 +728,32 @@ function Remove-ResumeStateFiles
         if ($IsState) { Write-Host '  The next run reads it again and retries the removal.' -ForegroundColor Yellow }
         $Left.Add($Path)
     }
-    if ([string]::IsNullOrEmpty($StateFile) -and $Left.Count -gt 0)
+    return $Left.ToArray()
+}
+
+# Remove per-stream state files while the resume state file stays: the files a
+# run that keeps the resume state folded in at startup, or that its streams
+# wrote. Each removal stops on an error and is then checked, with the same
+# warning as Remove-ResumeStateFiles, and the same line under it: the resume
+# state file is kept, so the next -Resume reads the same state and the named
+# files again. Returns the paths left on disk (none when all were removed).
+function Remove-StreamStateFiles
+{
+    param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
+    $Left = [System.Collections.Generic.List[string]]::new()
+    foreach ($Path in @($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) }))
     {
-        Write-Host '  The next -Resume reads the per-stream state file(s) above again and retries the removal.' -ForegroundColor Yellow
+        $Reason = $null
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $Path)) { continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        Write-Host ('WARNING: Could not remove the per-stream state file {0}: {1}' -f (Split-Path -Path $Path -Leaf), $Reason) -ForegroundColor Yellow
+        $Left.Add($Path)
+    }
+    if ($Left.Count -gt 0)
+    {
+        Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
     }
     return $Left.ToArray()
 }
@@ -775,14 +798,15 @@ function Get-ResumeStateRecordMismatch
         })
 }
 
-# Delete per-stream state files ($Files, the ids they hold records for in $Ids)
-# once the resume state file on disk holds those records as this run holds
-# them (Get-ResumeStateRecordMismatch); each removal is checked
-# (Remove-ResumeStateFiles). Otherwise keep them, with a warning naming them, so
-# a later -Resume folds them in again and nothing is lost. Used for the files a
-# run folded in at startup when it keeps the resume state or ends early, and for
-# the files of a parallel run's streams at its end-of-run merge ($Source says
-# which, for the warning). Returns the paths left on disk.
+# For a run that keeps the resume state (at the end of the run, or when it
+# ends early): delete per-stream state files ($Files, the ids they hold records
+# for in $Ids) once the resume state file on disk holds those records as this
+# run holds them (Get-ResumeStateRecordMismatch); each removal is checked
+# (Remove-StreamStateFiles). Otherwise keep them, with a warning naming them, so
+# a later -Resume folds them in again and nothing is lost. The files are the
+# ones the run folded in at startup, or, after the end-of-run merge of a
+# parallel run, the ones its streams wrote ($Source says which, for the
+# warning). Returns the paths left on disk.
 function Invoke-FoldedStreamStateCleanup
 {
     param(
@@ -802,7 +826,7 @@ function Invoke-FoldedStreamStateCleanup
         Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f (Split-Path -Path $ResumeStateFile -Leaf), $Source, (@($Left | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
         return @($Left | ForEach-Object { $_.FullName })
     }
-    return @(Remove-ResumeStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }))
+    return @(Remove-StreamStateFiles -StreamFiles @($Left | ForEach-Object { $_.FullName }) -StateFile $ResumeStateFile)
 }
 
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
