@@ -315,6 +315,41 @@ Describe 'Invoke-AzGraphQuerySafe retry behavior' {
         }
     }
 
+    # The parse error goes to the log. A page holds resource names and ids
+    # and can be megabytes long, so the message carries only its start, and
+    # none of it with -HideRawOutput (the inventory passes it under -Obfuscate).
+    Context 'The parse error does not log the whole page' {
+
+        BeforeAll {
+            $script:Marker = 'SECRET-RESOURCE-NAME'
+            $script:BigPage = 'not json {{{ ' + $script:Marker + (' x' * 50000)
+            Mock -CommandName Invoke-AzRestMethod -MockWith { New-GraphResponse -Content $script:BigPage }
+        }
+
+        It 'includes at most the first 500 characters of the raw output' {
+            $Message = try { Invoke-AzGraphQuerySafe -Query 'resources' -SubscriptionId $script:Sub | Out-Null; '' } catch { $_.Exception.Message }
+            $Message | Should -Match 'could not be parsed'
+            $Message | Should -Match $script:Marker -Because 'the start of the page helps diagnose the failure'
+            $Message.Length | Should -BeLessThan 1500
+            $Message | Should -Match ('of {0} characters' -f $script:BigPage.Length)
+        }
+
+        It 'includes none of the raw output with -HideRawOutput' {
+            $Message = try { Invoke-AzGraphQuerySafe -Query 'resources' -SubscriptionId $script:Sub -HideRawOutput | Out-Null; '' } catch { $_.Exception.Message }
+            $Message | Should -Match 'could not be parsed'
+            $Message | Should -Not -Match $script:Marker
+            $Message | Should -Not -Match 'not json'
+        }
+
+        It 'is passed -HideRawOutput under -Obfuscate by every inventory query' {
+            $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
+            $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
+            $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Invoke-AzGraphQuerySafe' }, $true))
+            $Calls.Count | Should -BeGreaterThan 0
+            foreach ($Call in $Calls) { $Call.Extent.Text | Should -Match '-HideRawOutput:\$Obfuscate\.IsPresent' }
+        }
+    }
+
     Context 'A truncated answer with no skip token is a failure, not a partial page' {
 
         It 'throws' {

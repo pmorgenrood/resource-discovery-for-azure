@@ -292,14 +292,20 @@ function Get-AzGraphRetryAfterSeconds
 
 # Rename every empty-string property KEY ("": ...) in JSON text to
 # "_rda_emptykey". JSON strings are matched whole (escapes included), so an
-# empty string value, or a "": inside a string, is left alone.
+# empty string value, or a "": inside a string, is left alone. When the text
+# already holds that name (in any case, since -Lowercase lowercases the text
+# afterwards), a numeric suffix is added until the name is unused, so the
+# renamed key never collides with a real one and no value is dropped.
 function Protect-AzGraphEmptyKey
 {
     param([string]$Json)
     if ($Json -notmatch '""\s*:') { return $Json }
+    $Sentinel = '_rda_emptykey'
+    for ($Suffix = 1; $Json.IndexOf($Sentinel, [System.StringComparison]::OrdinalIgnoreCase) -ge 0; $Suffix++) { $Sentinel = '_rda_emptykey' + $Suffix }
+    $Replacement = '"' + $Sentinel + '"'
     return [regex]::Replace($Json, '"(?:[^"\\]|\\.)*"(?=\s*:)', {
             param($Match)
-            if ($Match.Value -eq '""') { return '"_rda_emptykey"' }
+            if ($Match.Value -eq '""') { return $Replacement }
             return $Match.Value
         })
 }
@@ -381,18 +387,23 @@ function ConvertFrom-AzGraphPage
 # or empty page; the throw stops the script even under the production
 # 'SilentlyContinue' preference. -Lowercase lowercases each row's text before
 # parsing, culture-invariantly (collectors compare against lowercase strings).
+# A parse error quotes at most the first 500 characters of the page, and none
+# of it with -HideRawOutput (the inventory passes it under -Obfuscate).
 function Invoke-AzGraphQuerySafe
 {
     param(
         [Parameter(Mandatory = $true)][string]$Query,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$SubscriptionId,
         [switch]$Lowercase,
+        [switch]$HideRawOutput,
         [ValidateRange(1, 1000)][int]$PageSize = 1000,
         [ValidateRange(1, 1000)][int]$BatchSize = 1000
     )
 
     # A throw here must not be suppressed by the caller's preference.
     $ErrorActionPreference = 'Stop'
+    # How much of an unparseable page a parse error quotes.
+    $RawOutputLimit = 500
 
     $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $Ids = @($SubscriptionId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $Seen.Add($_) })
@@ -419,7 +430,27 @@ function Invoke-AzGraphQuerySafe
             try { $Parsed = ConvertFrom-AzGraphPage -Content $Page.Content -Lowercase:$Lowercase }
             catch
             {
-                throw ("Resource Graph returned output that could not be parsed as JSON: {0}`nQuery: {1}`nRaw output: {2}" -f $_.Exception.Message, $Query, $Page.Content)
+                # The page goes to the log: only its start, and none of it
+                # with -HideRawOutput, since it holds resource names and ids.
+                # The JSON parser quotes the text it failed on, so its
+                # message is shortened (or replaced by the position) too.
+                $Raw = [string]$Page.Content
+                $Cause = $_.Exception
+                while ($null -ne $Cause.InnerException) { $Cause = $Cause.InnerException }
+                if ($HideRawOutput)
+                {
+                    $Reason = if ($Cause -is [System.Text.Json.JsonException]) { 'invalid JSON at line {0}, byte {1}' -f $Cause.LineNumber, $Cause.BytePositionInLine }
+                    elseif ($Cause.Message -like 'the answer *') { $Cause.Message }
+                    else { $Cause.GetType().FullName }
+                    $RawNote = '(not shown: obfuscated run)'
+                }
+                else
+                {
+                    $Reason = [string]$Cause.Message
+                    if ($Reason.Length -gt $RawOutputLimit) { $Reason = $Reason.Substring(0, $RawOutputLimit) + '...' }
+                    $RawNote = if ($Raw.Length -gt $RawOutputLimit) { '{0}... (first {1} of {2} characters)' -f $Raw.Substring(0, $RawOutputLimit), $RawOutputLimit, $Raw.Length } else { $Raw }
+                }
+                throw ("Resource Graph returned output that could not be parsed as JSON: {0}`nQuery: {1}`nRaw output: {2}" -f $Reason, $Query, $RawNote)
             }
             foreach ($Row in $Parsed.Rows) { $All.Add($Row) }
 

@@ -624,14 +624,14 @@ Function RunInventorySetup()
             $Subscri = $SubscriptionID
 
             $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri)
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
                 $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -641,14 +641,14 @@ Function RunInventorySetup()
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID) -Severity 'Success'
 
             $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID)
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
                 $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -659,7 +659,7 @@ Function RunInventorySetup()
             # 1000), rather than whatever scope Resource Graph defaults to.
             $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
             $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeCount = Get-AzGraphCount -Result $EnvSize
 
             Write-Log -Message ("Resources Output: {0} Resources Identified" -f $EnvSizeCount) -Severity 'Success'
@@ -668,7 +668,7 @@ Function RunInventorySetup()
             {
                 # Every page, read with the skip token.
                 $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.Data
             }
@@ -680,7 +680,7 @@ Function RunInventorySetup()
         # Like the az CLI call it replaces, not limited to -SubscriptionID: every
         # subscription of the run, named explicitly (in batches of 1000).
         $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
-        $AVDSize = Invoke-AzGraphQuerySafe -Query "desktopvirtualizationresources | summarize count()" -SubscriptionId $RunSubscriptionIds
+        $AVDSize = Invoke-AzGraphQuerySafe -Query "desktopvirtualizationresources | summarize count()" -SubscriptionId $RunSubscriptionIds -HideRawOutput:$Obfuscate.IsPresent
         $AVDSizeCount = Get-AzGraphCount -Result $AVDSize
 
         Write-Host ("AVD Resources Output: {0} AVD Resources Identified" -f $AVDSizeCount) -BackgroundColor Black -ForegroundColor Green
@@ -689,7 +689,7 @@ Function RunInventorySetup()
         {
             # Every page, read with the skip token.
             $GraphQuery = "desktopvirtualizationresources | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
-            $AVD = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase
+            $AVD = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
             $Global:Resources += $AVD.data
         }

@@ -265,6 +265,31 @@ Describe 'Invoke-AzGraphQuerySafe and an empty-string property key' {
         $Result.data[1].id | Should -Match 'networksecuritygroups/nsg$'
     }
 
+    # A row can already hold a key named like the sentinel. Renaming "" to
+    # that name would give the object two keys of the same name, and one
+    # value would be lost (or the row would fail to parse).
+    It 'keeps both values when a row already has a key named _rda_emptykey' {
+        Mock -CommandName Invoke-AzRestMethod -MockWith { New-GraphResponse -Content '{"count":1,"data":[{"_rda_emptykey":"theirs","":"empty","_rda_emptykey1":"also theirs"}],"resultTruncated":"false"}' }
+
+        $Result = Invoke-AzGraphQuerySafe -Query 'resources' -SubscriptionId $script:Sub
+        $Row = $Result.data[0]
+        @($Row.PSObject.Properties).Count | Should -Be 3 -Because 'no value is dropped'
+        $Row._rda_emptykey | Should -BeExactly 'theirs'
+        $Row._rda_emptykey1 | Should -BeExactly 'also theirs'
+        @($Row.PSObject.Properties | Where-Object { $_.Value -eq 'empty' }).Count | Should -Be 1
+        @($Row.PSObject.Properties | Where-Object { $_.Value -eq 'empty' })[0].Name | Should -Match '^_rda_emptykey\d+$'
+    }
+
+    It 'keeps both values when a key differing only in case would collide after -Lowercase' {
+        Mock -CommandName Invoke-AzRestMethod -MockWith { New-GraphResponse -Content '{"count":1,"data":[{"_RDA_EMPTYKEY":"Theirs","":"Empty"}],"resultTruncated":"false"}' }
+
+        $Result = Invoke-AzGraphQuerySafe -Query 'resources' -SubscriptionId $script:Sub -Lowercase
+        $Row = $Result.data[0]
+        @($Row.PSObject.Properties).Count | Should -Be 2 -Because 'no value is dropped'
+        $Row._rda_emptykey | Should -BeExactly 'theirs'
+        @($Row.PSObject.Properties | Where-Object { $_.Value -eq 'empty' }).Count | Should -Be 1
+    }
+
     It 'does not rename a key that ends in an escaped quote' {
         Mock -CommandName Invoke-AzRestMethod -MockWith { New-GraphResponse -Content '{"count":1,"data":[{"a\"":"x","b":""}],"resultTruncated":"false"}' }
 
