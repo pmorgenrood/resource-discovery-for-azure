@@ -163,18 +163,20 @@ git clone https://github.com/awslabs/resource-discovery-for-azure.git
 
 ### Authentication Notes
 
-- **Azure Cloud Shell:** Authentication is automatic
+- **Azure Cloud Shell:** Cloud Shell's own sign-in is used when it can still get a token for the tenant (rule 2 below), so usually there is no prompt. `-Appid`, `-UseManagedIdentity`, `-DeviceLogin` and `-TenantID` work in Cloud Shell as anywhere else.
 - **Local PowerShell:** The tool signs in with Az PowerShell only (`Connect-AzAccount`); the Azure CLI is not used. You can sign in beforehand with `Connect-AzAccount -Tenant <tenant>` or let the script do it. If you plan to scan all subscriptions in a tenant, use `Run-AllSubscriptions.ps1`, which signs in once and then reuses the session for every subscription.
 
 Sign-in follows three rules, in this order:
 
-1. **Service principal:** `-Appid`, `-Secret` and `-TenantID` always sign in as the service principal (`Connect-AzAccount -ServicePrincipal`, the secret kept as a SecureString), even when a user is already signed in; `-Appid` without the other two stops with exit code `1`.
-2. **Existing sign-in:** otherwise an Az PowerShell sign-in that is on the target tenant and can still get a token without a prompt is reused, with no prompt. Without `-TenantID` the target tenant is the one that sign-in is on, and only that tenant's subscriptions are collected (listed with `Get-AzSubscription -TenantId`, so subscriptions delegated to the tenant are included).
-3. **One sign-in attempt:** otherwise the script signs in once (`Connect-AzAccount`; `-DeviceLogin` uses the device-code flow, `-UseManagedIdentity` the identity of the Azure VM or service it runs on) and checks the token. If the sign-in fails, or still gives no token without a prompt (for example because of MFA or Conditional Access), the run stops with exit code `1` and says which command to run yourself; it does not prompt again or continue with an empty inventory. With no usable sign-in and no `-TenantID`, the sign-in is made without a tenant and you pick the tenant afterwards (the first one in a non-interactive session).
+1. **Service principal:** `-Appid`, `-Secret` and `-TenantID` always sign in as the service principal (`Connect-AzAccount -ServicePrincipal`, the secret kept as a SecureString), even when a user is already signed in; `-Appid` without the other two stops with exit code `1`. If the service principal sign-in fails, or Az PowerShell is then not signed in as that service principal, the run stops with exit code `1`; it never continues as a user who was already signed in. `-UseManagedIdentity` works the same way with the identity of the Azure VM or service the script runs on.
+2. **Existing sign-in:** otherwise an Az PowerShell sign-in that is on the target tenant and can still get a token without a prompt is reused, with no prompt. When that sign-in is on another tenant but can get a token for `-TenantID` without a prompt, the script's process is switched to `-TenantID` (`Set-AzContext -Scope Process`) instead of signing in again. Without `-TenantID` the target tenant is the one that sign-in is on, and only that tenant's subscriptions are collected (listed with `Get-AzSubscription -TenantId`, so subscriptions delegated to the tenant are included).
+3. **One sign-in attempt:** otherwise the script signs in once (`Connect-AzAccount`; `-DeviceLogin` uses the device-code flow, `-UseManagedIdentity` the identity of the Azure VM or service it runs on) and checks the token. If the sign-in fails, or still gives no token without a prompt (for example because of MFA or Conditional Access), the run stops with exit code `1` and says which command to run yourself; it does not prompt again or continue with an empty inventory. With no usable sign-in and no `-TenantID`, the sign-in is made without a tenant and you pick the tenant afterwards (the first one in a non-interactive session); the list holds the tenants your subscriptions are accessed through, so a tenant that manages subscriptions with Azure Lighthouse is offered. A number outside the list is asked for once more, then the run stops. In a session with no console (CI, a scheduled task), the script does not open a browser: it stops with exit code `1` unless `-DeviceLogin`, a service principal or `-UseManagedIdentity` is given.
 
-A usable sign-in is never signed out; switching to the chosen tenant applies to the script's own process only (`Set-AzContext -Scope Process`). Service principal and managed identity sign-ins are kept to the script's process too (`Connect-AzAccount -Scope Process`), so a later run without `-Appid` or `-UseManagedIdentity` does not reuse them. With `-UseManagedIdentity`, if the token is lost later in the run, metrics and consumption reconnect with the same identity once; they never fall back to a user sign-in.
+The run goes on only when Az PowerShell is signed in to the target tenant and that tenant lists at least one subscription for the sign-in; otherwise it stops with exit code `1` instead of writing an empty or wrong-tenant report.
 
-You might get more than one authentication request due to different collector processes running in parallel.
+A usable sign-in is never signed out; switching to the chosen tenant applies to the script's own process only (`Set-AzContext -Scope Process`). Service principal and managed identity sign-ins are kept to the script's process too (`Connect-AzAccount -Scope Process`), so a later run without `-Appid` or `-UseManagedIdentity` does not reuse them. If the token is lost later in the run, metrics and consumption reconnect at most once per run, with the same identity: the service principal, the managed identity (never a user sign-in), or, for a user, a switch back to the run's tenant when that needs no prompt, or one sign-in on the run's tenant if the run has not prompted yet. Otherwise that phase is skipped with an error and the rest of the inventory continues.
+
+A run asks you to sign in at most once: the parallel collectors and the `Run-AllSubscriptions.ps1` streams use that one sign-in.
 
 ### Basic Execution
 
@@ -490,7 +492,7 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|----------|
 | `Appid` | String | Service Principal application ID | `-Appid "app-id-here"` |
-| `Secret` | String | Service Principal client secret | `-Secret "secret-here"` |
+| `Secret` | SecureString | Service Principal client secret, as a SecureString (a plain string is refused) | `-Secret (Read-Host -Prompt 'Client secret' -AsSecureString)` |
 | `DeviceLogin` | Switch | Use device code authentication | `-DeviceLogin` |
 | `UseManagedIdentity` | Switch | Sign in Az PowerShell (`Connect-AzAccount -Identity`, with `-Tenant` when `-TenantID` is given) with the managed identity of the Azure VM or service the script runs on. Direct runs of `ResourceInventory.ps1` only. | `-UseManagedIdentity` |
 
@@ -532,7 +534,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 **Authentication Errors:**
 - Ensure you have the required Azure roles assigned
 - For local environments, run `Connect-AzAccount -Tenant <tenant>` before executing the script, or let the script sign you in
-- Multiple authentication prompts may appear due to parallel processing
+- A run prompts at most once. If it stops with "did not give a usable token", run the `Connect-AzAccount` command it prints yourself, complete any MFA or Conditional Access prompt, then re-run
 - "Get-AzSubscription returned no subscriptions" — usually a Conditional Access / MFA gate. Re-run with `-DeviceLogin` to use the browser-based device-code flow.
 - Tenant-domain-style `-TenantID` (e.g. `contoso.onmicrosoft.com`) is resolved via Microsoft's public OIDC discovery endpoint, no sign-in needed. Pass the tenant GUID directly if discovery fails.
 
