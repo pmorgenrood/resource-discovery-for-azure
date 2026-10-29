@@ -1438,3 +1438,45 @@ function Get-RunSummaryLogContent
 
     return $Lines.ToArray()
 }
+
+# ---- Consolidated zip check -------------------------------------------------
+
+# Returns $null when the consolidated zip at $Path opens and holds every
+# per-subscription zip named in $SubZipNames, otherwise one line saying why not.
+# Compress-Archive removes its destination when a write fails (a full disk does
+# this, also during -Update), so "the command finished" does not mean the zip is
+# there. Reads only the zip's directory, not the reports in it.
+function Get-ConsolidatedZipProblem
+{
+    param(
+        [string]$Path,
+        [string[]]$SubZipNames
+    )
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf))
+    {
+        return 'the zip is not on disk.'
+    }
+    try
+    {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try
+        {
+            $EntryNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Archive.Entries | ForEach-Object { $_.FullName }), [System.StringComparer]::Ordinal)
+        }
+        finally
+        {
+            $Archive.Dispose()
+        }
+    }
+    catch
+    {
+        return ('the zip cannot be read: {0}' -f $_.Exception.Message)
+    }
+    $Missing = @($SubZipNames | Where-Object { -not $EntryNames.Contains($_) })
+    if ($Missing.Count -gt 0)
+    {
+        return ('{0} of the {1} per-subscription zip(s) are not in it.' -f $Missing.Count, @($SubZipNames).Count)
+    }
+    return $null
+}
