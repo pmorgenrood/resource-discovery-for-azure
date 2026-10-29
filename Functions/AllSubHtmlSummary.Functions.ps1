@@ -468,8 +468,8 @@ $ChartsHtml
 #      target) and Inventory_*.json (the summary's input). The per-sub HTML is
 #      self-contained, so navigation works without the bulky csv/metrics members.
 #   3. Build MainSummary.html in -OutputDirectory (links now resolve on disk).
-#   4. Optionally (-PackageZip) zip that folder into a portable bundle whose
-#      links survive being moved/emailed.
+#   4. Optionally (-PackageZip) zip the summary and the folders reconstructed
+#      in step 2 into a portable bundle whose links survive being moved/emailed.
 #
 # Backward-compatible: works on any consolidated zip, old or new, because it only
 # relies on the long-standing inner-zip layout. Falls back to already-extracted
@@ -549,6 +549,8 @@ function New-RdaAllSubHtmlSummaryFromZip
                 Where-Object { $_.Name -notlike '*_revealed*' })
 
         $Reconstructed = 0
+        # Folders this call writes; -PackageZip bundles only these.
+        $ReconstructedDirs = New-Object System.Collections.Generic.List[string]
         foreach ($InnerZip in $InnerZips)
         {
             # Folder named after the inner zip base (ResourcesReport_<stamp>), which
@@ -572,6 +574,7 @@ function New-RdaAllSubHtmlSummaryFromZip
                 }
             }
             finally { $Archive.Dispose() }
+            if (-not $ReconstructedDirs.Contains($Dest)) { $ReconstructedDirs.Add($Dest) }
             $Reconstructed++
         }
 
@@ -588,6 +591,7 @@ function New-RdaAllSubHtmlSummaryFromZip
                 $Dest = Join-Path $OutputDirectory $Ef.Name
                 New-Item -ItemType Directory -Path $Dest -Force | Out-Null
                 foreach ($F in $Files) { Copy-Item -LiteralPath $F.FullName -Destination (Join-Path $Dest $F.Name) -Force }
+                if (-not $ReconstructedDirs.Contains($Dest)) { $ReconstructedDirs.Add($Dest) }
                 $Reconstructed++
             }
         }
@@ -651,13 +655,22 @@ function New-RdaAllSubHtmlSummaryFromZip
     Write-Host ("Reconstructed {0} per-subscription report(s) into: {1}" -f $Reconstructed, $OutputDirectory) -ForegroundColor Green
     Write-Host ("Open this summary (links resolve from here): {0}" -f $HtmlFile) -ForegroundColor Green
 
-    # Optional portable bundle: zip the reconstructed folder so the summary and
-    # its per-sub reports travel together with working links.
+    # Optional portable bundle: the summary and the per-sub folders this call
+    # reconstructed, so they travel together with working links. Only those:
+    # -OutputDirectory may already hold other files (other bundles' reports, a
+    # dictionary, the wrapper's .resume-state-*.json), and a wildcard over the
+    # folder takes them too; on Windows a leading dot does not hide a file.
     if ($PackageZip)
     {
         $PackageZipPath = $OutputDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar) + '.zip'
         if (Test-Path -LiteralPath $PackageZipPath) { Remove-Item -LiteralPath $PackageZipPath -Force -ErrorAction SilentlyContinue }
-        Compress-Archive -Path (Join-Path $OutputDirectory '*') -DestinationPath $PackageZipPath -Force
+        $PackageItems = @($ReconstructedDirs)
+        $HtmlFullPath = (Resolve-Path -LiteralPath $HtmlFile).Path
+        if ((Split-Path -Path $HtmlFullPath -Parent) -eq $OutputDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar))
+        {
+            $PackageItems = @($HtmlFullPath) + $PackageItems
+        }
+        Compress-Archive -LiteralPath $PackageItems -DestinationPath $PackageZipPath -Force
         Write-Host ("Portable summary bundle (links survive extraction): {0}" -f $PackageZipPath) -ForegroundColor Green
     }
 
