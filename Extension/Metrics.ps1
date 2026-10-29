@@ -1026,7 +1026,9 @@ if ($Task -eq 'Processing')
     $ErrorCount = $DiagOutcomeCounts['Error']
 
     Write-MetricsDiag ("===== Metrics phase summary =====")
-    Write-MetricsDiag ("Total calls: {0} | Success: {1} | Timeout: {2} | Throttled: {3} | Error: {4} | Elapsed: {5}s" -f $DiagTotal, $OkCount, $TimeoutCount, $ThrottledCount, $ErrorCount, [math]::Round($PhaseStopwatch.Elapsed.TotalSeconds, 1))
+    # Outcomes are recorded per metric definition; one request can answer several,
+    # so the request count is reported on the next line.
+    Write-MetricsDiag ("Metric definitions: {0} | Success: {1} | Timeout: {2} | Throttled: {3} | Error: {4} | Elapsed: {5}s" -f $DiagTotal, $OkCount, $TimeoutCount, $ThrottledCount, $ErrorCount, [math]::Round($PhaseStopwatch.Elapsed.TotalSeconds, 1))
     Write-MetricsDiag ("Azure Monitor requests: {0} for {1} metric definition(s), of which {2} single-metric fallback request(s); retries not counted" -f $MetricRequestCounts[0], $MetricCount, $MetricRequestCounts[1])
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
