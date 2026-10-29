@@ -295,6 +295,19 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         $Printed | Should -Contain ('The per-subscription report zips of this run are still on disk under {0}.' -f $InventoryRoot)
     }
 
+    It 'the banner says to run again with -Resume while the resume state is kept, and only to run again without one' {
+        $InventoryRoot = Join-Path $TestDrive 'inv'
+        $BundleBuildError = 'x was lost while the run summary was added to it: the zip is not on disk.'
+        $ResumeStateFile = Join-Path $TestDrive '.resume-state-t.json'
+        Set-Content -LiteralPath $ResumeStateFile -Value '{}'
+        $Kept = @(. $script:BannerBlock 6>&1 | ConvertTo-Lines)
+        $Kept | Should -Contain 'Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again.'
+        Remove-Item -LiteralPath $ResumeStateFile -Force
+        $None = @(. $script:BannerBlock 6>&1 | ConvertTo-Lines)
+        $None | Should -Contain 'Fix the cause (for example, free up disk space), then run again.'
+        $None | Should -Not -Contain 'Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again.'
+    }
+
     It 'no banner when the zip was built' {
         Set-Variable -Name InventoryRoot -Value (Join-Path $TestDrive 'inv')
         Set-Variable -Name BundleBuildError -Value $null

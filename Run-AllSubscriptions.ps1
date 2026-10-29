@@ -1996,53 +1996,6 @@ $RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
 # the state only when a run collects them (without -Resume, or the subscription
 # on its own) or they are no longer visible.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
-# The per-stream files this run read and folded in at startup are deleted with
-# it: their records belong to the run this one has just finished, and a later
-# -Resume or -ResumeFailedOnly would otherwise recover them again, skipping a
-# subscription an old file lists as completed or retrying one from an old
-# failure record. After the parallel merge above they are the files its
-# streams wrote. A run in which a per-stream file could not be read is not a
-# clean run, so it says so instead.
-$ResumeStateClearTried = $false
-# A consolidated zip that could not be built keeps the state too: the next
-# -Resume then skips the completed subscriptions and carries their reports
-# into a new zip instead of collecting them all again (exit 2 says why).
-if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $null -eq $BundleBuildError -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
-{
-    $ResumeStateClearTried = $true
-    try
-    {
-        # The per-stream files first, then the resume state file, each removal
-        # checked (Remove-ResumeStateFiles). While one is left the resume state
-        # is kept and the run does not say it cleared the state.
-        $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
-        $FoldedStreamFiles = @()
-        $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
-        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
-        {
-            Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
-        }
-    }
-    catch
-    {
-        Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
-    }
-}
-# When the resume state is kept, the per-stream files folded in at startup (or
-# that this run's streams wrote) are deleted too, but only once the resume
-# state file on disk holds every record they gave: the startup fold, the merge
-# and each later change wrote it. If it does not (a write failed, or it cannot
-# be read back), they are kept and named, and a later -Resume folds them in
-# again (Invoke-FoldedStreamStateCleanup).
-if (-not $ResumeStateClearTried)
-{
-    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
-    $FoldedStreamFiles = @()
-}
-
-# A run that could not read a per-stream state file is not a clean run: say
-# whether the state was cleared or kept, and where that file went.
-Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
 
 # Final summary
 $Elapsed = (Get-Date) - $RunStartTime
@@ -2401,6 +2354,59 @@ if ($null -ne $OuterZipFile)
     }
 }
 
+# The resume state is decided here, after the last check of the consolidated
+# zip: the fold above can still lose it (a full disk), and a run whose zip is
+# lost must keep the state, so the next -Resume carries the reports on disk
+# into a new zip instead of collecting every subscription again.
+# The per-stream files this run read and folded in at startup are deleted with
+# it: their records belong to the run this one has just finished, and a later
+# -Resume or -ResumeFailedOnly would otherwise recover them again, skipping a
+# subscription an old file lists as completed or retrying one from an old
+# failure record. After the parallel merge above they are the files its
+# streams wrote. A run in which a per-stream file could not be read is not a
+# clean run, so it says so instead.
+$ResumeStateClearTried = $false
+# A consolidated zip that could not be built, or was lost while the run
+# summary was added to it, keeps the state too: the next
+# -Resume then skips the completed subscriptions and carries their reports
+# into a new zip instead of collecting them all again (exit 2 says why).
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $null -eq $BundleBuildError -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
+{
+    $ResumeStateClearTried = $true
+    try
+    {
+        # The per-stream files first, then the resume state file, each removal
+        # checked (Remove-ResumeStateFiles). While one is left the resume state
+        # is kept and the run does not say it cleared the state.
+        $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
+        $FoldedStreamFiles = @()
+        $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
+        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
+        {
+            Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+        }
+    }
+    catch
+    {
+        Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
+    }
+}
+# When the resume state is kept, the per-stream files folded in at startup (or
+# that this run's streams wrote) are deleted too, but only once the resume
+# state file on disk holds every record they gave: the startup fold, the merge
+# and each later change wrote it. If it does not (a write failed, or it cannot
+# be read back), they are kept and named, and a later -Resume folds them in
+# again (Invoke-FoldedStreamStateCleanup).
+if (-not $ResumeStateClearTried)
+{
+    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
+    $FoldedStreamFiles = @()
+}
+
+# A run that could not read a per-stream state file is not a clean run: say
+# whether the state was cleared or kept, and where that file went.
+Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
+
 # The consolidated zip is the run's output. When it could not be built, or was
 # lost afterwards, this banner says so after the summary and the run exits 2
 # below, even though every per-subscription report was written.
@@ -2410,7 +2416,16 @@ if ($null -ne $BundleBuildError)
     Write-Host "================ FAILED (consolidated zip) ================" -ForegroundColor Red
     Write-Host $BundleBuildError -ForegroundColor Red
     Write-Host ("The per-subscription report zips of this run are still on disk under {0}." -f $InventoryRoot) -ForegroundColor Red
-    Write-Host "Fix the cause (for example, free up disk space), then run again." -ForegroundColor Red
+    # The resume state is kept on this path (see above), so a -Resume carries
+    # the reports into a new zip; without a state file it would collect them.
+    if ($ResumeStateFile -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+    {
+        Write-Host "Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again." -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host "Fix the cause (for example, free up disk space), then run again." -ForegroundColor Red
+    }
     Write-Host "=========================================================" -ForegroundColor Red
 }
 

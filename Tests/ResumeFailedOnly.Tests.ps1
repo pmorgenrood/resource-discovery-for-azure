@@ -69,11 +69,16 @@ $Global:ResourceCount = 1
     # The resume-state cleanup: every statement after the main-summary build up to
     # and including the clean-run clear.
     $MainSummaryAt = script:Find-TopIndex -What 'the main-summary build' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text -match 'New-RdaAllSubHtmlSummary -RunOutputDirectory' }
-    $ClearAt = script:Find-TopIndex -After $MainSummaryAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
-    $CleanupText = script:Join-Top -From ($MainSummaryAt + 1) -To $ClearAt
+    # The clear comes after the last check of the consolidated zip, so it is
+    # lifted on its own: the statements up to the retry-owed count, then the
+    # clear from the statement that starts it.
+    $OwedAt = script:Find-TopIndex -After $MainSummaryAt -What 'the retry-owed count' -Match { param($s) $s.Extent.Text.StartsWith('$RetryOwedCount = ') }
+    $ClearStartAt = script:Find-TopIndex -After $OwedAt -What 'the start of the resume-state clear' -Match { param($s) $s.Extent.Text -eq '$ResumeStateClearTried = $false' }
+    $ClearAt = script:Find-TopIndex -After $ClearStartAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
+    $CleanupText = (script:Join-Top -From ($MainSummaryAt + 1) -To $OwedAt) + "`n" + (script:Join-Top -From $ClearStartAt -To $ClearAt)
 
     # The summary's retry advice: from the failed-subscriptions block to the execution time.
-    $AdviceAt = script:Find-TopIndex -After $ClearAt -What 'the failed-subscriptions summary' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Clauses[0].Item1.Extent.Text -eq '$FailedSubscriptions.Count -gt 0' -and $s.Extent.Text.Contains('Subscriptions Failed:') }
+    $AdviceAt = script:Find-TopIndex -After $OwedAt -What 'the failed-subscriptions summary' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Clauses[0].Item1.Extent.Text -eq '$FailedSubscriptions.Count -gt 0' -and $s.Extent.Text.Contains('Subscriptions Failed:') }
     $TimeAt = script:Find-TopIndex -After $AdviceAt -What 'the execution-time line' -Match { param($s) $s.Extent.Text.StartsWith('Write-Host ("Execution Time:') }
     $AdviceText = script:Join-Top -From $AdviceAt -To $TimeAt
 

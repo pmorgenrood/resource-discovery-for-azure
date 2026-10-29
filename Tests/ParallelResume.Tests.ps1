@@ -172,6 +172,36 @@ function Get-UsageAggregates
     }
 
 
+    # For the runs that ask for it, a copy of these modules whose Az.Accounts
+    # (which the wrapper and each stream import) also defines a global
+    # Compress-Archive in place of the real one: Compress-Archive -Update, the call that
+    # adds the run summary to the consolidated zip, removes the zip and fails,
+    # as on a full disk, while the scenario says LoseZipOnFold. Every other call
+    # goes to the real cmdlet.
+    $script:LoseZipModules = Join-Path $script:TestBase 'lose-zip-modules'
+    Copy-Item -LiteralPath $script:Modules -Destination $script:LoseZipModules -Recurse -Force
+    $LoseZip = @'
+
+# Compress-Archive is itself a function of Microsoft.PowerShell.Archive, so that
+# module is loaded first and this one defined after it; the real one is then
+# called through its command object, which loads nothing again.
+Import-Module Microsoft.PowerShell.Archive -Global
+$global:RdaRealCompressArchive = (Get-Module Microsoft.PowerShell.Archive | Select-Object -First 1).ExportedCommands['Compress-Archive']
+function global:Compress-Archive
+{
+    [CmdletBinding()]
+    param([string[]]$Path, [string[]]$LiteralPath, [string]$DestinationPath, [string]$CompressionLevel, [switch]$Update, [switch]$Force, [switch]$PassThru)
+    if ($Update -and (Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json).LoseZipOnFold)
+    {
+        Remove-Item -LiteralPath $DestinationPath -Force
+        throw 'stand-in: No space left on device'
+    }
+    & $global:RdaRealCompressArchive @PSBoundParameters
+}
+'@
+    Add-Content -LiteralPath (Join-Path $script:LoseZipModules 'Az.Accounts/99.0.0/Az.Accounts.psm1') -Value $LoseZip -Encoding utf8
+    $script:LoseZipEnv = @{ PSModulePath = $script:LoseZipModules }
+
     $script:Subs = @{}
     foreach ($Letter in 'A', 'B', 'C', 'D', 'E', 'F') { $script:Subs[$Letter] = @{ Id = ('sub-' + $Letter.ToLowerInvariant()); Name = ('Sub ' + $Letter) } }
     # The automatic stream count is 2 on a host with 4 logical processors.
@@ -191,7 +221,7 @@ function Get-UsageAggregates
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @())
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [switch]$LoseZipOnFold)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -200,6 +230,7 @@ function Get-UsageAggregates
             HangIds       = @($Hang | ForEach-Object { & $Id $_ })
             NoZipIds      = @($NoZip | ForEach-Object { & $Id $_ })
             ReadOnlyAfterIds = @($ReadOnlyAfter | ForEach-Object { & $Id $_ })
+            LoseZipOnFold = [bool]$LoseZipOnFold
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -643,6 +674,42 @@ Describe 'A run that ends early leaves no per-stream file it folded in' -Skip:$I
             script:Get-RecoveryLines $R | Should -BeNullOrEmpty
             @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
         }
+    }
+}
+
+Describe 'A consolidated zip lost while the run summary is added to it keeps the resume state' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    # Run 1 loses the zip in the fold (the last write to it), after every report
+    # was written. Its state must survive, so run 2 (-Resume) collects nothing,
+    # carries the reports on disk into a new zip and clears the state; run 3
+    # (-Resume, no state left) is an ordinary full run that ends clean. Exit:
+    # the state clears in run 2, once a zip holds every report.
+    It 'run 1 exits 2 and keeps the state, run 2 rebuilds the zip from the reports on disk, run 3 ends clean (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        script:Set-Scenario -Subs 'A', 'B', 'C' -LoseZipOnFold
+        $R1 = script:Invoke-Wrapper -Streams $Streams -Environment $script:LoseZipEnv
+        $R1.ExitCode | Should -Be 2
+        @($R1.Text | Where-Object { $_ -like 'ERROR: *AllSubscriptions_ResourcesReport_*.zip was lost while the run summary was added to it: the zip is not on disk.' }).Count | Should -Be 1
+        script:Test-CleanLine $R1 | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:Root -File -Filter 'AllSubscriptions_*.zip') | Should -BeNullOrEmpty
+        (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again.'
+
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams -Environment $script:LoseZipEnv
+        script:Get-Collected $R2 | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Subscriptions Skipped:   3 (already completed)'
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        $R2.ExitCode | Should -Be 0
+        @(script:Get-NewestBundleReportIds | Sort-Object -Unique) | Should -Be (script:Get-Ids 'A', 'B', 'C')
+
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams -Environment $script:LoseZipEnv
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        $R3.ExitCode | Should -Be 0
     }
 }
 
