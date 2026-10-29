@@ -388,6 +388,9 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
         $R1.Text | Should -Contain 'Subscriptions Processed: 2'
         (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B', 'C')
         (script:Read-State).Failed | Should -Be (script:Get-Ids 'D')
+        # The consolidated zip carries the earlier reports of the skipped A and B
+        # next to C's, collected by this run.
+        @(script:Get-NewestBundleReportIds | Sort-Object -Unique) | Should -Be (script:Get-Ids 'A', 'B', 'C')
 
         # Run 2: only D is left; it goes on the one-subscription path and the state clears.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
@@ -399,8 +402,10 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
         script:Read-State | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
         $R2.ExitCode | Should -Be 0
-        # The consolidated zip of run 2 holds D's report, collected by this run.
+        # The consolidated zip of run 2 holds D's report, collected by this run,
+        # and the earlier reports of the three subscriptions it skipped.
         @(script:Get-NewestBundleReportIds | Where-Object { $_ -eq 'sub-d' }).Count | Should -Be 1
+        @(script:Get-NewestBundleReportIds | Sort-Object -Unique) | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
     }
 
     It 'after an interrupted run with more streams than the -Resume uses, and the next two runs end clean' {

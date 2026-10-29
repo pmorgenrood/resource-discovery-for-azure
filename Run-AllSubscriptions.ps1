@@ -1159,6 +1159,9 @@ else
         {
             Write-Host ("Skipping (already completed): {0} ({1})" -f $Sub.Name, $Sub.Id) -ForegroundColor DarkGray
             $SkippedCount++
+            # Recorded as the sequential loop does, so the end of the run carries
+            # its earlier report into the consolidated zip (the streams never see it).
+            $SkippedSubscriptions += [pscustomobject]@{ Id = $Sub.Id; Name = $Sub.Name }
             continue
         }
         $PendingSubscriptions += $Sub
