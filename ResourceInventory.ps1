@@ -1486,6 +1486,11 @@ function ExecuteInventoryProcessing()
         $ReportedStartTime = $script:ConsumptionWindow.Start
         $ReportedEndTime = $script:ConsumptionWindow.End
 
+        # Name of the report folder this run writes to, recorded on a consumption
+        # failure (and on the sign-in skip below) so the wrapper's main summary can
+        # mark that report's row.
+        $ConsumptionReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
+
         if (-not (Test-DataPlaneAuthReady -Phase 'Consumption'))
         {
             Write-Log -Message ('Consumption: SKIPPED - could not establish a usable Azure context/token after one reconnect attempt. Consumption was requested (no -SkipConsumption) but cannot be collected. Re-authenticate (Connect-AzAccount) or pass -appid/-secret/-tenant, then re-run. The rest of the inventory will continue.') -Severity 'Error'
@@ -1493,9 +1498,10 @@ function ExecuteInventoryProcessing()
             if ($null -eq $Global:ConsumptionRecordCount) { $Global:ConsumptionRecordCount = 0 }
             if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
             $Global:ConsumptionFailedSubs += [pscustomobject]@{
-                Name    = '(all subscriptions)'
-                Id      = '(auth)'
-                Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.'
+                Name         = '(all subscriptions)'
+                Id           = '(auth)'
+                Message      = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.'
+                ReportFolder = $ConsumptionReportFolder
             }
             return
         }
@@ -1543,6 +1549,7 @@ function ExecuteInventoryProcessing()
                     Complete         = $false
                     PageAtFailure    = 0
                     RecordsCollected = 0
+                    ReportFolder     = $ConsumptionReportFolder
                 }
 
                 continue
@@ -1718,6 +1725,7 @@ function ExecuteInventoryProcessing()
                     Complete         = $false
                     PageAtFailure    = $ConsumptionPageIndex
                     RecordsCollected = $ConsumptionRecordsThisSub
+                    ReportFolder     = $ConsumptionReportFolder
                 }
             }
         }
