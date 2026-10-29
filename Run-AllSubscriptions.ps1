@@ -835,7 +835,8 @@ if ($ResumeFailedOnly)
 # actually process (not already-completed ones) are checked; when the resume
 # state records some subscriptions in scope as completed, the run does not
 # stop even if none of the checked ones is readable: it skips them as above
-# and finishes with nothing left to collect. Runs once in the parent, before
+# and finishes with nothing left to collect, with one stream (see
+# $NothingLeftToCollect below). Runs once in the parent, before
 # the sequential/parallel split, so it gates both. The records
 # are kept for the end-of-run 0-resource labels.
 $AccessProbed = @()
@@ -920,7 +921,23 @@ $RamLabel = if ($AutoTune.RamGB -gt 0) { '{0} GB RAM' -f $AutoTune.RamGB } else 
 $StreamsSrc = if ($StreamsAuto) { 'auto' } else { 'explicit' }
 $ConcurrencySrc = if ($ConcurrencyAuto) { 'auto' } else { 'explicit' }
 Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundColor DarkGray
-Write-Host ("Parallelism: -ParallelStreams {0} ({1}), -ConcurrencyLimit {2} ({3}). Pass either flag to override." -f $ParallelStreams, $StreamsSrc, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+# On -Resume with nothing left to collect (the role check skipped every
+# subscription left to check, and the others were completed by an earlier
+# run), use one stream: the sequential loop skips the completed subscriptions,
+# while the parallel streams and the one-subscription path would collect them
+# again.
+$NothingLeftToCollect = $Resume -and $null -ne $AccessDecision -and $AccessDecision.ReadableCount -eq 0 -and $AccessDecision.CompletedCount -gt 0
+if ($NothingLeftToCollect -and $ParallelStreams -gt 1)
+{
+    $StreamsAsked = if ($StreamsAuto) { 'the {0} chosen automatically' -f $ParallelStreams } else { 'the {0} passed' -f $ParallelStreams }
+    Write-Host ("Parallelism: -ParallelStreams 1 (nothing is left to collect, so one stream instead of {0}), -ConcurrencyLimit {1} ({2})." -f $StreamsAsked, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+    $ParallelStreams = 1
+    $StreamsSrc = 'nothing left to collect'
+}
+else
+{
+    Write-Host ("Parallelism: -ParallelStreams {0} ({1}), -ConcurrencyLimit {2} ({3}). Pass either flag to override." -f $ParallelStreams, $StreamsSrc, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+}
 
 # Build passthrough hashtable for optional switches
 $InventoryPassthrough = @{}
@@ -1982,6 +1999,8 @@ elseif ($FailedAttempts.Count -gt 0)
     # them so the operator does not lose track of historical failures simply
     # because the most recent run was clean.
     Write-Host ("Pending Retries:         {0} subscription(s) from a prior run still in FailedAttempts" -f $FailedAttempts.Count) -ForegroundColor Yellow
+    # Any of them the role check skipped as not readable, with the fix.
+    Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green

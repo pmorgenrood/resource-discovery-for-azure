@@ -1003,9 +1003,9 @@ function Resolve-AccessPreflight
 # ($Decision.ShouldBlock), that the run stops. Prints only: the caller skips
 # them or exits with code 1. -ResourceGroup words the lines for that resource
 # group. -Resume words a stop of a -Resume run: the fix ends in running
-# -Resume again, and a last line says a run without -Resume stops too (a
-# -Resume run stops only when no subscription is recorded as completed, so
-# both check the same subscriptions).
+# -Resume again, and a last line says a run without -Resume checks the same
+# subscriptions (a -Resume run stops only when no subscription is recorded as
+# completed) and, when every cause is a missing role, that it stops too.
 function Write-AccessPreflightReport
 {
     param(
@@ -1093,7 +1093,18 @@ function Write-AccessPreflightReport
     }
     if ($Resume -and $Stopping)
     {
-        Write-Host '  A run without -Resume checks the same subscriptions, so it stops here too.' -ForegroundColor $Colour
+        # With nothing recorded as completed a run without -Resume checks the
+        # same subscriptions. Only a missing role is sure to stop it again: a
+        # check that could not finish, or answers that disagree after a role
+        # change, can pass on the next run.
+        if ($Causes.Count -eq 1 -and $Causes[0] -eq 'NoAccess')
+        {
+            Write-Host '  A run without -Resume checks the same subscriptions, so it stops here too.' -ForegroundColor $Colour
+        }
+        else
+        {
+            Write-Host '  A run without -Resume checks the same subscriptions.' -ForegroundColor $Colour
+        }
     }
 }
 
@@ -1114,6 +1125,25 @@ function Write-SkippedSubscriptionSummary
         Write-Host ('  - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
     }
     Write-Host '  To include them, fix the access as the start of the run says, then re-run.' -ForegroundColor Yellow
+}
+
+# Under the end-of-run "Pending Retries" line: the subscriptions on the retry
+# list that this run's role check skipped as not readable. -ResumeFailedOnly
+# checks access before it retries, so it cannot collect them until the
+# identity can read them. Prints nothing when none of them was skipped.
+function Write-PendingRetrySkippedSummary
+{
+    param($FailedAttempts, $Decision)
+    $RetryIds = @(@($FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $Skipped = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and $RetryIds -contains [string]$_.Id } })
+    if ($Skipped.Count -eq 0) { return }
+    Write-Host ('  {0} of them cannot be read by the signed-in identity, so this run skipped them:' -f $Skipped.Count) -ForegroundColor Yellow
+    foreach ($Sub in $Skipped)
+    {
+        $Label = if (-not [string]::IsNullOrEmpty([string]$Sub.Reason)) { [string]$Sub.Reason } else { 'not readable' }
+        Write-Host ('    - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
+    }
+    Write-Host '  Grant the identity Reader on these subscriptions before -ResumeFailedOnly can retry them.' -ForegroundColor Yellow
 }
 
 # After a consumption data check refusal, say per failing subscription what the
