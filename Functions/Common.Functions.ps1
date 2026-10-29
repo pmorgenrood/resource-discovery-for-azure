@@ -969,23 +969,30 @@ function Test-SubscriptionRoleAccessAll
 # Decide, from the up-front role check records, which subscriptions the run
 # skips and whether it may proceed. Pure (no Azure calls) so the policy is
 # unit-testable. A subscription is not readable unless its State is
-# 'Readable', so a record that is not understood is skipped too. Returns:
+# 'Readable', so a record that is not understood is skipped too.
+# -CompletedCount is the number of in-scope subscriptions that a -Resume run
+# skips because the resume state records them as completed (they are not
+# checked again; an earlier run wrote their reports). Returns:
 #   Inaccessible    - the records the identity cannot (or may not) read; the
 #                     run skips them
 #   InaccessibleIds - their ids, to drop from scope
 #   ReadableCount   - how many checked subscriptions are readable
-#   ShouldBlock     - $true when subscriptions were checked and none is
-#                     readable: the caller must STOP with exit code 1.
+#   CompletedCount  - -CompletedCount as passed
+#   ShouldBlock     - $true when subscriptions were checked, none is readable
+#                     and none was completed earlier: the caller must STOP
+#                     with exit code 1. With completed subscriptions in scope
+#                     the run skips the unreadable ones and finishes.
 function Resolve-AccessPreflight
 {
-    param([object]$Probed)
+    param([object]$Probed, [int]$CompletedCount = 0)
     $Checked = @(@($Probed) | Where-Object { $_ })
     $Inaccessible = @($Checked | Where-Object { $_.State -ne 'Readable' })
     return [pscustomobject]@{
         Inaccessible    = $Inaccessible
         InaccessibleIds = @($Inaccessible | ForEach-Object { $_.Id })
         ReadableCount   = $Checked.Count - $Inaccessible.Count
-        ShouldBlock     = ($Inaccessible.Count -gt 0 -and $Inaccessible.Count -eq $Checked.Count)
+        CompletedCount  = $CompletedCount
+        ShouldBlock     = ($Inaccessible.Count -gt 0 -and $Inaccessible.Count -eq $Checked.Count -and $CompletedCount -le 0)
     }
 }
 
@@ -995,13 +1002,17 @@ function Resolve-AccessPreflight
 # for each cause; then says they are skipped, or, when none is readable
 # ($Decision.ShouldBlock), that the run stops. Prints only: the caller skips
 # them or exits with code 1. -ResourceGroup words the lines for that resource
-# group.
+# group. -Resume words a stop of a -Resume run: the fix ends in running
+# -Resume again, and a last line says a run without -Resume stops too (a
+# -Resume run stops only when no subscription is recorded as completed, so
+# both check the same subscriptions).
 function Write-AccessPreflightReport
 {
     param(
         [Parameter(Mandatory = $true)]$Decision,
         [Parameter(Mandatory = $true)][int]$ScopeCount,
-        [string]$ResourceGroup
+        [string]$ResourceGroup,
+        [switch]$Resume
     )
     $ForResourceGroup = -not [string]::IsNullOrEmpty($ResourceGroup)
     $Inaccessible = @($Decision.Inaccessible)
@@ -1035,11 +1046,13 @@ function Write-AccessPreflightReport
     # The fix depends on why each subscription failed: a missing role
     # (NoAccess, including NotFound for a resource group run), a check that
     # could not finish (Unknown), or the two answers disagreeing (Disagree).
-    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' } else { 'Grant the identity Reader on these subscriptions, then re-run.' }
+    $Stopping = [bool]$Decision.ShouldBlock
+    $ReRun = if ($Resume -and $Stopping) { 'run -Resume again' } else { 're-run' }
+    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then {0}.' -f $ReRun } else { 'Grant the identity Reader on these subscriptions, then {0}.' -f $ReRun }
     $Remedies = [ordered]@{
         NoAccess = $NoAccessText
-        Unknown  = 'The role check could not finish (the reason above says why); re-run.'
-        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.'
+        Unknown  = 'The role check could not finish (the reason above says why); {0}.' -f $ReRun
+        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then {0}.' -f $ReRun
     }
     $ByCause = [ordered]@{}
     foreach ($NA in $Inaccessible)
@@ -1049,10 +1062,17 @@ function Write-AccessPreflightReport
         $ByCause[$Cause] += [string]$NA.Name
     }
     $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
-    if ($Decision.ShouldBlock)
+    if ($Stopping)
     {
         $Lead = '  No subscription is readable. Stopping before any work.'
         $Colour = 'Red'
+    }
+    elseif ($Decision.ReadableCount -eq 0 -and $Decision.CompletedCount -gt 0)
+    {
+        # -Resume with every subscription left to check unreadable: the
+        # subscriptions an earlier run completed are skipped as done.
+        $Lead = '  Skipping them and finishing the run: the other {0} subscription(s) were completed by an earlier run, so nothing is left to collect. To include them:' -f $Decision.CompletedCount
+        $Colour = 'Yellow'
     }
     else
     {
@@ -1070,6 +1090,10 @@ function Write-AccessPreflightReport
         {
             Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
         }
+    }
+    if ($Resume -and $Stopping)
+    {
+        Write-Host '  A run without -Resume checks the same subscriptions, so it stops here too.' -ForegroundColor $Colour
     }
 }
 

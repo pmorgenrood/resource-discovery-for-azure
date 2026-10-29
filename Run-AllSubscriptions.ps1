@@ -832,8 +832,11 @@ if ($ResumeFailedOnly)
 # end of the run (Write-SkippedSubscriptionSummary). When none of the checked
 # subscriptions is readable the run stops with exit 1. -AllowPartialAccess is
 # accepted and changes nothing. On -Resume only the subscriptions this run will
-# actually process (not already-completed ones) are checked. Runs once in the
-# parent, before the sequential/parallel split, so it gates both. The records
+# actually process (not already-completed ones) are checked; when the resume
+# state records some subscriptions in scope as completed, the run does not
+# stop even if none of the checked ones is readable: it skips them as above
+# and finishes with nothing left to collect. Runs once in the parent, before
+# the sequential/parallel split, so it gates both. The records
 # are kept for the end-of-run 0-resource labels.
 $AccessProbed = @()
 $AccessDecision = $null
@@ -842,8 +845,9 @@ if ($ScopeForProbe.Count -gt 0)
 {
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $ScopeForProbe.Count) -ForegroundColor Cyan
     $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ScopeForProbe -IncludeUsage:(-not $SkipConsumption))
-    $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed
-    Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount $ScopeForProbe.Count
+    # The subscriptions left out of the check are the completed ones (-Resume only).
+    $AccessDecision = Resolve-AccessPreflight -Probed $AccessProbed -CompletedCount (@($Subscriptions).Count - $ScopeForProbe.Count)
+    Write-AccessPreflightReport -Decision $AccessDecision -ScopeCount $ScopeForProbe.Count -Resume:$Resume
     if ($AccessDecision.ShouldBlock)
     {
         Exit-Wrapper -Code 1

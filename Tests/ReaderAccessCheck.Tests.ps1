@@ -691,6 +691,20 @@ Describe 'Resolve-AccessPreflight' {
         $D.ReadableCount | Should -Be 1
         (Resolve-AccessPreflight -Probed @($Probed[1], $Probed[2])).ShouldBlock | Should -BeTrue
     }
+
+    It 'does not block when none is readable but subscriptions recorded as completed are in scope (-Resume)' {
+        $NoneReadable = @(
+            [pscustomobject]@{ Id = 's2'; State = 'NoAccess' }
+            [pscustomobject]@{ Id = 's3'; State = 'Unknown' }
+        )
+        $D = Resolve-AccessPreflight -Probed $NoneReadable -CompletedCount 1
+        $D.ShouldBlock | Should -BeFalse
+        $D.InaccessibleIds | Should -Be @('s2', 's3')
+        $D.ReadableCount | Should -Be 0
+        $D.CompletedCount | Should -Be 1
+        (Resolve-AccessPreflight -Probed $NoneReadable -CompletedCount 0).ShouldBlock | Should -BeTrue
+        (Resolve-AccessPreflight -Probed $NoneReadable).ShouldBlock | Should -BeTrue -Because 'a run that skips no completed subscription still stops'
+    }
 }
 
 Describe 'Write-AccessPreflightReport' {
@@ -769,6 +783,45 @@ Describe 'Write-AccessPreflightReport' {
         $Decision.ReadableCount = 0
         Write-AccessPreflightReport -Decision $Decision -ScopeCount 3
         $script:Lines[4] | Should -Be '  No subscription is readable. Stopping before any work.'
+    }
+
+    It 'on -Resume with only completed subscriptions besides these, skips them and finishes the run' {
+        $Decision = [pscustomobject]@{ Inaccessible = $script:Blocked.Inaccessible; InaccessibleIds = @('sub-b'); ReadableCount = 0; CompletedCount = 2; ShouldBlock = $false }
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 1 -Resume
+        @($script:Lines) | Should -Be @(
+            '  1 subscription(s) are NOT readable by the signed-in identity:'
+            '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
+            '  Skipping them and finishing the run: the other 2 subscription(s) were completed by an earlier run, so nothing is left to collect. To include them: Grant the identity Reader on these subscriptions, then re-run.'
+        )
+    }
+
+    It 'on a -Resume stop, ends each fix in running -Resume again and says a run without -Resume stops too' {
+        Write-AccessPreflightReport -Decision $script:Blocked -ScopeCount 1 -Resume
+        @($script:Lines) | Should -Be @(
+            '  1 subscription(s) are NOT readable by the signed-in identity:'
+            '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
+            '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then run -Resume again.'
+            '  A run without -Resume checks the same subscriptions, so it stops here too.'
+        )
+        $script:Lines.Clear()
+        $Decision = [pscustomobject]@{
+            Inaccessible    = @(
+                [pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo'; State = 'Unknown'; Reason = 'reason' }
+                [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie'; State = 'NoAccess'; Reason = 'reason' }
+                [pscustomobject]@{ Id = 'sub-d'; Name = 'Delta'; State = 'Disagree'; Reason = 'reason' }
+            )
+            InaccessibleIds = @('sub-b', 'sub-c', 'sub-d')
+            ReadableCount   = 0
+            ShouldBlock     = $true
+        }
+        Write-AccessPreflightReport -Decision $Decision -ScopeCount 3 -Resume
+        @($script:Lines | Select-Object -Skip 4) | Should -Be @(
+            '  No subscription is readable. Stopping before any work.'
+            '    Charlie: Grant the identity Reader on these subscriptions, then run -Resume again.'
+            '    Bravo: The role check could not finish (the reason above says why); run -Resume again.'
+            '    Delta: The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then run -Resume again.'
+            '  A run without -Resume checks the same subscriptions, so it stops here too.'
+        )
     }
 }
 
@@ -972,6 +1025,42 @@ Describe 'Run-AllSubscriptions.ps1 up-front role check' {
         $script:CompletedIds = @('sub-b', 'sub-c')
         { . $script:GateBlock } | Should -Not -Throw
         @($script:Calls | Where-Object { $_ -like 'roles *' }) | Should -Be @('roles sub-a')
+    }
+
+    It 'on -Resume does not stop when every subscription left to check is unreadable and the others were completed' {
+        $script:Resume = $true
+        $script:CompletedIds = @('sub-a')
+        . $script:GateBlock
+        Should -Invoke Exit-Wrapper -Times 0 -Exactly
+        @($Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
+        @($AccessDecision.InaccessibleIds) | Should -Be @('sub-b', 'sub-c')
+        @($script:Lines | Where-Object { $_ -notlike '  `[*' }) | Should -Be @(
+            'Verifying subscription access up front for 2 subscription(s)...'
+            '  2 subscription(s) are NOT readable by the signed-in identity:'
+            '    - Bravo (sub-b) - no role grants read access (roles visible: Reader at a resource group)'
+            '    - Charlie (sub-c) - role check inconclusive after retries (caller permissions: HTTP 429)'
+            '  Skipping them and finishing the run: the other 1 subscription(s) were completed by an earlier run, so nothing is left to collect. To include them:'
+            '    Bravo: Grant the identity Reader on these subscriptions, then re-run.'
+            '    Charlie: The role check could not finish (the reason above says why); re-run.'
+        )
+    }
+
+    It 'stops with exit 1 when none is readable without -Resume, even with completed subscriptions recorded' {
+        $script:CompletedIds = @('sub-b')
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' })
+        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+        $script:Lines | Should -Contain '    Bravo: Grant the identity Reader on these subscriptions, then re-run.'
+        ($script:Lines -join "`n") | Should -Not -Match '-Resume'
+    }
+
+    It 'on -Resume stops with exit 1 when none is readable and no subscription in scope is recorded as completed' {
+        $script:Resume = $true
+        # A completed subscription that is no longer in scope does not count.
+        $script:CompletedIds = @('sub-gone')
+        $script:Subscriptions = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Bravo' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'Charlie' })
+        { . $script:GateBlock } | Should -Throw 'EXIT 1'
+        $script:Lines | Should -Contain '    Bravo: Grant the identity Reader on these subscriptions, then run -Resume again.'
+        $script:Lines[-1] | Should -Be '  A run without -Resume checks the same subscriptions, so it stops here too.'
     }
 }
 
@@ -1372,5 +1461,378 @@ Describe 'Write-SkippedSubscriptionSummary (end-of-run list)' {
         # exit 4 check: its comment lines, the failure count and one exit line.
         $ExitFourCheck = '(\r?\n)+(#[^\r\n]*\r?\n)*\$CollectorFailureCount = [^\r\n]*\r?\nif \([^\r\n]*\) \{ exit 4 \}'
         $Direct | Should -Match ([regex]::Escape('Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity ''Success''') + '\s*\r?\n(#[^\n]*\n)*' + [regex]::Escape('Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult') + '\r?\n' + [regex]::Escape('Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped') + '(' + $ExitFourCheck + ')?$')
+    }
+}
+
+# End to end with Run-AllSubscriptions.ps1 itself: each run is the real wrapper,
+# started as its own pwsh process (stdin closed) from a copy of the tool whose
+# ResourceInventory.ps1 is a stand-in that writes one report folder and zip per
+# subscription, as the real one does. Azure is a set of stand-in Az modules and
+# an az command, found first on the module path and PATH of that process, which
+# answer from a scenario file: the subscriptions, the ones that cannot be read,
+# the ones that fail and the one whose collection the session ends in. The
+# process's home is a scratch folder, so the run writes its inventory root
+# under it. On Windows the wrapper writes to C:\InventoryReports instead, so
+# these tests do not run there.
+Describe 'Run-AllSubscriptions.ps1 -Resume when every subscription left to check is not readable' -Skip:$IsWindows {
+    BeforeAll {
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { '/tmp' }
+        $script:WrapperBase = Join-Path $TmpBase ('ReaderAccessResumeTest_' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:WrapperBase -Force | Out-Null
+        $script:WrapperTenant = '12345678-1234-1234-1234-123456789012'
+
+        $ToolRoot = Join-Path $script:WrapperBase 'tool'
+        New-Item -ItemType Directory -Path $ToolRoot -Force | Out-Null
+        foreach ($Item in @('Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1', 'Version.json', 'Functions', 'Extension'))
+        {
+            Copy-Item -LiteralPath (Join-Path $script:RepoRoot $Item) -Destination $ToolRoot -Recurse -Force
+        }
+        $script:WrapperScript = Join-Path $ToolRoot 'Run-AllSubscriptions.ps1'
+        @'
+param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit, [string]$ConsumptionWindowStart, [string]$ConsumptionWindowEnd)
+$Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
+# The session ends while this subscription is collected.
+if (@($Scenario.EndSessionIds) -contains $SubscriptionID) { [Environment]::Exit(137) }
+if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
+$Root = Join-Path $HOME 'InventoryReports'
+$Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + $SubscriptionID
+$Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
+$Stage = Join-Path $Root ('stage-' + $Stamp)
+New-Item -ItemType Directory -Path $Folder, $Stage -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $Stage ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value ('{"VirtualMachines":[{"Name":"vm","Subscription":"' + $SubscriptionID + '"}]}') -Encoding utf8
+Set-Content -LiteralPath (Join-Path $Stage ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
+$Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
+Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+Copy-Item -Path (Join-Path $Stage '*') -Destination $Folder
+Remove-Item -LiteralPath $Stage -Recurse -Force
+$Global:ZipOutputFile = $Zip
+$Global:Resources = @(1)
+$Global:ResourceCount = 1
+'@ | Set-Content -LiteralPath (Join-Path $ToolRoot 'ResourceInventory.ps1') -Encoding utf8
+
+        # Az.Accounts answers sign-in, context, token and subscription calls, and
+        # the Resource Manager paths the up-front checks read, by subscription:
+        # role assignments (none visible when not readable) and their
+        # definitions, caller permissions (none when not readable), Resource
+        # Graph resource counts and usage aggregates (one row above zero).
+        $script:WrapperModules = Join-Path $script:WrapperBase 'modules'
+        $Accounts = @'
+function Get-RdaStandInScenario { Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json }
+function Get-RdaStandInContext
+{
+    [pscustomobject]@{
+        Account      = [pscustomobject]@{ Id = 'operator@example.com'; Type = 'User' }
+        Tenant       = [pscustomobject]@{ Id = (Get-RdaStandInScenario).Tenant }
+        Subscription = $null
+        Environment  = [pscustomobject]@{ Name = 'AzureCloud'; ResourceManagerUrl = 'https://management.azure.com/' }
+    }
+}
+function Get-AzContext { [CmdletBinding()] param() Get-RdaStandInContext }
+function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context) Get-RdaStandInContext }
+function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
+function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
+function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
+function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
+function Get-AzAccessToken
+{
+    [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString)
+    $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"stand-in-caller"}')).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    [pscustomobject]@{ Token = ('e30.{0}.c2ln' -f $Claims); Type = 'Bearer'; ExpiresOn = (Get-Date).AddHours(1) }
+}
+function Get-AzSubscription
+{
+    [CmdletBinding()] param($TenantId, $SubscriptionId)
+    $Scenario = Get-RdaStandInScenario
+    @($Scenario.Subscriptions | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = $_.State; TenantId = $Scenario.Tenant } })
+}
+function Invoke-AzRestMethod
+{
+    [CmdletBinding()] param([string]$Method = 'GET', [string]$Path, [string]$Payload)
+    $Unreadable = @((Get-RdaStandInScenario).Unreadable)
+    $Answer = { param([int]$Status, $Body) [pscustomobject]@{ StatusCode = $Status; Content = (ConvertTo-Json -InputObject $Body -Depth 8 -Compress); Headers = @{} } }
+    if ($Path -match '^/subscriptions/([^/?]+)/resourcegroups\?')
+    {
+        if ($Unreadable -contains $Matches[1]) { return & $Answer 403 @{ error = @{ code = 'AuthorizationFailed'; message = 'stand-in: no role' } } }
+        return & $Answer 200 @{ value = @() }
+    }
+    if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/roleAssignments\?')
+    {
+        $Id = $Matches[1]
+        if ($Unreadable -contains $Id) { return & $Answer 200 @{ value = @() } }
+        return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/stand-in-reader" } }) }
+    }
+    if ($Path -match '/providers/Microsoft\.Authorization/roleDefinitions/[^/?]+\?')
+    {
+        return & $Answer 200 @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } }
+    }
+    if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?')
+    {
+        if ($Unreadable -contains $Matches[1]) { return & $Answer 200 @{ value = @() } }
+        return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) }
+    }
+    if ($Method -eq 'POST' -and $Path -like '/providers/Microsoft.ResourceGraph/resources*')
+    {
+        $Ids = @(($Payload | ConvertFrom-Json).subscriptions)
+        return & $Answer 200 @{ data = @($Ids | ForEach-Object { @{ subscriptionId = $_; ResourceCount = 1 } }) }
+    }
+    if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Commerce/UsageAggregates\?')
+    {
+        return & $Answer 200 @{ value = @(@{ properties = @{ quantity = 1.5; meterCategory = 'Stand-in'; instanceData = '' } }) }
+    }
+    return & $Answer 404 @{ error = @{ code = 'NotFound'; message = 'stand-in: no answer for this path' } }
+}
+'@
+        $Billing = @'
+function Get-UsageAggregates
+{
+    [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, [switch]$ShowDetails, $ContinuationToken)
+    [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null }
+}
+'@
+        foreach ($Module in @(@{ Name = 'Az.Accounts'; Body = $Accounts }, @{ Name = 'Az.Billing'; Body = $Billing }, @{ Name = 'Az.Compute'; Body = '' }, @{ Name = 'Az.Monitor'; Body = '' }))
+        {
+            $Dir = Join-Path $script:WrapperModules (Join-Path $Module.Name '99.0.0')
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psm1')) -Value $Module.Body -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psd1')) -Value ("@{{ ModuleVersion = '99.0.0'; RootModule = '{0}.psm1'; FunctionsToExport = '*' }}" -f $Module.Name) -Encoding utf8
+        }
+
+        # The az command: signed in to the scenario's tenant, with a token.
+        $script:WrapperBin = Join-Path $script:WrapperBase 'bin'
+        New-Item -ItemType Directory -Path $script:WrapperBin -Force | Out-Null
+        @'
+$Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
+if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'show') { [pscustomobject]@{ tenantId = $Scenario.Tenant } | ConvertTo-Json -Compress; exit 0 }
+if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'get-access-token') { exit 0 }
+exit 1
+'@ | Set-Content -LiteralPath (Join-Path $script:WrapperBin 'az.ps1') -Encoding utf8
+
+        $script:SubA = @{ Id = 'sub-a'; Name = 'Sub A' }
+        $script:SubB = @{ Id = 'sub-b'; Name = 'Sub B' }
+        $script:SubX = @{ Id = 'sub-x-not-readable'; Name = 'Sub X' }
+
+        # A fresh home (its InventoryReports folder is the run's inventory root),
+        # or an earlier one again.
+        function script:Use-WrapperCase
+        {
+            param([string]$CaseHome)
+            if (-not $CaseHome)
+            {
+                $CaseHome = Join-Path $script:WrapperBase ([guid]::NewGuid().ToString().Substring(0, 8))
+                New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
+            }
+            $script:CaseHome = $CaseHome
+            $script:CaseRoot = Join-Path $CaseHome 'InventoryReports'
+            $script:CaseScenario = Join-Path $CaseHome 'scenario.json'
+            $script:CaseState = Join-Path $script:CaseRoot ('.resume-state-{0}.json' -f $script:WrapperTenant)
+        }
+
+        function script:Set-WrapperScenario
+        {
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @())
+            [pscustomobject]@{
+                Tenant        = $script:WrapperTenant
+                Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
+                Unreadable    = @($Unreadable)
+                FailIds       = @($Fail)
+                EndSessionIds = @($EndSession)
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
+        }
+
+        # One run of the wrapper as its own process, stdin closed: its exit code
+        # and the lines it printed. A run still going after $TimeoutSeconds is
+        # stopped and the test fails.
+        function script:Invoke-WrapperRun
+        {
+            param([string[]]$Arguments = @(), [int]$TimeoutSeconds = 300)
+            $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
+            foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:WrapperScript, '-TenantID', $script:WrapperTenant, '-ParallelStreams', '1') + @($Arguments)) { $Info.ArgumentList.Add($Arg) }
+            $Info.UseShellExecute = $false
+            $Info.RedirectStandardInput = $true
+            $Info.RedirectStandardOutput = $true
+            $Info.RedirectStandardError = $true
+            $Info.Environment['HOME'] = $script:CaseHome
+            $Info.Environment['PSModulePath'] = $script:WrapperModules
+            $Info.Environment['PATH'] = $script:WrapperBin + [IO.Path]::PathSeparator + $env:PATH
+            $Info.Environment['RDA_STANDIN_AZURE'] = $script:CaseScenario
+            $Info.Environment['NO_COLOR'] = '1'
+            $Proc = [System.Diagnostics.Process]::Start($Info)
+            $Proc.StandardInput.Close()
+            $Out = $Proc.StandardOutput.ReadToEndAsync()
+            $Err = $Proc.StandardError.ReadToEndAsync()
+            if (-not $Proc.WaitForExit($TimeoutSeconds * 1000))
+            {
+                $Proc.Kill($true)
+                throw ('The wrapper run did not end within {0} seconds.' -f $TimeoutSeconds)
+            }
+            $Proc.WaitForExit()
+            $Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n")
+            return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; Error = [string]$Err.Result; Root = $script:CaseRoot }
+        }
+
+        # The resume state as written, or $null when there is none.
+        function script:Read-WrapperState
+        {
+            if (-not (Test-Path -LiteralPath $script:CaseState)) { return $null }
+            $Raw = Get-Content -LiteralPath $script:CaseState -Raw | ConvertFrom-Json
+            return [pscustomobject]@{
+                Completed = @($Raw.CompletedSubscriptionIds | Where-Object { $_ } | Sort-Object)
+                Failed    = @($Raw.FailedAttempts | Where-Object { $_ } | ForEach-Object { $_.Id } | Sort-Object)
+            }
+        }
+
+        function script:Get-AccessStopLines { param($Run) @($Run.Text | Where-Object { $_ -match 'No subscription is readable|Stopping before any work' }) }
+
+        # The lines that say how the run ended its output: the zip check, the
+        # consolidated zip, the bundle and the resume state. Paths and times
+        # are replaced so two runs can be compared.
+        function script:Get-RunEndLines
+        {
+            param($Run)
+            $Ending = '^(Per-subscription output verification|Compressing |Reporting Data File|No per-subscription zip files found|Inventory root not found|Bundle finalized|Resume state cleared|Resume: carrying)'
+            $Lines = @($Run.Text | Where-Object { $_ -match $Ending })
+            @($Lines | ForEach-Object { ($_.Replace($Run.Root, '<root>')) -replace '\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', '<time>' })
+        }
+
+        # Every entry of every zip under the inventory root, the zips inside them
+        # included: { Zip; Name; Text }.
+        function script:Get-WrapperZipEntries
+        {
+            $Found = [System.Collections.Generic.List[object]]::new()
+            $ReadArchive = {
+                param([System.IO.Compression.ZipArchive]$Archive, [string]$Label)
+                foreach ($Entry in @($Archive.Entries))
+                {
+                    $Buffer = [System.IO.MemoryStream]::new()
+                    $Stream = $Entry.Open()
+                    try { $Stream.CopyTo($Buffer) } finally { $Stream.Dispose() }
+                    $Found.Add([pscustomobject]@{ Zip = $Label; Name = $Entry.FullName; Text = [System.Text.Encoding]::UTF8.GetString($Buffer.ToArray()) })
+                    if ($Entry.FullName -like '*.zip')
+                    {
+                        $Buffer.Position = 0
+                        $Inner = [System.IO.Compression.ZipArchive]::new($Buffer, [System.IO.Compression.ZipArchiveMode]::Read)
+                        try { & $ReadArchive $Inner ($Label + '!' + $Entry.FullName) } finally { $Inner.Dispose() }
+                    }
+                }
+            }
+            foreach ($Zip in @(Get-ChildItem -LiteralPath $script:CaseRoot -Recurse -Force -File -Filter '*.zip'))
+            {
+                $Archive = [System.IO.Compression.ZipFile]::OpenRead($Zip.FullName)
+                try { & $ReadArchive $Archive $Zip.Name } finally { $Archive.Dispose() }
+            }
+            return $Found.ToArray()
+        }
+
+        $script:SkippedXLine = '    - Sub X (sub-x-not-readable) - no read access (role assignments not visible to this identity)'
+        $script:FinishLine = '  Skipping them and finishing the run: the other 1 subscription(s) were completed by an earlier run, so nothing is left to collect. To include them: Grant the identity Reader on these subscriptions, then re-run.'
+    }
+
+    AfterAll {
+        if ($script:WrapperBase -and (Test-Path -LiteralPath $script:WrapperBase)) { Remove-Item -LiteralPath $script:WrapperBase -Recurse -Force }
+    }
+
+    BeforeEach { script:Use-WrapperCase }
+
+    It 'after an interrupted run, skips and lists them, finishes like a -Resume with nothing left to collect, and a second -Resume ends too' {
+        # Run 1: Sub A completes, the session ends in Sub X.
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -EndSession $script:SubX.Id
+        (script:Invoke-WrapperRun).ExitCode | Should -Be 137
+        (script:Read-WrapperState).Completed | Should -Be @($script:SubA.Id)
+
+        # Sub X cannot be read any more.
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubX.Id
+        $R1 = script:Invoke-WrapperRun -Arguments '-Resume'
+        script:Get-AccessStopLines $R1 | Should -BeNullOrEmpty
+        $R1.ExitCode | Should -Be 0
+        $R1.Text | Should -Contain $script:SkippedXLine
+        $R1.Text | Should -Contain $script:FinishLine
+        $R1.Text | Should -Contain '  - Sub X (sub-x-not-readable) - no read access (role assignments not visible to this identity)' -Because 'the end of the run lists it again'
+        $R1.Text | Should -Not -Contain 'Processing subscription: Sub A (sub-a)' -Because 'Sub A was completed by run 1'
+        $R1.Text | Should -Not -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+        $Case = $script:CaseHome
+
+        # The same state with Sub X out of scope: a -Resume with nothing left to
+        # collect and no check. The run above ends its output the same way.
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -EndSession $script:SubX.Id
+        $null = script:Invoke-WrapperRun
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Disabled $script:SubX.Id
+        $Control = script:Invoke-WrapperRun -Arguments '-Resume'
+        $Control.ExitCode | Should -Be 0
+        script:Get-RunEndLines $R1 | Should -Be @(script:Get-RunEndLines $Control)
+        @(script:Get-RunEndLines $R1) | Should -Contain 'Resume state cleared (clean run).'
+
+        # A second -Resume (the first cleared the state) also ends without a stop.
+        script:Use-WrapperCase -CaseHome $Case
+        $R2 = script:Invoke-WrapperRun -Arguments '-Resume'
+        script:Get-AccessStopLines $R2 | Should -BeNullOrEmpty
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain $script:SkippedXLine
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+    }
+
+    It 'without -Resume still stops with exit 1 when none is readable, although the state records a completed subscription' {
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -EndSession $script:SubX.Id
+        $null = script:Invoke-WrapperRun
+        script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubA.Id, $script:SubX.Id
+        $R = script:Invoke-WrapperRun
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
+        @($R.Text | Where-Object { $_ -match 'Resume again|without -Resume' }) | Should -BeNullOrEmpty
+        (script:Read-WrapperState).Completed | Should -Be @($script:SubA.Id)
+    }
+
+    It 'on -Resume with no completed subscription stops with exit 1 and names the way out that works' {
+        # Run 1: Sub B fails, so the state holds a failure and nothing completed.
+        script:Set-WrapperScenario -Subs $script:SubB -Fail $script:SubB.Id
+        $null = script:Invoke-WrapperRun
+        (script:Read-WrapperState).Failed | Should -Be @($script:SubB.Id)
+
+        script:Set-WrapperScenario -Subs $script:SubB -Unreadable $script:SubB.Id
+        $R = script:Invoke-WrapperRun -Arguments '-Resume'
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then run -Resume again.'
+        $R.Text | Should -Contain '  A run without -Resume checks the same subscriptions, so it stops here too.'
+        (script:Read-WrapperState).Failed | Should -Be @($script:SubB.Id)
+
+        # As the message says, a run without -Resume stops the same way.
+        $Fresh = script:Invoke-WrapperRun
+        $Fresh.ExitCode | Should -Be 1
+        $Fresh.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
+
+        # Reader granted: -Resume collects Sub B and clears the state.
+        script:Set-WrapperScenario -Subs $script:SubB
+        $Granted = script:Invoke-WrapperRun -Arguments '-Resume'
+        $Granted.ExitCode | Should -Be 0
+        script:Get-AccessStopLines $Granted | Should -BeNullOrEmpty
+        $Granted.Text | Should -Contain 'Processing subscription: Sub B (sub-b)'
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
+    }
+
+    It 'under -Obfuscate no zip holds the skipped subscription (<Label>)' -TestCases @(
+        @{ Label = 'nothing left to collect'; Subs = @(@{ Id = 'sub-a'; Name = 'Sub A' }, @{ Id = 'sub-x-not-readable'; Name = 'Sub X' }); EndIn = 'sub-x-not-readable'; Bundle = $false }
+        @{ Label = 'one readable subscription left'; Subs = @(@{ Id = 'sub-a'; Name = 'Sub A' }, @{ Id = 'sub-b'; Name = 'Sub B' }, @{ Id = 'sub-x-not-readable'; Name = 'Sub X' }); EndIn = 'sub-b'; Bundle = $true }
+    ) {
+        param($Label, $Subs, $EndIn, $Bundle)
+        # Run 1: Sub A completes, the session ends in $EndIn. Then Sub X cannot be read.
+        script:Set-WrapperScenario -Subs $Subs -EndSession $EndIn
+        (script:Invoke-WrapperRun -Arguments '-Obfuscate').ExitCode | Should -Be 137
+        script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id
+        $R = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain $script:SkippedXLine
+
+        $Entries = @(script:Get-WrapperZipEntries)
+        $Entries.Count | Should -BeGreaterThan 0
+        if ($Bundle)
+        {
+            $Outer = @($Entries | Where-Object { $_.Zip -like 'AllSubscriptions_ResourcesReport_*.zip' -and $_.Zip -notlike '*!*' })
+            @($Outer | Where-Object { $_.Name -eq 'RunSummary.log' }).Count | Should -Be 1
+            @($Outer | Where-Object { $_.Name -eq 'MainSummary.html' }).Count | Should -Be 1
+        }
+        @($Entries | Where-Object { $_.Text.Contains($script:SubX.Id) -or $_.Name.Contains($script:SubX.Id) -or $_.Text.Contains($script:SubX.Name) } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
     }
 }
