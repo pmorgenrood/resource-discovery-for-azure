@@ -712,6 +712,12 @@ if ($Excluded.Count -gt 0)
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
 
+# A resume state file that is valid JSON but not the right shape is moved aside
+# before anything reads it, so this run and later ones go on as with no resume
+# state (Move-WrongShapeResumeStateFile). Per-stream state files are checked
+# the same way where they are read. A run that moves one aside is not a clean run.
+$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main -Resume:$Resume)
+
 # Always seed $CompletedIds from the existing state file. -Resume only
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
@@ -746,6 +752,8 @@ if ($Resume -or $ResumeFailedOnly)
             try
             {
                 $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
+                $Moved = Move-WrongShapeResumeStateFile -Path $StreamFile.FullName -Kind Stream -Record $Obj -Resume:$Resume
+                if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
             }
@@ -789,6 +797,21 @@ else
     {
         Write-Host ("Note: resume state file exists at {0} ({1} previously completed). Pass -Resume to skip them." -f $ResumeStateFile, $CompletedIds.Count) -ForegroundColor Yellow
     }
+}
+
+# -ResumeFailedOnly retries only the retry list. A state file moved aside above
+# for its shape took its part of that list with it, so the list is not complete:
+# stop before any work, rather than retry part of it or exit 0 with nothing done.
+if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
+{
+    Write-Host "ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above)." -ForegroundColor Red
+    foreach ($File in $WrongShapeStateFiles)
+    {
+        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'could not be moved aside' } else { 'moved aside to {0}' -f $File.MovedTo }
+        Write-Host ("  {0}: {1}; its records are not used." -f $File.Name, $Where) -ForegroundColor Yellow
+    }
+    Write-Host "  Next: run the same command with -Resume instead of -ResumeFailedOnly. It collects every subscription no earlier run recorded as completed." -ForegroundColor Yellow
+    Exit-Wrapper -Code 1
 }
 
 # -ResumeFailedOnly narrows the eligible-subscription list to only those that
@@ -1524,6 +1547,8 @@ else
                 try
                 {
                     $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
+                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Obj
+                    if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
                     if ($null -ne $Obj.Completed)
                     {
                         $AllCompletedFromStreams += @($Obj.Completed)
@@ -1765,13 +1790,14 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
     try
     {
         Remove-Item -Path $ResumeStateFile -Force
-        Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+        if ($WrongShapeStateFiles.Count -eq 0) { Write-Host "Resume state cleared (clean run)." -ForegroundColor Green }
     }
     catch
     {
         Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
     }
 }
+Write-WrongShapeStateSummary -Files $WrongShapeStateFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
 
 # Final summary
 $Elapsed = (Get-Date) - $RunStartTime

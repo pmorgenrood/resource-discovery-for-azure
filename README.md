@@ -277,6 +277,8 @@ After each subscription is fully processed (its per-subscription ZIP has been wr
 
 `-Resume` is opt-in. Without it, the wrapper processes every subscription returned by `Get-AzSubscription`, and existing state is left untouched.
 
+A state file that is valid JSON but not in the shape the wrapper writes (for example a retry list that is a plain string, or a retry entry without an `Id`) is not used: the wrapper prints a warning naming the file and the field, and renames the file to `<name>.unreadable-<UTC yyyyMMdd-HHmmss>` in the same folder, where no run reads it again and no zip takes it. This applies to the main state file and to the per-stream state files of `-ParallelStreams`. A `-Resume` run then collects again every subscription that file listed; for the main state file that means it starts fresh, as with no state file. A `-ResumeFailedOnly` run stops before retrying anything and exits `1`, because its retry list is no longer complete; run the same command with `-Resume` instead. Neither run prints `Resume state cleared (clean run).`
+
 #### Parallel subscription processing
 
 For large tenants, the slowest part of the run is collecting metrics. Each call to Azure Monitor takes 200–500 ms over the network, and a typical subscription with VMs, SQL DBs, and storage accounts produces thousands of these calls. Done one subscription at a time, that adds up to many hours.
