@@ -712,13 +712,13 @@ if ($Excluded.Count -gt 0)
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
 
-# A resume state file that is valid JSON but not the right shape is moved aside
-# before anything reads it, so this run and later ones go on as with no resume
-# state (Move-WrongShapeResumeStateFile). Per-stream state files are checked
-# the same way where they are read. A run that moves one aside is not a clean run.
-# A -ResumeFailedOnly run then stops (below), so only a -Resume run that goes on
-# says what it does instead.
-$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main -Resume:($Resume -and -not $ResumeFailedOnly))
+# The resume state file's shape is checked here, once, before anything reads it
+# (Move-WrongShapeResumeStateFile). A file that is valid JSON but not the right
+# shape is moved aside, so neither this run nor a later one uses its completed
+# list or retry list; a file that cannot be moved aside stops the run (exit 1).
+# Per-stream state files are checked where they are read. A run that moves one
+# aside is not a clean run.
+$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main)
 
 # Always seed $CompletedIds from the existing state file. -Resume only
 # controls whether we *use* that list to skip subscriptions; reading it
@@ -729,10 +729,6 @@ $CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $Ten
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
 $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
-
-# The shape was checked once, above. A file that is not the right shape and
-# could not be moved aside is still there: its records are not used either.
-if ($WrongShapeStateFiles.Count -gt 0) { $CompletedIds = @(); $FailedAttempts = @() }
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -805,6 +801,13 @@ else
     }
 }
 
+# A -Resume run that moved the resume state file aside says what it uses
+# instead: nothing (it starts fresh), or only per-stream state folded in above.
+if ($Resume -and -not $ResumeFailedOnly -and @($WrongShapeStateFiles | Where-Object { $_.Kind -eq 'Main' }).Count -gt 0)
+{
+    Write-WrongShapeResumeLine -UsesStreamState (@($CompletedIds | Where-Object { $_ }).Count -gt 0 -or @($FailedAttempts | Where-Object { $_ }).Count -gt 0)
+}
+
 # -ResumeFailedOnly retries only the retry list. A state file moved aside above
 # for its shape took its part of that list with it, so the list is not complete:
 # stop before any work, rather than retry part of it or exit 0 with nothing done.
@@ -813,8 +816,7 @@ if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
     Write-Host "ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above)." -ForegroundColor Red
     foreach ($File in $WrongShapeStateFiles)
     {
-        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'could not be moved aside' } else { 'moved aside to {0}' -f $File.MovedTo }
-        Write-Host ("  {0}: {1}; its records are not used." -f $File.Name, $Where) -ForegroundColor Yellow
+        Write-Host ("  {0}: moved aside to {1}; its records are not used." -f $File.Name, $File.MovedTo) -ForegroundColor Yellow
     }
     Write-Host "  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed." -ForegroundColor Yellow
     Exit-Wrapper -Code 1
@@ -1553,7 +1555,7 @@ else
                 try
                 {
                     $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
-                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Obj
+                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Obj -AfterCollection
                     if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
                     if ($null -ne $Obj.Completed)
                     {

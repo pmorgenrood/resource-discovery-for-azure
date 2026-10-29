@@ -468,20 +468,25 @@ function Resolve-TenantId
 
 # The right shape of a resume state record, parsed from JSON: the resume state
 # file (-Kind Main, written by Save-CompletedSubscriptionIds) or a per-stream
-# state file (-Kind Stream, written by Write-StreamState). Every reader of these
-# files checks a record here before it uses any of it. Returns $null when the
-# record has the right shape, otherwise a short text naming the first field that
-# does not (never a value from the file).
+# state file (-Kind Stream, written by Write-StreamState). The wrapper checks the
+# resume state file here once, at startup, before Get-CompletedSubscriptionIds
+# and Get-FailedAttempts read it (Move-WrongShapeResumeStateFile); those two do
+# not check it again. A per-stream record is checked by the wrapper's startup
+# fold and end-of-run merge, and by the stream worker's Read-StreamState.
+# Returns $null when the record has the right shape, otherwise a short text
+# naming the first field that does not (never a value from the file).
 #   - The record is a JSON object.
-#   - Main: TenantID is text, and CompletedSubscriptionIds is a list of
-#     non-empty text ids. Stream: Completed is a list of non-empty text ids.
+#   - Main: TenantID is text, and CompletedSubscriptionIds is a list of text
+#     ids. Stream: Completed is a list of text ids.
 #   - FailedAttempts (the retry list) is a list. Each entry is an object with a
 #     non-empty text Id, Attempts a whole number of at least 1 and LastFailedAt
 #     a date, the values Add-FailedAttempt and Merge-FailedAttempts convert. A
 #     file written before the retry list existed has no FailedAttempts key,
 #     which reads as an empty list.
-# A list may hold null entries: the wrapper and the stream worker save one when
-# a list becomes empty. They are not records, and the readers skip them.
+# The tool itself writes a null entry when a list becomes empty, and an empty
+# completed id where Save-CompletedSubscriptionIds converts a null entry to text,
+# so both are accepted and skipped here. Neither matches a subscription; of the
+# readers, Get-FailedAttempts drops null retry entries.
 # A $null record also returns $null: ConvertFrom-Json turns an empty or
 # whitespace-only file (a write cut short) into $null without an error. That
 # file is not valid JSON, so it is left to the readers, which treat it as they
@@ -503,7 +508,6 @@ function Get-ResumeStateShapeProblem
     {
         if ($null -eq $Id) { continue }
         if ($Id -isnot [string]) { return ('{0} holds an entry that is not a text id' -f $IdsKey) }
-        if ([string]::IsNullOrWhiteSpace($Id)) { return ('{0} holds an empty id' -f $IdsKey) }
     }
 
     $List = $Record.FailedAttempts
@@ -538,9 +542,13 @@ function Get-ResumeStateShapeProblem
 # name is taken, and kept for inspection. The name neither ends in '.json' nor
 # matches a state file name, so no later run reads it, and it stays a dot-file
 # in the inventory root, which no zip step of the wrapper takes. Prints a
-# warning naming the file and the field, never its content; with -Resume, also
-# what this run does instead. Returns { Kind; Name; MovedTo } (MovedTo is $null
-# when the rename failed).
+# warning naming the file and the field, never its content; with -Resume and a
+# per-stream file, also what this run does instead. Returns { Kind; Name;
+# MovedTo }.
+# When the file cannot be renamed, the run stops here with exit 1
+# (Stop-WrongShapeStateNotMoved): going on would leave the file where every
+# later run reads it again, and a save or clean-up of this run could write over
+# it or delete it.
 function Move-WrongShapeResumeStateFile
 {
     param(
@@ -548,6 +556,8 @@ function Move-WrongShapeResumeStateFile
         [Parameter(Mandatory = $true)][ValidateSet('Main', 'Stream')][string]$Kind,
         [object]$Record,
         [switch]$Resume,
+        # The end-of-run merge of a parallel run, after this run's collection.
+        [switch]$AfterCollection,
         [datetime]$Now = [datetime]::UtcNow
     )
     if (-not $PSBoundParameters.ContainsKey('Record'))
@@ -572,24 +582,51 @@ function Move-WrongShapeResumeStateFile
         $N++
         $MovedTo = if ($N -le 100) { '{0}-{1}' -f $Base, $N } else { $null }
     }
-    $Lead = 'WARNING: The {0} {1} is not the right shape ({2}), so its records are not used.' -f $What, $Name, $Problem
     try
     {
         if ($null -eq $MovedTo) { throw ('every name from {0} to {0}-100 is taken' -f $Base) }
         Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
-        Write-Host ('{0} It was moved aside to {1}, kept for inspection; no run reads it again.' -f $Lead, $MovedTo) -ForegroundColor Yellow
     }
     catch
     {
-        $MovedTo = $null
-        Write-Host ('{0} It could not be moved aside ({1}), so a later run finds it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+        Stop-WrongShapeStateNotMoved -Path $Path -What $What -Problem $Problem -Reason $_.Exception.Message -AfterCollection:$AfterCollection
+        return
     }
-    if ($Resume)
+    Write-Host ('WARNING: The {0} {1} is not the right shape ({2}), so its records are not used. It was moved aside to {3}, kept for inspection; no run reads it again.' -f $What, $Name, $Problem, $MovedTo) -ForegroundColor Yellow
+    if ($Resume -and $Kind -eq 'Stream')
     {
-        $Then = if ($Kind -eq 'Main') { "Starting fresh: this run does not use that file's completed list or retry list." } else { 'This run does not count the subscriptions it lists as completed.' }
-        Write-Host ('  {0}' -f $Then) -ForegroundColor Yellow
+        Write-Host '  This run does not count the subscriptions it lists as completed.' -ForegroundColor Yellow
     }
     return [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $MovedTo }
+}
+
+# A state file that is not the right shape and could not be moved aside
+# (Move-WrongShapeResumeStateFile): name it, give the reason, print the command
+# that removes it, and stop the run with exit 1. The command is a
+# Remove-Item -LiteralPath of the full path, quoted for PowerShell, with -Force:
+# PowerShell treats the dot-file as hidden and does not remove it without it.
+function Stop-WrongShapeStateNotMoved
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Problem,
+        [string]$Reason,
+        [switch]$AfterCollection
+    )
+    $Quoted = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path)
+    Write-Host ('ERROR: The {0} {1} is not the right shape ({2}), and it could not be moved aside: {3}' -f $What, (Split-Path -Path $Path -Leaf), $Problem, $Reason) -ForegroundColor Red
+    if ($AfterCollection)
+    {
+        Write-Host '  The run stops here (exit 1), before it merges or removes any per-stream state file and before the consolidated zip, so no run reads this file or writes over it. The reports collected so far are kept, and so are the other per-stream state files: a later -Resume skips the subscriptions they list as completed.' -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host '  The run stops here (exit 1), before any subscription is collected and before any resume state is written, so no run reads this file or writes over it.' -ForegroundColor Red
+    }
+    Write-Host '  Once the cause is fixed (for example, the folder can be written), remove the file with this command and run again:' -ForegroundColor Yellow
+    Write-Host ("  Remove-Item -LiteralPath '{0}' -Force" -f $Quoted) -ForegroundColor Yellow
+    Exit-Wrapper -Code 1
 }
 
 # The end-of-run line for each state file this run moved aside for its shape
@@ -603,8 +640,23 @@ function Write-WrongShapeStateSummary
     foreach ($File in @($Files | Where-Object { $null -ne $_ }))
     {
         $What = if ($File.Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
-        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'could not be moved aside' } else { 'was moved aside to {0}' -f $File.MovedTo }
-        Write-Host ('Resume state {0}, but not a clean run: the {1} {2} was not the right shape and {3}; its records were not used.' -f $Word, $What, $File.Name, $Where) -ForegroundColor Yellow
+        Write-Host ('Resume state {0}, but not a clean run: the {1} {2} was not the right shape and was moved aside to {3}; its records were not used.' -f $Word, $What, $File.Name, $File.MovedTo) -ForegroundColor Yellow
+    }
+}
+
+# What a -Resume run that moved the resume state file aside uses instead, once
+# the per-stream state of an interrupted parallel run has been folded in: none
+# (it starts fresh) or only that per-stream state.
+function Write-WrongShapeResumeLine
+{
+    param([bool]$UsesStreamState)
+    if ($UsesStreamState)
+    {
+        Write-Host '  This run does not use the completed list or retry list of the resume state file moved aside above; it uses only the per-stream state recovered above.' -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host '  Starting fresh: this run does not use the completed list or retry list of the resume state file moved aside above.' -ForegroundColor Yellow
     }
 }
 
