@@ -8,7 +8,10 @@
 #     state also deletes the per-stream state files it folded in, so the next
 #     run neither recovers them nor skips or retries from them. One that keeps
 #     the state deletes them once the resume state file holds their records,
-#     and keeps them with a warning while it cannot be written.
+#     and keeps them with a warning while it cannot be written. A run that ends
+#     early, with any exit code, does the same. A per-stream or resume state
+#     file that cannot be removed is named in a warning, the run does not say
+#     it cleared the state, and the next run removes it.
 #   - A per-stream state file the end-of-run merge cannot read is named on
 #     screen, moved aside where no later run reads it, and none of the
 #     subscriptions it lists counts as completed; that run does not report a
@@ -24,8 +27,9 @@
 # from a copy of the tool whose ResourceInventory.ps1 is a stand-in. Azure is a
 # set of stand-in Az modules and an az command, found first on the module path
 # and PATH of that process, which answer from a scenario file: the
-# subscriptions, the ones that fail, and the ones whose collection hangs until
-# the run is ended. An interrupted run is ended by killing the wrapper's
+# subscriptions, the ones that fail, the ones whose collection hangs until
+# the run is ended, the ones whose run writes no zip, and the ones after which
+# the inventory root is made read-only (so a removal there fails). An interrupted run is ended by killing the wrapper's
 # process tree once the streams have recorded what the test needs. The
 # process's home is a scratch folder, so the run writes its inventory root
 # under it. On Windows the wrapper writes to C:\InventoryReports instead, so
@@ -58,6 +62,8 @@ BeforeAll {
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit)
 $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
 if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
+# A run of this subscription that ends without writing its zip.
+if (@($Scenario.NoZipIds) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; $Global:Resources = @(1); $Global:ResourceCount = 1; return }
 # Collection of this subscription hangs; the marker file tells the test it started.
 if (@($Scenario.HangIds) -contains $SubscriptionID) { Set-Content -LiteralPath (Join-Path $HOME ('hang-' + $SubscriptionID)) -Value $PID; Start-Sleep -Seconds 600 }
 $Root = Join-Path $HOME 'InventoryReports'
@@ -74,6 +80,16 @@ Remove-Item -LiteralPath $Stage -Recurse -Force
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
+# After the report of this subscription is written, the inventory root is made
+# read-only, so a later removal or new file there fails. With several ids (one
+# per stream) each waits for the others first, and the first one listed does it.
+if (@($Scenario.ReadOnlyAfterIds) -contains $SubscriptionID)
+{
+    Set-Content -LiteralPath (Join-Path $HOME ('ro-' + $SubscriptionID)) -Value $PID
+    $Deadline = (Get-Date).AddSeconds(120)
+    while (@($Scenario.ReadOnlyAfterIds | Where-Object { -not (Test-Path -LiteralPath (Join-Path $HOME ('ro-' + $_))) }).Count -gt 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
+    if (@($Scenario.ReadOnlyAfterIds)[0] -eq $SubscriptionID) { & chmod 555 $Root }
+}
 '@
     Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Value $StandInInner -Encoding utf8
 
@@ -185,13 +201,15 @@ exit 1
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @())
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @())
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
             Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = $script:Subs[$_].Name; State = $(if ($Disabled -contains $_) { 'Disabled' } else { 'Enabled' }) } })
             FailIds       = @($Fail | ForEach-Object { & $Id $_ })
             HangIds       = @($Hang | ForEach-Object { & $Id $_ })
+            NoZipIds      = @($NoZip | ForEach-Object { & $Id $_ })
+            ReadOnlyAfterIds = @($ReadOnlyAfter | ForEach-Object { & $Id $_ })
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -288,6 +306,9 @@ exit 1
         @($Run.Text | ForEach-Object { if ($_ -match '^(?:\[stream-\d+\] processing \(\d+ of \d+\): |Processing subscription: ).+ \((sub-[a-z]+)\)$') { $Matches[1] } } | Sort-Object)
     }
     function script:Get-RecoveryLines { param($Run) @($Run.Text | Where-Object { $_ -like 'Recovered per-stream state*' }) }
+    # The stream count the run printed ('Parallelism: -ParallelStreams <n> ...').
+    function script:Get-StreamCount { param($Run) foreach ($Line in $Run.Text) { if ($Line -match '^Parallelism: -ParallelStreams (\d+) ') { return [int]$Matches[1] } }; return 0 }
+    function script:Get-RemoveWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: Could not remove the *' -or $_ -like '  The resume state file * is kept, so the next -Resume*' -or $_ -like '  The next -Resume reads the per-stream state file(s) above again*' -or $_ -like 'WARNING: The resume state file * could not be written or read back*' }) }
     function script:Get-StreamWarningLines { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The per-stream state file*' }) }
     function script:Test-CleanLine { param($Run) @($Run.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count -eq 1 }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $script:Subs[$_].Id } | Sort-Object) }
@@ -368,7 +389,12 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'C', 'D')
         $R1.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
         $R1.Text | Should -Contain 'Skipping (already completed): Sub B (sub-b)'
-        $R1.Text | Should -Contain 'Parallel-streams mode: 2 streams across 2 subscription(s) to process'
+        # The automatic count follows the host (its memory caps it; 4 logical
+        # processors are set), so the parallel-path lines are expected only when
+        # the run printed two or more streams. The rest holds on either path.
+        $Count = script:Get-StreamCount $R1
+        if ($Streams -gt 0) { $Count | Should -Be $Streams }
+        if ($Count -ge 2) { $R1.Text | Should -Contain 'Parallel-streams mode: 2 streams across 2 subscription(s) to process' }
         $R1.Text | Should -Contain 'Subscriptions Skipped:   2 (already completed)'
         $R1.Text | Should -Contain 'Subscriptions Processed: 2'
         (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B', 'C')
@@ -378,7 +404,7 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams -Environment $script:FourCpu
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'D')
-        $R2.Text | Should -Contain 'Only one subscription to process; running sequentially.'
+        if ((script:Get-StreamCount $R2) -ge 2) { $R2.Text | Should -Contain 'Only one subscription to process; running sequentially.' }
         $R2.Text | Should -Contain 'Subscriptions Skipped:   3 (already completed)'
         script:Test-CleanLine $R2 | Should -BeTrue
         script:Read-State | Should -BeNullOrEmpty
@@ -595,6 +621,191 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
         $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
         script:Test-CleanLine $R3 | Should -BeTrue
+    }
+}
+
+Describe 'A run that ends early leaves no per-stream file it folded in' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    It 'a -Resume run that stops with exit 2 deletes them, and the next two runs recover nothing' {
+        # Interrupted 2-stream run: stream 0 completes A, stream 1 fails B, then C and D hang.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        @(script:Get-StreamFiles).Count | Should -Be 2
+
+        # Run 1: C runs without writing its zip, so the output check stops the run with exit 2.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -NoZip 'C'
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R1.ExitCode | Should -Be 2
+        script:Get-RecoveryLines $R1 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty -Because 'the resume state holds their records, so the early exit deletes them'
+        script:Get-RemoveWarningLines $R1 | Should -BeNullOrEmpty
+
+        # Runs 2 and 3: no recovery line.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        foreach ($Run in 1..2)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+            script:Get-RecoveryLines $R | Should -BeNullOrEmpty
+            @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        }
+    }
+}
+
+Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not ($IsLinux -or $IsMacOS)) {
+    BeforeAll {
+        # A folder without write permission stops a removal in it, except for
+        # root, which this test then cannot use.
+        $Probe = Join-Path $script:TestBase ('ro-probe-' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $Probe -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Probe 'f') -Value 'x'
+        & chmod 555 $Probe
+        try { Remove-Item -LiteralPath (Join-Path $Probe 'f') -Force -ErrorAction Stop } catch { }
+        $script:ReadOnlyHolds = Test-Path -LiteralPath (Join-Path $Probe 'f')
+        & chmod 755 $Probe
+    }
+    BeforeEach { script:New-Case }
+    AfterEach { if (Test-Path -LiteralPath $script:Root) { & chmod 755 $script:Root } }
+
+    It 'is named while the resume state is cleared; the state is kept, and the next run removes everything (one stream)' {
+        if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Names.Count | Should -Be 2
+
+        # Run 1: B, C and D are collected, then the inventory root becomes read-only.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -ReadOnlyAfter 'D'
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B', 'C', 'D')
+        script:Test-CleanLine $R1 | Should -BeFalse
+        $State = Split-Path -Path $script:State -Leaf
+        $Lines = @(script:Get-RemoveWarningLines $R1)
+        $Lines.Count | Should -Be 3
+        @($Lines[0..1] | Sort-Object) | Should -Be @($Names | ForEach-Object { 'WARNING: Could not remove the per-stream state file {0}: Access to the path ''{1}'' is denied.' -f $_, (Join-Path $script:Root $_) })
+        $Lines[2] | Should -Be ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f $State)
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+
+        # Run 2, the folder writable again: recovered once more, D collected
+        # again (its completion could not be written), everything removed.
+        & chmod 755 $script:Root
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'D')
+        script:Get-RemoveWarningLines $R2 | Should -BeNullOrEmpty
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+
+        # Run 3 finds no state.
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'is named while the resume state is kept, and the next run removes it (one stream)' {
+        if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+
+        # Run 1: B fails again, so the state is kept; then the root becomes read-only.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -ReadOnlyAfter 'D'
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $Lines = @(script:Get-RemoveWarningLines $R1)
+        $Lines.Count | Should -Be 3
+        @($Lines[0..1] | Sort-Object) | Should -Be @($Names | ForEach-Object { 'WARNING: Could not remove the per-stream state file {0}: Access to the path ''{1}'' is denied.' -f $_, (Join-Path $script:Root $_) })
+        $Lines[2] | Should -Be '  The next -Resume reads the per-stream state file(s) above again and retries the removal.'
+        script:Test-CleanLine $R1 | Should -BeFalse
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
+
+        # Run 2, writable, B succeeds: recovered once more, everything removed.
+        & chmod 755 $script:Root
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'D')
+        script:Test-CleanLine $R2 | Should -BeTrue
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+
+        # Run 3 finds no state.
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'keeps the files of a parallel run''s streams while the resume state cannot be written, and the next run recovers them' {
+        if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
+        # Each stream writes its summary over a file that is already there, so it
+        # can still write it once the root is read-only.
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        foreach ($N in 0, 1) { Set-Content -LiteralPath (Join-Path $script:Root ('.rda-stream-{0}-summary.json' -f $N)) -Value '{}' }
+        # Run 1, two streams (A and C; B and D): once C and D are written, the root becomes read-only.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -ReadOnlyAfter 'C', 'D'
+        $R1 = script:Invoke-Wrapper -Streams 2
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Names.Count | Should -Be 2 -Because 'the resume state could not be written, so the stream files hold the only record'
+        $Lead = 'WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept and a later -Resume reads them again: ' -f (Split-Path -Path $script:State -Leaf)
+        $Lines = @(script:Get-RemoveWarningLines $R1)
+        $Lines.Count | Should -Be 1
+        $Lines[0] | Should -BeIn @(($Lead + ($Names -join ', ')), ($Lead + ($Names[1], $Names[0] -join ', ')))
+        script:Test-CleanLine $R1 | Should -BeFalse
+
+        # Run 2, writable: the stream files are recovered, nothing is left to collect, everything is removed.
+        & chmod 755 $script:Root
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 4 completed, 0 failed subscription record(s).')
+        script:Get-Collected $R2 | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Nothing left to process: every eligible subscription was completed by an earlier run.'
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+
+        # Run 3 finds no state and collects all four with two streams.
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+    }
+
+    It 'Remove-ResumeStateFiles names what it cannot remove, keeps the state file while a per-stream file is left, and removes all once it can' {
+        if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Dir = Join-Path $script:TestBase ('ro-' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        $Stream = Join-Path $Dir '.resume-state-t-stream-0.json'
+        $State = Join-Path $Dir '.resume-state-t.json'
+        Set-Content -LiteralPath $Stream -Value '{}'
+        Set-Content -LiteralPath $State -Value '{}'
+        & chmod 555 $Dir
+        try
+        {
+            $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1)
+            @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] }) | Should -Be @($Stream, $State)
+            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(
+                ('WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: Access to the path ''{0}'' is denied.' -f $Stream)
+                '  The resume state file .resume-state-t.json is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.'
+            )
+            $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) 6>&1)
+            @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] }) | Should -Be @($Stream)
+            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })[1] | Should -Be '  The next -Resume reads the per-stream state file(s) above again and retries the removal.'
+            $Out = @(Remove-ResumeStateFiles -StateFile $State 6>&1)
+            @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(
+                ('WARNING: Could not remove the resume state file .resume-state-t.json: Access to the path ''{0}'' is denied.' -f $State)
+                '  The next run reads it again and retries the removal.'
+            )
+        }
+        finally { & chmod 755 $Dir }
+        $Out = @(Remove-ResumeStateFiles -StreamFiles @($Stream) -StateFile $State 6>&1)
+        $Out | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $Stream | Should -BeFalse
+        Test-Path -LiteralPath $State | Should -BeFalse
     }
 }
 
