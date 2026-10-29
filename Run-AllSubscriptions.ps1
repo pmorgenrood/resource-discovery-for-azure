@@ -776,8 +776,8 @@ if ($Resume -or $ResumeFailedOnly)
         {
             Write-Host ("Recovered per-stream state from an interrupted parallel run: {0} completed, {1} failed subscription record(s)." -f $StrandedCompleted.Count, @($StrandedFailed).Count) -ForegroundColor Cyan
             # Heal the unified file immediately so even a re-interrupted run keeps
-            # the recovered picture. Per-stream files are left in place until the
-            # end of the run (the parallel merge, or the clean-up below).
+            # the recovered picture. Per-stream files are intentionally left for
+            # the end-of-run merge to reconcile and clean up.
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
         }
     }
