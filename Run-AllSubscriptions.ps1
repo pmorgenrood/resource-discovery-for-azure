@@ -733,8 +733,8 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # A file that cannot be read is moved aside with a warning
 # (Move-UnreadableStreamStateFile) and its records are not used; only the files
 # read here are deleted when the run clears the state.
-$FoldedStreamFiles = [System.Collections.Generic.List[object]]::new()
-$UnreadableStreamFiles = [System.Collections.Generic.List[object]]::new()
+$FoldedStreamFiles = @()
+$UnreadableStreamFiles = @()
 if ($Resume -or $ResumeFailedOnly)
 {
     $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
@@ -748,14 +748,14 @@ if ($Resume -or $ResumeFailedOnly)
             {
                 $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
                 if ($null -eq $Obj -or $Obj -isnot [pscustomobject]) { throw 'not a per-stream state record' }
-                $FoldedStreamFiles.Add($StreamFile)
+                $FoldedStreamFiles = @(@($FoldedStreamFiles | Where-Object { $null -ne $_ }) + $StreamFile)
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
             }
             catch
             {
                 Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
-                $UnreadableStreamFiles.Add((Move-UnreadableStreamStateFile -File $StreamFile))
+                $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile))
             }
         }
         if ($StrandedCompleted.Count -gt 0)
@@ -1798,7 +1798,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # when a per-stream file could not be read, so the state reported as
         # cleared below is cleared. Only files that were read are deleted; one
         # that could not be read was moved aside and is kept.
-        if ($NothingLeftToCollect -or $UnreadableStreamFiles.Count -gt 0)
+        if ($NothingLeftToCollect -or @($UnreadableStreamFiles).Count -gt 0)
         {
             foreach ($StreamFile in @($FoldedStreamFiles | Where-Object { $null -ne $_ }))
             {
@@ -1806,7 +1806,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
                 try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
             }
         }
-        if ($UnreadableStreamFiles.Count -eq 0)
+        if (@($UnreadableStreamFiles).Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
         }
