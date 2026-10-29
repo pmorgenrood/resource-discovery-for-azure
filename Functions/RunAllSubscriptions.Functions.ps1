@@ -824,10 +824,14 @@ function Get-ResumeStateRecordMismatch
     {
         return $Wanted
     }
-    if ($OnDisk -isnot [System.Management.Automation.PSCustomObject] -or [string]$OnDisk.TenantID -ne $Tenant) { return $Wanted }
-    $OnDiskCompleted = @($OnDisk.CompletedSubscriptionIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($OnDisk -isnot [System.Management.Automation.PSCustomObject]) { return $Wanted }
+    # A key the file does not have reads as none.
+    $Key = { param($Name) $Prop = $OnDisk.PSObject.Properties[$Name]; if ($null -ne $Prop) { $Prop.Value } }
+    if ([string](& $Key 'TenantID') -ne $Tenant) { return $Wanted }
+    $OnDiskCompleted = @(& $Key 'CompletedSubscriptionIds' | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $RunCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    $IsRecordList = { param($List) $Items = @($List | Where-Object { $null -ne $_ }); $Items.Count -gt 0 -and @($Items | Where-Object { $_ -is [string] -or $_ -is [ValueType] -or $null -eq $_.PSObject.Properties['Id'] }).Count -eq 0 }
+    $IsRecord = { param($Item) $null -ne $Item -and $Item -isnot [string] -and $Item -isnot [ValueType] -and $null -ne $Item.PSObject.Properties['Id'] }
+    $IsRecordList = { param($List) $Items = @($List | Where-Object { $null -ne $_ }); $Items.Count -gt 0 -and @($Items | Where-Object { -not (& $IsRecord $_) }).Count -eq 0 }
     # The lists to compare: the retry list, then every other list of per-id
     # records in the file that this run holds a variable for.
     $Lists = [System.Collections.Generic.List[object]]::new()
@@ -849,8 +853,8 @@ function Get-ResumeStateRecordMismatch
         {
             if ($List.CompletedOnly -and $RunCompleted -notcontains $Id) { continue }
             # The last record for the id on each side, as each side lets the last one win.
-            $RunRecord = @($List.Run | Where-Object { [string]$_.Id -eq $Id }) | Select-Object -Last 1
-            $DiskRecord = @($OnDisk.($List.Name) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Id'] -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
+            $RunRecord = @($List.Run | Where-Object { (& $IsRecord $_) -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
+            $DiskRecord = @(& $Key $List.Name | Where-Object { (& $IsRecord $_) -and [string]$_.Id -eq $Id }) | Select-Object -Last 1
             if ((ConvertTo-ResumeRecordText -Record $RunRecord) -ne (ConvertTo-ResumeRecordText -Record $DiskRecord)) { $Mismatch += $Id; break }
         }
     }

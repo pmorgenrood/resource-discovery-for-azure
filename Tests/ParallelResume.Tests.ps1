@@ -1118,6 +1118,9 @@ Describe 'Read-StreamResumeStateFile, Move-UnreadableStreamStateFile, Get-Resume
         # Such a list is compared for completed ids only.
         @(Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-c') -CompletedIds @('sub-a') -FailedAttempts @($Earlier)) | Should -BeNullOrEmpty
         $CompletedReports | Should -Not -BeNullOrEmpty
+        # Under strict mode, a file without a retry list compares as none.
+        '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"]}' | Set-Content -LiteralPath $Path -Encoding utf8
+        & { Set-StrictMode -Version Latest; Get-ResumeStateRecordMismatch -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -CompletedIds @('sub-a') -FailedAttempts @($Earlier) } | Should -Be @('sub-b')
     }
 
     It 'Get-StreamStateRecordIds lists every id a per-stream state file holds a record for' {
