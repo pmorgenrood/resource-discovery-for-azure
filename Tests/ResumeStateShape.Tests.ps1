@@ -4,24 +4,29 @@
 #     resume state record (the resume state file and the per-stream state
 #     files). Records as the wrapper and the stream worker write them pass;
 #     each kind of wrong value, present but invalid as well as missing, is
-#     named by its field, never by a value from the file.
+#     named by its field, never by a value from the file. An empty or
+#     whitespace-only file (not valid JSON) is not called the wrong shape.
 #   - Move-WrongShapeResumeStateFile: renames a wrong-shaped file to
-#     <name>.unreadable-<UTC time> with a warning naming the file and the field,
-#     and leaves a right-shaped, absent or cut-short file alone.
-#   - The readers (completed ids, retry list, the stream worker's reader) use
-#     nothing from a wrong-shaped record left in place.
+#     <name>.unreadable-<UTC time> (-2, -3 and so on when that name is taken)
+#     with a warning naming the file and the field, and leaves a right-shaped,
+#     absent, cut-short or empty file alone.
+#   - The stream worker's reader uses nothing from a wrong-shaped file, and
+#     reads an empty one as before.
 #   - End to end, the wrapper itself with 1 and 2 streams: a wrong-shaped resume
-#     state file or per-stream state file is moved aside, a -Resume run starts
-#     fresh for its records and does not print the clean-run line, a
-#     -ResumeFailedOnly run stops with exit 1 and names the command to run next,
-#     and the next run ends clean with no state left. The moved-aside file is in
-#     no zip, with and without -Obfuscate.
+#     state file or per-stream state file is moved aside, a -Resume run does not
+#     use its records and does not print the clean-run line, a -ResumeFailedOnly
+#     run stops with exit 1 and names the command to run next, and the next run
+#     ends clean with no state left and nothing on stderr. A wrong-shaped file
+#     that cannot be moved aside is not used either. Empty state files are
+#     handled as before. The moved-aside file is in no zip, with and without
+#     -Obfuscate.
 #
 # The end-to-end runs start Run-AllSubscriptions.ps1 itself as its own pwsh
 # process from a copy of the tool whose ResourceInventory.ps1 is a stand-in.
 # Azure is a set of stand-in Az modules and an az command, found first on the
 # module path and PATH of that process, which answer from a scenario file: the
-# subscriptions and the ones that fail. The process's home is a scratch folder,
+# subscriptions, the ones that fail, and whether the inventory root becomes
+# read-only once the subscriptions are listed. The process's home is a scratch folder,
 # so the run writes its inventory root under it. On Windows the wrapper writes to
 # C:\InventoryReports instead, so those tests do not run there.
 #
@@ -103,6 +108,9 @@ function Get-AzSubscription
 {
     [CmdletBinding()] param($TenantId, $SubscriptionId)
     $Scenario = Get-RdaStandInScenario
+    # The inventory root made read-only after the run's write probe and before
+    # its state check, so a rename there fails.
+    if ($Scenario.ReadOnlyRoot) { & chmod 555 (Join-Path $HOME 'InventoryReports') }
     @($Scenario.Subscriptions | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = $_.State; TenantId = $Scenario.Tenant } })
 }
 function Invoke-AzRestMethod
@@ -176,11 +184,12 @@ exit 1
 
     function script:Set-Scenario
     {
-        param([string[]]$Subs = @('A', 'B', 'C'), [string[]]$Fail = @())
+        param([string[]]$Subs = @('A', 'B', 'C'), [string[]]$Fail = @(), [switch]$ReadOnlyRoot)
         [pscustomobject]@{
             Tenant        = $script:Tenant
             Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = $script:Subs[$_].Name; State = 'Enabled' } })
             FailIds       = @($Fail | ForEach-Object { $script:Subs[$_].Id })
+            ReadOnlyRoot  = [bool]$ReadOnlyRoot
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -226,14 +235,14 @@ exit 1
     function script:Get-ShapeWarnings { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The * is not the right shape (*' }) }
 
     # The state files in the inventory root: the live ones, and the ones moved
-    # aside (named <name>.unreadable-<yyyyMMdd-HHmmss>).
+    # aside (named <name>.unreadable-<yyyyMMdd-HHmmss>, -2 and so on when taken).
     function script:Get-LiveStateFiles
     {
         @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -like '.resume-state-*.json' } | ForEach-Object { $_.Name } | Sort-Object)
     }
     function script:Get-MovedAside
     {
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -match '^\.resume-state-.+\.json\.unreadable-\d{8}-\d{6}$' })
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -match '^\.resume-state-.+\.json\.unreadable-\d{8}-\d{6}(-\d+)?$' })
     }
 
     # The state a test writes: the resume state file with a right-shaped
@@ -256,6 +265,11 @@ exit 1
         $Path = Join-Path $script:Root ('.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $StreamId)
         Set-Content -LiteralPath $Path -Value $Text -Encoding utf8
         return (Get-Content -LiteralPath $Path -Raw)
+    }
+    function script:Write-RawText
+    {
+        param([string]$Path, [string]$Text)
+        [System.IO.File]::WriteAllText($Path, $Text)
     }
     function script:New-RetryEntry
     {
@@ -294,7 +308,8 @@ exit 1
 
     # The checks every run that found a wrong-shaped file passes: one warning
     # naming the file and the field, the file moved aside with its content as
-    # seeded, and no conversion error from a value in it.
+    # seeded, and nothing on stderr (no conversion error from a value in it, no
+    # removal of a path already moved).
     function script:Assert-MovedAside
     {
         param($Run, [string]$FileName, [string]$Field, [string]$Content)
@@ -306,7 +321,7 @@ exit 1
         $Moved[0].Name | Should -Match ('^{0}\.unreadable-\d{{8}}-\d{{6}}$' -f [regex]::Escape($FileName))
         $Warnings[0] | Should -BeLike ('* moved aside to {0}, *' -f $Moved[0].Name)
         Get-Content -LiteralPath $Moved[0].FullName -Raw | Should -Be $Content
-        $Run.Error | Should -Not -Match 'Cannot convert'
+        $Run.Error | Should -BeNullOrEmpty
         $Run.Text | Should -Not -Contain 'Resume state cleared (clean run).'
         @($Run.Text | Where-Object { $_ -like 'Pending Retries:*' }) | Should -BeNullOrEmpty
         return $Moved[0]
@@ -324,7 +339,7 @@ exit 1
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         @(script:Get-MovedAside | ForEach-Object { $_.Name }) | Should -Be @($Moved.Name)
         Get-Content -LiteralPath $Moved.FullName -Raw | Should -Be $Content
-        $Run.Error | Should -Not -Match 'Cannot convert'
+        $Run.Error | Should -BeNullOrEmpty
     }
 
     function script:Assert-NotInAnyZip
@@ -388,6 +403,23 @@ Describe 'Get-ResumeStateShapeProblem: records as the wrapper and the stream wor
         Get-ResumeStateShapeProblem -Record $Record -Kind Stream | Should -BeNullOrEmpty
     }
 
+    It 'the joined id the one-id completed list writes (two ids run together) has the right shape' {
+        Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record '{"TenantID":"t","CompletedSubscriptionIds":["sub-asub-b"],"FailedAttempts":[]}') -Kind Main | Should -BeNullOrEmpty
+        Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record '{"Completed":["sub-asub-b"],"FailedAttempts":[]}') -Kind Stream | Should -BeNullOrEmpty
+    }
+
+    It 'an empty or whitespace-only file, read as $null, is not called the wrong shape (<Kind>, <Label>)' -TestCases @(
+        @{ Kind = 'Main'; Label = '0 bytes'; Text = '' },
+        @{ Kind = 'Main'; Label = 'whitespace only'; Text = "  `n`t " },
+        @{ Kind = 'Stream'; Label = '0 bytes'; Text = '' },
+        @{ Kind = 'Stream'; Label = 'the JSON literal null'; Text = 'null' }
+    ) {
+        script:Write-RawText -Path $script:Path -Text $Text
+        $Record = Get-Content -LiteralPath $script:Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $Record | Should -BeNullOrEmpty
+        Get-ResumeStateShapeProblem -Record $Record -Kind $Kind | Should -BeNullOrEmpty
+    }
+
     It 'a retry entry whose Attempts is text holding a whole number, and whose LastFailedAt is a non-ISO date text, has the right shape' {
         $Record = script:ConvertTo-Record '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[null,{"Id":"sub-a","Attempts":"2","LastFailedAt":"10/29/2026 18:00:00"}]}'
         Get-ResumeStateShapeProblem -Record $Record -Kind Main | Should -BeNullOrEmpty
@@ -413,7 +445,6 @@ Describe 'Get-ResumeStateShapeProblem: records as the wrapper and the stream wor
 
 Describe 'Get-ResumeStateShapeProblem: wrong shapes are named by their field' {
     It '<Kind> record <Label>: <Expected>' -TestCases @(
-        @{ Kind = 'Main'; Label = 'empty file (null)'; Json = 'null'; Expected = 'it is not a JSON object' },
         @{ Kind = 'Main'; Label = 'a text'; Json = '"garbage-shape-marker-5f3a"'; Expected = 'it is not a JSON object' },
         @{ Kind = 'Stream'; Label = 'a number'; Json = '5'; Expected = 'it is not a JSON object' },
         @{ Kind = 'Main'; Label = 'without TenantID'; Json = '{"CompletedSubscriptionIds":[]}'; Expected = 'TenantID is not text' },
@@ -422,6 +453,11 @@ Describe 'Get-ResumeStateShapeProblem: wrong shapes are named by their field' {
         @{ Kind = 'Main'; Label = 'with a text for CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"sub-a"}'; Expected = 'CompletedSubscriptionIds is not a list' },
         @{ Kind = 'Main'; Label = 'with a number in CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a",5]}'; Expected = 'CompletedSubscriptionIds holds an entry that is not a text id' },
         @{ Kind = 'Main'; Label = 'with an object in CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[{"Id":"sub-a"}]}'; Expected = 'CompletedSubscriptionIds holds an entry that is not a text id' },
+        @{ Kind = 'Main'; Label = 'with an empty id in CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a",""]}'; Expected = 'CompletedSubscriptionIds holds an empty id' },
+        @{ Kind = 'Main'; Label = 'with a whitespace-only id in CompletedSubscriptionIds, after a null'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[null,"   "]}'; Expected = 'CompletedSubscriptionIds holds an empty id' },
+        @{ Kind = 'Stream'; Label = 'with an empty id in Completed'; Json = '{"Completed":[""],"FailedAttempts":[]}'; Expected = 'Completed holds an empty id' },
+        @{ Kind = 'Stream'; Label = 'with a whitespace-only id in Completed'; Json = '{"Completed":["sub-a"," \t "],"FailedAttempts":[]}'; Expected = 'Completed holds an empty id' },
+        @{ Kind = 'Stream'; Label = 'with a number in Completed'; Json = '{"Completed":[5],"FailedAttempts":[]}'; Expected = 'Completed holds an entry that is not a text id' },
         @{ Kind = 'Stream'; Label = 'without Completed'; Json = '{"FailedAttempts":[]}'; Expected = 'Completed is missing' },
         @{ Kind = 'Stream'; Label = 'with a number for Completed'; Json = '{"Completed":5,"FailedAttempts":"garbage-shape-marker-5f3a"}'; Expected = 'Completed is not a list' },
         @{ Kind = 'Main'; Label = 'with a text for FailedAttempts'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":"garbage-shape-marker-5f3a"}'; Expected = 'FailedAttempts is not a list' },
@@ -476,8 +512,8 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 
     It 'with -Resume also says what this run does: <Kind>' -TestCases @(
-        @{ Kind = 'Main'; Name = '.resume-state-t.json'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"x"}'; Then = '  Starting fresh: this run collects every subscription, as with no resume state.' },
-        @{ Kind = 'Stream'; Name = '.resume-state-t-stream-1.json'; Json = '{"Completed":5}'; Then = '  The subscriptions it lists are not counted as completed, so this run collects them again.' }
+        @{ Kind = 'Main'; Name = '.resume-state-t.json'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"x"}'; Then = "  Starting fresh: this run does not use that file's completed list or retry list." },
+        @{ Kind = 'Stream'; Name = '.resume-state-t-stream-1.json'; Json = '{"Completed":5}'; Then = '  This run does not count the subscriptions it lists as completed.' }
     ) {
         $Path = Join-Path $script:Dir $Name
         Set-Content -LiteralPath $Path -Value $Json
@@ -496,13 +532,19 @@ Describe 'Move-WrongShapeResumeStateFile' {
 
     It 'leaves a <Label> file alone and returns nothing' -TestCases @(
         @{ Label = 'right-shaped'; Text = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"FailedAttempts":[null]}' },
-        @{ Label = 'cut-short (not JSON)'; Text = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"Fail' }
+        @{ Label = 'cut-short (not JSON)'; Text = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"Fail' },
+        @{ Label = '0-byte'; Text = '' },
+        @{ Label = 'whitespace-only'; Text = "  `r`n `t" }
     ) {
         $Path = Join-Path $script:Dir '.resume-state-t.json'
-        Set-Content -LiteralPath $Path -Value $Text -NoNewline
+        script:Write-RawText -Path $Path -Text $Text
         $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
         $Out | Should -BeNullOrEmpty
-        Get-Content -LiteralPath $Path -Raw | Should -Be $Text
+        # The same when the caller passes the record it parsed, as the fold and the merge do.
+        $Parsed = $false
+        try { $Record = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop; $Parsed = $true } catch { $Record = $null }
+        if ($Parsed) { @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Record $Record -Now $script:Now 6>&1) | Should -BeNullOrEmpty }
+        [System.IO.File]::ReadAllText($Path) | Should -Be $Text
         @(Get-ChildItem -LiteralPath $script:Dir -Force).Count | Should -Be 1
     }
 
@@ -510,16 +552,38 @@ Describe 'Move-WrongShapeResumeStateFile' {
         @(Move-WrongShapeResumeStateFile -Path (Join-Path $script:Dir '.resume-state-t.json') -Kind Main 6>&1) | Should -BeNullOrEmpty
     }
 
-    It 'says so when the rename fails, and returns no new name' {
+    It 'adds -2 when the name is taken, and -3 when that is taken too; the files already there are kept' {
         $Path = Join-Path $script:Dir '.resume-state-t.json'
+        $Base = '.resume-state-t.json.unreadable-20260102-030405'
+        Set-Content -LiteralPath (Join-Path $script:Dir $Base) -Value 'an earlier one'
         Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":5}'
-        New-Item -ItemType Directory -Path (Join-Path $script:Dir '.resume-state-t.json.unreadable-20260102-030405') -Force | Out-Null
+        $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
+        $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+        $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+        $Result[0].MovedTo | Should -Be ($Base + '-2')
+        $Lines[0] | Should -Be ('WARNING: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), so its records are not used. It was moved aside to {0}-2, kept for inspection; no run reads it again.' -f $Base)
+        # A second wrong-shaped file in the same second.
+        Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":6}'
+        (Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>$null).MovedTo | Should -Be ($Base + '-3')
+        Get-Content -LiteralPath (Join-Path $script:Dir $Base) -Raw | Should -Be ("an earlier one" + [Environment]::NewLine)
+        Get-Content -LiteralPath (Join-Path $script:Dir ($Base + '-2')) -Raw | Should -BeLike '*:5}*'
+        Get-Content -LiteralPath (Join-Path $script:Dir ($Base + '-3')) -Raw | Should -BeLike '*:6}*'
+        Test-Path -LiteralPath $Path | Should -BeFalse
+    }
+
+    It 'when the name and -2 to -100 are all taken, says it could not be moved aside and leaves the file' {
+        $Path = Join-Path $script:Dir '.resume-state-t.json'
+        $Base = '.resume-state-t.json.unreadable-20260102-030405'
+        New-Item -ItemType File -Path (Join-Path $script:Dir $Base) | Out-Null
+        foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:Dir ('{0}-{1}' -f $Base, $N)) | Out-Null }
+        Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":5}'
         $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
         $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Result[0].MovedTo | Should -BeNullOrEmpty
-        $Lines[0] | Should -BeLike 'WARNING: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), so its records are not used. It could not be moved aside (*), so a later run finds it again.'
+        $Lines[0] | Should -Be ('WARNING: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), so its records are not used. It could not be moved aside (every name from {0} to {0}-100 is taken), so a later run finds it again.' -f $Base)
         Test-Path -LiteralPath $Path | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $script:Dir -Force).Count | Should -Be 101
     }
 
     It 'Write-WrongShapeStateSummary names each file and never says clean run' {
@@ -536,21 +600,11 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 }
 
-Describe 'Readers use nothing from a wrong-shaped record left in place' {
+Describe 'Readers' {
     BeforeEach {
         $script:Dir = Join-Path $script:UnitDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $script:Dir -Force | Out-Null
         $script:Path = Join-Path $script:Dir '.resume-state-t.json'
-    }
-
-    It 'Get-CompletedSubscriptionIds and Get-FailedAttempts read <Label> as no records' -TestCases @(
-        @{ Label = 'a text retry list'; Json = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"FailedAttempts":"garbage"}' },
-        @{ Label = 'a retry entry with Attempts "abc"'; Json = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"FailedAttempts":[{"Id":"sub-b","Attempts":"abc","LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
-        @{ Label = 'a number for the completed list'; Json = '{"TenantID":"t","CompletedSubscriptionIds":5,"FailedAttempts":[]}' }
-    ) {
-        Set-Content -LiteralPath $script:Path -Value $Json
-        @(Get-CompletedSubscriptionIds -Path $script:Path -Tenant 't') | Should -BeNullOrEmpty
-        @(Get-FailedAttempts -Path $script:Path -Tenant 't') | Should -BeNullOrEmpty
     }
 
     It 'Get-FailedAttempts skips the null entry the wrapper saves when a retry list becomes empty' {
@@ -572,6 +626,20 @@ Describe 'Readers use nothing from a wrong-shaped record left in place' {
         @($State.Failed) | Should -BeNullOrEmpty
         $Lines | Should -Be @(('[stream-0] WARNING: could not read stream state at {0}: it is not the right shape (Completed is not a list)' -f $Path))
     }
+
+    It 'the stream worker reads a <Label> per-stream state file as no records, without a warning, as before' -TestCases @(
+        @{ Label = '0-byte'; Text = '' },
+        @{ Label = 'whitespace-only'; Text = "`n  `n" }
+    ) {
+        Set-Variable -Name Tag -Value '[stream-0]'
+        $Path = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        script:Write-RawText -Path $Path -Text $Text
+        $Out = @(Read-StreamState -Path $Path 6>&1)
+        $State = @($Out | Where-Object { $_ -is [hashtable] })[0]
+        @($State.Completed) | Should -BeNullOrEmpty
+        @($State.Failed) | Should -BeNullOrEmpty
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows {
@@ -589,10 +657,11 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
 
         # Run 1: moved aside, starts fresh (A is collected again although the
         # file listed it as completed), not a clean run, the state cleared.
+        # Nothing on stderr (Assert-MovedAside).
         $R1 = script:Invoke-Wrapper -Arguments $Args1 -Streams $Streams
         $R1.ExitCode | Should -Be 0
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
-        $R1.Text | Should -Contain '  Starting fresh: this run collects every subscription, as with no resume state.'
+        $R1.Text | Should -Contain "  Starting fresh: this run does not use that file's completed list or retry list."
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R1.Text | Should -Contain ('Resume state cleared, but not a clean run: the resume state file {0} was not the right shape and was moved aside to {1}; its records were not used.' -f $script:StateName, $Moved.Name)
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
@@ -614,7 +683,7 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         script:Get-Collected $R1 | Should -BeNullOrEmpty
         $R1.Text | Should -Contain 'ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above).'
         $R1.Text | Should -Contain ('  {0}: moved aside to {1}; its records are not used.' -f $script:StateName, $Moved.Name)
-        $R1.Text | Should -Contain '  Next: run the same command with -Resume instead of -ResumeFailedOnly. It collects every subscription no earlier run recorded as completed.'
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed.'
         @($R1.Text | Where-Object { $_ -like 'ResumeFailedOnly: filtered to*' -or $_ -like '*Nothing to retry*' }) | Should -BeNullOrEmpty
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
 
@@ -658,10 +727,81 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         $R1 = script:Invoke-Wrapper
         $R1.ExitCode | Should -Be 0
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
-        $R1.Text | Should -Not -Contain '  Starting fresh: this run collects every subscription, as with no resume state.'
+        @($R1.Text | Where-Object { $_ -like '  Starting fresh*' }) | Should -BeNullOrEmpty
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         $R2 = script:Invoke-Wrapper
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
+    }
+
+    It '-Resume and -ResumeFailedOnly together: stops with exit 1 and does not say it starts fresh' {
+        script:Set-Scenario
+        $Seeded = script:Write-MainState -FailedAttempts $script:Marker
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume', '-ResumeFailedOnly'
+        $R1.ExitCode | Should -Be 1
+        $null = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
+        @($R1.Text | Where-Object { $_ -like '  Starting fresh*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R1 | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above).'
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed.'
+    }
+
+    It 'beside a right-shaped per-stream file, -Resume says only that it does not use the moved file, and still skips what the stream file lists' {
+        # The moved file lists B as completed; the per-stream file lists A.
+        script:Set-Scenario
+        $Seeded = script:Write-MainState -FailedAttempts $script:Marker -Completed 'B'
+        $null = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", "Completed": ["sub-a"], "FailedAttempts": []}')
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R1.ExitCode | Should -Be 0
+        $null = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
+        $Lines = @($R1.Text | Where-Object { $_ -like '  Starting fresh*' -or $_ -like 'Recovered per-stream state*' -or $_ -like 'Resume mode:*' -or $_ -like 'Skipping (already completed):*' })
+        $Lines | Should -Be @(
+            "  Starting fresh: this run does not use that file's completed list or retry list.",
+            'Recovered per-stream state from an interrupted parallel run: 1 completed, 0 failed subscription record(s).',
+            'Resume mode: 1 previously completed subscription(s) will be skipped.',
+            'Skipping (already completed): Sub A (sub-a)'
+        )
+        # B, listed as completed only in the moved file, is collected.
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B', 'C')
+    }
+
+    It 'a <Label> resume state file is handled as before: -ResumeFailedOnly has nothing to retry and exits 0, nothing is moved' -TestCases @(
+        @{ Label = '0-byte'; Text = '' },
+        @{ Label = 'whitespace-only'; Text = "  `n`t`n " }
+    ) {
+        script:Set-Scenario
+        script:Write-RawText -Path $script:State -Text $Text
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
+        $R1.ExitCode | Should -Be 0
+        $R1.Error | Should -BeNullOrEmpty
+        @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
+        script:Get-MovedAside | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
+        @($R1.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped*' }) | Should -BeNullOrEmpty
+        [System.IO.File]::ReadAllText($script:State) | Should -Be $Text
+    }
+
+    It 'a wrong-shaped resume state file that cannot be moved aside is not used either' {
+        # The inventory root becomes read-only after the run's write probe, so the
+        # rename fails. Skipped where a read-only folder can still be written (root).
+        $Probe = Join-Path $script:CaseHome 'ro-probe'
+        New-Item -ItemType Directory -Path $Probe | Out-Null
+        & chmod 555 $Probe
+        $Refused = try { Set-Content -LiteralPath (Join-Path $Probe 'x') -Value 'x' -ErrorAction Stop; $false } catch { $true }
+        & chmod 755 $Probe
+        if (-not $Refused) { Set-ItResult -Skipped -Because 'a read-only folder can still be written here'; return }
+
+        script:Set-Scenario -ReadOnlyRoot
+        $Seeded = script:Write-MainState -FailedAttempts $script:Marker -Completed 'A'
+        try { $R1 = script:Invoke-Wrapper -Arguments '-Resume' }
+        finally { & chmod 755 $script:Root }
+        @(script:Get-ShapeWarnings $R1) | Should -BeLike ('WARNING: The resume state file {0} is not the right shape (FailedAttempts is not a list), so its records are not used. It could not be moved aside (*), so a later run finds it again.' -f $script:StateName)
+        # A, listed as completed in the file, is not skipped.
+        $R1.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        @($R1.Text | Where-Object { $_ -like 'Skipping (already completed):*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        $R1.Error | Should -Not -Match 'Cannot convert'
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $Seeded
     }
 
     It 'right-shaped state as the wrapper writes it (a null completed id, a null retry entry) is used, not moved aside' {
@@ -696,7 +836,7 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         $R1 = script:Invoke-Wrapper -Arguments $Args1 -Streams $Streams
         $R1.ExitCode | Should -Be 0
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:Stream0Name -Field 'Completed is not a list' -Content $Seeded
-        $R1.Text | Should -Contain '  The subscriptions it lists are not counted as completed, so this run collects them again.'
+        $R1.Text | Should -Contain '  This run does not count the subscriptions it lists as completed.'
         @($R1.Text | Where-Object { $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R1.Text | Should -Contain ('Resume state cleared, but not a clean run: the per-stream state file {0} was not the right shape and was moved aside to {1}; its records were not used.' -f $script:Stream0Name, $Moved.Name)
@@ -724,6 +864,24 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
     }
 
+    It 'a <Label> per-stream file beside a right-shaped resume state is handled as before: -ResumeFailedOnly retries the retry list' -TestCases @(
+        @{ Label = '0-byte'; Text = '' },
+        @{ Label = 'whitespace-only'; Text = "  `n " }
+    ) {
+        script:Set-Scenario -Subs 'A', 'B'
+        $null = script:Write-MainState -FailedAttempts @((script:New-RetryEntry -Letter 'B')) -Completed 'A'
+        $StreamPath = Join-Path $script:Root $script:Stream0Name
+        script:Write-RawText -Path $StreamPath -Text $Text
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
+        $R1.ExitCode | Should -Be 0
+        $R1.Error | Should -BeNullOrEmpty
+        @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
+        script:Get-MovedAside | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'ResumeFailedOnly: filtered to 1 previously-failed subscription(s) (was 2).'
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B')
+        script:Test-CleanLine $R1 | Should -BeTrue
+    }
+
     It '-ResumeFailedOnly with <Streams> stream(s) stops with exit 1; the advised -Resume ends clean' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
         script:Set-Scenario
         $Seeded = script:Write-StreamText -Text ('{"Completed": 5, "FailedAttempts": "' + $script:Marker + '"}')
@@ -733,18 +891,20 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:Stream0Name -Field 'Completed is not a list' -Content $Seeded
         script:Get-Collected $R1 | Should -BeNullOrEmpty
         $R1.Text | Should -Contain ('  {0}: moved aside to {1}; its records are not used.' -f $script:Stream0Name, $Moved.Name)
-        $R1.Text | Should -Contain '  Next: run the same command with -Resume instead of -ResumeFailedOnly. It collects every subscription no earlier run recorded as completed.'
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed.'
 
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
     }
 
-    It 'a stale wrong-shaped per-stream file found only by the end-of-run merge of a parallel run without -Resume is moved aside there' {
+    It 'a stale wrong-shaped per-stream file found only by the end-of-run merge of a parallel run without -Resume is moved aside there, with nothing on stderr' {
         script:Set-Scenario
         $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
         $R1 = script:Invoke-Wrapper -Streams 2
         $R1.ExitCode | Should -Be 0
         $Moved = script:Assert-MovedAside -Run $R1 -FileName ('.resume-state-{0}-stream-5.json' -f $script:Tenant) -Field 'FailedAttempts is not a list' -Content $Seeded
+        # The merge's clean-up does not try to remove the path it moved.
+        $R1.Error | Should -BeNullOrEmpty
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         $R2 = script:Invoke-Wrapper -Streams 2

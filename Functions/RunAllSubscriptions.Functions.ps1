@@ -473,8 +473,8 @@ function Resolve-TenantId
 # record has the right shape, otherwise a short text naming the first field that
 # does not (never a value from the file).
 #   - The record is a JSON object.
-#   - Main: TenantID is text, and CompletedSubscriptionIds is a list of text ids.
-#     Stream: Completed is a list of text ids.
+#   - Main: TenantID is text, and CompletedSubscriptionIds is a list of
+#     non-empty text ids. Stream: Completed is a list of non-empty text ids.
 #   - FailedAttempts (the retry list) is a list. Each entry is an object with a
 #     non-empty text Id, Attempts a whole number of at least 1 and LastFailedAt
 #     a date, the values Add-FailedAttempt and Merge-FailedAttempts convert. A
@@ -482,18 +482,29 @@ function Resolve-TenantId
 #     which reads as an empty list.
 # A list may hold null entries: the wrapper and the stream worker save one when
 # a list becomes empty. They are not records, and the readers skip them.
+# A $null record also returns $null: ConvertFrom-Json turns an empty or
+# whitespace-only file (a write cut short) into $null without an error. That
+# file is not valid JSON, so it is left to the readers, which treat it as they
+# did before this check.
 function Get-ResumeStateShapeProblem
 {
     param(
         [object]$Record,
         [Parameter(Mandatory = $true)][ValidateSet('Main', 'Stream')][string]$Kind
     )
+    if ($null -eq $Record) { return $null }
     if ($Record -isnot [System.Management.Automation.PSCustomObject]) { return 'it is not a JSON object' }
     if ($Kind -eq 'Main' -and $Record.TenantID -isnot [string]) { return 'TenantID is not text' }
     $IdsKey = if ($Kind -eq 'Main') { 'CompletedSubscriptionIds' } else { 'Completed' }
     if ($null -eq $Record.PSObject.Properties[$IdsKey]) { return ('{0} is missing' -f $IdsKey) }
     if ($null -ne $Record.$IdsKey -and $Record.$IdsKey -isnot [array]) { return ('{0} is not a list' -f $IdsKey) }
-    if (@($Record.$IdsKey | Where-Object { $null -ne $_ -and $_ -isnot [string] }).Count -gt 0) { return ('{0} holds an entry that is not a text id' -f $IdsKey) }
+    # foreach, not a pipeline: a large tenant has thousands of ids here.
+    foreach ($Id in @($Record.$IdsKey))
+    {
+        if ($null -eq $Id) { continue }
+        if ($Id -isnot [string]) { return ('{0} holds an entry that is not a text id' -f $IdsKey) }
+        if ([string]::IsNullOrWhiteSpace($Id)) { return ('{0} holds an empty id' -f $IdsKey) }
+    }
 
     $List = $Record.FailedAttempts
     if ($null -ne $List -and $List -isnot [array]) { return 'FailedAttempts is not a list' }
@@ -523,13 +534,13 @@ function Get-ResumeStateShapeProblem
 # read here, and a file that is absent or cannot be parsed is left to the
 # reader's own handling. Returns nothing when the record has the right shape.
 # Otherwise its records are not used: the file is renamed in place to
-# <name>.unreadable-<UTC time> and kept for inspection. That is the name other
-# state files that cannot be used are moved aside to, so one rule covers them
-# all: it neither ends in '.json' nor matches a state file name, so no later run
-# reads it, and it stays a dot-file in the inventory root, which no zip step
-# takes. Prints a warning naming the file and the field, never its content;
-# with -Resume, also what this run does instead. Returns { Kind; Name; MovedTo }
-# (MovedTo is $null when the rename failed).
+# <name>.unreadable-<UTC yyyyMMdd-HHmmss>, with -2, -3 and so on added when that
+# name is taken, and kept for inspection. The name neither ends in '.json' nor
+# matches a state file name, so no later run reads it, and it stays a dot-file
+# in the inventory root, which no zip step of the wrapper takes. Prints a
+# warning naming the file and the field, never its content; with -Resume, also
+# what this run does instead. Returns { Kind; Name; MovedTo } (MovedTo is $null
+# when the rename failed).
 function Move-WrongShapeResumeStateFile
 {
     param(
@@ -550,10 +561,21 @@ function Move-WrongShapeResumeStateFile
 
     $Name = Split-Path -Path $Path -Leaf
     $What = if ($Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
-    $MovedTo = '{0}.unreadable-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+    $Base = '{0}.unreadable-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+    # A second move in the same second, or a name an earlier run left, must not
+    # make the rename fail. Up to 100 names are tried.
+    $Folder = Split-Path -Path $Path -Parent
+    $MovedTo = $Base
+    $N = 1
+    while ($null -ne $MovedTo -and (Test-Path -LiteralPath (Join-Path $Folder $MovedTo)))
+    {
+        $N++
+        $MovedTo = if ($N -le 100) { '{0}-{1}' -f $Base, $N } else { $null }
+    }
     $Lead = 'WARNING: The {0} {1} is not the right shape ({2}), so its records are not used.' -f $What, $Name, $Problem
     try
     {
+        if ($null -eq $MovedTo) { throw ('every name from {0} to {0}-100 is taken' -f $Base) }
         Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
         Write-Host ('{0} It was moved aside to {1}, kept for inspection; no run reads it again.' -f $Lead, $MovedTo) -ForegroundColor Yellow
     }
@@ -564,7 +586,7 @@ function Move-WrongShapeResumeStateFile
     }
     if ($Resume)
     {
-        $Then = if ($Kind -eq 'Main') { 'Starting fresh: this run collects every subscription, as with no resume state.' } else { 'The subscriptions it lists are not counted as completed, so this run collects them again.' }
+        $Then = if ($Kind -eq 'Main') { "Starting fresh: this run does not use that file's completed list or retry list." } else { 'This run does not count the subscriptions it lists as completed.' }
         Write-Host ('  {0}' -f $Then) -ForegroundColor Yellow
     }
     return [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $MovedTo }
@@ -594,9 +616,6 @@ function Get-CompletedSubscriptionIds
     try
     {
         $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
-        # Not the right shape: no records to use. The wrapper moves such a file
-        # aside with a warning before it reads it (Move-WrongShapeResumeStateFile).
-        if ($null -ne (Get-ResumeStateShapeProblem -Record $State -Kind Main)) { return @() }
         if ($State.TenantID -ne $Tenant)
         {
             Write-Host ("Resume state file is for a different tenant ({0}); ignoring." -f $State.TenantID) -ForegroundColor Yellow
@@ -626,7 +645,6 @@ function Get-FailedAttempts
     try
     {
         $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
-        if ($null -ne (Get-ResumeStateShapeProblem -Record $State -Kind Main)) { return @() }
         if ($State.TenantID -ne $Tenant) { return @() }
         if ($null -eq $State.FailedAttempts) { return @() }
         # A null entry is not a failure record (Get-ResumeStateShapeProblem).
