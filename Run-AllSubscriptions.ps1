@@ -1828,8 +1828,9 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # is kept and the run does not say it cleared the state.
         $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
         $FoldedStreamFiles = @()
-        $StateFilesLeft = @(@($StreamFilesLeft | Where-Object { Test-Path -LiteralPath $_ }) + $ResumeStateFile)
-        if (@($StreamFilesLeft | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0)
+        $MergeFilesLeft = @($StreamFilesLeft | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Test-Path -LiteralPath $_) })
+        $StateFilesLeft = @($MergeFilesLeft + $ResumeStateFile)
+        if ($MergeFilesLeft.Count -eq 0)
         {
             $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
         }
