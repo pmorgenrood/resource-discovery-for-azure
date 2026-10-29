@@ -27,6 +27,7 @@
 # subscription id only.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("NoReportExitCode_" + [guid]::NewGuid().ToString('N'))
 
@@ -83,32 +84,33 @@ if ($Task -eq 'Processing')
     # real script. -Service arrives as one comma-separated string because
     # pwsh -File does not bind arrays. -NoResources makes Resource Graph report
     # an empty subscription. -Cwd starts the script from another folder,
-    # -SignedOut means no saved sign-in, and -NoAzCli removes the Azure CLI from
-    # PATH (and its stand-in) so the script's own CLI check runs.
+    # -SignedOut means no saved sign-in, and -NoAzModules makes the required Az
+    # PowerShell modules look not installed, so the script's own module check runs.
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
 param([string]$Tree, [string]$Out, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources, [string]$StateFile,
-    [string]$Cwd, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid, [switch]$SignedOut, [switch]$NoAzCli)
+    [string]$Cwd, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid, [switch]$SignedOut, [switch]$NoAzModules)
 $PSStyle.OutputRendering = 'PlainText'
 $Global:RdaSessionInitialized = $true
-$Global:AzPowerShellLoaded = -not $NoAzCli.IsPresent
+$Global:AzPowerShellLoaded = -not $NoAzModules.IsPresent
 $Global:PlatformOS = 'PowerShell Unix'
 $Global:StandInNoResources = $NoResources.IsPresent
 $Global:StandInSignedOut = $SignedOut.IsPresent
 $SubId = '12345678-1234-1234-1234-123456789012'
 $Global:StandInSubs = @([pscustomobject]@{ id = $SubId; name = 'Demo Subscription'; tenantId = 'tenant-demo'; state = 'Enabled' })
-if ($NoAzCli)
+if ($NoAzModules)
 {
-    $Sep = [IO.Path]::PathSeparator
-    foreach ($Cmd in @(Get-Command az -CommandType Application -All -ErrorAction SilentlyContinue))
+    # Get-Module -ListAvailable finds no Az module; every other use is the real one.
+    function global:Get-Module
     {
-        $Dir = (Split-Path -Parent $Cmd.Source).TrimEnd('/', '\')
-        $env:PATH = (@($env:PATH -split [regex]::Escape($Sep)) | Where-Object { $_ -and $_.TrimEnd('/', '\') -ne $Dir }) -join $Sep
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Name, [switch]$ListAvailable)
+        if ($ListAvailable -and @($Name | Where-Object { $_ -like 'Az.*' }).Count -gt 0) { return }
+        Microsoft.PowerShell.Core\Get-Module @PSBoundParameters
     }
 }
 else
 {
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -157,6 +159,8 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Params = @{ SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out }
 if (-not $NoSubscriptionID) { $Params.SubscriptionID = $SubId }
 if ($Service) { $Params.Service = @($Service -split ',') }
@@ -180,7 +184,7 @@ exit $Code
     {
         param([string]$Tree = $script:Tree, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources,
             [switch]$FromOtherFolder, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid,
-            [switch]$SignedOut, [switch]$NoAzCli, [switch]$UnwritableOut)
+            [switch]$SignedOut, [switch]$NoAzModules, [switch]$UnwritableOut)
 
         $Name = [guid]::NewGuid().ToString('N')
         $Out = Join-Path $script:WorkDir ('out_' + $Name)
@@ -211,7 +215,7 @@ exit $Code
         if ($TenantID) { $ArgList += @('-TenantID', $TenantID) }
         if ($Appid) { $ArgList += @('-Appid', $Appid) }
         if ($SignedOut) { $ArgList += '-SignedOut' }
-        if ($NoAzCli) { $ArgList += '-NoAzCli' }
+        if ($NoAzModules) { $ArgList += '-NoAzModules' }
 
         $Console = @(& pwsh @ArgList 2>&1 | ForEach-Object { [string]$_ })
         $ProcessExit = $LASTEXITCODE
@@ -308,9 +312,9 @@ Describe 'Direct run that stops during setup' {
         $Run.ProcessExit | Should -Be 1
     }
 
-    It 'exits 1 when the Azure CLI is not installed' {
-        $Run = Invoke-StandInRun -Service 'StandInWorking' -NoAzCli
-        $Run.Console | Should -Match 'Azure CLI Not Found'
+    It 'exits 1 when a required Az PowerShell module is not installed' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -NoAzModules
+        $Run.Console | Should -Match 'Required Azure PowerShell module\(s\) not found'
         $Run.Zip.Count | Should -Be 0
         $Run.ProcessExit | Should -Be 1
     }

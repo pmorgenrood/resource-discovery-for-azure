@@ -36,6 +36,7 @@ BeforeDiscovery {
 }
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ConsumptionIncompleteRow_' + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
@@ -63,7 +64,7 @@ $Global:StandInLapseIds = @($LapseIds -split ',' | Where-Object { $_ })
 $Global:StandInCurrentSub = $null
 $Global:StandInContextSub = $Global:StandInSubs[0].Id
 
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -117,6 +118,8 @@ function global:Import-Module
     Microsoft.PowerShell.Core\Import-Module @args
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Root = Join-Path $HOME 'InventoryReports'
 New-Item -ItemType Directory -Path $Root -Force | Out-Null
 $Start = (Get-Date).AddSeconds(-1)

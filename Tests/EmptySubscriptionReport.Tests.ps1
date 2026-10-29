@@ -19,6 +19,7 @@
 # documentation placeholder subscription id only; no live Azure.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("EmptySubscriptionReport_" + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
@@ -43,7 +44,7 @@ if ($WithDisk)
     $Global:StandInRows = @(@{ id = "/subscriptions/$SubId/resourceGroups/rg-demo/providers/Microsoft.Compute/disks/disk-demo"; name = 'disk-demo'; type = 'microsoft.compute/disks'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
             sku = @{ name = 'Premium_LRS' }; properties = @{ diskSizeGB = 32; diskState = 'Unattached'; timeCreated = '2024-03-15T09:41:27Z' } })
 }
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -76,6 +77,8 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Params = @{ SubscriptionID = $SubId; OutputDirectory = $Out; Service = @('VMDisk', 'SQLSERVER') }
 if ($Obfuscate) { $Params.Obfuscate = $true }
 Set-Location $Tree

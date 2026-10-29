@@ -26,6 +26,7 @@
 # only.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ResourceDiscoveryFailure_" + [guid]::NewGuid().ToString('N'))
@@ -37,9 +38,9 @@ BeforeAll {
         Copy-Item -Path (Join-Path $script:RepoRoot $Item) -Destination $script:Tree -Recurse -Force
     }
 
-    # Child-process harness. Scenario 'ok' reads every page. 'emptykey' gives the
-    # last resource a property whose name is empty, which ConvertFrom-Json cannot
-    # read, so the second page cannot be parsed. 'toolarge' fails the second page
+    # Child-process harness. Scenario 'ok' reads every page. 'badjson' cuts the
+    # second page off, so it cannot be parsed. (An empty property name no longer
+    # makes a page unreadable: the Az PowerShell path keeps it.) 'toolarge' fails the second page
     # with ResponsePayloadTooLarge six times and then answers, so the run also ends
     # when every failed call is retried. The retry backoff and the pause between
     # pages do not wait, so the suite runs in seconds.
@@ -60,7 +61,7 @@ function global:New-StandInPublicIp([int]$Index, [switch]$EmptyKey)
     if ($EmptyKey) { $Props['definition'] = @{ '' = 'unnamed' } }
     @{ id = ('/subscriptions/{0}/resourceGroups/rg-demo/providers/Microsoft.Network/publicIPAddresses/pip-demo-{1}' -f $Global:StandInSubs[0].id, $Index); name = ('pip-demo-{0}' -f $Index); type = 'microsoft.network/publicipaddresses'; location = 'eastus'; subscriptionId = $Global:StandInSubs[0].id; resourceGroup = 'rg-demo'; sku = @{ name = 'Standard' }; properties = $Props }
 }
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -82,8 +83,11 @@ function global:az
             return
         }
         $Rows = [System.Collections.Generic.List[object]]::new()
-        for ($i = $Skip; $i -lt [math]::Min($Skip + 1000, 1001); $i++) { $Rows.Add((New-StandInPublicIp -Index $i -EmptyKey:($Global:HScenario -eq 'emptykey' -and $i -eq 1000))) }
-        return (@{ data = @($Rows); count = $Rows.Count } | ConvertTo-Json -Depth 8 -Compress)
+        for ($i = $Skip; $i -lt [math]::Min($Skip + 1000, 1001); $i++) { $Rows.Add((New-StandInPublicIp -Index $i)) }
+        $Text = (@{ data = @($Rows); count = $Rows.Count } | ConvertTo-Json -Depth 8 -Compress)
+        # 'badjson': the second page is cut off, so it is not valid JSON.
+        if ($Global:HScenario -eq 'badjson' -and $Skip -ge 1000) { return $Text.Substring(0, $Text.Length - 3) }
+        return $Text
     }
     return $null
 }
@@ -122,6 +126,8 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Params = @{ SubscriptionID = $SubId; SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out; Service = @('PublicIP') }
 Set-Location $Tree
 $global:LASTEXITCODE = 0
@@ -202,7 +208,7 @@ Describe 'Direct run: a Resource Graph page that cannot be read' {
     }
 
     It 'stops with exit 1 and writes no report when a page cannot be parsed' {
-        $Run = Invoke-DiscoveryRun -Scenario 'emptykey'
+        $Run = Invoke-DiscoveryRun -Scenario 'badjson'
         $Run.ProcessExit | Should -Be 1 -Because $Run.Console
         $Run.Console | Should -Match 'could not be parsed as JSON'
         $Run.Console | Should -Match 'Resource discovery failed'
@@ -225,7 +231,7 @@ Describe 'Direct run: a Resource Graph page that cannot be read' {
 Describe 'Under -RunAllSubs: the failure reaches the wrapper with its reason' {
 
     It 'passes on the parse failure to the caller and writes no report' {
-        $Run = Invoke-DiscoveryRun -Scenario 'emptykey' -RunAllSubs
+        $Run = Invoke-DiscoveryRun -Scenario 'badjson' -RunAllSubs
         $Run.State.Caught | Should -Match 'could not be parsed as JSON' -Because $Run.Console
         $Run.Html.Count | Should -Be 0
         $Run.Zip.Count | Should -Be 0

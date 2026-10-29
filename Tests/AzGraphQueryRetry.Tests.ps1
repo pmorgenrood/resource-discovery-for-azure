@@ -344,9 +344,14 @@ Describe 'Invoke-AzGraphQuerySafe retry behavior' {
         It 'is passed -HideRawOutput under -Obfuscate by every inventory query' {
             $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
             $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
-            $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Invoke-AzGraphQuerySafe' }, $true))
+            # Every discovery query goes through Invoke-DiscoveryGraphQuery (it stops a
+            # direct run on a failure), which hands -HideRawOutput on unchanged.
+            $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Invoke-DiscoveryGraphQuery' }, $true))
             $Calls.Count | Should -BeGreaterThan 0
             foreach ($Call in $Calls) { $Call.Extent.Text | Should -Match '-HideRawOutput:\$Obfuscate\.IsPresent' }
+            $Direct = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Invoke-AzGraphQuerySafe' }, $true))
+            $Direct.Count | Should -Be 1
+            $Direct[0].Extent.Text | Should -Match '-HideRawOutput:\$HideRawOutput'
         }
     }
 

@@ -21,6 +21,7 @@
 # subscription id only.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("DirectRunExitCode_" + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
@@ -67,7 +68,7 @@ $Global:AzPowerShellLoaded = $true
 $Global:PlatformOS = 'PowerShell Unix'
 $SubId = '12345678-1234-1234-1234-123456789012'
 $Global:StandInSubs = @([pscustomobject]@{ id = $SubId; name = 'Demo Subscription'; tenantId = 'tenant-demo'; state = 'Enabled' })
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -110,6 +111,8 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Params = @{ SubscriptionID = $SubId; SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out }
 if ($Service) { $Params.Service = @($Service -split ',') }
 if ($RunAllSubs) { $Params.RunAllSubs = $true }
