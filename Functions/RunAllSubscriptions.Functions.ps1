@@ -621,6 +621,70 @@ function Get-StreamResumeStateFiles
     return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
+# Read one per-stream resume-state file. Returns its content, or $null when the
+# file cannot be read or does not hold a JSON object. A write cut short leaves a
+# partial file, which fails to parse, or an empty one, which ConvertFrom-Json
+# turns into $null without an error; both come back as $null here.
+function Read-StreamResumeStateFile
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try
+    {
+        $Obj = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $null
+    }
+    if ($Obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    return $Obj
+}
+
+# A per-stream state file that the end-of-run merge of a parallel run cannot
+# read (Read-StreamResumeStateFile). Its records are not used, so the
+# subscriptions it lists are not counted as completed and a later -Resume
+# collects them again. The file is renamed in place to
+# <name>.unreadable-<UTC time> and kept for inspection: that name ends neither
+# in '.json' nor matches Get-StreamResumeStateFiles, so no later run reads it,
+# and it stays a dot-file in the inventory root like the main state file, which
+# no zip step takes. Prints a warning naming the file, never its content.
+# Returns { Name; MovedTo } (MovedTo is $null when the rename failed).
+function Move-UnreadableStreamStateFile
+{
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
+    $Lead = 'WARNING: The per-stream state file {0} could not be read, so its records are not used: the subscriptions it lists are not counted as completed, and a later -Resume collects them again.' -f $File.Name
+    try
+    {
+        Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
+        Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
+    }
+    catch
+    {
+        $MovedTo = $null
+        Write-Host ('{0} It could not be moved aside ({1}), so a later run finds it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+    }
+    return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
+}
+
+# The end-of-run line for each per-stream state file this run could not read
+# (Move-UnreadableStreamStateFile): whether the resume state was cleared or
+# kept, and where the file went. Such a run is not a clean run, whatever else
+# happened, so it never prints "Resume state cleared (clean run).".
+function Write-UnreadableStreamStateSummary
+{
+    param([object[]]$Unreadable, [bool]$StateKept)
+    $Word = if ($StateKept) { 'kept' } else { 'cleared' }
+    foreach ($File in @($Unreadable | Where-Object { $null -ne $_ }))
+    {
+        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'was left in place (it could not be moved aside)' } else { 'was moved aside to {0}' -f $File.MovedTo }
+        Write-Host ('Resume state {0}, but not a clean run: the per-stream state file {1} could not be read and {2}; its records were not used.' -f $Word, $File.Name, $Where) -ForegroundColor Yellow
+    }
+}
+
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
 # pre-existing entries) against the unified CompletedIds list.
 #   - A sub that now appears in CompletedIds (any stream, or a prior run,
@@ -777,8 +841,9 @@ function Read-StreamState
         return @{
             Completed = if ($null -eq $Obj.Completed) { @() } else { @($Obj.Completed) }
             # Backward-compatible: state files written by an older worker had
-            # no FailedAttempts key, so default to @().
-            Failed    = if ($null -eq $Obj.FailedAttempts) { @() } else { @($Obj.FailedAttempts) }
+            # no FailedAttempts key, so default to @(). Files written before
+            # Write-StreamState dropped null entries can hold one; skip it.
+            Failed    = if ($null -eq $Obj.FailedAttempts) { @() } else { @($Obj.FailedAttempts | Where-Object { $_ }) }
         }
     }
     catch
@@ -797,7 +862,10 @@ function Write-StreamState
             Tenant         = $TenantID
             StreamId       = $StreamId
             Completed      = $Completed
-            FailedAttempts = @($FailedAttempts)
+            # Remove-FailedAttempt returns nothing once the list is empty, and
+            # @($null) is a one-entry array; drop that entry so the file holds
+            # only real failure records.
+            FailedAttempts = @($FailedAttempts | Where-Object { $_ })
         } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
     }
     catch

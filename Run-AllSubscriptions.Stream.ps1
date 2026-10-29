@@ -150,9 +150,12 @@ if ($Resume -or $ResumeFailedOnly)
     $State = Read-StreamState -Path $StreamStateFile
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
-    if ($CompletedIds.Count -gt 0)
+    # The parent leaves completed subscriptions out of the slices, so this file
+    # usually lists none of this slice; count only those that are in it.
+    $CompletedInSlice = @($CompletedIds | Where-Object { $SubscriptionIds -contains $_ })
+    if ($CompletedInSlice.Count -gt 0)
     {
-        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedIds.Count) 'DarkGray'
+        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedInSlice.Count) 'DarkGray'
     }
     if ($ResumeFailedOnly -and $FailedAttempts.Count -gt 0)
     {
