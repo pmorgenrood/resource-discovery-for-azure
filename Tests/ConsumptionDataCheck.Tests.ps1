@@ -1176,7 +1176,10 @@ exit $LASTEXITCODE
             $env:RDA_TEST_ROLES = $Roles
             $PwshArgs = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Root', $script:RepoRoot, '-Out', $Out, '-Mode', $Mode)
             if ($SkipConsumption) { $PwshArgs += '-SkipConsumption' }
-            $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String
+            # ResourceInventory.ps1 reads ./Version.json from the current folder.
+            Push-Location $script:RepoRoot
+            try { $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String }
+            finally { Pop-Location }
             [pscustomobject]@{
                 ExitCode          = $LASTEXITCODE
                 Output            = $Output

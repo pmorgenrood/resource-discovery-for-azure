@@ -755,7 +755,7 @@ if ($Resume -or $ResumeFailedOnly)
             catch
             {
                 Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
-                $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile))
+                $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile -ResumeFailedOnly:$ResumeFailedOnly))
             }
         }
         if ($StrandedCompleted.Count -gt 0)
@@ -1789,7 +1789,6 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
 {
     try
     {
-        Remove-Item -Path $ResumeStateFile -Force
         # A -Resume run with nothing left to collect uses one stream, so the
         # parallel merge, which deletes the per-stream state files an
         # interrupted parallel run left, does not run. Those files were folded
@@ -1797,16 +1796,16 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         # -Resume would recover and skip their subscriptions again. The same
         # when a per-stream file could not be read, so the state reported as
         # cleared below is cleared. Only files that were read are deleted; one
-        # that could not be read was moved aside and is kept.
+        # that could not be read was moved aside and is kept. Each removal is
+        # checked (Remove-ResumeStateFiles): a run that leaves a file never
+        # says it cleared the state.
+        $StreamFilesToRemove = @()
         if ($NothingLeftToCollect -or @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
         {
-            foreach ($StreamFile in @($FoldedStreamFiles | Where-Object { $null -ne $_ }))
-            {
-                $PerStreamFile = $StreamFile.FullName
-                try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
-            }
+            $StreamFilesToRemove = @($FoldedStreamFiles | Where-Object { $null -ne $_ } | ForEach-Object { $_.FullName })
         }
-        if (@($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
+        $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
+        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
         }

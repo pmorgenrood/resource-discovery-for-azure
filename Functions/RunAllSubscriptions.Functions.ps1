@@ -498,8 +498,8 @@ function Get-StreamResumeStateFiles
 
 # A per-stream state file that a resuming run cannot read (an interrupted
 # write can leave it cut short). Its records are not used, so the
-# subscriptions it lists are not counted as completed and the run collects
-# them again. The file is renamed in place to <name>.unreadable-<UTC time> and
+# subscriptions it lists are not counted as completed: a -Resume run collects
+# them again, and under -ResumeFailedOnly a later -Resume does. The file is renamed in place to <name>.unreadable-<UTC time> and
 # kept for inspection: that name ends neither in '.json' nor matches
 # Get-StreamResumeStateFiles, so no later run reads it and no zip step that
 # picks files by '*.json' takes it. Prints a warning naming the file, never its
@@ -508,10 +508,14 @@ function Move-UnreadableStreamStateFile
 {
     param(
         [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
-        [datetime]$Now = [datetime]::UtcNow
+        [datetime]$Now = [datetime]::UtcNow,
+        # -ResumeFailedOnly retries only the retry list, so it does not collect
+        # the subscriptions the file lists; a later -Resume does.
+        [switch]$ResumeFailedOnly
     )
     $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
-    $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again.' -f $File.Name
+    $Then = if ($ResumeFailedOnly) { 'a later -Resume collects them (-ResumeFailedOnly retries only the retry list)' } else { 'this run collects them again' }
+    $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and {1}.' -f $File.Name, $Then
     try
     {
         Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
@@ -538,6 +542,39 @@ function Write-UnreadableStreamStateSummary
         $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'was left in place (it could not be moved aside)' } else { 'was moved aside to {0}' -f $File.MovedTo }
         Write-Host ('Resume state {0}, but not a clean run: the per-stream state file {1} could not be read and {2}; its records were not used.' -f $Word, $File.Name, $Where) -ForegroundColor Yellow
     }
+}
+
+# Remove the resume state at the end of a run that clears it: first each
+# per-stream state file in -StreamFiles (the ones this run read), then the
+# resume state file -StateFile. Each removal stops on an error and is then
+# checked: a file that is still there gets a warning naming it. While a
+# per-stream file is left, the resume state file is kept too, so the next
+# -Resume reads the same state, reads that per-stream file again and retries
+# the removal. Returns the paths left on disk (none when all were removed).
+function Remove-ResumeStateFiles
+{
+    param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
+    $Left = [System.Collections.Generic.List[string]]::new()
+    foreach ($Path in @(@($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) }) + $StateFile))
+    {
+        $IsState = $Path -eq $StateFile
+        if ($IsState -and $Left.Count -gt 0)
+        {
+            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state, reads the per-stream state file(s) above again and retries the removal.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
+            $Left.Add($Path)
+            continue
+        }
+        $Reason = $null
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $Path)) { continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        $What = if ($IsState) { 'resume state file' } else { 'per-stream state file' }
+        Write-Host ('WARNING: Could not remove the {0} {1}: {2}' -f $What, (Split-Path -Path $Path -Leaf), $Reason) -ForegroundColor Yellow
+        if ($IsState) { Write-Host '  The next run reads it again and retries the removal.' -ForegroundColor Yellow }
+        $Left.Add($Path)
+    }
+    return $Left.ToArray()
 }
 
 # The subscriptions the up-front role check skipped for a cause that can pass
