@@ -38,22 +38,33 @@ function Get-AzMetric
 {
     param($ResourceId, $MetricName, $StartTime, $EndTime, $TimeGrain, $AggregationType, $DefaultProfile)
 
+    # One request can name several metrics (grouped requests) and is answered
+    # with one result per name. A grouped answer leaves out the read-operations
+    # metric of a disk with a behaviour, so the script requests that metric on
+    # its own, and the behaviour applies to that single-metric request only:
+    # the disk's other metrics are not delayed or failed with it.
     $DiskName = ($ResourceId -split '/')[-1]
-    if ($MetricName -eq '__READOPS__')
+    $Names = @($MetricName)
+    $Special = $DiskName -match '-(throttled|badmetric|empty|slow\d+)$'
+    if ($Names.Count -eq 1 -and $Names[0] -eq '__READOPS__')
     {
         if ($DiskName -like '*-throttled') { throw "__THROTTLE__" }
         if ($DiskName -like '*-badmetric') { throw "__BADMETRIC__" }
-        if ($DiskName -like '*-empty') { return [pscustomobject]@{ Id = $ResourceId; Name = $MetricName; Data = @() } }
         if ($DiskName -match '-slow(\d+)$') { Start-Sleep -Milliseconds ([int]$Matches[1]) }
     }
 
     $Seed = [int]($DiskName -replace '^disk-(\d+).*$', '$1')
-    $Data = foreach ($Hour in 0..2)
+    foreach ($Name in $Names)
     {
-        $Value = ($Seed % 50) + $Hour + ($MetricName.Length / 10)
-        [pscustomobject]@{ TimeStamp = ([datetime]$StartTime).AddHours($Hour); Average = $Value; Maximum = $Value; Minimum = $Value; Total = $Value; Count = 1 }
+        if ($Name -eq '__READOPS__' -and $Special -and $Names.Count -gt 1) { continue }
+        if ($Name -eq '__READOPS__' -and $DiskName -like '*-empty') { [pscustomobject]@{ Id = $ResourceId; Name = [pscustomobject]@{ Value = $Name }; Data = @() }; continue }
+        $Data = foreach ($Hour in 0..2)
+        {
+            $Value = ($Seed % 50) + $Hour + ($Name.Length / 10)
+            [pscustomobject]@{ TimeStamp = ([datetime]$StartTime).AddHours($Hour); Average = $Value; Maximum = $Value; Minimum = $Value; Total = $Value; Count = 1 }
+        }
+        [pscustomobject]@{ Id = $ResourceId; Name = [pscustomobject]@{ Value = $Name }; Data = @($Data) }
     }
-    [pscustomobject]@{ Id = $ResourceId; Name = $MetricName; Data = @($Data) }
 }
 Export-ModuleMember -Function Get-AzMetric
 '@.Replace('__READOPS__', $script:ReadOps).Replace('__THROTTLE__', $script:ThrottleMessage).Replace('__BADMETRIC__', $script:BadMetricMessage) |
@@ -157,8 +168,12 @@ AfterAll {
 Describe 'Metrics phase diagnostics across several batches' {
 
     BeforeAll {
-        # 200 attached disks x 4 metrics = 800 calls = batches of 250, 250, 250, 50.
-        # A disk's read-operations call has MetricIndex 4 * disk + 1.
+        # 200 attached disks x 4 metrics = 800 metric definitions. A disk's 4
+        # metrics share one grouped request, so 200 requests; a batch takes whole
+        # groups until it holds at least 250 definitions: 63, 63, 63 and 11
+        # requests (252, 252, 252 and 44 definitions). The read-operations metric
+        # of each of the 7 disks below is then requested on its own (7 fallback
+        # requests). A disk's read-operations call has MetricIndex 4 * disk + 1.
         # A failed call takes at least 7 s of retry backoff (14 s when throttled),
         # so the five slowest are the three failures and the 6 s and 7 s calls,
         # several seconds clear of the 1 s call and of every other call.
@@ -195,24 +210,25 @@ Describe 'Metrics phase diagnostics across several batches' {
 
     It 'writes the per-batch verbose lines, with the cumulative call count' {
         @($script:Run.Verbose | ForEach-Object { Hide-Seconds $_ }) | Should -Be @(
-            '[Metrics] Batch 1: dispatching 250 metric call(s) (processed 250/800).'
-            '[Metrics] Batch 1 complete in <s>s. Cumulative diagnostics: 250 call record(s) so far.'
-            '[Metrics] Batch 2: dispatching 250 metric call(s) (processed 500/800).'
-            '[Metrics] Batch 2 complete in <s>s. Cumulative diagnostics: 500 call record(s) so far.'
-            '[Metrics] Batch 3: dispatching 250 metric call(s) (processed 750/800).'
-            '[Metrics] Batch 3 complete in <s>s. Cumulative diagnostics: 750 call record(s) so far.'
-            '[Metrics] Batch 4: dispatching 50 metric call(s) (processed 800/800).'
+            '[Metrics] Batch 1: dispatching 63 metric call(s) (processed 252/800).'
+            '[Metrics] Batch 1 complete in <s>s. Cumulative diagnostics: 252 call record(s) so far.'
+            '[Metrics] Batch 2: dispatching 63 metric call(s) (processed 504/800).'
+            '[Metrics] Batch 2 complete in <s>s. Cumulative diagnostics: 504 call record(s) so far.'
+            '[Metrics] Batch 3: dispatching 63 metric call(s) (processed 756/800).'
+            '[Metrics] Batch 3 complete in <s>s. Cumulative diagnostics: 756 call record(s) so far.'
+            '[Metrics] Batch 4: dispatching 11 metric call(s) (processed 800/800).'
             '[Metrics] Batch 4 complete in <s>s. Cumulative diagnostics: 800 call record(s) so far.'
         )
     }
 
     It 'writes the summary sections in order' {
         $Log = $script:Run.Log
-        $Log.Count | Should -Be 13
+        $Log.Count | Should -Be 14
         $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
         $Log[1] | Should -Be '[Metrics] ===== Metrics phase summary ====='
-        $Log[3] | Should -Be '[Metrics] Non-success calls (where it got stuck):'
-        $Log[7] | Should -Be '[Metrics] Slowest 5 calls:'
+        $Log[3] | Should -Be '[Metrics] Azure Monitor requests: 207 for 800 metric definition(s), of which 7 single-metric fallback request(s); retries not counted'
+        $Log[4] | Should -Be '[Metrics] Non-success calls (where it got stuck):'
+        $Log[8] | Should -Be '[Metrics] Slowest 5 calls:'
     }
 
     It 'counts every call by outcome, including a status seen only in the first batch' {
@@ -220,7 +236,7 @@ Describe 'Metrics phase diagnostics across several batches' {
     }
 
     It 'lists every non-success call from every batch, slowest first' {
-        $Lines = $script:Run.Log[4..6]
+        $Lines = $script:Run.Log[5..7]
         $Expected = @(
             ('[Metrics]   Throttled {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:Throttled, $script:ThrottleMessage)
             ('[Metrics]   Error {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:BadMetricA, $script:BadMetricMessage)
@@ -232,7 +248,7 @@ Describe 'Metrics phase diagnostics across several batches' {
     }
 
     It 'lists the five slowest calls across all batches, slowest first' {
-        $Lines = $script:Run.Log[8..12]
+        $Lines = $script:Run.Log[9..13]
         $Expected = @(
             ('[Metrics]   <s>s {0} (Throttled)' -f $script:Throttled)
             ('[Metrics]   <s>s {0} (Error)' -f $script:BadMetricA)
@@ -248,8 +264,8 @@ Describe 'Metrics phase diagnostics across several batches' {
     It 'gives each failed call the same duration in both lists' {
         foreach ($Prefix in @($script:Throttled, $script:BadMetricA, $script:BadMetricB))
         {
-            $InNonSuccess = @($script:Run.Log[4..6] | Where-Object { $_.Contains(' ' + $Prefix + ' attempts=') })
-            $InSlowest = @($script:Run.Log[8..12] | Where-Object { $_.Contains('s ' + $Prefix + ' (') })
+            $InNonSuccess = @($script:Run.Log[5..7] | Where-Object { $_.Contains(' ' + $Prefix + ' attempts=') })
+            $InSlowest = @($script:Run.Log[9..13] | Where-Object { $_.Contains('s ' + $Prefix + ' (') })
             $InNonSuccess.Count | Should -Be 1
             $InSlowest.Count | Should -Be 1
             Get-Seconds $InSlowest[0] | Should -Be (Get-Seconds $InNonSuccess[0])
@@ -273,6 +289,7 @@ Describe 'Metrics phase diagnostics with no metric definitions' {
             '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
             '[Metrics] ===== Metrics phase summary ====='
             '[Metrics] Total calls: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
+            '[Metrics] Azure Monitor requests: 0 for 0 metric definition(s), of which 0 single-metric fallback request(s); retries not counted'
         )
     }
 }
