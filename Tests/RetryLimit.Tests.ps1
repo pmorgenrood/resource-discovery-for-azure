@@ -120,13 +120,19 @@ $Global:ResourceCount = 1
         if ($Body[$i] -is [System.Management.Automation.Language.ForEachStatementAst] -and $Body[$i].Condition.Extent.Text -eq '$StreamSummaries' -and $Body[$i].Body.Extent.Text -match 'ResourceCounts') { $AggAt = $i; break }
     }
     if ($AggAt -lt 0) { throw 'Expected the stream-summary aggregation loop in the wrapper.' }
-    $ParLaunchPrelude = "`$StreamCount = [Math]::Min(`$ParallelStreams, `$Subscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @()`n"
+    # The wrapper slices the pending list: on -Resume, what no earlier run completed.
+    $ParLaunchPrelude = "`$PendingSubscriptions = @(`$Subscriptions | Where-Object { -not (`$Resume -and `$CompletedIds -contains `$_.Id) })`n" +
+    "`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @()`n"
     $ParLaunchText = script:Set-TestPaths -Text (@($Body[0..($AggAt - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
     # The resume-state cleanup: every statement after the main-summary build up to
     # and including the clean-run clear.
     $MainSummaryAt = script:Find-TopIndex -What 'the main-summary build' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text -match 'New-RdaAllSubHtmlSummary -RunOutputDirectory' }
     $ClearAt = script:Find-TopIndex -After $MainSummaryAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
+    # With it, the clean-up of the per-stream files a run that keeps the resume
+    # state folded in, or that its streams wrote, when the wrapper has one.
+    $FoldedAt = $ClearAt + 1
+    if ($FoldedAt -lt $Top.Count -and $Top[$FoldedAt] -is [System.Management.Automation.Language.IfStatementAst] -and $Top[$FoldedAt].Extent.Text.Contains('Invoke-FoldedStreamStateCleanup')) { $ClearAt = $FoldedAt }
     $CleanupText = script:Join-Top -From ($MainSummaryAt + 1) -To $ClearAt
 
     # The summary: from the failed-subscriptions block to the execution time.
@@ -418,12 +424,17 @@ Describe 'Retry limit on the parallel path' {
         $Subs = @($script:A, $script:B, $script:X)
         $null = script:Invoke-Run -Subs $Subs
         $null = script:Invoke-Run -Subs $Subs -Streams 2 -ResumeFailedOnly
-        $Global:RdaRlFailIds = @('sub-x', 'sub-b')
-        $null = script:Invoke-Run -Subs $Subs -Streams 2 -Resume
+        # A parallel -Resume collects only what no earlier run completed, so the
+        # second subscription on the retry list is a new one, Sub Y, that fails
+        # in its first run.
+        $Subs = @($script:A, $script:B, $script:X, $script:Y)
+        $Global:RdaRlFailIds = @('sub-x', 'sub-y')
+        $Run3 = script:Invoke-Run -Subs $Subs -Streams 2 -Resume
+        @($Run3.Calls | Sort-Object) | Should -Be @('sub-x', 'sub-y') -Because 'the completed Sub A and Sub B are skipped'
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
         $Run4 = script:Invoke-Run -Subs $Subs -Streams 2 -ResumeFailedOnly
 
-        @($Run4.Calls) | Should -Be @('sub-b')
+        @($Run4.Calls) | Should -Be @('sub-y')
         @(script:Get-Lines -Run $Run4 -Like 'Not retried:*') | Should -Be @($script:NotRetriedX)
     }
 
