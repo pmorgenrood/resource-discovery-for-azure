@@ -1600,18 +1600,18 @@ else
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
-            # Also delete per-stream resume files now that the unified file holds
-            # the truth - this prevents drift if a future run uses a different
-            # stream count. Reuses the same on-disk discovery ($AllStreamFiles)
-            # as the merge loop above, so every file that was just merged is also
-            # the one that gets cleaned up here - regardless of this run's
-            # -ParallelStreams value. A file that could not be read was moved
-            # aside above and is kept. The others are deleted with the resume
-            # state at the end of the run, or at an early exit, as the files
-            # folded in at startup are: this read covers those too, so it takes
-            # their place. When the run keeps the resume state they are deleted
-            # only once the resume state file on disk holds every record they
-            # gave; each removal is checked, and a file that is left is named.
+            # The per-stream resume files are deleted now that the unified file
+            # holds the truth - this prevents drift if a future run uses a
+            # different stream count. They are the same on-disk discovery
+            # ($AllStreamFiles) as the merge loop above, so every file that was
+            # just merged is the one that gets cleaned up, regardless of this
+            # run's -ParallelStreams value. A file that could not be read was
+            # moved aside above and is kept. The others are deleted with the
+            # resume state at the end of the run, or at an early exit, as the
+            # files folded in at startup are: this read covers those too, so it
+            # takes their place. When the run keeps the resume state they are
+            # deleted only once the resume state file on disk holds every record
+            # they gave; each removal is checked, and a file that is left is named.
             $FoldedStreamFiles = @($AllStreamFiles | Where-Object { $UnreadableAtMerge -notcontains $_.FullName })
             $FoldedRecordIds = @(@($AllCompletedFromStreams) + @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { $_.Id }) | Where-Object { $_ })
             $FoldedSource = "this run's streams wrote"
@@ -1813,9 +1813,9 @@ if ($null -ne $OuterZipFile)
 # it: their records belong to the run this one has just finished, and a later
 # -Resume or -ResumeFailedOnly would otherwise recover them again, skipping a
 # subscription an old file lists as completed or retrying one from an old
-# failure record. The parallel merge above has already deleted the ones it
-# read. A run in which a per-stream file could not be read is not a clean run,
-# so it says so instead.
+# failure record. After the parallel merge above they are the files its
+# streams wrote. A run in which a per-stream file could not be read is not a
+# clean run, so it says so instead.
 $ResumeStateClearTried = $false
 if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
