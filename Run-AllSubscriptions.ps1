@@ -718,7 +718,10 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # list or retry list; a file that cannot be moved aside stops the run (exit 1).
 # Per-stream state files are checked where they are read. A run that moves one
 # aside is not a clean run.
-$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main)
+$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main -ResumeFailedOnly:$ResumeFailedOnly)
+# Per-stream files the end-of-run merge finds wrong-shaped and cannot move aside:
+# left alone, and the run ends with exit 1 once it is finished.
+$StreamStateNotMoved = @()
 
 # Always seed $CompletedIds from the existing state file. -Resume only
 # controls whether we *use* that list to skip subscriptions; reading it
@@ -754,7 +757,7 @@ if ($Resume -or $ResumeFailedOnly)
             try
             {
                 $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
-                $Moved = Move-WrongShapeResumeStateFile -Path $StreamFile.FullName -Kind Stream -Record $Obj -Resume:($Resume -and -not $ResumeFailedOnly)
+                $Moved = Move-WrongShapeResumeStateFile -Path $StreamFile.FullName -Kind Stream -Record $Obj -Resume:($Resume -and -not $ResumeFailedOnly) -ResumeFailedOnly:$ResumeFailedOnly
                 if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
@@ -1555,7 +1558,8 @@ else
                 try
                 {
                     $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
-                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Obj -AfterCollection
+                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Obj -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
+                    if ($Moved -and $Moved.NotMoved) { $StreamStateNotMoved += $Moved; continue }
                     if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
                     if ($null -ne $Obj.Completed)
                     {
@@ -1597,8 +1601,10 @@ else
             foreach ($StreamFile in $AllStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
-                # A file moved aside above for its shape is no longer there.
+                # A file moved aside above for its shape is no longer there; one
+                # that could not be moved aside is left alone.
                 if (-not (Test-Path -LiteralPath $PerStreamFile)) { continue }
+                if (@($StreamStateNotMoved | ForEach-Object { $_.Path }) -contains $PerStreamFile) { continue }
                 try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
             }
         }
@@ -1711,6 +1717,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
+        if ($StreamStateNotMoved.Count -gt 0) { Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly }
         Exit-Wrapper -Code 2
     }
     Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {0} successful sub(s))" -f $ActualZipCount) -ForegroundColor Green
@@ -1800,7 +1807,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
     try
     {
         Remove-Item -Path $ResumeStateFile -Force
-        if ($WrongShapeStateFiles.Count -eq 0) { Write-Host "Resume state cleared (clean run)." -ForegroundColor Green }
+        if ($WrongShapeStateFiles.Count -eq 0 -and $StreamStateNotMoved.Count -eq 0) { Write-Host "Resume state cleared (clean run)." -ForegroundColor Green }
     }
     catch
     {
@@ -2201,6 +2208,13 @@ if (@($Global:CollectorFailures).Count -gt 0)
     Write-Host "Re-run to retry, or investigate the error(s) above if they repeat." -ForegroundColor Red
     Write-Host "The rest of the inventory completed and the report was still produced." -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Red
+}
+
+# A per-stream state file the end-of-run merge could not move aside: the run
+# above is finished; it ends here with exit 1 and says what to do.
+if ($StreamStateNotMoved.Count -gt 0)
+{
+    Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
 }
 
 # Stop the wrapper transcript on the normal-completion path. Error paths take

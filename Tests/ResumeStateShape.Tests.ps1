@@ -66,6 +66,8 @@ $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-J
 # file per call so that streams do not write the same file.
 Set-Content -LiteralPath (Join-Path $HOME ('called-{0}-{1}.txt' -f $SubscriptionID, [guid]::NewGuid().ToString('N'))) -Value $SubscriptionID
 if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
+# A run of this subscription that ends without writing its zip.
+if (@($Scenario.NoZipIds) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; $Global:Resources = @(1); $Global:ResourceCount = 1; return }
 $Root = Join-Path $HOME 'InventoryReports'
 $Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + $SubscriptionID
 $Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
@@ -80,16 +82,6 @@ Remove-Item -LiteralPath $Stage -Recurse -Force
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
-# After the report of each listed subscription (one per stream), wait for the
-# others, then the first listed makes the inventory root read-only, so a rename
-# there at the end of the run fails.
-if (@($Scenario.ReadOnlyAfterIds) -contains $SubscriptionID)
-{
-    Set-Content -LiteralPath (Join-Path $HOME ('ro-' + $SubscriptionID)) -Value $PID
-    $Deadline = (Get-Date).AddSeconds(120)
-    while (@($Scenario.ReadOnlyAfterIds | Where-Object { -not (Test-Path -LiteralPath (Join-Path $HOME ('ro-' + $_))) }).Count -gt 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
-    if (@($Scenario.ReadOnlyAfterIds)[0] -eq $SubscriptionID) { Start-Sleep -Milliseconds 500; & chmod 555 $Root }
-}
 '@
     Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Value $StandInInner -Encoding utf8
 
@@ -109,6 +101,16 @@ function Get-RdaStandInContext
     }
 }
 function Get-AzContext { [CmdletBinding()] param() Get-RdaStandInContext }
+# Stands in for a file another program holds open: renaming a file the scenario
+# lists fails, as Rename-Item does then; every other rename, and every other
+# change to that file, goes through.
+function Rename-Item
+{
+    [CmdletBinding()] param([string]$LiteralPath, [string]$Path, [string]$NewName)
+    $Target = if ($LiteralPath) { $LiteralPath } else { $Path }
+    if (@((Get-RdaStandInScenario).RenameRefused) -contains (Split-Path -Path $Target -Leaf)) { throw [System.IO.IOException]::new(("The process cannot access the file '{0}' because it is being used by another process." -f $Target)) }
+    Microsoft.PowerShell.Management\Rename-Item @PSBoundParameters
+}
 function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context) Get-RdaStandInContext }
 function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
 function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
@@ -200,13 +202,14 @@ exit 1
 
     function script:Set-Scenario
     {
-        param([string[]]$Subs = @('A', 'B', 'C'), [string[]]$Fail = @(), [switch]$ReadOnlyRoot, [string[]]$ReadOnlyAfter = @())
+        param([string[]]$Subs = @('A', 'B', 'C'), [string[]]$Fail = @(), [switch]$ReadOnlyRoot, [string[]]$RenameRefused = @(), [string[]]$NoZip = @())
         [pscustomobject]@{
             Tenant           = $script:Tenant
             Subscriptions    = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = $script:Subs[$_].Name; State = 'Enabled' } })
             FailIds          = @($Fail | ForEach-Object { $script:Subs[$_].Id })
             ReadOnlyRoot     = [bool]$ReadOnlyRoot
-            ReadOnlyAfterIds = @($ReadOnlyAfter | ForEach-Object { $script:Subs[$_].Id })
+            RenameRefused    = @($RenameRefused)
+            NoZipIds         = @($NoZip | ForEach-Object { $script:Subs[$_].Id })
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -283,6 +286,15 @@ exit 1
         Set-Content -LiteralPath $Path -Value $Text -Encoding utf8
         return (Get-Content -LiteralPath $Path -Raw)
     }
+    # The lines a run prints when a wrong-shaped file cannot be moved aside.
+    $script:StopStart = "  This run stops here (exit 1), before it collects any subscription or writes any resume state. It does not use the file's records and does not write over it."
+    $script:StopAfter = "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual."
+    $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end."
+    $script:LaterMain = '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.'
+    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start: with one stream it leaves the file as it is; with -ParallelStreams its end-of-run merge leaves the file as it is and the run ends with exit 1, unless one of its streams has this file's number: that stream writes over the file without reading it, and the file's records are lost."
+    $script:RemoveLead = '  Once the cause shown above is fixed, remove the file with this command:'
+    $script:ThenSame = '  Then run the same command again.'
+    $script:ThenResume = "  Then run the same command without -ResumeFailedOnly, with -Resume: the retry list then holds none of this file's entries, so -ResumeFailedOnly would not retry them."
     # The lines a run prints when a wrong-shaped file cannot be moved aside, and
     # the remove command it prints.
     function script:Get-StopLines { param($Run) @($Run.Text | Where-Object { $_ -like 'ERROR: The * is not the right shape (*), and it could not be moved aside: *' }) }
@@ -644,12 +656,62 @@ Describe 'Move-WrongShapeResumeStateFile' {
         Should -Invoke Exit-Wrapper -Times 1 -Exactly -ParameterFilter { $Code -eq 1 }
         $Lines | Should -Be @(
             ('ERROR: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), and it could not be moved aside: every name from {0} to {0}-100 is taken' -f $Base),
-            '  The run stops here (exit 1), before any subscription is collected and before any resume state is written, so no run reads this file or writes over it.',
-            '  Once the cause is fixed (for example, the folder can be written), remove the file with this command and run again:',
-            ("  Remove-Item -LiteralPath '{0}' -Force" -f $Path)
+            $script:StopStart,
+            $script:LaterMain,
+            $script:RemoveLead,
+            ("  Remove-Item -LiteralPath '{0}' -Force" -f $Path),
+            $script:ThenSame
         )
         Test-Path -LiteralPath $Path | Should -BeTrue
         @(Get-ChildItem -LiteralPath $script:Dir -Force).Count | Should -Be 101
+    }
+
+    It 'the stop for a <Kind> file<When><Rfo> prints these lines, in this order, and exits 1' -TestCases @(
+        @{ Kind = 'Main'; After = $false; Rfo = ''; When = ''; Expect = 'StopStart,LaterMain,RemoveLead,Cmd,ThenSame' },
+        @{ Kind = 'Main'; After = $false; Rfo = ' under -ResumeFailedOnly'; When = ''; Expect = 'StopStart,LaterMain,RemoveLead,Cmd,ThenResume' },
+        @{ Kind = 'Stream'; After = $false; Rfo = ''; When = ''; Expect = 'StopStart,LaterStream,RemoveLead,Cmd,ThenSame' },
+        @{ Kind = 'Stream'; After = $false; Rfo = ' under -ResumeFailedOnly'; When = ''; Expect = 'StopStart,LaterStream,RemoveLead,Cmd,ThenResume' },
+        @{ Kind = 'Stream'; After = $true; Rfo = ''; When = ' found after the collection'; Expect = 'StopAfter,LaterStream,RemoveLead,Cmd,ThenSame' },
+        @{ Kind = 'Stream'; After = $true; Rfo = ' under -ResumeFailedOnly'; When = ' found after the collection'; Expect = 'StopAfter,LaterStream,RemoveLead,Cmd,ThenResume' }
+    ) {
+        Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
+        $Path = Join-Path $script:Dir '.resume-state-t-stream-3.json'
+        $Lines = [System.Collections.Generic.List[string]]::new()
+        $File = [pscustomobject]@{ Kind = $Kind; Name = '.resume-state-t-stream-3.json'; MovedTo = $null; Path = $Path; Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true }
+        { Stop-WrongShapeStateNotMoved -Files @($File) -AfterCollection:$After -ResumeFailedOnly:($Rfo -ne '') 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
+        $What = if ($Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+        $Want = @(('ERROR: The {0} .resume-state-t-stream-3.json is not the right shape (Completed is not a list), and it could not be moved aside: stand-in reason' -f $What)) + @($Expect -split ',' | ForEach-Object { if ($_ -eq 'Cmd') { "  Remove-Item -LiteralPath '{0}' -Force" -f $Path } else { (Get-Variable -Scope Script -Name $_).Value } })
+        @($Lines) | Should -Be $Want
+    }
+
+    It 'two files after the collection: an ERROR line and a remove command for each, then one exit 1' {
+        Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
+        $Files = @(5, 6 | ForEach-Object { [pscustomobject]@{ Kind = 'Stream'; Name = ('.resume-state-t-stream-{0}.json' -f $_); MovedTo = $null; Path = (Join-Path $script:Dir ('.resume-state-t-stream-{0}.json' -f $_)); Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true } })
+        $Lines = [System.Collections.Generic.List[string]]::new()
+        { Stop-WrongShapeStateNotMoved -Files $Files -AfterCollection 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
+        Should -Invoke Exit-Wrapper -Times 1 -Exactly
+        @($Lines | Where-Object { $_ -like 'ERROR: *' }).Count | Should -Be 2
+        $Lines | Should -Contain '  Once the cause shown above is fixed, remove the files with these commands:'
+        @($Lines | Where-Object { $_ -like "  Remove-Item -LiteralPath '*' -Force" }) | Should -Be @($Files | ForEach-Object { "  Remove-Item -LiteralPath '{0}' -Force" -f $_.Path })
+    }
+
+    It 'after the collection, a file that cannot be moved aside is left as it is and returned, with a notice, and the run is not stopped yet' {
+        Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
+        $Path = Join-Path $script:Dir '.resume-state-t-stream-5.json'
+        Set-Content -LiteralPath $Path -Value '{"Completed":5}'
+        & chmod 555 $script:Dir
+        try { $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Stream -AfterCollection -Now $script:Now 6>&1) }
+        finally { & chmod 755 $script:Dir }
+        if (-not (Test-Path -LiteralPath $Path) -or @(Get-ChildItem -LiteralPath $script:Dir -Force).Count -ne 1) { Set-ItResult -Skipped -Because 'a read-only folder can still be written here'; return }
+        Should -Invoke Exit-Wrapper -Times 0
+        $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+        $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+        $Result.Count | Should -Be 1
+        $Result[0].NotMoved | Should -BeTrue
+        $Result[0].Path | Should -Be $Path
+        $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-5.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
+        $Lines[1] | Should -Be $script:MergeNotice
+        Get-Content -LiteralPath $Path -Raw | Should -BeLike '*"Completed":5*'
     }
 
     It 'quotes a path holding a single quote in the remove command, and the command removes the file' {
@@ -662,13 +724,13 @@ Describe 'Move-WrongShapeResumeStateFile' {
         try
         {
             $Lines = [System.Collections.Generic.List[string]]::new()
-            { Move-WrongShapeResumeStateFile -Path $Path -Kind Stream -AfterCollection -Now $script:Now 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
+            { Move-WrongShapeResumeStateFile -Path $Path -Kind Stream -Now $script:Now 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
         }
         finally { & chmod 755 $Odd }
         if (-not (Test-Path -LiteralPath $Path)) { Set-ItResult -Skipped -Because 'a read-only folder can still be written here'; return }
         $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-0.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
-        $Lines[1] | Should -BeLike '  The run stops here (exit 1), before it merges or removes any per-stream state file and before the consolidated zip, *'
-        $Command = $Lines[3].Trim()
+        $Lines[1] | Should -Be $script:StopStart
+        $Command = @($Lines | Where-Object { $_ -like "  Remove-Item -LiteralPath '*" })[0].Trim()
         $Command | Should -Be ("Remove-Item -LiteralPath '{0}' -Force" -f $Path.Replace("'", "''"))
         & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Command
         Test-Path -LiteralPath $Path | Should -BeFalse
@@ -889,8 +951,10 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
             finally { & chmod 755 $script:Root }
             $R.ExitCode | Should -Be 1
             script:Get-StopLines $R | Should -BeLike ('ERROR: The resume state file {0} is not the right shape (FailedAttempts is not a list), and it could not be moved aside: Access to the path *' -f $script:StateName)
-            $R.Text | Should -Contain '  The run stops here (exit 1), before any subscription is collected and before any resume state is written, so no run reads this file or writes over it.'
-            $R.Text | Should -Contain '  Once the cause is fixed (for example, the folder can be written), remove the file with this command and run again:'
+            $R.Text | Should -Contain $script:StopStart
+            $R.Text | Should -Contain $script:LaterMain
+            $R.Text | Should -Contain $script:RemoveLead
+            $R.Text | Should -Contain $(if ($Switch -eq '-ResumeFailedOnly') { $script:ThenResume } else { $script:ThenSame })
             $Commands += @(script:Get-RemoveCommand $R)
             @(script:Get-ShapeWarnings $R) | Should -BeNullOrEmpty
             @($R.Text | Where-Object { $_ -like '  Starting fresh*' -or $_ -like 'Resume mode:*' -or $_ -like 'ResumeFailedOnly:*' }) | Should -BeNullOrEmpty
@@ -1040,7 +1104,9 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
             finally { & chmod 755 $script:Root }
             $R.ExitCode | Should -Be 1
             script:Get-StopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: Access to the path *' -f $script:Stream0Name)
-            $R.Text | Should -Contain '  The run stops here (exit 1), before any subscription is collected and before any resume state is written, so no run reads this file or writes over it.'
+            $R.Text | Should -Contain $script:StopStart
+            $R.Text | Should -Contain $script:LaterStream
+            $R.Text | Should -Contain $(if ($Switch -eq '-ResumeFailedOnly') { $script:ThenResume } else { $script:ThenSame })
             script:Get-RemoveCommand $R | Should -Be @("Remove-Item -LiteralPath '{0}' -Force" -f $StreamPath)
             script:Get-Calls | Should -BeNullOrEmpty
             Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
@@ -1104,35 +1170,6 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
     }
 
-    It 'a stale wrong-shaped per-stream file the end-of-run merge cannot move aside stops that run with exit 1 before the merge and the zip; after the printed command the next run ends clean' {
-        if (-not (script:Test-ReadOnlyRefused)) { Set-ItResult -Skipped -Because 'a read-only folder can still be written here'; return }
-        # A and C run in stream 0, B in stream 1; once both have written their
-        # reports, the inventory root becomes read-only.
-        script:Set-Scenario -ReadOnlyAfter 'C', 'B'
-        $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
-        $Stale = Join-Path $script:Root ('.resume-state-{0}-stream-5.json' -f $script:Tenant)
-        try { $R1 = script:Invoke-Wrapper -Streams 2 }
-        finally { & chmod 755 $script:Root }
-        $R1.ExitCode | Should -Be 1
-        script:Get-StopLines $R1 | Should -BeLike ('ERROR: The per-stream state file .resume-state-{0}-stream-5.json is not the right shape (FailedAttempts is not a list), and it could not be moved aside: Access to the path *' -f $script:Tenant)
-        $R1.Text | Should -Contain '  The run stops here (exit 1), before it merges or removes any per-stream state file and before the consolidated zip, so no run reads this file or writes over it. The reports collected so far are kept, and so are the other per-stream state files: a later -Resume skips the subscriptions they list as completed.'
-        script:Get-RemoveCommand $R1 | Should -Be @("Remove-Item -LiteralPath '{0}' -Force" -f $Stale)
-        @(script:Get-Calls | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B', 'C')
-        Get-Content -LiteralPath $Stale -Raw | Should -Be $Seeded
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip') | Should -BeNullOrEmpty
-        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
-        script:Get-MovedAside | Should -BeNullOrEmpty
-
-        script:Set-Scenario
-        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command ("Remove-Item -LiteralPath '{0}' -Force" -f $Stale)
-        $R2 = script:Invoke-Wrapper -Streams 2
-        $R2.ExitCode | Should -Be 0
-        $R2.Error | Should -BeNullOrEmpty
-        @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
-        script:Test-CleanLine $R2 | Should -BeTrue
-        script:Get-LiveStateFiles | Should -BeNullOrEmpty
-    }
-
     It 'a stale wrong-shaped per-stream file found only by the end-of-run merge of a parallel run without -Resume is moved aside there, with nothing on stderr' {
         script:Set-Scenario
         $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
@@ -1145,5 +1182,197 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         $R2 = script:Invoke-Wrapper -Streams 2
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
+    }
+}
+
+Describe 'Wrapper end to end: a wrong-shaped state file another program holds open' -Skip:$IsWindows {
+    # The stand-in Rename-Item refuses to rename the listed file, as for a file
+    # another program holds open; the run can read and write everything else.
+    BeforeEach {
+        script:New-Case
+        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+    }
+
+    It 'the resume state file, under -ResumeFailedOnly: the stop names -Resume as the next command, which collects Sub B from the retry list; the run after it ends clean' {
+        script:Set-Scenario -RenameRefused $script:StateName
+        # The completed list is a text, the retry list holds Sub B.
+        $null = script:Write-MainState -FailedAttempts @((script:New-RetryEntry -Letter 'B'))
+        $Raw = Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json
+        $Raw.CompletedSubscriptionIds = $script:Subs['A'].Id
+        $Raw | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
+        $R1.ExitCode | Should -Be 1
+        script:Get-StopLines $R1 | Should -BeLike ('ERROR: The resume state file {0} is not the right shape (CompletedSubscriptionIds is not a list), and it could not be moved aside: The process cannot access the file *' -f $script:StateName)
+        $R1.Text | Should -Contain $script:ThenResume
+        $R1.Text | Should -Not -Contain $script:ThenSame
+        script:Get-Calls | Should -BeNullOrEmpty
+
+        # The cause gone; the printed command, then the command the stop names.
+        script:Set-Scenario
+        $Cmd = @(script:Get-RemoveCommand $R1)[0]
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Cmd
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.ExitCode | Should -Be 0
+        script:Get-Collected $R2 | Should -Contain 'sub-b'
+        script:Test-CleanLine $R2 | Should -BeTrue
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R3.ExitCode | Should -Be 0
+        @(script:Get-ShapeWarnings $R3) | Should -BeNullOrEmpty
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+
+    It 'a per-stream file holding Sub C''s retry entry, under -ResumeFailedOnly: the -Resume the stop names collects Sub B and Sub C; the run after it ends clean' {
+        script:Set-Scenario -RenameRefused $script:Stream0Name
+        $null = script:Write-MainState -FailedAttempts @((script:New-RetryEntry -Letter 'B')) -Completed 'A'
+        $StreamPath = Join-Path $script:Root $script:Stream0Name
+        [pscustomobject]@{ Tenant = $script:Tenant; StreamId = '0'; Completed = 5; FailedAttempts = @((script:New-RetryEntry -Letter 'C')) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StreamPath -Encoding utf8
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
+        $R1.ExitCode | Should -Be 1
+        script:Get-StopLines $R1 | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: *' -f $script:Stream0Name)
+        $R1.Text | Should -Contain $script:ThenResume
+
+        script:Set-Scenario
+        $Cmd = @(script:Get-RemoveCommand $R1)[0]
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Cmd
+        Test-Path -LiteralPath $StreamPath | Should -BeFalse
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.ExitCode | Should -Be 0
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
+        $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        script:Test-CleanLine $R2 | Should -BeTrue
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R3.ExitCode | Should -Be 0
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+
+    It 'the resume state file: while it cannot be moved aside, a later <Label> run stops the same way, collects nothing and leaves the file as it is' -ForEach @(
+        @{ Label = '-Resume'; Arguments = @('-Resume'); Streams = 1 },
+        @{ Label = '-ResumeFailedOnly'; Arguments = @('-ResumeFailedOnly'); Streams = 1 },
+        @{ Label = 'one-stream'; Arguments = @(); Streams = 1 },
+        @{ Label = 'two-stream'; Arguments = @(); Streams = 2 }
+    ) {
+        script:Set-Scenario -RenameRefused $script:StateName
+        $Seeded = script:Write-MainState -FailedAttempts $script:Marker
+        # The run that first stops, then the later run.
+        $null = script:Invoke-Wrapper -Arguments '-Resume'
+        $Before = script:Get-RootSnapshot
+        $R = script:Invoke-Wrapper -Arguments $Arguments -Streams $Streams
+        $R.ExitCode | Should -Be 1
+        script:Get-StopLines $R | Should -BeLike ('ERROR: The resume state file {0} is not the right shape (FailedAttempts is not a list), and it could not be moved aside: *' -f $script:StateName)
+        $R.Text | Should -Contain $script:StopStart
+        $R.Text | Should -Contain $script:LaterMain
+        script:Get-Calls | Should -BeNullOrEmpty
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $Seeded
+        script:Get-RootSnapshot | Should -Be $Before
+        $R.Error | Should -BeNullOrEmpty
+    }
+
+    It 'a per-stream file: while it cannot be moved aside, a later -Resume and a later two-stream -ResumeFailedOnly stop the same way at their start; a one-stream run without either switch leaves it as it is; a two-stream run writes over it and its records are lost' {
+        script:Set-Scenario -RenameRefused $script:Stream0Name
+        $Seeded = script:Write-StreamText -Text ('{"Completed": 5, "FailedAttempts": "' + $script:Marker + '"}')
+        $StreamPath = Join-Path $script:Root $script:Stream0Name
+        $null = script:Invoke-Wrapper -Arguments '-Resume'
+        foreach ($Later in @(@{ Arguments = @('-Resume'); Streams = 1 }, @{ Arguments = @('-ResumeFailedOnly'); Streams = 2 }))
+        {
+            $R = script:Invoke-Wrapper -Arguments $Later.Arguments -Streams $Later.Streams
+            $R.ExitCode | Should -Be 1
+            script:Get-StopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: *' -f $script:Stream0Name)
+            $R.Text | Should -Contain $script:StopStart
+            $R.Text | Should -Contain $script:LaterStream
+            script:Get-Calls | Should -BeNullOrEmpty
+            Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+        }
+        # One stream, no switch: the file is not read and stays as it is.
+        $R3 = script:Invoke-Wrapper
+        $R3.ExitCode | Should -Be 0
+        @(script:Get-StopLines $R3) + @(script:Get-ShapeWarnings $R3) | Should -BeNullOrEmpty
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+        # Two streams, no switch: stream 0 writes over it without reading it; the
+        # merge then finds that stream's own record and removes the file. No copy
+        # of the seeded file is kept.
+        $R4 = script:Invoke-Wrapper -Streams 2
+        $R4.ExitCode | Should -Be 0
+        $R4.Error | Should -BeNullOrEmpty
+        @(script:Get-StopLines $R4) + @(script:Get-ShapeWarnings $R4) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $StreamPath | Should -BeFalse
+        script:Get-MovedAside | Should -BeNullOrEmpty
+        script:Test-CleanLine $R4 | Should -BeTrue
+    }
+
+    It 'a stale per-stream file found by the end-of-run merge (<Label>): the run builds its zip, main summary and end-of-run summary first, every collected report once in the zip, then ends with exit 1; after the printed command the same command ends clean' -ForEach @(
+        @{ Label = 'every subscription collected'; Fail = @(); InZip = @('A', 'B', 'C') },
+        @{ Label = 'Sub B failing'; Fail = @('B'); InZip = @('A', 'C') }
+    ) {
+        script:Set-Scenario -RenameRefused $script:Stream5Name -Fail $Fail
+        $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
+        $Stale = Join-Path $script:Root $script:Stream5Name
+        $R1 = script:Invoke-Wrapper -Streams 2
+        $R1.ExitCode | Should -Be 1
+        $R1.Error | Should -BeNullOrEmpty
+        # At the merge: the notice; the file left alone.
+        @(script:Get-StopLines $R1).Count | Should -Be 2
+        script:Get-StopLines $R1 | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (FailedAttempts is not a list), and it could not be moved aside: *' -f $script:Stream5Name)
+        $R1.Text | Should -Contain $script:MergeNotice
+        Get-Content -LiteralPath $Stale -Raw | Should -Be $Seeded
+        script:Get-MovedAside | Should -BeNullOrEmpty
+        # The rest of the run as usual: the consolidated zip with every collected
+        # report once (nothing lost, nothing doubled) and the run's summary files,
+        # the main summary, the end-of-run summary with its failure list.
+        @(script:Get-Calls) | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $Bundles = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip')
+        $Bundles.Count | Should -Be 1
+        $Entries = @(script:Get-ZipEntries | Where-Object { $_.Zip -eq $Bundles[0].Name })
+        @($Entries | Where-Object { $_.Name -like 'ResourcesReport_*.zip' } | ForEach-Object { $_.Name -replace '^.*(sub-[a-z])\.zip$', '$1' } | Sort-Object) | Should -Be (script:Get-Ids $InZip)
+        @($Entries | ForEach-Object { $_.Name }) | Should -Contain 'RunSummary.log'
+        @($Entries | ForEach-Object { $_.Name }) | Should -Contain 'MainSummary.html'
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'MainSummary_*.html').Count | Should -Be 1
+        $R1.Text | Should -Contain '================ Summary ================'
+        if ($Fail.Count -gt 0)
+        {
+            @($R1.Text | Where-Object { $_ -like 'Subscriptions Failed:    1 (Sub B *' }).Count | Should -Be 1
+            @($R1.Text | Where-Object { $_ -like 'Failure Diagnostics:     *' }).Count | Should -Be 1
+        }
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        script:Assert-NotInAnyZip
+        # The run's own per-stream files merged and removed as usual; at its end, the stop.
+        @(script:Get-LiveStateFiles | Where-Object { $_ -like '*-stream-*' }) | Should -Be @($script:Stream5Name)
+        $Last = @($R1.Text | Where-Object { $_ -match '\S' })
+        $At = [array]::IndexOf($Last, $script:StopAfter)
+        $At | Should -BeGreaterThan ([array]::IndexOf($Last, '================ Summary ================'))
+        $Last[$At - 1] | Should -BeLike ('ERROR: The per-stream state file {0} *' -f $script:Stream5Name)
+        @($Last[($At + 1)..($Last.Count - 1)]) | Should -Be @($script:LaterStream, $script:RemoveLead, ("  Remove-Item -LiteralPath '{0}' -Force" -f $Stale), $script:ThenSame)
+
+        # The cause gone; the printed command, then the same command.
+        script:Set-Scenario
+        $Cmd = @(script:Get-RemoveCommand $R1)[0]
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Cmd
+        Test-Path -LiteralPath $Stale | Should -BeFalse
+        $R2 = script:Invoke-Wrapper -Streams 2
+        $R2.ExitCode | Should -Be 0
+        $R2.Error | Should -BeNullOrEmpty
+        @(script:Get-StopLines $R2) + @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        $Newest = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip' | Sort-Object LastWriteTimeUtc | Select-Object -Last 1)
+        @(script:Get-ZipEntries | Where-Object { $_.Zip -eq $Newest[0].Name -and $_.Name -like 'ResourcesReport_*.zip' } | ForEach-Object { $_.Name -replace '^.*(sub-[a-z])\.zip$', '$1' } | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B', 'C')
+    }
+
+    It 'the end-of-run stop exits 1 in place of the code the run would otherwise end with (2 here, a missing zip)' {
+        script:Set-Scenario -NoZip 'B'
+        $Control = script:Invoke-Wrapper -Streams 2
+        $Control.ExitCode | Should -Be 2
+        script:New-Case
+        script:Set-Scenario -NoZip 'B' -RenameRefused ('.resume-state-{0}-stream-5.json' -f $script:Tenant)
+        $null = script:Write-StreamText -Text '{"Completed": ["sub-a"], "FailedAttempts": "garbage"}' -StreamId 5
+        $R = script:Invoke-Wrapper -Streams 2
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain $script:MergeNotice
+        $R.Text | Should -Contain 'ERROR: Per-subscription output verification failed.'
+        $R.Text | Should -Contain $script:StopAfter
+        $R.Text | Should -Contain $script:ThenSame
     }
 }

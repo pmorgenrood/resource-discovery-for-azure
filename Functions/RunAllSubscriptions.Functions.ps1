@@ -544,11 +544,15 @@ function Get-ResumeStateShapeProblem
 # in the inventory root, which no zip step of the wrapper takes. Prints a
 # warning naming the file and the field, never its content; with -Resume and a
 # per-stream file, also what this run does instead. Returns { Kind; Name;
-# MovedTo }.
-# When the file cannot be renamed, the run stops here with exit 1
-# (Stop-WrongShapeStateNotMoved): going on would leave the file where every
-# later run reads it again, and a save or clean-up of this run could write over
-# it or delete it.
+# MovedTo; Path; Problem; Reason; NotMoved }.
+# When the file cannot be renamed, the run must not use its records or write
+# over it, and must not carry on as if the file were not there: later runs read
+# it again. At startup the run stops here with exit 1
+# (Stop-WrongShapeStateNotMoved). With -AfterCollection (the end-of-run merge of
+# a parallel run) the run is finished first: this prints a notice and returns
+# the file with NotMoved set; the wrapper leaves the file alone and, at the end
+# of the run, stops with exit 1 the same way. -ResumeFailedOnly only changes
+# what the stop advises.
 function Move-WrongShapeResumeStateFile
 {
     param(
@@ -558,6 +562,7 @@ function Move-WrongShapeResumeStateFile
         [switch]$Resume,
         # The end-of-run merge of a parallel run, after this run's collection.
         [switch]$AfterCollection,
+        [switch]$ResumeFailedOnly,
         [datetime]$Now = [datetime]::UtcNow
     )
     if (-not $PSBoundParameters.ContainsKey('Record'))
@@ -589,43 +594,82 @@ function Move-WrongShapeResumeStateFile
     }
     catch
     {
-        Stop-WrongShapeStateNotMoved -Path $Path -What $What -Problem $Problem -Reason $_.Exception.Message -AfterCollection:$AfterCollection
-        return
+        $NotMoved = [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $null; Path = $Path; Problem = $Problem; Reason = $_.Exception.Message; NotMoved = $true }
+        if (-not $AfterCollection) { Stop-WrongShapeStateNotMoved -Files @($NotMoved) -ResumeFailedOnly:$ResumeFailedOnly }
+        Write-WrongShapeNotMovedLine -File $NotMoved
+        Write-Host "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end." -ForegroundColor Red
+        return $NotMoved
     }
     Write-Host ('WARNING: The {0} {1} is not the right shape ({2}), so its records are not used. It was moved aside to {3}, kept for inspection; no run reads it again.' -f $What, $Name, $Problem, $MovedTo) -ForegroundColor Yellow
     if ($Resume -and $Kind -eq 'Stream')
     {
         Write-Host '  This run does not count the subscriptions it lists as completed.' -ForegroundColor Yellow
     }
-    return [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $MovedTo }
+    return [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $MovedTo; Path = $Path; Problem = $Problem; Reason = $null; NotMoved = $false }
 }
 
-# A state file that is not the right shape and could not be moved aside
-# (Move-WrongShapeResumeStateFile): name it, give the reason, print the command
-# that removes it, and stop the run with exit 1. The command is a
-# Remove-Item -LiteralPath of the full path, quoted for PowerShell, with -Force:
-# PowerShell treats the dot-file as hidden and does not remove it without it.
+# The first line about a state file that is not the right shape and could not
+# be moved aside (Move-WrongShapeResumeStateFile): the file, the field and the
+# reason the rename failed.
+function Write-WrongShapeNotMovedLine
+{
+    param([Parameter(Mandatory = $true)][object]$File)
+    $What = if ($File.Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+    Write-Host ('ERROR: The {0} {1} is not the right shape ({2}), and it could not be moved aside: {3}' -f $What, $File.Name, $File.Problem, $File.Reason) -ForegroundColor Red
+}
+
+# Stop the run with exit 1 for state files that are not the right shape and
+# could not be moved aside (-Files, from Move-WrongShapeResumeStateFile): name
+# each one with the reason; say what this run did and did not do, and what
+# later runs do while the file stays; print the command that removes each file
+# and the command to run next. The remove command is a Remove-Item -LiteralPath
+# of the full path, quoted for PowerShell, with -Force: on Linux and macOS
+# PowerShell treats a file whose name starts with a dot as hidden and does not
+# remove it without -Force; on Windows a leading dot does not hide a file, so
+# -Force is not needed there and changes nothing for this file.
+# -AfterCollection: the files were found by the end-of-run merge of a parallel
+# run, which left them alone and finished the run (its consolidated zip, main
+# summary and end-of-run summary) before calling this. That case has its own
+# branch below; without it the run stops at its start.
 function Stop-WrongShapeStateNotMoved
 {
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$What,
-        [Parameter(Mandatory = $true)][string]$Problem,
-        [string]$Reason,
-        [switch]$AfterCollection
+        [Parameter(Mandatory = $true)][object[]]$Files,
+        [switch]$AfterCollection,
+        [switch]$ResumeFailedOnly
     )
-    $Quoted = [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path)
-    Write-Host ('ERROR: The {0} {1} is not the right shape ({2}), and it could not be moved aside: {3}' -f $What, (Split-Path -Path $Path -Leaf), $Problem, $Reason) -ForegroundColor Red
+    $Files = @($Files | Where-Object { $null -ne $_ })
+    foreach ($File in $Files) { Write-WrongShapeNotMovedLine -File $File }
     if ($AfterCollection)
     {
-        Write-Host '  The run stops here (exit 1), before it merges or removes any per-stream state file and before the consolidated zip, so no run reads this file or writes over it. The reports collected so far are kept, and so are the other per-stream state files: a later -Resume skips the subscriptions they list as completed.' -ForegroundColor Red
+        Write-Host "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual." -ForegroundColor Red
     }
     else
     {
-        Write-Host '  The run stops here (exit 1), before any subscription is collected and before any resume state is written, so no run reads this file or writes over it.' -ForegroundColor Red
+        Write-Host "  This run stops here (exit 1), before it collects any subscription or writes any resume state. It does not use the file's records and does not write over it." -ForegroundColor Red
     }
-    Write-Host '  Once the cause is fixed (for example, the folder can be written), remove the file with this command and run again:' -ForegroundColor Yellow
-    Write-Host ("  Remove-Item -LiteralPath '{0}' -Force" -f $Quoted) -ForegroundColor Yellow
+    if (@($Files | Where-Object { $_.Kind -eq 'Main' }).Count -gt 0)
+    {
+        Write-Host '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.' -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start: with one stream it leaves the file as it is; with -ParallelStreams its end-of-run merge leaves the file as it is and the run ends with exit 1, unless one of its streams has this file's number: that stream writes over the file without reading it, and the file's records are lost." -ForegroundColor Yellow
+    }
+    $Lead = if ($Files.Count -gt 1) { '  Once the cause shown above is fixed, remove the files with these commands:' } else { '  Once the cause shown above is fixed, remove the file with this command:' }
+    Write-Host $Lead -ForegroundColor Yellow
+    foreach ($File in $Files)
+    {
+        Write-Host ("  Remove-Item -LiteralPath '{0}' -Force" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($File.Path)) -ForegroundColor Yellow
+    }
+    if ($ResumeFailedOnly)
+    {
+        Write-Host "  Then run the same command without -ResumeFailedOnly, with -Resume: the retry list then holds none of this file's entries, so -ResumeFailedOnly would not retry them." -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host '  Then run the same command again.' -ForegroundColor Yellow
+    }
     Exit-Wrapper -Code 1
 }
 
