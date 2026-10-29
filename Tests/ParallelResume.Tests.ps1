@@ -1100,6 +1100,19 @@ Describe 'A per-stream state file that can be neither used nor moved aside stops
         script:Test-CleanLine $R3 | Should -BeTrue
         script:Read-State | Should -BeNullOrEmpty
     }
+
+    It 'at the end-of-run merge with a failed subscription: exit 2 keeps its code, and the banner still names the file' {
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'A' -CutAfter 'C' -CutStream 1 -PinCut
+        $Path = Join-Path $script:Root ('.resume-state-{0}-stream-1.json' -f $script:Tenant)
+        $R1 = script:Invoke-Wrapper -Streams 2
+        $R1.ExitCode | Should -Be 2
+        script:Get-RemoveCommand $R1 | Should -Be @("  Remove-Item -LiteralPath '{0}' -Force" -f $Path)
+        # The next run stops at startup until the file is removed.
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R2.ExitCode | Should -Be 1
+        script:Get-Collected $R2 | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'A stream that fails to start puts its subscriptions on the retry list' -Skip:$IsWindows {

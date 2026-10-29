@@ -300,6 +300,11 @@ exit $LASTEXITCODE
     $Exit = $LASTEXITCODE
     $Zip = Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
     $Dict = Get-ChildItem -Path $Out -Filter 'ObfuscationDictionary_*.json' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    # A run that did not end with 0 (a collector failed: exit 4) can still
+    # leave a zip, with resource types missing, and the tests would then skip
+    # what they cannot find. Such a zip is not offered: the caller's BeforeAll
+    # throws with the run's exit code and console.
+    if ($Exit -ne 0) { $Zip = $null }
     return [pscustomobject]@{
         ZipPath        = $(if ($null -ne $Zip) { $Zip.FullName } else { $null })
         DictionaryPath = $(if ($null -ne $Dict) { $Dict.FullName } else { $null })
