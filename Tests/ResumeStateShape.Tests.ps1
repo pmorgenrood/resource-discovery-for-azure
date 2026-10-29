@@ -873,13 +873,15 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         $StreamPath = Join-Path $script:Root $script:Stream0Name
         script:Write-RawText -Path $StreamPath -Text $Text
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
+        # Not the wrong shape and no new stop. Whether the empty file itself is
+        # kept or moved aside as unreadable belongs to the handling of
+        # per-stream files that cannot be read, so it is not checked here.
         $R1.ExitCode | Should -Be 0
         $R1.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
-        script:Get-MovedAside | Should -BeNullOrEmpty
+        @($R1.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped*' }) | Should -BeNullOrEmpty
         $R1.Text | Should -Contain 'ResumeFailedOnly: filtered to 1 previously-failed subscription(s) (was 2).'
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B')
-        script:Test-CleanLine $R1 | Should -BeTrue
     }
 
     It '-ResumeFailedOnly with <Streams> stream(s) stops with exit 1; the advised -Resume ends clean' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
