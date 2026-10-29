@@ -25,8 +25,8 @@
 #
 # Every run is Run-AllSubscriptions.ps1 itself, started as its own pwsh process
 # from a copy of the tool whose ResourceInventory.ps1 is a stand-in. Azure is a
-# set of stand-in Az modules and an az command, found first on the module path
-# and PATH of that process, which answer from a scenario file: the
+# set of stand-in Az modules (the tool uses Az PowerShell only), found first on
+# the module path of that process, which answer from a scenario file: the
 # subscriptions, the ones that fail, the ones whose collection hangs until
 # the run is ended, the ones whose run writes no zip, and the ones after which
 # the inventory root is made read-only (so a removal there fails). An interrupted run is ended by killing the wrapper's
@@ -171,16 +171,6 @@ function Get-UsageAggregates
         Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psd1')) -Value ("@{{ ModuleVersion = '99.0.0'; RootModule = '{0}.psm1'; FunctionsToExport = '*' }}" -f $Module.Name) -Encoding utf8
     }
 
-    # The az command: signed in to the scenario's tenant, with a token.
-    $script:Bin = Join-Path $script:TestBase 'bin'
-    New-Item -ItemType Directory -Path $script:Bin -Force | Out-Null
-    $Az = @'
-$Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
-if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'show') { [pscustomobject]@{ tenantId = $Scenario.Tenant } | ConvertTo-Json -Compress; exit 0 }
-if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'get-access-token') { exit 0 }
-exit 1
-'@
-    Set-Content -LiteralPath (Join-Path $script:Bin 'az.ps1') -Value $Az -Encoding utf8
 
     $script:Subs = @{}
     foreach ($Letter in 'A', 'B', 'C', 'D', 'E', 'F') { $script:Subs[$Letter] = @{ Id = ('sub-' + $Letter.ToLowerInvariant()); Name = ('Sub ' + $Letter) } }
@@ -231,7 +221,6 @@ exit 1
         $Info.RedirectStandardError = $true
         $Info.Environment['HOME'] = $script:CaseHome
         $Info.Environment['PSModulePath'] = $script:Modules
-        $Info.Environment['PATH'] = $script:Bin + [IO.Path]::PathSeparator + $env:PATH
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['NO_COLOR'] = '1'
         foreach ($Key in $Environment.Keys) { $Info.Environment[$Key] = [string]$Environment[$Key] }

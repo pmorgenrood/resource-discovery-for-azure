@@ -123,7 +123,8 @@ $Global:LASTEXITCODE = 0
     "`$ResumeFailedOnly = `$false; `$FailedSubscriptions = @()`n" +
     $StartupText + "`n" + $SetupText + "`n"
     $script:SequentialRun = [scriptblock]::Create($Prelude + '. ' + $SeqText)
-    $script:FallbackRun = [scriptblock]::Create($Prelude + $OneText)
+    # The fallback takes the pending list, which the wrapper builds just before it.
+    $script:FallbackRun = [scriptblock]::Create($Prelude + "`$PendingSubscriptions = @(`$Subscriptions)`n" + $OneText)
     $script:StreamMergeRun = [scriptblock]::Create($Prelude + $MergeText)
 
     # Run one lifted block against a case folder. Returns the host lines it
@@ -263,6 +264,9 @@ Describe 'Other places that add to the completed list, starting from one earlier
         script:Save-TestStreamState -Root $script:Root -StreamId 1 -Subs @($script:C)
         $null = script:Invoke-Wrapper -Block $script:StreamMergeRun -Root $script:Root -Subs $script:All
         script:Get-StateIds -Root $script:Root | Should -Be '3 id(s): Sub A, Sub B, Sub C'
-        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-t-stream-*.json' -Force).Count | Should -Be 0
+        # The merge itself no longer deletes the per-stream files: the wrapper
+        # deletes them with the resume state at the end of the run, or at an
+        # early exit (Tests/ParallelResume.Tests.ps1 covers that).
+        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-t-stream-*.json' -Force).Count | Should -Be 2
     }
 }
