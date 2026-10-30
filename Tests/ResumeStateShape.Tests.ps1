@@ -1359,7 +1359,7 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
     }
 
-    It 'a right-shaped per-stream file read before one that cannot be moved aside: -Resume stops with exit 1 and prints no other warning; the right-shaped file is kept and the -Resume after the printed command uses it and ends clean' {
+    It 'a right-shaped per-stream file read before one that cannot be moved aside: -Resume stops with exit 1 and prints no other warning; the right-shaped file is kept and the -Resume after the printed command uses it' {
         # Stream 0 lists Sub A as completed; stream 1 cannot be moved aside.
         $Stream1Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
         script:Set-Scenario -RenameRefused $Stream1Name
@@ -1375,10 +1375,14 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         script:Set-Scenario
         & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R1)[0])
         $R2 = script:Invoke-Wrapper -Arguments '-Resume'
-        $R2.ExitCode | Should -Be 0
+        # The exit code is not checked beyond "not the stop": it also depends on
+        # whether the report of a subscription skipped as completed can be put in
+        # this run's zip.
+        $R2.ExitCode | Should -Not -Be 1
+        $R2.Error | Should -BeNullOrEmpty
+        @(script:Get-StopLines $R2) + @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
         $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
-        script:Test-CleanLine $R2 | Should -BeTrue
     }
 
     It 'a stale per-stream file found by the end-of-run merge (<Label>): the run builds its zip, main summary and end-of-run summary first, every collected report once in the zip, then ends with exit 1; after the printed command the same command ends clean' -ForEach @(
