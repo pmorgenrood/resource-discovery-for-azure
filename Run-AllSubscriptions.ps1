@@ -519,6 +519,9 @@ $WrapperTranscriptStarted = $false
 # nothing to clean up.
 $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
+# Set once the run id is known; from then on Exit-Wrapper names another run's
+# per-stream state files left on disk (Write-OtherRunStreamStateLine).
+$OtherRunLineReady = $false
 $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
 try
 {
@@ -754,6 +757,7 @@ if (-not ($Resume -or $ResumeFailedOnly))
         Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
     }
 }
+$OtherRunLineReady = $true
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -1914,18 +1918,15 @@ Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept
 # The per-stream state files of another run: never used by this run. A run that
 # ends clean removes them, since no run can resume them
 # (Remove-OtherRunStreamStateFiles); any other run leaves them and names the ones
-# on disk now (a parallel -Resume may have written its own over some of them).
+# on disk now (a parallel -Resume may have written its own over some of them),
+# as an early exit does (Exit-Wrapper).
 if ($CleanRun)
 {
     $null = Remove-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
 }
-else
+elseif ($OtherRunLineReady)
 {
-    $OtherRunStreamFiles = @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId | ForEach-Object { $_.Name })
-    if ($OtherRunStreamFiles.Count -gt 0)
-    {
-        Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
-    }
+    Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
 }
 
 # Final summary

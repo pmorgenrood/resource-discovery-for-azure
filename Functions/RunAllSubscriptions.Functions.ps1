@@ -36,6 +36,13 @@ function Exit-Wrapper
     {
         $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
     }
+    # An early exit is not a clean run, so it names the per-stream state files
+    # of another run left on disk, as the end of such a run does. Only once the
+    # run id is set ($OtherRunLineReady); before that no run id is known.
+    if ($OtherRunLineReady)
+    {
+        Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
+    }
     if ($WrapperTranscriptStarted)
     {
         try { Stop-Transcript | Out-Null }
@@ -524,6 +531,33 @@ function Get-FailedAttempts
     }
 }
 
+# After a failed write of the resume state: remove its temporary path ($Path)
+# when it is a file (what the write left) or an empty folder, never anything
+# inside a folder. A folder with content there makes every write of the resume
+# state fail, so the warning names it and the command that removes it. Removing
+# a folder with content without -Recurse would ask for confirmation, which a
+# non-interactive run cannot answer; [System.IO.Directory]::Delete with
+# recursive $false throws on one instead.
+function Remove-ResumeStateTempPath
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path -PathType Leaf)
+    {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    try
+    {
+        [System.IO.Directory]::Delete($Path, $false)
+    }
+    catch
+    {
+        $Command = if ($IsWindows) { "Remove-Item -LiteralPath '{0}' -Recurse" -f $Path } else { "rm -r '{0}'" -f $Path }
+        Write-Host ("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: {1}" -f $Path, $Command) -ForegroundColor Yellow
+    }
+}
+
 function Save-CompletedSubscriptionIds
 {
     param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), [string]$RunId)
@@ -562,9 +596,7 @@ function Save-CompletedSubscriptionIds
     catch
     {
         Write-Host ("WARNING: Failed to persist resume state to {0}: $_" -f $Path) -ForegroundColor Yellow
-        # Only a file this write left; anything else at that path is not ours to
-        # remove, and removing a folder would ask for confirmation.
-        if (Test-Path -LiteralPath "$Path.tmp" -PathType Leaf) { Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue }
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
     }
 }
 
@@ -681,8 +713,7 @@ function Set-ResumeStateRunId
     }
     catch
     {
-        # As in Save-CompletedSubscriptionIds: only a file this write left.
-        if (Test-Path -LiteralPath "$Path.tmp" -PathType Leaf) { Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue }
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
     }
 }
 
@@ -713,6 +744,24 @@ function Get-OtherRunStreamStateFiles
             $Obj = Read-StreamResumeStateFile -Path $_.FullName
             $null -ne $Obj -and -not (Test-StreamStateRunId -State $Obj -RunId $RunId)
         })
+}
+
+# A run that does not end clean names the per-stream state files of another run
+# still on disk (Get-OtherRunStreamStateFiles): at its normal end and at every
+# early exit (Exit-Wrapper) once its run id is set. Prints nothing when there
+# are none.
+function Write-OtherRunStreamStateLine
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    $Names = @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant -RunId $RunId | ForEach-Object { $_.Name })
+    if ($Names.Count -gt 0)
+    {
+        Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($Names -join ', ')) -ForegroundColor DarkGray
+    }
 }
 
 # At the end of a run that ends clean: remove the per-stream state files of this
