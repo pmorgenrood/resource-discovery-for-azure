@@ -736,27 +736,23 @@ $CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $T
 $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 
 # The run id ties the per-stream state files to the run that wrote them. A run
-# without -Resume or -ResumeFailedOnly starts a new one and writes it into the
-# resume state file before any stream starts (Set-ResumeStateRunId, which keeps
-# every other key of the file); -Resume and -ResumeFailedOnly
-# keep the id the file holds (none for a file written before run ids existed,
-# whose per-stream files carry none either). Every save of the resume state
-# writes $RunId (Save-CompletedSubscriptionIds), each stream gets it, and the
-# startup fold and the end-of-run merge use only the per-stream files that
-# carry it (Test-StreamStateRunId). A failed write does not stop the run; its
-# warning says that a later -Resume may not see this run's results (it does not
-# use this run's per-stream files, and may use an earlier run's), so the next
-# run should start without -Resume.
+# without -Resume or -ResumeFailedOnly starts a new one ($NewRunId) and writes
+# it into the resume state file right before it starts collecting, after every
+# setup stop (Write-StartOfRunId, at the start of the sequential loop, of the
+# one-subscription path and of the parallel streams); until then $RunId is the
+# id the file holds, so a run that stops before collecting leaves the earlier
+# run's id and a later -Resume or -ResumeFailedOnly still uses that run's
+# per-stream files. -Resume and -ResumeFailedOnly keep the id the file holds
+# (none for a file written before run ids existed, whose per-stream files carry
+# none either). Every save of the resume state writes $RunId
+# (Save-CompletedSubscriptionIds), each stream gets it, and the startup fold and
+# the end-of-run merge use only the per-stream files that carry it
+# (Test-StreamStateRunId). A failed write does not stop the run; its warning
+# says that a later -Resume may not see this run's results (it does not use
+# this run's per-stream files, and may use an earlier run's), so the next run
+# should start without -Resume.
 $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
-if (-not ($Resume -or $ResumeFailedOnly))
-{
-    $RunId = [guid]::NewGuid().ToString()
-    Set-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId
-    if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
-    {
-        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
-    }
-}
+$NewRunId = if ($Resume -or $ResumeFailedOnly) { '' } else { [guid]::NewGuid().ToString() }
 $OtherRunLineReady = $true
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
@@ -1022,6 +1018,8 @@ if ($ParallelStreams -le 1)
 {
     # === SEQUENTIAL PATH (default) ============================================
     # Original behavior, unchanged. Selected when -ParallelStreams 1 or unset.
+    # The new run id, right before collecting (see $NewRunId above).
+    if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId }
     $SubTotal = @($Subscriptions).Count
     $SubIndex = 0
     foreach ($Sub in $Subscriptions)
@@ -1257,7 +1255,8 @@ else
         # User asked for parallel but only one (or zero) sub is left to
         # process. Process it inline using the same per-sub logic the
         # sequential branch uses, instead of bailing and asking the user to
-        # re-run.
+        # re-run. The new run id first, as in the sequential path.
+        if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId }
         if ($PendingSubscriptions.Count -eq 0)
         {
             Write-Host "Nothing left to process: every eligible subscription was completed by an earlier run." -ForegroundColor Green
@@ -1372,6 +1371,10 @@ else
                 Write-Host "Make sure Run-AllSubscriptions.Stream.ps1 is present alongside Run-AllSubscriptions.ps1, or re-run without -ParallelStreams." -ForegroundColor Yellow
                 Exit-Wrapper -Code 1
             }
+
+            # The new run id, after the Az context snapshot and the worker
+            # check, right before the streams start (see $NewRunId above).
+            if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId }
 
             # Round-robin split: sub 0 -> stream 0, sub 1 -> stream 1, ..., sub N -> stream (N % StreamCount).
             # This balances the slices regardless of how subscription sizes vary,

@@ -38,7 +38,7 @@ function Exit-Wrapper
     }
     # An early exit is not a clean run, so it names the per-stream state files
     # of another run left on disk, as the end of such a run does. Only once the
-    # run id is set ($OtherRunLineReady); before that no run id is known.
+    # run id has been read ($OtherRunLineReady); before that no run id is known.
     if ($OtherRunLineReady)
     {
         Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
@@ -714,6 +714,24 @@ function Set-ResumeStateRunId
     catch
     {
         Remove-ResumeStateTempPath -Path "$Path.tmp"
+    }
+}
+
+# Write a new run id ($RunId) into the resume state file for $Tenant, for a run
+# without -Resume or -ResumeFailedOnly, right before it starts collecting
+# (Set-ResumeStateRunId), and read it back: a failed write does not stop the
+# run, and the warning says what it means for a later -Resume.
+function Write-StartOfRunId
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    Set-ResumeStateRunId -Path $Path -Tenant $Tenant -RunId $RunId
+    if ((Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -ne $RunId)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
     }
 }
 
