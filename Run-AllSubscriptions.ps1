@@ -718,6 +718,17 @@ if ($Excluded.Count -gt 0)
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
 
+# The resume state file's shape is checked here, once, before anything reads it
+# (Move-WrongShapeResumeStateFile). A file that is valid JSON but not the right
+# shape is moved aside, so neither this run nor a later one uses its completed
+# list or retry list; a file that cannot be moved aside stops the run (exit 1).
+# Per-stream state files are checked where they are read. A run that moves one
+# aside is not a clean run.
+$WrongShapeStateFiles = @(Move-WrongShapeResumeStateFile -Path $ResumeStateFile -Kind Main -ResumeFailedOnly:$ResumeFailedOnly)
+# Per-stream files the end-of-run merge finds wrong-shaped and cannot move aside:
+# left alone, and the run ends with exit 1 once it is finished.
+$StreamStateNotMoved = @()
+
 # Always seed $CompletedIds from the existing state file. -Resume only
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
@@ -734,8 +745,10 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 
 # The run id ties the per-stream state files to the run that wrote them. A run
 # without -Resume or -ResumeFailedOnly starts a new one and writes it into the
-# resume state file before any stream starts (Set-ResumeStateRunId, which keeps
-# every other key of the file); -Resume and -ResumeFailedOnly
+# resume state file before it collects any subscription or starts any stream
+# (Set-ResumeStateRunId, which keeps every other key of the file; written just
+# before the sequential / parallel split below, after the shape check of the
+# per-stream files its streams will use); -Resume and -ResumeFailedOnly
 # keep the id the file holds (none for a file written before run ids existed,
 # whose per-stream files carry none either). Every save of the resume state
 # writes $RunId (Save-CompletedSubscriptionIds), each stream gets it, and the
@@ -745,15 +758,6 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # use this run's per-stream files, and may use an earlier run's), so the next
 # run should start without -Resume.
 $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
-if (-not ($Resume -or $ResumeFailedOnly))
-{
-    $RunId = [guid]::NewGuid().ToString()
-    Set-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId
-    if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
-    {
-        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
-    }
-}
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -789,6 +793,25 @@ if ($Resume -or $ResumeFailedOnly)
     {
         $StrandedCompleted = @()
         $StrandedFailed = @()
+        # Check the shape of every per-stream file before folding any
+        # (Move-WrongShapeResumeStateFile): one that is not the right shape is
+        # moved aside and left out, and one that cannot be moved aside stops the
+        # run here, before any file is folded in or any state written. A file
+        # that cannot be parsed, or parses to nothing, is left to the read below.
+        $ShapeCheckedStreamFiles = @()
+        foreach ($StreamFile in $StrandedStreamFiles)
+        {
+            $Parsed = $true
+            try { $Record = Get-Content -LiteralPath $StreamFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch { $Parsed = $false }
+            if ($Parsed)
+            {
+                $Moved = Move-WrongShapeResumeStateFile -Path $StreamFile.FullName -Kind Stream -Record $Record -Resume:($Resume -and -not $ResumeFailedOnly) -ResumeFailedOnly:$ResumeFailedOnly
+                if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
+            }
+            $ShapeCheckedStreamFiles += $StreamFile
+        }
+        $StrandedStreamFiles = $ShapeCheckedStreamFiles
         foreach ($StreamFile in $StrandedStreamFiles)
         {
             $Obj = Read-StreamResumeStateFile -Path $StreamFile.FullName
@@ -839,6 +862,27 @@ else
     {
         Write-Host ("Note: resume state file exists at {0} ({1} previously completed). Pass -Resume to skip them." -f $ResumeStateFile, $CompletedIds.Count) -ForegroundColor Yellow
     }
+}
+
+# A -Resume run that moved the resume state file aside says what it uses
+# instead: nothing (it starts fresh), or only per-stream state folded in above.
+if ($Resume -and -not $ResumeFailedOnly -and @($WrongShapeStateFiles | Where-Object { $_.Kind -eq 'Main' }).Count -gt 0)
+{
+    Write-WrongShapeResumeLine -UsesStreamState (@($CompletedIds | Where-Object { $_ }).Count -gt 0 -or @($FailedAttempts | Where-Object { $_ }).Count -gt 0)
+}
+
+# -ResumeFailedOnly retries only the retry list. A state file moved aside above
+# for its shape took its part of that list with it, so the list is not complete:
+# stop before any work, rather than retry part of it or exit 0 with nothing done.
+if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
+{
+    Write-Host "ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above)." -ForegroundColor Red
+    foreach ($File in $WrongShapeStateFiles)
+    {
+        Write-Host ("  {0}: moved aside to {1}; its records are not used." -f $File.Name, $File.MovedTo) -ForegroundColor Yellow
+    }
+    Write-Host "  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed." -ForegroundColor Yellow
+    Exit-Wrapper -Code 1
 }
 
 # -ResumeFailedOnly narrows the eligible-subscription list to only those that
@@ -1013,6 +1057,36 @@ $DiagFile = $null
 # explanation is that the signed-in identity does not have Reader on the
 # subscription, but it can also legitimately mean the subscription is empty).
 $SubResourceCounts = @()
+
+# A run without -Resume or -ResumeFailedOnly: first the shape of the per-stream
+# state file of each stream it will use (more than one stream: set by
+# -ParallelStreams, or chosen for this host). Each stream writes its own file
+# without reading it, so one that is not the right shape is moved aside here, or,
+# if it cannot be, the run stops here (Move-WrongShapeResumeStateFile), before it
+# writes any resume state. Files of other stream numbers are checked by the
+# end-of-run merge; on -Resume and -ResumeFailedOnly the startup fold checked
+# every per-stream file. Then the new run id, written into the resume state file
+# (see above), so a run stopped by that check keeps the earlier run's id and its
+# per-stream files stay that run's for a later -Resume.
+if (-not ($Resume -or $ResumeFailedOnly))
+{
+    $PlannedStreamCount = if ($ParallelStreams -le 1) { 1 } else { [Math]::Min($ParallelStreams, $Subscriptions.Count) }
+    if ($PlannedStreamCount -ge 2)
+    {
+        for ($S = 0; $S -lt $PlannedStreamCount; $S++)
+        {
+            $OwnStreamFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json" -f $TenantID, $S)
+            $Moved = Move-WrongShapeResumeStateFile -Path $OwnStreamFile -Kind Stream
+            if ($Moved) { $WrongShapeStateFiles += $Moved }
+        }
+    }
+    $RunId = [guid]::NewGuid().ToString()
+    Set-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId
+    if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
+    }
+}
 
 if ($ParallelStreams -le 1)
 {
@@ -1325,7 +1399,6 @@ else
     }
     if ($StreamCount -ge 2)
     {
-
         # Snapshot the parent's Az context to a shared file so each stream can
         # Import-AzContext without prompting. Save-AzContext writes a JSON file
         # containing a token cache, so it MUST NOT be left on disk after the
@@ -1603,6 +1676,20 @@ else
             foreach ($StreamFile in $AllStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
+                # The shape first (Move-WrongShapeResumeStateFile): a file that is
+                # not the right shape is moved aside, or, if it cannot be, left
+                # alone and the run ends with exit 1 once it is finished. Either
+                # way it is left out of the merge and of the clean-up below, like
+                # a file that cannot be read.
+                $Parsed = $true
+                try { $Record = Get-Content -LiteralPath $PerStreamFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+                catch { $Parsed = $false }
+                if ($Parsed)
+                {
+                    $Moved = Move-WrongShapeResumeStateFile -Path $PerStreamFile -Kind Stream -Record $Record -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
+                    if ($Moved -and $Moved.NotMoved) { $StreamStateNotMoved += $Moved; $UnreadableAtMerge += $PerStreamFile; continue }
+                    if ($Moved) { $WrongShapeStateFiles += $Moved; $UnreadableAtMerge += $PerStreamFile; continue }
+                }
                 $Obj = Read-StreamResumeStateFile -Path $PerStreamFile
                 if ($null -eq $Obj)
                 {
@@ -1771,6 +1858,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
+        if ($StreamStateNotMoved.Count -gt 0) { Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly }
         Exit-Wrapper -Code 2
     }
     Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {0} successful sub(s))" -f $ActualZipCount) -ForegroundColor Green
@@ -1885,7 +1973,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $FailedAttempts.Count -eq 0 -and (Test
         {
             $StateFilesLeft = @(Remove-ResumeStateFiles -StreamFiles $StreamFilesToRemove -StateFile $ResumeStateFile)
         }
-        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0 -and $UnusedListStreamFiles.Count -eq 0)
+        if ($StateFilesLeft.Count -eq 0 -and @($UnreadableStreamFiles | Where-Object { $null -ne $_ }).Count -eq 0 -and $UnusedListStreamFiles.Count -eq 0 -and $WrongShapeStateFiles.Count -eq 0 -and $StreamStateNotMoved.Count -eq 0)
         {
             Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
             $CleanRun = $true
@@ -1910,6 +1998,7 @@ if (-not $ResumeStateClearTried)
 # A run that could not read a per-stream state file is not a clean run: say
 # whether the state was cleared or kept, and where that file went.
 Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
+Write-WrongShapeStateSummary -Files $WrongShapeStateFiles -StateKept (Test-Path -Path $ResumeStateFile -PathType Leaf)
 
 # The per-stream state files of another run: never used by this run. A run that
 # ends clean removes them, since no run can resume them
@@ -2310,6 +2399,13 @@ if (@($Global:CollectorFailures).Count -gt 0)
     Write-Host "Re-run to retry, or investigate the error(s) above if they repeat." -ForegroundColor Red
     Write-Host "The rest of the inventory completed and the report was still produced." -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Red
+}
+
+# A per-stream state file the end-of-run merge could not move aside: the run
+# above is finished; it ends here with exit 1 and says what to do.
+if ($StreamStateNotMoved.Count -gt 0)
+{
+    Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
 }
 
 # Stop the wrapper transcript on the normal-completion path. Error paths take
