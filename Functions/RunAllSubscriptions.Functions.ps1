@@ -628,9 +628,13 @@ function Write-WrongShapeNotMovedLine
 # remove it without -Force; on Windows a leading dot does not hide a file, so
 # -Force is not needed there and changes nothing for this file.
 # -AfterCollection: the files were found by the end-of-run merge of a parallel
-# run, which left them alone and finished the run (its consolidated zip, main
-# summary and end-of-run summary) before calling this. That case has its own
-# branch below; without it the run stops at its start.
+# run, which left them alone. When the per-subscription output check passes,
+# the run first finishes (its consolidated zip, main summary and end-of-run
+# summary) and calls this at its end. When that check fails, it calls this right
+# after the check's lines, before the consolidated zip and the summaries, where
+# it would otherwise end with exit 2; exit 1 replaces that 2. That case has its
+# own branch below; without it the run stops at its start, before it collects
+# any subscription.
 function Stop-WrongShapeStateNotMoved
 {
     param(
@@ -654,7 +658,7 @@ function Stop-WrongShapeStateNotMoved
     }
     else
     {
-        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start: with one stream it leaves the file as it is; with -ParallelStreams its end-of-run merge leaves the file as it is and the run ends with exit 1, unless one of its streams has this file's number: that stream writes over the file without reading it, and the file's records are lost." -ForegroundColor Yellow
+        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not read it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
     }
     $Lead = if ($Files.Count -gt 1) { '  Once the cause shown above is fixed, remove the files with these commands:' } else { '  Once the cause shown above is fixed, remove the file with this command:' }
     Write-Host $Lead -ForegroundColor Yellow

@@ -213,12 +213,15 @@ exit 1
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
-    # One run of the wrapper as its own process, stdin closed. A run that has
-    # not ended after $TimeoutSeconds is stopped and the test fails.
+    # One run of the wrapper as its own process, stdin closed. -Streams 0 leaves
+    # -ParallelStreams out, so the run picks the stream count for the host
+    # (-Environment can set DOTNET_PROCESSOR_COUNT). A run that has not ended
+    # after $TimeoutSeconds is stopped and the test fails.
     function script:Invoke-Wrapper
     {
-        param([string[]]$Arguments = @(), [int]$Streams = 1, [int]$TimeoutSeconds = 300)
-        $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant, '-ParallelStreams', [string]$Streams)
+        param([string[]]$Arguments = @(), [int]$Streams = 1, [hashtable]$Environment = @{}, [int]$TimeoutSeconds = 300)
+        $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant)
+        if ($Streams -gt 0) { $All += @('-ParallelStreams', [string]$Streams) }
         $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
         foreach ($Arg in @($All) + @($Arguments)) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
@@ -230,6 +233,7 @@ exit 1
         $Info.Environment['PATH'] = $script:Bin + [IO.Path]::PathSeparator + $env:PATH
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['NO_COLOR'] = '1'
+        foreach ($Key in $Environment.Keys) { $Info.Environment[$Key] = [string]$Environment[$Key] }
         $Proc = [System.Diagnostics.Process]::Start($Info)
         $Proc.StandardInput.Close()
         $Out = $Proc.StandardOutput.ReadToEndAsync()
@@ -291,7 +295,11 @@ exit 1
     $script:StopAfter = "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual."
     $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end."
     $script:LaterMain = '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.'
-    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start: with one stream it leaves the file as it is; with -ParallelStreams its end-of-run merge leaves the file as it is and the run ends with exit 1, unless one of its streams has this file's number: that stream writes over the file without reading it, and the file's records are lost."
+    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not read it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
+    # The automatic stream count is 2 on a host with 4 logical processors and
+    # more than 5 GB of memory.
+    $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
+    function script:Get-StreamCount { param($Run) foreach ($Line in $Run.Text) { if ($Line -match '^Parallelism: -ParallelStreams (\d+) \((auto|explicit)\)') { return [int]$Matches[1] } }; return 0 }
     $script:RemoveLead = '  Once the cause shown above is fixed, remove the file with this command:'
     $script:ThenSame = '  Then run the same command again.'
     $script:ThenResume = "  Then run the same command without -ResumeFailedOnly, with -Resume: the retry list then holds none of this file's entries, so -ResumeFailedOnly would not retry them."
@@ -1170,6 +1178,23 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
     }
 
+    It 'a wrong-shaped per-stream file of a stream a run without -Resume uses (<Label>) is moved aside before the streams start; the run is not a clean run, and the next one ends clean' -ForEach @(
+        @{ Label = '-ParallelStreams 2'; Streams = 2 },
+        @{ Label = 'no -ParallelStreams, two chosen for the host'; Streams = 0 }
+    ) {
+        script:Set-Scenario
+        $Seeded = script:Write-StreamText -Text ('{"Completed": 5, "FailedAttempts": "' + $script:Marker + '"}')
+        $R1 = script:Invoke-Wrapper -Streams $Streams -Environment $script:FourCpu
+        if ((script:Get-StreamCount $R1) -ne 2) { Set-ItResult -Skipped -Because ('this host chose {0} stream(s), not 2' -f (script:Get-StreamCount $R1)); return }
+        $R1.ExitCode | Should -Be 0
+        $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:Stream0Name -Field 'Completed is not a list' -Content $Seeded
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R1.Text | Should -Contain ('Resume state cleared, but not a clean run: the per-stream state file {0} was not the right shape and was moved aside to {1}; its records were not used.' -f $script:Stream0Name, $Moved.Name)
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        $R2 = script:Invoke-Wrapper -Streams $Streams -Environment $script:FourCpu
+        script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
+    }
+
     It 'a stale wrong-shaped per-stream file found only by the end-of-run merge of a parallel run without -Resume is moved aside there, with nothing on stderr' {
         script:Set-Scenario
         $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
@@ -1273,37 +1298,87 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         $R.Error | Should -BeNullOrEmpty
     }
 
-    It 'a per-stream file: while it cannot be moved aside, a later -Resume and a later two-stream -ResumeFailedOnly stop the same way at their start; a one-stream run without either switch leaves it as it is; a two-stream run writes over it and its records are lost' {
+    It 'a per-stream file: while it cannot be moved aside, a later -Resume, a later two-stream -ResumeFailedOnly and a later run without either switch that runs two streams (<Label>) stop the same way at their start and keep the file; a one-stream run without either switch leaves it as it is' -ForEach @(
+        @{ Label = '-ParallelStreams 2'; Streams = 2 },
+        @{ Label = 'no -ParallelStreams, two chosen for the host'; Streams = 0 }
+    ) {
         script:Set-Scenario -RenameRefused $script:Stream0Name
         $Seeded = script:Write-StreamText -Text ('{"Completed": 5, "FailedAttempts": "' + $script:Marker + '"}')
         $StreamPath = Join-Path $script:Root $script:Stream0Name
         $null = script:Invoke-Wrapper -Arguments '-Resume'
-        foreach ($Later in @(@{ Arguments = @('-Resume'); Streams = 1 }, @{ Arguments = @('-ResumeFailedOnly'); Streams = 2 }))
+        foreach ($Later in @(@{ Arguments = @('-Resume'); Streams = 1 }, @{ Arguments = @('-ResumeFailedOnly'); Streams = 2 }, @{ Arguments = @(); Streams = $Streams }))
         {
-            $R = script:Invoke-Wrapper -Arguments $Later.Arguments -Streams $Later.Streams
+            $R = script:Invoke-Wrapper -Arguments $Later.Arguments -Streams $Later.Streams -Environment $script:FourCpu
+            if ($Later.Arguments.Count -eq 0 -and (script:Get-StreamCount $R) -ne 2) { Set-ItResult -Skipped -Because ('this host chose {0} stream(s), not 2' -f (script:Get-StreamCount $R)); return }
             $R.ExitCode | Should -Be 1
             script:Get-StopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: *' -f $script:Stream0Name)
             $R.Text | Should -Contain $script:StopStart
             $R.Text | Should -Contain $script:LaterStream
+            $R.Text | Should -Not -Contain 'Resume state cleared (clean run).'
             script:Get-Calls | Should -BeNullOrEmpty
             Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+            $R.Error | Should -BeNullOrEmpty
         }
         # One stream, no switch: the file is not read and stays as it is.
-        $R3 = script:Invoke-Wrapper
-        $R3.ExitCode | Should -Be 0
-        @(script:Get-StopLines $R3) + @(script:Get-ShapeWarnings $R3) | Should -BeNullOrEmpty
-        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
-        Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
-        # Two streams, no switch: stream 0 writes over it without reading it; the
-        # merge then finds that stream's own record and removes the file. No copy
-        # of the seeded file is kept.
-        $R4 = script:Invoke-Wrapper -Streams 2
+        $R4 = script:Invoke-Wrapper
         $R4.ExitCode | Should -Be 0
-        $R4.Error | Should -BeNullOrEmpty
         @(script:Get-StopLines $R4) + @(script:Get-ShapeWarnings $R4) | Should -BeNullOrEmpty
-        Test-Path -LiteralPath $StreamPath | Should -BeFalse
-        script:Get-MovedAside | Should -BeNullOrEmpty
-        script:Test-CleanLine $R4 | Should -BeTrue
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+        # The cause gone; the printed command, then the same two-stream run.
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command ("Remove-Item -LiteralPath '{0}' -Force" -f $StreamPath)
+        $R5 = script:Invoke-Wrapper -Streams $Streams -Environment $script:FourCpu
+        $R5.ExitCode | Should -Be 0
+        script:Test-CleanLine $R5 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+
+    It 'no -ParallelStreams, two streams chosen for the host: a stale per-stream file the end-of-run merge cannot move aside ends the run with exit 1 after its zip and keeps the file; after the printed command the same command ends clean' {
+        script:Set-Scenario -RenameRefused $script:Stream5Name
+        $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
+        $Stale = Join-Path $script:Root $script:Stream5Name
+        $R1 = script:Invoke-Wrapper -Streams 0 -Environment $script:FourCpu
+        if ((script:Get-StreamCount $R1) -ne 2) { Set-ItResult -Skipped -Because ('this host chose {0} stream(s), not 2' -f (script:Get-StreamCount $R1)); return }
+        $R1.ExitCode | Should -Be 1
+        $R1.Text | Should -Contain $script:MergeNotice
+        $R1.Text | Should -Contain $script:StopAfter
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip').Count | Should -Be 1
+        Get-Content -LiteralPath $Stale -Raw | Should -Be $Seeded
+        # The cause still there: the next run does the same.
+        $R2 = script:Invoke-Wrapper -Streams 0 -Environment $script:FourCpu
+        $R2.ExitCode | Should -Be 1
+        $R2.Text | Should -Contain $script:StopAfter
+        Get-Content -LiteralPath $Stale -Raw | Should -Be $Seeded
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R2)[0])
+        $R3 = script:Invoke-Wrapper -Streams 0 -Environment $script:FourCpu
+        $R3.ExitCode | Should -Be 0
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+
+    It 'a right-shaped per-stream file read before one that cannot be moved aside: -Resume stops with exit 1 and prints no other warning; the right-shaped file is kept and the -Resume after the printed command uses it and ends clean' {
+        # Stream 0 lists Sub A as completed; stream 1 cannot be moved aside.
+        $Stream1Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+        script:Set-Scenario -RenameRefused $Stream1Name
+        $Good = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", "Completed": ["sub-a"], "FailedAttempts": []}')
+        $null = script:Write-StreamText -Text '{"Completed": 5, "FailedAttempts": []}' -StreamId 1
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R1.ExitCode | Should -Be 1
+        $R1.Error | Should -BeNullOrEmpty
+        script:Get-StopLines $R1 | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: *' -f $Stream1Name)
+        @($R1.Text | Where-Object { $_ -like 'WARNING:*' }) | Should -BeNullOrEmpty
+        Get-Content -LiteralPath (Join-Path $script:Root $script:Stream0Name) -Raw | Should -Be $Good
+        script:Get-Calls | Should -BeNullOrEmpty
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R1)[0])
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
+        script:Test-CleanLine $R2 | Should -BeTrue
     }
 
     It 'a stale per-stream file found by the end-of-run merge (<Label>): the run builds its zip, main summary and end-of-run summary first, every collected report once in the zip, then ends with exit 1; after the printed command the same command ends clean' -ForEach @(

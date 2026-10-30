@@ -1281,6 +1281,18 @@ else
     }
     if ($StreamCount -ge 2)
     {
+        # Each stream writes its own per-stream state file without reading it
+        # first (it reads it only with -Resume or -ResumeFailedOnly), so check
+        # the shape of the file each stream of this run will use before any
+        # stream starts. One that is not the right shape is moved aside, or, if
+        # it cannot be, the run stops here (Move-WrongShapeResumeStateFile).
+        # Files of other stream numbers are checked by the end-of-run merge.
+        for ($S = 0; $S -lt $StreamCount; $S++)
+        {
+            $OwnStreamFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json" -f $TenantID, $S)
+            $Moved = Move-WrongShapeResumeStateFile -Path $OwnStreamFile -Kind Stream -Resume:($Resume -and -not $ResumeFailedOnly) -ResumeFailedOnly:$ResumeFailedOnly
+            if ($Moved) { $WrongShapeStateFiles += $Moved }
+        }
 
         # Snapshot the parent's Az context to a shared file so each stream can
         # Import-AzContext without prompting. Save-AzContext writes a JSON file
