@@ -562,7 +562,9 @@ function Save-CompletedSubscriptionIds
     catch
     {
         Write-Host ("WARNING: Failed to persist resume state to {0}: $_" -f $Path) -ForegroundColor Yellow
-        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+        # Only a file this write left; anything else at that path is not ours to
+        # remove, and removing a folder would ask for confirmation.
+        if (Test-Path -LiteralPath "$Path.tmp" -PathType Leaf) { Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -679,7 +681,8 @@ function Set-ResumeStateRunId
     }
     catch
     {
-        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+        # As in Save-CompletedSubscriptionIds: only a file this write left.
+        if (Test-Path -LiteralPath "$Path.tmp" -PathType Leaf) { Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -696,12 +699,27 @@ function Test-StreamStateRunId
     return ($FileRunId -eq [string]$RunId)
 }
 
+# The per-stream state files of this tenant on disk now that another run wrote:
+# readable, with a run id other than $RunId (Test-StreamStateRunId), sorted by
+# name. Files that cannot be read are not among them.
+function Get-OtherRunStreamStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    return @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name | Where-Object {
+            $Obj = Read-StreamResumeStateFile -Path $_.FullName
+            $null -ne $Obj -and -not (Test-StreamStateRunId -State $Obj -RunId $RunId)
+        })
+}
+
 # At the end of a run that ends clean: remove the per-stream state files of this
-# tenant that another run wrote (readable, with a run id other than $RunId,
-# Test-StreamStateRunId). No run can resume them. Each removal stops on an error
-# and is then checked; a file that is still there is named in a warning. Files
-# that cannot be read are left for the -Resume that handles them. Returns
-# { Removed; Left } (file names).
+# tenant that another run wrote (Get-OtherRunStreamStateFiles). No run can
+# resume them. Each removal stops on an error and is then checked; a file that
+# is still there is named in a warning. Files that cannot be read are left for
+# the -Resume that handles them. Returns { Removed; Left } (file names).
 function Remove-OtherRunStreamStateFiles
 {
     param(
@@ -711,10 +729,8 @@ function Remove-OtherRunStreamStateFiles
     )
     $Removed = @()
     $Left = @()
-    foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name))
+    foreach ($File in @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant -RunId $RunId))
     {
-        $Obj = Read-StreamResumeStateFile -Path $File.FullName
-        if ($null -eq $Obj -or (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
         $Reason = $null
         try { Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop }
         catch { $Reason = $_.Exception.Message }
@@ -1083,7 +1099,10 @@ function Move-UntrackedStreamStateFiles
 # left. A file holding a list this version does not keep is renamed aside
 # instead (Move-UntrackedStreamStateFiles); -Moved, when given, collects those.
 # Otherwise keep them all, with a warning naming them, so a later -Resume folds
-# them in again and nothing is lost. Used for the files a run folded in at
+# them in again and nothing is lost. That holds while the resume state file
+# holds this run's id ($RunId, the script's when not given); when it does not
+# (its write failed from the start of the run), a later -Resume does not read
+# these files, and the warning says so. Used for the files a run folded in at
 # startup when it keeps the resume state or ends early, and for the files of a
 # parallel run's streams at its end-of-run merge ($Source says which, for the
 # warning). Returns the paths left on disk.
@@ -1097,14 +1116,25 @@ function Invoke-FoldedStreamStateCleanup
         [object]$CompletedIds,
         [object]$FailedAttempts,
         [string]$Source = 'this run read at startup',
-        [System.Collections.Generic.List[object]]$Moved
+        [System.Collections.Generic.List[object]]$Moved,
+        [string]$RunId
     )
+    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = [string](Get-ResumeStateRunList -Name 'RunId') }
     $Left = @($Files | Where-Object { $null -ne $_ -and (Test-Path -LiteralPath $_.FullName -PathType Leaf) })
     if ($Left.Count -eq 0) { return @() }
     $NotHeld = @(Get-ResumeStateRecordMismatch -Path $ResumeStateFile -Tenant $Tenant -Ids $Ids -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts)
     if ($NotHeld.Count -gt 0)
     {
-        Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f (Split-Path -Path $ResumeStateFile -Leaf), $Source, (@($Left | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+        $StateName = Split-Path -Path $ResumeStateFile -Leaf
+        $Names = @($Left | ForEach-Object { $_.Name }) -join ', '
+        if ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Tenant) -eq [string]$RunId)
+        {
+            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f $StateName, $Source, $Names) -ForegroundColor Yellow
+        }
+        else
+        {
+            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept: {2}. The resume state file does not hold this run's id, so a later -Resume or -ResumeFailedOnly does not read them and may not see what this run completed or failed. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f $StateName, $Source, $Names) -ForegroundColor Yellow
+        }
         return @($Left | ForEach-Object { $_.FullName })
     }
     $Untracked = Move-UntrackedStreamStateFiles -Files $Left

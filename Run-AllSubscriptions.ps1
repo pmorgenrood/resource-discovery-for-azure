@@ -740,8 +740,10 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # whose per-stream files carry none either). Every save of the resume state
 # writes $RunId (Save-CompletedSubscriptionIds), each stream gets it, and the
 # startup fold and the end-of-run merge use only the per-stream files that
-# carry it (Test-StreamStateRunId). A failed write costs time, not data: the
-# subscriptions this run's streams record are collected again by a later -Resume.
+# carry it (Test-StreamStateRunId). A failed write does not stop the run; its
+# warning says that a later -Resume may not see this run's results (it does not
+# use this run's per-stream files, and may use an earlier run's), so the next
+# run should start without -Resume.
 $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
 if (-not ($Resume -or $ResumeFailedOnly))
 {
@@ -749,12 +751,9 @@ if (-not ($Resume -or $ResumeFailedOnly))
     Set-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId
     if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
     {
-        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume does not use this run's per-stream state files and collects the subscriptions they record again." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow
     }
 }
-# The per-stream state files of another run, found by the startup fold or the
-# end-of-run merge; neither uses them (see the end of the run).
-$OtherRunStreamFiles = @()
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -798,11 +797,8 @@ if ($Resume -or $ResumeFailedOnly)
                 Write-Verbose ("Could not read stranded stream resume file {0}" -f $StreamFile.FullName)
                 continue
             }
-            if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId))
-            {
-                $OtherRunStreamFiles += $StreamFile.Name
-                continue
-            }
+            # Another run's file is not folded in (see the end of the run).
+            if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
             if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
             if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
             $FoldedStreamFiles += $StreamFile
@@ -1620,7 +1616,6 @@ else
                 if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId))
                 {
                     # Another run's file: not merged and not deleted here.
-                    $OtherRunStreamFiles += $StreamFile.Name
                     $OtherRunAtMerge += $PerStreamFile
                     continue
                 }
@@ -1918,16 +1913,19 @@ Write-UnreadableStreamStateSummary -Unreadable $UnreadableStreamFiles -StateKept
 
 # The per-stream state files of another run: never used by this run. A run that
 # ends clean removes them, since no run can resume them
-# (Remove-OtherRunStreamStateFiles); any other run leaves them and names the
-# ones its startup fold or end-of-run merge found.
-$OtherRunStreamFiles = @($OtherRunStreamFiles | Sort-Object -Unique)
+# (Remove-OtherRunStreamStateFiles); any other run leaves them and names the ones
+# on disk now (a parallel -Resume may have written its own over some of them).
 if ($CleanRun)
 {
     $null = Remove-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
 }
-elseif ($OtherRunStreamFiles.Count -gt 0)
+else
 {
-    Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
+    $OtherRunStreamFiles = @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId | ForEach-Object { $_.Name })
+    if ($OtherRunStreamFiles.Count -gt 0)
+    {
+        Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
+    }
 }
 
 # Final summary

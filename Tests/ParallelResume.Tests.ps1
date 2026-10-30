@@ -28,8 +28,14 @@
 #   - A run without -Resume starts a new run id, every save of the resume state
 #     keeps it, and the startup fold and the end-of-run merge use only the
 #     per-stream files that carry it: an earlier run's file is left by a run
-#     that does not end clean and removed by one that does, and a later -Resume
-#     collects what the run without -Resume failed.
+#     that does not end clean, which names the ones still on disk, and removed
+#     by one that does, and a later -Resume collects what the run without
+#     -Resume failed. When the resume state cannot be written from the start of
+#     such a run, its warnings say that a later -Resume may not see its results
+#     and that the next run should start without -Resume; a folder where the
+#     state's temporary file goes makes the run warn, not prompt.
+# When an end-to-end test fails, the full output of each wrapper run it made is
+# printed after the failure.
 # Each scenario is followed by the next two runs, which end without a repeated
 # recovery line, without collecting a completed subscription again, and with
 # no resume state once nothing is left. The reader, the move-aside helper and
@@ -60,6 +66,8 @@ BeforeAll {
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { '/tmp' }
     $script:TestBase = Join-Path $TmpBase ('ParallelResumeTest_' + [guid]::NewGuid().ToString().Substring(0, 8))
     New-Item -ItemType Directory -Path $script:TestBase -Force | Out-Null
+    $script:CaseRuns = [System.Collections.Generic.List[object]]::new()
+    $script:ErrorMark = $Error.Count
     $script:Tenant = '12345678-1234-1234-1234-123456789012'
     $script:Pwsh = Join-Path $PSHOME 'pwsh'
 
@@ -211,6 +219,8 @@ exit 1
     foreach ($Letter in 'A', 'B', 'C', 'D', 'E', 'F') { $script:Subs[$Letter] = @{ Id = ('sub-' + $Letter.ToLowerInvariant()); Name = ('Sub ' + $Letter) } }
     # The automatic stream count is 2 on a host with 4 logical processors.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
+    # The warning of a run without -Resume whose first write of the resume state fails ({0}: the tenant).
+    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may use an earlier run''s instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly.'
 
     # A fresh home (its InventoryReports folder is the run's inventory root) and
     # scenario for each test.
@@ -221,6 +231,29 @@ exit 1
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
         $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        # Every wrapper run of the test, kept whole for Write-FailedCaseRuns.
+        $script:CaseRuns = [System.Collections.Generic.List[object]]::new()
+        $script:ErrorMark = $Error.Count
+    }
+
+    # After a test that failed (an assertion, or an error the test threw), print
+    # the full output of each wrapper run it made, so a failure that does not
+    # repeat can still be read. Changes nothing that is asserted.
+    function script:Write-FailedCaseRuns
+    {
+        if ($null -eq $script:CaseRuns -or $script:CaseRuns.Count -eq 0) { return }
+        $New = @($Error | Select-Object -First ([math]::Max(0, $Error.Count - $script:ErrorMark)))
+        if (@($New | Where-Object { $_.FullyQualifiedErrorId -eq 'PesterAssertionFailed' -or $_.CategoryInfo.Category -eq 'OperationStopped' }).Count -eq 0) { return }
+        Write-Host ('--- The wrapper runs of this test ({0}), in order:' -f $script:CaseRuns.Count)
+        $N = 0
+        foreach ($Run in $script:CaseRuns)
+        {
+            $N++
+            Write-Host ('--- run {0}: {1} | exit {2} | ended by the test: {3}' -f $N, $Run.Arguments, $Run.ExitCode, $Run.Ended)
+            foreach ($Line in @($Run.Text)) { Write-Host ('  | ' + $Line) }
+            foreach ($Line in @(([string]$Run.Error) -split "`r?`n" | Where-Object { $_ })) { Write-Host ('  ! ' + $Line) }
+        }
+        Write-Host ('--- per-stream and resume state files now: ' + (@(Get-ChildItem -LiteralPath $script:Root -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.resume-state*' } | ForEach-Object { $_.Name } | Sort-Object) -join ', '))
     }
 
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
@@ -251,6 +284,7 @@ exit 1
         $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant)
         if ($Streams -gt 0) { $All += @('-ParallelStreams', [string]$Streams) }
         $All += @($Arguments)
+        $Label = ((@($All | Select-Object -Skip 7) + @(if ($StrictMode) { '(strict mode)' })) -join ' ')
         # With -StrictMode the wrapper runs under Set-StrictMode -Version Latest,
         # set by the shell that starts it.
         if ($StrictMode) { $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ("Set-StrictMode -Version Latest; & '{0}' {1}; exit `$LASTEXITCODE" -f $script:Wrapper, (@($All | Select-Object -Skip 5) -join ' '))) }
@@ -283,12 +317,16 @@ exit 1
         if (-not $Proc.WaitForExit([int][math]::Max(1000, ($Deadline - (Get-Date)).TotalMilliseconds)))
         {
             $Proc.Kill($true)
+            $Proc.WaitForExit()
+            $script:CaseRuns.Add([pscustomobject]@{ Arguments = $Label; ExitCode = 'none (stopped after the timeout)'; Ended = $Ended; Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n"); Error = [string]$Err.Result })
             throw ('The wrapper run did not end within {0} seconds.' -f $TimeoutSeconds)
         }
         $Proc.WaitForExit()
-        if ($EndWhen -and -not $Ended) { throw 'The run ended before the point at which the test ends it.' }
         $Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n")
-        return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; Error = [string]$Err.Result }
+        $Run = [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; Error = [string]$Err.Result }
+        $script:CaseRuns.Add([pscustomobject]@{ Arguments = $Label; ExitCode = $Proc.ExitCode; Ended = $Ended; Text = $Text; Error = $Run.Error })
+        if ($EndWhen -and -not $Ended) { throw 'The run ended before the point at which the test ends it.' }
+        return $Run
     }
 
     # True once each listed subscription's collection has started to hang.
@@ -409,6 +447,7 @@ AfterAll {
 
 Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'after a parallel run that finished with failures (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 2 }, @{ Streams = 0 }) {
         # Finished 2-stream run: A and B complete, C and D fail. Its merge folds
@@ -501,6 +540,7 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
 
 Describe 'A resume state that lists one completed subscription' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'stays a list of ids when the next one completes, and the next -Resume collects neither (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
         # A one-stream run: A completes and B fails, so the state lists one completed id.
@@ -529,6 +569,7 @@ Describe 'A resume state that lists one completed subscription' -Skip:$IsWindows
 
 Describe 'An exit before the startup fold of per-stream state' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'prints no error under Set-StrictMode -Version Latest' {
         # No subscriptions in the tenant: the run ends at its first checks.
@@ -542,6 +583,7 @@ Describe 'An exit before the startup fold of per-stream state' -Skip:$IsWindows 
 
 Describe 'A one-stream run that clears the resume state deletes the per-stream files it folded in' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'one-stream -Resume, then <Next>' -ForEach @(@{ Next = '-Resume' }, @{ Next = '-ResumeFailedOnly' }) {
         # Interrupted 2-stream run: stream 0 completes A, stream 1 fails B, then C and D hang.
@@ -605,6 +647,7 @@ Describe 'A one-stream run that clears the resume state deletes the per-stream f
 
 Describe 'A run that keeps the resume state deletes the per-stream files it folded in, once the state holds their records' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'one-stream <Mode> that keeps the state, then the same twice: the recovery line prints in the first run only' -ForEach @(@{ Mode = '-Resume' }, @{ Mode = '-ResumeFailedOnly' }) {
         # Interrupted 2-stream run: stream 0 completes A, stream 1 fails B, then C and D hang.
@@ -912,6 +955,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
 
 Describe 'A run that ends early leaves no per-stream file it folded in' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'a -Resume run that stops with exit 2 deletes them, and the next two runs recover nothing' {
         # Interrupted 2-stream run: stream 0 completes A, stream 1 fails B, then C and D hang.
@@ -951,7 +995,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         & chmod 755 $Probe
     }
     BeforeEach { script:New-Case }
-    AfterEach { if (Test-Path -LiteralPath $script:Root) { & chmod 755 $script:Root } }
+    AfterEach { if (Test-Path -LiteralPath $script:Root) { & chmod 755 $script:Root }; script:Write-FailedCaseRuns }
 
     It 'is named while the resume state is cleared; the state is kept, and the next run removes everything (one stream)' {
         if (-not $script:ReadOnlyHolds) { Set-ItResult -Skipped -Because 'a read-only folder does not stop a removal for this user'; return }
@@ -1096,6 +1140,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
 
 Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'is named, moved aside and never reported as a clean run (stream file <Kind>, run 1 <Run1>)' -ForEach @(
         @{ Kind = 'cut short'; Run1 = 'without -Resume' }
@@ -1189,6 +1234,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
 
 Describe 'The run id ties per-stream state files to the run that wrote them' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'a run without -Resume after an interrupted parallel run: the next <Next> collects what that run failed (-ParallelStreams <Streams>)' -ForEach @(
         @{ Streams = 1; Next = '-Resume' }, @{ Streams = 2; Next = '-Resume' },
@@ -1201,6 +1247,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
 
         # Run 2, without -Resume: C fails now. It starts a new id; with two
         # streams, its end-of-run merge leaves the stream 2 file of run 1 alone.
+        # It does not end clean, so it names run 1's files still on disk.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C'
         $R2 = script:Invoke-Wrapper -Streams $Streams
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
@@ -1212,7 +1259,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $Others = @(script:Get-StreamFiles | Where-Object { [string](Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).RunId -eq $FirstId } | ForEach-Object { $_.Name } | Sort-Object)
         $Others.Count | Should -Be $(if ($Streams -eq 1) { 3 } else { 1 })
         $Line = 'The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f ($Others -join ', ')
-        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(if ($Streams -gt 1) { $Line })
+        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @($Line)
 
         # Run 2 did not end clean, so they are left.
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Others
@@ -1301,7 +1348,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, two streams, interrupted after A, while every write of the resume state fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B', 'C' -BlockStateWrite
         $R1 = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'B', 'C') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
-        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later -Resume does not use this run''s per-stream state files and collects the subscriptions they record again.' -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
         script:Read-StateFile | Should -BeNullOrEmpty
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
 
@@ -1318,6 +1365,95 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
         script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'a run that does not end clean names only the files of another run still on disk (-Resume with two streams)' {
+        # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2.
+        script:Invoke-InterruptedThreeStreamRun
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        # Run 2, without -Resume, one stream: C and D fail. Run 1's three files are left and named.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f ($Names -join ', ')))
+        # Run 3, -Resume with two streams: C fails again, D completes. Its
+        # streams write over the stream 0 and 1 files and its merge removes
+        # them, so only run 1's stream 2 file is left, and only it is named.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C'
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C', 'D')
+        script:Test-CleanLine $R3 | Should -BeFalse
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name }) | Should -Be @($Names[2])
+        @($R3.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $Names[2]))
+        # Run 4, -Resume: C completes, the run ends clean and removes that file; run 5 finds no state.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'C')
+        script:Test-CleanLine $R4 | Should -BeTrue
+        @($R4.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f $Names[2]))
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        $R5 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R5.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R5 | Should -BeTrue
+    }
+
+    It 'a folder at the resume state''s temporary path: the run warns, collects and prints nothing on stderr' {
+        # A non-empty folder where every write of the resume state puts its temporary file.
+        New-Item -ItemType Directory -Path ($script:State + '.tmp') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -Value 'x'
+        script:Set-Scenario -Subs 'A', 'B'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 0
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Get-ErrorLines $R1 | Should -BeNullOrEmpty
+        $R1.Error | Should -BeNullOrEmpty
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
+        # The folder is left as it was.
+        Test-Path -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -PathType Leaf | Should -BeTrue
+        script:Test-CleanLine $R1 | Should -BeFalse
+
+        # Once the folder is gone, a run without -Resume (the next step the warning
+        # names) writes the state and ends clean; the next -Resume finds no state.
+        Get-ChildItem -LiteralPath ($script:State + '.tmp') -Force | Remove-Item -Force
+        Remove-Item -LiteralPath ($script:State + '.tmp') -Force
+        $R2 = script:Invoke-Wrapper -Streams 1
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
+        $R2.Error | Should -BeNullOrEmpty
+        script:Test-CleanLine $R2 | Should -BeTrue
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'a run without -Resume whose every resume state write fails, after an interrupted run: its warnings say a later -Resume may not see its results' {
+        # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2; the resume state holds run 1's id.
+        script:Invoke-InterruptedThreeStreamRun
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        # Run 2, without -Resume, two streams, every write of the resume state fails: C fails.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C' -BlockStateWrite
+        $R2 = script:Invoke-Wrapper -Streams 2
+        $R2.Error | Should -BeNullOrEmpty
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        $Lead = 'WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept: ' -f $script:Tenant
+        $Tail = '. The resume state file does not hold this run''s id, so a later -Resume or -ResumeFailedOnly does not read them and may not see what this run completed or failed. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly.'
+        $Lines = @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written or read back*' })
+        $Lines.Count | Should -Be 1
+        $Lines[0] | Should -BeIn @(($Lead + ($Names[0], $Names[1] -join ', ') + $Tail), ($Lead + ($Names[1], $Names[0] -join ', ') + $Tail))
+        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $Names[2]))
+        script:Test-CleanLine $R2 | Should -BeFalse
+
+        # Run 3, the next step the warnings name: a run without -Resume, writes
+        # working. It collects all six, ends clean and removes every earlier
+        # run's per-stream file; the next -Resume finds no state.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+        $R3 = script:Invoke-Wrapper -Streams 1
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        @($R3.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R4.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R4 | Should -BeTrue
     }
 
     It 'a run without -Resume after an interrupted parallel run ships the report it made, not the earlier stream file''s' {
@@ -1640,6 +1776,7 @@ Describe 'The per-stream and resume state helpers' {
 
 Describe 'The recovery line after an interrupted parallel run' -Skip:$IsWindows {
     BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
 
     It 'counts no failure for the null entry a stream file written by an older worker holds' {
         # Stream files as an older worker wrote them when nothing had failed.
