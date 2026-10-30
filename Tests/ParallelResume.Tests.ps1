@@ -158,7 +158,11 @@ function Invoke-AzRestMethod
 {
     [CmdletBinding()] param([string]$Method = 'GET', [string]$Path, [string]$Payload)
     $Answer = { param([int]$Status, $Body) [pscustomobject]@{ StatusCode = $Status; Content = (ConvertTo-Json -InputObject $Body -Depth 8 -Compress); Headers = @{} } }
-    if ($Path -match '^/subscriptions/([^/?]+)/resourcegroups\?') { return & $Answer 200 @{ value = @() } }
+    if ($Path -match '^/subscriptions/([^/?]+)/resourcegroups\?')
+    {
+        if (@((Get-RdaStandInScenario).DeniedIds) -contains $Matches[1]) { return & $Answer 403 @{ error = @{ code = 'AuthorizationFailed'; message = 'stand-in: no role on the subscription' } } }
+        return & $Answer 200 @{ value = @() }
+    }
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/roleAssignments\?')
     {
         $Id = $Matches[1]
@@ -195,6 +199,7 @@ if ((Get-RdaStandInScenario).BlockStateWrite)
 function Get-UsageAggregates
 {
     [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, [switch]$ShowDetails, $ContinuationToken)
+    if ((Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json).ConsumptionDenied) { throw 'AuthorizationFailed: stand-in: the client does not have authorization to read usage' }
     [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null }
 }
 '@
@@ -261,7 +266,7 @@ exit 1
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite)
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -272,6 +277,8 @@ exit 1
             ReadOnlyAfterIds = @($ReadOnlyAfter | ForEach-Object { & $Id $_ })
             FailReason    = $FailReason
             BlockStateWrite = [bool]$BlockStateWrite
+            DeniedIds     = @($Denied | ForEach-Object { & $Id $_ })
+            ConsumptionDenied = [bool]$ConsumptionDenied
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -1544,6 +1551,56 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Get-Collected $R | Should -Be (script:Get-Ids 'A', 'B')
         # The source lines quoted by every error the run printed.
         @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunId|OtherRunStreamFiles|OtherRunAtMerge|OtherRunLineReady' }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A run that stops before it starts collecting keeps the earlier run id' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'a run without -Resume stopped by <Label> leaves the resume state as it was; the next -ResumeFailedOnly recovers the earlier run''s per-stream file and retries what it failed' -ForEach @(
+        @{ Label = 'the up-front access check'; Stop = 'Access'; Streams = 1 },
+        @{ Label = 'the up-front consumption check'; Stop = 'Consumption'; Streams = 2 },
+        @{ Label = 'a missing parallel worker script'; Stop = 'Worker'; Streams = 2 }
+    ) {
+        # An earlier interrupted run (id run-earlier): Sub A completed in the
+        # resume state, and its stream 1 holds Sub B completed and Sub C failed.
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Now = (Get-Date).ToUniversalTime().ToString('o')
+        Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": ["sub-a"], "FailedAttempts": [], "RunId": "run-earlier", "LastUpdated": "' + $Now + '"}') -Encoding utf8
+        $Before = [System.IO.File]::ReadAllBytes($script:State)
+        $Stream1 = Join-Path $script:Root ('.resume-state-{0}-stream-1.json' -f $script:Tenant)
+        Set-Content -LiteralPath $Stream1 -Value ('{"Tenant": "' + $script:Tenant + '", "StreamId": "1", "RunId": "run-earlier", "Completed": ["sub-b"], "FailedAttempts": [{"Id": "sub-c", "Name": "Sub C", "LastFailedAt": "' + $Now + '", "Reason": "stand-in failure", "Attempts": 1}]}') -Encoding utf8
+        $Worker = Join-Path (Split-Path -Path $script:Wrapper -Parent) 'Run-AllSubscriptions.Stream.ps1'
+        switch ($Stop)
+        {
+            'Access' { script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'B' }
+            'Consumption' { script:Set-Scenario -Subs 'A', 'B', 'C' -ConsumptionDenied }
+            'Worker' { script:Set-Scenario -Subs 'A', 'B', 'C'; Rename-Item -LiteralPath $Worker -NewName 'Run-AllSubscriptions.Stream.ps1.away' }
+        }
+        try
+        {
+            $R1 = script:Invoke-Wrapper -Streams $Streams
+        }
+        finally
+        {
+            if ($Stop -eq 'Worker') { Rename-Item -LiteralPath ($Worker + '.away') -NewName 'Run-AllSubscriptions.Stream.ps1' }
+        }
+        $R1.ExitCode | Should -Be 1
+        $R1.Error | Should -BeNullOrEmpty
+        if ($Stop -eq 'Worker') { $R1.Text | Should -Contain ('ERROR: parallel worker script not found at {0}.' -f $Worker) }
+        script:Get-Collected $R1 | Should -BeNullOrEmpty
+        [System.IO.File]::ReadAllBytes($script:State) | Should -Be $Before
+        @($R1.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $Stream1 | Should -BeTrue
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R2.ExitCode | Should -Be 0
+        $R2.Error | Should -BeNullOrEmpty
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C')
+        script:Test-CleanLine $R2 | Should -BeTrue
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 }
 

@@ -274,13 +274,15 @@ exit 1
     # the given text.
     function script:Write-MainState
     {
-        param([object]$FailedAttempts, [string[]]$Completed = @('A'))
-        [pscustomobject]@{
+        param([object]$FailedAttempts, [string[]]$Completed = @('A'), [string]$RunId)
+        $Record = [pscustomobject]@{
             TenantID                 = $script:Tenant
             CompletedSubscriptionIds = @($Completed | ForEach-Object { $script:Subs[$_].Id })
             FailedAttempts           = $FailedAttempts
             LastUpdated              = (Get-Date).ToUniversalTime().ToString('o')
-        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
+        }
+        if ($RunId) { $Record | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId }
+        $Record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
         return (Get-Content -LiteralPath $script:State -Raw)
     }
     function script:Write-StreamText
@@ -295,7 +297,7 @@ exit 1
     $script:StopAfter = "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual."
     $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end."
     $script:LaterMain = '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.'
-    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not read it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
+    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
     # The automatic stream count is 2 on a host with 4 logical processors and
     # more than 5 GB of memory.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
@@ -903,16 +905,21 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed.'
     }
 
-    It 'beside a right-shaped per-stream file, -Resume says only that it does not use the moved file, and still skips what the stream file lists' {
+    It 'beside a right-shaped per-stream file of the same run (<Label>), -Resume says only that it does not use the moved file, and still skips what the stream file lists; the next -Resume finds no state' -ForEach @(
+        @{ Label = 'files written before run ids'; RunId = '' },
+        @{ Label = 'both with the run id run-earlier'; RunId = 'run-earlier' }
+    ) {
         # The moved file lists B as completed; the per-stream file lists A.
         script:Set-Scenario
-        $Seeded = script:Write-MainState -FailedAttempts $script:Marker -Completed 'B'
-        $null = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", "Completed": ["sub-a"], "FailedAttempts": []}')
+        $Seeded = script:Write-MainState -FailedAttempts $script:Marker -Completed 'B' -RunId $RunId
+        $IdPart = if ($RunId) { '"RunId": "' + $RunId + '", ' } else { '' }
+        $null = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", ' + $IdPart + '"Completed": ["sub-a"], "FailedAttempts": []}')
         $R1 = script:Invoke-Wrapper -Arguments '-Resume'
         # The exit code is not checked beyond "not the stop": it also depends on
         # whether the report of a subscription skipped as completed can be put in
         # this run's zip.
         $R1.ExitCode | Should -Not -Be 1
+        $R1.Error | Should -BeNullOrEmpty
         $null = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
         $Lines = @($R1.Text | Where-Object { $_ -like '  Starting fresh*' -or $_ -like '  This run does not use*' -or $_ -like 'Recovered per-stream state*' -or $_ -like 'Resume mode:*' -or $_ -like 'Skipping (already completed):*' })
         $Lines | Should -Be @(
@@ -923,6 +930,39 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         )
         # B, listed as completed only in the moved file, is collected.
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B', 'C')
+        @($R1.Text | Where-Object { $_ -like '*were written by another run*' }) | Should -BeNullOrEmpty
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R2 | Should -BeTrue
+    }
+
+    It 'beside a right-shaped per-stream file of the same run (<Label>), -ResumeFailedOnly stops and the -Resume it names skips what that file lists, with <Streams> stream(s); the -Resume after that finds no state' -ForEach @(
+        @{ Label = 'files written before run ids'; RunId = ''; Streams = 1 },
+        @{ Label = 'both with the run id run-earlier'; RunId = 'run-earlier'; Streams = 1 },
+        @{ Label = 'both with the run id run-earlier'; RunId = 'run-earlier'; Streams = 2 }
+    ) {
+        script:Set-Scenario
+        $null = script:Write-MainState -FailedAttempts $script:Marker -Completed 'B' -RunId $RunId
+        $IdPart = if ($RunId) { '"RunId": "' + $RunId + '", ' } else { '' }
+        $null = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", ' + $IdPart + '"Completed": ["sub-a"], "FailedAttempts": []}')
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams $Streams
+        $R1.ExitCode | Should -Be 1
+        $R1.Error | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'Recovered per-stream state from an interrupted parallel run: 1 completed, 0 failed subscription record(s).'
+        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above).'
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Resume. It collects every subscription the remaining state does not list as completed.'
+        script:Get-Calls | Should -BeNullOrEmpty
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        $R2.ExitCode | Should -Not -Be 1
+        $R2.Error | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R3 | Should -BeTrue
     }
 
     It 'a <Label> resume state file is handled as before: -ResumeFailedOnly has nothing to retry and exits 0, nothing is moved' -TestCases @(
@@ -1568,5 +1608,28 @@ Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindo
         @($R.Text | Where-Object { $_ -like 'Removed the per-stream state files *' }) | Should -BeNullOrEmpty
         Get-Content -LiteralPath (Join-Path $script:Root $StuckName) -Raw | Should -Be $StuckText
         Get-Content -LiteralPath (Join-Path $script:Root $OtherName) -Raw | Should -Be $Other
+    }
+
+    It 'a run stopped for a resume state file it cannot move aside (<Label>) names only the right-shaped file of another run, once; the per-stream file of the run that file belongs to is not named' -ForEach @(
+        @{ Label = '-Resume'; Arguments = @('-Resume') },
+        @{ Label = 'without either switch'; Arguments = @() }
+    ) {
+        script:Set-Scenario -RenameRefused $script:StateName
+        script:Write-RawText -Path $script:State -Text ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": 5, "FailedAttempts": [], "RunId": "run-earlier"}')
+        $MainBytes = [System.IO.File]::ReadAllBytes($script:State)
+        $Own = script:Write-StreamText -StreamId 1 -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "1", "RunId": "run-earlier", "Completed": ["sub-b"], "FailedAttempts": []}')
+        $OtherName = '.resume-state-{0}-stream-6.json' -f $script:Tenant
+        $Other = script:Write-StreamText -StreamId 6 -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "6", "RunId": "run-other", "Completed": [], "FailedAttempts": []}')
+        $R = script:Invoke-Wrapper -Arguments $Arguments
+        $R.ExitCode | Should -Be 1
+        $R.Error | Should -BeNullOrEmpty
+        script:Get-StopLines $R | Should -BeLike ('ERROR: The resume state file {0} is not the right shape (CompletedSubscriptionIds is not a list), and it could not be moved aside: *' -f $script:StateName)
+        @($R.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(
+            ('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $OtherName)
+        )
+        [System.IO.File]::ReadAllBytes($script:State) | Should -Be $MainBytes
+        Get-Content -LiteralPath (Join-Path $script:Root $script:Stream1Name) -Raw | Should -Be $Own
+        Get-Content -LiteralPath (Join-Path $script:Root $OtherName) -Raw | Should -Be $Other
+        script:Get-Calls | Should -BeNullOrEmpty
     }
 }

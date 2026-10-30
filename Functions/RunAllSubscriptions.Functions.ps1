@@ -38,7 +38,7 @@ function Exit-Wrapper
     }
     # An early exit is not a clean run, so it names the per-stream state files
     # of another run left on disk, as the end of such a run does. Only once the
-    # run id is set ($OtherRunLineReady); before that no run id is known.
+    # run id has been read ($OtherRunLineReady); before that no run id is known.
     if ($OtherRunLineReady)
     {
         Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
@@ -676,7 +676,7 @@ function Stop-WrongShapeStateNotMoved
     }
     else
     {
-        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not read it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
+        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
     }
     $Lead = if ($Files.Count -gt 1) { '  Once the cause shown above is fixed, remove the files with these commands:' } else { '  Once the cause shown above is fixed, remove the file with this command:' }
     Write-Host $Lead -ForegroundColor Yellow
@@ -915,9 +915,11 @@ function Get-ResumeStateRunId
     if ($State -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     $TenantProp = $State.PSObject.Properties['TenantID']
     if ($null -eq $TenantProp -or [string]$TenantProp.Value -ne $Tenant) { return $null }
+    # Only a text id: the file is read before its shape check, so any other
+    # value is not taken for one.
     $Prop = $State.PSObject.Properties['RunId']
-    if ($null -eq $Prop -or [string]::IsNullOrEmpty([string]$Prop.Value)) { return $null }
-    return [string]$Prop.Value
+    if ($null -eq $Prop -or $Prop.Value -isnot [string] -or [string]::IsNullOrEmpty($Prop.Value)) { return $null }
+    return $Prop.Value
 }
 
 # Write $RunId into the resume state file for $Tenant at the start of a run
@@ -957,6 +959,24 @@ function Set-ResumeStateRunId
     catch
     {
         Remove-ResumeStateTempPath -Path "$Path.tmp"
+    }
+}
+
+# Write a new run id ($RunId) into the resume state file for $Tenant, for a run
+# without -Resume or -ResumeFailedOnly, right before it starts collecting
+# (Set-ResumeStateRunId), and read it back: a failed write does not stop the
+# run, and the warning says what it means for a later -Resume.
+function Write-StartOfRunId
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    Set-ResumeStateRunId -Path $Path -Tenant $Tenant -RunId $RunId
+    if ((Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -ne $RunId)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
     }
 }
 
