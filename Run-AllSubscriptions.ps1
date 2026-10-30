@@ -734,21 +734,19 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 
 # The run id ties the per-stream state files to the run that wrote them. A run
 # without -Resume or -ResumeFailedOnly starts a new one and writes it into the
-# resume state file before any stream starts; -Resume and -ResumeFailedOnly
+# resume state file before any stream starts (Set-ResumeStateRunId, which keeps
+# every other key of the file); -Resume and -ResumeFailedOnly
 # keep the id the file holds (none for a file written before run ids existed,
 # whose per-stream files carry none either). Every save of the resume state
 # writes $RunId (Save-CompletedSubscriptionIds), each stream gets it, and the
 # startup fold and the end-of-run merge use only the per-stream files that
 # carry it (Test-StreamStateRunId). A failed write costs time, not data: the
 # subscriptions this run's streams record are collected again by a later -Resume.
-if ($Resume -or $ResumeFailedOnly)
-{
-    $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
-}
-else
+$RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
+if (-not ($Resume -or $ResumeFailedOnly))
 {
     $RunId = [guid]::NewGuid().ToString()
-    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -RunId $RunId
+    Set-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId
     if ((Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) -ne $RunId)
     {
         Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume does not use this run's per-stream state files and collects the subscriptions they record again." -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor Yellow

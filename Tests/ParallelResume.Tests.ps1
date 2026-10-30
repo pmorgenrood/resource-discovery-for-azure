@@ -1275,17 +1275,25 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $null = script:Invoke-Wrapper -Streams 1
         $Id = [string](script:Read-StateFile).RunId
         $Id | Should -Not -BeNullOrEmpty
-        # Interrupted 2-stream -Resume after C fails as well, then -Resume and -ResumeFailedOnly with one stream each.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'D'
-        $null = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2 -EndWhen { script:Test-Hanging 'D' }
+        # Run 2, -Resume with two streams, interrupted: B completes, D hangs.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'D'
+        $null = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2 -EndWhen { (script:Test-Hanging 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-b' }
         [string](script:Read-StateFile).RunId | Should -Be $Id
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B'
-        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
-        script:Get-RecoveryLines $R2 | Should -Not -BeNullOrEmpty
+        # Run 3, -Resume with one stream: the files are folded in, D fails.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'D'
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R3 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 0 failed subscription record(s).')
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'D')
         [string](script:Read-StateFile).RunId | Should -Be $Id
-        $R3 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
-        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'B')
+        # Run 4, -ResumeFailedOnly: D fails again.
+        $R4 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'D')
         [string](script:Read-StateFile).RunId | Should -Be $Id
+        # Run 5, -ResumeFailedOnly: D succeeds and the state clears.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R5 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        script:Get-Collected $R5 | Should -Be (script:Get-Ids 'D')
+        script:Test-CleanLine $R5 | Should -BeTrue
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 
@@ -1504,7 +1512,7 @@ Describe 'The per-stream and resume state helpers' {
         @(Get-StreamStateUntrackedLists -State $null) | Should -BeNullOrEmpty
     }
 
-    It 'Get-ResumeStateRunId, Test-StreamStateRunId and Save-CompletedSubscriptionIds carry the run id' {
+    It 'Get-ResumeStateRunId, Set-ResumeStateRunId, Test-StreamStateRunId and Save-CompletedSubscriptionIds carry the run id' {
         $Path = Join-Path $script:UnitDir '.resume-state-t4.json'
         Get-ResumeStateRunId -Path $Path -Tenant 't' | Should -BeNullOrEmpty
         try
@@ -1534,6 +1542,19 @@ Describe 'The per-stream and resume state helpers' {
         Test-StreamStateRunId -State $Without -RunId '' | Should -BeTrue
         Test-StreamStateRunId -State $Without -RunId 'x' | Should -BeFalse
         Test-StreamStateRunId -State $null -RunId '' | Should -BeFalse
+        # The start-of-run write keeps every other key of the file, and writes a
+        # bare state when there is none or it is for another tenant.
+        '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"FailedAttempts":[],"Extra":[{"Id":"sub-a","Zip":"r.zip"}]}' | Set-Content -LiteralPath $Path -Encoding utf8
+        Set-ResumeStateRunId -Path $Path -Tenant 't' -RunId 'run-three'
+        $Kept = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $Kept.RunId | Should -Be 'run-three'
+        @($Kept.CompletedSubscriptionIds) | Should -Be @('sub-a')
+        @($Kept.Extra)[0].Zip | Should -Be 'r.zip'
+        Set-ResumeStateRunId -Path $Path -Tenant 'other' -RunId 'run-four'
+        $Bare = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $Bare.TenantID | Should -Be 'other'
+        @($Bare.CompletedSubscriptionIds) | Should -BeNullOrEmpty
+        $Bare.RunId | Should -Be 'run-four'
         # The worker's own read takes only its run's file.
         $Stream = Join-Path $script:UnitDir '.resume-state-t-stream-6.json'
         Set-Content -LiteralPath $Stream -Value '{"Tenant":"t","StreamId":"6","RunId":"x","Completed":["sub-a"],"FailedAttempts":[]}' -Encoding utf8

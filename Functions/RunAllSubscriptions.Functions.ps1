@@ -643,6 +643,46 @@ function Get-ResumeStateRunId
     return [string]$Prop.Value
 }
 
+# Write $RunId into the resume state file for $Tenant at the start of a run
+# without -Resume or -ResumeFailedOnly, keeping every other key the file holds
+# (a version that keeps more lists keeps them too). With no file, or one that
+# cannot be read or is for another tenant, it writes a state with nothing
+# completed or failed. Atomic like Save-CompletedSubscriptionIds. Prints nothing:
+# the caller reads the id back (Get-ResumeStateRunId) and says what a failed
+# write means.
+function Set-ResumeStateRunId
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    $State = $null
+    try
+    {
+        $Read = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $TenantProp = if ($Read -is [System.Management.Automation.PSCustomObject]) { $Read.PSObject.Properties['TenantID'] }
+        if ($null -ne $TenantProp -and [string]$TenantProp.Value -eq $Tenant) { $State = $Read }
+    }
+    catch
+    {
+        $State = $null
+    }
+    if ($null -eq $State) { $State = [pscustomobject]@{ TenantID = $Tenant; CompletedSubscriptionIds = @(); FailedAttempts = @() } }
+    $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId -Force
+    $State | Add-Member -NotePropertyName 'LastUpdated' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+    try
+    {
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8
+        [System.IO.File]::Move($TmpPath, $Path, $true)
+    }
+    catch
+    {
+        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # True when a per-stream state file ($State, as Read-StreamResumeStateFile
 # returns it) belongs to the run with id $RunId: its RunId is the same, or
 # neither has one (files written before run ids existed). A file of another
