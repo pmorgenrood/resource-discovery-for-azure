@@ -1541,4 +1541,32 @@ Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindo
             script:Get-LiveStateFiles | Should -Be @($script:Stream0Name)
         }
     }
+
+    # The line that names another run's per-stream state files, at the end of a
+    # run that is not clean and at an early exit (Exit-Wrapper).
+    It 'the other-run line names only the right-shaped file of another run, never a wrong-shaped one, once (<Label>)' -ForEach @(
+        @{ Label = '-Resume stopped at its start'; Arguments = @('-Resume'); Streams = 1; Stuck = 0; MainRunId = 'run-earlier' },
+        @{ Label = 'a two-stream run without either switch stopped before its streams start'; Arguments = @(); Streams = 2; Stuck = 0; MainRunId = 'run-earlier' },
+        @{ Label = 'a two-stream run without either switch stopped at its end'; Arguments = @(); Streams = 2; Stuck = 5; MainRunId = '' }
+    ) {
+        $StuckName = '.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stuck
+        $OtherName = '.resume-state-{0}-stream-6.json' -f $script:Tenant
+        script:Set-Scenario -RenameRefused $StuckName
+        if ($MainRunId)
+        {
+            script:Write-RawText -Path $script:State -Text ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": [], "FailedAttempts": [], "RunId": "' + $MainRunId + '"}')
+        }
+        $StuckText = script:Write-StreamText -StreamId $Stuck -Text ('{"Completed": 5, "FailedAttempts": "' + $script:Marker + '"}')
+        $Other = script:Write-StreamText -StreamId 6 -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "6", "RunId": "run-other", "Completed": [], "FailedAttempts": []}')
+        $R = script:Invoke-Wrapper -Arguments $Arguments -Streams $Streams
+        $R.ExitCode | Should -Be 1
+        $R.Error | Should -BeNullOrEmpty
+        script:Get-StopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (*' -f $StuckName)
+        @($R.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(
+            ('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $OtherName)
+        )
+        @($R.Text | Where-Object { $_ -like 'Removed the per-stream state files *' }) | Should -BeNullOrEmpty
+        Get-Content -LiteralPath (Join-Path $script:Root $StuckName) -Raw | Should -Be $StuckText
+        Get-Content -LiteralPath (Join-Path $script:Root $OtherName) -Raw | Should -Be $Other
+    }
 }

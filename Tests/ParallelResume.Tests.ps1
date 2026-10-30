@@ -32,8 +32,10 @@
 #     by one that does, and a later -Resume collects what the run without
 #     -Resume failed. When the resume state cannot be written from the start of
 #     such a run, its warnings say that a later -Resume may not see its results
-#     and that the next run should start without -Resume; a folder where the
-#     state's temporary file goes makes the run warn, not prompt.
+#     and that the next run should start without -Resume; a folder with content
+#     where the state's temporary file goes makes the run warn with the command
+#     that removes it, not prompt, and an empty one is removed. A run that
+#     stops early names another run's files still on disk too.
 # When an end-to-end test fails, the full output of each wrapper run it made is
 # printed after the failure.
 # Each scenario is followed by the next two runs, which end without a repeated
@@ -1396,7 +1398,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Test-CleanLine $R5 | Should -BeTrue
     }
 
-    It 'a folder at the resume state''s temporary path: the run warns, collects and prints nothing on stderr' {
+    It 'a folder with content at the resume state''s temporary path: the run warns with the command that removes it, collects and prints nothing on stderr' {
         # A non-empty folder where every write of the resume state puts its temporary file.
         New-Item -ItemType Directory -Path ($script:State + '.tmp') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -Value 'x'
@@ -1408,6 +1410,9 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R1.Error | Should -BeNullOrEmpty
         @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
         @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
+        # Each failed write names the folder and the command that removes it.
+        $Folder = @($R1.Text | Where-Object { $_ -like 'WARNING: * is a folder with content*' } | Sort-Object -Unique)
+        $Folder | Should -Be @(("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: rm -r '{0}'" -f ($script:State + '.tmp')))
         # The folder is left as it was.
         Test-Path -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -PathType Leaf | Should -BeTrue
         script:Test-CleanLine $R1 | Should -BeFalse
@@ -1423,6 +1428,55 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
         script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'an empty folder at the resume state''s temporary path is removed by the first failed write, and later writes succeed' {
+        New-Item -ItemType Directory -Path ($script:State + '.tmp') -Force | Out-Null
+        # Run 1, without -Resume: A and B complete, C fails.
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 0
+        $R1.Error | Should -BeNullOrEmpty
+        script:Get-ErrorLines $R1 | Should -Be @('ERROR processing subscription Sub C: stand-in failure for this subscription')
+        # The start-of-run write fails on the folder and removes it; every later write succeeds.
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' -or $_ -like 'WARNING: * is a folder with content*' }) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath ($script:State + '.tmp') | Should -BeFalse
+        [string](script:Read-StateFile).RunId | Should -Not -BeNullOrEmpty
+        (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B')
+        (script:Read-State).Failed | Should -Be (script:Get-Ids 'C')
+        # Run 2, -Resume: A and B are skipped, C completes, the run ends clean; run 3 finds no state.
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C')
+        script:Test-CleanLine $R2 | Should -BeTrue
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'a run that stops early names the files of another run still on disk, and the next clean -Resume removes them' {
+        # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2.
+        script:Invoke-InterruptedThreeStreamRun
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        # Run 2, without -Resume, one stream: D writes no zip, so the output check stops the run with exit 2.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -NoZip 'D'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 2
+        $R2.Error | Should -BeNullOrEmpty
+        @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
+        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f ($Names -join ', ')))
+        # Run 3, -Resume: the run ends clean and removes run 1's files; run 4 finds no state.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        script:Test-CleanLine $R3 | Should -BeTrue
+        @($R3.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
+        @($R3.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -BeNullOrEmpty
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R4.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R4 | Should -BeTrue
     }
 
     It 'a run without -Resume whose every resume state write fails, after an interrupted run: its warnings say a later -Resume may not see its results' {
@@ -1489,7 +1543,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R.ExitCode | Should -Be 0
         script:Get-Collected $R | Should -Be (script:Get-Ids 'A', 'B')
         # The source lines quoted by every error the run printed.
-        @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunId|OtherRunStreamFiles|OtherRunAtMerge' }) | Should -BeNullOrEmpty
+        @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunId|OtherRunStreamFiles|OtherRunAtMerge|OtherRunLineReady' }) | Should -BeNullOrEmpty
     }
 }
 

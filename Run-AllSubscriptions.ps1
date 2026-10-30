@@ -519,6 +519,9 @@ $WrapperTranscriptStarted = $false
 # nothing to clean up.
 $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
+# Set once the run id is known; from then on Exit-Wrapper names another run's
+# per-stream state files left on disk (Write-OtherRunStreamStateLine).
+$OtherRunLineReady = $false
 $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
 try
 {
@@ -758,6 +761,10 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # use this run's per-stream files, and may use an earlier run's), so the next
 # run should start without -Resume.
 $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
+# From here Exit-Wrapper names another run's per-stream state files. For a run
+# without -Resume or -ResumeFailedOnly, until its new id is written below, the id
+# is the one the resume state file holds, which is the one a later -Resume uses.
+$OtherRunLineReady = $true
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -2003,19 +2010,19 @@ Write-WrongShapeStateSummary -Files $WrongShapeStateFiles -StateKept (Test-Path 
 # The per-stream state files of another run: never used by this run. A run that
 # ends clean removes them, since no run can resume them
 # (Remove-OtherRunStreamStateFiles); any other run leaves them and names the ones
-# on disk now (a parallel -Resume may have written its own over some of them).
+# on disk now (a parallel -Resume may have written its own over some of them),
+# as an early exit does (Exit-Wrapper).
 if ($CleanRun)
 {
     $null = Remove-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
 }
-else
+elseif ($OtherRunLineReady)
 {
-    $OtherRunStreamFiles = @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId | ForEach-Object { $_.Name })
-    if ($OtherRunStreamFiles.Count -gt 0)
-    {
-        Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($OtherRunStreamFiles -join ', ')) -ForegroundColor DarkGray
-    }
+    Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
 }
+# Named once: the end-of-run stop for a per-stream state file that cannot be
+# moved aside leaves through Exit-Wrapper below, which would name them again.
+$OtherRunLineReady = $false
 
 # Final summary
 $Elapsed = (Get-Date) - $RunStartTime
