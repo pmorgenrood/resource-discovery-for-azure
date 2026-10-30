@@ -1224,8 +1224,11 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
     }
 
     It 'a per-stream file holding Sub C''s retry entry, under -ResumeFailedOnly: the -Resume the stop names collects Sub B and Sub C; the run after it ends clean' {
+        # Run 0 writes the resume state as the tool does: A completed, B on the
+        # retry list (C is not visible to it).
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper
         script:Set-Scenario -RenameRefused $script:Stream0Name
-        $null = script:Write-MainState -FailedAttempts @((script:New-RetryEntry -Letter 'B')) -Completed 'A'
         $StreamPath = Join-Path $script:Root $script:Stream0Name
         [pscustomobject]@{ Tenant = $script:Tenant; StreamId = '0'; Completed = 5; FailedAttempts = @((script:New-RetryEntry -Letter 'C')) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StreamPath -Encoding utf8
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
