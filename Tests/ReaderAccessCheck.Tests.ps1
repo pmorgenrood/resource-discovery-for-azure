@@ -14,6 +14,7 @@
 # =============================================================================
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
@@ -1190,7 +1191,7 @@ $TestSub = '12345678-1234-1234-1234-123456789012'
 # Subscription N (from 1): ...1234567890<11+N>, so subscription 1 is $TestSub.
 $Global:TestSubs = @(1..$SubCount | ForEach-Object { [pscustomobject]@{ id = ('12345678-1234-1234-1234-1234567890{0:d2}' -f (11 + $_)); name = $(if ($SubCount -eq 1) { 'Placeholder subscription' } else { 'Placeholder subscription {0}' -f $_ }); tenantId = $TestSub } })
 $Global:UnreadableIds = @(($Unreadable -split ',') | Where-Object { $_ } | ForEach-Object { $Global:TestSubs[[int]$_ - 1].id })
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
@@ -1268,6 +1269,8 @@ function global:Invoke-AzRestMethod
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'resource counts'
     & $Json @{ data = @(@(($Payload | ConvertFrom-Json).subscriptions) | ForEach-Object { @{ subscriptionId = $_; ResourceCount = 4 } }) }
 }
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $env:RDA_TEST_ROLES = $Roles
 $env:RDA_TEST_PERM_SUB = $PermSub
 $env:RDA_TEST_PERM_RG = $PermRg
@@ -2521,7 +2524,10 @@ exit 1
         {
             [System.IO.File]::SetUnixFileMode($script:CaseRoot, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
         }
-        $R1.ExitCode | Should -Be 0
+        # -Resume carries the two earlier reports into a consolidated zip, which
+        # the read-only folder refuses, so the run ends with exit 2 and names it.
+        $R1.ExitCode | Should -Be 2
+        $R1.Text | Should -Contain '================ FAILED (consolidated zip) ================'
         $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
         foreach ($Name in $StreamNames)
         {
