@@ -2476,7 +2476,7 @@ exit 1
         script:Set-WrapperScenario -Subs $Subs
 
         $R1 = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly'
-        $R1.ExitCode | Should -Be 0
+        $R1.ExitCode | Should -Be 2 -Because 'Sub B, listed only in the unreadable file, is still owed'
         $Warning = @($R1.Text | Where-Object { $_ -like 'WARNING: The per-stream state file *' })
         $Warning.Count | Should -Be 1
         $Warning[0] | Should -BeLike ('WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and a later -Resume collects them (-ResumeFailedOnly retries only the retry list). It was moved aside to {0}.unreadable-*.' -f $Cut)
