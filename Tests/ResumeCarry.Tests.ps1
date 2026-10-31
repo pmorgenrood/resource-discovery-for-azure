@@ -382,7 +382,7 @@ Describe 'Exit code when an earlier report is missing from the consolidated zip'
 
     It 'the wrapper passes the uncarried list to the exit code and prints the FAILED banner before its transcript stops' {
         $Src = Get-Content -LiteralPath $script:WrapperPath -Raw
-        $Src | Should -Match ([regex]::Escape('Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing (@($UncarriedSkipped).Count -gt 0)'))
+        $Src | Should -Match ([regex]::Escape('Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0)'))
         $Lines = Get-Content -LiteralPath $script:WrapperPath
         $Banner = ($Lines | Select-String -SimpleMatch 'FAILED (earlier report not carried) =' | Select-Object -First 1).LineNumber
         $Stop = ($Lines | Select-String -SimpleMatch 'Stop-Transcript on normal completion failed' | Select-Object -First 1).LineNumber
@@ -754,7 +754,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
 
         $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
         $After2.Reports | Should -BeNullOrEmpty
-        $After2.Failed | Should -BeNullOrEmpty -Because 'a run that left no zip is not recorded as a failed attempt'
+        $After2.Failed | Should -Be @('sub-a') -Because 'a run that left no zip is a failed run, so the retry limit ends a cause that does not go away'
         $Post2.ExitCode | Should -Be 2 -Because 'the run that left no zip still ends at the output verification, as before'
         ($Post2.Text -join "`n") | Should -Match 'ERROR: Per-subscription output verification failed'
         @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
@@ -790,7 +790,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
 
         $After2.Completed | Should -Be @('sub-b') -Because 'the latest run of sub-a left no report'
         @($After2.Reports | ForEach-Object Id) | Should -Be @('sub-b')
-        $After2.Failed | Should -BeNullOrEmpty
+        $After2.Failed | Should -Be @('sub-a') -Because 'a run that left no zip is a failed run'
         @($Summary.Completed) | Should -Be @('sub-b') -Because 'the stream does not count sub-a as completed either'
         @($Summary.NoReport | ForEach-Object Id) | Should -Be @('sub-a')
         @($Agg.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b') -Because 'sub-a still counts as collected this run, so the verification still sees its zip missing'
@@ -808,7 +808,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
 
         $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
         $After2.Reports | Should -BeNullOrEmpty
-        $After2.Failed | Should -BeNullOrEmpty
+        $After2.Failed | Should -Be @('sub-a') -Because 'a run that left no zip is a failed run'
         @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
         @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
     }

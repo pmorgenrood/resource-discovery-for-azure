@@ -138,11 +138,13 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
 
         BeforeEach {
             Set-EarlierRunTotals
-            # The end-of-run statements may also read these: the wrapper transcript is off, and
-            # (where the wrapper carries earlier -Resume reports) none failed to carry.
+            # The end-of-run statements may also read these: the wrapper transcript is off,
+            # (where the wrapper carries earlier -Resume reports) none failed to carry, and
+            # (where it has a retry limit) no subscription past the limit is owed.
             # Set-Variable: only the lifted text reads them.
             Set-Variable -Name WrapperTranscriptStarted -Value $false
             Set-Variable -Name UncarriedSkipped -Value @()
+            Set-Variable -Name RetryLimitedOwed -Value @()
         }
 
         It 'sequential run: reports only its own consumption records and exits 0' {

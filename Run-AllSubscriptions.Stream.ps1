@@ -39,6 +39,10 @@ param (
     # worker's binding. Default to @() and guard the body explicitly.
     [string[]] $SubscriptionIds = @(),
     [string[]] $SubscriptionNames = @(),
+    # The parent's retry-list entries for this slice ({ Id, Name, LastFailedAt,
+    # Reason, Attempts }). [object] for the same single-element collapse as
+    # Add-FailedAttempt's -Existing.
+    [object] $PriorFailedAttempts = @(),
 
     [switch] $Resume,
     # The parent already narrowed $SubscriptionIds to just the failed subs
@@ -167,6 +171,14 @@ if ($Resume -or $ResumeFailedOnly)
         Write-Stream ("resume-failed-only: prior FailedAttempts list has {0} entry(ies) for this stream" -f $FailedAttempts.Count) 'DarkGray'
     }
 }
+# Start from the parent's retry-list entries, so a failure here counts one more
+# run on top of the earlier ones instead of starting again at one. The newer
+# entry wins where this stream's own state file has the same subscription.
+$Prior = @(@($PriorFailedAttempts) | Where-Object { $null -ne $_ })
+if ($Prior.Count -gt 0)
+{
+    $FailedAttempts = @(Merge-FailedAttempts -ExistingFailedAttempts $Prior -StreamFailedAttempts $FailedAttempts -CompletedIds @())
+}
 
 # ---- Build the inner-script passthrough --------------------------------------
 $InventoryPassthrough = @{}
@@ -282,13 +294,12 @@ for ($i = 0; $i -lt $PairCount; $i++)
             # The run left no zip, so there is no report a later -Resume could
             # carry: the sub is not completed. Named in the summary so the parent
             # also ends an earlier run's completion of it in the unified state.
+            # It goes on the retry list as a failed run, as in the parent.
             $NoReportSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
-            if ($Completed -contains $SubId)
-            {
-                $Completed = @($Completed | Where-Object { $_ -ne $SubId })
-                $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
-                Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
-            }
+            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+            $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason 'the run wrote no report zip (see the errors above)'
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
         elseif ($null -ne $IncompleteReason)
         {
