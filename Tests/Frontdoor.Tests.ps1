@@ -4,14 +4,14 @@
 # Run with: Invoke-Pester ./Tests/Frontdoor.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    $ZipPath = if ($env:TEST_ZIP_PATH) { $env:TEST_ZIP_PATH } else
-    {
-        Get-ChildItem -Path $PSScriptRoot -Filter "ResourcesReport_*.zip" |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # $env:TEST_ZIP_PATH, else the newest Tests/ResourcesReport_*.zip, else a
+    # synthetic report generated offline (Tests/Helpers/SyntheticReportZip.ps1).
+    . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+    $script:Fixture = Get-RdaTestReportZip
+    $ZipPath = $script:Fixture.ZipPath
     if ([string]::IsNullOrEmpty($ZipPath) -or -not (Test-Path $ZipPath))
     {
-        throw "No test zip found. Copy a ResourcesReport_*.zip to Tests/ or set `$env:TEST_ZIP_PATH"
+        throw ("No test zip found, and generating a synthetic one failed (exit {0}):`n{1}" -f $script:Fixture.Exit, $script:Fixture.Console)
     }
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "/tmp" }
     $script:ExtractPath = Join-Path $TmpBase ("FrontdoorTest_" + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -23,17 +23,23 @@ BeforeAll {
     $script:FrontDoors = @($script:Inventory.FRONTDOOR) | Where-Object { $null -ne $_ }
 
     $script:ObfuscationPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # An ID is a masked ARM id, every name segment a token (Get-ObfuscatedResourceId).
+    $script:ObfuscatedIdPattern = Get-RdaObfuscatedIdPattern
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 
-    # Detect whether this zip is from an obfuscated run (any ID matches the pattern)
+    # Detect whether this zip is from an obfuscated run: the ID starts like a
+    # masked id or is a token. Only the start is read, so an ID that leaks a real
+    # segment further on fails "ID should match obfuscation pattern" below
+    # instead of skipping it.
     $script:IsObfuscated = $false
     if ($script:FrontDoors.Count -gt 0 -and $null -ne $script:FrontDoors[0].ID)
     {
-        $script:IsObfuscated = $script:FrontDoors[0].ID -match $script:ObfuscationPattern
+        $script:IsObfuscated = $script:FrontDoors[0].ID -match '^(/subscriptions/)?(prod|nonprod)_'
     }
 }
 
 AfterAll {
+    Remove-RdaTestReportZip $script:Fixture
     if (Test-Path $script:ExtractPath) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
 }
 
@@ -154,7 +160,7 @@ Describe "Front Door Obfuscation in Obfuscated Mode" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.ID | Should -Match $script:ObfuscationPattern -Because "Obfuscated mode: ID must be masked"
+            $fd.ID | Should -Match $script:ObfuscatedIdPattern -Because "Obfuscated mode: ID must be masked"
         }
     }
 
