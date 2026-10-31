@@ -25,6 +25,24 @@
 function Exit-Wrapper
 {
     param([int]$Code = 0)
+    # Every early exit of the wrapper passes here, and the resume state is kept
+    # at each of them. The per-stream state files the run folded in at startup
+    # are deleted first, once the resume state holds their records
+    # (Invoke-FoldedStreamStateCleanup), so a run that stops early leaves none
+    # behind and no exit needs code of its own. There are none before the fold,
+    # and none after the end-of-run merge of a parallel run or the end-of-run
+    # clean-up, which deal with them.
+    if (@($FoldedStreamFiles | Where-Object { $null -ne $_ }).Count -gt 0)
+    {
+        $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
+    }
+    # An early exit is not a clean run, so it names the per-stream state files
+    # of another run left on disk, as the end of such a run does. Only once the
+    # run id has been read ($OtherRunLineReady); before that no run id is known.
+    if ($OtherRunLineReady)
+    {
+        Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
+    }
     if ($WrapperTranscriptStarted)
     {
         try { Stop-Transcript | Out-Null }
@@ -341,6 +359,248 @@ function Resolve-TenantId
     return $Resolved
 }
 
+# The right shape of a resume state record, parsed from JSON: the resume state
+# file (-Kind Main, written by Save-CompletedSubscriptionIds) or a per-stream
+# state file (-Kind Stream, written by Write-StreamState). The wrapper checks the
+# resume state file here once, at startup, before Get-CompletedSubscriptionIds
+# and Get-FailedAttempts read it (Move-WrongShapeResumeStateFile); those two do
+# not check it again. A per-stream record is checked by the wrapper's startup
+# fold and end-of-run merge, and by the stream worker's Read-StreamState.
+# Returns $null when the record has the right shape, otherwise a short text
+# naming the first field that does not (never a value from the file).
+#   - The record is a JSON object.
+#   - Main: TenantID is text, and CompletedSubscriptionIds is a list of text
+#     ids. Stream: Completed is a list of text ids.
+#   - FailedAttempts (the retry list) is a list. Each entry is an object with a
+#     non-empty text Id, Attempts a whole number of at least 1 and LastFailedAt
+#     a date, the values Add-FailedAttempt and Merge-FailedAttempts convert. A
+#     file written before the retry list existed has no FailedAttempts key,
+#     which reads as an empty list.
+# The tool itself writes a null entry when a list becomes empty, and an empty
+# completed id where Save-CompletedSubscriptionIds converts a null entry to text,
+# so both are accepted and skipped here. Neither matches a subscription; of the
+# readers, Get-FailedAttempts drops null retry entries.
+# A $null record also returns $null: ConvertFrom-Json turns an empty or
+# whitespace-only file (a write cut short) into $null without an error. That
+# file is not valid JSON, so it is left to the readers, which treat it as they
+# did before this check.
+function Get-ResumeStateShapeProblem
+{
+    param(
+        [object]$Record,
+        [Parameter(Mandatory = $true)][ValidateSet('Main', 'Stream')][string]$Kind
+    )
+    if ($null -eq $Record) { return $null }
+    if ($Record -isnot [System.Management.Automation.PSCustomObject]) { return 'it is not a JSON object' }
+    if ($Kind -eq 'Main' -and $Record.TenantID -isnot [string]) { return 'TenantID is not text' }
+    $IdsKey = if ($Kind -eq 'Main') { 'CompletedSubscriptionIds' } else { 'Completed' }
+    if ($null -eq $Record.PSObject.Properties[$IdsKey]) { return ('{0} is missing' -f $IdsKey) }
+    if ($null -ne $Record.$IdsKey -and $Record.$IdsKey -isnot [array]) { return ('{0} is not a list' -f $IdsKey) }
+    # foreach, not a pipeline: a large tenant has thousands of ids here.
+    foreach ($Id in @($Record.$IdsKey))
+    {
+        if ($null -eq $Id) { continue }
+        if ($Id -isnot [string]) { return ('{0} holds an entry that is not a text id' -f $IdsKey) }
+    }
+
+    $List = $Record.FailedAttempts
+    if ($null -ne $List -and $List -isnot [array]) { return 'FailedAttempts is not a list' }
+    $N = 0
+    foreach ($Entry in @($List))
+    {
+        $N++
+        if ($null -eq $Entry) { continue }
+        if ($Entry -isnot [System.Management.Automation.PSCustomObject]) { return ('FailedAttempts entry {0} is not an object' -f $N) }
+        if ($Entry.Id -isnot [string] -or [string]::IsNullOrWhiteSpace($Entry.Id)) { return ('FailedAttempts entry {0} has no text Id' -f $N) }
+        $Count = 0
+        if (-not [int]::TryParse([string]$Entry.Attempts, [ref]$Count) -or $Count -lt 1) { return ('FailedAttempts entry {0}: Attempts is not a whole number of at least 1' -f $N) }
+        # ConvertFrom-Json turns an ISO 8601 date text into a [datetime]; any
+        # other text must parse as one the way the [datetime] cast does.
+        $When = [datetime]::MinValue
+        if ($Entry.LastFailedAt -isnot [datetime] -and -not ($Entry.LastFailedAt -is [string] -and [datetime]::TryParse($Entry.LastFailedAt, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$When)))
+        {
+            return ('FailedAttempts entry {0}: LastFailedAt is not a date' -f $N)
+        }
+    }
+    return $null
+}
+
+# Check one resume state file (-Kind Main) or per-stream state file (-Kind
+# Stream) for the right shape (Get-ResumeStateShapeProblem). -Record is the
+# parsed content when the caller has already read it; otherwise the file is
+# read here, and a file that is absent or cannot be parsed is left to the
+# reader's own handling. Returns nothing when the record has the right shape.
+# Otherwise its records are not used: the file is renamed in place to
+# <name>.unreadable-<UTC yyyyMMdd-HHmmss>, with -2, -3 and so on added when that
+# name is taken, and kept for inspection. The name neither ends in '.json' nor
+# matches a state file name, so no later run reads it, and it stays a dot-file
+# in the inventory root, which no zip step of the wrapper takes. Prints a
+# warning naming the file and the field, never its content; with -Resume and a
+# per-stream file, also what this run does instead. Returns { Kind; Name;
+# MovedTo; Path; Problem; Reason; NotMoved }.
+# When the file cannot be renamed, the run must not use its records or write
+# over it, and must not carry on as if the file were not there: later runs read
+# it again. At startup the run stops here with exit 1
+# (Stop-WrongShapeStateNotMoved). With -AfterCollection (the end-of-run merge of
+# a parallel run) the run is finished first: this prints a notice and returns
+# the file with NotMoved set; the wrapper leaves the file alone and, at the end
+# of the run, stops with exit 1 the same way. -ResumeFailedOnly only changes
+# what the stop advises.
+function Move-WrongShapeResumeStateFile
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('Main', 'Stream')][string]$Kind,
+        [object]$Record,
+        [switch]$Resume,
+        # The end-of-run merge of a parallel run, after this run's collection.
+        [switch]$AfterCollection,
+        [switch]$ResumeFailedOnly,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    if (-not $PSBoundParameters.ContainsKey('Record'))
+    {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+        try { $Record = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+        catch { return }
+    }
+    $Problem = Get-ResumeStateShapeProblem -Record $Record -Kind $Kind
+    if ($null -eq $Problem) { return }
+
+    $Name = Split-Path -Path $Path -Leaf
+    $What = if ($Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+    $Base = '{0}.unreadable-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+    # A second move in the same second, or a name an earlier run left, must not
+    # make the rename fail. Up to 100 names are tried.
+    $Folder = Split-Path -Path $Path -Parent
+    $MovedTo = $Base
+    $N = 1
+    while ($null -ne $MovedTo -and (Test-Path -LiteralPath (Join-Path $Folder $MovedTo)))
+    {
+        $N++
+        $MovedTo = if ($N -le 100) { '{0}-{1}' -f $Base, $N } else { $null }
+    }
+    try
+    {
+        if ($null -eq $MovedTo) { throw ('every name from {0} to {0}-100 is taken' -f $Base) }
+        Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
+    }
+    catch
+    {
+        $NotMoved = [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $null; Path = $Path; Problem = $Problem; Reason = $_.Exception.Message; NotMoved = $true }
+        if (-not $AfterCollection) { Stop-WrongShapeStateNotMoved -Files @($NotMoved) -ResumeFailedOnly:$ResumeFailedOnly }
+        Write-WrongShapeNotMovedLine -File $NotMoved
+        Write-Host "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end." -ForegroundColor Red
+        return $NotMoved
+    }
+    Write-Host ('WARNING: The {0} {1} is not the right shape ({2}), so its records are not used. It was moved aside to {3}, kept for inspection; no run reads it again.' -f $What, $Name, $Problem, $MovedTo) -ForegroundColor Yellow
+    if ($Resume -and $Kind -eq 'Stream')
+    {
+        Write-Host '  This run does not count the subscriptions it lists as completed.' -ForegroundColor Yellow
+    }
+    return [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $MovedTo; Path = $Path; Problem = $Problem; Reason = $null; NotMoved = $false }
+}
+
+# The first line about a state file that is not the right shape and could not
+# be moved aside (Move-WrongShapeResumeStateFile): the file, the field and the
+# reason the rename failed.
+function Write-WrongShapeNotMovedLine
+{
+    param([Parameter(Mandatory = $true)][object]$File)
+    $What = if ($File.Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+    Write-Host ('ERROR: The {0} {1} is not the right shape ({2}), and it could not be moved aside: {3}' -f $What, $File.Name, $File.Problem, $File.Reason) -ForegroundColor Red
+}
+
+# Stop the run with exit 1 for state files that are not the right shape and
+# could not be moved aside (-Files, from Move-WrongShapeResumeStateFile): name
+# each one with the reason; say what this run did and did not do, and what
+# later runs do while the file stays; print the command that removes each file
+# and the command to run next. The remove command is a Remove-Item -LiteralPath
+# of the full path, quoted for PowerShell, with -Force: on Linux and macOS
+# PowerShell treats a file whose name starts with a dot as hidden and does not
+# remove it without -Force; on Windows a leading dot does not hide a file, so
+# -Force is not needed there and changes nothing for this file.
+# -AfterCollection: the files were found by the end-of-run merge of a parallel
+# run, which left them alone. When the per-subscription output check passes,
+# the run first finishes (its consolidated zip, main summary and end-of-run
+# summary) and calls this at its end. When that check fails, it calls this right
+# after the check's lines, before the consolidated zip and the summaries, where
+# it would otherwise end with exit 2; exit 1 replaces that 2. That case has its
+# own branch below; without it the run stops at its start, before it collects
+# any subscription.
+function Stop-WrongShapeStateNotMoved
+{
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Files,
+        [switch]$AfterCollection,
+        [switch]$ResumeFailedOnly
+    )
+    $Files = @($Files | Where-Object { $null -ne $_ })
+    foreach ($File in $Files) { Write-WrongShapeNotMovedLine -File $File }
+    if ($AfterCollection)
+    {
+        Write-Host "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual." -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host "  This run stops here (exit 1), before it collects any subscription or writes any resume state. It does not use the file's records and does not write over it." -ForegroundColor Red
+    }
+    if (@($Files | Where-Object { $_.Kind -eq 'Main' }).Count -gt 0)
+    {
+        Write-Host '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.' -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
+    }
+    $Lead = if ($Files.Count -gt 1) { '  Once the cause shown above is fixed, remove the files with these commands:' } else { '  Once the cause shown above is fixed, remove the file with this command:' }
+    Write-Host $Lead -ForegroundColor Yellow
+    foreach ($File in $Files)
+    {
+        Write-Host ("  Remove-Item -LiteralPath '{0}' -Force" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($File.Path)) -ForegroundColor Yellow
+    }
+    if ($ResumeFailedOnly)
+    {
+        Write-Host "  Then run the same command without -ResumeFailedOnly, with -Resume: the retry list then holds none of this file's entries, so -ResumeFailedOnly would not retry them." -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host '  Then run the same command again.' -ForegroundColor Yellow
+    }
+    Exit-Wrapper -Code 1
+}
+
+# The end-of-run line for each state file this run moved aside for its shape
+# (Move-WrongShapeResumeStateFile): whether the resume state was cleared or
+# kept, and where the file went. Such a run is not a clean run, whatever else
+# happened, so it never prints "Resume state cleared (clean run).".
+function Write-WrongShapeStateSummary
+{
+    param([object[]]$Files, [bool]$StateKept)
+    $Word = if ($StateKept) { 'kept' } else { 'cleared' }
+    foreach ($File in @($Files | Where-Object { $null -ne $_ }))
+    {
+        $What = if ($File.Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+        Write-Host ('Resume state {0}, but not a clean run: the {1} {2} was not the right shape and was moved aside to {3}; its records were not used.' -f $Word, $What, $File.Name, $File.MovedTo) -ForegroundColor Yellow
+    }
+}
+
+# What a -Resume run that moved the resume state file aside uses instead, once
+# the per-stream state of an interrupted parallel run has been folded in: none
+# (it starts fresh) or only that per-stream state.
+function Write-WrongShapeResumeLine
+{
+    param([bool]$UsesStreamState)
+    if ($UsesStreamState)
+    {
+        Write-Host '  This run does not use the completed list or retry list of the resume state file moved aside above; it uses only the per-stream state recovered above.' -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host '  Starting fresh: this run does not use the completed list or retry list of the resume state file moved aside above.' -ForegroundColor Yellow
+    }
+}
+
 function Get-CompletedSubscriptionIds
 {
     param([string]$Path, [string]$Tenant)
@@ -380,7 +640,8 @@ function Get-FailedAttempts
         $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
         if ($State.TenantID -ne $Tenant) { return @() }
         if ($null -eq $State.FailedAttempts) { return @() }
-        return @($State.FailedAttempts)
+        # A null entry is not a failure record (Get-ResumeStateShapeProblem).
+        return @($State.FailedAttempts | Where-Object { $null -ne $_ })
     }
     catch
     {
@@ -454,9 +715,36 @@ function Test-ResumeStateWithoutReports
     }
 }
 
+# After a failed write of the resume state: remove its temporary path ($Path)
+# when it is a file (what the write left) or an empty folder, never anything
+# inside a folder. A folder with content there makes every write of the resume
+# state fail, so the warning names it and the command that removes it. Removing
+# a folder with content without -Recurse would ask for confirmation, which a
+# non-interactive run cannot answer; [System.IO.Directory]::Delete with
+# recursive $false throws on one instead.
+function Remove-ResumeStateTempPath
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path -PathType Leaf)
+    {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    try
+    {
+        [System.IO.Directory]::Delete($Path, $false)
+    }
+    catch
+    {
+        $Command = if ($IsWindows) { "Remove-Item -LiteralPath '{0}' -Recurse" -f $Path } else { "rm -r '{0}'" -f $Path }
+        Write-Host ("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: {1}" -f $Path, $Command) -ForegroundColor Yellow
+    }
+}
+
 function Save-CompletedSubscriptionIds
 {
-    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), $Reports = @(), $NotReadable = @())
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), $Reports = @(), $NotReadable = @(), [string]$RunId)
 
     # One report record per completed id (the last one given wins), none for an
     # id that is not completed. See New-CompletedReportRecord for the shape.
@@ -464,6 +752,10 @@ function Save-CompletedSubscriptionIds
     # Only the access check passes -NotReadable; every other save keeps the list
     # the file already holds.
     if (-not $PSBoundParameters.ContainsKey('NotReadable')) { $NotReadable = Get-NotReadableSubscriptionIds -Path $Path -Tenant $Tenant }
+    # The id of the run the per-stream state files belong to (Get-ResumeStateRunId).
+    # Every save writes it, so a save that is not given it writes the script's
+    # $RunId, and the per-stream files of this run keep matching.
+    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = [string](Get-ResumeStateRunList -Name 'RunId') }
     $State = [pscustomobject]@{
         TenantID                  = $Tenant
         CompletedSubscriptionIds  = @($Ids)
@@ -481,6 +773,7 @@ function Save-CompletedSubscriptionIds
         NotReadableSubscriptionIds = @(@($NotReadable) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
         LastUpdated               = (Get-Date).ToString('o')
     }
+    if (-not [string]::IsNullOrEmpty($RunId)) { $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId }
     try
     {
         # Atomic write: serialize to a sibling temp file, then swap it into place
@@ -499,7 +792,7 @@ function Save-CompletedSubscriptionIds
     catch
     {
         Write-Host ("WARNING: Failed to persist resume state to {0}: $_" -f $Path) -ForegroundColor Yellow
-        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
     }
 }
 
@@ -583,6 +876,171 @@ function Get-IncompleteDataReason
     return ('{0} incomplete: {1}' -f ($Phases -join ' and '), ($Messages -join ' '))
 }
 
+# The run id the resume state file for $Tenant holds, or $null when there is no
+# file, it cannot be read, it is for another tenant, or it was written before
+# run ids existed. A run without -Resume or -ResumeFailedOnly writes a new id at
+# its start; -Resume and -ResumeFailedOnly keep this one. The per-stream state
+# files a parallel run writes carry the same id (Write-StreamState).
+function Get-ResumeStateRunId
+{
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Tenant)
+    try
+    {
+        $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $null
+    }
+    if ($State -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $TenantProp = $State.PSObject.Properties['TenantID']
+    if ($null -eq $TenantProp -or [string]$TenantProp.Value -ne $Tenant) { return $null }
+    # Only a text id: the file is read before its shape check, so any other
+    # value is not taken for one.
+    $Prop = $State.PSObject.Properties['RunId']
+    if ($null -eq $Prop -or $Prop.Value -isnot [string] -or [string]::IsNullOrEmpty($Prop.Value)) { return $null }
+    return $Prop.Value
+}
+
+# Write $RunId into the resume state file for $Tenant at the start of a run
+# without -Resume or -ResumeFailedOnly, keeping every other key the file holds
+# (a version that keeps more lists keeps them too). With no file, or one that
+# cannot be read or is for another tenant, it writes a state with nothing
+# completed or failed. Atomic like Save-CompletedSubscriptionIds. Prints nothing:
+# the caller reads the id back (Get-ResumeStateRunId) and says what a failed
+# write means.
+function Set-ResumeStateRunId
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    $State = $null
+    try
+    {
+        $Read = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $TenantProp = if ($Read -is [System.Management.Automation.PSCustomObject]) { $Read.PSObject.Properties['TenantID'] }
+        if ($null -ne $TenantProp -and [string]$TenantProp.Value -eq $Tenant) { $State = $Read }
+    }
+    catch
+    {
+        $State = $null
+    }
+    if ($null -eq $State) { $State = [pscustomobject]@{ TenantID = $Tenant; CompletedSubscriptionIds = @(); FailedAttempts = @() } }
+    $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId -Force
+    $State | Add-Member -NotePropertyName 'LastUpdated' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+    try
+    {
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8
+        [System.IO.File]::Move($TmpPath, $Path, $true)
+    }
+    catch
+    {
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
+    }
+}
+
+# Write a new run id ($RunId) into the resume state file for $Tenant, for a run
+# without -Resume or -ResumeFailedOnly, right before it starts collecting
+# (Set-ResumeStateRunId), and read it back: a failed write does not stop the
+# run, and the warning says what it means for a later -Resume.
+function Write-StartOfRunId
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+    Set-ResumeStateRunId -Path $Path -Tenant $Tenant -RunId $RunId
+    if ((Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -ne $RunId)
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run's per-stream state files, and it may use an earlier run's instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
+    }
+}
+
+# True when a per-stream state file ($State, as Read-StreamResumeStateFile
+# returns it) belongs to the run with id $RunId: its RunId is the same, or
+# neither has one (files written before run ids existed). A file of another
+# run is never folded in, merged or deleted by this run.
+function Test-StreamStateRunId
+{
+    param([object]$State, [string]$RunId)
+    if ($null -eq $State) { return $false }
+    $Prop = $State.PSObject.Properties['RunId']
+    $FileRunId = if ($null -eq $Prop) { '' } else { [string]$Prop.Value }
+    return ($FileRunId -eq [string]$RunId)
+}
+
+# The per-stream state files of this tenant on disk now that another run wrote:
+# readable, the right shape (Get-ResumeStateShapeProblem), with a run id other
+# than $RunId (Test-StreamStateRunId), sorted by name. Files that cannot be read
+# are not among them, nor files that are not the right shape: those are handled
+# where per-stream files are read (Move-WrongShapeResumeStateFile), and a
+# one-stream run without -Resume or -ResumeFailedOnly leaves them as they are.
+function Get-OtherRunStreamStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    return @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object -Property Name | Where-Object {
+            $Obj = Read-StreamResumeStateFile -Path $_.FullName
+            $null -ne $Obj -and $null -eq (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream) -and -not (Test-StreamStateRunId -State $Obj -RunId $RunId)
+        })
+}
+
+# A run that does not end clean names the per-stream state files of another run
+# still on disk (Get-OtherRunStreamStateFiles): at its normal end and at every
+# early exit (Exit-Wrapper) once its run id is set. Prints nothing when there
+# are none.
+function Write-OtherRunStreamStateLine
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    $Names = @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant -RunId $RunId | ForEach-Object { $_.Name })
+    if ($Names.Count -gt 0)
+    {
+        Write-Host ("The per-stream state files {0} were written by another run, so this run does not use them; they are left in place." -f ($Names -join ', ')) -ForegroundColor DarkGray
+    }
+}
+
+# At the end of a run that ends clean: remove the per-stream state files of this
+# tenant that another run wrote (Get-OtherRunStreamStateFiles). No run can
+# resume them. Each removal stops on an error and is then checked; a file that
+# is still there is named in a warning. Files that cannot be read are left for
+# the -Resume that handles them. Returns { Removed; Left } (file names).
+function Remove-OtherRunStreamStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId
+    )
+    $Removed = @()
+    $Left = @()
+    foreach ($File in @(Get-OtherRunStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant -RunId $RunId))
+    {
+        $Reason = $null
+        try { Remove-Item -LiteralPath $File.FullName -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $File.FullName)) { $Removed += $File.Name; continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        Write-Host ('WARNING: Could not remove the per-stream state file {0}, which another run wrote: {1}' -f $File.Name, $Reason) -ForegroundColor Yellow
+        $Left += $File.Name
+    }
+    if ($Removed.Count -gt 0)
+    {
+        Write-Host ('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Removed -join ', ')) -ForegroundColor DarkGray
+    }
+    return [pscustomobject]@{ Removed = $Removed; Left = $Left }
+}
+
 # Discover every per-stream resume-state file on disk for a tenant, rather
 # than iterating 0..($StreamCount-1). $StreamCount reflects THIS run's
 # -ParallelStreams value; if an earlier interrupted run used a LARGER value,
@@ -601,14 +1059,37 @@ function Get-StreamResumeStateFiles
     return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
-# A per-stream state file that a resuming run cannot read (an interrupted
-# write can leave it cut short). Its records are not used, so the
-# subscriptions it lists are not counted as completed: a -Resume run collects
-# them again, and under -ResumeFailedOnly a later -Resume does. The file is renamed in place to <name>.unreadable-<UTC time> and
-# kept for inspection: that name ends neither in '.json' nor matches
-# Get-StreamResumeStateFiles, so no later run reads it and no zip step that
-# picks files by '*.json' takes it. Prints a warning naming the file, never its
-# content. Returns { Name; MovedTo } (MovedTo is $null when the rename failed).
+# Read one per-stream resume-state file. Returns its content, or $null when the
+# file cannot be read or does not hold a JSON object. A write cut short leaves a
+# partial file, which fails to parse, or an empty one, which ConvertFrom-Json
+# turns into $null without an error; both come back as $null here.
+function Read-StreamResumeStateFile
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try
+    {
+        $Obj = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $null
+    }
+    if ($Obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    return $Obj
+}
+
+# A per-stream state file that a run cannot read: the startup fold of a
+# resuming run (an interrupted write can leave it cut short), or, with
+# -AtRunEnd, the end-of-run merge of a parallel run (Read-StreamResumeStateFile).
+# Its records are not used, so the subscriptions it lists are not counted as
+# completed: at startup a -Resume run collects them again, and under
+# -ResumeFailedOnly a later -Resume does; after the end-of-run merge a later
+# -Resume collects them. The file is renamed in place to
+# <name>.unreadable-<UTC time> and kept for inspection: that name ends neither
+# in '.json' nor matches Get-StreamResumeStateFiles, so no later run reads it
+# and no zip step that picks files by '*.json' takes it. Prints a warning
+# naming the file, never its content. Returns { Name; MovedTo } (MovedTo is
+# $null when the rename failed).
 function Move-UnreadableStreamStateFile
 {
     param(
@@ -616,11 +1097,22 @@ function Move-UnreadableStreamStateFile
         [datetime]$Now = [datetime]::UtcNow,
         # -ResumeFailedOnly retries only the retry list, so it does not collect
         # the subscriptions the file lists; a later -Resume does.
-        [switch]$ResumeFailedOnly
+        [switch]$ResumeFailedOnly,
+        # Found by the end-of-run merge of a parallel run, after collection.
+        [switch]$AtRunEnd
     )
     $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
-    $Then = if ($ResumeFailedOnly) { 'a later -Resume collects them (-ResumeFailedOnly retries only the retry list)' } else { 'this run collects them again' }
-    $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and {1}.' -f $File.Name, $Then
+    if ($AtRunEnd)
+    {
+        $Lead = 'WARNING: The per-stream state file {0} could not be read, so its records are not used: the subscriptions it lists are not counted as completed, and a later -Resume collects them again.' -f $File.Name
+        $Again = 'a later run'
+    }
+    else
+    {
+        $Then = if ($ResumeFailedOnly) { 'a later -Resume collects them (-ResumeFailedOnly retries only the retry list)' } else { 'this run collects them again' }
+        $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and {1}.' -f $File.Name, $Then
+        $Again = 'a later -Resume'
+    }
     try
     {
         Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
@@ -629,7 +1121,7 @@ function Move-UnreadableStreamStateFile
     catch
     {
         $MovedTo = $null
-        Write-Host ('{0} It could not be moved aside ({1}), so a later -Resume finds it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host ('{0} It could not be moved aside ({1}), so {2} finds it again.' -f $Lead, $_.Exception.Message, $Again) -ForegroundColor Yellow
     }
     return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
 }
@@ -682,6 +1174,285 @@ function Remove-ResumeStateFiles
         $Left.Add($Path)
     }
     return $Left.ToArray()
+}
+
+# Remove per-stream state files while the resume state file stays: the files a
+# run that keeps the resume state folded in at startup, or that its streams
+# wrote. Each removal stops on an error and is then checked, with the same
+# warning as Remove-ResumeStateFiles, and the same line under it: the resume
+# state file is kept, so the next -Resume reads the same state and the named
+# files again. Returns the paths left on disk (none when all were removed).
+function Remove-StreamStateFiles
+{
+    param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
+    $Left = [System.Collections.Generic.List[string]]::new()
+    foreach ($Path in @($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) }))
+    {
+        $Reason = $null
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $Path)) { continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        Write-Host ('WARNING: Could not remove the per-stream state file {0}: {1}' -f (Split-Path -Path $Path -Leaf), $Reason) -ForegroundColor Yellow
+        $Left.Add($Path)
+    }
+    if ($Left.Count -gt 0)
+    {
+        Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
+    }
+    return $Left.ToArray()
+}
+
+# The subscription ids a per-stream state file holds records for: every id in
+# its lists, whether listed as an id (Completed) or as a record with an Id
+# (FailedAttempts, and any other list of per-id records the file carries).
+function Get-StreamStateRecordIds
+{
+    param([object]$State)
+    if ($null -eq $State) { return @() }
+    $Ids = @()
+    foreach ($Prop in @($State.PSObject.Properties))
+    {
+        if ($null -eq $Prop.Value -or $Prop.Value -is [string] -or $Prop.Value -isnot [System.Collections.IEnumerable]) { continue }
+        foreach ($Item in @($Prop.Value))
+        {
+            if ($Item -is [string]) { $Ids += $Item }
+            elseif ($null -ne $Item -and $null -ne $Item.PSObject.Properties['Id']) { $Ids += [string]$Item.Id }
+        }
+    }
+    return @($Ids | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+# One per-id record as a string that two copies of the same record share
+# whether they come from this run's memory or from the file: a round trip
+# through JSON (so a date read from the file and the one this run wrote compare
+# alike), then every field in name order.
+function ConvertTo-ResumeRecordText
+{
+    param([object]$Record)
+    if ($null -eq $Record) { return '' }
+    $Copy = $Record | ConvertTo-Json -Depth 6 -Compress | ConvertFrom-Json
+    $Sorted = [ordered]@{}
+    foreach ($Name in @($Copy.PSObject.Properties.Name | Sort-Object)) { $Sorted[$Name] = $Copy.$Name }
+    return ($Sorted | ConvertTo-Json -Depth 6 -Compress)
+}
+
+# The per-id lists this version keeps in the resume state and in a per-stream
+# state file, and the script variable a run keeps each one in: State is the key
+# in the resume state file, Stream the key in a per-stream state file, Run the
+# variable. CompletedOnly marks a list the resume state keeps for completed
+# subscriptions only. A list a later version adds needs its entry here, or a
+# per-stream state file holding it is renamed aside once its other records are
+# held (Get-StreamStateUntrackedLists, Move-UntrackedStreamStateFiles).
+function Get-ResumeStateRecordLists
+{
+    return @(
+        [pscustomobject]@{ State = 'CompletedSubscriptionIds'; Stream = 'Completed'; Run = 'CompletedIds'; CompletedOnly = $false }
+        [pscustomobject]@{ State = 'FailedAttempts'; Stream = 'FailedAttempts'; Run = 'FailedAttempts'; CompletedOnly = $false }
+    )
+}
+
+# The value of the script variable $Name, or $null when there is none. The name
+# is taken literally (no wildcard), and only the script scope is read, so a
+# local of the same name in a calling function is not used.
+function Get-ResumeStateRunList
+{
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $Variable = $ExecutionContext.SessionState.PSVariable.Get('script:' + $Name)
+    if ($null -eq $Variable) { return $null }
+    return $Variable.Value
+}
+
+# True for a per-id record: an object with an Id.
+function Test-ResumeStateRecord
+{
+    param([object]$Item)
+    return ($null -ne $Item -and $Item -isnot [string] -and $Item -isnot [ValueType] -and $null -ne $Item.PSObject.Properties['Id'])
+}
+
+# The lists with entries in a per-stream state file ($State, as
+# Read-StreamResumeStateFile returns it) that this version does not keep: keys
+# holding a list other than the Stream names of Get-ResumeStateRecordLists.
+function Get-StreamStateUntrackedLists
+{
+    param([object]$State)
+    if ($null -eq $State) { return @() }
+    $Tracked = @(Get-ResumeStateRecordLists | ForEach-Object { $_.Stream })
+    return @($State.PSObject.Properties | Where-Object {
+            $Tracked -notcontains $_.Name -and $null -ne $_.Value -and $_.Value -isnot [string] -and
+            $_.Value -is [System.Collections.IEnumerable] -and @($_.Value | Where-Object { $null -ne $_ }).Count -gt 0
+        } | ForEach-Object { $_.Name })
+}
+
+# The ids among $Ids whose record in the resume state file on disk is not the
+# one this run holds. Compared: whether the id is completed ($CompletedIds
+# against CompletedSubscriptionIds), then, as whole records, every list of
+# per-id records that this version keeps (Get-ResumeStateRecordLists: the retry
+# list $FailedAttempts, and each other list from its script variable) or that
+# the file holds (records with an Id). A list the file does not have, or the
+# run does not keep, reads as none on that side, so a record on only one side is
+# a mismatch. Lists marked CompletedOnly are compared for the ids this run holds
+# as completed, every other list for every id. Each list is indexed by id once,
+# the last record winning, as each writer lets it. Every id comes back when the
+# file is missing, cannot be read or is for another tenant. Read before
+# per-stream state files are deleted, so they are deleted only once the resume
+# state holds every record they gave as this run holds it.
+function Get-ResumeStateRecordMismatch
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        # [object]: a one-item list arrives as a bare string or object.
+        [object]$Ids,
+        [object]$CompletedIds,
+        [object]$FailedAttempts
+    )
+    $Wanted = @($Ids | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    if ($Wanted.Count -eq 0) { return @() }
+    try
+    {
+        $OnDisk = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch
+    {
+        return $Wanted
+    }
+    if ($OnDisk -isnot [System.Management.Automation.PSCustomObject]) { return $Wanted }
+    # A key the file does not have reads as none.
+    $Key = { param($Name) $Prop = $OnDisk.PSObject.Properties[$Name]; if ($null -ne $Prop) { $Prop.Value } }
+    if ([string](& $Key 'TenantID') -ne $Tenant) { return $Wanted }
+    $OnDiskCompleted = [System.Collections.Generic.HashSet[string]]::new([string[]]@(& $Key 'CompletedSubscriptionIds' | Where-Object { $_ } | ForEach-Object { [string]$_ }))
+    $RunCompleted = [System.Collections.Generic.HashSet[string]]::new([string[]]@($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ }))
+    $Index = {
+        param($List)
+        $ById = @{}
+        foreach ($Item in @($List)) { if (Test-ResumeStateRecord -Item $Item) { $ById[[string]$Item.Id] = $Item } }
+        $ById
+    }
+    # The record lists to compare, by their key in the resume state file.
+    $Lists = [ordered]@{}
+    foreach ($Entry in @(Get-ResumeStateRecordLists))
+    {
+        if ($Entry.State -eq 'CompletedSubscriptionIds') { continue }
+        $RunList = if ($Entry.Run -eq 'FailedAttempts') { $FailedAttempts } else { Get-ResumeStateRunList -Name $Entry.Run }
+        $Lists[$Entry.State] = [pscustomobject]@{ Run = $RunList; CompletedOnly = [bool]$Entry.CompletedOnly }
+    }
+    foreach ($Prop in @($OnDisk.PSObject.Properties))
+    {
+        if ($Prop.Name -eq 'CompletedSubscriptionIds' -or $Lists.Contains($Prop.Name)) { continue }
+        if (@($Prop.Value | Where-Object { Test-ResumeStateRecord -Item $_ }).Count -gt 0)
+        {
+            $Lists[$Prop.Name] = [pscustomobject]@{ Run = $null; CompletedOnly = $false }
+        }
+    }
+    $Mismatch = [System.Collections.Generic.List[string]]::new()
+    foreach ($Id in $Wanted)
+    {
+        if ($OnDiskCompleted.Contains($Id) -ne $RunCompleted.Contains($Id)) { $Mismatch.Add($Id) }
+    }
+    foreach ($Name in @($Lists.Keys))
+    {
+        $RunById = & $Index $Lists[$Name].Run
+        $DiskById = & $Index (& $Key $Name)
+        foreach ($Id in $Wanted)
+        {
+            if ($Mismatch.Contains($Id)) { continue }
+            if ($Lists[$Name].CompletedOnly -and -not $RunCompleted.Contains($Id)) { continue }
+            $InRun = $RunById.ContainsKey($Id)
+            $OnFile = $DiskById.ContainsKey($Id)
+            if (-not $InRun -and -not $OnFile) { continue }
+            if ($InRun -ne $OnFile -or (ConvertTo-ResumeRecordText -Record $RunById[$Id]) -ne (ConvertTo-ResumeRecordText -Record $DiskById[$Id])) { $Mismatch.Add($Id) }
+        }
+    }
+    return @($Mismatch | Sort-Object -Unique)
+}
+
+# A per-stream state file holding a list this version does not keep
+# (Get-StreamStateUntrackedLists) is not deleted where the others are: its
+# completed and failed subscriptions were used, and the file is renamed in place
+# to <name>.unused-<UTC time> with a warning naming the list, kept for
+# inspection. That name ends neither in '.json' nor matches
+# Get-StreamResumeStateFiles, so no run reads it, and it stays a dot-file in the
+# inventory root, which no zip step takes. $Files are file objects or paths.
+# Returns { Left = the paths of the other files; Moved = @({ Name; MovedTo;
+# Lists }); NotMoved = the paths that could not be renamed }.
+function Move-UntrackedStreamStateFiles
+{
+    param([object]$Files, [datetime]$Now = [datetime]::UtcNow)
+    $Left = @()
+    $Moved = @()
+    $NotMoved = @()
+    foreach ($File in @($Files | Where-Object { $null -ne $_ }))
+    {
+        $Path = if ($File -is [string]) { $File } else { $File.FullName }
+        $Lists = @(Get-StreamStateUntrackedLists -State (Read-StreamResumeStateFile -Path $Path))
+        if ($Lists.Count -eq 0) { $Left += $Path; continue }
+        $Name = Split-Path -Path $Path -Leaf
+        $MovedTo = '{0}.unused-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+        $Lead = 'WARNING: The per-stream state file {0} holds records this version does not keep ({1}); its completed and failed subscriptions were used.' -f $Name, ($Lists -join ', ')
+        try
+        {
+            Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
+            Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
+            $Moved += [pscustomobject]@{ Name = $Name; MovedTo = $MovedTo; Lists = $Lists }
+        }
+        catch
+        {
+            Write-Host ('{0} It could not be moved aside ({1}), so a later -Resume reads it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+            $NotMoved += $Path
+        }
+    }
+    return [pscustomobject]@{ Left = $Left; Moved = $Moved; NotMoved = $NotMoved }
+}
+
+# Delete per-stream state files ($Files, the ids they hold records for in $Ids)
+# once the resume state file on disk holds those records as this run holds
+# them (Get-ResumeStateRecordMismatch); each removal is checked
+# (Remove-StreamStateFiles), and the resume state file is kept while one is
+# left. A file holding a list this version does not keep is renamed aside
+# instead (Move-UntrackedStreamStateFiles); -Moved, when given, collects those.
+# Otherwise keep them all, with a warning naming them, so a later -Resume folds
+# them in again and nothing is lost. That holds while the resume state file
+# holds this run's id ($RunId, the script's when not given); when it does not
+# (its write failed from the start of the run), a later -Resume does not read
+# these files, and the warning says so. Used for the files a run folded in at
+# startup when it keeps the resume state or ends early, and for the files of a
+# parallel run's streams at its end-of-run merge ($Source says which, for the
+# warning). Returns the paths left on disk.
+function Invoke-FoldedStreamStateCleanup
+{
+    param(
+        [object]$Files,
+        [Parameter(Mandatory = $true)][string]$ResumeStateFile,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [object]$Ids,
+        [object]$CompletedIds,
+        [object]$FailedAttempts,
+        [string]$Source = 'this run read at startup',
+        [System.Collections.Generic.List[object]]$Moved,
+        [string]$RunId
+    )
+    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = [string](Get-ResumeStateRunList -Name 'RunId') }
+    $Left = @($Files | Where-Object { $null -ne $_ -and (Test-Path -LiteralPath $_.FullName -PathType Leaf) })
+    if ($Left.Count -eq 0) { return @() }
+    $NotHeld = @(Get-ResumeStateRecordMismatch -Path $ResumeStateFile -Tenant $Tenant -Ids $Ids -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts)
+    if ($NotHeld.Count -gt 0)
+    {
+        $StateName = Split-Path -Path $ResumeStateFile -Leaf
+        $Names = @($Left | ForEach-Object { $_.Name }) -join ', '
+        if ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Tenant) -eq [string]$RunId)
+        {
+            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept and a later -Resume reads them again: {2}" -f $StateName, $Source, $Names) -ForegroundColor Yellow
+        }
+        else
+        {
+            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept: {2}. The resume state file does not hold this run's id, so a later -Resume or -ResumeFailedOnly does not read them and may not see what this run completed or failed. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f $StateName, $Source, $Names) -ForegroundColor Yellow
+        }
+        return @($Left | ForEach-Object { $_.FullName })
+    }
+    $Untracked = Move-UntrackedStreamStateFiles -Files $Left
+    if ($null -ne $Moved) { foreach ($Item in @($Untracked.Moved)) { $Moved.Add($Item) } }
+    return @($Untracked.NotMoved) + @(Remove-StreamStateFiles -StreamFiles @($Untracked.Left) -StateFile $ResumeStateFile)
 }
 
 # The subscriptions the up-front role check skipped for a cause that can pass
@@ -1110,16 +1881,24 @@ function Write-Stream
 
 function Read-StreamState
 {
-    param([string]$Path)
+    # $RunId: a file of another run (Test-StreamStateRunId) reads as empty.
+    param([string]$Path, [string]$RunId)
     if (-not (Test-Path -Path $Path -PathType Leaf)) { return @{ Completed = @(); Failed = @(); Reports = @() } }
     try
     {
         $Obj = Get-Content -Path $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        # The wrapper moves a file that is not the right shape aside before any
+        # stream starts; one left in place is not used either, nor one of
+        # another run.
+        $Problem = Get-ResumeStateShapeProblem -Record $Obj -Kind Stream
+        if ($null -ne $Problem) { throw ('it is not the right shape ({0})' -f $Problem) }
+        if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { return @{ Completed = @(); Failed = @(); Reports = @() } }
         return @{
             Completed = if ($null -eq $Obj.Completed) { @() } else { @($Obj.Completed) }
             # Backward-compatible: state files written by an older worker had
-            # no FailedAttempts key, so default to @().
-            Failed    = if ($null -eq $Obj.FailedAttempts) { @() } else { @($Obj.FailedAttempts) }
+            # no FailedAttempts key, so default to @(). Files written before
+            # Write-StreamState dropped null entries can hold one; skip it.
+            Failed    = if ($null -eq $Obj.FailedAttempts) { @() } else { @($Obj.FailedAttempts | Where-Object { $_ }) }
             # Same for Reports (see New-CompletedReportRecord).
             Reports   = if ($null -eq $Obj.Reports) { @() } else { @($Obj.Reports) }
         }
@@ -1139,8 +1918,13 @@ function Write-StreamState
         @{
             Tenant         = $TenantID
             StreamId       = $StreamId
+            # The run this file belongs to (Test-StreamStateRunId).
+            RunId          = $RunId
             Completed      = $Completed
-            FailedAttempts = @($FailedAttempts)
+            # Remove-FailedAttempt returns nothing once the list is empty, and
+            # @($null) is a one-entry array; drop that entry so the file holds
+            # only real failure records.
+            FailedAttempts = @($FailedAttempts | Where-Object { $_ })
             Reports        = @($Reports)
         } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
     }

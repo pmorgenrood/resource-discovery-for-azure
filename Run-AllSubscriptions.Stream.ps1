@@ -58,7 +58,10 @@ param (
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
     [string] $ConsumptionWindowStart,
-    [string] $ConsumptionWindowEnd
+    [string] $ConsumptionWindowEnd,
+    # The parent run's id: written into this stream's state file, and an
+    # existing file is read on -Resume only when it carries the same id.
+    [string] $RunId = ''
 )
 
 # ---------------------------------------------------------------------------
@@ -158,13 +161,16 @@ $FailedAttempts = @()
 $Reports = @()
 if ($Resume -or $ResumeFailedOnly)
 {
-    $State = Read-StreamState -Path $StreamStateFile
+    $State = Read-StreamState -Path $StreamStateFile -RunId $RunId
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
     $Reports = @($State.Reports)
-    if ($CompletedIds.Count -gt 0)
+    # The parent leaves completed subscriptions out of the slices, so this file
+    # usually lists none of this slice; count only those that are in it.
+    $CompletedInSlice = @($CompletedIds | Where-Object { $SubscriptionIds -contains $_ })
+    if ($CompletedInSlice.Count -gt 0)
     {
-        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedIds.Count) 'DarkGray'
+        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedInSlice.Count) 'DarkGray'
     }
     if ($ResumeFailedOnly -and $FailedAttempts.Count -gt 0)
     {
