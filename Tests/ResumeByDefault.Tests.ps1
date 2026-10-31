@@ -247,7 +247,7 @@ function global:Compress-Archive
     # The automatic stream count is 2 on a host with 4 logical processors.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
     # The warning of a run without -Resume whose first write of the resume state fails ({0}: the tenant).
-    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may use an earlier run''s instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly.'
+    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may continue an earlier run instead. Once the file can be written, start the next run with -Fresh.'
 
     # A fresh home (its InventoryReports folder is the run's inventory root) and
     # scenario for each test.
@@ -606,6 +606,7 @@ Describe 'A run without -Resume continues the unfinished run' -Skip:$IsWindows {
     It 'with -Fresh starts a new run that collects everything again, and the next run starts a new run (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
         script:Invoke-InterruptedRun -Streams $Streams
         $Started = script:Get-StateStartText
+        $EarlierReports = @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Where-Object { $_.FullName -like '*ResourcesReport*' } | ForEach-Object { $_.FullName })
 
         $R1 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams $Streams
         $R1.ExitCode | Should -Be 0
@@ -613,6 +614,7 @@ Describe 'A run without -Resume continues the unfinished run' -Skip:$IsWindows {
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
         $R1.Text | Should -Not -Contain 'Skipping (already completed): Sub A (sub-a)'
         script:Read-State | Should -BeNullOrEmpty
+        foreach ($Path in $EarlierReports) { Test-Path -LiteralPath $Path | Should -BeTrue -Because ('-Fresh does not delete or move {0}' -f $Path) }
 
         $R2 = script:Invoke-Wrapper -Streams $Streams
         $R2.ExitCode | Should -Be 0
@@ -726,6 +728,8 @@ Describe 'The age of the unfinished run' -Skip:$IsWindows {
         script:Invoke-InterruptedRun -Streams 1
         script:Set-StateKeys @{ RunStartedAt = ([datetime]::UtcNow.AddDays(-$Days).ToString('o', [cultureinfo]::InvariantCulture)) }
         $Started = script:Get-StateStartText
+        $EarlierReports = @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Where-Object { $_.FullName -like '*ResourcesReport*' } | ForEach-Object { $_.FullName })
+        $EarlierReports.Count | Should -BeGreaterThan 5 -Because 'the interrupted run wrote the folders and zips of A and B'
         $R = script:Invoke-Wrapper -Arguments $Arguments -Streams 1
         $R.ExitCode | Should -Be 0
         $Continue = 'Continuing the run started {0} (2 of 4 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText
@@ -740,6 +744,8 @@ Describe 'The age of the unfinished run' -Skip:$IsWindows {
             {
                 script:Get-StartLines $R | Should -Be @(('The unfinished run started {0}, more than 7 days ago; starting a new run. Pass -Resume to continue it anyway.' -f $Started))
                 script:Get-Collected $R | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+                # The earlier run's report folders and zips stay on disk.
+                foreach ($Path in $EarlierReports) { Test-Path -LiteralPath $Path | Should -BeTrue -Because ('the new run does not delete or move {0}' -f $Path) }
             }
             'continues with a warning'
             {
@@ -854,6 +860,16 @@ Describe '-ResumeFailedOnly with no unfinished run, and -Fresh with -Resume' -Sk
         script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
     }
 
+    It '-ResumeFailedOnly with a resume state file that is <Case> stops with exit 1 and says the file cannot be read' -ForEach @(@{ Case = 'empty'; Content = '' }, @{ Case = 'not JSON'; Content = '{ cut' }) {
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath $script:State -Value $Content -NoNewline
+        $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. Nothing was collected or written.'
+        script:Get-Collected $R | Should -BeNullOrEmpty
+    }
+
     It '-Fresh with <Other> stops with exit 1 before anything is read or written' -ForEach @(@{ Other = '-Resume' }, @{ Other = '-ResumeFailedOnly' }) {
         script:Invoke-InterruptedRun -Streams 1
         $Before = Get-Content -LiteralPath $script:State -Raw
@@ -956,6 +972,7 @@ Describe 'Resolve-RunStart and its readers' {
         @{ Label = 'old, no switch, other settings'; Info = { script:New-Info -StartedAt $script:Now.AddDays(-9) }; Switches = @{ Obfuscate = $true }; Mode = 'New'; Reason = 'too-old' }
         @{ Label = 'other settings, -ResumeFailedOnly'; Info = { script:New-Info }; Switches = @{ ResumeFailedOnly = $true; SkipMetrics = $true }; Mode = 'Stop'; Reason = 'settings-differ' }
         @{ Label = 'unreadable settings'; Info = { script:New-Info -Settings $null -SettingsProblem 'they are not a JSON object' }; Switches = @{}; Mode = 'Stop'; Reason = 'settings-unreadable' }
+        @{ Label = 'a file that is not the right shape, other settings'; Info = { $I = script:New-Info -Settings $null -SettingsProblem 'they are not recorded'; $I | Add-Member -NotePropertyName ShapeProblem -NotePropertyValue 'FailedAttempts is not a list' -Force; $I }; Switches = @{ Obfuscate = $true }; Mode = 'Continue'; Reason = 'wrong-shape' }
         @{ Label = 'an earlier version''s file, other settings'; Info = { script:New-Info -Legacy -StartedAt $null -Settings $null -SettingsProblem 'they are not recorded' }; Switches = @{ Obfuscate = $true }; Mode = 'Continue'; Reason = 'legacy' }
     ) {
         $Settings = Get-RunDataSettings -Obfuscate ([bool]$Switches.Obfuscate) -SkipMetrics ([bool]$Switches.SkipMetrics)
@@ -1033,5 +1050,100 @@ Describe 'Resolve-RunStart and its readers' {
         # A new run's start-of-run write empties the completed list and its reports.
         Set-ResumeStateRunId -Path $File -Tenant $Tenant -RunId 'run-2' -NewRun
         (Get-Content -LiteralPath $File -Raw | ConvertFrom-Json).CompletedSubscriptionIds | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The next runs after each case, with the exit of every run' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'a subscription past the retry limit: every run that continues ends with exit 2 and names -Fresh; -Fresh collects it' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $Exits = @()
+        # Runs 1 to 3: B fails each time (the third makes it past the limit).
+        foreach ($N in 1, 2, 3) { $Exits += (script:Invoke-Wrapper -Streams 1).ExitCode }
+        $Exits | Should -Be @(2, 2, 2)
+        $Started = script:Get-StateStartText
+        # Runs 4 and 5 continue the same run, skip B and end with exit 2.
+        foreach ($N in 4, 5)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 2
+            script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+            script:Get-Collected $R | Should -BeNullOrEmpty
+            $R.Text | Should -Contain 'Not retried: Sub B (sub-b) failed 3 runs in a row; last reason: stand-in failure for this subscription. To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it.'
+            $R.Text | Should -Contain '  To try them again, start a new run with -Fresh (it collects every subscription again), for example:'
+            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh' -f $script:Tenant)
+            Test-Path -LiteralPath $script:State | Should -BeTrue
+        }
+        # Run 6: -Fresh with B fixed collects both and ends clean; run 7 starts a new run.
+        script:Set-Scenario -Subs 'A', 'B'
+        $R6 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R6.ExitCode | Should -Be 0
+        script:Get-Collected $R6 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        $R7 = script:Invoke-Wrapper -Streams 1
+        $R7.ExitCode | Should -Be 0
+        script:Get-StartLines $R7 | Should -Be @('Starting a new run.')
+    }
+
+    It 'a subscription the signed-in identity cannot read: each run is a new run that skips it and ends with exit 0, with no state kept' {
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        foreach ($N in 1, 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 0
+            script:Get-StartLines $R | Should -Be @('Starting a new run.')
+            script:Get-Collected $R | Should -Be (script:Get-Ids 'A')
+            $R.Text | Should -Contain '  To include them, fix the access as the start of the run says, then re-run.'
+            script:Read-State | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'a run lock left by a killed run stops the next run with exit 1 and the remove command; after it the run continues, and the next run starts a new run' {
+        script:Invoke-InterruptedRun -Streams 1 -KeepLock
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter '.run-lock-*').Count | Should -Be 1
+        $Started = script:Get-StateStartText
+        $Before = Get-Content -LiteralPath $script:State -Raw
+        $R0 = script:Invoke-Wrapper -Streams 1
+        $R0.ExitCode | Should -Be 1
+        @($R0.Text | Where-Object { $_ -like 'ERROR: Another run for tenant * holds the lock on this inventory folder*' }).Count | Should -Be 1
+        @($R0.Text | Where-Object { $_ -like '  That run is no longer running*' }).Count | Should -Be 1
+        script:Get-Collected $R0 | Should -BeNullOrEmpty
+        script:Get-StartLines $R0 | Should -BeNullOrEmpty -Because 'the lock is taken before the resume state is read'
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
+        $Remove = @($R0.Text | Where-Object { $_ -match '^    Remove-Item -LiteralPath ' })
+        $Remove.Count | Should -Be 1
+        & ([scriptblock]::Create($Remove[0].Trim()))
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 0
+        script:Get-StartLines $R1 | Should -Be @(('Continuing the run started {0} (2 of 4 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-StartLines $R2 | Should -Be @('Starting a new run.')
+    }
+
+    It 'two runs at once: the second is refused by the run lock with exit 1 and changes nothing; once the first has ended the next run continues' {
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'C'
+        $script:Second = $null
+        $script:SecondState = $null
+        $EndWhen = {
+            if (-not ((script:Test-Hanging 'C') -and ((script:Get-StateCompleted) -join ',') -eq 'sub-a,sub-b')) { return $false }
+            $script:SecondState = Get-Content -LiteralPath $script:State -Raw
+            $script:Second = script:Invoke-Wrapper -Streams 1
+            return $true
+        }
+        $null = script:Invoke-Wrapper -Streams 1 -EndWhen $EndWhen
+        $script:Second.ExitCode | Should -Be 1
+        script:Get-Collected $script:Second | Should -BeNullOrEmpty
+        script:Get-StartLines $script:Second | Should -BeNullOrEmpty -Because 'the lock is taken before the resume state is read'
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $script:SecondState
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C', 'D')
+        $R4 = script:Invoke-Wrapper -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
     }
 }

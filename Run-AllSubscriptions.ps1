@@ -523,7 +523,9 @@ $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnl
 # written with its new id right before it starts collecting ($NewRunInfo, see
 # $NewRunId below); for a run that continues one whose file lacks them, written
 # before collecting too. Until then every save keeps the ones the file holds.
-$RunInfo = $null
+# A run that continues one whose file records them keeps the stored values as
+# they are, so its saves need not read the file for them.
+$RunInfo = if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'wrong-shape') { $StoredRun.Values } else { $null }
 $NewRunInfo = $null
 
 
@@ -821,7 +823,7 @@ elseif ($ResumeFailedOnly)
 # The start line of a run that continues the unfinished run: when it started,
 # how many of the subscriptions in scope are done and past the retry limit, and
 # its settings (Get-RunContinueLine). A new run said so above.
-if ($RunStart.Mode -eq 'Continue')
+if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape')
 {
     $InScopeIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
     $DoneCount = @($InScopeIds | Where-Object { $CompletedIds -contains $_ }).Count
@@ -970,7 +972,7 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     $SkippedForRetryLimit = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $EligibleIds -contains [string]$_.Id })
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. To try it again, start a run without -Resume or -ResumeFailedOnly." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {
@@ -1079,8 +1081,9 @@ $ConsumptionWindow = Get-ConsumptionWindow
 # at its start, so one consolidated zip has one cost window even when the run
 # is continued on a later day. A file that holds none this run can use (written
 # before runs recorded it, or not two dates) gets today's, recorded for the runs
-# after this one; the line says so.
-if ($RunStart.Mode -eq 'Continue')
+# after this one; the line says so. A file that was not the right shape was
+# moved aside above, and the run uses today's window, as -Resume did.
+if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape')
 {
     if ($null -ne $StoredRun.Window)
     {
@@ -1188,7 +1191,7 @@ $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowArgs.Consumpti
 # every setup stop and before it collects: this run's start time and settings
 # for the first, the window above for the second (the rest kept as stored).
 # Every later save keeps them, so the next run checks against them.
-if ($RunStart.Mode -eq 'Continue' -and ($StoredRun.Legacy -or $null -eq $StoredRun.Window))
+if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape' -and ($StoredRun.Legacy -or $null -eq $StoredRun.Window))
 {
     $RunInfo = [ordered]@{}
     $Fill = New-ResumeRunInfo -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow
@@ -2972,7 +2975,7 @@ if (@($UncarriedSkipped).Count -gt 0)
     {
         Write-Host ("  - {0} ({1}): {2}" -f $U.Name, $U.Id, $U.Reason) -ForegroundColor Red
     }
-    Write-Host "Their reports are NOT in the consolidated zip. Re-run without -Resume to collect every subscription again," -ForegroundColor Red
+    Write-Host "Their reports are NOT in the consolidated zip. Re-run with -Fresh to collect every subscription again," -ForegroundColor Red
     Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
     foreach ($U in @($UncarriedSkipped))
     {

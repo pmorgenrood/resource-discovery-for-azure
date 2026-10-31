@@ -269,7 +269,7 @@ function global:Compress-Archive
     # The automatic stream count is 2 on a host with 4 logical processors.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
     # The warning of a run without -Resume whose first write of the resume state fails ({0}: the tenant).
-    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later -Resume or -ResumeFailedOnly may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may use an earlier run''s instead. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly.'
+    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may continue an earlier run instead. Once the file can be written, start the next run with -Fresh.'
 
     # A fresh home (its InventoryReports folder is the run's inventory root) and
     # scenario for each test.
@@ -1649,7 +1649,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R2.Error | Should -BeNullOrEmpty
         @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
         $Lead = 'WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept: ' -f $script:Tenant
-        $Tail = '. The resume state file does not hold this run''s id, so a later -Resume or -ResumeFailedOnly does not read them and may not see what this run completed or failed. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly.'
+        $Tail = '. The resume state file does not hold this run''s id, so a later run does not read them and may not see what this run completed or failed. Once the file can be written, start the next run with -Fresh.'
         $Lines = @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written or read back*' })
         $Lines.Count | Should -Be 1
         $Lines[0] | Should -BeIn @(($Lead + ($Names[0], $Names[1] -join ', ') + $Tail), ($Lead + ($Names[1], $Names[0] -join ', ') + $Tail))

@@ -286,7 +286,7 @@ function Get-UsageAggregates
     $script:StopAfter = "  This run ends with exit 1 in place of 0 and 3-5; a run that ends with exit 2 (a report is missing) keeps exit 2. It did not use the file's records and did not write over it; the rest of the run above went as usual."
     $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end."
     $script:LaterMain = '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.'
-    $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
+    $script:LaterStream = "  While the file cannot be moved aside, every later run that continues the unfinished run (with or without -Resume, and -ResumeFailedOnly) reads it at its start and stops the same way. A later run that starts a new run (-Fresh) and runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
     # The automatic stream count is 2 on a host with 4 logical processors and
     # more than 5 GB of memory.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
@@ -1680,7 +1680,7 @@ Describe 'Wrapper end to end: a per-stream state file that cannot be read and ca
     BeforeEach {
         script:New-Case
         $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f $script:Tenant
-        $script:LaterUnreadable = '  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.'
+        $script:LaterUnreadable = '  While the file cannot be moved aside, every later run that continues the unfinished run (with or without -Resume, and -ResumeFailedOnly) reads it at its start and stops the same way. A later run that starts a new run (-Fresh) does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.'
     }
     BeforeAll {
         function script:Get-UnreadableStopLines { param($Run) @($Run.Text | Where-Object { $_ -like 'ERROR: The per-stream state file * could not be read, and it could not be moved aside: *' }) }

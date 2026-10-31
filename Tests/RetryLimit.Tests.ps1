@@ -225,7 +225,7 @@ $Global:ResourceCount = 1
     $script:C = [pscustomobject]@{ Id = 'sub-c'; Name = 'Sub C' }
     $script:X = [pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X' }
     $script:Y = [pscustomobject]@{ Id = 'sub-y'; Name = 'Sub Y' }
-    $script:NotRetriedX = 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: stand-in failure for this subscription. To try it again, start a run without -Resume or -ResumeFailedOnly.'
+    $script:NotRetriedX = 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: stand-in failure for this subscription. To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it.'
 
     # A fresh home, inventory root and resume-state path for each test. The root is
     # <home>/InventoryReports, the path the wrapper's sequential catch also uses.
@@ -357,10 +357,10 @@ Describe 'Retry limit on the sequential path' {
         # and the limit would never end the cycle.
         @(script:Get-Lines -Run $Run4 -Like 'Resume state cleared*') | Should -BeNullOrEmpty
         Test-Path -LiteralPath $script:State | Should -BeTrue
-        @(script:Get-Lines -Run $Run4 -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; -Resume and -ResumeFailedOnly do not collect these')
+        @(script:Get-Lines -Run $Run4 -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these')
         @(script:Get-Lines -Run $Run4 -Like '  - Sub X (sub-x):*') | Should -Be @('  - Sub X (sub-x): failed 3 runs in a row; last reason: stand-in failure for this subscription')
-        @(script:Get-Lines -Run $Run4 -Like '  To try them again, start a run without -Resume or -ResumeFailedOnly*') | Should -HaveCount 1
-        @(script:Get-Lines -Run $Run4 -Like '    ./Run-AllSubscriptions.ps1 -TenantID t') | Should -HaveCount 1
+        @(script:Get-Lines -Run $Run4 -Like '  To try them again, start a new run with -Fresh*') | Should -HaveCount 1
+        @(script:Get-Lines -Run $Run4 -Like '    ./Run-AllSubscriptions.ps1 -TenantID t -Fresh') | Should -HaveCount 1
         @(script:Get-Lines -Run $Run4 -Like '*ResourceInventory.ps1*') | Should -BeNullOrEmpty -Because 'a direct run does not change the resume state, so it does not end the skip'
         @(script:Get-Lines -Run $Run4 -Like 'Pending Retries:*') | Should -BeNullOrEmpty -Because '-ResumeFailedOnly would not retry it'
         $Run4.Result.WrapperExitCode | Should -Be 2
@@ -382,9 +382,9 @@ Describe 'Retry limit on the sequential path' {
         $Clear = @($Run3.Result.RunSummary)
         $Obf = @((script:Invoke-Run -Subs $Subs -Resume -Obfuscate).Result.RunSummary)
 
-        @($Clear | Where-Object { $_ -like '  Retry limit reached*' }) | Should -Be @('  Retry limit reached : 1 (incomplete; -Resume and -ResumeFailedOnly do not collect these)')
+        @($Clear | Where-Object { $_ -like '  Retry limit reached*' }) | Should -Be @('  Retry limit reached : 1 (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these)')
         @($Clear | Where-Object { $_ -like '  - Sub X (sub-x):*' }) | Should -Be @('  - Sub X (sub-x): failed 3 runs in a row; last reason: stand-in failure for this subscription')
-        @($Obf | Where-Object { $_ -like '  Retry limit reached*' }) | Should -Be @('  Retry limit reached : 1 (incomplete; -Resume and -ResumeFailedOnly do not collect these)')
+        @($Obf | Where-Object { $_ -like '  Retry limit reached*' }) | Should -Be @('  Retry limit reached : 1 (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these)')
         ($Obf -join "`n") | Should -Not -Match 'sub-x|Sub X|stand-in failure'
     }
 
@@ -446,11 +446,11 @@ Describe 'Following the retry-limit advice' {
         # The advice: the start-up line and the end-of-run command.
         $Advice = @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x)*')
         $Advice | Should -HaveCount 1
-        $Advice[0] | Should -BeLike '*To try it again, start a run without -Resume or -ResumeFailedOnly.'
+        $Advice[0] | Should -BeLike '*To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it.'
         $Command = @(script:Get-Lines -Run $Run4 -Like '    ./Run-AllSubscriptions.ps1 *')
         $Command | Should -HaveCount 1
         $Command[0] | Should -Not -Match '-Resume'
-        @($Run4.Result.RunSummary | Where-Object { $_ -like 'Retry limit reached (detail;*' }) | Should -Be @('Retry limit reached (detail; to try them again, start a run without -Resume or -ResumeFailedOnly):')
+        @($Run4.Result.RunSummary | Where-Object { $_ -like 'Retry limit reached (detail;*' }) | Should -Be @('Retry limit reached (detail; to try them again, start a new run with -Fresh):')
 
         # The cause is gone. Follow the advice: the same run without -Resume.
         $Global:RdaRlFailIds = @()
@@ -683,9 +683,9 @@ Describe 'A subscription past the retry limit that is outside the run''s subscri
             @($R.Calls) | Should -Not -Contain 'sub-x'
             $R.ExitCode | Should -BeNullOrEmpty
             $R.Result.WrapperExitCode | Should -Be 2 -Because 'Retry Limit Reached lists Sub X as incomplete, so its report is missing'
-            @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; -Resume and -ResumeFailedOnly do not collect these')
-            @(script:Get-Lines -Run $R -Like '  To try them again*') | Should -Be @('  To try them again, start a run without -Resume or -ResumeFailedOnly; Sub X is not Enabled, so add -IncludeDisabled, for example:')
-            @(script:Get-Lines -Run $R -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t -IncludeDisabled')
+            @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these')
+            @(script:Get-Lines -Run $R -Like '  To try them again*') | Should -Be @('  To try them again, start a new run with -Fresh; Sub X is not Enabled, so add -IncludeDisabled, for example:')
+            @(script:Get-Lines -Run $R -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t -Fresh -IncludeDisabled')
             Test-Path -LiteralPath $script:State | Should -BeTrue
             [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
         }
@@ -827,10 +827,10 @@ Describe 'A subscription past the retry limit that is no longer listed' {
         @(script:Get-Lines -Run $R1 -Like 'Kept on the retry list:*') | Should -Be @('Kept on the retry list: 1 subscription(s) not in the subscription list (Sub X (sub-x)), because Get-AzSubscription returned warnings or errors, so the list may be incomplete:')
         @(script:Get-Lines -Run $R1 -Like '  - stand-in:*') | Should -Be @('  - stand-in: unable to acquire a token for part of the tenant')
         @(script:Get-Lines -Run $R1 -Like 'Dropped from the retry list:*') | Should -BeNullOrEmpty
-        @(script:Get-Lines -Run $R1 -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; -Resume and -ResumeFailedOnly do not collect these')
+        @(script:Get-Lines -Run $R1 -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these')
         @(script:Get-Lines -Run $R1 -Like '  Sub X is not in the subscription list*') | Should -Be @("  Sub X is not in the subscription list, which came back with warnings or errors (printed at the start of the run). Fix those until 'Get-AzSubscription -TenantId t' lists the tenant without them, then run again: the run drops a subscription that is gone from the retry list, and collects one that is listed again, for example:")
         @(script:Get-Lines -Run $R1 -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t')
-        @(script:Get-Lines -Run $R1 -Like '*start a run without -Resume or -ResumeFailedOnly*') | Should -BeNullOrEmpty -Because 'that run alone would leave it as it is while the listing warns'
+        @(script:Get-Lines -Run $R1 -Like '*start a new run with -Fresh*') | Should -BeNullOrEmpty -Because 'a new run alone would leave it as it is while the listing warns'
         $R1.Result.WrapperExitCode | Should -Be 2 -Because 'its report is missing and its entry is kept'
         Test-Path -LiteralPath $script:State | Should -BeTrue
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3

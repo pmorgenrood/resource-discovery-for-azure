@@ -233,7 +233,9 @@ Describe 'Sequential run: the resume state keeps one id per completed subscripti
         @{ TenantID = 't'; CompletedSubscriptionIds = @($null); FailedAttempts = @($Failed); LastUpdated = (Get-Date).ToString('o') } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t.json') -Encoding utf8
         $R = script:Invoke-Wrapper -Block $script:SequentialRun -Root $script:Root -Subs @($script:A) -Resume $true
-        script:Get-ResumeLine -Text $R.Text | Should -Be 'Resume mode: no previous state found; processing all subscriptions.'
+        # A state file is there, so 'no previous state found' is not printed; the
+        # wrapper's start line (outside this block) says 0 subscriptions are done.
+        script:Get-ResumeLine -Text $R.Text | Should -Be ''
         $R.Processed | Should -Be 'Sub A'
         script:Get-StateIds -Root $script:Root | Should -Be '1 id(s): Sub A'
     }
@@ -254,7 +256,8 @@ Describe 'Other places that add to the completed list, starting from one earlier
     }
 
     It 'the one-subscription fallback of -ParallelStreams adds its subscription as a separate id' {
-        $R = script:Invoke-Wrapper -Block $script:FallbackRun -Root $script:Root -Subs @($script:B)
+        # A run that continues the earlier run (a new run starts from an empty list).
+        $R = script:Invoke-Wrapper -Block $script:FallbackRun -Root $script:Root -Subs @($script:B) -Resume $true
         $R.Processed | Should -Be 'Sub B'
         script:Get-StateIds -Root $script:Root | Should -Be '2 id(s): Sub A, Sub B'
     }

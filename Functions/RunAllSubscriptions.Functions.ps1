@@ -639,11 +639,11 @@ function Stop-WrongShapeStateNotMoved
         # Only per-stream files that cannot be read: the startup fold of
         # -Resume and -ResumeFailedOnly reads them, and the end-of-run merge of
         # a run with more than one stream.
-        Write-Host '  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.' -ForegroundColor Yellow
+        Write-Host '  While the file cannot be moved aside, every later run that continues the unfinished run (with or without -Resume, and -ResumeFailedOnly) reads it at its start and stops the same way. A later run that starts a new run (-Fresh) does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.' -ForegroundColor Yellow
     }
     else
     {
-        Write-Host "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
+        Write-Host "  While the file cannot be moved aside, every later run that continues the unfinished run (with or without -Resume, and -ResumeFailedOnly) reads it at its start and stops the same way. A later run that starts a new run (-Fresh) and runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end." -ForegroundColor Yellow
     }
     $Lead = if ($Files.Count -gt 1) { '  Once the cause shown above is fixed, remove the files with these commands:' } else { '  Once the cause shown above is fixed, remove the file with this command:' }
     Write-Host $Lead -ForegroundColor Yellow
@@ -1207,18 +1207,26 @@ function Get-ResumeStateRunInfoValues
 # was written before runs recorded them). StartedAt (UTC) or StartedAtProblem;
 # Settings (by Get-RunDataSettingNames) or SettingsProblem; Window (as
 # Get-ConsumptionWindow returns it) or WindowProblem. Values: the four keys as
-# stored. Reads nothing else from the file.
+# stored. Present: a file is at the path, whether or not it can be read.
+# Reads nothing else from the file.
 function Read-ResumeRunInfo
 {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Tenant)
-    $Info = [pscustomobject]@{ Exists = $false; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
+    $Info = [pscustomobject]@{ Present = (Test-Path -LiteralPath $Path -PathType Leaf); Exists = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
     try { $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
     catch { return $Info }
     if ($State -isnot [System.Management.Automation.PSCustomObject]) { return $Info }
     $TenantProp = $State.PSObject.Properties['TenantID']
     if ($null -eq $TenantProp -or [string]$TenantProp.Value -ne $Tenant) { return $Info }
     $Info.Exists = $true
-    $Info.Values = Get-ResumeStateRunInfoValues -Path $Path -Tenant $Tenant
+    # A file that is not the right shape is moved aside later in the run
+    # (Move-WrongShapeResumeStateFile); the run continues as -Resume does then.
+    $Info.ShapeProblem = Get-ResumeStateShapeProblem -Record $State -Kind Main
+    foreach ($Key in @(Get-ResumeRunInfoKeys))
+    {
+        $Prop = $State.PSObject.Properties[$Key]
+        if ($null -ne $Prop) { $Info.Values[$Key] = $Prop.Value }
+    }
 
     $StartProp = $State.PSObject.Properties['RunStartedAt']
     $SettingsProp = $State.PSObject.Properties['RunSettings']
@@ -1270,6 +1278,8 @@ function Read-ResumeRunInfo
 #   -Fresh with -Resume or -ResumeFailedOnly: Stop.
 #   No unfinished run: New; with -ResumeFailedOnly, Stop (there is no retry list).
 #   -Fresh: New.
+#   A file that is not the right shape: Continue (it is moved aside later, as
+#     for -Resume).
 #   A file from before runs recorded their start time and settings: Continue
 #     (neither can be checked; the start line says so).
 #   The age, before the settings: the run started more than -MaxAgeDays ago,
@@ -1309,7 +1319,8 @@ function Resolve-RunStart
     {
         if ($ResumeFailedOnly)
         {
-            & $Say 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. Nothing was collected or written.' 'Red'
+            $Why = if ($Info.Present) { 'The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant)' } else { 'No resume state file for this tenant is in the inventory folder' }
+            & $Say ('ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. {0}, so there is no retry list. Nothing was collected or written.' -f $Why) 'Red'
             & $Say '  Next: run the same command without -ResumeFailedOnly. It starts a new run that collects every subscription.' 'Yellow'
             return (& $Decide 'Stop' 'nothing-to-retry' 1)
         }
@@ -1328,6 +1339,9 @@ function Resolve-RunStart
         & $Say ('Starting a new run (-Fresh). The unfinished run {0} is not continued: this run collects every subscription again.' -f $Which)
         return (& $Decide 'New' 'fresh')
     }
+    # Not the right shape: the run continues as -Resume does, and the shape check
+    # moves the file aside and says what the run uses instead.
+    if ($null -ne $Info.ShapeProblem) { return (& $Decide 'Continue' 'wrong-shape') }
     if ($Info.Legacy)
     {
         & $Say 'The resume state file was written by an earlier version, which did not record when its run started or with which settings, so this run cannot check either. It continues that run, as -Resume does, and records its own start time and settings in the file once it starts collecting.' 'Yellow'
@@ -1930,7 +1944,7 @@ function Invoke-FoldedStreamStateCleanup
         }
         else
         {
-            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept: {2}. The resume state file does not hold this run's id, so a later -Resume or -ResumeFailedOnly does not read them and may not see what this run completed or failed. Once the file can be written, start the next run without -Resume or -ResumeFailedOnly." -f $StateName, $Source, $Names) -ForegroundColor Yellow
+            Write-Host ("WARNING: The resume state file {0} could not be written or read back with every record of the per-stream state files {1}, so they are kept: {2}. The resume state file does not hold this run's id, so a later run does not read them and may not see what this run completed or failed. Once the file can be written, start the next run with -Fresh." -f $StateName, $Source, $Names) -ForegroundColor Yellow
         }
         return @($Left | ForEach-Object { $_.FullName })
     }
@@ -2084,8 +2098,9 @@ function Get-FailedAttemptCount
 }
 
 # The retry-list entries of the subscriptions that failed $RetryLimit runs in a
-# row. -Resume and -ResumeFailedOnly do not collect these; a run without either
-# still does, and only such a run takes them off the retry list.
+# row. A run that continues the unfinished run (with or without -Resume) and
+# -ResumeFailedOnly do not collect these; a new run (-Fresh, or one past
+# -ResumeMaxAgeDays) still does, and only such a run takes them off the retry list.
 function Get-RetryLimitedAttempts
 {
     param([object]$FailedAttempts)
@@ -2101,7 +2116,7 @@ function Write-RetryLimitSummary
     param([object]$RetryLimited, [string]$TenantID, [string[]]$ExcludedIds = @(), [string[]]$NotListedIds = @())
     $List = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     if ($List.Count -eq 0) { return }
-    Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; -Resume and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
     foreach ($Entry in $List)
     {
         Write-Host ("  - {0} ({1}): failed {2} runs in a row; last reason: {3}" -f $Entry.Name, $Entry.Id, (Get-FailedAttemptCount -Entry $Entry), $Entry.Reason) -ForegroundColor Yellow
@@ -2123,12 +2138,12 @@ function Write-RetryLimitSummary
     $NotEnabled = @($List | Where-Object { @($ExcludedIds) -contains [string]$_.Id })
     if ($NotEnabled.Count -gt 0)
     {
-        Write-Host ("  To try them again, start a run without -Resume or -ResumeFailedOnly; {0} not Enabled, so add -IncludeDisabled, for example:" -f ((@($NotEnabled | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotEnabled.Count -eq 1) { ' is' } else { ' are' }))) -ForegroundColor Yellow
-        Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -IncludeDisabled" -f $TenantID) -ForegroundColor Yellow
+        Write-Host ("  To try them again, start a new run with -Fresh; {0} not Enabled, so add -IncludeDisabled, for example:" -f ((@($NotEnabled | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotEnabled.Count -eq 1) { ' is' } else { ' are' }))) -ForegroundColor Yellow
+        Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -IncludeDisabled" -f $TenantID) -ForegroundColor Yellow
         return
     }
-    Write-Host "  To try them again, start a run without -Resume or -ResumeFailedOnly (it collects every subscription), for example:" -ForegroundColor Yellow
-    Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0}" -f $TenantID) -ForegroundColor Yellow
+    Write-Host "  To try them again, start a new run with -Fresh (it collects every subscription again), for example:" -ForegroundColor Yellow
+    Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh" -f $TenantID) -ForegroundColor Yellow
 }
 
 # The resume-state record for one completed subscription's report zip:
@@ -4067,7 +4082,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Skipped   : {0} (already completed / resume)' -f $Skipped))
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
-    $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
+    $Lines.Add(('  Retry limit reached : {0} (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
@@ -4095,7 +4110,7 @@ function Get-RunSummaryLogContent
         if ($Limited.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Retry limit reached (detail; to try them again, start a run without -Resume or -ResumeFailedOnly):')
+            $Lines.Add('Retry limit reached (detail; to try them again, start a new run with -Fresh):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
         }
         if ($NoAccess.Count -gt 0)

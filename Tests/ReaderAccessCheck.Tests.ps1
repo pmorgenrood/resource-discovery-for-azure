@@ -2138,11 +2138,11 @@ exit 1
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
     }
 
-    It 'without -Resume still stops with exit 1 when none is readable, although the state records a completed subscription' {
+    It 'a new run (-Fresh) still stops with exit 1 when none is readable, although the state records a completed subscription' {
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -EndSession $script:SubX.Id
         $null = script:Invoke-WrapperRun
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubA.Id, $script:SubX.Id
-        $R = script:Invoke-WrapperRun
+        $R = script:Invoke-WrapperRun -Arguments '-Fresh'
         $R.ExitCode | Should -Be 1
         $R.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
         @($R.Text | Where-Object { $_ -match 'Resume again|without -Resume' }) | Should -BeNullOrEmpty
@@ -2162,8 +2162,8 @@ exit 1
         $R.Text | Should -Contain '  A run without -Resume checks the same subscriptions, so it stops here too.'
         (script:Read-WrapperState).Failed | Should -Be @($script:SubB.Id)
 
-        # As the message says, a run without -Resume stops the same way.
-        $Fresh = script:Invoke-WrapperRun
+        # A new run (-Fresh) checks the same subscriptions and stops the same way.
+        $Fresh = script:Invoke-WrapperRun -Arguments '-Fresh'
         $Fresh.ExitCode | Should -Be 1
         $Fresh.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
 
