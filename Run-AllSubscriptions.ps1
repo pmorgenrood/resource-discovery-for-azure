@@ -312,6 +312,9 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
     exit 1
 }
 . $FunctionsFile
+# Read while this is still the top of the call stack: whether a Ctrl+C stop may
+# set the exit code of this pwsh process (see Test-WrapperOwnsProcessExit).
+$WrapperOwnsProcessExit = Test-WrapperOwnsProcessExit -IsStartupScript (@(Get-PSCallStack).Count -eq 1) -ScriptPath $PSCommandPath -ProcessArguments ([Environment]::GetCommandLineArgs())
 
 # Shared cross-cutting helpers (Write-RdaProgress). Same dot-source pattern.
 $CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
@@ -1169,6 +1172,9 @@ if ($ParallelStreams -le 1)
 
         Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
 
+        # Set at the end of the try and at the start of the catch. When the
+        # finally finds it unset, the try was stopped by Ctrl+C.
+        $SubscriptionHandled = $false
         try
         {
             # Cleared first so a stale path from the previous subscription is never recorded as this one's.
@@ -1264,9 +1270,11 @@ if ($ParallelStreams -le 1)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
+            $SubscriptionHandled = $true
         }
         catch
         {
+            $SubscriptionHandled = $true
             # Surface the full exception chain so failures (e.g. report/JSON write
             # errors, OOM in long CloudShell runs, file-handle leaks) are
             # diagnosable instead of being summarised to a single line. See #16.
@@ -1362,6 +1370,10 @@ if ($ParallelStreams -le 1)
                 -Reason $ErrRecord.Exception.Message
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         }
+        finally
+        {
+            if (-not $SubscriptionHandled) { Exit-WrapperInterrupted -InventoryRoot $InventoryRoot -OwnsProcessExit $WrapperOwnsProcessExit }
+        }
 
         Write-Host "-----------------------------------" -ForegroundColor Gray
     }
@@ -1453,6 +1465,8 @@ else
         {
             $Sub = $PendingSubscriptions[0]
             Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
+            # Same Ctrl+C check as the sequential branch above.
+            $SubscriptionHandled = $false
             try
             {
                 # Cleared first so a stale path is never recorded as this subscription's zip.
@@ -1509,9 +1523,11 @@ else
                     # Already recorded as completed: still save, so this run's zip replaces the earlier one.
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
+                $SubscriptionHandled = $true
             }
             catch
             {
+                $SubscriptionHandled = $true
                 # Match the sequential branch's diagnostic detail so users do not
                 # get a degraded error report when -ParallelStreams collapses to a
                 # single subscription. Mirrors the catch handler around line 615.
@@ -1547,6 +1563,10 @@ else
                     -Reason $ErrRecord.Exception.Message
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             }
+            finally
+            {
+                if (-not $SubscriptionHandled) { Exit-WrapperInterrupted -InventoryRoot $InventoryRoot -OwnsProcessExit $WrapperOwnsProcessExit }
+            }
         }
         # Skip the parallel orchestration entirely; fall through to the
         # post-processing (consolidation, summary) below.
@@ -1580,6 +1600,12 @@ else
         $AzContextSnapshots = @()
         $SnapshotContent = $null
         $SnapshotsOwnerOnly = $true
+        # The finally reads these to tell a Ctrl+C while the streams run (exit
+        # 130) from an error (rethrown as before) and from the end of the
+        # streams (the cleanup only).
+        $StreamsStarted = $false
+        $StreamsFinished = $false
+        $OrchestrationError = $null
         try
         {
             $WorkerScript = Join-Path $PSScriptRoot 'Run-AllSubscriptions.Stream.ps1'
@@ -1589,6 +1615,7 @@ else
                 Write-Host "Make sure Run-AllSubscriptions.Stream.ps1 is present alongside Run-AllSubscriptions.ps1, or re-run without -ParallelStreams." -ForegroundColor Yellow
                 Exit-Wrapper -Code 1
             }
+            $StreamsStarted = $true
 
             # The new run id, after the Az context snapshot and the worker
             # check, right before the streams start (see $NewRunId above).
@@ -1726,6 +1753,7 @@ else
             }
             # Drain anything still buffered after all jobs reached terminal state.
             $Jobs | Receive-Job
+            $StreamsFinished = $true
 
             # Capture exit codes and any errors from the jobs themselves before removing.
             foreach ($j in $Jobs)
@@ -2029,6 +2057,11 @@ else
             $FoldedStreamFiles = @()
             $FoldedRecordIds = @()
         }
+        catch
+        {
+            $OrchestrationError = $_
+            throw
+        }
         finally
         {
             # Unconditional cleanup of the Az context snapshots and background jobs.
@@ -2072,6 +2105,20 @@ else
                 {
                     Write-Host ("WARNING: could not fully clean up background jobs: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
                 }
+            }
+
+            # 3. A Ctrl+C while the streams ran: the jobs are stopped and the
+            # snapshots are gone, so end with exit 130. Each stream's resume
+            # state stays on disk for -Resume, and Exit-Wrapper releases the
+            # run lock. The per-stream state files this run folded in at
+            # startup are not deleted on the way out: the streams have written
+            # what they collected into those same files, which the resume
+            # state file does not hold until the end-of-run merge.
+            if ($StreamsStarted -and -not $StreamsFinished -and $null -eq $OrchestrationError)
+            {
+                $FoldedStreamFiles = @()
+                $FoldedRecordIds = @()
+                Exit-WrapperInterrupted -InventoryRoot $InventoryRoot -OwnsProcessExit $WrapperOwnsProcessExit
             }
         }
     }

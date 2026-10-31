@@ -25,6 +25,9 @@
 function Exit-Wrapper
 {
     param([int]$Code = 0)
+    # An exit runs the finally blocks it leaves; one of them may call
+    # Exit-WrapperInterrupted, which then lets this exit keep its code.
+    $script:WrapperExiting = $true
     # Every early exit of the wrapper passes here, and the resume state is kept
     # at each of them. The per-stream state files the run folded in at startup
     # are deleted first, once the resume state holds their records
@@ -54,6 +57,70 @@ function Exit-Wrapper
         catch { Write-Verbose ("Stop-Transcript on Exit-Wrapper failed: {0}" -f $_.Exception.Message) }
     }
     exit $Code
+}
+
+# Whether a run stopped by Ctrl+C may set the exit code of its pwsh process,
+# which ends that process once the script returns. A plain `exit 130` is not
+# enough under `pwsh -File`: after a Ctrl+C, PowerShell exits 0 for an advanced
+# script (this one has [Parameter()] attributes). Setting the process's code
+# would close a session, so it is done only when the wrapper is the process's
+# startup script (-File, or the script path as pwsh's first value, which pwsh
+# takes as -File) and pwsh was not given -NoExit. -NoExit counts in every form
+# pwsh might take, so anything that could be it keeps the run as in a session:
+# any argument before the script path that starts with 'noe' once leading '-',
+# '/' and dash characters are removed, in any case (pwsh documents -NoExit and
+# -noe). The arguments are read here only; they are never printed or logged.
+# Returns $false for anything it cannot read, and when the script path is not
+# among the arguments (for example under Start-Job -FilePath, whose job process
+# is started without it).
+function Test-WrapperOwnsProcessExit
+{
+    param([bool]$IsStartupScript, [string]$ScriptPath, [object]$ProcessArguments)
+    if (-not $IsStartupScript -or [string]::IsNullOrWhiteSpace($ScriptPath)) { return $false }
+    try
+    {
+        $Arguments = @($ProcessArguments)
+        foreach ($Argument in @($Arguments | Select-Object -Skip 1))
+        {
+            $Text = [string]$Argument
+            if (-not [string]::IsNullOrWhiteSpace($Text))
+            {
+                $IsScript = $false
+                try { $IsScript = [string]::Equals([System.IO.Path]::GetFullPath($Text), $ScriptPath, [System.StringComparison]::OrdinalIgnoreCase) }
+                catch { $IsScript = $false }
+                # Everything after the script path is the script's own.
+                if ($IsScript) { return $true }
+            }
+            $Key = $Text.Trim().TrimStart([char]'-', [char]'/', [char]0x2013, [char]0x2014, [char]0x2015)
+            if ($Key -like 'noe*') { return $false }
+        }
+        return $false
+    }
+    catch
+    {
+        return $false
+    }
+}
+
+# Ends a run stopped by Ctrl+C before every subscription was processed: one
+# line, then exit 130 (128 + SIGINT, the code a shell reports for a command
+# stopped by Ctrl+C), so a scheduler or a script does not read the stop as a
+# clean run. A run started with `pwsh -File` (without -NoExit) gets 130 as the
+# process's exit code (Test-WrapperOwnsProcessExit). A run started inside a
+# PowerShell session, or by `pwsh -NoExit -File`, goes back to the prompt with
+# $LASTEXITCODE 130 and the session stays open. A `pwsh -Command` run ends
+# with PowerShell's own code for a stopped command, 1. The caller runs this
+# last in a finally block, after its own cleanup; the resume state written so
+# far is left as it is.
+function Exit-WrapperInterrupted
+{
+    param([string]$InventoryRoot, [bool]$OwnsProcessExit)
+    if (Get-Variable -Name 'WrapperExiting' -Scope Script -ValueOnly -ErrorAction SilentlyContinue) { return }
+    Write-Host ("Interrupted (Ctrl+C) before all subscriptions were processed. The resume state is kept in {0}; to continue, run the same command again with -Resume." -f $InventoryRoot) -ForegroundColor Yellow
+    # Only marks the code: the process ends once the script has returned, so
+    # Exit-Wrapper's clean-up still runs.
+    if ($OwnsProcessExit) { $Host.SetShouldExit(130) }
+    Exit-Wrapper -Code 130
 }
 
 # Auto-tune parallelism to the current host. Detects logical CPU count and total
