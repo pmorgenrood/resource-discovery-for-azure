@@ -495,7 +495,7 @@ function Move-WrongShapeResumeStateFile
         $NotMoved = [pscustomobject]@{ Kind = $Kind; Name = $Name; MovedTo = $null; Path = $Path; Problem = $Problem; Reason = $_.Exception.Message; NotMoved = $true }
         if (-not $AfterCollection) { Stop-WrongShapeStateNotMoved -Files @($NotMoved) -ResumeFailedOnly:$ResumeFailedOnly }
         Write-WrongShapeNotMovedLine -File $NotMoved
-        Write-Host "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end." -ForegroundColor Red
+        Write-Host "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end." -ForegroundColor Red
         return $NotMoved
     }
     Write-Host ('WARNING: The {0} {1} is not the right shape ({2}), so its records are not used. It was moved aside to {3}, kept for inspection; no run reads it again.' -f $What, $Name, $Problem, $MovedTo) -ForegroundColor Yellow
@@ -538,13 +538,16 @@ function Stop-WrongShapeStateNotMoved
     param(
         [Parameter(Mandatory = $true)][object[]]$Files,
         [switch]$AfterCollection,
-        [switch]$ResumeFailedOnly
+        [switch]$ResumeFailedOnly,
+        # Print the stop and return: the caller ends the run with its exit code
+        # (after collection, exit 2 keeps its code over this stop).
+        [switch]$NoExit
     )
     $Files = @($Files | Where-Object { $null -ne $_ })
     foreach ($File in $Files) { Write-WrongShapeNotMovedLine -File $File }
     if ($AfterCollection)
     {
-        Write-Host "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual." -ForegroundColor Red
+        Write-Host "  This run ends with exit 1 in place of 0 and 3-5; a run that ends with exit 2 (a report is missing) keeps exit 2. It did not use the file's records and did not write over it; the rest of the run above went as usual." -ForegroundColor Red
     }
     else
     {
@@ -572,6 +575,7 @@ function Stop-WrongShapeStateNotMoved
     {
         Write-Host '  Then run the same command again.' -ForegroundColor Yellow
     }
+    if ($NoExit) { return }
     Exit-Wrapper -Code 1
 }
 

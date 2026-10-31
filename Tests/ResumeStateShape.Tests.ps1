@@ -283,8 +283,8 @@ function Get-UsageAggregates
     }
     # The lines a run prints when a wrong-shaped file cannot be moved aside.
     $script:StopStart = "  This run stops here (exit 1), before it collects any subscription or writes any resume state. It does not use the file's records and does not write over it."
-    $script:StopAfter = "  This run ends with exit 1, in place of the code it would otherwise end with. It did not use the file's records and did not write over it; the rest of the run above went as usual."
-    $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1, with what to do next at its end."
+    $script:StopAfter = "  This run ends with exit 1 in place of 0 and 3-5; a run that ends with exit 2 (a report is missing) keeps exit 2. It did not use the file's records and did not write over it; the rest of the run above went as usual."
+    $script:MergeNotice = "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end."
     $script:LaterMain = '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.'
     $script:LaterStream = "  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch that runs one stream does not use it and leaves it as it is. One that runs more streams (set by -ParallelStreams, or chosen for this host when it is not given) stops the same way, at its start when one of its streams has this file's number and otherwise at its end."
     # The automatic stream count is 2 on a host with 4 logical processors and
@@ -1431,15 +1431,16 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
     }
 
-    It 'a stale per-stream file found by the end-of-run merge (<Label>): the run builds its zip, main summary and end-of-run summary first, every collected report once in the zip, then ends with exit 1; after the printed command the same command ends clean' -ForEach @(
-        @{ Label = 'every subscription collected'; Fail = @(); InZip = @('A', 'B', 'C') },
-        @{ Label = 'Sub B failing'; Fail = @('B'); InZip = @('A', 'C') }
+    It 'a stale per-stream file found by the end-of-run merge (<Label>): the run builds its zip, main summary and end-of-run summary first, every collected report once in the zip, then ends with exit <ExitCode>; after the printed command the same command ends clean' -ForEach @(
+        @{ Label = 'every subscription collected'; Fail = @(); InZip = @('A', 'B', 'C'); ExitCode = 1 },
+        # A failed subscription is exit 2, which keeps its code over the stop.
+        @{ Label = 'Sub B failing'; Fail = @('B'); InZip = @('A', 'C'); ExitCode = 2 }
     ) {
         script:Set-Scenario -RenameRefused $script:Stream5Name -Fail $Fail
         $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
         $Stale = Join-Path $script:Root $script:Stream5Name
         $R1 = script:Invoke-Wrapper -Streams 2
-        $R1.ExitCode | Should -Be 1
+        $R1.ExitCode | Should -Be $ExitCode
         $R1.Error | Should -BeNullOrEmpty
         # At the merge: the notice; the file left alone.
         @(script:Get-StopLines $R1).Count | Should -Be 2
@@ -1489,19 +1490,40 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         @(script:Get-ZipEntries | Where-Object { $_.Zip -eq $Newest[0].Name -and $_.Name -like 'ResourcesReport_*.zip' } | ForEach-Object { $_.Name -replace '^.*(sub-[a-z])\.zip$', '$1' } | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B', 'C')
     }
 
-    It 'the end-of-run stop exits 1 in place of the code the run would otherwise end with (2 here, a missing zip)' {
+    It 'the end-of-run stop keeps exit 2 when a report is missing; the next -Resume stops at its start with exit 1, and after the printed command the run ends clean' {
         script:Set-Scenario -NoZip 'B'
         $Control = script:Invoke-Wrapper -Streams 2
         $Control.ExitCode | Should -Be 2
         script:New-Case
-        script:Set-Scenario -NoZip 'B' -RenameRefused ('.resume-state-{0}-stream-5.json' -f $script:Tenant)
+        $StaleName = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+        script:Set-Scenario -NoZip 'B' -RenameRefused $StaleName
         $null = script:Write-StreamText -Text '{"Completed": ["sub-a"], "FailedAttempts": "garbage"}' -StreamId 5
+        $Stale = Join-Path $script:Root $StaleName
+        # Run 1: a report is missing, so exit 2 keeps its code; the stop still
+        # names the file and the command that removes it.
         $R = script:Invoke-Wrapper -Streams 2
-        $R.ExitCode | Should -Be 1
+        $R.ExitCode | Should -Be 2
         $R.Text | Should -Contain $script:MergeNotice
         $R.Text | Should -Contain 'ERROR: Per-subscription output verification failed.'
         $R.Text | Should -Contain $script:StopAfter
         $R.Text | Should -Contain $script:ThenSame
+        @(script:Get-RemoveCommand $R).Count | Should -Be 1
+        Test-Path -LiteralPath $Stale | Should -BeTrue
+        # Run 2: a -Resume reads the file at its start and stops there with exit 1,
+        # before it collects anything.
+        $CallsBefore = @(script:Get-Calls).Count
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R2.ExitCode | Should -Be 1
+        @(script:Get-StopLines $R2).Count | Should -Be 1
+        @(script:Get-Calls).Count | Should -Be $CallsBefore
+        # Run 3: the cause gone, the printed command, then the same -Resume: it
+        # collects the subscription whose report was missing and ends clean.
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R2)[0])
+        Test-Path -LiteralPath $Stale | Should -BeFalse
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R3.ExitCode | Should -Be 0
+        script:Test-CleanLine $R3 | Should -BeTrue
     }
 }
 

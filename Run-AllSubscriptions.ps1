@@ -2151,7 +2151,9 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
-        if ($StreamStateNotMoved.Count -gt 0) { Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly }
+        # A report is missing, so exit 2 keeps its code over a per-stream state
+        # file the merge could not move aside; the stop still names that file.
+        if ($StreamStateNotMoved.Count -gt 0) { Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -NoExit -ResumeFailedOnly:$ResumeFailedOnly }
         Exit-Wrapper -Code 2
     }
     if ($UncarriedSkipped.Count -gt 0)
@@ -2817,10 +2819,11 @@ if (@($UncarriedSkipped).Count -gt 0)
 }
 
 # A per-stream state file the end-of-run merge could not move aside: the run
-# above is finished; it ends here with exit 1 and says what to do.
+# above is finished; the stop says what to do, and the exit code is set below
+# (exit 1 in place of 0 and 3-5; exit 2 keeps its code).
 if ($StreamStateNotMoved.Count -gt 0)
 {
-    Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
+    Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -NoExit -ResumeFailedOnly:$ResumeFailedOnly
 }
 
 # Release this run's lock before the transcript stops. Exit-Wrapper does the
@@ -2845,6 +2848,14 @@ if ($null -ne $BundleBuildError)
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
 $WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
+# A per-stream state file the merge could not move aside stops the next run at
+# its start: exit 1, in place of 0 and 3-5, so a caller acts on it. Exit 2
+# (reports missing or subscriptions failed) keeps its code; the stop above
+# names the file either way.
+if ($StreamStateNotMoved.Count -gt 0 -and $WrapperExitCode -ne 2)
+{
+    exit 1
+}
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode
