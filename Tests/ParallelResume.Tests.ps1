@@ -115,6 +115,19 @@ if (@($Scenario.ReadOnlyAfterIds) -contains $SubscriptionID)
     while (@($Scenario.ReadOnlyAfterIds | Where-Object { -not (Test-Path -LiteralPath (Join-Path $HOME ('ro-' + $_))) }).Count -gt 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
     if (@($Scenario.ReadOnlyAfterIds)[0] -eq $SubscriptionID) { & chmod 555 $Root }
 }
+# After the report of this subscription is written, the state file of another
+# stream is cut short (or emptied) once that stream has finished, so the
+# end-of-run merge finds it unreadable.
+if ($Scenario.CutStreamFile -and $Scenario.CutStreamFile.AfterId -eq $SubscriptionID)
+{
+    $Cut = $Scenario.CutStreamFile
+    $Done = Join-Path $Root ('.rda-stream-{0}-summary.json' -f $Cut.Stream)
+    $Deadline = (Get-Date).AddSeconds(240)
+    while (-not (Test-Path -LiteralPath $Done) -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
+    $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f $TenantID, $Cut.Stream)
+    if ($Cut.Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Target, [byte[]]@()) }
+    else { $Raw = Get-Content -LiteralPath $Target -Raw; Set-Content -LiteralPath $Target -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
+}
 '@
     Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Value $StandInInner -Encoding utf8
 
@@ -167,13 +180,19 @@ function Invoke-AzRestMethod
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/roleAssignments\?')
     {
         $Id = $Matches[1]
+        # A denied subscription: no role for the caller, as #38's read-access check reads it.
+        if (@((Get-RdaStandInScenario).DeniedIds) -contains $Id) { return & $Answer 200 @{ value = @() } }
         return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/stand-in-reader" } }) }
     }
     if ($Path -match '/providers/Microsoft\.Authorization/roleDefinitions/[^/?]+\?')
     {
         return & $Answer 200 @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } }
     }
-    if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?') { return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) } }
+    if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?')
+    {
+        if (@((Get-RdaStandInScenario).DeniedIds) -contains $Matches[1]) { return & $Answer 200 @{ value = @() } }
+        return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) }
+    }
     if ($Method -eq 'POST' -and $Path -like '/providers/Microsoft.ResourceGraph/resources*')
     {
         $Ids = @(($Payload | ConvertFrom-Json).subscriptions)
@@ -181,6 +200,8 @@ function Invoke-AzRestMethod
     }
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Commerce/UsageAggregates\?')
     {
+        # No usage access: #38's consumption check reads this path, as the billing phase's cmdlet does.
+        if ((Get-RdaStandInScenario).ConsumptionDenied) { return & $Answer 403 @{ error = @{ code = 'AuthorizationFailed'; message = 'stand-in: the client does not have authorization to read usage' } } }
         return & $Answer 200 @{ value = @(@{ properties = @{ quantity = 1.5; meterCategory = 'Stand-in'; instanceData = '' } }) }
     }
     return & $Answer 404 @{ error = @{ code = 'NotFound'; message = 'stand-in: no answer for this path' } }
@@ -287,7 +308,7 @@ function global:Compress-Archive
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold)
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold, [string]$CutAfter, [int]$CutStream = 1, [string]$CutKind = 'cut short')
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -301,6 +322,7 @@ function global:Compress-Archive
             DeniedIds     = @($Denied | ForEach-Object { & $Id $_ })
             ConsumptionDenied = [bool]$ConsumptionDenied
             LoseZipOnFold = [bool]$LoseZipOnFold
+            CutStreamFile = $(if ($CutAfter) { [pscustomobject]@{ AfterId = (& $Id $CutAfter); Stream = $CutStream; Kind = $CutKind } } else { $null })
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -463,6 +485,37 @@ function global:Compress-Archive
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($Newest[0].FullName)
         try { @($Archive.Entries | Where-Object { $_.FullName -like 'ResourcesReport_*.zip' } | ForEach-Object { $_.FullName -replace '^.*\d(sub-[a-z]+)\.zip$', '$1' } | Sort-Object) }
         finally { $Archive.Dispose() }
+    }
+
+    # Interrupted 3-stream run over A to F: streams 0, 1 and 2 hold A and D, B
+    # and E, C and F; A, B and C complete, then D, E and F hang and the run is
+    # ended. -Fail makes the listed ones of A, B and C fail instead.
+    function script:New-InterruptedStreamState
+    {
+        param([hashtable]$Streams, [hashtable]$Names = @{})
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        foreach ($Stream in $Streams.Keys)
+        {
+            $Completed = @()
+            $Reports = @()
+            foreach ($Letter in @($Streams[$Stream]))
+            {
+                $Id = $script:Subs[$Letter].Id
+                $Stamp = '20260101000000000' + $Id
+                $Folder = Join-Path $script:Root ('ResourcesReport' + $Stamp)
+                New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $Folder ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value ('{"VirtualMachines":[{"Name":"vm","Subscription":"' + $Id + '"}]}') -Encoding utf8
+                Set-Content -LiteralPath (Join-Path $Folder ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
+                $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
+                Compress-Archive -Path (Join-Path $Folder '*') -DestinationPath $Zip -Force
+                (Get-Item -LiteralPath $Folder).LastWriteTime = (Get-Date).AddHours(-1)
+                Get-ChildItem -LiteralPath $Folder -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddHours(-1) }
+                $Completed += $Id
+                $Reports += [pscustomobject]@{ Id = $Id; Name = $script:Subs[$Letter].Name; Zip = [System.IO.Path]::GetRelativePath($script:Root, $Zip); Obfuscated = $false }
+            }
+            $Name = if ($Names.ContainsKey($Stream)) { $Names[$Stream] } else { '.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stream }
+            [pscustomobject]@{ Tenant = $script:Tenant; StreamId = [string]$Stream; Completed = @($Completed); FailedAttempts = @(); Reports = @($Reports) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root $Name) -Encoding utf8
+        }
     }
 
     # Interrupted 3-stream run over A to F: streams 0, 1 and 2 hold A and D, B
@@ -1244,28 +1297,39 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         @{ Kind = 'cut short'; Run1 = '-Resume' }
         @{ Kind = 'empty'; Run1 = '-Resume' }
     ) {
-        script:Invoke-InterruptedThreeStreamRun
-        # A write of the stream 2 file that was cut short.
-        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f $script:Tenant)
-        if ($Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Bad, [byte[]]@()) }
-        else { $Raw = Get-Content -LiteralPath $Bad -Raw; Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
-
-        # Run 1 uses 2 streams, so no stream of it rewrites the stream 2 file. A
-        # run without -Resume collects everything and reads the per-stream files
-        # only in its end-of-run merge.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+        # No run is killed: the stream files are written directly, or cut short by
+        # the stand-in once the stream that wrote it has finished.
         $Resuming = $Run1 -eq '-Resume'
+        if ($Resuming)
+        {
+            # An interrupted 3-stream run over A to F: A, B and C completed, D, E
+            # and F were never reached. The write of the stream 2 file was cut short.
+            script:New-InterruptedStreamState -Streams @{ 0 = @('A'); 1 = @('B'); 2 = @('C') }
+            $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f $script:Tenant)
+            if ($Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Bad, [byte[]]@()) }
+            else { $Raw = Get-Content -LiteralPath $Bad -Raw; Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
+            script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+            $Name = '.resume-state-{0}-stream-2.json' -f $script:Tenant
+        }
+        else
+        {
+            # 2 streams over A, B and C: stream 0 holds A and C, stream 1 holds B.
+            # Once B's stream has finished, C's run cuts its state file short, so
+            # the run reads it only in its end-of-run merge.
+            script:Set-Scenario -Subs 'A', 'B', 'C' -CutAfter 'C' -CutStream 1 -CutKind $Kind
+            $Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+        }
+
         $R1 = script:Invoke-Wrapper -Arguments @(if ($Resuming) { '-Resume' }) -Streams 2
         # On -Resume, C was recorded only in the unreadable file, so it is collected.
-        script:Get-Collected $R1 | Should -Be $(if ($Resuming) { script:Get-Ids 'C', 'D', 'E', 'F' } else { script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F' })
+        script:Get-Collected $R1 | Should -Be $(if ($Resuming) { script:Get-Ids 'C', 'D', 'E', 'F' } else { script:Get-Ids 'A', 'B', 'C' })
         $Warnings = @(script:Get-StreamWarningLines $R1)
         $Warnings.Count | Should -Be 1
         script:Test-CleanLine $R1 | Should -BeFalse
         $Moved = @(script:Get-StreamLikeFiles)
         $Moved.Count | Should -Be 1
-        $Moved[0].Name | Should -Match ('^\.resume-state-{0}-stream-2\.json\.unreadable-\d{{8}}-\d{{6}}$' -f [regex]::Escape($script:Tenant))
+        $Moved[0].Name | Should -Match ('^{0}\.unreadable-\d{{8}}-\d{{6}}$' -f [regex]::Escape($Name))
         @(script:Get-StreamFiles) | Should -BeNullOrEmpty
-        $Name = '.resume-state-{0}-stream-2.json' -f $script:Tenant
         # The warning names the file and where it went, whichever step found it.
         $Warnings[0] | Should -BeLike ('WARNING: The per-stream state file {0}*could not be read, so its records are not used: the subscriptions it lists are not counted as completed* It was moved aside to {1}.' -f $Name, $Moved[0].Name)
         if (-not $Resuming)
@@ -1279,6 +1343,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         @(script:Get-ZipEntries | Where-Object { $_.Name -like '*resume-state*' -or $_.Text -like '*resume-state*' }) | Should -BeNullOrEmpty
 
         # Runs 2 and 3: nothing is recovered or reported again, and each ends clean.
+        script:Set-Scenario -Subs 'A', 'B', 'C'
         foreach ($Run in 1..2)
         {
             $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
@@ -1529,7 +1594,8 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, without -Resume: A and B complete, C fails.
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
         $R1 = script:Invoke-Wrapper -Streams 1
-        $R1.ExitCode | Should -Be 0
+        # A failed subscription is exit 2.
+        $R1.ExitCode | Should -Be 2
         $R1.Error | Should -BeNullOrEmpty
         script:Get-ErrorLines $R1 | Should -Be @('ERROR processing subscription Sub C: stand-in failure for this subscription')
         # The start-of-run write fails on the folder and removes it; every later write succeeds.
