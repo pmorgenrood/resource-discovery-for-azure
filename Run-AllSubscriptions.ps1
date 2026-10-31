@@ -1703,7 +1703,14 @@ else
             # falsy, but when one matches it returns a single non-array object
             # whose truthiness varies by PowerShell edition. @(...).Count is
             # always an integer.
-            while (@($Jobs | Where-Object { $_.State -eq 'Running' }).Count -gt 0)
+            # Wait until every job has finished, not only while one is Running:
+            # a job that waits on a prompt is Blocked until the Receive-Job below
+            # shows the prompt, and ending the wait then loses the rest of that
+            # stream. A job whose worker process dies stays Running until
+            # PowerShell fails it (about 60 seconds later on PowerShell 7.6), and
+            # is then reported as a stream with no summary.
+            $FinishedJobStates = @('Completed', 'Failed', 'Stopped')
+            while (@($Jobs | Where-Object { $FinishedJobStates -notcontains [string]$_.State }).Count -gt 0)
             {
                 $Jobs | Receive-Job
                 Start-Sleep -Milliseconds 1500
