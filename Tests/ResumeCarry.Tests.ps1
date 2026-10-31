@@ -696,7 +696,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $After2.Failed | Should -Be @('sub-a')
     }
 
-    It 'a stream that did not start leaves the earlier completion and report of its subscriptions as they were' {
+    It 'a stream that did not start ends the earlier completion of its subscriptions, puts them on the retry list, and the next -Resume collects them' {
         $S = script:Read-State -Path $script:State
         $Summary = Join-Path $script:Root '.rda-stream-0-summary.json'
         @{ StreamId = '0'; Tenant = 't'; Status = 'failed-to-start'; Reason = 'stand-in'; Completed = @(); ResourceCounts = @()
@@ -705,9 +705,41 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $Summary; FailuresPath = (Join-Path $script:Root 'failures-stream-0.log'); SubCount = 1 })
         $Agg = & $script:AggregateBlock $Streams $script:Root 't' $script:State $S.Completed @() $S.Reports 6>$null
 
-        @($Agg.CompletedIds) | Should -Be @('sub-a')
-        @($Agg.CompletedReports | ForEach-Object Id) | Should -Be @('sub-a')
+        # A run without -Resume sliced sub-a, which an earlier run completed, and
+        # its stream did not start: sub-a was not collected, so the earlier
+        # completion and report end, and it is on the retry list as a failed run.
+        @($Agg.CompletedIds) | Should -BeNullOrEmpty
+        @($Agg.CompletedReports | ForEach-Object Id) | Should -BeNullOrEmpty
         @($Agg.FailedSubscriptions).Count | Should -Be 1
+        $After = script:Read-State -Path $script:State
+        $After.Completed | Should -BeNullOrEmpty
+        $After.Failed | Should -Be @('sub-a')
+
+        # The next -Resume collects sub-a instead of carrying its old report.
+        $R = script:Invoke-ResumeRun -Root $script:Root -State $script:State
+        @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty
+        ($R.Post.Text -join "`n") | Should -Not -Match 'Resume: carrying'
+        @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Contain 'sub-a'
+    }
+
+    It 'a stream that did not start with an id it could not read (the unknown-id marker, or a blank id) puts no retry entry for it, and the run still keeps the state' {
+        $S = script:Read-State -Path $script:State
+        $Summary = Join-Path $script:Root '.rda-stream-0-summary.json'
+        @{ StreamId = '0'; Tenant = 't'; Status = 'failed-to-start'; Reason = 'stand-in'; Completed = @(); ResourceCounts = @()
+            Failed = @(@{ Id = '<unknown>'; Name = '<unknown>'; Reason = 'stream did not start: Az context import failed' }, @{ Id = ' '; Name = 'blank'; Reason = 'stream did not start: Az context import failed' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
+        $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $Summary; FailuresPath = (Join-Path $script:Root 'failures-stream-0.log'); SubCount = 1 })
+        $Agg = & $script:AggregateBlock $Streams $script:Root 't' $script:State $S.Completed @() $S.Reports 6>$null
+
+        # The failure is listed, so the run is not clean and keeps the state; an
+        # id the stream could not read matches no subscription, so it is neither
+        # a retry entry nor taken off the completed list.
+        @($Agg.FailedSubscriptions).Count | Should -BeGreaterOrEqual 1
+        @($Agg.CompletedIds) | Should -Be @('sub-a')
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+        $After = script:Read-State -Path $script:State
+        $After.Completed | Should -Be @('sub-a')
+        @($After.Failed | Where-Object { $_ -eq '<unknown>' -or [string]::IsNullOrWhiteSpace($_) }) | Should -BeNullOrEmpty
     }
 
     It 'sequential: a run without -Resume leaves no zip for sub-a, and the next -Resume collects it again' {

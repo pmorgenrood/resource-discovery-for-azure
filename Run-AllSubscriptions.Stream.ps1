@@ -196,6 +196,10 @@ $SkippedSubs = @()
 # Subs this stream collected without a zip being written; reported in the
 # summary so the parent takes them off the unified completed list.
 $NoReportSubs = @()
+# Subs this stream collected with metrics or consumption left incomplete; they
+# are in the retry list, and the summary names them so the parent also takes
+# them off the unified completed list.
+$IncompleteSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -239,6 +243,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
     {
         # Cleared first so a stale path from the previous sub is never recorded as this one's.
         $Global:ZipOutputFile = $null
+        # Counted before the call, so Get-IncompleteDataReason sees only what this call appends.
+        $MetricsGapsBefore = @($Global:MetricsFailedSubs | Where-Object { $null -ne $_ }).Count
+        $ConsumptionGapsBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -268,6 +275,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
         {
             $Reports = @(@($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId }) + $NewReport)
         }
+        $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
 
         if ($null -eq $NewReport)
         {
@@ -281,6 +289,18 @@ for ($i = 0; $i -lt $PairCount; $i++)
                 $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
                 Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
             }
+        }
+        elseif ($null -ne $IncompleteReason)
+        {
+            # Same as the parent's sequential branch: the report was written
+            # without some of its metrics or consumption, so the sub goes into
+            # the retry list instead of the completed list.
+            Write-Stream ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $SubName) 'Yellow'
+            $IncompleteSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
+            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+            $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason $IncompleteReason
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
         elseif (-not ($Completed -contains $SubId))
         {
@@ -371,6 +391,7 @@ $Summary = [pscustomobject]@{
     Failed                 = $FailedSubs
     Skipped                = @($SkippedSubs)
     NoReport               = @($NoReportSubs)
+    Incomplete             = @($IncompleteSubs)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
     ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
