@@ -14,6 +14,7 @@
 # =============================================================================
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
@@ -1130,7 +1131,7 @@ $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
 $Global:PlatformOS = 'PowerShell Unix'
 $TestSub = '12345678-1234-1234-1234-123456789012'
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
@@ -1159,6 +1160,8 @@ function global:Invoke-AzRestMethod
     }
     [pscustomobject]@{ StatusCode = 200; Content = ('{{"data":[{{"subscriptionId":"{0}","ResourceCount":4}}]}}' -f $TestSub) }
 }
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $env:RDA_TEST_MODE = $Mode
 $Extra = @{}
 if ($SkipConsumption) { $Extra.SkipConsumption = $true }
