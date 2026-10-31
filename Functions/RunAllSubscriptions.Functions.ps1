@@ -1208,11 +1208,13 @@ function Get-ResumeStateRunInfoValues
 # Settings (by Get-RunDataSettingNames) or SettingsProblem; Window (as
 # Get-ConsumptionWindow returns it) or WindowProblem. Values: the four keys as
 # stored. Present: a file is at the path, whether or not it can be read.
+# StreamOnly is set by the caller when there is no such file but per-stream
+# state files of an interrupted parallel run are there.
 # Reads nothing else from the file.
 function Read-ResumeRunInfo
 {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Tenant)
-    $Info = [pscustomobject]@{ Present = (Test-Path -LiteralPath $Path -PathType Leaf); Exists = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
+    $Info = [pscustomobject]@{ Present = (Test-Path -LiteralPath $Path -PathType Leaf); Exists = $false; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
     try { $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
     catch { return $Info }
     if ($State -isnot [System.Management.Automation.PSCustomObject]) { return $Info }
@@ -1276,6 +1278,8 @@ function Read-ResumeRunInfo
 # signing in or writing anything). Lines are { Text; Colour } to print now.
 # The rules, in order:
 #   -Fresh with -Resume or -ResumeFailedOnly: Stop.
+#   No resume state file but per-stream state files (StreamOnly), without
+#     -Fresh: Continue, as -Resume does.
 #   No unfinished run: New; with -ResumeFailedOnly, Stop (there is no retry list).
 #   -Fresh: New.
 #   A file that is not the right shape: Continue (it is moved aside later, as
@@ -1314,6 +1318,15 @@ function Resolve-RunStart
         & $Say ('ERROR: -Fresh starts a new run and {0} continues the unfinished one, so they cannot be used together. This run stops here (exit 1), before it signs in or writes anything.' -f $Switch) 'Red'
         & $Say ('  Next: run the same command with only one of them: -Fresh to start over, or {0}.' -f $Switch) 'Yellow'
         return (& $Decide 'Stop' 'fresh-with-resume' 1)
+    }
+    # Only per-stream state files of an interrupted parallel run: continue it, as
+    # -Resume does (the startup fold reads them). Nothing records its start time
+    # or settings.
+    if (-not $Info.Exists -and $Info.StreamOnly -and -not $Fresh)
+    {
+        & $Say 'Per-stream state files of an interrupted parallel run are in the inventory folder, but no resume state file records when that run started or with which settings, so this run cannot check either. It continues that run, as -Resume does, and records its own start time and settings once it starts collecting.' 'Yellow'
+        & $Say '  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), end this run and start again with -Fresh, so one consolidated zip does not mix them.' 'Yellow'
+        return (& $Decide 'Continue' 'stream-only')
     }
     if (-not $Info.Exists)
     {
@@ -1429,6 +1442,9 @@ function Write-ResumeStateRunInfo
         [Parameter(Mandatory = $true)][string]$Tenant,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$RunInfo
     )
+    # No file yet (a run that continues from per-stream state files only): the
+    # run's saves write the keys with the rest.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
     try
     {
         $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop

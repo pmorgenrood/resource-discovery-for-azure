@@ -957,6 +957,9 @@ Describe 'Resolve-RunStart and its readers' {
 
     It '<Label> -> <Mode>' -ForEach @(
         @{ Label = 'no file, no switch'; Info = { script:New-Info -Missing }; Switches = @{}; Mode = 'New'; Reason = 'none' }
+        @{ Label = 'only per-stream files, no switch'; Info = { $I = script:New-Info -Missing -Legacy; $I | Add-Member -NotePropertyName StreamOnly -NotePropertyValue $true -Force; $I }; Switches = @{}; Mode = 'Continue'; Reason = 'stream-only' }
+        @{ Label = 'only per-stream files, -ResumeFailedOnly'; Info = { $I = script:New-Info -Missing -Legacy; $I | Add-Member -NotePropertyName StreamOnly -NotePropertyValue $true -Force; $I }; Switches = @{ ResumeFailedOnly = $true }; Mode = 'Continue'; Reason = 'stream-only' }
+        @{ Label = 'only per-stream files, -Fresh'; Info = { $I = script:New-Info -Missing -Legacy; $I | Add-Member -NotePropertyName StreamOnly -NotePropertyValue $true -Force; $I }; Switches = @{ Fresh = $true }; Mode = 'New'; Reason = 'none' }
         @{ Label = 'no file, -Resume'; Info = { script:New-Info -Missing }; Switches = @{ Resume = $true }; Mode = 'New'; Reason = 'none' }
         @{ Label = 'no file, -ResumeFailedOnly'; Info = { script:New-Info -Missing }; Switches = @{ ResumeFailedOnly = $true }; Mode = 'Stop'; Reason = 'nothing-to-retry' }
         @{ Label = 'a run, no switch'; Info = { script:New-Info }; Switches = @{}; Mode = 'Continue'; Reason = 'continue' }

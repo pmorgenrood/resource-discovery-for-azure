@@ -515,6 +515,11 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Tenant
 # what -Resume, or a run without it, did before.
 $RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled)
 $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $TenantID
+if (-not $StoredRun.Exists -and @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID).Count -gt 0)
+{
+    $StoredRun.StreamOnly = $true
+    $StoredRun.Legacy = $true
+}
 $RunStart = Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings -MaxAgeDays $ResumeMaxAgeDays
 foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
 if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
@@ -525,7 +530,7 @@ $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnl
 # before collecting too. Until then every save keeps the ones the file holds.
 # A run that continues one whose file records them keeps the stored values as
 # they are, so its saves need not read the file for them.
-$RunInfo = if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'wrong-shape') { $StoredRun.Values } else { $null }
+$RunInfo = if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'stream-only', 'wrong-shape') { $StoredRun.Values } else { $null }
 $NewRunInfo = $null
 
 
