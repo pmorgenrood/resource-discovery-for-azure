@@ -127,18 +127,22 @@ $Global:ResourceCount = 1
     "`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @()`n"
     $ParLaunchText = script:Set-TestPaths -Text (@($Body[0..($AggAt - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
-    # The resume-state cleanup: every statement after the main-summary build up to
-    # and including the clean-run clear.
+    # The resume-state cleanup: the statements after the main-summary build up to
+    # the retry-owed count, then the clean-run clear. The clear comes after the
+    # last check of the consolidated zip, so it is lifted on its own, from the
+    # statement that starts it.
     $MainSummaryAt = script:Find-TopIndex -What 'the main-summary build' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text -match 'New-RdaAllSubHtmlSummary -RunOutputDirectory' }
-    $ClearAt = script:Find-TopIndex -After $MainSummaryAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
+    $OwedAt = script:Find-TopIndex -After $MainSummaryAt -What 'the retry-owed count' -Match { param($s) $s.Extent.Text.StartsWith('$RetryOwedCount = ') }
+    $ClearStartAt = script:Find-TopIndex -After $OwedAt -What 'the start of the resume-state clear' -Match { param($s) $s.Extent.Text -eq '$ResumeStateClearTried = $false' }
+    $ClearAt = script:Find-TopIndex -After $ClearStartAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
     # With it, the clean-up of the per-stream files a run that keeps the resume
     # state folded in, or that its streams wrote, when the wrapper has one.
     $FoldedAt = $ClearAt + 1
     if ($FoldedAt -lt $Top.Count -and $Top[$FoldedAt] -is [System.Management.Automation.Language.IfStatementAst] -and $Top[$FoldedAt].Extent.Text.Contains('Invoke-FoldedStreamStateCleanup')) { $ClearAt = $FoldedAt }
-    $CleanupText = script:Join-Top -From ($MainSummaryAt + 1) -To $ClearAt
+    $CleanupText = (script:Join-Top -From ($MainSummaryAt + 1) -To $OwedAt) + "`n" + (script:Join-Top -From $ClearStartAt -To $ClearAt)
 
     # The summary: from the failed-subscriptions block to the execution time.
-    $AdviceAt = script:Find-TopIndex -After $ClearAt -What 'the failed-subscriptions summary' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Clauses[0].Item1.Extent.Text -eq '$FailedSubscriptions.Count -gt 0' -and $s.Extent.Text.Contains('Subscriptions Failed:') }
+    $AdviceAt = script:Find-TopIndex -After $OwedAt -What 'the failed-subscriptions summary' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Clauses[0].Item1.Extent.Text -eq '$FailedSubscriptions.Count -gt 0' -and $s.Extent.Text.Contains('Subscriptions Failed:') }
     $TimeAt = script:Find-TopIndex -After $AdviceAt -What 'the execution-time line' -Match { param($s) $s.Extent.Text.StartsWith('Write-Host ("Execution Time:') }
     $AdviceText = script:Join-Top -From $AdviceAt -To $TimeAt
 
