@@ -625,13 +625,12 @@ A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) also sets an exit c
 
 | Code | Meaning |
 |---|---|
-| `0` | Completed; no collector failed. A run that stopped before writing its zip, for example after 5 collectors failed in a row, can also end with `0`, so check that the zip named on the `Reporting Data File:` line exists. |
-| `1` | A pre-flight check stopped the run before collection (for example `-Service` matched no collector, or the `-ObfuscationDictionary` file is missing or not valid JSON). |
+| `0` | Completed; the report and zip were written and no collector failed. |
+| `1` | The run stopped during setup, before it collected anything, and the red error line printed before it gives the cause: for example a pre-flight check (`-Service` matched no collector, the `-ObfuscationDictionary` file is missing or not valid JSON), the output folder cannot be written, the Azure CLI is not installed, a service principal sign-in has no `-Secret`, `-ResourceGroup` is given without `-SubscriptionID`, or the consumption data check stopped it. |
+| `2` | The run ended without writing its report zip, and its last console line says `No report was written`. This happens, for example, when 5 collectors failed in a row and collection stopped, or when the HTML report or the zip could not be written; the errors printed before that line give the cause. |
 | `4` | Completed and the report and zip were written, but one or more `Services/*/*.ps1` collectors failed. Those resource types are missing (not empty) from the report; its "Incomplete collection" banner names them. |
 
-Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `4` when a collector failed; the wrapper reports the failure with its own code `4` above.
-
-A direct run of `ResourceInventory.ps1` also ends with exit code `1` when the consumption data check stops it.
+Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `2` or `4`; the wrapper's codes above apply, and a run that stops during setup counts as a failed subscription.
 
 ### Important Notes
 
