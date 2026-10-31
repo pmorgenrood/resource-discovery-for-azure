@@ -97,7 +97,7 @@ $Global:ResourceCount = 1
     $RecordText = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$ScopeForProbe.Count -gt 0' -and $_.Extent.Text.Contains('-NotReadable $NotReadableIds') } | ForEach-Object { $_.Extent.Text }) -join "`n"
 
     # The sequential loop: the body of `if ($ParallelStreams -le 1)`.
-    $SeqIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' }, $true))
+    $SeqIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' -and $args[0].Parent -is [System.Management.Automation.Language.NamedBlockAst] }, $true))
     if ($SeqIf.Count -ne 1) { throw "Expected one 'if (`$ParallelStreams -le 1)' in the wrapper, found $($SeqIf.Count)." }
     $SeqText = script:Set-TestPaths -Text $SeqIf[0].Clauses[0].Item2.Extent.Text
 
@@ -156,7 +156,11 @@ $Global:ResourceCount = 1
     $ExitText = @($Top[($ExitAt - 2)..$ExitAt] | ForEach-Object { $_.Extent.Text }) -join "`n"
 
     # Each run starts the way a new wrapper process does: run-wide totals empty.
+    # The lifted blocks keep the run's lists in this block's scope, where a real
+    # wrapper run keeps them in its script scope, so the run-list reader the
+    # per-stream clean-up uses reads the nearest variable of that exact name.
     $Prologue = "function Exit-Wrapper { param([int]`$Code) throw ('Exit-Wrapper ' + `$Code) }`n" +
+    "function Get-ResumeStateRunList { param([string]`$Name) `$Found = @(Get-Variable -Name `$Name -ErrorAction SilentlyContinue | Where-Object { `$_.Name -ceq `$Name }); if (`$Found.Count -gt 0) { `$Found[0].Value } }`n" +
     "`$Global:MetricsFailedSubs = @(); `$Global:ConsumptionFailedSubs = @(); `$Global:CollectorFailures = @(); `$Global:ConsumptionRecordCount = 0`n" +
     "`$Obfuscate = [bool]`$ObfuscateRun; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null`n" +
     "`$InventoryPassthrough = @{ ConcurrencyLimit = 6 }; `$WrapperTranscriptStarted = `$false; `$Elapsed = [timespan]::Zero`n" +
