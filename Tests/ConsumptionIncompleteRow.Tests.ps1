@@ -95,6 +95,7 @@ function global:Get-AzAccessToken
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Import-AzContext { [CmdletBinding()] param($Path) }
 function global:Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
+function global:Get-AzContextAutosaveSetting { [CmdletBinding()] param($Scope) [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
 function global:Invoke-AzRestMethod { [CmdletBinding()] param($Method, $Path, $Payload, $Uri) throw ('no stand-in for {0} {1}' -f $Method, $(if ($Path) { $Path } else { $Uri })) }
 function global:Get-AzMetric { throw 'no metric calls expected: the harness runs with -SkipMetrics' }
 # The consumption loop has just switched the context to the subscription; its

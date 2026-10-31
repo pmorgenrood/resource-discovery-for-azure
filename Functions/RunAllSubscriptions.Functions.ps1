@@ -1938,6 +1938,303 @@ function Write-StreamState
     }
 }
 
+# ---- Az context snapshot for stream workers ---------------------------------
+# Each stream worker signs in by importing its own copy of the wrapper's Az
+# context, written by Save-AzContext to the inventory folder just before the
+# worker is started. The copy holds a full token cache, including a refresh
+# token that can get new access tokens after the ones in the file expire. A
+# worker reads its copy once, at start-up, and deletes it straight after; the
+# wrapper deletes any copy still there when the streams end. A copy's name
+# says which process wrote it, so a later run can delete the copies of a run
+# that was killed, and only those.
+
+# The command that removes one file, as printed for the operator.
+function Get-RemoveFileCommand
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return ("Remove-Item -LiteralPath '{0}' -Force" -f $Path.Replace("'", "''"))
+}
+
+# A path for a new snapshot in the inventory folder. The name holds the owner:
+# this machine's name (escaped so it is a valid file name), this process's id
+# and start time (UTC), and a random id.
+function New-AzContextSnapshotPath
+{
+    param([Parameter(Mandatory = $true)][string]$InventoryRoot)
+    $Self = [System.Diagnostics.Process]::GetCurrentProcess()
+    $Started = $Self.StartTime.ToUniversalTime()
+    $Stamp = $Started.ToString('yyyyMMddTHHmmssfffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $Name = '.rda-stream-azcontext-{0}-{1}-{2}-{3}.json' -f [uri]::EscapeDataString([Environment]::MachineName), $PID, $Stamp, [guid]::NewGuid().ToString('N')
+    return (Join-Path $InventoryRoot $Name)
+}
+
+# The owner recorded in a snapshot's file name: { Valid, MachineName,
+# ProcessId, ProcessStartTimeUtc }. Valid is $false for a name in another form
+# (such as the random-only names of earlier versions) or with a value that
+# cannot be read.
+function ConvertFrom-AzContextSnapshotName
+{
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $Owner = [pscustomobject]@{ Valid = $false; MachineName = $null; ProcessId = 0; ProcessStartTimeUtc = $null }
+    if ($Name -notmatch '^\.rda-stream-azcontext-(?<Machine>[A-Za-z0-9._~%-]+)-(?<Pid>\d{1,10})-(?<Start>\d{8}T\d{9}Z)-[0-9a-f]{32}\.json$') { return $Owner }
+    $Machine = $Matches['Machine']; $PidText = $Matches['Pid']; $StartText = $Matches['Start']
+    try { $MachineName = [uri]::UnescapeDataString($Machine) } catch { return $Owner }
+    $ProcessId = 0
+    if (-not [int]::TryParse($PidText, [ref]$ProcessId) -or $ProcessId -le 0) { return $Owner }
+    $Started = [datetime]::MinValue
+    $Styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [datetime]::TryParseExact($StartText, 'yyyyMMddTHHmmssfffZ', [System.Globalization.CultureInfo]::InvariantCulture, $Styles, [ref]$Started)) { return $Owner }
+    $Owner.Valid = $true
+    $Owner.MachineName = $MachineName
+    $Owner.ProcessId = $ProcessId
+    $Owner.ProcessStartTimeUtc = $Started
+    return $Owner
+}
+
+# Whether the process that wrote a snapshot can still use it. Returns one of:
+#   ProcessGone, ProcessIdReused - that process has ended, so its runs have
+#     too, and the copy can be deleted. The id counts as reused only when the
+#     process now holding it started more than ReusedAfter (one hour) after
+#     the start time in the name: a process started at another time is
+#     usually far apart, while a clock correction can shift the start time
+#     one process reads for another (on Linux each .NET process computes it
+#     from a boot time it fixes when it starts), so a smaller difference, or
+#     a process that seems to have started earlier, keeps the copy;
+#   ThisProcess, ProcessRunning, StartTimeUnknown - it may still be in use.
+#     ThisProcess is this process itself: PowerShell can run several
+#     invocations of the wrapper at once in one process (in runspaces or
+#     thread jobs), and the name does not say which of them wrote the copy;
+#   OtherMachine, Unreadable - this machine cannot tell.
+function Get-AzContextSnapshotOwnerState
+{
+    param(
+        [Parameter(Mandatory = $true)]$Owner,
+        [timespan]$ReusedAfter = [timespan]::FromHours(1)
+    )
+    if (-not $Owner.Valid) { return 'Unreadable' }
+    if ($Owner.MachineName -ne [Environment]::MachineName) { return 'OtherMachine' }
+    try { $Process = [System.Diagnostics.Process]::GetProcessById($Owner.ProcessId) }
+    catch { return 'ProcessGone' }
+    try
+    {
+        $Exited = $false
+        try { $Exited = $Process.HasExited }
+        catch { Write-Verbose ('Exit state of process {0} not readable: {1}' -f $Owner.ProcessId, $_.Exception.Message) }
+        if ($Exited) { return 'ProcessGone' }
+        $Started = $null
+        try { $Started = $Process.StartTime.ToUniversalTime() }
+        catch { Write-Verbose ('Start time of process {0} not readable: {1}' -f $Owner.ProcessId, $_.Exception.Message) }
+        if ($null -eq $Started) { return 'StartTimeUnknown' }
+        if (($Started - $Owner.ProcessStartTimeUtc) -gt $ReusedAfter) { return 'ProcessIdReused' }
+        if ($Owner.ProcessId -eq $PID) { return 'ThisProcess' }
+        return 'ProcessRunning'
+    }
+    finally { $Process.Dispose() }
+}
+
+# The security descriptor of a new Windows snapshot: full control for the
+# current user, SYSTEM and Administrators, and nothing inherited from the
+# folder. Throws off Windows.
+function New-OwnerOnlyFileSecurity
+{
+    $Security = [System.Security.AccessControl.FileSecurity]::new()
+    $Security.SetAccessRuleProtection($true, $false)
+    foreach ($Sid in @([System.Security.Principal.WindowsIdentity]::GetCurrent().User, [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')))
+    {
+        $Security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($Sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow))
+    }
+    return $Security
+}
+
+# Create an empty file for a secret, before anything is written to it. On Linux
+# and macOS it is created with mode 600 in the same call, and on Windows with
+# the access list of New-OwnerOnlyFileSecurity, so it is never readable by
+# other users. Save-AzContext and the copies below write into it in place,
+# which keeps that mode or list. On Windows, an error in building or applying
+# the access list that is not an I/O error makes it create the file with the
+# folder's access list instead, and Test-OwnerOnlyFile then reports it; an
+# I/O error (the file already exists, the folder cannot be written) is thrown,
+# and no file is created. Before PowerShell 7.3 on Linux and macOS the file
+# gets the default mode, which Test-OwnerOnlyFile reports. Throws when the
+# file already exists.
+function New-OwnerOnlyFile
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($IsWindows)
+    {
+        try
+        {
+            $Security = New-OwnerOnlyFileSecurity
+            ([System.IO.FileSystemAclExtensions]::Create([System.IO.FileInfo]::new($Path), [System.IO.FileMode]::CreateNew, [System.Security.AccessControl.FileSystemRights]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None, $Security)).Dispose()
+            return
+        }
+        catch [System.IO.IOException] { throw }
+        catch { Write-Verbose ('Could not create {0} with an owner-only access list: {1}' -f $Path, $_.Exception.Message) }
+    }
+    else
+    {
+        # UnixCreateMode needs .NET 7 (PowerShell 7.3 or later).
+        $OptionsType = 'System.IO.FileStreamOptions' -as [type]
+        if ($null -ne $OptionsType -and $null -ne $OptionsType.GetProperty('UnixCreateMode'))
+        {
+            $Options = $OptionsType::new()
+            $Options.Mode = [System.IO.FileMode]::CreateNew
+            $Options.Access = [System.IO.FileAccess]::Write
+            $Options.UnixCreateMode = [System.IO.UnixFileMode]'UserRead, UserWrite'
+            ([System.IO.FileStream]::new($Path, $Options)).Dispose()
+            return
+        }
+    }
+    ([System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)).Dispose()
+}
+
+# $true when an access list lets no one but the allowed accounts in: it does not
+# inherit from its folder, and every Allow entry is for one of AllowedSids.
+# Rules are { Sid, Type } (SID text, 'Allow' or 'Deny').
+function Test-OwnerOnlyAccessList
+{
+    param(
+        [Parameter(Mandatory = $true)][bool]$Protected,
+        [object[]]$Rules = @(),
+        [Parameter(Mandatory = $true)][string[]]$AllowedSids
+    )
+    if (-not $Protected) { return $false }
+    foreach ($Rule in @($Rules))
+    {
+        if ([string]$Rule.Type -eq 'Allow' -and $AllowedSids -notcontains [string]$Rule.Sid) { return $false }
+    }
+    return $true
+}
+
+# $true when no user other than the owner can read or write the file: on Linux
+# and macOS no group or other permission bit is set; on Windows its effective
+# access list, read back from the file, passes Test-OwnerOnlyAccessList for the
+# current user, SYSTEM and Administrators. $false when that cannot be read.
+function Test-OwnerOnlyFile
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try
+    {
+        if ($IsWindows)
+        {
+            $Acl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]::new($Path))
+            $Rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { [pscustomobject]@{ Sid = $_.IdentityReference.Value; Type = [string]$_.AccessControlType } })
+            $Allowed = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
+            return (Test-OwnerOnlyAccessList -Protected $Acl.AreAccessRulesProtected -Rules $Rules -AllowedSids $Allowed)
+        }
+        $Mode = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).UnixFileMode
+        if ($null -eq $Mode) { return $false }
+        $GroupOrOther = [System.IO.UnixFileMode]'GroupRead, GroupWrite, GroupExecute, OtherRead, OtherWrite, OtherExecute'
+        return (([int]$Mode -band [int]$GroupOrOther) -eq 0)
+    }
+    catch
+    {
+        Write-Verbose ('Could not read the access of {0}: {1}' -f $Path, $_.Exception.Message)
+        return $false
+    }
+}
+
+# Write one stream's snapshot. The file is created owner-only first. Without
+# Content, Save-AzContext writes the wrapper's current context into it; with
+# Content (the bytes of an earlier snapshot of this run), those bytes are
+# written. On Linux and macOS a write that widened the mode is narrowed again.
+# Returns { OwnerOnly, Content }, Content being the bytes written. Throws when
+# the file cannot be written (the caller deletes it).
+function Save-StreamAzContextSnapshot
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [byte[]]$Content
+    )
+    New-OwnerOnlyFile -Path $Path
+    if ($null -eq $Content)
+    {
+        Save-AzContext -Path $Path -Force -ErrorAction Stop | Out-Null
+        $Content = [System.IO.File]::ReadAllBytes($Path)
+    }
+    else
+    {
+        [System.IO.File]::WriteAllBytes($Path, $Content)
+    }
+    # $null before .NET 7, which has no API to set a mode.
+    $ModeType = 'System.IO.UnixFileMode' -as [type]
+    if (-not $IsWindows -and $null -ne $ModeType -and -not (Test-OwnerOnlyFile -Path $Path))
+    {
+        # A file system that refuses the change only earns the caller's warning.
+        try { [System.IO.File]::SetUnixFileMode($Path, ($ModeType::UserRead -bor $ModeType::UserWrite)) }
+        catch { Write-Verbose ("Could not set mode 600 on {0}: {1}" -f $Path, $_.Exception.Message) }
+    }
+    return [pscustomobject]@{ OwnerOnly = (Test-OwnerOnlyFile -Path $Path); Content = $Content }
+}
+
+# Delete Az context snapshots. Never throws, so a failed delete cannot hide the
+# real exit reason. A file that is gone, also when another process deleted it
+# first, counts as deleted. Returns one { Path, Message } per file that is
+# still there, so the caller can say it must be deleted by hand.
+function Remove-AzContextSnapshot
+{
+    param([string[]]$Path = @())
+    $Failed = @()
+    foreach ($Item in @($Path | Where-Object { -not [string]::IsNullOrEmpty($_) }))
+    {
+        if (-not (Test-Path -LiteralPath $Item)) { continue }
+        try { Remove-Item -LiteralPath $Item -Force -ErrorAction Stop }
+        catch
+        {
+            if (Test-Path -LiteralPath $Item) { $Failed += [pscustomobject]@{ Path = $Item; Message = $_.Exception.Message } }
+        }
+    }
+    return $Failed
+}
+
+# Look at the Az context snapshots in the inventory folder at the start of a
+# run. A run that is killed (for example when its terminal window is closed)
+# never reaches its own cleanup, and its copies stay. A copy is deleted only
+# when its name shows it was written by a process on this machine that has
+# ended; the copies of a process that is still running, this one included,
+# are kept, however old they are and whatever the tenant of their run. Such a
+# copy is deleted by its own run's cleanup, or by a later run once that
+# process has ended. A copy from another machine or with a name in another
+# form is never deleted here: it is returned in Unknown so the caller can
+# name it. Returns { Removed, Failed, Unknown }; Unknown entries are
+# { Path, Reason, MachineName }.
+function Remove-OrphanedAzContextSnapshot
+{
+    param([Parameter(Mandatory = $true)][string]$InventoryRoot)
+    $Orphaned = @()
+    $Unknown = @()
+    foreach ($File in @(Get-ChildItem -Path $InventoryRoot -Filter '.rda-stream-azcontext-*.json' -File -Force -ErrorAction SilentlyContinue))
+    {
+        $Owner = ConvertFrom-AzContextSnapshotName -Name $File.Name
+        $State = Get-AzContextSnapshotOwnerState -Owner $Owner
+        switch ($State)
+        {
+            { $_ -in 'ProcessGone', 'ProcessIdReused' } { $Orphaned += $File.FullName }
+            { $_ -in 'OtherMachine', 'Unreadable' } { $Unknown += [pscustomobject]@{ Path = $File.FullName; Reason = $State; MachineName = $Owner.MachineName } }
+        }
+    }
+    $Failed = @(Remove-AzContextSnapshot -Path $Orphaned)
+    return [pscustomobject]@{
+        Removed = $Orphaned.Count - $Failed.Count
+        Failed  = $Failed
+        Unknown = $Unknown
+    }
+}
+
+# Whether Az context autosave is off for this process, so an imported context
+# (and its token cache) is kept in memory and not written to the user's Az
+# profile files: Get-AzContextAutosaveSetting reports Process mode with no
+# context or cache file. Returns { Disabled; Detail }, Detail saying what the
+# setting reported, or why it could not be read, when it is not off.
+function Get-AzContextAutosaveCheck
+{
+    try { $Setting = Get-AzContextAutosaveSetting -Scope Process -ErrorAction Stop }
+    catch { return [pscustomobject]@{ Disabled = $false; Detail = ('Get-AzContextAutosaveSetting failed: {0}' -f $_.Exception.Message) } }
+    if ($null -eq $Setting) { return [pscustomobject]@{ Disabled = $false; Detail = 'Get-AzContextAutosaveSetting returned nothing' } }
+    $NoFile = { param($Value) [string]::IsNullOrEmpty([string]$Value) -or [string]$Value -eq 'None' }
+    if ([string]$Setting.Mode -eq 'Process' -and (& $NoFile $Setting.ContextFile) -and (& $NoFile $Setting.CacheFile)) { return [pscustomobject]@{ Disabled = $true; Detail = $null } }
+    return [pscustomobject]@{ Disabled = $false; Detail = ('Get-AzContextAutosaveSetting reports Mode={0}, ContextFile={1}, CacheFile={2}' -f $Setting.Mode, $Setting.ContextFile, $Setting.CacheFile) }
+}
 
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation

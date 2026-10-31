@@ -8,8 +8,9 @@
 #   - Owns its own slice of the subscription list.
 #   - Owns its own resume-state file (.resume-state-<TenantID>-stream-<N>.json),
 #     so the streams cannot race on a shared file.
-#   - Imports an Az PowerShell context from a shared snapshot file written by
-#     the parent wrapper, so authentication is not re-prompted per stream.
+#   - Imports an Az PowerShell context from its own snapshot file written by
+#     the parent wrapper, so authentication is not re-prompted per stream,
+#     and deletes that file once read.
 #   - Calls ResourceInventory.ps1 once per subscription in its slice.
 #   - Emits structured progress lines to stdout (prefixed [stream-N]) so the
 #     parent wrapper can collate output across streams.
@@ -89,6 +90,11 @@ $Tag = "[stream-$StreamId]"
 if ($SubscriptionIds.Count -eq 0)
 {
     Write-Stream "no subscriptions in slice; exiting cleanly" 'Yellow'
+    # This stream never imports its Az context snapshot, so delete it now.
+    foreach ($Failure in @(Remove-AzContextSnapshot -Path $AzContextPath))
+    {
+        Write-Stream ("WARNING: could not remove Az context snapshot at {0}: {1}. It holds an Azure token cache; remove it with: {2}" -f $Failure.Path, $Failure.Message, (Get-RemoveFileCommand -Path $Failure.Path)) 'Yellow'
+    }
     @{
         StreamId              = $StreamId
         Tenant                = $TenantID
@@ -109,40 +115,70 @@ Write-Stream ("starting; subs in slice: {0}" -f $SubscriptionIds.Count) 'Cyan'
 # ---- Az context import -------------------------------------------------------
 #
 # The parent wrapper called Save-AzContext on its already-authenticated session
-# and passed us the path. Importing it gives this child process a working Az
-# context without prompting for sign-in. Import-AzContext is idempotent.
+# and passed us the path of this stream's own copy. Importing it gives this
+# child process a working Az context without prompting for sign-in. The file
+# holds a token cache and nothing reads it again, so it is deleted in the
+# `finally`, whether the import worked or not.
+$ImportStep = 'import'
 try
 {
     Import-Module Az.Accounts -ErrorAction Stop -Force | Out-Null
-    # Prevent the imported context from being persisted to the user's on-disk
-    # AzureRmContext.json. Without this, every parallel worker writes its
-    # token cache to the same shared profile and the streams race on disk
-    # state. Process-scope auto-save is per-process, so calling it here
-    # confines this worker's context to in-memory.
+    # The imported context and its token cache must stay in this process's
+    # memory. With autosave on, Import-AzContext also writes them to the user's
+    # Az profile files (AzureRmContext.json and the token cache file), where
+    # they outlive this stream's snapshot and every stream writes to the same
+    # files. So the snapshot is imported only once autosave is confirmed off
+    # for this process.
+    $ImportStep = 'autosave'
+    $AutosaveError = $null
     try { Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null }
-    catch { Write-Stream ("WARNING: could not disable AzContext autosave: {0}" -f $_.Exception.Message) 'Yellow' }
+    catch { $AutosaveError = $_.Exception.Message }
+    $AutosaveCheck = Get-AzContextAutosaveCheck
+    if (-not $AutosaveCheck.Disabled)
+    {
+        $Detail = if ($AutosaveError) { 'Disable-AzContextAutosave failed: {0}; {1}' -f $AutosaveError, $AutosaveCheck.Detail } else { $AutosaveCheck.Detail }
+        throw ("Az context autosave could not be turned off for this stream ({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user's Az profile files." -f $Detail)
+    }
+    $ImportStep = 'import'
     Import-AzContext -Path $AzContextPath -ErrorAction Stop | Out-Null
-    Write-Stream "Az context imported from shared snapshot" 'Green'
+    Write-Stream "Az context imported from snapshot" 'Green'
 }
 catch
 {
-    Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $_.Exception.Message) 'Red'
+    $Reason = $_.Exception.Message
+    if ($ImportStep -eq 'autosave')
+    {
+        Write-Stream ("FATAL: {0} Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers." -f $Reason) 'Red'
+        $SubReason = 'stream did not start: Az context autosave could not be turned off'
+    }
+    else
+    {
+        Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $Reason) 'Red'
+        $SubReason = 'stream did not start: Az context import failed'
+    }
     # Write a minimum stream summary so the parent doesn't think the stream
     # disappeared silently.
     @{
         StreamId      = $StreamId
         Tenant        = $TenantID
         Status        = 'failed-to-start'
-        Reason        = $_.Exception.Message
+        Reason        = $Reason
         Completed     = @()
         Failed        = @(0..([Math]::Max($SubscriptionIds.Count, $SubscriptionNames.Count) - 1) | ForEach-Object {
                 $Name = if ($_ -lt $SubscriptionNames.Count) { $SubscriptionNames[$_] } else { '<unknown>' }
                 $Id = if ($_ -lt $SubscriptionIds.Count) { $SubscriptionIds[$_] }   else { '<unknown>' }
-                [pscustomobject]@{ Id = $Id; Name = $Name; Reason = 'stream did not start: Az context import failed' }
+                [pscustomobject]@{ Id = $Id; Name = $Name; Reason = $SubReason }
             })
         ResourceCounts = @()
     } | ConvertTo-Json -Depth 5 | Set-Content -Path $StreamSummaryPath -Encoding utf8
     exit 1
+}
+finally
+{
+    foreach ($Failure in @(Remove-AzContextSnapshot -Path $AzContextPath))
+    {
+        Write-Stream ("WARNING: could not remove Az context snapshot at {0}: {1}. It holds an Azure token cache; remove it with: {2}" -f $Failure.Path, $Failure.Message, (Get-RemoveFileCommand -Path $Failure.Path)) 'Yellow'
+    }
 }
 
 # ---- Per-stream resume state -------------------------------------------------

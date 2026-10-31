@@ -468,6 +468,7 @@ Describe 'Parallel path, end to end: interrupted stream, then -Resume' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
         $script:WorkerPath = Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1'
         function script:Invoke-Worker
@@ -533,6 +534,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
 
         # The same stand-in, except that it throws for the ids in $Global:RdaCarryTestFailIds,

@@ -481,6 +481,34 @@ $ChartsHtml
     Write-Host ("  {0} subscription(s), {1:N0} total resource(s), {2} empty, {3} failed. Privacy: {4}." -f $SubCount, $RunTotalResources, $EmptyCount, $FailedList.Count, $ObfuscationStatus) -ForegroundColor DarkGray
 }
 
+# The items -PackageZip puts in the bundle: the given -Path items (the summary
+# and the folders this call reconstructed), or what the -Directory '*' wildcard
+# lists (on Linux and macOS that leaves out dot-files; on Windows it does not),
+# minus every Az context snapshot ('.rda-stream-azcontext-*'), which holds an
+# Azure token cache and is in the folder when the folder is the inventory root
+# while a parallel run is starting. A subfolder that holds a snapshot at any
+# depth is left out with a warning, because Compress-Archive packs a folder
+# whole. Returns full paths.
+function Get-RdaPackageZipItem
+{
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Directory')][string]$Directory,
+        [Parameter(Mandatory, ParameterSetName = 'Path')][string[]]$Path
+    )
+    $Snapshot = '.rda-stream-azcontext-*'
+    $Candidates = if ($PSCmdlet.ParameterSetName -eq 'Path') { @($Path | ForEach-Object { Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }) } else { @(Get-ChildItem -Path (Join-Path $Directory '*') -ErrorAction SilentlyContinue) }
+    foreach ($Item in $Candidates)
+    {
+        if ($Item.Name -like $Snapshot) { continue }
+        if ($Item.PSIsContainer -and @(Get-ChildItem -LiteralPath $Item.FullName -Recurse -Force -File -Filter $Snapshot -ErrorAction SilentlyContinue).Count -gt 0)
+        {
+            Write-Warning ("Left {0} out of the bundle: it holds an Az context snapshot ({1}), which is an Azure token cache." -f $Item.FullName, $Snapshot)
+            continue
+        }
+        $Item.FullName
+    }
+}
+
 # =============================================================================
 # New-RdaAllSubHtmlSummaryFromZip
 #
@@ -699,7 +727,7 @@ function New-RdaAllSubHtmlSummaryFromZip
         {
             $PackageItems = @($HtmlFullPath) + $PackageItems
         }
-        Compress-Archive -LiteralPath $PackageItems -DestinationPath $PackageZipPath -Force
+        Compress-Archive -LiteralPath @(Get-RdaPackageZipItem -Path $PackageItems) -DestinationPath $PackageZipPath -Force
         Write-Host ("Portable summary bundle (links survive extraction): {0}" -f $PackageZipPath) -ForegroundColor Green
     }
 

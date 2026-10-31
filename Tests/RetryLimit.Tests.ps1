@@ -124,7 +124,7 @@ $Global:ResourceCount = 1
     if ($AggAt -lt 0) { throw 'Expected the stream-summary aggregation loop in the wrapper.' }
     # The wrapper slices the pending list: on -Resume, what no earlier run completed.
     $ParLaunchPrelude = "`$PendingSubscriptions = @(`$Subscriptions | Where-Object { -not (`$Resume -and `$CompletedIds -contains `$_.Id) })`n" +
-    "`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @()`n"
+    "`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshots = @(); `$Jobs = @(); `$StreamSummaries = @()`n"
     $ParLaunchText = script:Set-TestPaths -Text (@($Body[0..($AggAt - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
     # The resume-state cleanup: the statements after the main-summary build up to
@@ -422,6 +422,7 @@ Describe 'Following the retry-limit advice' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -466,6 +467,7 @@ Describe 'Retry limit on the parallel path' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -529,6 +531,7 @@ Describe 'Retry limit for a subscription whose metrics stay incomplete' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -556,6 +559,7 @@ Describe 'Retry limit for a subscription whose run writes no report zip' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -585,6 +589,7 @@ Describe 'Resume state after a consolidated zip that could not be built' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -611,6 +616,7 @@ Describe 'A retry-list entry for a subscription that is no longer visible' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }
@@ -772,6 +778,7 @@ Describe 'A subscription past the retry limit that is no longer listed' {
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
     BeforeEach { script:New-Case }

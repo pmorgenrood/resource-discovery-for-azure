@@ -188,6 +188,7 @@ Describe 'A subscription with metrics or consumption left incomplete stays in th
     BeforeAll {
         Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
         Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
         Mock Import-AzContext -MockWith { }
     }
 

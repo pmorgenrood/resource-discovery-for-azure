@@ -429,6 +429,25 @@ catch
 
 Invoke-PreFlightChecks -InventoryRoot $InventoryRoot
 
+# A parallel run that was killed (for example when its terminal window was
+# closed) leaves its Az context snapshots, each an Azure token cache, in the
+# inventory folder. Remove the ones whose run has ended on this machine; name
+# the ones this machine cannot judge.
+$OrphanedSnapshots = Remove-OrphanedAzContextSnapshot -InventoryRoot $InventoryRoot
+if ($OrphanedSnapshots.Removed -gt 0)
+{
+    Write-Host ("Removed {0} Az context snapshot file(s) that an earlier parallel run left in {1}; the process on this machine that wrote them has ended (each held an Azure token cache)." -f $OrphanedSnapshots.Removed, $InventoryRoot) -ForegroundColor Yellow
+}
+foreach ($Failure in $OrphanedSnapshots.Failed)
+{
+    Write-Host ("WARNING: could not remove the Az context snapshot at {0}: {1}. It holds an Azure token cache; remove it with: {2}" -f $Failure.Path, $Failure.Message, (Get-RemoveFileCommand -Path $Failure.Path)) -ForegroundColor Yellow
+}
+foreach ($Kept in $OrphanedSnapshots.Unknown)
+{
+    $Why = if ($Kept.Reason -eq 'OtherMachine') { "it was written by a run on another machine ($($Kept.MachineName))" } else { 'its name does not say which run wrote it' }
+    Write-Host ("Kept the Az context snapshot {0}: {1}, so this run cannot tell whether it is still in use. It holds an Azure token cache; if no run is using it, remove it with: {2}" -f $Kept.Path, $Why, (Get-RemoveFileCommand -Path $Kept.Path)) -ForegroundColor Yellow
+}
+
 
 try
 {
@@ -1343,10 +1362,11 @@ else
     #   - Its own per-stream failures log (RunAllSubscriptions_failures_*_stream-<N>.log).
     #
     # All streams share:
-    #   - One Az context snapshot, written by the parent via Save-AzContext
-    #     and imported by every stream via Import-AzContext. This is the only
-    #     way to avoid an interactive sign-in prompt in each child process.
-    #     The snapshot is removed after all streams finish.
+    #   - The parent's Az context, which the parent writes with Save-AzContext
+    #     to one snapshot file per stream and each stream reads with
+    #     Import-AzContext. This is the only way to avoid an interactive
+    #     sign-in prompt in each child process. A stream deletes its snapshot
+    #     as soon as it has read it; see the snapshot write below.
     #
     # Output is interleaved (each stream prints its own lines, prefixed
     # `[stream-N]`). The final summary is consolidated from the per-stream
@@ -1505,39 +1525,32 @@ else
     }
     if ($StreamCount -ge 2)
     {
-        # Snapshot the parent's Az context to a shared file so each stream can
-        # Import-AzContext without prompting. Save-AzContext writes a JSON file
-        # containing a token cache, so it MUST NOT be left on disk after the
-        # run completes - that's the responsibility of the `finally` block
-        # below, which guarantees cleanup even on stream-launch crash, on
-        # Receive-Job failure, or on Ctrl+C.
-        $AzContextSnapshot = Join-Path $InventoryRoot (".rda-stream-azcontext-{0}.json" -f ([guid]::NewGuid().ToString()))
-        try
-        {
-            Save-AzContext -Path $AzContextSnapshot -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Host ("ERROR: could not snapshot Az context for stream workers: {0}" -f $_.Exception.Message) -ForegroundColor Red
-            Write-Host "Re-run without -ParallelStreams to use the sequential code path." -ForegroundColor Yellow
-            # No snapshot was successfully written, so no security cleanup needed -
-            # but Save-AzContext can write a partial file before throwing on some
-            # error paths, so still try to remove it.
-            if (Test-Path -Path $AzContextSnapshot)
-            {
-                try { Remove-Item -Path $AzContextSnapshot -Force }
-                catch { Write-Verbose ("Could not remove partial Az context snapshot: {0}" -f $_.Exception.Message) }
-            }
-            Exit-Wrapper -Code 1
-        }
+
+        # Each stream signs in by importing a snapshot of the parent's Az
+        # context, so it does not prompt. The snapshot holds a token cache with
+        # a refresh token, so on disk it is kept as short and as private as
+        # possible:
+        #   - one file per stream, written just before that stream's job is
+        #     started, and created readable by this user only (mode 600 on
+        #     Linux and macOS, an owner-only access list on Windows);
+        #   - its name holds this process's id and start time, so a later run
+        #     can tell that the run that wrote it has ended;
+        #   - a stream reads its file only once, at start-up, and deletes it
+        #     straight after (Run-AllSubscriptions.Stream.ps1);
+        #   - the `finally` below deletes any file still there, as its first
+        #     step, before the job cleanup, which can wait about a minute;
+        #   - the next run deletes the files of a run that was killed.
 
         # Everything from here until the matching `finally` is the orchestration
-        # body. The `finally` guarantees the Az context snapshot is always wiped
+        # body. The `finally` guarantees the Az context snapshots are wiped
         # AND that any background jobs are cleaned up, which is the primary
         # reason for this try/finally structure.
         # Declared outside the try so the finally can always see them.
         $Jobs = @()
         $StreamSummaries = @()
+        $AzContextSnapshots = @()
+        $SnapshotContent = $null
+        $SnapshotsOwnerOnly = $true
         try
         {
             $WorkerScript = Join-Path $PSScriptRoot 'Run-AllSubscriptions.Stream.ps1'
@@ -1585,6 +1598,12 @@ else
 
                 Write-Host ("[stream-{0}] queued: {1} subscription(s)" -f $S, $SliceList.Count) -ForegroundColor DarkCyan
 
+                # This stream's Az context snapshot. It is written just before
+                # the job starts, below. The path is recorded now, so the
+                # `finally` also deletes a file whose write failed part-way.
+                $SnapshotPath = New-AzContextSnapshotPath -InventoryRoot $InventoryRoot
+                $AzContextSnapshots += $SnapshotPath
+
                 # Pass arguments to the worker via a single hashtable so the worker
                 # script's named parameters bind correctly. Start-Job's -FilePath
                 # mode passes ArgumentList positionally which collides with our
@@ -1596,7 +1615,7 @@ else
                     StreamId           = [string]$S
                     InventoryRoot      = $InventoryRoot
                     ScriptRoot         = $PSScriptRoot
-                    AzContextPath      = $AzContextSnapshot
+                    AzContextPath      = $SnapshotPath
                     StreamSummaryPath  = $SummaryPath
                     StreamFailuresPath = $FailuresPath
                     SubscriptionIds    = $SliceIds
@@ -1616,11 +1635,31 @@ else
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
 
+                # Write the snapshot. The first is written by Save-AzContext;
+                # the others get the same bytes.
+                try
+                {
+                    $Snapshot = Save-StreamAzContextSnapshot -Path $SnapshotPath -Content $SnapshotContent
+                }
+                catch
+                {
+                    Write-Host ("ERROR: could not snapshot Az context for stream workers: {0}" -f $_.Exception.Message) -ForegroundColor Red
+                    Write-Host "Re-run without -ParallelStreams to use the sequential code path." -ForegroundColor Yellow
+                    Exit-Wrapper -Code 1
+                }
+                $SnapshotContent = $Snapshot.Content
+                if (-not $Snapshot.OwnerOnly -and $SnapshotsOwnerOnly)
+                {
+                    $SnapshotsOwnerOnly = $false
+                    Write-Host ("WARNING: could not make the Az context snapshots in {0} readable by this user only. Each holds an Azure token cache until its stream has read it." -f $InventoryRoot) -ForegroundColor Yellow
+                }
+
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)
                     & $WorkerScript @WorkerArgs
                 } -ArgumentList @($WorkerScript, $WorkerArgs)
             }
+            $SnapshotContent = $null
 
             # Stream output back to the user as it arrives. Receive-Job is
             # non-blocking when called against a still-running job; without this
@@ -1943,15 +1982,32 @@ else
         }
         finally
         {
-            # Unconditional cleanup of background jobs and the Az context snapshot.
+            # Unconditional cleanup of the Az context snapshots and background jobs.
             # Runs whether the orchestration succeeded, threw mid-aggregation, or
             # was interrupted via Ctrl+C while a child stream was still running.
 
-            # 1. Background jobs. If we threw before $jobs was declared, the
+            # 1. Az context snapshots, first: nothing below needs them, and the
+            # job cleanup can wait for about a minute (Stop-Job waits that long
+            # for a job whose worker process has already exited, as after a
+            # Ctrl+C in a terminal); a run ended during that minute, for
+            # example by closing the terminal window, would otherwise leave the
+            # files. Each file holds a token cache with a refresh token, which
+            # can get new access tokens after the ones in the file expire, so
+            # it must not stay on disk. A stream normally deletes its own file
+            # once read; this catches a stream that never got that far.
+            # Best-effort: warn if the delete fails but do not propagate the
+            # error - that would mask the real exit reason.
+            foreach ($Failure in @(Remove-AzContextSnapshot -Path $AzContextSnapshots))
+            {
+                Write-Host ("WARNING: could not remove Az context snapshot at {0}: {1}" -f $Failure.Path, $Failure.Message) -ForegroundColor Yellow
+                Write-Host ("  This file contains an Azure token cache; remove it with: {0}" -f (Get-RemoveFileCommand -Path $Failure.Path)) -ForegroundColor Yellow
+            }
+
+            # 2. Background jobs. If we threw before $jobs was declared, the
             # variable is null/empty and Remove-Job is a no-op. Each job is a
-            # separate `pwsh` process holding an Az context snapshot reference;
-            # leaving them running after the parent exits would leak both
-            # processes and authentication state.
+            # separate `pwsh` process holding the imported Az context in
+            # memory; leaving them running after the parent exits would leak
+            # both processes and authentication state.
             if ($null -ne $Jobs -and @($Jobs).Count -gt 0)
             {
                 try
@@ -1966,24 +2022,6 @@ else
                 catch
                 {
                     Write-Host ("WARNING: could not fully clean up background jobs: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-                }
-            }
-
-            # 2. Az context snapshot. The snapshot file contains a token cache;
-            # leaving it on disk is a security exposure (bounded by the ~1h
-            # token lifetime, but real). Best-effort: log if the delete fails
-            # but do not propagate the error - that would mask the real exit
-            # reason.
-            if (Test-Path -Path $AzContextSnapshot)
-            {
-                try
-                {
-                    Remove-Item -Path $AzContextSnapshot -Force -ErrorAction Stop
-                }
-                catch
-                {
-                    Write-Host ("WARNING: could not remove Az context snapshot at {0}: {1}" -f $AzContextSnapshot, $_.Exception.Message) -ForegroundColor Yellow
-                    Write-Host "  This file contains an Azure token cache and should be deleted manually." -ForegroundColor Yellow
                 }
             }
         }

@@ -90,6 +90,7 @@ function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Contex
 function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
 function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
 function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
+function Get-AzContextAutosaveSetting { [CmdletBinding()] param($Scope) [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
 function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
 function Get-AzAccessToken
 {
