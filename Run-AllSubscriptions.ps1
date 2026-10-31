@@ -508,15 +508,45 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Tenant
 # none, with -Fresh, or (without -Resume or -ResumeFailedOnly) when that run is
 # older than -ResumeMaxAgeDays. A run whose settings differ from the unfinished
 # run's stops here with exit 1, as do -Fresh with -Resume or -ResumeFailedOnly
-# and -ResumeFailedOnly with no unfinished run: before it signs in, collects or
-# writes anything. Taken after the run lock, so a second run at the same time
+# and -ResumeFailedOnly with no unfinished run: before it signs in, collects
+# anything or writes the resume state (the transcript and this run's lock are
+# written before, as by every run). Taken after the run lock, so a second run at the same time
 # never reads a state the first one is writing. From here on $Resume is true
 # for a run that continues (unless it is -ResumeFailedOnly, which keeps its own
 # path) and false for one that starts a new run, so the rest of the run does
 # what -Resume, or a run without it, did before.
 $RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled)
 $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $TenantID
-if (-not $StoredRun.Exists -and -not $Fresh -and (Test-ResumableStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RecordsOnly:(-not ($Resume -or $ResumeFailedOnly))))
+$StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'main'
+# With no resume state file, or one that is not the right shape (moved aside
+# below), the run record the per-stream state files of the unfinished run hold
+# is checked as the resume state file's would be: age, then settings
+# (Read-StreamRunInfo). Files that carry different records stop the run.
+# Files without a record keep the rule below.
+$StreamRun = $null
+if (-not $Fresh -and (-not $StoredRun.Exists -or $null -ne $StoredRun.ShapeProblem))
+{
+    $StreamRun = Read-StreamRunInfo -InventoryRoot $InventoryRoot -Tenant $TenantID -MainExists ([bool]$StoredRun.Exists) -RunId ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID))
+}
+if ($null -ne $StreamRun -and ($StreamRun.HasRecord -or @($StreamRun.Conflict).Count -gt 0))
+{
+    $MainShape = $null -ne $StoredRun.ShapeProblem
+    $StoredRun = if ($null -ne $StreamRun.Info) { $StreamRun.Info } else { [pscustomobject]@{ Present = $true; Exists = $true; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} } }
+    $StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'stream' -Force
+    $StoredRun | Add-Member -NotePropertyName 'RunId' -NotePropertyValue ([string]$StreamRun.RunId) -Force
+    $StoredRun | Add-Member -NotePropertyName 'StreamFiles' -NotePropertyValue @($StreamRun.Files) -Force
+    $StoredRun | Add-Member -NotePropertyName 'RecordConflict' -NotePropertyValue @($StreamRun.Conflict) -Force
+    $StoredRun | Add-Member -NotePropertyName 'MainShapeProblem' -NotePropertyValue $MainShape -Force
+}
+# With a usable resume state file that records the run, the per-stream state
+# files of the same run that carry a record must record the same one; they are
+# compared before anything of them is folded in (Get-StreamRecordMismatches).
+if (-not $Fresh -and $StoredRun.RecordSource -eq 'main' -and $StoredRun.Exists -and $null -eq $StoredRun.ShapeProblem -and -not $StoredRun.Legacy)
+{
+    $StoredRun | Add-Member -NotePropertyName 'StreamMismatch' -NotePropertyValue @(Get-StreamRecordMismatches -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)) -Main $StoredRun) -Force
+}
+$StreamFileMode = if ($Resume) { 'Any' } elseif ($ResumeFailedOnly) { 'Parsed' } else { 'Records' }
+if (-not $StoredRun.Exists -and -not $Fresh -and (Test-ResumableStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -Mode $StreamFileMode))
 {
     $StoredRun.StreamOnly = $true
     $StoredRun.Legacy = $true
@@ -525,22 +555,27 @@ $RunStart = Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFai
 foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
 if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
 $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnly))
-# The start time, settings and cost window this run records: for a new run,
-# written with its new id right before it starts collecting ($NewRunInfo, see
-# $NewRunId below); for a run that continues one whose file lacks them, written
-# before collecting too. Until then every save keeps the ones the file holds.
-# A run that continues one whose file records them keeps the stored values as
-# they are, so its saves need not read the file for them.
-$RunInfo = if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'stream-only', 'wrong-shape') { $StoredRun.Values } else { $null }
-# The cost window this run computes (Get-ConsumptionWindow), once, here: a
-# new run records it, and a run that continues one replaces it with the
-# recorded window below. A new run's start time, settings and window are known
-# from here, so a write of the resume state that creates the file before the
-# run starts collecting (the retry list after the access check) records them
-# too (Save-CompletedSubscriptionIds); the new run id is still written only
-# right before collecting.
+# The cost window of this run: the one the unfinished run recorded when this
+# run continues a file that holds one it can use, so one consolidated zip has
+# one cost window even when the run is continued on a later day; otherwise the
+# one computed now (Get-ConsumptionWindow). Passed to the up-front check and to
+# every ResourceInventory.ps1 this run starts.
 $ConsumptionWindow = Get-ConsumptionWindow
-$NewRunInfo = if ($RunStart.Mode -ne 'Continue') { New-ResumeRunInfo -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow } else { $null }
+$ContinuesRecord = $RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'stream-only', 'wrong-shape'
+if ($ContinuesRecord -and $null -ne $StoredRun.Window) { $ConsumptionWindow = $StoredRun.Window }
+# This run's record (New-ResumeRunRecord): its run id, start time, settings and
+# cost window, built once here and written by every write of the resume state
+# (Save-CompletedSubscriptionIds, Update-ResumeStateRetryList and
+# Write-StartOfRunId read $RunRecord), so no write of this run pairs its lists
+# with another run's record. A new run's in-memory completed lists are emptied
+# once they are read (below), so its first write holds nothing completed. Until
+# then the file is left as it is: a new run that stops before it writes the
+# state leaves the earlier run's state, id and per-stream files as they were.
+$StoredRunId = if ($StoredRun.RecordSource -eq 'stream') { [string]$StoredRun.RunId } else { [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) }
+$RunRecord = New-ResumeRunRecord -Start $RunStart -StoredRun $StoredRun -StoredRunId $StoredRunId -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow
+# The record is written right before collection starts (Write-StartOfRunId) by
+# the first of the three ways the run collects.
+$RunRecordPending = $true
 
 
 
@@ -621,7 +656,10 @@ Write-Host ("Subscriptions visible: {0}" -f $AllSubscriptions.Count) -Foreground
 if ($Excluded.Count -gt 0)
 {
     $ByState = $Excluded | Group-Object -Property State | ForEach-Object { ('{0}: {1}' -f $_.Name, $_.Count) }
-    Write-Host ("Excluded {0} non-Enabled subscription(s) [{1}]. Use -IncludeDisabled to inventory them anyway." -f $Excluded.Count, ($ByState -join ', ')) -ForegroundColor Yellow
+    # Whether this run leaves a resume state file is not known yet, so the
+    # command that works either way (Get-RunGoOnCommand).
+    $IncludeHow = Get-RunGoOnCommand -Switches '-IncludeDisabled' -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly)
+    Write-Host ("Excluded {0} non-Enabled subscription(s) [{1}]. To inventory them anyway, {2}." -f $Excluded.Count, ($ByState -join ', '), $IncludeHow) -ForegroundColor Yellow
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
 
@@ -633,6 +671,9 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # per-stream state files, also at the stop for a resume state file that cannot
 # be moved aside.
 $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID)
+# A run that continues from the record of per-stream state files (no resume
+# state file) uses their run id, so the startup fold reads them.
+if ($StoredRun.RecordSource -eq 'stream' -and $RunStart.Mode -eq 'Continue') { $RunId = [string]$StoredRun.RunId }
 $OtherRunLineReady = $true
 
 # The resume state file's shape is checked here, once, before anything else reads
@@ -693,7 +734,10 @@ $IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -
 # its id with it, so a later -Resume finds none, and until this run writes its
 # new id its early exits compare with that.
 if (-not ($Resume -or $ResumeFailedOnly)) { $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID) }
-$NewRunId = if ($Resume -or $ResumeFailedOnly) { '' } else { [guid]::NewGuid().ToString() }
+$NewRunId = if ($RunRecord.NewRun) { [string]$RunRecord.RunId } else { '' }
+# A new run starts with nothing completed (see $RunRecord above); the retry
+# list and its counts are kept.
+if ($RunRecord.NewRun) { $CompletedIds = @(); $CompletedReports = @() }
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -837,12 +881,12 @@ elseif ($ResumeFailedOnly)
 # The start line of a run that continues the unfinished run: when it started,
 # how many of the subscriptions in scope are done and past the retry limit, and
 # its settings (Get-RunContinueLine). A new run said so above.
-if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape')
+if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape' -and -not ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0))
 {
     $InScopeIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
     $DoneCount = @($InScopeIds | Where-Object { $CompletedIds -contains $_ }).Count
     $PastLimitCount = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $InScopeIds -contains [string]$_.Id }).Count
-    Write-Host (Get-RunContinueLine -Info $StoredRun -Settings $RunDataSettings -Done $DoneCount -Total $InScopeIds.Count -PastRetryLimit $PastLimitCount) -ForegroundColor Cyan
+    Write-Host (Get-RunContinueLine -Info $StoredRun -Settings $RunDataSettings -Done $DoneCount -Total $InScopeIds.Count -PastRetryLimit $PastLimitCount -ResumeFailedOnly:$ResumeFailedOnly) -ForegroundColor Cyan
 }
 
 # A -Resume run that moved the resume state file aside says what it uses
@@ -943,7 +987,34 @@ if ($ResumeFailedOnly)
             if ($NotReachedIds.Count -eq 0)
             {
                 Write-Host ("Not finished: the run has not ended clean (the resume state file {0} is kept), so its consolidated zip is owed. This mode retries only the retry list and does not build one." -f $ResumeStateFile) -ForegroundColor Yellow
-                Write-Host "  Next: run the same command without -ResumeFailedOnly. It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state." -ForegroundColor Yellow
+                # Which run comes next: one without either switch starts a new run
+                # when the unfinished run is past -ResumeMaxAgeDays (or its start
+                # time cannot be read), so then -Resume. What it collects again:
+                # the completed subscriptions whose report the state does not
+                # record (a file written by an earlier version) cannot be carried.
+                # What a run that continues this one does with each completed
+                # subscription: carries its report when the state records one;
+                # collects it again when the state was written by an earlier
+                # version without report records ($IdsWithoutReports); otherwise
+                # it cannot carry it and ends with exit 2, so the way on is a
+                # new run. Which run continues: one without either switch, or
+                # -Resume past -ResumeMaxAgeDays (a run without either switch
+                # would start a new run then).
+                $Recorded = Get-LatestCompletedReports -Reports $CompletedReports
+                $NoRecord = @($CompletedIds | Where-Object { $_ -and -not $Recorded.ContainsKey([string]$_) })
+                $Recollect = @($NoRecord | Where-Object { @($IdsWithoutReports) -contains $_ })
+                $Uncarried = @($NoRecord | Where-Object { @($IdsWithoutReports) -notcontains $_ })
+                $Aged = $null -ne $StoredRun -and $RunStart.Reason -notin 'legacy', 'stream-only' -and $null -ne (Get-ResumeRunAgeProblem -Info $StoredRun -MaxAgeDays $ResumeMaxAgeDays)
+                if ($Uncarried.Count -gt 0)
+                {
+                    Write-Host ("  Next: {0}. The resume state records no report for {1} completed subscription(s), so a run that continues this one cannot put them into a consolidated zip and ends with exit 2; a new run collects every subscription again." -f (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly $true), $Uncarried.Count) -ForegroundColor Yellow
+                }
+                else
+                {
+                    $NextRun = if ($Aged) { 'run the same command with -Resume in place of -ResumeFailedOnly (the unfinished run is past -ResumeMaxAgeDays, or its start time cannot be read, so a run without either switch would start a new run)' } else { 'run the same command without -ResumeFailedOnly' }
+                    $Effect = if ($Recollect.Count -gt 0) { 'It collects again the {0} subscription(s) whose report the resume state does not record (it was written by an earlier version), puts every report into a new consolidated zip and clears the state once it ends clean.' -f $Recollect.Count } else { 'It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state once it ends clean.' }
+                    Write-Host ("  Next: {0}. {1}" -f $NextRun, $Effect) -ForegroundColor Yellow
+                }
             }
         }
         Exit-Wrapper -Code $(if ($StateKept) { 2 } else { 0 })
@@ -1058,6 +1129,7 @@ if ($ScopeForProbe.Count -gt 0)
     {
         $FailedAttempts = $RoleCheckRetry.FailedAttempts
         $CompletedIds = $RoleCheckRetry.CompletedIds
+        # The write carries this run's record ($RunRecord), a new run's included.
         Update-ResumeStateRetryList -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
     }
     if ($AccessDecision.ShouldBlock)
@@ -1103,16 +1175,14 @@ if ($ScopeForProbe.Count -gt 0)
 # before runs recorded it, or not two dates) gets today's, recorded for the runs
 # after this one; the line says so. A file that was not the right shape was
 # moved aside above, and the run uses today's window, as -Resume did.
-if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape')
+if ($ContinuesRecord)
 {
     if ($null -ne $StoredRun.Window)
     {
-        $ConsumptionWindow = $StoredRun.Window
         Write-Host ("Cost window: {0}, recorded when the run started." -f (Format-ConsumptionWindow -Window $ConsumptionWindow)) -ForegroundColor DarkGray
     }
-    elseif (-not $StoredRun.Legacy)
+    else
     {
-        # A file that records no start time or settings either said so above.
         Write-Host ("WARNING: The resume state file holds no cost window this run can use ({0}), so this run uses today's: {1}. Subscriptions collected earlier in the run may cover other days." -f $StoredRun.WindowProblem, (Format-ConsumptionWindow -Window $ConsumptionWindow)) -ForegroundColor Yellow
     }
 }
@@ -1121,7 +1191,14 @@ $ConsumptionCheckScope = if ($Resume) { @($Subscriptions | Where-Object { -not (
 if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)
 {
     $ConsumptionCheck = Invoke-ConsumptionDataCheck -Subscriptions $ConsumptionCheckScope -RoleCheck $AccessProbed -Window $ConsumptionWindow
-    Write-ConsumptionDataCheckReport -Result $ConsumptionCheck
+    $ConsumptionReportArgs = @{ Result = $ConsumptionCheck }
+    # The run stops here, so the resume state file stays as it is on disk now:
+    # with one there, the next run would continue it with its settings
+    # (Get-RunGoOnCommand).
+    $StateLeft = (-not [string]::IsNullOrEmpty([string]$ResumeStateFile)) -and [bool](Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)
+    $SkipHow = Get-RunGoOnCommand -Switches '-SkipConsumption' -StateKept ([bool]$StateLeft) -ResumeFailedOnly ([bool]$ResumeFailedOnly)
+    $ConsumptionReportArgs.SkipConsumptionLine = if ($StateLeft) { '  3. Or {0} to inventory without consumption data: the resume state file {1} is kept, and a run that continues it keeps its settings.' -f $SkipHow, (Split-Path -Path $ResumeStateFile -Leaf) } else { '  3. Or {0} to inventory without consumption data.' -f $SkipHow }
+    Write-ConsumptionDataCheckReport @ConsumptionReportArgs
     Write-UsageRoleReport -ConsumptionResult $ConsumptionCheck -RoleCheck $AccessProbed
     if ($ConsumptionCheck.ShouldBlock)
     {
@@ -1142,6 +1219,7 @@ if ($ScopeForProbe.Count -gt 0)
     $NotReadableIds = @(@($NotReadableIds | Where-Object { $_ -and $CheckedIds -notcontains [string]$_ }) + $SkippedNotReadable | ForEach-Object { [string]$_ } | Sort-Object -Unique)
     if (($NotReadableIds -join ',') -ne $NotReadableBefore)
     {
+        # The write carries this run's record ($RunRecord).
         Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports -NotReadable $NotReadableIds
     }
 }
@@ -1203,23 +1281,6 @@ $ConsumptionWindowArgs = ConvertTo-ConsumptionWindowArgument -Window $Consumptio
 $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowArgs.ConsumptionWindowStart
 $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowArgs.ConsumptionWindowEnd
 
-# A run that continues one whose file lacks its start time and settings (an
-# earlier version wrote it) or a usable cost window records them now, after
-# every setup stop and before it collects: this run's start time and settings
-# for the first, the window above for the second (the rest kept as stored).
-# Every later save keeps them, so the next run checks against them.
-if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape' -and ($StoredRun.Legacy -or $null -eq $StoredRun.Window))
-{
-    $RunInfo = [ordered]@{}
-    $Fill = New-ResumeRunInfo -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow
-    foreach ($Key in @(Get-ResumeRunInfoKeys))
-    {
-        $IsWindowKey = $Key -like 'ConsumptionWindow*'
-        if ($StoredRun.Legacy -or $IsWindowKey) { $RunInfo[$Key] = $Fill[$Key] }
-        elseif ($StoredRun.Values.Contains($Key)) { $RunInfo[$Key] = $StoredRun.Values[$Key] }
-    }
-    Write-ResumeStateRunInfo -Path $ResumeStateFile -Tenant $TenantID -RunInfo $RunInfo
-}
 
 # Loop through each subscription and run ResourceInventory
 $SkippedCount = 0
@@ -1264,7 +1325,7 @@ if ($ParallelStreams -le 1)
     # === SEQUENTIAL PATH (default) ============================================
     # Original behavior, unchanged. Selected when -ParallelStreams 1 or unset.
     # The new run id, right before collecting (see $NewRunId above).
-    if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; $RunInfo = $NewRunInfo; $CompletedIds = @(); $CompletedReports = @(); Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId -RunInfo $RunInfo -NewRun }
+    if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
     $SubTotal = @($Subscriptions).Count
     $SubIndex = 0
     foreach ($Sub in $Subscriptions)
@@ -1564,7 +1625,7 @@ else
         # process. Process it inline using the same per-sub logic the
         # sequential branch uses, instead of bailing and asking the user to
         # re-run. The new run id first, as in the sequential path.
-        if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; $RunInfo = $NewRunInfo; $CompletedIds = @(); $CompletedReports = @(); Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId -RunInfo $RunInfo -NewRun }
+        if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
         if ($PendingSubscriptions.Count -eq 0)
         {
             Write-Host "Nothing left to process: every eligible subscription was completed by an earlier run." -ForegroundColor Green
@@ -1731,7 +1792,7 @@ else
 
             # The new run id, after the Az context snapshot and the worker
             # check, right before the streams start (see $NewRunId above).
-            if ($NewRunId) { $RunId = $NewRunId; $NewRunId = ''; $RunInfo = $NewRunInfo; $CompletedIds = @(); $CompletedReports = @(); Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -RunId $RunId -RunInfo $RunInfo -NewRun }
+            if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $TenantID -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
 
             # Round-robin split: sub 0 -> stream 0, sub 1 -> stream 1, ..., sub N -> stream (N % StreamCount).
             # This balances the slices regardless of how subscription sizes vary,
@@ -1795,6 +1856,8 @@ else
                     ConsumptionWindowStart = $ConsumptionWindowArgs.ConsumptionWindowStart
                     ConsumptionWindowEnd   = $ConsumptionWindowArgs.ConsumptionWindowEnd
                     RunId              = $RunId
+                    # The run's record, which the stream writes into its state file.
+                    RunRecordJson      = (ConvertTo-Json -InputObject $RunRecord.Info -Depth 4 -Compress)
                 }
                 if ($Resume) { $WorkerArgs.Resume = $true }
                 if ($ResumeFailedOnly) { $WorkerArgs.ResumeFailedOnly = $true }
@@ -2481,7 +2544,10 @@ Write-Host "================ Summary ================" -ForegroundColor Green
 Write-Host ("Subscriptions Visible:   {0}" -f $AllSubscriptions.Count) -ForegroundColor Green
 if ($Excluded.Count -gt 0)
 {
-    Write-Host ("Subscriptions Excluded:  {0} (non-Enabled; use -IncludeDisabled to inventory them)" -f $Excluded.Count) -ForegroundColor Green
+    # Before the resume state is decided below, so the command that works
+    # either way (Get-RunGoOnCommand).
+    $IncludeHow = Get-RunGoOnCommand -Switches '-IncludeDisabled' -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly)
+    Write-Host ("Subscriptions Excluded:  {0} (non-Enabled; {1} to inventory them)" -f $Excluded.Count, $IncludeHow) -ForegroundColor Green
 }
 Write-Host ("Subscriptions Eligible:  {0}" -f $Subscriptions.Count) -ForegroundColor Green
 if ($Resume)
@@ -2694,6 +2760,15 @@ elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
     Write-NotCountedRetrySummary -FailedAttempts $FailedAttempts
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
+    # A subscription whose role check could not finish, or whose two answers
+    # disagree, keeps the state, so every later run continues this one. The way
+    # out when the cause does not go away: a new run.
+    $PendingIds = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $RoleCheckPending = @(if ($null -ne $AccessDecision) { @($AccessDecision.Inaccessible) | Where-Object { $null -ne $_ -and @('Unknown', 'Disagree') -contains [string]$_.State -and $PendingIds -contains [string]$_.Id } })
+    if ($RoleCheckPending.Count -gt 0)
+    {
+        Write-Host ("Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than {0} days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried. To start over instead, {1}." -f $ResumeMaxAgeDays, (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
+    }
 }
 if ($NotCollected.Count -gt 0)
 {

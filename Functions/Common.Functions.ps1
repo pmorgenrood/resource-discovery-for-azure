@@ -1836,6 +1836,24 @@ function Invoke-ConsumptionDataCheck
     return (Resolve-ConsumptionDataCheck -Results $CheckResults.ToArray() -Window $Window -ResourceGroup $ResourceGroup)
 }
 
+# How a person goes on with a changed or added setting ($Switches, for example
+# '-SkipConsumption'), as the command to run next. While a resume state file is
+# or may be left ($StateKept: a run that continues an unfinished run, a new run
+# that has written its state, a run whose end is not known yet, or an early
+# stop with a state file on disk), the next run would continue that run and stop
+# on the changed setting, so it is a new run with -Fresh, which
+# -ResumeFailedOnly does not take. With no state file left, the setting alone.
+# Every 'how to go on' line about a setting uses this, so each command it names
+# runs as stated.
+function Get-RunGoOnCommand
+{
+    param([string]$Switches = '', [bool]$StateKept = $true, [bool]$ResumeFailedOnly)
+    $With = if ($StateKept) { ('-Fresh ' + $Switches).Trim() } else { $Switches.Trim() }
+    if ($ResumeFailedOnly) { return ('run the same command without -ResumeFailedOnly, with {0}' -f $With) }
+    if ($StateKept) { return ('start a new run with {0}' -f $With) }
+    return ('re-run with {0}' -f $With)
+}
+
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
 # every failing subscription with its outcome and the window queried, then the
 # fix. The caller exits with code 1 when $Result.ShouldBlock is $true. A
@@ -1843,7 +1861,12 @@ function Invoke-ConsumptionDataCheck
 # read only: its consumption sheet may still have values.
 function Write-ConsumptionDataCheckReport
 {
-    param([Parameter(Mandatory = $true)]$Result)
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        # The third way to fix a refusal. Run-AllSubscriptions.ps1 passes its own
+        # when the run continues an unfinished run, whose settings it must keep.
+        [string]$SkipConsumptionLine = '  3. Or re-run with -SkipConsumption to inventory without consumption data.'
+    )
     $WindowText = Format-ConsumptionWindow -Window $Result.Window
     $ForRg = Format-ConsumptionCheckTarget -ResourceGroup $Result.ResourceGroup
     $InRg = if ([string]::IsNullOrEmpty($Result.ResourceGroup)) { '' } else { " in resource group '{0}'" -f $Result.ResourceGroup }
@@ -1892,7 +1915,7 @@ function Write-ConsumptionDataCheckReport
     Write-Host 'To fix:' -ForegroundColor Yellow
     Write-Host '  1. Give the signed-in identity Microsoft.Commerce/UsageAggregates/read on each subscription above. The built-in Reader and Billing Reader roles include it; Cost Management Reader does NOT.' -ForegroundColor Yellow
     Write-Host '  2. If the identity already has it: the subscription may be partner-managed (CSP) without cost visibility for this identity, or on an offer the legacy usage API (Get-UsageAggregates) does not serve.' -ForegroundColor Yellow
-    Write-Host '  3. Or re-run with -SkipConsumption to inventory without consumption data.' -ForegroundColor Yellow
+    Write-Host $SkipConsumptionLine -ForegroundColor Yellow
 }
 
 # End-of-run list of the subscriptions the consumption data check passed with

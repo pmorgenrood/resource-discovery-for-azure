@@ -44,7 +44,10 @@ function Exit-Wrapper
     # run id has been read ($OtherRunLineReady); before that no run id is known.
     if ($OtherRunLineReady)
     {
-        Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
+        # Against the run the state file holds now: a new run that has written
+        # its state makes the earlier run's files another run's.
+        $IdOnDisk = Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $TenantID
+        Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $(if ($null -ne $IdOnDisk) { $IdOnDisk } else { $RunId })
     }
     # Then the run lock, after the per-stream files (their clean-up writes the
     # resume state, so the lock must still be held) and before the transcript
@@ -848,7 +851,10 @@ function Save-CompletedSubscriptionIds
     # The id of the run the per-stream state files belong to (Get-ResumeStateRunId).
     # Every save writes it, so a save that is not given it writes the script's
     # $RunId, and the per-stream files of this run keep matching.
-    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = [string](Get-ResumeStateRunList -Name 'RunId') }
+    # This run's record (Get-ResumeStateRunRecord), when the script holds one:
+    # its id and its start time, settings and cost window go into every save.
+    $Record = Get-ResumeStateRunRecord
+    if (-not $PSBoundParameters.ContainsKey('RunId')) { $RunId = if ($null -ne $Record) { [string]$Record.RunId } else { [string](Get-ResumeStateRunList -Name 'RunId') } }
     $State = [pscustomobject]@{
         TenantID                  = $Tenant
         CompletedSubscriptionIds  = @($Ids)
@@ -867,18 +873,10 @@ function Save-CompletedSubscriptionIds
         LastUpdated               = (Get-Date).ToString('o')
     }
     if (-not [string]::IsNullOrEmpty($RunId)) { $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue $RunId }
-    # The start time, settings and cost window of the run: the script's $RunInfo
-    # once the run has written them, otherwise the ones the file holds, kept as
-    # stored, so a save never turns the file into one that records none.
-    # A save that creates the file before a new run has written its run id
-    # (the retry list after the access check) writes that new run's ones.
-    $RunInfo = Get-ResumeStateRunList -Name 'RunInfo'
-    if ($RunInfo -isnot [System.Collections.IDictionary])
-    {
-        $RunInfo = Get-ResumeStateRunInfoValues -Path $Path -Tenant $Tenant
-        $NewRunInfo = Get-ResumeStateRunList -Name 'NewRunInfo'
-        if ($RunInfo.Count -eq 0 -and $NewRunInfo -is [System.Collections.IDictionary] -and -not (Test-Path -LiteralPath $Path -PathType Leaf)) { $RunInfo = $NewRunInfo }
-    }
+    # The start time, settings and cost window: this run's record, or, without
+    # one, the ones the file holds, kept as stored, so a save never turns the
+    # file into one that records none.
+    $RunInfo = if ($null -ne $Record) { $Record.Info } else { Get-ResumeStateRunInfoValues -Path $Path -Tenant $Tenant }
     foreach ($Key in @($RunInfo.Keys)) { $State | Add-Member -NotePropertyName $Key -NotePropertyValue $RunInfo[$Key] -Force }
     try
     {
@@ -1091,14 +1089,74 @@ function Write-StartOfRunId
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Tenant,
-        [Parameter(Mandatory = $true)][string]$RunId,
-        [System.Collections.IDictionary]$RunInfo,
-        [switch]$NewRun
+        [Parameter(Mandatory = $true)][object]$Record,
+        [string[]]$Ids = @(),
+        $FailedAttempts = @(),
+        $Reports = @()
     )
-    Set-ResumeStateRunId -Path $Path -Tenant $Tenant -RunId $RunId -RunInfo $RunInfo -NewRun:$NewRun
-    if ((Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -ne $RunId)
+    $State = $null
+    try
     {
-        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: it does not use this run's per-stream state files, and it may continue an earlier run instead. Once the file can be written, start the next run with -Fresh." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
+        $Read = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($Read -is [System.Management.Automation.PSCustomObject] -and [string]$Read.TenantID -eq $Tenant) { $State = $Read }
+    }
+    catch { $State = $null }
+    # A run that continues one whose file already holds this record writes
+    # nothing here.
+    if ($null -ne $State -and -not $Record.NewRun -and [string](Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -eq [string]$Record.RunId)
+    {
+        $Same = $true
+        foreach ($Key in @($Record.Info.Keys))
+        {
+            $Prop = $State.PSObject.Properties[$Key]
+            if ($null -eq $Prop -or (ConvertTo-Json -InputObject $Prop.Value -Depth 4 -Compress) -ne (ConvertTo-Json -InputObject $Record.Info[$Key] -Depth 4 -Compress)) { $Same = $false; break }
+        }
+        if ($Same) { return }
+    }
+    if ($null -eq $State)
+    {
+        # No file of this tenant (a file moved aside, or a new run's first
+        # write): one from this run's lists.
+        $Latest = Get-LatestCompletedReports -Reports $Reports
+        $State = [pscustomobject]@{
+            TenantID                   = $Tenant
+            CompletedSubscriptionIds   = @($Ids)
+            CompletedReports           = @(foreach ($Id in @($Ids)) { if (-not [string]::IsNullOrWhiteSpace($Id) -and $Latest.ContainsKey($Id)) { $Latest[$Id] } })
+            FailedAttempts             = @($FailedAttempts)
+            NotReadableSubscriptionIds = @()
+        }
+    }
+    elseif ($Record.NewRun)
+    {
+        # A new run: nothing completed. The file keeps every other key it holds
+        # (a version that keeps more lists keeps them).
+        $State | Add-Member -NotePropertyName 'CompletedSubscriptionIds' -NotePropertyValue @() -Force
+        $State | Add-Member -NotePropertyName 'CompletedReports' -NotePropertyValue @() -Force
+    }
+    Add-ResumeRunRecordKeys -State $State -Record $Record -Ids @($State.CompletedSubscriptionIds)
+    $State | Add-Member -NotePropertyName 'LastUpdated' -NotePropertyValue ((Get-Date).ToString('o')) -Force
+    try
+    {
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8 -ErrorAction Stop
+        [System.IO.File]::Move($TmpPath, $Path, $true)
+    }
+    catch
+    {
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
+    }
+    $Back = Read-ResumeRunInfo -Path $Path -Tenant $Tenant
+    $IdOk = [string]::IsNullOrEmpty([string]$Record.RunId) -or (Get-ResumeStateRunId -Path $Path -Tenant $Tenant) -eq [string]$Record.RunId
+    # As dates: the file gives the time back as a date, the record holds text.
+    $Want = ConvertFrom-ResumeRunStartTime -Value $Record.Info['RunStartedAt']
+    $StartOk = $Back.Exists -and $(if ($null -eq $Want) { $null -eq $Back.StartedAt } else { $null -ne $Back.StartedAt -and $Back.StartedAt -eq $Want })
+    if (-not ($IdOk -and $StartOk) -and -not $Record.NewRun)
+    {
+        Write-Host ("WARNING: Could not record this run's start time, settings and cost window in the resume state file {0}. A later write of it in this run records them; until one succeeds, the next run reads the file as it was." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
+    }
+    elseif (-not ($IdOk -and $StartOk))
+    {
+        Write-Host ("WARNING: The resume state file {0} could not be written at the start of this run, so it does not hold this run's id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: when an earlier run's resume state file is there, it continues that run and does not use this run's per-stream state files. Once the file can be written, start the next run with -Fresh." -f (Split-Path -Path $Path -Leaf)) -ForegroundColor Yellow
     }
 }
 
@@ -1231,6 +1289,17 @@ function Read-ResumeRunInfo
     # A file that is not the right shape is moved aside later in the run
     # (Move-WrongShapeResumeStateFile); the run continues as -Resume does then.
     $Info.ShapeProblem = Get-ResumeStateShapeProblem -Record $State -Kind Main
+    Set-ResumeRunInfoFields -Info $Info -State $State
+    return $Info
+}
+
+# Fill $Info (the object Read-ResumeRunInfo returns) from the run record keys a
+# parsed state object ($State: the resume state file, or a per-stream state
+# file) holds: Values, Legacy, StartedAt or StartedAtProblem, Settings or
+# SettingsProblem, Window or WindowProblem. Reads nothing else.
+function Set-ResumeRunInfoFields
+{
+    param([Parameter(Mandatory = $true)][object]$Info, [Parameter(Mandatory = $true)][object]$State)
     foreach ($Key in @(Get-ResumeRunInfoKeys))
     {
         $Prop = $State.PSObject.Properties[$Key]
@@ -1274,15 +1343,189 @@ function Read-ResumeRunInfo
         if ($null -eq $Window) { $Info.WindowProblem = 'it is not two yyyy-MM-dd dates, the start not after the end' }
         else { $Info.Window = $Window }
     }
-    return $Info
 }
+
+# How two run records (as Read-ResumeRunInfo returns them) differ: one
+# { What; Main; Other } for the start time, each setting and the cost window
+# whose values are not the same (a value that cannot be read counts as its own
+# value). Start times are compared as UTC times.
+function Get-ResumeRunRecordDifferences
+{
+    param([Parameter(Mandatory = $true)][object]$Main, [Parameter(Mandatory = $true)][object]$Other)
+    $Found = [System.Collections.Generic.List[object]]::new()
+    $When = { param($Info) if ($null -ne $Info.StartedAt) { $Info.StartedAt.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fffffff', [cultureinfo]::InvariantCulture) + ' UTC' } else { 'a start time that cannot be read' } }
+    $A = & $When $Main; $B = & $When $Other
+    if ($A -ne $B) { $Found.Add([pscustomobject]@{ What = 'the start time'; Main = $A; Other = $B }) }
+    foreach ($Name in @(Get-RunDataSettingNames))
+    {
+        $Value = { param($Info) if ($null -eq $Info.Settings) { 'not readable' } elseif ($Info.Settings[$Name]) { 'on' } else { 'off' } }
+        $A = & $Value $Main; $B = & $Value $Other
+        if ($A -ne $B) { $Found.Add([pscustomobject]@{ What = ('-' + $Name); Main = $A; Other = $B }) }
+    }
+    $Window = { param($Info) if ($null -ne $Info.Window) { Format-ConsumptionWindow -Window $Info.Window } else { 'a cost window that cannot be read' } }
+    $A = & $Window $Main; $B = & $Window $Other
+    if ($A -ne $B) { $Found.Add([pscustomobject]@{ What = 'the cost window'; Main = $A; Other = $B }) }
+    return $Found.ToArray()
+}
+
+# The per-stream state files of the run the resume state file holds (its run
+# id, Test-StreamStateRunId), readable and of the right shape, whose run record
+# is not the one the resume state file records ($Main, from Read-ResumeRunInfo):
+# { File; Differences } (Get-ResumeRunRecordDifferences). Files without a record
+# (written before runs recorded one) are not compared.
+function Get-StreamRecordMismatches
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$RunId = '',
+        [Parameter(Mandatory = $true)][object]$Main
+    )
+    $Found = [System.Collections.Generic.List[object]]::new()
+    foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object Name))
+    {
+        $Obj = Read-StreamResumeStateFile -Path $File.FullName
+        if ($null -eq $Obj -or $null -ne (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)) { continue }
+        if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
+        if ($null -eq $Obj.PSObject.Properties['RunStartedAt'] -and $null -eq $Obj.PSObject.Properties['RunSettings']) { continue }
+        $Info = [pscustomobject]@{ Present = $true; Exists = $true; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
+        Set-ResumeRunInfoFields -Info $Info -State $Obj
+        $Differences = @(Get-ResumeRunRecordDifferences -Main $Main -Other $Info)
+        if ($Differences.Count -gt 0) { $Found.Add([pscustomobject]@{ File = $File.Name; Differences = $Differences }) }
+    }
+    return $Found.ToArray()
+}
+
+# The run record the per-stream state files of this tenant hold, for a run
+# that has no resume state file it can use: none (-MainExists $false), or one
+# that is not the right shape and is moved aside (-MainExists $true, -RunId its
+# run id, '' when it has none). Only readable files of the right shape count.
+# With a resume state file, the files of its run id; without one, the files
+# that carry a record, of the run id whose record started last. Returns
+# { HasRecord; RunId; Files; Conflict; Info }: Info as Read-ResumeRunInfo
+# returns it (Exists set) when the files of that run that carry a record all
+# carry the same one; Conflict lists those files when they do not. A file
+# without a record (written by a version that did not record one) gives none.
+function Read-StreamRunInfo
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [bool]$MainExists,
+        [string]$RunId = ''
+    )
+    $Result = [pscustomobject]@{ HasRecord = $false; RunId = ''; Files = @(); Conflict = @(); Info = $null }
+    $Read = @()
+    foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant | Sort-Object Name))
+    {
+        $Obj = Read-StreamResumeStateFile -Path $File.FullName
+        if ($null -eq $Obj -or $null -ne (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)) { continue }
+        $IdProp = $Obj.PSObject.Properties['RunId']
+        $HasRecord = $null -ne $Obj.PSObject.Properties['RunStartedAt'] -or $null -ne $Obj.PSObject.Properties['RunSettings']
+        $Read += [pscustomobject]@{ Name = $File.Name; RunId = $(if ($null -eq $IdProp) { '' } else { [string]$IdProp.Value }); Obj = $Obj; HasRecord = $HasRecord }
+    }
+    if ($MainExists) { $Run = @($Read | Where-Object { $_.RunId -eq [string]$RunId }) }
+    else
+    {
+        $WithRecord = @($Read | Where-Object { $_.HasRecord })
+        if ($WithRecord.Count -eq 0) { return $Result }
+        # The run whose record started last; one whose start time cannot be read counts as the oldest.
+        $Latest = @($WithRecord | Sort-Object -Property @{ Expression = { $When = ConvertFrom-ResumeRunStartTime -Value $_.Obj.PSObject.Properties['RunStartedAt'].Value; if ($null -eq $When) { [datetime]::MinValue } else { $When } } } -Descending)[0]
+        $Run = @($Read | Where-Object { $_.RunId -eq $Latest.RunId })
+    }
+    $Recorded = @($Run | Where-Object { $_.HasRecord })
+    if ($Recorded.Count -eq 0) { return $Result }
+    $Result.RunId = [string]$Recorded[0].RunId
+    $Result.Files = @($Run | ForEach-Object { $_.Name })
+    $Texts = @($Recorded | ForEach-Object {
+            $One = [ordered]@{}
+            foreach ($Key in @(Get-ResumeRunInfoKeys)) { $P = $_.Obj.PSObject.Properties[$Key]; $One[$Key] = $(if ($null -eq $P) { $null } else { $P.Value }) }
+            ConvertTo-Json -InputObject $One -Depth 4 -Compress
+        } | Sort-Object -Unique)
+    if ($Texts.Count -gt 1)
+    {
+        # Info holds only the latest start time these files record, so the run
+        # can judge its age before it stops for the conflict (Resolve-RunStart).
+        $Result.Conflict = @($Recorded | ForEach-Object { $_.Name })
+        $Starts = @($Recorded | ForEach-Object { ConvertFrom-ResumeRunStartTime -Value $(if ($null -ne $_.Obj.PSObject.Properties['RunStartedAt']) { $_.Obj.PSObject.Properties['RunStartedAt'].Value }) } | Where-Object { $null -ne $_ } | Sort-Object -Descending)
+        $Result.Info = [pscustomobject]@{ Present = $true; Exists = $true; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $(if ($Starts.Count -gt 0) { $Starts[0] } else { $null }); StartedAtProblem = $(if ($Starts.Count -gt 0) { $null } else { 'none of the per-stream state files records one that can be read' }); Settings = $null; SettingsProblem = 'the per-stream state files record different ones'; Window = $null; WindowProblem = 'the per-stream state files record different ones'; Values = [ordered]@{} }
+        return $Result
+    }
+    $Info = [pscustomobject]@{ Present = $true; Exists = $true; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} }
+    Set-ResumeRunInfoFields -Info $Info -State $Recorded[0].Obj
+    $Result.Info = $Info
+    $Result.HasRecord = $true
+    return $Result
+}
+
+# This run's record: { RunId; Info; NewRun }. Every write of the resume state
+# carries it: the run id (none for a run that continues a file without one, so
+# its per-stream files keep matching), and Info, the start time, settings and
+# cost window (New-ResumeRunInfo keys). NewRun: a new run, whose writes start
+# with nothing completed. Built once, where the run decides how it starts
+# ($Start, from Resolve-RunStart), and kept in the script's $RunRecord:
+#   a new run: a new id, this run's start time, settings and window;
+#   a run that continues a file that records them: its id and record as
+#     stored, with $Window as its cost window (the recorded one when it can be
+#     used, which the caller passes);
+#   a run that continues a file from an earlier version, only per-stream files
+#     or a file that is not the right shape (moved aside): the stored id, if
+#     any, with this run's start time, settings and window.
+function New-ResumeRunRecord
+{
+    param(
+        [Parameter(Mandatory = $true)][object]$Start,
+        [Parameter(Mandatory = $true)][object]$StoredRun,
+        [string]$StoredRunId,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Settings,
+        [Parameter(Mandatory = $true)]$Window
+    )
+    $Own = New-ResumeRunInfo -StartedAt $StartedAt -Settings $Settings -Window $Window
+    if ($Start.Mode -ne 'Continue') { return [pscustomobject]@{ RunId = [guid]::NewGuid().ToString(); Info = $Own; NewRun = $true } }
+    if ($Start.Reason -in 'legacy', 'stream-only', 'wrong-shape') { return [pscustomobject]@{ RunId = [string]$StoredRunId; Info = $Own; NewRun = $false } }
+    $Info = [ordered]@{}
+    foreach ($Key in @($StoredRun.Values.Keys)) { $Info[$Key] = $StoredRun.Values[$Key] }
+    $Info['ConsumptionWindowStart'] = $Own['ConsumptionWindowStart']
+    $Info['ConsumptionWindowEnd'] = $Own['ConsumptionWindowEnd']
+    return [pscustomobject]@{ RunId = [string]$StoredRunId; Info = $Info; NewRun = $false }
+}
+
+# The script's $RunRecord (New-ResumeRunRecord), or $null when there is none
+# (the helpers used on their own).
+function Get-ResumeStateRunRecord
+{
+    $Record = Get-ResumeStateRunList -Name 'RunRecord'
+    if ($null -eq $Record -or $null -eq $Record.PSObject.Properties['Info'] -or $Record.Info -isnot [System.Collections.IDictionary]) { return $null }
+    return $Record
+}
+
+# Put the run record ($Record) on a resume state object ($State) that is about
+# to be written: the run id (when it has one) and the Info keys. For a new run,
+# report records are kept only for the completed ids given ($Ids), as
+# Save-CompletedSubscriptionIds keeps them. Does nothing without a record.
+function Add-ResumeRunRecordKeys
+{
+    param([Parameter(Mandatory = $true)][object]$State, [object]$Record, [string[]]$Ids = @())
+    if ($null -eq $Record) { return }
+    if (-not [string]::IsNullOrEmpty([string]$Record.RunId)) { $State | Add-Member -NotePropertyName 'RunId' -NotePropertyValue ([string]$Record.RunId) -Force }
+    foreach ($Key in @($Record.Info.Keys)) { $State | Add-Member -NotePropertyName $Key -NotePropertyValue $Record.Info[$Key] -Force }
+    if ($Record.NewRun -and $null -ne $State.PSObject.Properties['CompletedReports'])
+    {
+        $Keep = @($Ids | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $State | Add-Member -NotePropertyName 'CompletedReports' -NotePropertyValue @(@($State.CompletedReports) | Where-Object { $null -ne $_ -and $Keep -contains [string]$_.Id }) -Force
+    }
+}
+
 
 # Decide how a run starts, from what the resume state file holds (-Info, from
 # Read-ResumeRunInfo), the switches given and this run's settings (-Settings,
 # from Get-RunDataSettings). Prints nothing; returns { Mode; Reason; ExitCode;
 # Lines; Differences }. Mode is Continue (continue the unfinished run, as
-# -Resume does), New (start a new run) or Stop (end with ExitCode before
-# signing in or writing anything). Lines are { Text; Colour } to print now.
+# -Resume does), New (start a new run) or Stop (end with ExitCode before it
+# signs in, collects anything or writes the resume state; the transcript and
+# the run lock are written before, as by every run). Lines are { Text; Colour }
+# to print now.
 # The rules, in order:
 #   -Fresh with -Resume or -ResumeFailedOnly: Stop.
 #   No resume state file but per-stream state files (StreamOnly), without
@@ -1295,8 +1538,8 @@ function Read-ResumeRunInfo
 #     (neither can be checked; the start line says so).
 #   The age, before the settings: the run started more than -MaxAgeDays ago,
 #     its start time cannot be read, or it is more than a day in the future.
-#     Without -Resume or -ResumeFailedOnly: New. With one: a warning, then the
-#     settings.
+#     Without -Resume or -ResumeFailedOnly: New. With one: the settings, and a
+#     warning naming its start date once they match.
 #   The settings cannot be read, or differ from this run's: Stop.
 #   Otherwise: Continue.
 function Resolve-RunStart
@@ -1319,10 +1562,16 @@ function Resolve-RunStart
         [pscustomobject]@{ Mode = $Mode; Reason = $Reason; ExitCode = $Code; Lines = $Lines.ToArray(); Differences = $Differences.ToArray() }
     }
     $Say = { param([string]$Text, [string]$Colour = 'Cyan') $Lines.Add([pscustomobject]@{ Text = $Text; Colour = $Colour }) }
+    # How to start over: -Fresh, which -ResumeFailedOnly does not take.
+    $FreshHow = if ($ResumeFailedOnly) { 'run the same command without -ResumeFailedOnly, with -Fresh,' } else { 'pass -Fresh' }
+    $FreshAgain = if ($ResumeFailedOnly) { 'end this run and run the same command without -ResumeFailedOnly, with -Fresh' } else { 'end this run and start again with -Fresh' }
+    # What a stop before sign-in leaves out. The transcript and the run lock are
+    # written before this decision, as by every run.
+    $NotDone = 'before it signs in, collects anything or writes the resume state'
 
     if ($Fresh -and $Explicit)
     {
-        & $Say ('ERROR: -Fresh starts a new run and {0} continues the unfinished one, so they cannot be used together. This run stops here (exit 1), before it signs in or writes anything.' -f $Switch) 'Red'
+        & $Say ('ERROR: -Fresh starts a new run and {0} continues the unfinished one, so they cannot be used together. This run stops here (exit 1), {1}.' -f $Switch, $NotDone) 'Red'
         & $Say ('  Next: run the same command with only one of them: -Fresh to start over, or {0}.' -f $Switch) 'Yellow'
         return (& $Decide 'Stop' 'fresh-with-resume' 1)
     }
@@ -1331,8 +1580,9 @@ function Resolve-RunStart
     # or settings.
     if (-not $Info.Exists -and $Info.StreamOnly -and -not $Fresh)
     {
-        & $Say 'Per-stream state files of an interrupted parallel run are in the inventory folder, but no resume state file records when that run started, with which settings or which cost window, so this run cannot check them. It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window once it starts collecting.' 'Yellow'
-        & $Say '  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), end this run and start again with -Fresh, so one consolidated zip does not mix them.' 'Yellow'
+        $Goes = if ($ResumeFailedOnly) { 'It reads them as -Resume does. When they hold a retry list it can use, it retries that list, uses its own cost window, and records its own start time, settings and cost window; when one is not the right shape, the retry list is not complete and it stops (see below).' } else { 'It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window once it starts collecting.' }
+        & $Say ('Per-stream state files of an interrupted parallel run are in the inventory folder, but no resume state file records when that run started, with which settings or which cost window, so this run cannot check them. {0}' -f $Goes) 'Yellow'
+        & $Say ('  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), {0}, so one consolidated zip does not mix them.' -f $FreshAgain) 'Yellow'
         return (& $Decide 'Continue' 'stream-only')
     }
     if (-not $Info.Exists)
@@ -1340,7 +1590,7 @@ function Resolve-RunStart
         if ($ResumeFailedOnly)
         {
             $Why = if ($Info.Present) { 'The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant)' } else { 'No resume state file for this tenant is in the inventory folder' }
-            & $Say ('ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. {0}, so there is no retry list. Nothing was collected or written.' -f $Why) 'Red'
+            & $Say ('ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. {0}, so there is no retry list. It did not sign in, collect anything or write the resume state.' -f $Why) 'Red'
             & $Say '  Next: run the same command without -ResumeFailedOnly. It starts a new run that collects every subscription.' 'Yellow'
             return (& $Decide 'Stop' 'nothing-to-retry' 1)
         }
@@ -1352,7 +1602,13 @@ function Resolve-RunStart
         else { & $Say 'Starting a new run.' }
         return (& $Decide 'New' 'none')
     }
+    $FromStreams = $null -ne $Info.PSObject.Properties['RecordSource'] -and $Info.RecordSource -eq 'stream'
     $Started = if ($null -ne $Info.StartedAt) { Format-RunStartTime -Time $Info.StartedAt } else { $null }
+    if ($FromStreams -and -not $Fresh)
+    {
+        $Why = if ($Info.MainShapeProblem) { 'is not the right shape (it is moved aside below)' } else { 'is not in the inventory folder' }
+        & $Say ('The resume state file {0}, so this run checks the start time, settings and cost window that the per-stream state files of the unfinished run record ({1}).' -f $Why, (@($Info.StreamFiles) -join ', ')) 'Yellow'
+    }
     if ($Fresh)
     {
         $Which = if ($Started) { 'started {0}' -f $Started } else { 'in the resume state file' }
@@ -1365,14 +1621,11 @@ function Resolve-RunStart
     if ($Info.Legacy)
     {
         & $Say 'The resume state file was written by an earlier version, which did not record when its run started, with which settings or which cost window, so this run cannot check them. It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window in the file once it starts collecting.' 'Yellow'
-        & $Say '  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), end this run and start again with -Fresh, so one consolidated zip does not mix them.' 'Yellow'
+        & $Say ('  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), {0}, so one consolidated zip does not mix them.' -f $FreshAgain) 'Yellow'
         return (& $Decide 'Continue' 'legacy')
     }
 
-    $AgeProblem = $null
-    if ($null -eq $Info.StartedAt) { $AgeProblem = 'unreadable' }
-    elseif ($Info.StartedAt -gt $Now.AddDays(1)) { $AgeProblem = 'future' }
-    elseif (($Now - $Info.StartedAt).TotalDays -gt $MaxAgeDays) { $AgeProblem = 'old' }
+    $AgeProblem = Get-ResumeRunAgeProblem -Info $Info -MaxAgeDays $MaxAgeDays -Now $Now
     if ($null -ne $AgeProblem)
     {
         $What = switch ($AgeProblem)
@@ -1386,13 +1639,50 @@ function Resolve-RunStart
             & $Say ('{0}; starting a new run. Pass -Resume to continue it anyway.' -f $What) 'Yellow'
             return (& $Decide 'New' 'too-old')
         }
-        & $Say ('WARNING: {0}. This run continues it because {1} was passed; the metrics of the subscriptions it collects cover a later period than those collected earlier in that run.' -f $What, $Switch) 'Yellow'
+        # Said once the settings check below passes, so a run it stops does
+        # not claim to continue; the metrics claim only when metrics are
+        # collected (the settings check makes the stored setting the same).
+        $Later = if ($Settings['SkipMetrics']) { '' } else { '; the metrics of the subscriptions it collects cover a later period than those collected earlier in that run' }
+        $AgeWarning = 'WARNING: {0}. This run continues it because {1} was passed{2}.' -f $What, $Switch, $Later
+    }
+
+    # Per-stream files of the unfinished run that carry different records: the
+    # run cannot tell which one is its own, so it stops (-Fresh starts over).
+    # After the age check, judged by the latest start time they record: a run
+    # without -Resume past the age limit has started a new run above, and the
+    # old per-stream files are another run's.
+    if ($FromStreams -and @($Info.RecordConflict).Count -gt 0 -and -not $Fresh)
+    {
+        & $Say ('ERROR: This run stops here (exit 1), {0}: the per-stream state files of the unfinished run record different start times, settings or cost windows ({1}), so this run cannot check that it collects the same way.' -f $NotDone, (@($Info.RecordConflict) -join ', ')) 'Red'
+        & $Say ('  Next: {0} to start a new run that collects every subscription again.' -f $FreshHow) 'Yellow'
+        return (& $Decide 'Stop' 'stream-records-differ' 1)
+    }
+    # A usable resume state file whose per-stream state files of the same run
+    # record another start time, settings or cost window (StreamMismatch, from
+    # Get-StreamRecordMismatches): one of them was changed or damaged after the
+    # run wrote it, so this run cannot tell which one its earlier subscriptions
+    # were collected with, and stops (-Fresh starts over). After the age check:
+    # a run without -Resume past the age limit has started a new run above, and
+    # the old per-stream files are another run's.
+    $Mismatch = @(if ($null -ne $Info.PSObject.Properties['StreamMismatch']) { $Info.StreamMismatch | Where-Object { $null -ne $_ } })
+    if ($Mismatch.Count -gt 0 -and -not $Fresh)
+    {
+        & $Say ('ERROR: This run stops here (exit 1), {0}: the resume state file and the per-stream state files of the unfinished run no longer record the same start time, settings and cost window ({1}). Only a file that was changed or damaged after the run wrote it can cause this, so this run cannot check that it collects the same way.' -f $NotDone, (@($Mismatch | ForEach-Object { $_.File }) -join ', ')) 'Red'
+        foreach ($Item in $Mismatch)
+        {
+            foreach ($Difference in @($Item.Differences))
+            {
+                & $Say ('  {0}: {1} is {2} there, {3} in the resume state file.' -f $Item.File, $Difference.What, $Difference.Other, $Difference.Main) 'Red'
+            }
+        }
+        & $Say ('  Next: {0} to start a new run that collects every subscription again.' -f $FreshHow) 'Yellow'
+        return (& $Decide 'Stop' 'stream-records-differ-from-main' 1)
     }
 
     if ($null -ne $Info.SettingsProblem)
     {
-        & $Say ('ERROR: This run stops here (exit 1), before it collects or writes anything: the resume state file records the settings of the unfinished run, but they cannot be read ({0}), so this run cannot check that it collects the same way.' -f $Info.SettingsProblem) 'Red'
-        & $Say '  Next: pass -Fresh to start a new run that collects every subscription again.' 'Yellow'
+        & $Say ('ERROR: This run stops here (exit 1), {0}: the resume state file records the settings of the unfinished run, but they cannot be read ({1}), so this run cannot check that it collects the same way.' -f $NotDone, $Info.SettingsProblem) 'Red'
+        & $Say ('  Next: {0} to start a new run that collects every subscription again.' -f $FreshHow) 'Yellow'
         return (& $Decide 'Stop' 'settings-unreadable' 1)
     }
     foreach ($Name in @(Get-RunDataSettingNames))
@@ -1405,15 +1695,16 @@ function Resolve-RunStart
     if ($Differences.Count -gt 0)
     {
         $Which = if ($Started) { ' started {0}' -f $Started } else { '' }
-        & $Say ('ERROR: This run stops here (exit 1), before it collects or writes anything: the unfinished run{0} used other settings than this run, and one consolidated zip must not mix them.' -f $Which) 'Red'
+        & $Say ('ERROR: This run stops here (exit 1), {0}: the unfinished run{1} used other settings than this run, and one consolidated zip must not mix them.' -f $NotDone, $Which) 'Red'
         foreach ($Difference in $Differences)
         {
             $OnOff = { param([bool]$Value) if ($Value) { 'on' } else { 'off' } }
             & $Say ('  -{0}: {1} in the unfinished run, {2} in this run.' -f $Difference.Name, (& $OnOff $Difference.Stored), (& $OnOff $Difference.Given)) 'Red'
         }
-        & $Say ('  Next: run the same command with the unfinished run''s settings ({0}) to continue it, or pass -Fresh to start a new run that collects every subscription again.' -f (Format-RunDataSettings -Settings $Info.Settings)) 'Yellow'
+        & $Say ('  Next: run the same command with the unfinished run''s settings ({0}) to continue it, or {1} to start a new run that collects every subscription again.' -f (Format-RunDataSettings -Settings $Info.Settings), $FreshHow) 'Yellow'
         return (& $Decide 'Stop' 'settings-differ' 1)
     }
+    if ($null -ne $AgeProblem) { & $Say $AgeWarning 'Yellow' }
     return (& $Decide 'Continue' $(if ($null -ne $AgeProblem) { 'old-explicit' } else { 'continue' }))
 }
 
@@ -1421,23 +1712,53 @@ function Resolve-RunStart
 # that a run continuing without a resume state file reads at its start: one
 # with no run id (written before run ids existed, so the startup fold uses it),
 # or one that cannot be read or is not the right shape (the startup fold moves
-# it aside, as -Resume did). With -RecordsOnly (a run without -Resume or
-# -ResumeFailedOnly) only a readable, right-shaped file with no run id counts:
-# one that cannot be used holds no run to continue, and such a run starts a new
-# run, which handles it as before. A file that carries a run id belongs to a run
-# whose resume state file is gone, so no run can continue it; the end of a run
-# names or removes it as another run's.
+# it aside, as -Resume did). -Mode says which other files count: Any (-Resume)
+# counts every file that cannot be used; Parsed (-ResumeFailedOnly) counts one
+# that parses as JSON but is not the right shape, which the startup check moves
+# aside and which stops -ResumeFailedOnly there (its retry list is not
+# complete), but not one that cannot be parsed, which holds no retry list;
+# Records (a run without either switch) counts neither, so such a run starts a
+# new run and handles them as before. A file that carries a run id belongs to a
+# run whose resume state file is gone, so no run can continue it; the end of a
+# run names or removes it as another run's.
 function Test-ResumableStreamStateFiles
 {
-    param([Parameter(Mandatory = $true)][string]$InventoryRoot, [Parameter(Mandatory = $true)][string]$Tenant, [switch]$RecordsOnly)
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [ValidateSet('Any', 'Parsed', 'Records')][string]$Mode = 'Any'
+    )
     foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant))
     {
         $Obj = Read-StreamResumeStateFile -Path $File.FullName
         $Usable = $null -ne $Obj -and $null -eq (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)
-        if (-not $Usable -and -not $RecordsOnly) { return $true }
-        if ($Usable -and (Test-StreamStateRunId -State $Obj -RunId '')) { return $true }
+        if ($Usable)
+        {
+            if (Test-StreamStateRunId -State $Obj -RunId '') { return $true }
+            continue
+        }
+        if ($Mode -eq 'Any') { return $true }
+        if ($Mode -eq 'Parsed')
+        {
+            $Parsed = $null
+            try { $Parsed = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $Parsed = $null }
+            if ($null -ne $Parsed) { return $true }
+        }
     }
     return $false
+}
+
+# Why a run without -Resume or -ResumeFailedOnly does not continue the run
+# $Info (from Read-ResumeRunInfo) for its age: 'old' (it started more than
+# $MaxAgeDays days ago), 'future' (more than a day ahead), 'unreadable' (no
+# start time can be read), or $null when its age lets it continue.
+function Get-ResumeRunAgeProblem
+{
+    param([Parameter(Mandatory = $true)][object]$Info, [int]$MaxAgeDays = 7, [datetime]$Now = [datetime]::UtcNow)
+    if ($null -eq $Info.StartedAt) { return 'unreadable' }
+    if ($Info.StartedAt -gt $Now.AddDays(1)) { return 'future' }
+    if (($Now - $Info.StartedAt).TotalDays -gt $MaxAgeDays) { return 'old' }
+    return $null
 }
 
 # The start line of a run that continues an unfinished run: when it started,
@@ -1450,47 +1771,19 @@ function Get-RunContinueLine
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Settings,
         [int]$Done,
         [int]$Total,
-        [int]$PastRetryLimit
+        [int]$PastRetryLimit,
+        # -ResumeFailedOnly does not take -Fresh: say to run without it.
+        [switch]$ResumeFailedOnly
     )
     $Counts = '{0} of {1} subscriptions done' -f $Done, $Total
     if ($PastRetryLimit -gt 0) { $Counts += (', {0} past the retry limit' -f $PastRetryLimit) }
     $Lead = if ($null -ne $Info.StartedAt) { 'Continuing the run started {0} ({1})' -f (Format-RunStartTime -Time $Info.StartedAt), $Counts }
     elseif ($Info.Legacy) { 'Continuing the unfinished run (its start time is not recorded; {0})' -f $Counts }
     else { 'Continuing the unfinished run (its start time cannot be read; {0})' -f $Counts }
-    return ('{0}. Settings: {1}. Pass -Fresh to start over.' -f $Lead, (Format-RunDataSettings -Settings $Settings))
+    $Over = if ($ResumeFailedOnly) { 'To start over, run the same command without -ResumeFailedOnly, with -Fresh.' } else { 'Pass -Fresh to start over.' }
+    return ('{0}. Settings: {1}. {2}' -f $Lead, (Format-RunDataSettings -Settings $Settings), $Over)
 }
 
-# Write the start time, settings and cost window of the run ($RunInfo) into the
-# resume state file for $Tenant, keeping every other key it holds. For a run
-# that continues one whose file lacks them. Atomic like
-# Save-CompletedSubscriptionIds; a failed write prints a warning and the run
-# goes on (the next run reads the file as it was).
-function Write-ResumeStateRunInfo
-{
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Tenant,
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$RunInfo
-    )
-    # No file yet (a run that continues from per-stream state files only): the
-    # run's saves write the keys with the rest.
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
-    try
-    {
-        $State = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if ($State -isnot [System.Management.Automation.PSCustomObject] -or [string]$State.TenantID -ne $Tenant) { return }
-        foreach ($Key in @($RunInfo.Keys)) { $State | Add-Member -NotePropertyName $Key -NotePropertyValue $RunInfo[$Key] -Force }
-        $State | Add-Member -NotePropertyName 'LastUpdated' -NotePropertyValue ((Get-Date).ToString('o')) -Force
-        $TmpPath = "$Path.tmp"
-        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8 -ErrorAction Stop
-        [System.IO.File]::Move($TmpPath, $Path, $true)
-    }
-    catch
-    {
-        Write-Host ("WARNING: Could not record this run's start time, settings and cost window in the resume state file {0}: {1}" -f (Split-Path -Path $Path -Leaf), $_.Exception.Message) -ForegroundColor Yellow
-        Remove-ResumeStateTempPath -Path "$Path.tmp"
-    }
-}
 
 # True when a per-stream state file ($State, as Read-StreamResumeStateFile
 # returns it) belongs to the run with id $RunId: its RunId is the same, or
@@ -2062,6 +2355,9 @@ function Update-ResumeStateRetryList
     }
     $State | Add-Member -NotePropertyName CompletedSubscriptionIds -NotePropertyValue @($Ids) -Force
     $State | Add-Member -NotePropertyName FailedAttempts -NotePropertyValue @($FailedAttempts) -Force
+    # This run's record goes into the same write, so the file never pairs this
+    # run's lists with the record of the run it replaces (Add-ResumeRunRecordKeys).
+    Add-ResumeRunRecordKeys -State $State -Record (Get-ResumeStateRunRecord) -Ids $Ids
     $State | Add-Member -NotePropertyName LastUpdated -NotePropertyValue (Get-Date).ToString('o') -Force
     try
     {
@@ -3646,24 +3942,38 @@ function Read-StreamState
 function Write-StreamState
 {
     param([string]$Path, [string[]]$Completed, $FailedAttempts = @(), $Reports = @())
+    $State = [ordered]@{
+        Tenant         = $TenantID
+        StreamId       = $StreamId
+        # The run this file belongs to (Test-StreamStateRunId).
+        RunId          = $RunId
+    }
+    # The run's record (start time, settings, cost window), as the parent run
+    # passed it ($StreamRunRecord), in the same write as the lists, so a run
+    # that continues from this file can check them (Read-StreamRunInfo).
+    $Record = Get-Variable -Name 'StreamRunRecord' -ValueOnly -ErrorAction SilentlyContinue
+    if ($Record -is [System.Management.Automation.PSCustomObject])
+    {
+        foreach ($Key in @(Get-ResumeRunInfoKeys)) { $P = $Record.PSObject.Properties[$Key]; if ($null -ne $P) { $State[$Key] = $P.Value } }
+    }
+    $State.Completed = $Completed
+    # Remove-FailedAttempt returns nothing once the list is empty, and
+    # @($null) is a one-entry array; drop that entry so the file holds only
+    # real failure records.
+    $State.FailedAttempts = @($FailedAttempts | Where-Object { $_ })
+    $State.Reports = @($Reports)
     try
     {
-        @{
-            Tenant         = $TenantID
-            StreamId       = $StreamId
-            # The run this file belongs to (Test-StreamStateRunId).
-            RunId          = $RunId
-            Completed      = $Completed
-            # Remove-FailedAttempt returns nothing once the list is empty, and
-            # @($null) is a one-entry array; drop that entry so the file holds
-            # only real failure records.
-            FailedAttempts = @($FailedAttempts | Where-Object { $_ })
-            Reports        = @($Reports)
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
+        # Through a sibling temporary file and a replace, as the resume state
+        # file is written: a write cut short leaves the earlier file whole.
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8 -ErrorAction Stop
+        [System.IO.File]::Move($TmpPath, $Path, $true)
     }
     catch
     {
         Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $_.Exception.Message) 'Yellow'
+        Remove-ResumeStateTempPath -Path "$Path.tmp"
     }
 }
 

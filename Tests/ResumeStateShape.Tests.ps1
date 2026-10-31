@@ -982,7 +982,7 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         $R1.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
         script:Get-MovedAside | Should -BeNullOrEmpty
-        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. Nothing was collected or written.'
+        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. It did not sign in, collect anything or write the resume state.'
         script:Get-Calls | Should -BeNullOrEmpty
         [System.IO.File]::ReadAllText($script:State) | Should -Be $Text
     }
@@ -1698,14 +1698,34 @@ Describe 'Wrapper end to end: a per-stream state file that cannot be read and ca
         $Seeded = script:Write-StreamText -Text '{"Completed": ["sub-a"], "FailedAt'
         $StreamPath = Join-Path $script:Root $script:Stream0Name
         $Before = script:Get-RootSnapshot
+        $Used = $Switch
+        if ($Switch -eq '-ResumeFailedOnly')
+        {
+            # With no resume state file, a per-stream file that cannot be parsed
+            # holds no retry list, so -ResumeFailedOnly has no run to retry: it
+            # stops before it reads the file, and leaves it as it is.
+            foreach ($N in 1, 2)
+            {
+                $R = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams
+                $R.ExitCode | Should -Be 1
+                @($R.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry.*' }).Count | Should -Be 1
+                script:Get-UnreadableStopLines $R | Should -BeNullOrEmpty
+                script:Get-Calls | Should -BeNullOrEmpty
+                Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+                script:Get-RootSnapshot | Should -Be $Before
+                $R.Error | Should -BeNullOrEmpty
+            }
+            # The -Resume that follows reads it and stops as below.
+            $Used = '-Resume'
+        }
         foreach ($N in 1, 2)
         {
-            $R = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams
+            $R = script:Invoke-Wrapper -Arguments $Used -Streams $Streams
             $R.ExitCode | Should -Be 1
             script:Get-UnreadableStopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} could not be read, and it could not be moved aside: The process cannot access the file *' -f $script:Stream0Name)
             $R.Text | Should -Contain $script:StopStart
             $R.Text | Should -Contain $script:LaterUnreadable
-            $R.Text | Should -Contain $(if ($Switch -eq '-ResumeFailedOnly') { $script:ThenResume } else { $script:ThenSame })
+            $R.Text | Should -Contain $(if ($Used -eq '-ResumeFailedOnly') { $script:ThenResume } else { $script:ThenSame })
             script:Get-RemoveCommand $R | Should -Be @("Remove-Item -LiteralPath '{0}' -Force" -f $StreamPath)
             @($R.Text | Where-Object { $_ -like '*finds it again*' }) | Should -BeNullOrEmpty
             $R.Text | Should -Not -Contain 'Resume state cleared (clean run).'

@@ -269,7 +269,7 @@ function global:Compress-Archive
     # The automatic stream count is 2 on a host with 4 logical processors.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
     # The warning of a run without -Resume whose first write of the resume state fails ({0}: the tenant).
-    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may continue an earlier run instead. Once the file can be written, start the next run with -Fresh.'
+    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: when an earlier run''s resume state file is there, it continues that run and does not use this run''s per-stream state files. Once the file can be written, start the next run with -Fresh.'
 
     # A fresh home (its InventoryReports folder is the run's inventory root) and
     # scenario for each test.
@@ -529,6 +529,44 @@ function global:Compress-Archive
         $null = script:Invoke-Wrapper -Streams 3 -EndWhen { (script:Test-Hanging 'D', 'E', 'F') -and ((script:Get-StreamCompletedIds) -join ',') -eq $Expected }
         @(script:Get-StreamFiles).Count | Should -Be 3
     }
+    # The strict-mode errors older code prints on the paths these tests run: the
+    # file and the start of the source line each error quotes. Any other
+    # error fails the strict-mode test (Get-UnknownStrictErrors). The same list
+    # as Tests/ResumeByDefault.Tests.ps1.
+    $script:KnownStrictErrors = @(
+        'Common.Functions.ps1|if ($RoleRecord.Failed)'
+        'Common.Functions.ps1|if ($CheckResult.Failed)'
+        'Run-AllSubscriptions.ps1|if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($ConsumptionFailures.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($MetricsFailures.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($CollectorFailuresList.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($ConsumptionAuthSkipped.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($MetricsAuthSkipped.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if ($FailedAttempts.Count -eq 0)'
+        'Run-AllSubscriptions.ps1|if ($ScopeForProbe.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)'
+        'Run-AllSubscriptions.ps1|elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)'
+    )
+    # Every strict-mode error a run printed on stderr, as '<file>|<source line>',
+    # and every collection error on stdout other than the exit code read after
+    # each subscription (older code), that is not on the known list.
+    function script:Get-UnknownStrictErrors
+    {
+        param($Run)
+        $Found = [System.Collections.Generic.List[string]]::new()
+        $File = $null
+        foreach ($Line in @(([string]$Run.Error) -split "`r?`n"))
+        {
+            $Plain = $Line -replace "`e\[[0-9;]*m", ''
+            if ($Plain -match '^\S+Exception: (.+):(\d+)\s*$' -or $Plain -match '^\S+: (/.+\.ps1):(\d+)\s*$') { $File = Split-Path -Path $Matches[1] -Leaf; continue }
+            if ($null -ne $File -and $Plain -match '^\s*\d+ \|\s(.*)$') { $Found.Add(('{0}|{1}' -f $File, $Matches[1].Trim().TrimEnd([char]0x2026).TrimEnd())); $File = $null }
+        }
+        foreach ($Line in @($Run.Text | Where-Object { $_ -match '^(\[stream-\d+\] )?ERROR processing subscription ' }))
+        {
+            if ($Line -notmatch "The variable '\`$LASTEXITCODE' cannot be retrieved because it has not been set\.$") { $Found.Add('stdout|' + $Line) }
+        }
+        @($Found | Where-Object { $E = $_; @($script:KnownStrictErrors | Where-Object { $E -eq $_ -or $E.StartsWith($_) -or $_.StartsWith($E) }).Count -eq 0 })
+    }
 }
 
 AfterAll {
@@ -708,7 +746,7 @@ Describe 'A one-stream run that clears the resume state deletes the per-stream f
         }
         else
         {
-            $R2.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. Nothing was collected or written.'
+            $R2.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. It did not sign in, collect anything or write the resume state.'
             script:Get-Collected $R2 | Should -BeNullOrEmpty
             $R2.ExitCode | Should -Be 1
         }
@@ -1240,7 +1278,15 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         $Lines[0] | Should -BeIn @(($Lead + ($Names -join ', ')), ($Lead + ($Names[1], $Names[0] -join ', ')))
         script:Test-CleanLine $R1 | Should -BeFalse
 
-        # Run 2, writable: the stream files are recovered, nothing is left to collect, everything is removed.
+        # A stream writes its state file through a temporary file in the same
+        # folder, so a stream whose last write came after the root became
+        # read-only could not record its last subscription: that file keeps the
+        # earlier record, whole, and the stream named the failed write.
+        $InFiles = @(script:Get-StreamCompletedIds)
+        $Missing = @(script:Get-Ids 'A', 'B', 'C', 'D' | Where-Object { $InFiles -notcontains $_ })
+        @($R1.Text | Where-Object { $_ -match '^\[stream-\d+\] WARNING: failed to persist stream state to ' }).Count | Should -Be $Missing.Count
+
+        # Run 2, writable: the stream files are recovered, what they do not record is collected, everything is removed.
         & chmod 755 $script:Root
         # The read-only folder also refused the removal of R1's own run lock, and
         # R1 printed the command that removes it. The lock is never taken over,
@@ -1250,9 +1296,9 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         & ([scriptblock]::Create($Remove[0]))
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
-        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 4 completed, 0 failed subscription record(s).')
-        script:Get-Collected $R2 | Should -BeNullOrEmpty
-        $R2.Text | Should -Contain 'Nothing left to process: every eligible subscription was completed by an earlier run.'
+        script:Get-RecoveryLines $R2 | Should -Be @(('Recovered per-stream state from an interrupted parallel run: {0} completed, 0 failed subscription record(s).' -f $InFiles.Count))
+        script:Get-Collected $R2 | Should -Be $Missing
+        if ($Missing.Count -eq 0) { $R2.Text | Should -Contain 'Nothing left to process: every eligible subscription was completed by an earlier run.' }
         script:Test-CleanLine $R2 | Should -BeTrue
         script:Read-State | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
@@ -1517,7 +1563,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 
-    It 'a start-of-run write that fails says what a later -Resume does, and that -Resume collects those subscriptions again' {
+    It 'a start-of-run write that fails says what a later run may not see; with no resume state file, the next -Resume continues the run from its per-stream record' {
         # Run 1, two streams, interrupted after A, while every write of the resume state fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B', 'C' -BlockStateWrite
         $R1 = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'B', 'C') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
@@ -1525,14 +1571,16 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Read-StateFile | Should -BeNullOrEmpty
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
 
-        # Run 2, writes work: A is collected again; run 1's files are not used,
-        # and run 2 ends clean, so it removes them.
+        # Run 2, writes work: there is no resume state file, and each stream file
+        # carries run 1's id and record, so run 2 continues run 1 from them: A is
+        # skipped, the rest is collected, and run 2 ends clean, removing them.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
-        script:Get-RecoveryLines $R2 | Should -BeNullOrEmpty
+        $R2.Text | Should -Contain ('The resume state file is not in the inventory folder, so this run checks the start time, settings and cost window that the per-stream state files of the unfinished run record ({0}).' -f ($Names -join ', '))
+        script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 0 failed subscription record(s).')
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C', 'D')
         script:Test-CleanLine $R2 | Should -BeTrue
-        @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
+        @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
 
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
@@ -1709,13 +1757,23 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $Entries | Should -Not -Contain (Split-Path -Path $Old -Leaf)
     }
 
-    It 'a run without -Resume adds no strict-mode error with its run id' {
+    It 'a run without -Resume adds no strict-mode error with its run id: every error it prints is on a known line of older code (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
         script:Set-Scenario -Subs 'A', 'B'
-        $R = script:Invoke-Wrapper -Streams 1 -StrictMode
-        $R.ExitCode | Should -Be 0
+        $R = script:Invoke-Wrapper -Streams $Streams -StrictMode
+        # Older code on this path prints strict-mode errors (the role check, the
+        # exit code read after each subscription, the end-of-run summary), which
+        # also change the exit code, so the exit code is not asserted here.
         script:Get-Collected $R | Should -Be (script:Get-Ids 'A', 'B')
-        # The source lines quoted by every error the run printed.
-        @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunId|OtherRunStreamFiles|OtherRunAtMerge|OtherRunLineReady' }) | Should -BeNullOrEmpty
+        script:Get-UnknownStrictErrors $R | Should -BeNullOrEmpty
+    }
+
+    It 'the strict-mode check reports an error on a line it does not know, and not one on a known line' {
+        $Unknown = [pscustomobject]@{ Text = @(); Error = "PropertyNotFoundException: /x/tool/Run-AllSubscriptions.ps1:661`nLine |`n 661 |  if (`$RunId.Missing) { }`n     |      ~~~~~~`n" }
+        @(script:Get-UnknownStrictErrors $Unknown) | Should -Be @('Run-AllSubscriptions.ps1|if ($RunId.Missing) { }')
+        $Known = [pscustomobject]@{ Text = @(); Error = "PropertyNotFoundException: /x/tool/Functions/Common.Functions.ps1:942`nLine |`n 942 |          if (`$RoleRecord.Failed)`n     |              ~~~~~`n" }
+        script:Get-UnknownStrictErrors $Known | Should -BeNullOrEmpty
+        $Stdout = [pscustomobject]@{ Text = @('ERROR processing subscription Sub A: The property ''RunId'' cannot be found on this object.'); Error = '' }
+        @(script:Get-UnknownStrictErrors $Stdout).Count | Should -Be 1
     }
 }
 

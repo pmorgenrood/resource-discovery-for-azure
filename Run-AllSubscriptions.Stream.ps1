@@ -62,7 +62,10 @@ param (
     [string] $ConsumptionWindowEnd,
     # The parent run's id: written into this stream's state file, and an
     # existing file is read on -Resume only when it carries the same id.
-    [string] $RunId = ''
+    [string] $RunId = '',
+    # The parent run's record (start time, settings, cost window) as JSON:
+    # written into this stream's state file with its lists (Write-StreamState).
+    [string] $RunRecordJson = ''
 )
 
 # ---------------------------------------------------------------------------
@@ -78,6 +81,14 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
     exit 1
 }
 . $FunctionsFile
+
+# The parent run's record for Write-StreamState; a stream started without one
+# writes none.
+$StreamRunRecord = $null
+if (-not [string]::IsNullOrWhiteSpace($RunRecordJson))
+{
+    try { $StreamRunRecord = $RunRecordJson | ConvertFrom-Json -ErrorAction Stop } catch { $StreamRunRecord = $null }
+}
 
 # Tag used to prefix all stdout lines so the parent wrapper can demultiplex
 # interleaved output across streams.

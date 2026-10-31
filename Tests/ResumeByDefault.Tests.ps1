@@ -8,9 +8,10 @@
 #     the earlier run's completed subscriptions.
 #   - A run whose settings (-Obfuscate, -SkipMetrics, -SkipConsumption,
 #     -IncludeDisabled) differ from the unfinished run's, or whose recorded
-#     settings cannot be read, stops with exit 1 before it collects or writes
-#     anything, and stops the same way again; the same settings continue it and
-#     -Fresh starts over.
+#     settings cannot be read, stops with exit 1 before it signs in, collects
+#     anything or writes the resume state (it leaves only its transcript, and
+#     releases its run lock), and stops the same way again; the same settings
+#     continue it and -Fresh starts over.
 #   - The age is checked before the settings: an unfinished run older than
 #     -ResumeMaxAgeDays (7 by default), or whose start time cannot be read, is
 #     not continued by a run without -Resume, which starts a new run; -Resume
@@ -252,7 +253,7 @@ function global:Compress-Archive
     # The automatic stream count is 2 on a host with 4 logical processors.
     $script:FourCpu = @{ DOTNET_PROCESSOR_COUNT = '4' }
     # The warning of a run without -Resume whose first write of the resume state fails ({0}: the tenant).
-    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: it does not use this run''s per-stream state files, and it may continue an earlier run instead. Once the file can be written, start the next run with -Fresh.'
+    $script:StartWriteWarning = 'WARNING: The resume state file .resume-state-{0}.json could not be written at the start of this run, so it does not hold this run''s id. Unless a later write of it in this run succeeds, a later run may not see what this run completed or failed: when an earlier run''s resume state file is there, it continues that run and does not use this run''s per-stream state files. Once the file can be written, start the next run with -Fresh.'
 
     # A fresh home (its InventoryReports folder is the run's inventory root) and
     # scenario for each test.
@@ -523,17 +524,34 @@ function global:Compress-Archive
     function script:Get-UsagePaths { @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'usage-*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName }) }
     function script:Clear-Calls { Get-ChildItem -LiteralPath $script:CaseHome -File | Where-Object { $_.Name -like 'call-*.log' -or $_.Name -like 'usage-*.log' } | Remove-Item -Force }
 
-    # Set (or, with a $null value, remove) keys of the resume state file.
+    # Set (or, with a $null value, remove) keys of the resume state file. A run
+    # record key (start time, settings, cost window) is set the same way in the
+    # per-stream state files of the same run that carry a record, as the run
+    # would have written them, unless -MainOnly.
     function script:Set-StateKeys
     {
-        param([hashtable]$Keys)
+        param([hashtable]$Keys, [switch]$MainOnly)
         $Raw = Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json
-        foreach ($Key in $Keys.Keys)
-        {
-            if ($null -eq $Keys[$Key]) { $Raw.PSObject.Properties.Remove($Key) }
-            else { $Raw | Add-Member -NotePropertyName $Key -NotePropertyValue $Keys[$Key] -Force }
+        $Apply = {
+            param($Obj, [string[]]$Only)
+            foreach ($Key in $Keys.Keys)
+            {
+                if ($Only -and $Only -notcontains $Key) { continue }
+                if ($null -eq $Keys[$Key]) { $Obj.PSObject.Properties.Remove($Key) }
+                else { $Obj | Add-Member -NotePropertyName $Key -NotePropertyValue $Keys[$Key] -Force }
+            }
         }
+        & $Apply $Raw $null
         $Raw | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:State -Encoding utf8
+        if ($MainOnly) { return }
+        $RecordKeys = @('RunStartedAt', 'RunSettings', 'ConsumptionWindowStart', 'ConsumptionWindowEnd')
+        foreach ($File in @(script:Get-StreamFiles))
+        {
+            $Obj = Get-Content -LiteralPath $File.FullName -Raw | ConvertFrom-Json
+            if ([string]$Obj.RunId -ne [string]$Raw.RunId -or $null -eq $Obj.PSObject.Properties['RunSettings']) { continue }
+            & $Apply $Obj $RecordKeys
+            $Obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $File.FullName -Encoding utf8
+        }
     }
 
     # The start time the resume state file records, as the start line shows it.
@@ -652,15 +670,17 @@ Describe 'A run whose settings differ from the unfinished run''s stops before it
     BeforeEach { script:New-Case }
     AfterEach { script:Write-FailedCaseRuns }
 
-    It 'names the setting, writes nothing, and stops the same way again; the same settings continue (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+    It 'names the setting, does not sign in, collect or write the resume state, leaves only its transcript and releases its lock, and stops the same way again; the same settings continue (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
         script:Invoke-InterruptedRun -Streams $Streams -Arguments '-Obfuscate'
         $Started = script:Get-StateStartText
         $Before = Get-Content -LiteralPath $script:State -Raw
-        $FilesBefore = @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike 'RunAllSubscriptions_transcript_*' -and $_.Name -notlike '.run-lock-*' } | ForEach-Object { $_.FullName } | Sort-Object)
+        # Every file but a run lock, with its content: the killed run's lock was removed with the command its stop prints, and each run here releases its own.
+        $Snapshot = { @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike '.run-lock-*' } | ForEach-Object { '{0}|{1}' -f $_.FullName, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } | Sort-Object) }
+        $FilesBefore = & $Snapshot
         script:Clear-Calls
 
         $Expected = @(
-            ('ERROR: This run stops here (exit 1), before it collects or writes anything: the unfinished run started {0} used other settings than this run, and one consolidated zip must not mix them.' -f $Started)
+            ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the unfinished run started {0} used other settings than this run, and one consolidated zip must not mix them.' -f $Started)
             '  -Obfuscate: on in the unfinished run, off in this run.'
             '  Next: run the same command with the unfinished run''s settings (-Obfuscate) to continue it, or pass -Fresh to start a new run that collects every subscription again.'
         )
@@ -672,7 +692,17 @@ Describe 'A run whose settings differ from the unfinished run''s stops before it
             script:Get-Calls | Should -BeNullOrEmpty
             script:Get-UsagePaths | Should -BeNullOrEmpty -Because 'the stop comes before the up-front checks'
             Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
-            @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike 'RunAllSubscriptions_transcript_*' -and $_.Name -notlike '.run-lock-*' } | ForEach-Object { $_.FullName } | Sort-Object) | Should -Be $FilesBefore
+            # What the stop leaves out: no sign-in, no collection, no resume-state
+            # write. What it writes, as every run does: its transcript, and the
+            # run lock, released at the stop.
+            @($R.Text | Where-Object { $_ -like 'Existing session detected*' -or $_ -like 'Subscriptions visible:*' }) | Should -BeNullOrEmpty
+            $FilesNow = & $Snapshot
+            @($FilesBefore | Where-Object { $FilesNow -notcontains $_ }) | Should -BeNullOrEmpty -Because 'no file is changed or removed'
+            $Added = @($FilesNow | Where-Object { $FilesBefore -notcontains $_ })
+            $Added.Count | Should -Be 1
+            $Added[0] | Should -BeLike '*RunAllSubscriptions_transcript_*'
+            $FilesBefore = $FilesNow
+            @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter '.run-lock-*') | Should -BeNullOrEmpty
         }
 
         # With -Obfuscate it continues: every subscription collected masked.
@@ -715,7 +745,7 @@ Describe 'A run whose settings differ from the unfinished run''s stops before it
         {
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 1
-            $R.Text | Should -Contain ('ERROR: This run stops here (exit 1), before it collects or writes anything: the resume state file records the settings of the unfinished run, but they cannot be read ({0}), so this run cannot check that it collects the same way.' -f $Problem)
+            $R.Text | Should -Contain ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the resume state file records the settings of the unfinished run, but they cannot be read ({0}), so this run cannot check that it collects the same way.' -f $Problem)
             Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
         }
         $R3 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
@@ -859,11 +889,12 @@ Describe '-ResumeFailedOnly with no unfinished run, and -Fresh with -Resume' -Sk
         {
             $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
             $R.ExitCode | Should -Be 1
-            $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. Nothing was collected or written.'
+            $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. It did not sign in, collect anything or write the resume state.'
             $R.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly. It starts a new run that collects every subscription.'
             $R.Text | Should -Not -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
             script:Get-Collected $R | Should -BeNullOrEmpty
             Test-Path -LiteralPath $script:State | Should -BeFalse
+            @($R.Text | Where-Object { $_ -like 'Existing session detected*' -or $_ -like 'Subscriptions visible:*' }) | Should -BeNullOrEmpty -Because 'the stop comes before sign-in'
         }
         $R3 = script:Invoke-Wrapper -Streams 1
         $R3.ExitCode | Should -Be 0
@@ -876,16 +907,16 @@ Describe '-ResumeFailedOnly with no unfinished run, and -Fresh with -Resume' -Sk
         Set-Content -LiteralPath $script:State -Value $Content -NoNewline
         $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         $R.ExitCode | Should -Be 1
-        $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. Nothing was collected or written.'
+        $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. It did not sign in, collect anything or write the resume state.'
         script:Get-Collected $R | Should -BeNullOrEmpty
     }
 
-    It '-Fresh with <Other> stops with exit 1 before anything is read or written' -ForEach @(@{ Other = '-Resume' }, @{ Other = '-ResumeFailedOnly' }) {
+    It '-Fresh with <Other> stops with exit 1 before it signs in, collects anything or writes the resume state' -ForEach @(@{ Other = '-Resume' }, @{ Other = '-ResumeFailedOnly' }) {
         script:Invoke-InterruptedRun -Streams 1
         $Before = Get-Content -LiteralPath $script:State -Raw
         $R = script:Invoke-Wrapper -Arguments '-Fresh', $Other -Streams 1
         $R.ExitCode | Should -Be 1
-        $R.Text | Should -Contain ('ERROR: -Fresh starts a new run and {0} continues the unfinished one, so they cannot be used together. This run stops here (exit 1), before it signs in or writes anything.' -f $Other)
+        $R.Text | Should -Contain ('ERROR: -Fresh starts a new run and {0} continues the unfinished one, so they cannot be used together. This run stops here (exit 1), before it signs in, collects anything or writes the resume state.' -f $Other)
         script:Get-Collected $R | Should -BeNullOrEmpty
         Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
     }
@@ -896,7 +927,7 @@ Describe '-ResumeFailedOnly with no unfinished run, and -Fresh with -Resume' -Sk
         $Started = script:Get-StateStartText
         script:Set-Scenario -Subs 'A', 'B', 'C'
         $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
-        script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 3 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+        script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 3 subscriptions done). Settings: {1}. To start over, run the same command without -ResumeFailedOnly, with -Fresh.' -f $Started, $script:DefaultSettingsText))
         script:Get-Collected $R | Should -Be (script:Get-Ids 'B')
     }
 }
@@ -930,17 +961,66 @@ Describe 'A resume state file written before runs recorded their start time and 
 }
 
 Describe 'Resume by default under strict mode' -Skip:$IsWindows {
+    BeforeAll {
+        # The strict-mode errors that older code on these paths prints (the role
+        # check, the consumption check, the end-of-run summary): each is the file
+        # and the start of the source line the error quotes. Any other error,
+        # whatever variable it names, fails the test.
+        $script:KnownStrictErrors = @(
+            'Common.Functions.ps1|if ($RoleRecord.Failed)'
+            'Common.Functions.ps1|if ($CheckResult.Failed)'
+            'Run-AllSubscriptions.ps1|if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($ConsumptionFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($MetricsFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($CollectorFailuresList.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($ConsumptionAuthSkipped.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($MetricsAuthSkipped.Count -gt 0)'
+            # Reached by the one-subscription, two-stream and empty-retry-list runs below.
+            'Run-AllSubscriptions.ps1|if ($FailedAttempts.Count -eq 0)'
+            'Run-AllSubscriptions.ps1|if ($ScopeForProbe.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)'
+        )
+        # Every strict-mode error a run printed on stderr, as '<file>|<source line>',
+        # and every collection error it printed on stdout.
+        function script:Get-StrictErrors
+        {
+            param($Run)
+            $Found = [System.Collections.Generic.List[string]]::new()
+            $File = $null
+            foreach ($Line in @(([string]$Run.Error) -split "`r?`n"))
+            {
+                $Plain = $Line -replace "`e\[[0-9;]*m", ''
+                if ($Plain -match '^\S+Exception: (.+):(\d+)\s*$' -or $Plain -match '^\S+: (/.+\.ps1):(\d+)\s*$') { $File = Split-Path -Path $Matches[1] -Leaf; continue }
+                if ($null -ne $File -and $Plain -match '^\s*\d+ \|\s(.*)$')
+                {
+                    $Found.Add(('{0}|{1}' -f $File, $Matches[1].Trim().TrimEnd([char]0x2026).TrimEnd()))
+                    $File = $null
+                }
+            }
+            foreach ($Line in @($Run.Text | Where-Object { $_ -match '^(\[stream-\d+\] )?ERROR processing subscription ' }))
+            {
+                # The exit code read after each subscription, older code.
+                if ($Line -notmatch "The variable '\`$LASTEXITCODE' cannot be retrieved because it has not been set\.$") { $Found.Add('stdout|' + $Line) }
+            }
+            return $Found.ToArray()
+        }
+        function script:Get-UnknownStrictErrors
+        {
+            param($Run)
+            @(script:Get-StrictErrors $Run | Where-Object { $E = $_; @($script:KnownStrictErrors | Where-Object { $E -eq $_ -or $E.StartsWith($_) -or $_.StartsWith($E) }).Count -eq 0 })
+        }
+    }
     BeforeEach { script:New-Case }
     AfterEach { script:Write-FailedCaseRuns }
 
-    It 'a run that continues, one that stops for its settings and one that starts a new run add no strict-mode error' {
+    It 'the paths this change adds print no strict-mode error outside the known older-code list: a stop for settings, a continued run, -Fresh, -ResumeFailedOnly with nothing owed, and a continued wrongly shaped state file' {
         script:Invoke-InterruptedRun -Streams 1
         $Started = script:Get-StateStartText
         $Stop = script:Invoke-Wrapper -Arguments '-Obfuscate' -Streams 1 -StrictMode
         $Stop.ExitCode | Should -Be 1
-        # Older code on these paths still prints strict-mode errors (the role
-        # check, and the exit code read after each subscription), so the exit
-        # codes are not asserted here; only the lines this change reads are.
+        # Older code on these paths still prints strict-mode errors (above), so
+        # the exit codes of the runs that pass it are not asserted here.
         $Continue = script:Invoke-Wrapper -Streams 1 -StrictMode
         script:Get-StartLines $Continue | Should -Be @(('Continuing the run started {0} (2 of 4 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
         # The continued run ends clean and removes the state, so an interrupted
@@ -948,10 +1028,34 @@ Describe 'Resume by default under strict mode' -Skip:$IsWindows {
         script:Invoke-InterruptedRun -Streams 1
         $New = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1 -StrictMode
         @(script:Get-StartLines $New)[0] | Should -BeLike 'Starting a new run (-Fresh).*'
-        foreach ($R in $Stop, $Continue, $New)
+        $NoRun = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1 -StrictMode
+        # A state file that is not the right shape, continued.
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": "sub-x", "FailedAttempts": []}') -Encoding utf8
+        $Shape = script:Invoke-Wrapper -Streams 1 -StrictMode
+        @($Shape.Text | Where-Object { $_ -like 'WARNING: The resume state file*is not the right shape*' }).Count | Should -Be 1
+        # A continued run with two streams; a run over one subscription; and
+        # -ResumeFailedOnly over a kept state with an empty retry list.
+        script:New-Case
+        script:Invoke-InterruptedRun -Streams 2
+        $Two = script:Invoke-Wrapper -Streams 2 -StrictMode
+        script:New-Case
+        script:Set-Scenario -Subs 'A'
+        $One = script:Invoke-Wrapper -Streams 2 -StrictMode
+        script:New-Case
+        script:Invoke-InterruptedRun -Streams 1
+        $EmptyList = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1 -StrictMode
+        foreach ($R in $Stop, $Continue, $New, $NoRun, $Shape, $Two, $One, $EmptyList)
         {
-            @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunStart|StoredRun|RunInfo|NewRunInfo|RunDataSettings|DoneCount|PastLimitCount|InScopeIds|Fill|IsWindowKey|IdsWithoutReports|NoRole|StateKept|ConvertFrom-ResumeRunStartTime|Read-ResumeRunInfo|Resolve-RunStart|Get-RunContinueLine|Write-ResumeStateRunInfo|Get-ResumeStateRunInfoValues' }) | Should -BeNullOrEmpty
+            script:Get-UnknownStrictErrors $R | Should -BeNullOrEmpty
         }
+    }
+
+    It 'the check finds an error on a line it does not know' {
+        $Fake = [pscustomobject]@{ Text = @('ERROR processing subscription Sub A: The property ''Removed'' cannot be found on this object.'); Error = "PropertyNotFoundException: /x/tool/Run-AllSubscriptions.ps1:1020`nLine |`n1020 |      foreach (`$Entry in `$NoRole.Removed)`n     |                         ~~~~~~~~`n" }
+        @(script:Get-UnknownStrictErrors $Fake).Count | Should -Be 2
+        $Known = [pscustomobject]@{ Text = @(); Error = "PropertyNotFoundException: /x/tool/Functions/Common.Functions.ps1:942`nLine |`n 942 |          if (`$RoleRecord.Failed)`n     |              ~~~~~`n" }
+        script:Get-UnknownStrictErrors $Known | Should -BeNullOrEmpty
     }
 }
 
@@ -1046,6 +1150,24 @@ Describe 'Resolve-RunStart and its readers' {
 
         Set-Content -LiteralPath $File -Value '{ not json'
         (Read-ResumeRunInfo -Path $File -Tenant $Tenant).Exists | Should -BeFalse
+    }
+
+    It 'Write-StreamState writes through a temporary file: a write cut short leaves the earlier per-stream file whole' {
+        $Dir = Join-Path $script:TestBase ('unit-' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        $File = Join-Path $Dir '.resume-state-t-stream-0.json'
+        $TenantID = 't'; $StreamId = '0'; $RunId = 'run-1'
+        $StreamRunRecord = [pscustomobject]@{ RunStartedAt = '2026-10-30T12:00:00.0000000Z'; RunSettings = [pscustomobject]@{ Obfuscate = $false; SkipMetrics = $true; SkipConsumption = $false; IncludeDisabled = $false }; ConsumptionWindowStart = '2026-09-29'; ConsumptionWindowEnd = '2026-10-29' }
+        Write-StreamState -Path $File -Completed @('sub-a') -FailedAttempts @() -Reports @()
+        $Earlier = [System.IO.File]::ReadAllBytes($File)
+        $Written = Get-Content -LiteralPath $File -Raw | ConvertFrom-Json
+        $Written.RunSettings.SkipMetrics | Should -BeTrue
+        $Written.ConsumptionWindowEnd | Should -Be '2026-10-29'
+        # A write that puts '{' where it writes and then fails, as on a full disk.
+        function Set-Content { param([string]$Path, $Value, $Encoding, $ErrorAction) [System.IO.File]::WriteAllText($Path, '{'); throw [System.IO.IOException]::new('No space left on device') }
+        Write-StreamState -Path $File -Completed @('sub-a', 'sub-b') -FailedAttempts @() -Reports @() 6>$null
+        [System.IO.File]::ReadAllBytes($File) | Should -Be $Earlier
+        Test-Path -LiteralPath "$File.tmp" | Should -BeFalse
     }
 
     It 'every save of the resume state keeps the start time, settings and cost window the file holds' {
@@ -1179,6 +1301,7 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
                 script:Get-Collected $R | Should -BeNullOrEmpty
             }
             @($R.Text | Where-Object { $_ -like 'Pending Retries:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -BeGreaterThan 0
+            if ($N -lt 3) { $R.Text | Should -Contain 'Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than 7 days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried. To start over instead, start a new run with -Fresh.' }
             @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @($N)
         }
         foreach ($N in 4, 5)
@@ -1261,7 +1384,7 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
             $R.ExitCode | Should -Be 2 -Because 'the state is kept, so the consolidated zip is owed'
             $R.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
             $R.Text | Should -Contain ('Not finished: the run has not ended clean (the resume state file {0} is kept), so its consolidated zip is owed. This mode retries only the retry list and does not build one.' -f $script:State)
-            $R.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly. It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state.'
+            $R.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly. It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state once it ends clean.'
             script:Get-Collected $R | Should -BeNullOrEmpty
             Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
         }
@@ -1291,5 +1414,518 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
         $R3 = script:Invoke-Wrapper -Streams 1
         script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+}
+
+Describe 'The run record in every per-stream state file' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'each stream writes the run''s start time, settings and cost window with its run id' {
+        script:Invoke-InterruptedRun -Streams 2 -Arguments '-SkipMetrics'
+        $Main = script:Read-StateFile
+        $Files = @(script:Get-StreamFiles)
+        $Files.Count | Should -Be 2
+        foreach ($File in $Files)
+        {
+            $Obj = Get-Content -LiteralPath $File.FullName -Raw | ConvertFrom-Json
+            [string]$Obj.RunId | Should -Be ([string]$Main.RunId)
+            $Obj.RunSettings.SkipMetrics | Should -BeTrue
+            $Obj.RunSettings.Obfuscate | Should -BeFalse
+            ([datetime]$Obj.RunStartedAt).ToUniversalTime() | Should -Be ([datetime]$Main.RunStartedAt).ToUniversalTime()
+            "$($Obj.ConsumptionWindowStart)..$($Obj.ConsumptionWindowEnd)" | Should -Be "$($Main.ConsumptionWindowStart)..$($Main.ConsumptionWindowEnd)"
+        }
+    }
+
+    It 'the resume state file <Case>: a run with other settings stops on the per-stream record (exit 1, twice) and leaves the files; the same settings continue (exit 0); then a new run (exit 0)' -ForEach @(
+        @{ Case = 'is not the right shape'; Damage = 'shape' }
+        @{ Case = 'is missing'; Damage = 'missing' }
+    ) {
+        script:Invoke-InterruptedRun -Streams 2 -Arguments '-SkipMetrics'
+        $Started = script:Get-StateStartText
+        if ($Damage -eq 'shape') { script:Set-StateKeys @{ CompletedSubscriptionIds = 'sub-x' } } else { Remove-Item -LiteralPath $script:State -Force }
+        $Snapshot = { @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike '.run-lock-*' -and $_.Name -notlike 'RunAllSubscriptions_transcript_*' } | ForEach-Object { '{0}|{1}' -f $_.FullName, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } | Sort-Object) }
+        $Before = & $Snapshot
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Why = if ($Damage -eq 'shape') { 'is not the right shape (it is moved aside below)' } else { 'is not in the inventory folder' }
+        script:Clear-Calls
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain ('The resume state file {0}, so this run checks the start time, settings and cost window that the per-stream state files of the unfinished run record ({1}).' -f $Why, ($Names -join ', '))
+            $R.Text | Should -Contain '  -SkipMetrics: on in the unfinished run, off in this run.'
+            script:Get-Calls | Should -BeNullOrEmpty
+            & $Snapshot | Should -Be $Before -Because 'the stop leaves every file as it was'
+        }
+        $R3 = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @(('Continuing the run started {0} (2 of 4 subscriptions done). Settings: -SkipMetrics. Pass -Fresh to start over.' -f $Started))
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C', 'D')
+        @(script:Get-Calls | Where-Object { $_ -notlike '*|SkipMetrics=True|*' }) | Should -BeNullOrEmpty
+        script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+
+    It 'per-stream files of one run that disagree, all started past the age limit: -Resume stops (exit 1); a run without -Resume starts a new run and says why (exit 0), the old files are another run''s; then a new run (exit 0)' {
+        # No resume state file; two stream files of one run that started 9 days ago, -Obfuscate differing.
+        script:Invoke-InterruptedRun -Streams 2
+        Remove-Item -LiteralPath $script:State -Force
+        $Old = [datetime]::UtcNow.AddDays(-9)
+        $Files = @(script:Get-StreamFiles | Sort-Object Name)
+        foreach ($N in 0, 1)
+        {
+            $Obj = Get-Content -LiteralPath $Files[$N].FullName -Raw | ConvertFrom-Json
+            $Obj.RunStartedAt = $Old.ToString('o', [cultureinfo]::InvariantCulture)
+            if ($N -eq 1) { $Obj.RunSettings.Obfuscate = $true }
+            $Obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Files[$N].FullName -Encoding utf8
+        }
+        $Started = $Old.ToString('d MMM yyyy HH:mm', [cultureinfo]::InvariantCulture) + ' UTC'
+        $Names = @($Files | ForEach-Object { $_.Name })
+        # Run 1, -Resume asks to continue it: the conflict stops it.
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R1.ExitCode | Should -Be 1
+        $R1.Text | Should -Contain ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the per-stream state files of the unfinished run record different start times, settings or cost windows ({0}), so this run cannot check that it collects the same way.' -f ($Names -join ', '))
+        @($R1.Text | Where-Object { $_ -like '*This run continues it*' }) | Should -BeNullOrEmpty
+        # Run 2, without -Resume: the age comes first, so a new run, and it says why.
+        script:Clear-Calls
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain ('The unfinished run started {0}, more than 7 days ago; starting a new run. Pass -Resume to continue it anyway.' -f $Started)
+        @($R2.Text | Where-Object { $_ -like 'ERROR: This run stops here*' -or $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        @(script:Get-Calls | Where-Object { $_ -notlike '*|Obfuscate=False|*' }) | Should -BeNullOrEmpty
+        @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+
+    It 'a usable resume state file within the age limit whose per-stream files of the same run record other settings stops the run before it folds them (exit 1, twice; continued with -ParallelStreams <Streams>); -Fresh starts a new run (exit 0); then a new run (exit 0)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        # A two-stream -SkipMetrics run interrupted after A and B; then only the
+        # resume state file's record is changed to SkipMetrics off.
+        script:Invoke-InterruptedRun -Streams 2 -Arguments '-SkipMetrics'
+        $Settings = (script:Read-StateFile).RunSettings
+        $Settings.SkipMetrics = $false
+        script:Set-StateKeys @{ RunSettings = $Settings } -MainOnly
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        $Names.Count | Should -Be 2
+        $Snapshot = { @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike '.run-lock-*' -and $_.Name -notlike 'RunAllSubscriptions_transcript_*' } | ForEach-Object { '{0}|{1}' -f $_.FullName, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } | Sort-Object) }
+        $Before = & $Snapshot
+        script:Clear-Calls
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Streams $Streams
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the resume state file and the per-stream state files of the unfinished run no longer record the same start time, settings and cost window ({0}). Only a file that was changed or damaged after the run wrote it can cause this, so this run cannot check that it collects the same way.' -f ($Names -join ', '))
+            foreach ($Name in $Names) { $R.Text | Should -Contain ('  {0}: -SkipMetrics is on there, off in the resume state file.' -f $Name) }
+            $R.Text | Should -Contain '  Next: pass -Fresh to start a new run that collects every subscription again.'
+            @($R.Text | Where-Object { $_ -like 'Continuing *' -or $_ -like 'Recovered per-stream state*' -or $_ -like 'Existing session detected*' }) | Should -BeNullOrEmpty
+            script:Get-Calls | Should -BeNullOrEmpty
+            & $Snapshot | Should -Be $Before -Because 'the stop leaves every file as it was'
+        }
+        # -Fresh: a new run that collects all four, unmasked metrics included, and ends clean.
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams $Streams
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        @(script:Get-Calls | Where-Object { $_ -notlike '*|SkipMetrics=False|*' }) | Should -BeNullOrEmpty
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Streams $Streams
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+
+    It 'the same files past the age limit: a run without -Resume starts a new run and says why (exit 0), the old per-stream files are another run''s and are removed; then a new run (exit 0)' {
+        script:Invoke-InterruptedRun -Streams 2 -Arguments '-SkipMetrics'
+        $Settings = (script:Read-StateFile).RunSettings
+        $Settings.SkipMetrics = $false
+        script:Set-StateKeys @{ RunSettings = $Settings; RunStartedAt = [datetime]::UtcNow.AddDays(-8).ToString('o', [cultureinfo]::InvariantCulture) } -MainOnly
+        $Started = script:Get-StateStartText
+        $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
+        script:Clear-Calls
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 0
+        script:Get-StartLines $R1 | Should -Be @(('The unfinished run started {0}, more than 7 days ago; starting a new run. Pass -Resume to continue it anyway.' -f $Started))
+        @($R1.Text | Where-Object { $_ -like 'ERROR: This run stops here*' -or $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        @(script:Get-Calls | Where-Object { $_ -notlike '*|SkipMetrics=False|*' }) | Should -BeNullOrEmpty
+        @($R1.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
+        script:Read-State | Should -BeNullOrEmpty
+        @(script:Get-StreamFiles) | Should -BeNullOrEmpty
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-StartLines $R2 | Should -Be @('Starting a new run.')
+    }
+
+    It 'per-stream files that record the same run as the resume state file are folded in as before' {
+        script:Invoke-InterruptedRun -Streams 2 -Arguments '-SkipMetrics'
+        $Started = script:Get-StateStartText
+        $R = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams 1
+        $R.ExitCode | Should -Be 0
+        @($R.Text | Where-Object { $_ -like 'ERROR: This run stops here*' }) | Should -BeNullOrEmpty
+        script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (2 of 4 subscriptions done). Settings: -SkipMetrics. Pass -Fresh to start over.' -f $Started))
+        script:Get-Collected $R | Should -Be (script:Get-Ids 'C', 'D')
+    }
+
+    It 'per-stream files of one run within the age limit that record different settings stop the run (exit 1, twice, naming them); -Fresh starts a new run (exit 0); then a new run (exit 0)' {
+        script:Invoke-InterruptedRun -Streams 2
+        Remove-Item -LiteralPath $script:State -Force
+        $Files = @(script:Get-StreamFiles | Sort-Object Name)
+        $Obj = Get-Content -LiteralPath $Files[1].FullName -Raw | ConvertFrom-Json
+        $Obj.RunSettings.Obfuscate = $true
+        $Obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Files[1].FullName -Encoding utf8
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the per-stream state files of the unfinished run record different start times, settings or cost windows ({0}, {1}), so this run cannot check that it collects the same way.' -f $Files[0].Name, $Files[1].Name)
+            $R.Text | Should -Contain '  Next: pass -Fresh to start a new run that collects every subscription again.'
+            script:Get-Collected $R | Should -BeNullOrEmpty
+        }
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        $R4 = script:Invoke-Wrapper -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+}
+
+Describe 'One run record in every write, and advice that runs as stated' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It '-Fresh whose first write of the resume state fails leaves the earlier run''s state whole, says so, and the next runs act on that state' {
+        script:Invoke-InterruptedRun -Streams 1 -Arguments '-Obfuscate'
+        $Before = Get-Content -LiteralPath $script:State -Raw
+        # An empty folder where the write puts its temporary file: the first write fails and removes it.
+        New-Item -ItemType Directory -Path ($script:State + '.tmp') -Force | Out-Null
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -RoleUnknown 'A', 'B', 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R2.ExitCode | Should -Be 1
+        @($R2.Text | Where-Object { $_ -like ('WARNING: Failed to persist resume state to *{0}*' -f (Split-Path -Path $script:State -Leaf)) }).Count | Should -Be 1
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $Before -Because 'no write pairs the -Fresh run''s retry list with the earlier run''s record'
+        Test-Path -LiteralPath ($script:State + '.tmp') | Should -BeFalse
+        # Run 3, plain: the earlier run is still the unfinished one, so its settings apply.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 1
+        $R3.Text | Should -Contain '  -Obfuscate: on in the unfinished run, off in this run.'
+        # Run 4, -Fresh as that stop advises: a new run that ends clean; run 5: a new run.
+        $R4 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Read-State | Should -BeNullOrEmpty
+        $R5 = script:Invoke-Wrapper -Streams 1
+        $R5.ExitCode | Should -Be 0
+        script:Get-StartLines $R5 | Should -Be @('Starting a new run.')
+    }
+
+    It 'a continued state file that is not the right shape, stopped by the access check, writes its retry list with this run''s start time and settings; the next two runs check them' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": "sub-x", "FailedAttempts": []}') -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B' -RoleUnknown 'A', 'B'
+        $R1 = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams 1
+        $R1.ExitCode | Should -Be 1
+        $Raw = script:Read-StateFile
+        $Raw.RunSettings.SkipMetrics | Should -BeTrue
+        $Raw.PSObject.Properties['RunStartedAt'] | Should -Not -BeNullOrEmpty
+        "$($Raw.ConsumptionWindowStart)..$($Raw.ConsumptionWindowEnd)" | Should -Be (script:Get-ConsumptionWindowText)
+        @($Raw.FailedAttempts | ForEach-Object { $_.Id } | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B')
+        $Started = script:Get-StateStartText
+        script:Set-Scenario -Subs 'A', 'B'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 1
+        $R2.Text | Should -Contain '  -SkipMetrics: on in the unfinished run, off in this run.'
+        @($R2.Text | Where-Object { $_ -like 'The resume state file was written by an earlier version*' }) | Should -BeNullOrEmpty
+        $R3 = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @(('Continuing the run started {0} (0 of 2 subscriptions done). Settings: -SkipMetrics. Pass -Fresh to start over.' -f $Started))
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+    }
+
+    It '-Fresh that writes its state and is then refused by the consumption check names -Fresh -SkipConsumption and -Fresh -IncludeDisabled; each advised command runs as stated' {
+        script:Invoke-InterruptedRun -Streams 1 -Arguments '-Obfuscate'
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E' -Disabled 'E' -RoleUnknown 'B' -ConsumptionDenied
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R2.ExitCode | Should -Be 1
+        (script:Read-StateFile).RunSettings.Obfuscate | Should -BeFalse -Because 'the -Fresh run wrote its own record with the retry list'
+        $R2.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f $script:Tenant)
+        $R2.Text | Should -Contain 'Excluded 1 non-Enabled subscription(s) [Disabled: 1]. To inventory them anyway, start a new run with -Fresh -IncludeDisabled.'
+        @($R2.Text | Where-Object { $_ -like '*re-run with -SkipConsumption*' -or $_ -like '*Use -IncludeDisabled*' }) | Should -BeNullOrEmpty
+        # Run 3, the advised -Fresh -SkipConsumption (role checks pass now): a new run, exit 0, clean.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E' -Disabled 'E' -ConsumptionDenied
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh', '-SkipConsumption' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Read-State | Should -BeNullOrEmpty
+        # Run 4, the advised -Fresh -IncludeDisabled (with -SkipConsumption, as consumption is still refused): collects E too.
+        $R4 = script:Invoke-Wrapper -Arguments '-Fresh', '-IncludeDisabled', '-SkipConsumption' -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E')
+    }
+
+    It 'a new run that ends with its state kept names -Fresh -IncludeDisabled in its summary; that command collects the disabled subscription and the next run is a new run' {
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Disabled 'B' -Fail 'C'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 2
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+        $R1.Text | Should -Contain 'Subscriptions Excluded:  1 (non-Enabled; start a new run with -Fresh -IncludeDisabled to inventory them)'
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Disabled 'B'
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh', '-IncludeDisabled' -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Read-State | Should -BeNullOrEmpty
+        $R3 = script:Invoke-Wrapper -Arguments '-IncludeDisabled' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+
+    It 'an explicit <Switch> of a run past the age limit with -SkipMetrics <Stored> in the unfinished run and <Given> in this run stops without claiming to continue; the matching settings continue, then a new run' -ForEach @(
+        @{ Switch = '-Resume'; Stored = 'on'; Given = 'off'; First = @('-SkipMetrics'); Mismatch = @('-Resume'); Match = @('-Resume', '-SkipMetrics'); Next = @('-SkipMetrics'); Metrics = $false }
+        @{ Switch = '-Resume'; Stored = 'off'; Given = 'on'; First = @(); Mismatch = @('-Resume', '-SkipMetrics'); Match = @('-Resume'); Next = @(); Metrics = $true }
+        @{ Switch = '-ResumeFailedOnly'; Stored = 'on'; Given = 'off'; First = @('-SkipMetrics'); Mismatch = @('-ResumeFailedOnly'); Match = $null; Next = $null; Metrics = $false }
+    ) {
+        script:Invoke-InterruptedRun -Streams 1 -Arguments $First
+        script:Set-StateKeys @{ RunStartedAt = [datetime]::UtcNow.AddDays(-9).ToString('o', [cultureinfo]::InvariantCulture) }
+        $Started = script:Get-StateStartText
+        $Before = Get-Content -LiteralPath $script:State -Raw
+        $R1 = script:Invoke-Wrapper -Arguments $Mismatch -Streams 1
+        $R1.ExitCode | Should -Be 1
+        $R1.Text | Should -Contain ('  -SkipMetrics: {0} in the unfinished run, {1} in this run.' -f $Stored, $Given)
+        @($R1.Text | Where-Object { $_ -like '*This run continues it*' -or $_ -like '*metrics of the subscriptions*' -or $_ -like 'Continuing *' }) | Should -BeNullOrEmpty
+        Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
+        if ($null -eq $Match) { return }
+        $R2 = script:Invoke-Wrapper -Arguments $Match -Streams 1
+        $R2.ExitCode | Should -Be 0
+        $Tail = if ($Metrics) { '; the metrics of the subscriptions it collects cover a later period than those collected earlier in that run.' } else { '.' }
+        $R2.Text | Should -Contain ('WARNING: The unfinished run started {0}, more than 7 days ago. This run continues it because {1} was passed{2}' -f $Started, $Switch, $Tail)
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C', 'D')
+        $R3 = script:Invoke-Wrapper -Arguments $Next -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+
+    It 'a role check that could not finish: past the age limit a run without -Resume starts a new run that keeps it on the retry list, as the line says' {
+        script:Set-Scenario -Subs 'A', 'B' -RoleUnknown 'B'
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 0
+            @($R.Text | Where-Object { $_ -like 'Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than 7 days ago*' }).Count | Should -Be 1
+        }
+        $OldId = [string](script:Read-StateFile).RunId
+        script:Set-StateKeys @{ RunStartedAt = [datetime]::UtcNow.AddDays(-8).ToString('o', [cultureinfo]::InvariantCulture) }
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        @(script:Get-StartLines $R3)[0] | Should -BeLike 'The unfinished run started *, more than 7 days ago; starting a new run.*'
+        [string](script:Read-StateFile).RunId | Should -Not -Be $OldId
+        @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @(3)
+    }
+
+    It '-ResumeFailedOnly with the zip owed and a report-record list that lacks the completed subscriptions names -Fresh (exit 2); -Fresh collects them, and the next run is a new run' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Window = (script:Get-ConsumptionWindowText) -split '\.\.'
+        [pscustomobject]@{
+            TenantID = $script:Tenant; RunId = 'run-earlier'; CompletedSubscriptionIds = @('sub-a', 'sub-b'); CompletedReports = @(); FailedAttempts = @()
+            RunStartedAt = [datetime]::UtcNow.AddHours(-1).ToString('o', [cultureinfo]::InvariantCulture)
+            RunSettings = [pscustomobject]@{ Obfuscate = $false; SkipMetrics = $false; SkipConsumption = $false; IncludeDisabled = $false }
+            ConsumptionWindowStart = $Window[0]; ConsumptionWindowEnd = $Window[1]
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:State -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B'
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R1.ExitCode | Should -Be 2
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Fresh. The resume state records no report for 2 completed subscription(s), so a run that continues this one cannot put them into a consolidated zip and ends with exit 2; a new run collects every subscription again.'
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+
+    It '-ResumeFailedOnly with only a per-stream file that is not the right shape says it stops, not that it continues (exit 1); then no run to retry (exit 1); then a new run' {
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Value '{"Completed": 5, "FailedAttempts": "x"}' -Encoding utf8
+        $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R1.ExitCode | Should -Be 1
+        @($R1.Text | Where-Object { $_ -like '*It continues that run*' -or $_ -like 'Continuing *' }) | Should -BeNullOrEmpty
+        @($R1.Text | Where-Object { $_ -like 'Per-stream state files of an interrupted parallel run*when one is not the right shape, the retry list is not complete and it stops (see below).' }).Count | Should -Be 1
+        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped before retrying anything (exit 1). The retry list is not complete: a resume state file was not the right shape (see the warning above).'
+        $R2 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R2.ExitCode | Should -Be 1
+        @($R2.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry.*' }).Count | Should -Be 1
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+    }
+}
+
+Describe 'Resume by default: the state each run records, and the advice it prints' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'a continued state file that is not the right shape records this run''s start time and settings, so the next run checks them (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": "sub-x", "FailedAttempts": []}') -Encoding utf8
+        # Run 1, -SkipMetrics: the file is moved aside; A and B complete, then the run is ended.
+        script:Invoke-InterruptedRun -Streams $Streams -Arguments '-SkipMetrics'
+        $Raw = script:Read-StateFile
+        $Raw.RunSettings.SkipMetrics | Should -BeTrue
+        $Raw.PSObject.Properties['RunStartedAt'] | Should -Not -BeNullOrEmpty
+        "$($Raw.ConsumptionWindowStart)..$($Raw.ConsumptionWindowEnd)" | Should -Be (script:Get-ConsumptionWindowText)
+        $Started = script:Get-StateStartText
+        # Run 2, without -SkipMetrics: stops (exit 1), and does not read the file as an earlier version's.
+        $R2 = script:Invoke-Wrapper -Streams $Streams
+        $R2.ExitCode | Should -Be 1
+        $R2.Text | Should -Contain '  -SkipMetrics: on in the unfinished run, off in this run.'
+        @($R2.Text | Where-Object { $_ -like 'The resume state file was written by an earlier version*' }) | Should -BeNullOrEmpty
+        # Run 3, -SkipMetrics: continues, collects C and D the same way; run 4: a new run.
+        script:Clear-Calls
+        $R3 = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams $Streams
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @(('Continuing the run started {0} (2 of 4 subscriptions done). Settings: -SkipMetrics. Pass -Fresh to start over.' -f $Started))
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C', 'D')
+        @(script:Get-Calls | Where-Object { $_ -notlike '*|SkipMetrics=True|*' }) | Should -BeNullOrEmpty
+        script:Read-State | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Streams $Streams
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+
+    It '-Fresh stopped by the role check writes its retry list with its own run id, start time and settings; the next two runs continue it (-ParallelStreams <Streams>)' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        script:Invoke-InterruptedRun -Streams $Streams -Arguments '-Obfuscate'
+        $OldId = [string](script:Read-StateFile).RunId
+        # Run 2, -Fresh without -Obfuscate: every role check cannot finish, so the run stops (exit 1) after it writes the retry list.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -RoleUnknown 'A', 'B', 'C', 'D'
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams $Streams
+        $R2.ExitCode | Should -Be 1
+        $Raw = script:Read-StateFile
+        [string]$Raw.RunId | Should -Not -Be $OldId
+        $Raw.RunSettings.Obfuscate | Should -BeFalse
+        @($Raw.CompletedSubscriptionIds | Where-Object { $_ }) | Should -BeNullOrEmpty
+        @($Raw.FailedAttempts | ForEach-Object { $_.Id } | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        $Started = script:Get-StateStartText
+        # Runs 3 and 4, the role checks pass: run 3 continues the -Fresh run and collects all four; run 4 is a new run.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R3 = script:Invoke-Wrapper -Streams $Streams
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @(('Continuing the run started {0} (0 of 4 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Read-State | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Streams $Streams
+        $R4.ExitCode | Should -Be 0
+        script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+
+    It '-ResumeFailedOnly with no resume state file and only a per-stream file that cannot be parsed has no run to retry: exit 1, twice; then a new run' {
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Value '{ cut' -NoNewline
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. It did not sign in, collect anything or write the resume state.'
+            @($R.Text | Where-Object { $_ -like 'Continuing *' -or $_ -like '*Nothing to retry*' }) | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $script:State | Should -BeFalse
+        }
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B')
+    }
+
+    It 'a continued run refused by the consumption check says to start a new run with -Fresh -SkipConsumption, and names -Fresh -IncludeDisabled for a disabled subscription; exit 1, twice; then that command ends clean' {
+        script:Invoke-InterruptedRun -Streams 1
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E' -Disabled 'E' -ConsumptionDenied
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f $script:Tenant)
+            $R.Text | Should -Not -Contain '  3. Or re-run with -SkipConsumption to inventory without consumption data.'
+            $R.Text | Should -Contain 'Excluded 1 non-Enabled subscription(s) [Disabled: 1]. To inventory them anyway, start a new run with -Fresh -IncludeDisabled.'
+        }
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh', '-SkipConsumption' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Read-State | Should -BeNullOrEmpty
+    }
+
+    It '-ResumeFailedOnly with other settings says to start over without -ResumeFailedOnly, with -Fresh; exit 1, twice; then -Fresh ends clean' {
+        script:Invoke-InterruptedRun -Streams 1 -Arguments '-Obfuscate'
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain '  Next: run the same command with the unfinished run''s settings (-Obfuscate) to continue it, or run the same command without -ResumeFailedOnly, with -Fresh, to start a new run that collects every subscription again.'
+        }
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+    }
+
+    It 'the consolidated zip owed by a run past the age limit: -ResumeFailedOnly says to run with -Resume (exit 2, twice); -Resume builds the zip and ends clean' {
+        script:Set-Scenario -Subs 'A', 'B' -LoseZipOnFold
+        $R1 = script:Invoke-Wrapper -Streams 1 -Environment $script:LoseZipEnv
+        $R1.ExitCode | Should -Be 2
+        script:Set-StateKeys @{ RunStartedAt = [datetime]::UtcNow.AddDays(-8).ToString('o', [cultureinfo]::InvariantCulture) }
+        script:Set-Scenario -Subs 'A', 'B'
+        foreach ($N in 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+            $R.ExitCode | Should -Be 2
+            $R.Text | Should -Contain '  Next: run the same command with -Resume in place of -ResumeFailedOnly (the unfinished run is past -ResumeMaxAgeDays, or its start time cannot be read, so a run without either switch would start a new run). It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state once it ends clean.'
+        }
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-Collected $R4 | Should -BeNullOrEmpty
+        script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        $R5 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R5.ExitCode | Should -Be 1
+    }
+
+    It 'a state file from an earlier version with every subscription completed and no report records: -ResumeFailedOnly says a run without it collects them again (exit 2, twice); that run does, and ends clean' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": ["sub-a", "sub-b"], "FailedAttempts": []}') -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B'
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+            $R.ExitCode | Should -Be 2
+            $R.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly. It collects again the 2 subscription(s) whose report the resume state does not record (it was written by an earlier version), puts every report into a new consolidated zip and clears the state once it ends clean.'
+        }
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        $R4 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R4.ExitCode | Should -Be 1
+    }
+
+    It 'an explicit -Resume of a run past the age limit with -SkipMetrics does not speak of metrics; the next run is a new run' {
+        script:Invoke-InterruptedRun -Streams 1 -Arguments '-SkipMetrics'
+        script:Set-StateKeys @{ RunStartedAt = [datetime]::UtcNow.AddDays(-9).ToString('o', [cultureinfo]::InvariantCulture) }
+        $Started = script:Get-StateStartText
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume', '-SkipMetrics' -Streams 1
+        $R1.ExitCode | Should -Be 0
+        $R1.Text | Should -Contain ('WARNING: The unfinished run started {0}, more than 7 days ago. This run continues it because -Resume was passed.' -f $Started)
+        @($R1.Text | Where-Object { $_ -like '*metrics of the subscriptions*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'C', 'D')
+        $R2 = script:Invoke-Wrapper -Arguments '-SkipMetrics' -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-StartLines $R2 | Should -Be @('Starting a new run.')
     }
 }
