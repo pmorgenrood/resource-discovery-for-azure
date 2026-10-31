@@ -922,18 +922,24 @@ if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
 # happen if the catch/success paths are correct, but cheap to defend).
 # A retry-list entry for a subscription the signed-in identity no longer sees
 # at all (deleted, moved to another tenant) can never be retried or counted, so
-# it would keep the resume state forever. Every run drops it, with or without
-# -Resume (a run without it reads and writes the same retry list), before the
-# entries past the retry limit are worked out, so a gone one is never owed.
-# A disabled subscription is still listed by Get-AzSubscription, so its entry
-# stays (-IncludeDisabled retries it). A listing that came back with warnings or
-# errors can leave out a subscription that is only hidden for now, so then no
-# entry is dropped, and the warnings and errors are printed.
+# it would keep the resume state forever. Drop it, say so, and keep the rest.
+# The same for one this run leaves out of scope: a subscription that is not
+# enabled, without -IncludeDisabled. No run with these settings can retry it
+# (a run that continues this one must keep them), and a new run keeps the retry
+# list, so its entry would keep the state on every run; the line names the
+# command that collects it. Every run does this, a new run included: it keeps
+# the retry list too. It comes before the entries past the retry limit are
+# worked out, so a gone one is never owed. A listing that came back with
+# warnings or errors can leave out a subscription that is only hidden for now,
+# so then no entry is dropped for not being listed, and the warnings and errors
+# are printed; one listed as not enabled is still taken off.
 $KeptNotListedIds = @()
 if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
 {
     $VisibleIds = @($AllSubscriptions | ForEach-Object { [string]$_.Id })
+    $InScopeIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
     $GoneAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $VisibleIds -notcontains [string]$_.Id })
+    $OutOfScopeAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $VisibleIds -contains [string]$_.Id -and $InScopeIds -notcontains [string]$_.Id })
     $ListingProblems = @(@($SubWarnings) + @($SubErrors) | Where-Object { $_ } | ForEach-Object {
             $Text = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } elseif ($_ -is [System.Management.Automation.WarningRecord]) { $_.Message } else { [string]$_ }
             # The first line, at most 300 characters: what to fix, not the whole record.
@@ -948,15 +954,22 @@ if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
         foreach ($Problem in @($ListingProblems | Select-Object -First 5)) { Write-Host ("  - {0}" -f $Problem) -ForegroundColor Yellow }
         if ($ListingProblems.Count -gt 5) { Write-Host ("  - ... and {0} more" -f ($ListingProblems.Count - 5)) -ForegroundColor Yellow }
         $KeptNotListedIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
+        $GoneAttempts = @()
     }
-    elseif ($GoneAttempts.Count -gt 0)
+    if ($GoneAttempts.Count -gt 0 -or $OutOfScopeAttempts.Count -gt 0)
     {
         foreach ($Gone in $GoneAttempts)
         {
             Write-Host ("Dropped from the retry list: {0} ({1}) is no longer visible to the signed-in identity, so no run can retry it." -f $Gone.Name, $Gone.Id) -ForegroundColor Yellow
         }
-        $GoneIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
-        $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $GoneIds -notcontains [string]$_.Id })
+        foreach ($Out in $OutOfScopeAttempts)
+        {
+            $SubState = [string](@($AllSubscriptions | Where-Object { [string]$_.Id -eq [string]$Out.Id })[0].State)
+            Write-Host ("Taken off the retry list: {0} ({1}) is {2}, and this run leaves out subscriptions that are not enabled (no -IncludeDisabled), so no run with these settings can retry it. To collect it, {3}." -f $Out.Name, $Out.Id, $SubState, (Get-RunGoOnCommand -Switches '-IncludeDisabled' -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
+        }
+        $DropIds = @(@($GoneAttempts) + @($OutOfScopeAttempts) | ForEach-Object { [string]$_.Id })
+        $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $DropIds -notcontains [string]$_.Id })
+        # The write carries this run's record ($RunRecord), a new run's included.
         Update-ResumeStateRetryList -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
     }
 }
@@ -1070,9 +1083,10 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     }
 }
 # The retry-list entries past the limit that this run does not collect: those
-# skipped above, and those outside this run's subscription set (for example a
-# disabled subscription without -IncludeDisabled). While one is still on the
-# retry list at the end, its report is missing, so the run ends with exit 2.
+# skipped above, and those outside this run's subscription set (one that a
+# listing with warnings or errors did not show; one that is not enabled was
+# taken off the list above). While one is still on the retry list at the end,
+# its report is missing, so the run ends with exit 2.
 $RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
 $RetryLimitedNotInRunIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $RunSubscriptionIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
 
@@ -2778,7 +2792,7 @@ if ($NotCollected.Count -gt 0)
 if ($RetryLimited.Count -gt 0)
 {
     # Set by the resume-state cleanup above.
-    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -ExcludedIds @($Excluded | ForEach-Object { [string]$_.Id }) -NotListedIds $KeptNotListedIds
+    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -NotListedIds $KeptNotListedIds
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($WrapperTranscriptStarted)

@@ -1929,3 +1929,49 @@ Describe 'Resume by default: the state each run records, and the advice it print
         script:Get-StartLines $R2 | Should -Be @('Starting a new run.')
     }
 }
+
+Describe 'A retry-list subscription that is not enabled' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'is taken off the retry list by <Run2>, which ends clean with exit 0; the next two runs are new runs with exit 0, and -Fresh -IncludeDisabled collects it' -ForEach @(@{ Run2 = 'a run without a switch'; Arguments = @() }, @{ Run2 = '-Fresh'; Arguments = @('-Fresh') }) {
+        # Run 1: B fails (exit 2, on the retry list). Then B is disabled.
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        (script:Invoke-Wrapper -Streams 1).ExitCode | Should -Be 2
+        script:Set-Scenario -Subs 'A', 'B' -Disabled 'B'
+        $R2 = script:Invoke-Wrapper -Arguments $Arguments -Streams 1
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain 'Taken off the retry list: Sub B (sub-b) is Disabled, and this run leaves out subscriptions that are not enabled (no -IncludeDisabled), so no run with these settings can retry it. To collect it, start a new run with -Fresh -IncludeDisabled.'
+        @($R2.Text | Where-Object { $_ -like 'Pending Retries:*' }) | Should -BeNullOrEmpty
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        foreach ($N in 3, 4)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 0
+            script:Get-StartLines $R | Should -Be @('Starting a new run.')
+            script:Get-Collected $R | Should -Be (script:Get-Ids 'A')
+            script:Read-State | Should -BeNullOrEmpty
+        }
+        $R5 = script:Invoke-Wrapper -Arguments '-Fresh', '-IncludeDisabled' -Streams 1
+        $R5.ExitCode | Should -Be 0
+        script:Get-Collected $R5 | Should -Be (script:Get-Ids 'A', 'B')
+    }
+
+    It 'a continued run that takes it off keeps the state for the subscriptions still owed, and the next run continues' {
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B' -Hang 'C'
+        $null = script:Invoke-Wrapper -Streams 1 -EndWhen { (script:Test-Hanging 'C') -and (script:Read-State).Failed -contains 'sub-b' }
+        $Started = script:Get-StateStartText
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Disabled 'B' -Fail 'C'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 2
+        @($R2.Text | Where-Object { $_ -like 'Taken off the retry list: Sub B (sub-b) is Disabled*' }).Count | Should -Be 1
+        (script:Read-State).Failed | Should -Be (script:Get-Ids 'C')
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Disabled 'B'
+        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3.ExitCode | Should -Be 0
+        script:Get-StartLines $R3 | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C')
+        script:Read-State | Should -BeNullOrEmpty
+    }
+}

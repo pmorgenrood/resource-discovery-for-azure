@@ -643,19 +643,21 @@ Describe 'A retry-list entry for a subscription that is no longer visible' {
 Describe 'A retry-list entry for a subscription outside the current subscription set' {
     BeforeEach { script:New-Case }
 
-    It '-ResumeFailedOnly whose retry list holds only a disabled subscription says none are visible and exits 2' {
+    It '-ResumeFailedOnly whose retry list holds only a disabled subscription takes it off the list, retries nothing and exits 2 while the state is kept' {
         $Global:RdaRlFailIds = @('sub-x')
         $null = script:Invoke-Run -Subs @($script:A, $script:X)
         $Global:RdaRlFailIds = @()
-        # Sub X is disabled now: Azure still lists it, but it is not in the run's set.
+        # Sub X is disabled now: Azure still lists it, but it is not in the run's set,
+        # so no run with these settings can retry it.
         $Global:RdaRlAlsoVisible = @($script:X)
         $R = script:Invoke-Run -Subs @($script:A) -ResumeFailedOnly
 
-        $R.ExitCode | Should -Be 2 -Because 'the retry list still holds it, so the run is not a success'
-        @(script:Get-Lines -Run $R -Like 'WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set*').Count | Should -Be 1
+        $R.ExitCode | Should -Be 2 -Because 'the state is kept, so the run is not a success'
+        @(script:Get-Lines -Run $R -Like 'Taken off the retry list: Sub X (sub-x) is *, and this run leaves out subscriptions that are not enabled (no -IncludeDisabled)*').Count | Should -Be 1
+        @(script:Get-Lines -Run $R -Like 'WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set*') | Should -BeNullOrEmpty
         @(script:Get-Lines -Run $R -Like 'Dropped from the retry list:*') | Should -BeNullOrEmpty -Because 'a disabled subscription is still listed by Azure'
         @($R.Calls) | Should -BeNullOrEmpty
-        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 1
+        script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
     }
 }
 
@@ -667,7 +669,7 @@ Describe 'A subscription past the retry limit that is outside the run''s subscri
     }
     BeforeEach { script:New-Case }
 
-    It 'keeps the state, names -IncludeDisabled, and every run that leaves it out exits 2 until a run collects it' {
+    It 'is taken off the retry list with the command that collects it, and the run ends clean' {
         $Global:RdaRlFailIds = @('sub-x')
         $Subs = @($script:A, $script:B, $script:X)
         $null = script:Invoke-Run -Subs $Subs
@@ -675,35 +677,20 @@ Describe 'A subscription past the retry limit that is outside the run''s subscri
         $null = script:Invoke-Run -Subs $Subs -Resume
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
         $Global:RdaRlFailIds = @()
-        # Sub X is disabled now: Azure still lists it, but it is not in the run's set.
+        # Sub X is disabled now: Azure still lists it, but it is not in the run's
+        # set, so no run with these settings can retry it.
         $Global:RdaRlAlsoVisible = @($script:X)
-        foreach ($n in 1..2)
-        {
-            $R = script:Invoke-Run -Subs @($script:A, $script:B) -Resume
-            @($R.Calls) | Should -Not -Contain 'sub-x'
-            $R.ExitCode | Should -BeNullOrEmpty
-            $R.Result.WrapperExitCode | Should -Be 2 -Because 'Retry Limit Reached lists Sub X as incomplete, so its report is missing'
-            @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these')
-            @(script:Get-Lines -Run $R -Like '  To try them again*') | Should -Be @('  To try them again, start a new run with -Fresh; Sub X is not Enabled, so add -IncludeDisabled, for example:')
-            @(script:Get-Lines -Run $R -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t -Fresh -IncludeDisabled')
-            Test-Path -LiteralPath $script:State | Should -BeTrue
-            [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
-        }
-        # A run without -Resume, but without -IncludeDisabled, leaves it out too.
-        $R3 = script:Invoke-Run -Subs @($script:A, $script:B)
-        @($R3.Calls) | Should -Not -Contain 'sub-x'
-        $R3.Result.WrapperExitCode | Should -Be 2
-        Test-Path -LiteralPath $script:State | Should -BeTrue
-        # The advice followed: -IncludeDisabled puts Sub X back in the run's set.
-        $Global:RdaRlAlsoVisible = @()
-        $R4 = script:Invoke-Run -Subs $Subs
-        @($R4.Calls) | Should -Contain 'sub-x'
+        $R = script:Invoke-Run -Subs @($script:A, $script:B) -Resume
+        @($R.Calls) | Should -Not -Contain 'sub-x'
+        $R.ExitCode | Should -BeNullOrEmpty
+        @(script:Get-Lines -Run $R -Like 'Taken off the retry list: Sub X (sub-x) is *, and this run leaves out subscriptions that are not enabled (no -IncludeDisabled)*').Count | Should -Be 1
+        @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -BeNullOrEmpty
         script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
-        $R4.Result.WrapperExitCode | Should -Be 0
+        $R.Result.WrapperExitCode | Should -Be 0
         Test-Path -LiteralPath $script:State | Should -BeFalse
-        $R5 = script:Invoke-Run -Subs $Subs -Resume
-        @(script:Get-Lines -Run $R5 -Like 'Retry Limit Reached:*') | Should -BeNullOrEmpty
-        $R5.Result.WrapperExitCode | Should -Be 0
+        $R2 = script:Invoke-Run -Subs @($script:A, $script:B) -Resume
+        @(script:Get-Lines -Run $R2 -Like 'Taken off the retry list:*') | Should -BeNullOrEmpty
+        $R2.Result.WrapperExitCode | Should -Be 0
     }
 }
 
@@ -782,6 +769,22 @@ Describe 'A subscription listing that came back with warnings or errors' {
         @(script:Get-Lines -Run $R3 -Like 'Dropped from the retry list:*').Count | Should -Be 1
         script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
         Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+
+    It 'still takes off an entry the listing shows as not enabled, and keeps one it left out' {
+        $Global:RdaRlFailIds = @('sub-x', 'sub-c')
+        $null = script:Invoke-Run -Subs @($script:A, $script:X, $script:C)
+        $Global:RdaRlFailIds = @()
+        $Global:RdaRlListWarnings = @('stand-in: unable to acquire a token for part of the tenant')
+        # Sub X is listed but not enabled; Sub C is not listed at all.
+        $Global:RdaRlAlsoVisible = @($script:X)
+        $R = script:Invoke-Run -Subs @($script:A) -Resume
+        @(script:Get-Lines -Run $R -Like 'Taken off the retry list: Sub X (sub-x) is *').Count | Should -Be 1
+        @(script:Get-Lines -Run $R -Like 'Kept on the retry list: 1 subscription(s) not in the subscription list (Sub C (sub-c))*').Count | Should -Be 1
+        @(script:Get-Lines -Run $R -Like 'Dropped from the retry list:*') | Should -BeNullOrEmpty
+        script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
+        script:Get-Entry -Id 'sub-c' | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath $script:State | Should -BeTrue
     }
 }
 

@@ -2471,7 +2471,7 @@ function Get-RetryLimitedAttempts
 # empty list.
 function Write-RetryLimitSummary
 {
-    param([object]$RetryLimited, [string]$TenantID, [string[]]$ExcludedIds = @(), [string[]]$NotListedIds = @())
+    param([object]$RetryLimited, [string]$TenantID, [string[]]$NotListedIds = @())
     $List = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     if ($List.Count -eq 0) { return }
     Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
@@ -2481,7 +2481,7 @@ function Write-RetryLimitSummary
     }
     # A subscription missing from a listing that came back with warnings or
     # errors is kept until a complete listing: no run can tell whether it is
-    # gone (then the run drops it) or only hidden (then a run without -Resume
+    # gone (then the run drops it) or only hidden (then a new run with -Fresh
     # collects it), so the advice is to fix the listing first.
     $NotListed = @($List | Where-Object { @($NotListedIds) -contains [string]$_.Id })
     if ($NotListed.Count -gt 0)
@@ -2491,15 +2491,6 @@ function Write-RetryLimitSummary
     }
     $List = @($List | Where-Object { @($NotListedIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
-    # A subscription that is not Enabled is left out of every run without
-    # -IncludeDisabled, so the advice for it adds that switch.
-    $NotEnabled = @($List | Where-Object { @($ExcludedIds) -contains [string]$_.Id })
-    if ($NotEnabled.Count -gt 0)
-    {
-        Write-Host ("  To try them again, start a new run with -Fresh; {0} not Enabled, so add -IncludeDisabled, for example:" -f ((@($NotEnabled | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotEnabled.Count -eq 1) { ' is' } else { ' are' }))) -ForegroundColor Yellow
-        Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -IncludeDisabled" -f $TenantID) -ForegroundColor Yellow
-        return
-    }
     Write-Host "  To try them again, start a new run with -Fresh (it collects every subscription again), for example:" -ForegroundColor Yellow
     Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh" -f $TenantID) -ForegroundColor Yellow
 }

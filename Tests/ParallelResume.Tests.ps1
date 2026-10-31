@@ -839,12 +839,13 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         $Before = Get-Content -LiteralPath $script:State -Raw
         if ($Disk -ne 'no retry list') { [int]@((script:Read-StateFile).FailedAttempts)[0].Attempts | Should -Be 1 }
 
-        # Run 2: every write of the resume state fails. B is disabled, so it is
-        # not collected and keeps the state; A, C and D complete.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -BlockStateWrite
+        # Run 2: every write of the resume state fails. B fails again, so it
+        # keeps the state; A, C and D complete. (A subscription that is not
+        # enabled is taken off the retry list, so it cannot keep the state.)
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -FailReason 'newer reason' -BlockStateWrite
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'C', 'D')
-        script:Get-ErrorLines $R2 | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
+        script:Get-ErrorLines $R2 | Should -Be @('ERROR processing subscription Sub B: newer reason')
         $R2.Error | Should -BeNullOrEmpty
         @($R2.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 0 completed, 1 failed subscription record(s).')
@@ -951,12 +952,13 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         $Obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
         [string]@((script:Read-StateFile).CompletedReports)[0].Zip | Should -Be $Earlier
 
-        # Run 2: every write of the resume state fails. B stays disabled and
-        # failed, which keeps the state; C and D complete.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -BlockStateWrite
+        # Run 2: every write of the resume state fails. B fails, which keeps
+        # the state; C and D complete. (A subscription that is not enabled is
+        # taken off the retry list, so it cannot keep the state.)
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -BlockStateWrite
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C', 'D')
-        script:Get-ErrorLines $R2 | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C', 'D')
+        script:Get-ErrorLines $R2 | Should -Be @('ERROR processing subscription Sub B: stand-in failure for this subscription')
         $R2.Error | Should -BeNullOrEmpty
         @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only it holds the newer report'
@@ -1004,20 +1006,20 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         $Obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
         @($Obj.CompletedSubscriptionIds) | Should -Be @('sub-a')
 
-        # Run 2: every write of the resume state fails; B keeps the state, C and D complete.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -BlockStateWrite
+        # Run 2: every write of the resume state fails; B fails and keeps the state, C and D complete.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -BlockStateWrite
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C', 'D')
-        script:Get-ErrorLines $R2 | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C', 'D')
+        script:Get-ErrorLines $R2 | Should -Be @('ERROR processing subscription Sub B: stand-in failure for this subscription')
         @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only it holds the newer report'
         $null -eq (script:Read-StateFile).PSObject.Properties['CompletedReports'] | Should -BeTrue
 
-        # Run 3, writes work again and B stays disabled: the newer report is written into the state, and the stream files go.
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B'
+        # Run 3, writes work again and B still fails: the newer report is written into the state, and the stream files go.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B'
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         $R3.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
-        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C', 'D')
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'B', 'C', 'D')
         @($R3.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -BeNullOrEmpty
         @(@((script:Read-StateFile).CompletedReports) | Where-Object { $_.Id -eq 'sub-a' } | ForEach-Object { [string]$_.Zip }) | Should -Be @($Newer)
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
