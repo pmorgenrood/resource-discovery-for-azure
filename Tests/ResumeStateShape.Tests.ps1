@@ -499,6 +499,18 @@ Describe 'Get-ResumeStateShapeProblem: records as the wrapper and the stream wor
         Get-ResumeStateShapeProblem -Record $Record -Kind Main | Should -BeNullOrEmpty
     }
 
+    It 'a retry entry <Label> has the right shape: it counts as one failed run' -ForEach @(
+        @{ Kind = 'Main'; Label = 'with a retry entry without Attempts'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
+        @{ Kind = 'Main'; Label = 'with Attempts "abc"'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":"abc","LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
+        @{ Kind = 'Main'; Label = 'with Attempts 2.5'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":2.5,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
+        @{ Kind = 'Main'; Label = 'with Attempts 0'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":0,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
+        @{ Kind = 'Stream'; Label = 'with Attempts true'; Json = '{"Completed":[],"FailedAttempts":[{"Id":"sub-a","Attempts":true,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
+        @{ Kind = 'Main'; Label = 'with Attempts larger than a whole number holds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":99999999999,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' }
+    ) {
+        Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record $Json) -Kind $Kind | Should -BeNullOrEmpty
+        Get-FailedAttemptCount -Entry (script:ConvertTo-Record $Json).FailedAttempts[0] | Should -Be 1
+    }
+
     It 'every Attempts and LastFailedAt value it accepts converts as Add-FailedAttempt and Merge-FailedAttempts convert it' {
         foreach ($Attempts in @('1', '2', '"3"', '1.0', '2147483647'))
         {
@@ -537,12 +549,6 @@ Describe 'Get-ResumeStateShapeProblem: wrong shapes are named by their field' {
         @{ Kind = 'Main'; Label = 'with a retry entry without Id'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Attempts":1,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1 has no text Id' },
         @{ Kind = 'Main'; Label = 'with an empty retry Id'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":" ","Attempts":1,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1 has no text Id' },
         @{ Kind = 'Main'; Label = 'with a number for a retry Id'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":5,"Attempts":1,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1 has no text Id' },
-        @{ Kind = 'Main'; Label = 'with a retry entry without Attempts'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
-        @{ Kind = 'Main'; Label = 'with Attempts "abc"'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":"abc","LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
-        @{ Kind = 'Main'; Label = 'with Attempts 2.5'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":2.5,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
-        @{ Kind = 'Main'; Label = 'with Attempts 0'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":0,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
-        @{ Kind = 'Stream'; Label = 'with Attempts true'; Json = '{"Completed":[],"FailedAttempts":[{"Id":"sub-a","Attempts":true,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
-        @{ Kind = 'Main'; Label = 'with Attempts larger than a whole number holds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":99999999999,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'; Expected = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
         @{ Kind = 'Main'; Label = 'with a retry entry without LastFailedAt'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":1}]}'; Expected = 'FailedAttempts entry 1: LastFailedAt is not a date' },
         @{ Kind = 'Main'; Label = 'with LastFailedAt "not-a-date"'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":1,"LastFailedAt":"not-a-date"}]}'; Expected = 'FailedAttempts entry 1: LastFailedAt is not a date' },
         @{ Kind = 'Stream'; Label = 'with a number for LastFailedAt'; Json = '{"Completed":[],"FailedAttempts":[{"Id":"sub-a","Attempts":1,"LastFailedAt":20261029}]}'; Expected = 'FailedAttempts entry 1: LastFailedAt is not a date' },
@@ -845,7 +851,6 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
     }
 
     It 'a retry entry whose <Field> is present but invalid, with <Streams> stream(s) and that subscription failing again: no conversion error, and the next -Resume ends clean' -ForEach @(
-        @{ Field = 'Attempts'; Streams = 1; Subs = @('A', 'B'); Problem = 'FailedAttempts entry 1: Attempts is not a whole number of at least 1' },
         @{ Field = 'LastFailedAt'; Streams = 2; Subs = @('A', 'B', 'C'); Problem = 'FailedAttempts entry 1: LastFailedAt is not a date' }
     ) {
         # B fails again in run 1. With 2 streams, A and C are in stream 0 and B

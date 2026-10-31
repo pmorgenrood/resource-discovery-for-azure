@@ -377,8 +377,9 @@ function Resolve-TenantId
 #   - Main: TenantID is text, and CompletedSubscriptionIds is a list of text
 #     ids. Stream: Completed is a list of text ids.
 #   - FailedAttempts (the retry list) is a list. Each entry is an object with a
-#     non-empty text Id, Attempts a whole number of at least 1 and LastFailedAt
-#     a date, the values Add-FailedAttempt and Merge-FailedAttempts convert. A
+#     non-empty text Id and LastFailedAt a date, the values Add-FailedAttempt
+#     and Merge-FailedAttempts convert (a missing or unreadable Attempts counts
+#     as one failed run, Get-FailedAttemptCount). A
 #     file written before the retry list existed has no FailedAttempts key,
 #     which reads as an empty list.
 # The tool itself writes a null entry when a list becomes empty, and an empty
@@ -417,8 +418,9 @@ function Get-ResumeStateShapeProblem
         if ($null -eq $Entry) { continue }
         if ($Entry -isnot [System.Management.Automation.PSCustomObject]) { return ('FailedAttempts entry {0} is not an object' -f $N) }
         if ($Entry.Id -isnot [string] -or [string]::IsNullOrWhiteSpace($Entry.Id)) { return ('FailedAttempts entry {0} has no text Id' -f $N) }
-        $Count = 0
-        if (-not [int]::TryParse([string]$Entry.Attempts, [ref]$Count) -or $Count -lt 1) { return ('FailedAttempts entry {0}: Attempts is not a whole number of at least 1' -f $N) }
+        # Attempts is not checked: an entry whose Attempts is missing or is not a
+        # whole number of at least 1 counts as one failed run (Get-FailedAttemptCount),
+        # so its file is used, not moved aside.
         # ConvertFrom-Json turns an ISO 8601 date text into a [datetime]; any
         # other text must parse as one the way the [datetime] cast does.
         $When = [datetime]::MinValue
