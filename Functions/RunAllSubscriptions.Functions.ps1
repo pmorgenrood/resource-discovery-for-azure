@@ -160,131 +160,6 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
     }
 }
 
-# Classify a subscription that returned 0 resources as either a genuine
-# permission gap (the signed-in identity has NO role on the subscription) or a
-# genuinely empty subscription. This distinction is impossible to make from the
-# resource-discovery phase alone: Azure Resource Graph queries at the tenant
-# level and returns reduced/empty results rather than a 403 when the identity
-# lacks a role, so "no access" and "empty" look identical there.
-#
-# To tell them apart we make ONE cheap, access-scoped control-plane call via the
-# native Az module (Invoke-AzRestMethod) - an authenticated ARM GET of the
-# subscription's resource groups. Listing resource groups requires a role on the
-# subscription (Reader is enough): HTTP 200 means the identity DOES have access
-# (so 0 resources == genuinely empty), 403/401 means no role, and 404 means ARM
-# is hiding a subscription the identity cannot see. Using the module cmdlet (not
-# the `az` CLI) keeps this portable across Windows/Linux/macOS with no per-OS
-# shell quoting - see .kiro/steering/cross-platform-powershell.md.
-#
-# Returns one of: 'NoAccess', 'Empty', 'Unknown'. Only called for subs that
-# returned 0 resources, so it adds no cost to the normal (non-empty) path.
-function Get-SubscriptionAccessState
-{
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
-
-    # One cheap, access-scoped control-plane read via the native Az module - an
-    # authenticated ARM GET of the subscription's resource groups. Portable by
-    # construction (no `az` CLI, no per-OS shell quoting). Invoke-AzRestMethod
-    # returns a PSHttpResponse with an integer .StatusCode for HTTP responses
-    # (including 4xx) and only throws for CLIENT-side failures (no usable
-    # context/token, network/DNS) - verified against a live session: 200 for an
-    # accessible subscription, 404 for an unknown one, neither thrown.
-    try
-    {
-        $Response = Invoke-AzRestMethod -Method GET `
-            -Path ('/subscriptions/{0}/resourcegroups?api-version=2021-04-01' -f $SubscriptionId) `
-            -ErrorAction Stop
-    }
-    catch
-    {
-        # Client-side failure (no usable Azure context/token, network/DNS). This
-        # is not a permission verdict - hedge as Unknown so the caller retries.
-        return 'Unknown'
-    }
-
-    $Status = [int]$Response.StatusCode
-    if ($Status -ge 200 -and $Status -lt 300)
-    {
-        # Identity can read the subscription, so 0 resources means it is
-        # genuinely empty.
-        return 'Empty'
-    }
-    if ($Status -eq 403 -or $Status -eq 401)
-    {
-        return 'NoAccess'
-    }
-    if ($Status -eq 404)
-    {
-        # An identity that can ENUMERATE a subscription (it came from
-        # Get-AzSubscription) but gets 404 on a control-plane read into it has
-        # no usable role there - ARM hides the subscription rather than
-        # returning a 403. Treat that as NoAccess too, since the sub IDs we
-        # probe are always real and tenant-visible.
-        return 'NoAccess'
-    }
-    # Any other status (429 throttling, 5xx, gateway) is transient/inconclusive.
-    # Don't mislabel it - report Unknown so the caller can retry and the summary
-    # can hedge.
-    return 'Unknown'
-}
-
-# Probe control-plane READ access for a set of subscriptions up front, before any
-# per-subscription work. Reuses Get-SubscriptionAccessState (one cheap
-# native ARM GET per sub): 'Empty' == the identity CAN read the subscription
-# (accessible, whether or not it has resources), 'NoAccess' == no role on it,
-# 'Unknown' == an inconclusive/transient failure. A transient 'Unknown' is retried
-# a few times with a short backoff before it is accepted, so a throttle/network
-# blip is not mistaken for a permission gap. Returns one record per sub -
-# { Id, Name, State } with State in Empty/NoAccess/Unknown. This is side-effecting
-# (makes Azure control-plane calls); the proceed/skip DECISION is factored into
-# the pure Resolve-AccessPreflight below so it can be unit-tested without a live
-# session.
-function Test-SubscriptionAccessAll
-{
-    param(
-        [Parameter(Mandatory = $true)]$Subscriptions,
-        [int]$UnknownRetries = 2,
-        [int]$RetryDelaySeconds = 2
-    )
-    $Probed = @()
-    foreach ($Sub in @($Subscriptions))
-    {
-        $State = Get-SubscriptionAccessState -SubscriptionId $Sub.Id
-        $Attempt = 0
-        while ($State -eq 'Unknown' -and $Attempt -lt $UnknownRetries)
-        {
-            Start-Sleep -Seconds $RetryDelaySeconds
-            $State = Get-SubscriptionAccessState -SubscriptionId $Sub.Id
-            $Attempt++
-        }
-        $Probed += [pscustomobject]@{ Id = $Sub.Id; Name = $Sub.Name; State = $State }
-    }
-    return $Probed
-}
-
-# Decide, from the up-front access probe results, whether the run may proceed.
-# Pure (no Azure/az calls) so the gate policy is unit-testable in isolation. A
-# subscription is "inaccessible" when the identity has no role ('NoAccess') or the
-# probe stayed inconclusive after retries ('Unknown' - treated as blocking so a
-# genuine access/throttling problem is never silently skipped). Returns:
-#   Inaccessible    - the probe records the identity cannot (or may not) read
-#   InaccessibleIds - the ids to drop from scope when -AllowPartialAccess is set
-#   ShouldBlock     - $true when there is >=1 inaccessible sub AND
-#                     -AllowPartialAccess was NOT set: the caller must STOP.
-function Resolve-AccessPreflight
-{
-    param(
-        [object]$Probed,
-        [switch]$AllowPartialAccess
-    )
-    $Inaccessible = @(@($Probed) | Where-Object { $_ -and ($_.State -eq 'NoAccess' -or $_.State -eq 'Unknown') })
-    return [pscustomobject]@{
-        Inaccessible    = $Inaccessible
-        InaccessibleIds = @($Inaccessible | ForEach-Object { $_.Id })
-        ShouldBlock     = ($Inaccessible.Count -gt 0 -and -not $AllowPartialAccess)
-    }
-}
-
 # === Pre-flight checks ===
 #
 # Detect the most common environment problems that make a long run pointless,
@@ -621,6 +496,150 @@ function Get-StreamResumeStateFiles
     return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
+# A per-stream state file that a resuming run cannot read (an interrupted
+# write can leave it cut short). Its records are not used, so the
+# subscriptions it lists are not counted as completed: a -Resume run collects
+# them again, and under -ResumeFailedOnly a later -Resume does. The file is renamed in place to <name>.unreadable-<UTC time> and
+# kept for inspection: that name ends neither in '.json' nor matches
+# Get-StreamResumeStateFiles, so no later run reads it and no zip step that
+# picks files by '*.json' takes it. Prints a warning naming the file, never its
+# content. Returns { Name; MovedTo } (MovedTo is $null when the rename failed).
+function Move-UnreadableStreamStateFile
+{
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
+        [datetime]$Now = [datetime]::UtcNow,
+        # -ResumeFailedOnly retries only the retry list, so it does not collect
+        # the subscriptions the file lists; a later -Resume does.
+        [switch]$ResumeFailedOnly
+    )
+    $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
+    $Then = if ($ResumeFailedOnly) { 'a later -Resume collects them (-ResumeFailedOnly retries only the retry list)' } else { 'this run collects them again' }
+    $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and {1}.' -f $File.Name, $Then
+    try
+    {
+        Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
+        Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
+    }
+    catch
+    {
+        $MovedTo = $null
+        Write-Host ('{0} It could not be moved aside ({1}), so a later -Resume finds it again.' -f $Lead, $_.Exception.Message) -ForegroundColor Yellow
+    }
+    return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
+}
+
+# The end-of-run line for each per-stream state file this run could not read
+# (Move-UnreadableStreamStateFile): whether the resume state was cleared or
+# kept, and where the file went. Such a run is not a clean run, whatever else
+# happened, so it never prints "Resume state cleared (clean run).".
+function Write-UnreadableStreamStateSummary
+{
+    param([object[]]$Unreadable, [bool]$StateKept)
+    $Word = if ($StateKept) { 'kept' } else { 'cleared' }
+    foreach ($File in @($Unreadable | Where-Object { $null -ne $_ }))
+    {
+        $Where = if ([string]::IsNullOrEmpty([string]$File.MovedTo)) { 'was left in place (it could not be moved aside)' } else { 'was moved aside to {0}' -f $File.MovedTo }
+        Write-Host ('Resume state {0}, but not a clean run: the per-stream state file {1} could not be read and {2}; its records were not used.' -f $Word, $File.Name, $Where) -ForegroundColor Yellow
+    }
+}
+
+# Remove the resume state at the end of a run that clears it: first each
+# per-stream state file in -StreamFiles (the ones this run read), then the
+# resume state file -StateFile. Each removal stops on an error and is then
+# checked: a file that is still there gets a warning naming it. While a
+# per-stream file is left, the resume state file is kept too, so the next
+# -Resume reads the same state and that per-stream file again. Only some runs
+# remove per-stream files, so the warning asks for the named files to be
+# removed once the folder can be written. Returns the paths left on disk (none
+# when all were removed).
+function Remove-ResumeStateFiles
+{
+    param([string[]]$StreamFiles = @(), [Parameter(Mandatory = $true)][string]$StateFile)
+    $Left = [System.Collections.Generic.List[string]]::new()
+    foreach ($Path in @(@($StreamFiles | Where-Object { -not [string]::IsNullOrEmpty($_) }) + $StateFile))
+    {
+        $IsState = $Path -eq $StateFile
+        if ($IsState -and $Left.Count -gt 0)
+        {
+            Write-Host ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $StateFile -Leaf)) -ForegroundColor Yellow
+            $Left.Add($Path)
+            continue
+        }
+        $Reason = $null
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        catch { $Reason = $_.Exception.Message }
+        if (-not (Test-Path -LiteralPath $Path)) { continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it is still there after the removal' }
+        $What = if ($IsState) { 'resume state file' } else { 'per-stream state file' }
+        Write-Host ('WARNING: Could not remove the {0} {1}: {2}' -f $What, (Split-Path -Path $Path -Leaf), $Reason) -ForegroundColor Yellow
+        if ($IsState) { Write-Host '  The next run reads it again and retries the removal.' -ForegroundColor Yellow }
+        $Left.Add($Path)
+    }
+    return $Left.ToArray()
+}
+
+# The subscriptions the up-front role check skipped for a cause that can pass
+# on a later run: the check could not finish (Unknown), or the two answers
+# disagree while a role change takes effect (Disagree). Each one is put on the
+# retry list as a failed run (Add-FailedAttempt, so the run count goes up) and
+# taken off the completed list, so the resume state is kept and -Resume and
+# -ResumeFailedOnly check it again; the retry limit ends the retries of one
+# that keeps failing. A subscription skipped for a missing role is not added:
+# it needs Reader first. Pure; the caller persists. Returns
+# { FailedAttempts; CompletedIds; Added }.
+function Add-RoleCheckRetryAttempts
+{
+    param([object]$FailedAttempts, [object]$CompletedIds, $Decision)
+    $Added = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and @('Unknown', 'Disagree') -contains [string]$_.State } })
+    $List = @($FailedAttempts | Where-Object { $_ })
+    foreach ($Skip in $Added)
+    {
+        $List = @(Add-FailedAttempt -Existing $List -Id ([string]$Skip.Id) -Name ([string]$Skip.Name) -Reason ('skipped by the up-front role check: {0}' -f $Skip.Reason))
+    }
+    $AddedIds = @($Added | ForEach-Object { [string]$_.Id })
+    return [pscustomobject]@{
+        FailedAttempts = $List
+        CompletedIds   = @(@($CompletedIds) | Where-Object { $_ -and $AddedIds -notcontains [string]$_ })
+        Added          = $Added
+    }
+}
+
+# Write the retry list and the completed ids into the resume state file and
+# leave every other key the file holds as it is, so records other code keeps
+# there survive. Writes a new file through Save-CompletedSubscriptionIds when
+# there is none (or it is for another tenant or cannot be read). Same atomic
+# write as Save-CompletedSubscriptionIds.
+function Update-ResumeStateRetryList
+{
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @())
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $State = $null
+    if (Test-Path -LiteralPath $Path -PathType Leaf)
+    {
+        try { $State = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $State = $null }
+    }
+    if ($null -eq $State -or $State -isnot [pscustomobject] -or [string]$State.TenantID -ne $Tenant)
+    {
+        Save-CompletedSubscriptionIds -Path $Path -Tenant $Tenant -Ids $Ids -FailedAttempts $FailedAttempts
+        return
+    }
+    $State | Add-Member -NotePropertyName CompletedSubscriptionIds -NotePropertyValue @($Ids) -Force
+    $State | Add-Member -NotePropertyName FailedAttempts -NotePropertyValue @($FailedAttempts) -Force
+    $State | Add-Member -NotePropertyName LastUpdated -NotePropertyValue (Get-Date).ToString('o') -Force
+    try
+    {
+        $TmpPath = "$Path.tmp"
+        $State | ConvertTo-Json -Depth 6 | Set-Content -Path $TmpPath -Encoding utf8
+        [System.IO.File]::Move($TmpPath, $Path, $true)
+    }
+    catch
+    {
+        Write-Host ("WARNING: Failed to persist resume state to {0}: $_" -f $Path) -ForegroundColor Yellow
+        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
 # pre-existing entries) against the unified CompletedIds list.
 #   - A sub that now appears in CompletedIds (any stream, or a prior run,
@@ -806,85 +825,6 @@ function Write-StreamState
     }
 }
 
-
-# Classify a consumption-probe error message into an access outcome. Pure (no
-# Azure calls) so the classification rules are unit-testable without a live
-# session. Returns:
-#   'Ok'          - no error ($null/empty message): the probe query succeeded.
-#   'Denied'      - the message indicates an authorization/RBAC denial: the
-#                   identity lacks Cost Management / Billing Reader. Because
-#                   consumption was REQUESTED (no -SkipConsumption), the caller
-#                   treats this as a HARD failure - producing a report silently
-#                   missing requested billing data is worse than stopping.
-#   'Unavailable' - any other failure (expired token, Conditional Access, MFA,
-#                   throttling, transient network). NOT a hard failure: this is
-#                   the recoverable class the per-subscription consumption phase
-#                   already detects, retries once, and reports on.
-function Get-ConsumptionAccessOutcome
-{
-    param([string]$ErrorMessage)
-    if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Ok' }
-    # Authorization / permission denial signatures across ARM + the billing APIs.
-    if ($ErrorMessage -match '(?i)authoriz|forbidden|\b403\b|does not have|AuthorizationFailed|not authorized|insufficient privileg|access is denied|RBAC')
-    {
-        return 'Denied'
-    }
-    return 'Unavailable'
-}
-
-# Probe whether the signed-in identity can actually READ consumption/billing
-# data for a subscription, by issuing the same Get-UsageAggregates call the
-# consumption phase uses (a tiny 1-day window). A subscription with access but
-# zero usage returns an empty result (not an error) -> 'Ok'. A failure to switch
-# context is treated as 'Unavailable' (a session/token problem, not a
-# consumption-authorization denial).
-#
-# Returns a [pscustomobject] with:
-#   Outcome - 'Ok' / 'Denied' / 'Unavailable' (verdict via Get-ConsumptionAccessOutcome).
-#   Detail  - $null on success, otherwise the underlying exception message so the
-#             caller can tell the operator WHY the probe failed (e.g. the legacy
-#             Get-UsageAggregates API is unsupported on this subscription type, a
-#             token needs refreshing, or a 429 throttle). The verdict logic is
-#             unchanged - Detail is purely for diagnosability.
-function Test-ConsumptionAccess
-{
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
-
-    try
-    {
-        $null = Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop
-    }
-    catch
-    {
-        return [pscustomobject]@{
-            Outcome = 'Unavailable'
-            Detail  = ('could not switch Az context to the probe subscription: {0}' -f $_.Exception.Message)
-        }
-    }
-
-    # Get-UsageAggregates with Daily granularity requires the reported times to
-    # be at UTC midnight (00:00:00Z). A local-midnight value ((Get-Date).Date)
-    # serialises with the host's UTC offset, so for any operator NOT in UTC the
-    # API rejects it with "InvalidInput: The reportedstarttime ... must have the
-    # time set to midnight (0:00:00Z)" - which the probe then misclassified as a
-    # transient/token 'Unavailable' on every run. Use explicit UTC midnight so
-    # the probe actually tests billing access instead of tripping on a malformed
-    # time. ([DateTime]::UtcNow.Date is 00:00:00 with Kind=Utc -> serialises as Z.)
-    $ProbeEnd = [DateTime]::UtcNow.Date
-    $ProbeStart = $ProbeEnd.AddDays(-1)
-    try
-    {
-        $null = Get-UsageAggregates -ReportedStartTime $ProbeStart -ReportedEndTime $ProbeEnd -AggregationGranularity 'Daily' -ErrorAction Stop
-        return [pscustomobject]@{ Outcome = 'Ok'; Detail = $null }
-    }
-    catch
-    {
-        return [pscustomobject]@{
-            Outcome = (Get-ConsumptionAccessOutcome -ErrorMessage $_.Exception.Message)
-            Detail  = $_.Exception.Message
-        }
-    }
-}
 
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation
