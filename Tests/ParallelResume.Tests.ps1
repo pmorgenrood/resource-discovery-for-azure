@@ -695,7 +695,8 @@ Describe 'A one-stream run that clears the resume state deletes the per-stream f
         script:Read-State | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
 
-        # Run 2 recovers nothing: -Resume skips nothing, -ResumeFailedOnly has nothing to retry.
+        # Run 2 recovers nothing: -Resume skips nothing, -ResumeFailedOnly has no
+        # unfinished run to retry, so it stops with exit 1.
         $R2 = script:Invoke-Wrapper -Arguments $Next -Streams 1
         script:Get-RecoveryLines $R2 | Should -BeNullOrEmpty
         $R2.Text | Should -Not -Contain 'Skipping (already completed): Sub A (sub-a)'
@@ -703,13 +704,14 @@ Describe 'A one-stream run that clears the resume state deletes the per-stream f
         {
             script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D')
             script:Test-CleanLine $R2 | Should -BeTrue
+            $R2.ExitCode | Should -Be 0
         }
         else
         {
-            $R2.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
+            $R2.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. No resume state file for this tenant is in the inventory folder, so there is no retry list. Nothing was collected or written.'
             script:Get-Collected $R2 | Should -BeNullOrEmpty
+            $R2.ExitCode | Should -Be 1
         }
-        $R2.ExitCode | Should -Be 0
         script:Read-State | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
@@ -893,14 +895,22 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         # Run 0, one stream: A completes with a report, B fails.
         script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
         $null = script:Invoke-Wrapper -Streams 1
-        $Earlier = [string]@((script:Read-StateFile).CompletedReports)[0].Zip
-        # Run 1, two streams, interrupted (B disabled): stream 0 collects A again,
-        # with a newer report, then D hangs; stream 1 hangs on C.
+        $EarlierRecord = @((script:Read-StateFile).CompletedReports)[0]
+        $Earlier = [string]$EarlierRecord.Zip
+        # Run 1, a new run (-Fresh), two streams, interrupted (B disabled): stream
+        # 0 collects A again, with a newer report, then D hangs; stream 1 hangs on C.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -Hang 'C', 'D'
-        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
+        $null = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
         $Newer = [string]@((Get-Content -LiteralPath (Join-Path $script:Root $Names[0]) -Raw | ConvertFrom-Json).Reports)[0].Zip
         $Newer | Should -Not -Be $Earlier
+        # A new run starts with an empty completed list; the resume state on disk
+        # is given A's earlier record back, so it holds an older report than the
+        # per-stream file.
+        $Obj = script:Read-StateFile
+        $Obj.CompletedSubscriptionIds = @('sub-a')
+        $Obj.CompletedReports = @($EarlierRecord)
+        $Obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
         [string]@((script:Read-StateFile).CompletedReports)[0].Zip | Should -Be $Earlier
 
         # Run 2: every write of the resume state fails. B stays disabled and
@@ -939,17 +949,19 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
             Set-ItResult -Skipped -Because 'this version does not record the report of each completed subscription in the resume state'
             return
         }
-        # Run 0, one stream: A completes, B fails. Run 1, two streams, interrupted
-        # (B disabled): stream 0 collects A again, with a newer report, then D
-        # hangs; stream 1 hangs on C.
+        # Run 0, one stream: A completes, B fails. Run 1, a new run (-Fresh), two
+        # streams, interrupted (B disabled): stream 0 collects A again, with a
+        # newer report, then D hangs; stream 1 hangs on C.
         script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
         $null = script:Invoke-Wrapper -Streams 1
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Disabled 'B' -Hang 'C', 'D'
-        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
+        $null = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 2 -EndWhen { (script:Test-Hanging 'C', 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
         $Newer = [string]@((Get-Content -LiteralPath (Join-Path $script:Root $Names[0]) -Raw | ConvertFrom-Json).Reports)[0].Zip
-        # The resume state as a version without report records wrote it.
+        # The resume state as a version without report records wrote it, listing
+        # A as completed (run 1 was a new run, which starts with an empty list).
         $Obj = script:Read-StateFile
+        $Obj.CompletedSubscriptionIds = @('sub-a')
         $Obj.PSObject.Properties.Remove('CompletedReports')
         $Obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
         @($Obj.CompletedSubscriptionIds) | Should -Be @('sub-a')
@@ -1397,7 +1409,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
     BeforeEach { script:New-Case }
     AfterEach { script:Write-FailedCaseRuns }
 
-    It 'a run without -Resume after an interrupted parallel run: the next <Next> collects what that run failed (-ParallelStreams <Streams>)' -ForEach @(
+    It 'a new run (-Fresh) after an interrupted parallel run: the next <Next> collects what that run failed (-ParallelStreams <Streams>)' -ForEach @(
         @{ Streams = 1; Next = '-Resume' }, @{ Streams = 2; Next = '-Resume' },
         @{ Streams = 1; Next = '-ResumeFailedOnly' }, @{ Streams = 2; Next = '-ResumeFailedOnly' }) {
         # Run 1, interrupted 3-stream run: A, B and C complete in their stream files, D, E and F hang.
@@ -1406,11 +1418,11 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $FirstId | Should -Match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         @(script:Get-StreamFiles | ForEach-Object { [string](Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).RunId } | Sort-Object -Unique) | Should -Be @($FirstId)
 
-        # Run 2, without -Resume: C fails now. It starts a new id; with two
+        # Run 2, -Fresh: C fails now. It starts a new id; with two
         # streams, its end-of-run merge leaves the stream 2 file of run 1 alone.
         # It does not end clean, so it names run 1's files still on disk.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C'
-        $R2 = script:Invoke-Wrapper -Streams $Streams
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams $Streams
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
         $SecondId = [string](script:Read-StateFile).RunId
         $SecondId | Should -Not -Be $FirstId
@@ -1532,9 +1544,9 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2.
         script:Invoke-InterruptedThreeStreamRun
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
-        # Run 2, without -Resume, one stream: C and D fail. Run 1's three files are left and named.
+        # Run 2, -Fresh, one stream: C and D fail. Run 1's three files are left and named.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C', 'D'
-        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f ($Names -join ', ')))
         # Run 3, -Resume with two streams: C fails again, D completes. Its
         # streams write over the stream 0 and 1 files and its merge removes
@@ -1576,11 +1588,11 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         Test-Path -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -PathType Leaf | Should -BeTrue
         script:Test-CleanLine $R1 | Should -BeFalse
 
-        # Once the folder is gone, a run without -Resume (the next step the warning
-        # names) writes the state and ends clean; the next -Resume finds no state.
+        # Once the folder is gone, -Fresh (the next step the warning names)
+        # writes the state and ends clean; the next -Resume finds no state.
         Get-ChildItem -LiteralPath ($script:State + '.tmp') -Force | Remove-Item -Force
         Remove-Item -LiteralPath ($script:State + '.tmp') -Force
-        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
         $R2.Error | Should -BeNullOrEmpty
         script:Test-CleanLine $R2 | Should -BeTrue
@@ -1619,9 +1631,9 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2.
         script:Invoke-InterruptedThreeStreamRun
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
-        # Run 2, without -Resume, one stream: D writes no zip, so the output check stops the run with exit 2.
+        # Run 2, -Fresh, one stream: D writes no zip, so the output check stops the run with exit 2.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -NoZip 'D'
-        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         $R2.ExitCode | Should -Be 2
         $R2.Error | Should -BeNullOrEmpty
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
@@ -1639,13 +1651,13 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Test-CleanLine $R4 | Should -BeTrue
     }
 
-    It 'a run without -Resume whose every resume state write fails, after an interrupted run: its warnings say a later -Resume may not see its results' {
+    It 'a new run (-Fresh) whose every resume state write fails, after an interrupted run: its warnings say a later run may not see its results' {
         # Run 1, interrupted 3-stream run: A, B and C complete in stream files 0, 1 and 2; the resume state holds run 1's id.
         script:Invoke-InterruptedThreeStreamRun
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
-        # Run 2, without -Resume, two streams, every write of the resume state fails: C fails.
+        # Run 2, -Fresh, two streams, every write of the resume state fails: C fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C' -BlockStateWrite
-        $R2 = script:Invoke-Wrapper -Streams 2
+        $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 2
         $R2.Error | Should -BeNullOrEmpty
         @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
         $Lead = 'WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept: ' -f $script:Tenant
@@ -1656,11 +1668,11 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $Names[2]))
         script:Test-CleanLine $R2 | Should -BeFalse
 
-        # Run 3, the next step the warnings name: a run without -Resume, writes
-        # working. It collects all six, ends clean and removes every earlier
-        # run's per-stream file; the next -Resume finds no state.
+        # Run 3, the next step the warnings name: -Fresh, writes working. It
+        # collects all six, ends clean and removes every earlier run's
+        # per-stream file; the next -Resume finds no state.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-        $R3 = script:Invoke-Wrapper -Streams 1
+        $R3 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C', 'D', 'E', 'F')
         script:Test-CleanLine $R3 | Should -BeTrue
         @($R3.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Names -join ', ')))
@@ -1670,7 +1682,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Test-CleanLine $R4 | Should -BeTrue
     }
 
-    It 'a run without -Resume after an interrupted parallel run ships the report it made, not the earlier stream file''s' {
+    It 'a new run (-Fresh) after an interrupted parallel run ships the report it made, not the earlier stream file''s' {
         if ((Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1') -Raw) -notmatch '(?m)^function Get-CompletedReports\b')
         {
             Set-ItResult -Skipped -Because 'this version does not record the report of each completed subscription in the resume state'
@@ -1680,9 +1692,9 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B', 'C'
         $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'B', 'C') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
         $Old = [string]@((Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Raw | ConvertFrom-Json).Reports)[0].Zip
-        # Run 2, without -Resume, one stream: A completes with a new report, B fails.
+        # Run 2, -Fresh, one stream: A completes with a new report, B fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B'
-        $null = script:Invoke-Wrapper -Streams 1
+        $null = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         $New = [string]@(@((script:Read-StateFile).CompletedReports) | Where-Object { $_.Id -eq 'sub-a' })[0].Zip
         $New | Should -Not -Be $Old
         # Run 3, -Resume: B succeeds; A is skipped and its report from run 2 is carried.
@@ -1711,7 +1723,7 @@ Describe 'A run that stops before it starts collecting keeps the earlier run id'
     BeforeEach { script:New-Case }
     AfterEach { script:Write-FailedCaseRuns }
 
-    It 'a run without -Resume stopped by <Label> leaves the resume state as it was; the next -ResumeFailedOnly recovers the earlier run''s per-stream file and retries what it failed' -ForEach @(
+    It 'a new run (-Fresh) stopped by <Label> leaves the resume state as it was; the next -ResumeFailedOnly recovers the earlier run''s per-stream file and retries what it failed' -ForEach @(
         @{ Label = 'the up-front access check'; Stop = 'Access'; Streams = 1 },
         @{ Label = 'the up-front consumption check'; Stop = 'Consumption'; Streams = 2 },
         @{ Label = 'a missing parallel worker script'; Stop = 'Worker'; Streams = 2 }
@@ -1734,7 +1746,7 @@ Describe 'A run that stops before it starts collecting keeps the earlier run id'
         }
         try
         {
-            $R1 = script:Invoke-Wrapper -Streams $Streams
+            $R1 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams $Streams
         }
         finally
         {

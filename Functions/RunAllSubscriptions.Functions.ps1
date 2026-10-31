@@ -870,8 +870,15 @@ function Save-CompletedSubscriptionIds
     # The start time, settings and cost window of the run: the script's $RunInfo
     # once the run has written them, otherwise the ones the file holds, kept as
     # stored, so a save never turns the file into one that records none.
+    # A save that creates the file before a new run has written its run id
+    # (the retry list after the access check) writes that new run's ones.
     $RunInfo = Get-ResumeStateRunList -Name 'RunInfo'
-    if ($RunInfo -isnot [System.Collections.IDictionary]) { $RunInfo = Get-ResumeStateRunInfoValues -Path $Path -Tenant $Tenant }
+    if ($RunInfo -isnot [System.Collections.IDictionary])
+    {
+        $RunInfo = Get-ResumeStateRunInfoValues -Path $Path -Tenant $Tenant
+        $NewRunInfo = Get-ResumeStateRunList -Name 'NewRunInfo'
+        if ($RunInfo.Count -eq 0 -and $NewRunInfo -is [System.Collections.IDictionary] -and -not (Test-Path -LiteralPath $Path -PathType Leaf)) { $RunInfo = $NewRunInfo }
+    }
     foreach ($Key in @($RunInfo.Keys)) { $State | Add-Member -NotePropertyName $Key -NotePropertyValue $RunInfo[$Key] -Force }
     try
     {
@@ -1324,7 +1331,7 @@ function Resolve-RunStart
     # or settings.
     if (-not $Info.Exists -and $Info.StreamOnly -and -not $Fresh)
     {
-        & $Say 'Per-stream state files of an interrupted parallel run are in the inventory folder, but no resume state file records when that run started or with which settings, so this run cannot check either. It continues that run, as -Resume does, and records its own start time and settings once it starts collecting.' 'Yellow'
+        & $Say 'Per-stream state files of an interrupted parallel run are in the inventory folder, but no resume state file records when that run started, with which settings or which cost window, so this run cannot check them. It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window once it starts collecting.' 'Yellow'
         & $Say '  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), end this run and start again with -Fresh, so one consolidated zip does not mix them.' 'Yellow'
         return (& $Decide 'Continue' 'stream-only')
     }
@@ -1357,7 +1364,7 @@ function Resolve-RunStart
     if ($null -ne $Info.ShapeProblem) { return (& $Decide 'Continue' 'wrong-shape') }
     if ($Info.Legacy)
     {
-        & $Say 'The resume state file was written by an earlier version, which did not record when its run started or with which settings, so this run cannot check either. It continues that run, as -Resume does, and records its own start time and settings in the file once it starts collecting.' 'Yellow'
+        & $Say 'The resume state file was written by an earlier version, which did not record when its run started, with which settings or which cost window, so this run cannot check them. It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window in the file once it starts collecting.' 'Yellow'
         & $Say '  If that run used other settings than this one (-Obfuscate, -SkipMetrics, -SkipConsumption or -IncludeDisabled), end this run and start again with -Fresh, so one consolidated zip does not mix them.' 'Yellow'
         return (& $Decide 'Continue' 'legacy')
     }
@@ -1408,6 +1415,29 @@ function Resolve-RunStart
         return (& $Decide 'Stop' 'settings-differ' 1)
     }
     return (& $Decide 'Continue' $(if ($null -ne $AgeProblem) { 'old-explicit' } else { 'continue' }))
+}
+
+# True when per-stream state files of this tenant are in the inventory folder
+# that a run continuing without a resume state file reads at its start: one
+# with no run id (written before run ids existed, so the startup fold uses it),
+# or one that cannot be read or is not the right shape (the startup fold moves
+# it aside, as -Resume did). With -RecordsOnly (a run without -Resume or
+# -ResumeFailedOnly) only a readable, right-shaped file with no run id counts:
+# one that cannot be used holds no run to continue, and such a run starts a new
+# run, which handles it as before. A file that carries a run id belongs to a run
+# whose resume state file is gone, so no run can continue it; the end of a run
+# names or removes it as another run's.
+function Test-ResumableStreamStateFiles
+{
+    param([Parameter(Mandatory = $true)][string]$InventoryRoot, [Parameter(Mandatory = $true)][string]$Tenant, [switch]$RecordsOnly)
+    foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenant))
+    {
+        $Obj = Read-StreamResumeStateFile -Path $File.FullName
+        $Usable = $null -ne $Obj -and $null -eq (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)
+        if (-not $Usable -and -not $RecordsOnly) { return $true }
+        if ($Usable -and (Test-StreamStateRunId -State $Obj -RunId '')) { return $true }
+    }
+    return $false
 }
 
 # The start line of a run that continues an unfinished run: when it started,

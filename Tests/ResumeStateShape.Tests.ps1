@@ -885,13 +885,14 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected $Collected
     }
 
-    It 'a run without -Resume moves it aside too, does not say clean run, and the next run ends clean' {
+    It 'a run without -Resume moves it aside too and, as -Resume does, says it starts fresh; it does not say clean run, and the next run ends clean' {
         script:Set-Scenario
         $Seeded = script:Write-MainState -FailedAttempts $script:Marker
         $R1 = script:Invoke-Wrapper
         $R1.ExitCode | Should -Be 0
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'FailedAttempts is not a list' -Content $Seeded
-        @($R1.Text | Where-Object { $_ -like '  Starting fresh*' }) | Should -BeNullOrEmpty
+        # A run without -Resume continues the unfinished run as -Resume does, so it says what it uses instead.
+        @($R1.Text | Where-Object { $_ -like '  Starting fresh*' }) | Should -Be @('  Starting fresh: this run does not use the completed list or retry list of the resume state file moved aside above.')
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         $R2 = script:Invoke-Wrapper
         script:Assert-NextRunClean -Run $R2 -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
@@ -969,20 +970,20 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         script:Test-CleanLine $R3 | Should -BeTrue
     }
 
-    It 'a <Label> resume state file is handled as before: -ResumeFailedOnly has nothing to retry and, with subscriptions no run has completed, exits 2; nothing is moved' -TestCases @(
+    It 'a <Label> resume state file is not called the wrong shape: -ResumeFailedOnly has no unfinished run to retry, so it stops with exit 1; nothing is moved' -TestCases @(
         @{ Label = '0-byte'; Text = '' },
         @{ Label = 'whitespace-only'; Text = "  `n`t`n " }
     ) {
         script:Set-Scenario
         script:Write-RawText -Path $script:State -Text $Text
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
-        # Nothing to retry while subscriptions no run has completed remain is exit 2.
-        $R1.ExitCode | Should -Be 2
+        # The file holds no run, so there is no retry list: exit 1, as with no file.
+        $R1.ExitCode | Should -Be 1
         $R1.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
         script:Get-MovedAside | Should -BeNullOrEmpty
-        $R1.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
-        @($R1.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped*' }) | Should -BeNullOrEmpty
+        $R1.Text | Should -Contain 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry. The resume state file for this tenant cannot be read (it is empty, not JSON, or for another tenant), so there is no retry list. Nothing was collected or written.'
+        script:Get-Calls | Should -BeNullOrEmpty
         [System.IO.File]::ReadAllText($script:State) | Should -Be $Text
     }
 
@@ -1202,7 +1203,6 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:Stream0Name -Field 'it is not a JSON object' -Content $Seeded
         script:Get-LiveStateFiles | Should -BeNullOrEmpty
         $R2 = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams
-        $R2.ExitCode | Should -Be 0
         $R2.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
         @(script:Get-MovedAside | ForEach-Object { $_.Name }) | Should -Be @($Moved.Name)
@@ -1210,10 +1210,13 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         {
             $R1.ExitCode | Should -Be 1
             $R1.Text | Should -Contain ('  {0}: moved aside to {1}; its records are not used.' -f $script:Stream0Name, $Moved.Name)
-            $R2.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
+            # Nothing is left of a run: -ResumeFailedOnly has no run to retry.
+            $R2.ExitCode | Should -Be 1
+            @($R2.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry.*' }).Count | Should -Be 1
         }
         else
         {
+            $R2.ExitCode | Should -Be 0
             $R1.ExitCode | Should -Be 0
             script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
             script:Test-CleanLine $R2 | Should -BeTrue

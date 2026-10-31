@@ -159,10 +159,14 @@ function Invoke-AzRestMethod
         $Id = $Matches[1]
         # A denied subscription: no role for the caller, as #38's read-access check reads it.
         if (@((Get-RdaStandInScenario).DeniedIds) -contains $Id) { return & $Answer 200 @{ value = @() } }
-        return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/stand-in-reader" } }) }
+        # A subscription whose role check cannot finish holds a role whose definition cannot be read.
+        $Role = if (@((Get-RdaStandInScenario).RoleUnknownIds) -contains $Id) { 'stand-in-unreadable' } else { 'stand-in-reader' }
+        return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/$Role" } }) }
     }
     if ($Path -match '/providers/Microsoft\.Authorization/roleDefinitions/[^/?]+\?')
     {
+        # The role of a subscription whose role check cannot finish: its definition cannot be read.
+        if ($Path -like '*/roleDefinitions/stand-in-unreadable?*') { return & $Answer 403 @{ error = @{ code = 'AuthorizationFailed'; message = 'stand-in: the role definition cannot be read' } } }
         return & $Answer 200 @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } }
     }
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?')
@@ -286,7 +290,7 @@ function global:Compress-Archive
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold, [string]$CutAfter, [int]$CutStream = 1, [string]$CutKind = 'cut short')
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [string[]]$RoleUnknown = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold, [string]$CutAfter, [int]$CutStream = 1, [string]$CutKind = 'cut short')
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -298,6 +302,7 @@ function global:Compress-Archive
             FailReason    = $FailReason
             BlockStateWrite = [bool]$BlockStateWrite
             DeniedIds     = @($Denied | ForEach-Object { & $Id $_ })
+            RoleUnknownIds = @($RoleUnknown | ForEach-Object { & $Id $_ })
             ConsumptionDenied = [bool]$ConsumptionDenied
             LoseZipOnFold = [bool]$LoseZipOnFold
             CutStreamFile = $(if ($CutAfter) { [pscustomobject]@{ AfterId = (& $Id $CutAfter); Stream = $CutStream; Kind = $CutKind } } else { $null })
@@ -905,7 +910,7 @@ Describe 'A resume state file written before runs recorded their start time and 
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'D'
         $R1 = script:Invoke-Wrapper -Streams 1 -EndWhen { (script:Test-Hanging 'D') -and ((script:Get-StateCompleted) -join ',') -eq 'sub-a,sub-b,sub-c' }
         script:Get-StartLines $R1 | Should -Be @(
-            'The resume state file was written by an earlier version, which did not record when its run started or with which settings, so this run cannot check either. It continues that run, as -Resume does, and records its own start time and settings in the file once it starts collecting.'
+            'The resume state file was written by an earlier version, which did not record when its run started, with which settings or which cost window, so this run cannot check them. It continues that run, as -Resume does, uses its own cost window, and records its own start time, settings and cost window in the file once it starts collecting.'
             ('Continuing the unfinished run (its start time is not recorded; 2 of 4 subscriptions done). Settings: {0}. Pass -Fresh to start over.' -f $script:DefaultSettingsText)
         )
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'C', 'D')
@@ -1152,5 +1157,110 @@ Describe 'The next runs after each case, with the exit of every run' -Skip:$IsWi
         $R4 = script:Invoke-Wrapper -Streams 1
         $R4.ExitCode | Should -Be 0
         script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+}
+
+Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'a role check that could not finish: runs 1 to 3 keep the state and end with exit 0, then each continued run skips it with exit 2 and names -Fresh' {
+        script:Set-Scenario -Subs 'A', 'B' -RoleUnknown 'B'
+        $Started = $null
+        foreach ($N in 1, 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 0 -Because 'skipping a subscription the role check could not finish does not change the exit code'
+            if ($N -eq 1) { script:Get-Collected $R | Should -Be (script:Get-Ids 'A'); $Started = script:Get-StateStartText }
+            else
+            {
+                script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+                script:Get-Collected $R | Should -BeNullOrEmpty
+            }
+            @($R.Text | Where-Object { $_ -like 'Pending Retries:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -BeGreaterThan 0
+            @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @($N)
+        }
+        foreach ($N in 4, 5)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 2
+            script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*To try it again, start a new run with -Fresh*' }).Count | Should -Be 1
+            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh' -f $script:Tenant)
+        }
+        # The role check can finish again: -Fresh collects both and ends clean; the next run is a new run.
+        script:Set-Scenario -Subs 'A', 'B'
+        $R6 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R6.ExitCode | Should -Be 0
+        script:Get-Collected $R6 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        $R7 = script:Invoke-Wrapper -Streams 1
+        $R7.ExitCode | Should -Be 0
+        script:Get-StartLines $R7 | Should -Be @('Starting a new run.')
+    }
+
+    It '-Fresh while a subscription past the retry limit still fails: -Fresh collects it and ends with exit 2, and the next two runs skip it with exit 2 and name -Fresh' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $Exits = @(foreach ($N in 1, 2, 3) { (script:Invoke-Wrapper -Streams 1).ExitCode })
+        $Exits | Should -Be @(2, 2, 2)
+        $R4 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
+        $R4.ExitCode | Should -Be 2
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B')
+        $Started = script:Get-StateStartText
+        @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @(4) -Because '-Fresh keeps the retry list and its counts'
+        $R4.Text | Should -Contain '  To try them again, start a new run with -Fresh (it collects every subscription again), for example:'
+        foreach ($N in 5, 6)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 2
+            script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+            script:Get-Collected $R | Should -BeNullOrEmpty
+            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 4 runs in a row;*start a new run with -Fresh*' }).Count | Should -Be 1
+        }
+    }
+
+    It 'the state kept because the consolidated zip was lost: -ResumeFailedOnly ends with exit 2 twice and changes nothing; a run without it builds the zip and ends clean' {
+        script:Set-Scenario -Subs 'A', 'B' -LoseZipOnFold
+        $R1 = script:Invoke-Wrapper -Streams 1 -Environment $script:LoseZipEnv
+        $R1.ExitCode | Should -Be 2
+        (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B')
+        $Before = Get-Content -LiteralPath $script:State -Raw
+        script:Set-Scenario -Subs 'A', 'B'
+        foreach ($N in 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+            $R.ExitCode | Should -Be 2 -Because 'the state is kept, so the consolidated zip is owed'
+            $R.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
+            $R.Text | Should -Contain ('Not finished: the run has not ended clean (the resume state file {0} is kept), so its consolidated zip is owed. This mode retries only the retry list and does not build one.' -f $script:State)
+            $R.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly. It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state.'
+            script:Get-Collected $R | Should -BeNullOrEmpty
+            Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
+        }
+        $R4 = script:Invoke-Wrapper -Streams 1
+        $R4.ExitCode | Should -Be 0
+        script:Get-Collected $R4 | Should -BeNullOrEmpty
+        script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+        # Nothing is owed now: -ResumeFailedOnly has no run to retry.
+        $R5 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
+        $R5.ExitCode | Should -Be 1
+    }
+
+    It 'a new run stopped by the access check records its start time and settings with the retry list it writes, so the next run continues it and does not read it as an earlier version''s' {
+        # Every subscription's role check cannot finish, so the access check stops the run.
+        script:Set-Scenario -Subs 'A', 'B' -RoleUnknown 'A', 'B'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 1
+        $Raw = script:Read-StateFile
+        $Raw.RunSettings.Obfuscate | Should -BeFalse
+        $Raw.PSObject.Properties['RunStartedAt'] | Should -Not -BeNullOrEmpty
+        $Started = script:Get-StateStartText
+        script:Set-Scenario -Subs 'A', 'B'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 0
+        script:Get-StartLines $R2 | Should -Be @(('Continuing the run started {0} (0 of 2 subscriptions done). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
+        $R3 = script:Invoke-Wrapper -Streams 1
+        script:Get-StartLines $R3 | Should -Be @('Starting a new run.')
     }
 }

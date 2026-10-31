@@ -715,20 +715,27 @@ Describe '-ResumeFailedOnly that drops the last retry-list entry' {
     }
     BeforeEach { script:New-Case }
 
-    It 'removes the state when nothing is owed, and the next -ResumeFailedOnly starts with no state' {
+    It 'keeps the state and exits 2 with nothing left to retry, and a -Resume run ends it clean' {
         $Global:RdaRlFailIds = @('sub-x')
         $null = script:Invoke-Run -Subs @($script:A, $script:X)
         $Global:RdaRlFailIds = @()
-        # Sub X is gone; Sub A is completed.
+        # Sub X is gone; Sub A is completed. The state is kept until a run ends
+        # clean, so the run's consolidated zip is still owed.
         $R1 = script:Invoke-Run -Subs @($script:A) -ResumeFailedOnly
         @(script:Get-Lines -Run $R1 -Like 'Dropped from the retry list:*').Count | Should -Be 1
-        @(script:Get-Lines -Run $R1 -Like 'Resume state cleared (clean run).').Count | Should -Be 1
-        $R1.ExitCode | Should -Be 0
-        Test-Path -LiteralPath $script:State | Should -BeFalse
+        @(script:Get-Lines -Run $R1 -Like 'Resume state cleared*') | Should -BeNullOrEmpty
+        @(script:Get-Lines -Run $R1 -Like 'Not finished:*').Count | Should -Be 1
+        $R1.ExitCode | Should -Be 2
+        Test-Path -LiteralPath $script:State | Should -BeTrue
         $R2 = script:Invoke-Run -Subs @($script:A) -ResumeFailedOnly
         @(script:Get-Lines -Run $R2 -Like 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.').Count | Should -Be 1
         @(script:Get-Lines -Run $R2 -Like 'Dropped from the retry list:*') | Should -BeNullOrEmpty
-        $R2.ExitCode | Should -Be 0
+        $R2.ExitCode | Should -Be 2
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+        # The way out the line names: the same run without -ResumeFailedOnly.
+        $R3 = script:Invoke-Run -Subs @($script:A) -Resume
+        @($R3.Calls) | Should -Not -Contain 'sub-a'
+        $R3.Result.WrapperExitCode | Should -Be 0
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 

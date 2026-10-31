@@ -261,12 +261,14 @@ Describe '-ResumeFailedOnly with nothing on the retry list' {
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 
-    It 'names nothing when every eligible subscription is completed' {
+    It 'names nothing as not collected when every eligible subscription is completed, and exits 2 while the state is kept (the consolidated zip is owed)' {
         $null = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Interrupted
         $R = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -ResumeFailedOnly
 
-        $R.ExitCode | Should -Be 0
+        $R.ExitCode | Should -Be 2 -Because 'a kept state means the run has not ended clean, so its consolidated zip is owed'
         @($R.Text | Where-Object { $_ -like 'Not Collected:*' }).Count | Should -Be 0
+        @($R.Text | Where-Object { $_ -like 'Not finished: the run has not ended clean*' }).Count | Should -Be 1
+        Test-Path -LiteralPath $script:State | Should -BeTrue
     }
 }
 

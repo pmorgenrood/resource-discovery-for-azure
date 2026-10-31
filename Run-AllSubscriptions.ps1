@@ -14,9 +14,10 @@ param (
     # again. (A run without it, or with -Resume, continues an interrupted run -
     # that covers both failures and subscriptions not yet reached.) If there are
     # no recorded failures, prints "Nothing to retry", names any subscription an
-    # interrupted run never reached, and exits 2 while one is named (0 when
-    # none). With no unfinished run to retry (no resume state file), it stops
-    # with exit 1 and starts nothing. Works with
+    # interrupted run never reached, and exits 2: the state file is kept until a
+    # run ends clean, so with every subscription completed the run's
+    # consolidated zip is still owed. With no unfinished run to retry (no resume
+    # state file), it stops with exit 1 and starts nothing. Works with
     # -ParallelStreams; the failed-only filter is applied before the
     # subscriptions are split across streams.
     [switch]$ResumeFailedOnly,
@@ -515,7 +516,7 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Tenant
 # what -Resume, or a run without it, did before.
 $RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled)
 $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $TenantID
-if (-not $StoredRun.Exists -and @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID).Count -gt 0)
+if (-not $StoredRun.Exists -and -not $Fresh -and (Test-ResumableStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID -RecordsOnly:(-not ($Resume -or $ResumeFailedOnly))))
 {
     $StoredRun.StreamOnly = $true
     $StoredRun.Legacy = $true
@@ -531,7 +532,15 @@ $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnl
 # A run that continues one whose file records them keeps the stored values as
 # they are, so its saves need not read the file for them.
 $RunInfo = if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -notin 'legacy', 'stream-only', 'wrong-shape') { $StoredRun.Values } else { $null }
-$NewRunInfo = $null
+# The cost window this run computes (Get-ConsumptionWindow), once, here: a
+# new run records it, and a run that continues one replaces it with the
+# recorded window below. A new run's start time, settings and window are known
+# from here, so a write of the resume state that creates the file before the
+# run starts collecting (the retry list after the access check) records them
+# too (Save-CompletedSubscriptionIds); the new run id is still written only
+# right before collecting.
+$ConsumptionWindow = Get-ConsumptionWindow
+$NewRunInfo = if ($RunStart.Mode -ne 'Continue') { New-ResumeRunInfo -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow } else { $null }
 
 
 
@@ -876,7 +885,6 @@ if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
 # stays (-IncludeDisabled retries it). A listing that came back with warnings or
 # errors can leave out a subscription that is only hidden for now, so then no
 # entry is dropped, and the warnings and errors are printed.
-$DroppedGoneEntries = $false
 $KeptNotListedIds = @()
 if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
 {
@@ -906,7 +914,6 @@ if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
         $GoneIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
         $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $GoneIds -notcontains [string]$_.Id })
         Update-ResumeStateRetryList -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
-        $DroppedGoneEntries = $true
     }
 }
 
@@ -921,29 +928,25 @@ if ($ResumeFailedOnly)
         # deleted it) there is nothing to name.
         # Exit 2 while that list is not empty: work remains that this mode does
         # not do, so the run is not reported as a success (a -Resume collects it).
+        # The state file is kept until a run ends clean, so while it is there
+        # with every subscription completed, that run has not ended clean: its
+        # consolidated zip is owed (it was lost, never built, or the run was
+        # ended before it), and this mode does not build one. Exit 2 then too;
+        # exit 0 only when there is no state file left, so nothing is owed.
         $NotReachedIds = @()
-        if (Test-Path -Path $ResumeStateFile -PathType Leaf)
+        $StateKept = Test-Path -Path $ResumeStateFile -PathType Leaf
+        if ($StateKept)
         {
             $NotReached = @(Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds -NotReadableIds $NotReadableIds)
             $NotReachedIds = @($NotReached | Where-Object { $null -ne $_ })
             Write-NotCollectedSummary -NotCollected $NotReached -ResumeStateFile $ResumeStateFile
-        }
-        # The drop above emptied the retry list and no subscription is left that
-        # no run has completed: nothing is owed, so the state is removed as at the
-        # end of a clean run. Otherwise it would stay behind on every repeat.
-        if ($DroppedGoneEntries -and $NotReachedIds.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
-        {
-            try
+            if ($NotReachedIds.Count -eq 0)
             {
-                Remove-Item -Path $ResumeStateFile -Force
-                Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
-            }
-            catch
-            {
-                Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
+                Write-Host ("Not finished: the run has not ended clean (the resume state file {0} is kept), so its consolidated zip is owed. This mode retries only the retry list and does not build one." -f $ResumeStateFile) -ForegroundColor Yellow
+                Write-Host "  Next: run the same command without -ResumeFailedOnly. It collects no completed subscription again, puts their reports into a new consolidated zip and clears the state." -ForegroundColor Yellow
             }
         }
-        Exit-Wrapper -Code $(if ($NotReachedIds.Count -gt 0) { 2 } else { 0 })
+        Exit-Wrapper -Code $(if ($StateKept) { 2 } else { 0 })
     }
     $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
     $BeforeCount = $Subscriptions.Count
@@ -1076,12 +1079,11 @@ if ($ScopeForProbe.Count -gt 0)
 # Subscriptions the role check skipped are not checked. On -Resume only the
 # subscriptions this run will process are checked.
 #
-# The window is computed once here and passed to every ResourceInventory.ps1
+# The window is computed once, at the start of the run, and passed to every ResourceInventory.ps1
 # this run starts (-ConsumptionWindowStart/-ConsumptionWindowEnd in
 # $InventoryPassthrough and the parallel workers' arguments), so a
 # subscription collected after midnight still collects the window checked
 # here.
-$ConsumptionWindow = Get-ConsumptionWindow
 # A run that continues an unfinished run uses the cost window that run recorded
 # at its start, so one consolidated zip has one cost window even when the run
 # is continued on a later day. A file that holds none this run can use (written
@@ -1095,14 +1097,11 @@ if ($RunStart.Mode -eq 'Continue' -and $RunStart.Reason -ne 'wrong-shape')
         $ConsumptionWindow = $StoredRun.Window
         Write-Host ("Cost window: {0}, recorded when the run started." -f (Format-ConsumptionWindow -Window $ConsumptionWindow)) -ForegroundColor DarkGray
     }
-    else
+    elseif (-not $StoredRun.Legacy)
     {
+        # A file that records no start time or settings either said so above.
         Write-Host ("WARNING: The resume state file holds no cost window this run can use ({0}), so this run uses today's: {1}. Subscriptions collected earlier in the run may cover other days." -f $StoredRun.WindowProblem, (Format-ConsumptionWindow -Window $ConsumptionWindow)) -ForegroundColor Yellow
     }
-}
-else
-{
-    $NewRunInfo = New-ResumeRunInfo -StartedAt $RunStartTime -Settings $RunDataSettings -Window $ConsumptionWindow
 }
 $ConsumptionCheck = $null
 $ConsumptionCheckScope = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }

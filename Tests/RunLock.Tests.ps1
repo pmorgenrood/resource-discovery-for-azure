@@ -1948,12 +1948,14 @@ Describe 'The lock is released on every way out' -Skip:$IsWindows {
         }
     }
 
-    It 'exit 0 with nothing to retry (-ResumeFailedOnly), and the next two runs find no lock' {
+    It 'exit 1 with no run to retry (-ResumeFailedOnly), and the next two runs find no lock' {
         script:Set-Scenario -Subs 'A'
         $Run = script:Invoke-Wrapper -Run 'r1' -Arguments '-ResumeFailedOnly'
-        $Run.ExitCode | Should -Be 0
-        script:Get-LockAtList -Run 'r1' | Should -Be 'True'
-        $Run.Text | Should -Contain 'ResumeFailedOnly: no failed subscriptions in resume state. Nothing to retry.'
+        $Run.ExitCode | Should -Be 1
+        # The run takes its lock before it decides how it starts, and this stop
+        # comes before it signs in, so it never reads the subscription list.
+        @($Run.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped (exit 1): there is no unfinished run to retry.*' }).Count | Should -Be 1
+        script:Get-LockAtList -Run 'r1' | Should -Be 'not reached'
         Test-Path -LiteralPath $script:LockPath | Should -BeFalse
         foreach ($Next in 'r2', 'r3')
         {
