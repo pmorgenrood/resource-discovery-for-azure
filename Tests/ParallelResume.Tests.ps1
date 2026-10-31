@@ -352,6 +352,13 @@ function global:Compress-Archive
             throw ('The wrapper run did not end within {0} seconds.' -f $TimeoutSeconds)
         }
         $Proc.WaitForExit()
+        # A run ended this way is killed, so it leaves its run lock, which no
+        # run takes over: the next run would stop on it and print the command
+        # that removes it. That command is run here, as a user would run it.
+        if ($Ended)
+        {
+            foreach ($Lock in @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter '.run-lock-*.json' -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $Lock.FullName -Force }
+        }
         $Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n")
         $Run = [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; Error = [string]$Err.Result }
         $script:CaseRuns.Add([pscustomobject]@{ Arguments = $Label; ExitCode = $Proc.ExitCode; Ended = $Ended; Text = $Text; Error = $Run.Error })
@@ -1091,6 +1098,12 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         # Run 2, the folder writable again: recovered once more, D collected
         # again (its completion could not be written), everything removed.
         & chmod 755 $script:Root
+        # The read-only folder also refused the removal of R1's own run lock, and
+        # R1 printed the command that removes it. The lock is never taken over,
+        # so that command is run now that the folder can be written.
+        $Remove = @(foreach ($Line in $R1.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+        $Remove.Count | Should -Be 1 -Because 'the run says it could not remove its run lock, with the command that does'
+        & ([scriptblock]::Create($Remove[0]))
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
@@ -1125,6 +1138,12 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
 
         # Run 2, writable, B succeeds: recovered once more, everything removed.
         & chmod 755 $script:Root
+        # The read-only folder also refused the removal of R1's own run lock, and
+        # R1 printed the command that removes it. The lock is never taken over,
+        # so that command is run now that the folder can be written.
+        $Remove = @(foreach ($Line in $R1.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+        $Remove.Count | Should -Be 1 -Because 'the run says it could not remove its run lock, with the command that does'
+        & ([scriptblock]::Create($Remove[0]))
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
@@ -1158,6 +1177,12 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
 
         # Run 2, writable: the stream files are recovered, nothing is left to collect, everything is removed.
         & chmod 755 $script:Root
+        # The read-only folder also refused the removal of R1's own run lock, and
+        # R1 printed the command that removes it. The lock is never taken over,
+        # so that command is run now that the folder can be written.
+        $Remove = @(foreach ($Line in $R1.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+        $Remove.Count | Should -Be 1 -Because 'the run says it could not remove its run lock, with the command that does'
+        & ([scriptblock]::Create($Remove[0]))
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 4 completed, 0 failed subscription record(s).')

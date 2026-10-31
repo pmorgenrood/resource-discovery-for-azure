@@ -997,6 +997,12 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         {
             try { $R = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams }
             finally { & chmod 755 $script:Root }
+            # The read-only folder also refused the removal of this run's own lock,
+            # and the run printed the command that removes it. The lock is never
+            # taken over, so that command is run now that the folder can be written.
+            $LockRemove = @(foreach ($Line in $R.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+            $LockRemove.Count | Should -Be 1 -Because 'the run says it could not remove its run lock, with the command that does'
+            & ([scriptblock]::Create($LockRemove[0]))
             $R.ExitCode | Should -Be 1
             script:Get-StopLines $R | Should -BeLike ('ERROR: The resume state file {0} is not the right shape (FailedAttempts is not a list), and it could not be moved aside: Access to the path *' -f $script:StateName)
             $R.Text | Should -Contain $script:StopStart
@@ -1150,6 +1156,12 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         {
             try { $R = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams }
             finally { & chmod 755 $script:Root }
+            # The read-only folder also refused the removal of this run's own lock,
+            # and the run printed the command that removes it. The lock is never
+            # taken over, so that command is run now that the folder can be written.
+            $LockRemove = @(foreach ($Line in $R.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+            $LockRemove.Count | Should -Be 1 -Because 'the run says it could not remove its run lock, with the command that does'
+            & ([scriptblock]::Create($LockRemove[0]))
             $R.ExitCode | Should -Be 1
             script:Get-StopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} is not the right shape (Completed is not a list), and it could not be moved aside: Access to the path *' -f $script:Stream0Name)
             $R.Text | Should -Contain $script:StopStart

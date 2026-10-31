@@ -459,6 +459,26 @@ catch
     Exit-Wrapper -Code 1
 }
 
+# One run at a time for this tenant in this inventory folder: two runs would
+# share the resume state file and the per-stream state files below and
+# overwrite each other's progress. The lock is taken here, before any resume
+# state is read or written, and released by Exit-Wrapper on the early exits
+# and at the normal end below. A run that ends any other way (Ctrl+C, an
+# error that ends the script) releases it once its clean-up has finished:
+# the heartbeat sees the command has ended, or the process exits (see
+# Start-RunLockHeartbeat). A run that finds a lock stops here with exit 1,
+# whoever wrote it; the message says who holds it and what to do
+# (Write-RunLockHeldMessage).
+$RunLockPath = Get-RunLockPath -InventoryRoot $InventoryRoot -Tenant $TenantID
+$RunLock = Request-RunLock -Path $RunLockPath -RunStartTime $RunStartTime
+if (-not $RunLock.Acquired)
+{
+    Write-RunLockHeldMessage -Request $RunLock -Tenant $TenantID
+    $RunLock = $null
+    Exit-Wrapper -Code 1
+}
+if (-not (Start-RunLockHeartbeat -Lock $RunLock)) { Exit-Wrapper -Code 1 }
+
 # Resume state helpers
 $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $TenantID)
 
@@ -2795,6 +2815,10 @@ if ($StreamStateNotMoved.Count -gt 0)
 {
     Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -ResumeFailedOnly:$ResumeFailedOnly
 }
+
+# Release this run's lock before the transcript stops. Exit-Wrapper does the
+# same on the early exits.
+Remove-RunLock -Lock $RunLock
 
 # Stop the wrapper transcript on the normal-completion path. Error paths take
 # Exit-Wrapper which does the same.

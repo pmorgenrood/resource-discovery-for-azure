@@ -707,9 +707,70 @@ Describe 'The Az context snapshots of a parallel run' -Skip:$IsWindows {
         $null = $Run.Process.WaitForExit(10000)
         $Left | Should -Be 0 -Because ('the interrupted run deletes the files within 30 s, before stopping the jobs returns (about a minute after the workers died). Run output: {0}' -f ([string]$Run.Out.Result -replace '\s+', ' '))
 
+        # A run still in that minute was killed above (Stop-Started), as a closed
+        # terminal would end it, so it left its run lock, which no run takes
+        # over: the next run stops on it with the command that removes it, and
+        # that command is run, as a user would run it.
+        $LockPath = if (Get-Command -Name Get-RunLockPath -ErrorAction SilentlyContinue) { Get-RunLockPath -InventoryRoot $script:Root -Tenant $script:Tenant } else { $null }
+        if ($Running -and $LockPath -and (Test-Path -LiteralPath $LockPath))
+        {
+            $Stopped = script:Invoke-Wrapper -Streams 2
+            $Stopped.ExitCode | Should -Be 1 -Because 'a lock left by a killed run stops the next run'
+            $Remove = @($Stopped.Text | Where-Object { $_ -match '^    Remove-Item -LiteralPath ' })
+            $Remove.Count | Should -Be 1 -Because 'the stop prints the command that removes the lock of a run that is no longer running'
+            & ([scriptblock]::Create($Remove[0].Trim()))
+        }
+
         # The next two runs.
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the next run'
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
+    }
+
+    It 'keeps its run lock through the clean-up after Ctrl+C while the workers read their files, then releases it with no snapshot left' {
+        if (-not (Get-Command -Name Get-RunLockPath -ErrorAction SilentlyContinue))
+        {
+            Set-ItResult -Skipped -Because 'this version takes no run lock'
+            return
+        }
+        if (-not $script:Perl -and -not $IsMacOS -and ((Get-Content -LiteralPath '/proc/self/status' | Where-Object { $_ -like 'SigIgn:*' }) -replace '^SigIgn:\s*', '' | ForEach-Object { ([Convert]::ToUInt64($_, 16) -band 2) -ne 0 }))
+        {
+            Set-ItResult -Skipped -Because 'this test process ignores Ctrl+C (SIGINT), so the run it starts would too, and perl is not there to set it back'
+            return
+        }
+        $LockPath = Get-RunLockPath -InventoryRoot $script:Root -Tenant $script:Tenant
+        $Run = script:Start-Wrapper -Streams 2 -HoldImport
+        $null = script:Wait-ImportHeld -Count 2
+        Test-Path -LiteralPath $LockPath | Should -BeTrue -Because 'the run holds its lock while the streams start'
+        @(script:Get-Snapshot).Count | Should -BeGreaterThan 0 -Because 'the workers are still reading their files'
+        # Ctrl+C, as the terminal sends it, while both workers are inside
+        # Import-AzContext. Then watch the lock and the snapshots until the
+        # wrapper has ended.
+        & kill -INT $Run.Process.Id
+        $Samples = [System.Collections.Generic.List[object]]::new()
+        $Deadline = (Get-Date).AddSeconds(120)
+        while (-not $Run.Process.HasExited -and (Get-Date) -lt $Deadline)
+        {
+            $Samples.Add([pscustomobject]@{ Lock = (Test-Path -LiteralPath $LockPath); Snapshots = @(script:Get-Snapshot).Count })
+            Start-Sleep -Milliseconds 100
+        }
+        $Ended = $Run.Process.HasExited
+        $LockLeft = Test-Path -LiteralPath $LockPath
+        $Left = @(script:Get-Snapshot).Count
+        script:Stop-Started
+        $Ended | Should -BeTrue -Because ('the interrupted run ends. Run output: {0}' -f ([string]$Run.Out.Result -replace '\s+', ' '))
+        @($Samples | Where-Object { -not $_.Lock -and $_.Snapshots -gt 0 }) | Should -BeNullOrEmpty -Because 'the lock is released only after the clean-up has deleted the snapshots'
+        $LockLeft | Should -BeFalse -Because 'the lock is released once the clean-up has finished'
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter '.run-lock-*').Count | Should -Be 0
+        $Left | Should -Be 0 -Because 'the interrupted run deletes every snapshot'
+
+        # The next two runs find no lock left, take their own and end clean.
+        foreach ($Because in 'the next run', 'the run after it')
+        {
+            $Next = script:Invoke-Wrapper -Streams 2
+            script:Assert-CleanRun -Result $Next -Because $Because
+            @($Next.Text | Where-Object { $_ -match 'holds the lock on this inventory folder' }) | Should -BeNullOrEmpty -Because ('{0}: the interrupted run left no lock' -f $Because)
+            Test-Path -LiteralPath $LockPath | Should -BeFalse -Because $Because
+        }
     }
 
     It 'keeps the snapshots of a live run of another tenant whose workers have not opened them, however old, and removes them once that run has ended' {

@@ -43,6 +43,11 @@ function Exit-Wrapper
     {
         Write-OtherRunStreamStateLine -InventoryRoot $InventoryRoot -Tenant $TenantID -RunId $RunId
     }
+    # Then the run lock, after the per-stream files (their clean-up writes the
+    # resume state, so the lock must still be held) and before the transcript
+    # stops. Before the lock is taken there is none to release.
+    $HeldRunLock = Get-Variable -Name 'RunLock' -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $HeldRunLock) { Remove-RunLock -Lock $HeldRunLock }
     if ($WrapperTranscriptStarted)
     {
         try { Stop-Transcript | Out-Null }
@@ -1873,6 +1878,1172 @@ function Get-WrapperExitCode
     if ($AuthSkipped) { return 3 }
     if ($CollectorsFailed) { return 4 }
     return 0
+}
+
+# ---- One run at a time for each tenant --------------------------------------
+# Two runs for one tenant in one inventory folder would share the resume state
+# file and the per-stream state files and overwrite each other's progress, so
+# the wrapper holds a lock file for the tenant from before it reads any resume
+# state until it exits:
+#   <InventoryRoot>/.run-lock-<TenantID>.json
+# It is a dot-file named like the resume state file; no resume-state,
+# per-stream or zip step reads it or packs it. A run creates the lock only when
+# there is none (the file is created only if it is absent, and written to disk
+# before the run goes on), and only that run refreshes it and removes it. A run
+# that finds a lock stops with exit 1, whoever wrote it: a lock is never taken
+# over. The lock holds the full host name, the process id, that process's
+# start time (on Linux also the boot id and the start in clock ticks since
+# boot), the run's start time, a heartbeat time refreshed every minute (all
+# UTC), an id for this run of the wrapper and the id of the runspace it runs
+# in. They are used only to say in the stop message who holds the lock and
+# what to do about it (Get-RunLockHolder, Write-RunLockHeldMessage).
+# Stream worker processes never take the lock; the wrapper holds it for them.
+
+function Get-RunLockPath
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant
+    )
+    # Small letters: a tenant id typed in capitals names the same tenant, and
+    # on a file system that tells case apart it would otherwise get a lock of
+    # its own.
+    return (Join-Path $InventoryRoot ('.run-lock-{0}.json' -f $Tenant.ToLowerInvariant()))
+}
+
+# The lock's times are written as round-trip UTC text ('o'). Returns that time
+# as UTC, or $null for a value that is missing, not text, or not a date.
+function ConvertTo-RunLockTime
+{
+    param($Value)
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $Parsed = [datetime]::MinValue
+    $Styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if ([datetime]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, $Styles, [ref]$Parsed)) { return $Parsed }
+    return $null
+}
+
+function Format-RunLockTime
+{
+    param([Parameter(Mandatory = $true)][datetime]$Value)
+    return ('{0} UTC' -f $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture))
+}
+
+# Reads a lock file. Returns Exists, Valid, Problem (why it is not valid), Raw
+# (its text; $null when it could not be read), FileWriteTimeUtc and the
+# recorded values, times as UTC. A read that fails, or a lock that is not
+# valid, is read again for about 2 seconds (Attempts): a run that has just
+# created its lock may not have written it yet, and a file another process has
+# open for a moment, or a share that is away for a moment, is not reported as
+# unreadable. Read as plain JSON (System.Text.Json) so the recorded times stay
+# text until ConvertTo-RunLockTime parses them. The run id and the runspace id
+# are not required.
+function Read-RunLock
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Attempts = 10,
+        [int]$RetryMilliseconds = 200
+    )
+    for ($Try = 1; $Try -le $Attempts; $Try++)
+    {
+        $Lock = Read-RunLockOnce -Path $Path
+        if (-not $Lock.Exists -or $Lock.Valid) { return $Lock }
+        if ($Try -lt $Attempts) { Start-Sleep -Milliseconds $RetryMilliseconds }
+    }
+    return $Lock
+}
+
+function Read-RunLockOnce
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Lock = [pscustomobject]@{
+        Exists              = $false
+        Valid               = $false
+        Problem             = $null
+        Raw                 = $null
+        FileWriteTimeUtc    = $null
+        MachineName         = $null
+        ProcessId           = $null
+        ProcessStartTimeUtc = $null
+        RunStartTimeUtc     = $null
+        HeartbeatUtc        = $null
+        BootId              = $null
+        ProcessStartTicks   = $null
+        InvocationId        = $null
+        RunspaceId          = $null
+    }
+    $Item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $Item) { return $Lock }
+    $Lock.Exists = $true
+    $Lock.FileWriteTimeUtc = $Item.LastWriteTimeUtc
+    try
+    {
+        $Lock.Raw = Read-RunLockText -Path $Item.FullName
+    }
+    catch [System.IO.FileNotFoundException]
+    {
+        $Lock.Exists = $false
+        return $Lock
+    }
+    catch
+    {
+        $Lock.Problem = Get-RunLockErrorText -ErrorRecord $_
+        return $Lock
+    }
+
+    $Values = @{}
+    try
+    {
+        $Document = [System.Text.Json.JsonDocument]::Parse($Lock.Raw)
+        try
+        {
+            foreach ($Property in $Document.RootElement.EnumerateObject())
+            {
+                $Number = 0
+                if ($Property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $Values[$Property.Name] = $Property.Value.GetString() }
+                elseif ($Property.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and $Property.Value.TryGetInt32([ref]$Number)) { $Values[$Property.Name] = $Number }
+                else { $Values[$Property.Name] = $null }
+            }
+        }
+        finally
+        {
+            $Document.Dispose()
+        }
+    }
+    catch
+    {
+        $Lock.Problem = $(if ($Lock.Raw.Length -eq 0) { 'it is empty' } else { 'it is not a JSON object' })
+        return $Lock
+    }
+
+    $NotValid = @()
+    if ($Values['MachineName'] -is [string] -and -not [string]::IsNullOrWhiteSpace($Values['MachineName'])) { $Lock.MachineName = $Values['MachineName'] }
+    else { $NotValid += 'MachineName' }
+    if ($Values['ProcessId'] -is [int] -and $Values['ProcessId'] -gt 0) { $Lock.ProcessId = $Values['ProcessId'] }
+    else { $NotValid += 'ProcessId' }
+    foreach ($Name in 'ProcessStartTimeUtc', 'RunStartTimeUtc', 'HeartbeatUtc')
+    {
+        $Time = ConvertTo-RunLockTime -Value $Values[$Name]
+        if ($null -eq $Time) { $NotValid += $Name }
+        else { $Lock.$Name = $Time }
+    }
+    if ($NotValid.Count -gt 0)
+    {
+        $Lock.Problem = ('{0} missing or not valid' -f ($NotValid -join ', '))
+        return $Lock
+    }
+    if ($Values['InvocationId'] -is [string] -and -not [string]::IsNullOrWhiteSpace($Values['InvocationId'])) { $Lock.InvocationId = $Values['InvocationId'] }
+    if ($Values['RunspaceId'] -is [int]) { $Lock.RunspaceId = $Values['RunspaceId'] }
+    # Linux only; a lock without them is described by its start time.
+    if ($Values['BootId'] -is [string] -and $Values['BootId'] -match '^[0-9a-f-]{36}$') { $Lock.BootId = $Values['BootId'] }
+    if ($Values['ProcessStartTicks'] -is [string] -and $Values['ProcessStartTicks'] -match '^[0-9]{1,20}$') { $Lock.ProcessStartTicks = $Values['ProcessStartTicks'] }
+    $Lock.Valid = $true
+    return $Lock
+}
+
+# The text of a lock file (one function, so a failed read can be tested).
+function Read-RunLockText
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [System.IO.File]::ReadAllText($Path)
+}
+
+# The message of an error, without the 'Exception calling "Move" with "2"
+# argument(s):' text PowerShell puts around an error from a .NET method.
+function Get-RunLockErrorText
+{
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $Exception = $ErrorRecord.Exception
+    if ($Exception -is [System.Management.Automation.MethodInvocationException] -and $null -ne $Exception.InnerException) { return $Exception.InnerException.Message }
+    return $Exception.Message
+}
+
+# This machine's full host name. On Linux and macOS [Environment]::MachineName
+# is the host name cut at the first dot, so build.east.example and
+# build.west.example would both be 'build'. Host names are compared without
+# regard to case (Test-RunLockThisMachine).
+function Get-RunLockHostName
+{
+    $Name = $null
+    try { $Name = [System.Net.Dns]::GetHostName() }
+    catch { Write-Verbose ('Host name not readable: {0}' -f $_.Exception.Message) }
+    if ([string]::IsNullOrWhiteSpace($Name)) { return [Environment]::MachineName }
+    return $Name
+}
+
+function Test-RunLockThisMachine
+{
+    param([string]$Name)
+    return [string]::Equals($Name, (Get-RunLockHostName), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# The id of the current boot of this machine (Linux; $null elsewhere or when it
+# cannot be read). A process recorded under another boot id is from before a
+# restart.
+function Get-RunLockBootId
+{
+    if (-not $IsLinux) { return $null }
+    try { $Id = [System.IO.File]::ReadAllText('/proc/sys/kernel/random/boot_id').Trim() }
+    catch { return $null }
+    if ($Id -match '^[0-9a-f-]{36}$') { return $Id }
+    return $null
+}
+
+# When this machine started (UTC; Linux, from 'btime' in /proc/stat; $null
+# elsewhere or when it cannot be read).
+function Get-RunLockBootTime
+{
+    if (-not $IsLinux) { return $null }
+    try { $Lines = [System.IO.File]::ReadAllLines('/proc/stat') }
+    catch { return $null }
+    foreach ($Line in $Lines)
+    {
+        $Seconds = [long]0
+        if ($Line.StartsWith('btime ') -and [long]::TryParse($Line.Substring(6).Trim(), [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Seconds)) { return [DateTimeOffset]::FromUnixTimeSeconds($Seconds).UtcDateTime }
+    }
+    return $null
+}
+
+# When a process started, in clock ticks since boot, and its state (Linux;
+# $null elsewhere or when it cannot be read). On Linux .NET works out
+# Process.StartTime from the current wall clock, so a clock step (time
+# synchronisation, a virtual machine paused or resumed) moves it; the ticks
+# since boot do not move. They are field 22 of /proc/<id>/stat. The command
+# name (field 2) is in parentheses and can hold spaces and parentheses, so the
+# fields are counted from the last ')'.
+function Get-RunLockLinuxStart
+{
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    if (-not $IsLinux) { return $null }
+    try { $Text = [System.IO.File]::ReadAllText(('/proc/{0}/stat' -f $ProcessId)) }
+    catch { return $null }
+    $End = $Text.LastIndexOf(')')
+    if ($End -lt 0) { return $null }
+    $Fields = $Text.Substring($End + 1).Trim().Split(' ')
+    # $Fields[0] is field 3 (the state), so field 22 is $Fields[19].
+    if ($Fields.Count -lt 20) { return $null }
+    $Ticks = [long]0
+    if (-not [long]::TryParse($Fields[19], [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Ticks)) { return $null }
+    return [pscustomobject]@{ State = $Fields[0]; Ticks = [string]$Ticks }
+}
+
+# Whether a process with this id is running on this machine and, when they can
+# be read, when it started (UTC; $null when it cannot be read) and, on Linux,
+# its start in clock ticks since boot (StartTicks). A process that has ended
+# but whose parent has not yet collected it (state Z) is not running.
+function Get-RunLockProcess
+{
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    try
+    {
+        $Process = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+    }
+    catch
+    {
+        return [pscustomobject]@{ Running = $false; StartTimeUtc = $null; StartTicks = $null }
+    }
+    try
+    {
+        $StartTimeUtc = $null
+        try { $StartTimeUtc = $Process.StartTime.ToUniversalTime() }
+        catch { Write-Verbose ('Start time of process {0} not readable: {1}' -f $ProcessId, $_.Exception.Message) }
+        $Exited = $false
+        try { $Exited = $Process.HasExited }
+        catch { Write-Verbose ('Exit state of process {0} not readable: {1}' -f $ProcessId, $_.Exception.Message) }
+        $Linux = Get-RunLockLinuxStart -ProcessId $ProcessId
+        if ($null -ne $Linux -and $Linux.State -eq 'Z') { $Exited = $true }
+        return [pscustomobject]@{ Running = (-not $Exited); StartTimeUtc = $StartTimeUtc; StartTicks = $(if ($null -ne $Linux) { $Linux.Ticks } else { $null }) }
+    }
+    finally
+    {
+        $Process.Dispose()
+    }
+}
+
+# ---- Runs of the wrapper in this process ----
+# Every run that holds a lock is listed, by its run id, in one table for the
+# whole process (kept in the process's AppDomain data, so every runspace sees
+# the same table). Each entry is the run's lock state (a synchronized
+# hashtable, New-RunLockState): Path, Identity (the values that make the lock
+# this run's), InvocationId, Runspace, Pipeline (the command the run's
+# runspace was running when the run took the lock), Stopped (no more
+# heartbeats), Released (this run no longer touches the file) and Warned.
+
+function Get-RunLockRegistry
+{
+    $Domain = [System.AppDomain]::CurrentDomain
+    [System.Threading.Monitor]::Enter($Domain)
+    try
+    {
+        $Registry = $Domain.GetData('RdaRunLock.Runs.V3')
+        if ($null -eq $Registry)
+        {
+            $Registry = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+            $Domain.SetData('RdaRunLock.Runs.V3', $Registry)
+        }
+    }
+    finally
+    {
+        [System.Threading.Monitor]::Exit($Domain)
+    }
+    return , $Registry
+}
+
+# The command the calling runspace is running now ($null when it cannot be
+# read). PowerShell has no public way to see from another thread whether a
+# runspace is still running a given command: its RunspaceAvailability reads
+# Available while a 'pwsh -File' script is still running (measured). So this
+# reads the runspace's own record of its running command, a non-public
+# method, here only. When it cannot be read, the heartbeat keeps going and the
+# stop message of any run names the run as still going (see
+# Get-RunLockInvocationState and Test-RunLockRunspaceRunEnded).
+function Get-RunLockCurrentPipeline
+{
+    try
+    {
+        $Method = [System.Management.Automation.Runspaces.Runspace].GetMethod('GetCurrentlyRunningPipeline', [System.Reflection.BindingFlags]'NonPublic, Instance')
+        if ($null -eq $Method) { return $null }
+        return $Method.Invoke([System.Management.Automation.Runspaces.Runspace]::DefaultRunspace, @())
+    }
+    catch
+    {
+        return $null
+    }
+}
+
+# Whether the run behind a lock state is still going: Running, Ended (its
+# runspace is closed, or the command that started it has finished, stopped or
+# failed, its clean-up included) or Unknown (that command cannot be read).
+# Self-contained, because the heartbeat runspace runs it too.
+function Get-RunLockInvocationState
+{
+    param([Parameter(Mandatory = $true)]$State)
+    $Runspace = $State['Runspace']
+    if ($null -eq $Runspace -or $Runspace.RunspaceStateInfo.State -ne [System.Management.Automation.Runspaces.RunspaceState]::Opened) { return 'Ended' }
+    $Pipeline = $State['Pipeline']
+    if ($null -eq $Pipeline) { return 'Unknown' }
+    $PipelineState = [string]$Pipeline.PipelineStateInfo.State
+    if ($PipelineState -eq 'Completed' -or $PipelineState -eq 'Failed' -or $PipelineState -eq 'Stopped') { return 'Ended' }
+    return 'Running'
+}
+
+# Whether a run listed for the calling runspace has ended: its command has
+# finished, or it was started by the command that is running now (a script
+# that caught that run's error and went on). A run whose command is another
+# one that is still running is paused under a nested prompt (a debugger stop,
+# a suspended confirm prompt) and goes on later. When either command cannot
+# be read (Get-RunLockCurrentPipeline), the run counts as still going.
+function Test-RunLockRunspaceRunEnded
+{
+    param([Parameter(Mandatory = $true)]$Entry)
+    if ((Get-RunLockInvocationState -State $Entry) -eq 'Ended') { return $true }
+    $Recorded = $Entry['Pipeline']
+    $Current = Get-RunLockCurrentPipeline
+    if ($null -eq $Recorded -or $null -eq $Current) { return $false }
+    return [object]::ReferenceEquals($Recorded, $Current)
+}
+
+# Lists a run in the process's table (Request-RunLock does this before the
+# lock file can appear). An earlier run of the same runspace is left as it
+# is: its own heartbeat removes its lock once the command that started it has
+# ended, and its release at process exit when the process ends. Only the run
+# that created a lock removes it.
+function Register-RunLockInvocation
+{
+    param([Parameter(Mandatory = $true)]$State)
+    $null = (Get-RunLockRegistry).TryAdd([string]$State['InvocationId'], $State)
+}
+
+function Unregister-RunLockInvocation
+{
+    param([Parameter(Mandatory = $true)]$State)
+    $Registry = Get-RunLockRegistry
+    $Removed = $null
+    $null = $Registry.TryRemove([string]$State['InvocationId'], [ref]$Removed)
+    $ExitRelease = 'RdaRunLock.ExitReleaseV3' -as [type]
+    if ($null -ne $ExitRelease) { $ExitRelease::Remove($State) }
+}
+
+# Who holds an existing lock (from Read-RunLock), only to choose what the stop
+# message says (Write-RunLockHeldMessage); no run acts on it. Returns Kind,
+# Why, AgeSeconds (how long ago the heartbeat was refreshed; $null for a lock
+# that is not valid) and Ending (the lock is of a run in this process whose
+# command has ended and whose own heartbeat is about to remove it). Kind is
+# one of:
+#   Running      this machine, and the process that wrote the lock is running
+#                (for this process: the run that wrote it is still going, also
+#                when it is paused under a nested prompt of this runspace);
+#   Ended        this machine, and that process is not running (Why:
+#                ProcessGone, ProcessIdReused, Restarted, or RunEnded for an
+#                earlier run in this process that has ended);
+#   Unknown      this machine, a process with that id is running, but whether
+#                it is the one that wrote the lock cannot be told (Why:
+#                StartUnreadable, or StartTimeDiffers on Linux for a lock
+#                without the boot id and start ticks, where a clock step
+#                also moves the start time);
+#   OtherMachine another full host name, or this host name with another boot
+#                id and a refresh after this machine started (Why: OtherBoot),
+#                which is another machine with the same name, not a restart;
+#   Unreadable   the lock cannot be read or holds values that are not valid.
+# On Linux the process is told by the boot id and the start in clock ticks
+# since boot, which a clock step does not move; elsewhere, and for a lock
+# written without them, by the start time, to within one second.
+function Get-RunLockHolder
+{
+    param([Parameter(Mandatory = $true)]$Lock)
+    if (-not $Lock.Valid) { return [pscustomobject]@{ Kind = 'Unreadable'; Why = $null; AgeSeconds = $null; Ending = $false } }
+    $Age = [int][math]::Floor([math]::Max(0, ([datetime]::UtcNow - $Lock.HeartbeatUtc).TotalSeconds))
+    $Holder = [pscustomobject]@{ Kind = 'Running'; Why = $null; AgeSeconds = $Age; Ending = $false }
+    if (-not (Test-RunLockThisMachine -Name $Lock.MachineName)) { $Holder.Kind = 'OtherMachine'; return $Holder }
+    $BootId = $null
+    if ($null -ne $Lock.BootId -and $null -ne $Lock.ProcessStartTicks) { $BootId = Get-RunLockBootId }
+    if ($null -ne $BootId -and $BootId -ne $Lock.BootId)
+    {
+        # A restart only when the lock was last refreshed before this boot.
+        $BootTime = Get-RunLockBootTime
+        if ($null -ne $BootTime -and $Lock.HeartbeatUtc -lt $BootTime) { $Holder.Kind = 'Ended'; $Holder.Why = 'Restarted' }
+        else { $Holder.Kind = 'OtherMachine'; $Holder.Why = 'OtherBoot' }
+        return $Holder
+    }
+    $Process = Get-RunLockProcess -ProcessId $Lock.ProcessId
+    if (-not $Process.Running) { $Holder.Kind = 'Ended'; $Holder.Why = 'ProcessGone'; return $Holder }
+    if ($null -ne $BootId)
+    {
+        if ($null -eq $Process.StartTicks) { $Holder.Kind = 'Unknown'; $Holder.Why = 'StartUnreadable'; return $Holder }
+        if ($Process.StartTicks -cne $Lock.ProcessStartTicks) { $Holder.Kind = 'Ended'; $Holder.Why = 'ProcessIdReused'; return $Holder }
+    }
+    elseif ($null -eq $Process.StartTimeUtc) { $Holder.Kind = 'Unknown'; $Holder.Why = 'StartUnreadable'; return $Holder }
+    elseif ([math]::Abs(($Process.StartTimeUtc - $Lock.ProcessStartTimeUtc).TotalSeconds) -gt 1)
+    {
+        # Another process reads a process's start time to within a fraction of
+        # a millisecond of what the process reads for itself.
+        if ($IsLinux) { $Holder.Kind = 'Unknown'; $Holder.Why = 'StartTimeDiffers' }
+        else { $Holder.Kind = 'Ended'; $Holder.Why = 'ProcessIdReused' }
+        return $Holder
+    }
+    if ($Lock.ProcessId -eq $PID -and -not [string]::IsNullOrEmpty($Lock.InvocationId))
+    {
+        # This process. A run is listed before its lock file can appear, so
+        # a run that is not listed has ended. A listed run has ended when its
+        # command has finished (then its own heartbeat removes the lock within
+        # a quarter of a second: Ending), or, for the asking runspace, when it
+        # was started by the command running now (Test-RunLockRunspaceRunEnded).
+        $Entry = $null
+        $Listed = (Get-RunLockRegistry).TryGetValue($Lock.InvocationId, [ref]$Entry)
+        if (-not $Listed) { $Holder.Kind = 'Ended'; $Holder.Why = 'RunEnded' }
+        elseif ((Get-RunLockInvocationState -State $Entry) -eq 'Ended')
+        {
+            $Holder.Kind = 'Ended'
+            $Holder.Why = 'RunEnded'
+            $Holder.Ending = ([bool]$Entry['Beating'] -and -not $Entry['Stopped'] -and -not $Entry['Released'])
+        }
+        elseif ([object]::ReferenceEquals($Entry['Runspace'], [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace) -and (Test-RunLockRunspaceRunEnded -Entry $Entry))
+        {
+            $Holder.Kind = 'Ended'
+            $Holder.Why = 'RunEnded'
+        }
+    }
+    return $Holder
+}
+
+# The record this run writes into its lock (all values as written).
+function New-RunLockRecord
+{
+    param(
+        [Parameter(Mandatory = $true)][datetime]$RunStartTime,
+        [Parameter(Mandatory = $true)][string]$InvocationId
+    )
+    $Self = [System.Diagnostics.Process]::GetCurrentProcess()
+    try { $SelfStart = $Self.StartTime.ToUniversalTime() }
+    finally { $Self.Dispose() }
+    $Record = [ordered]@{
+        MachineName         = (Get-RunLockHostName)
+        ProcessId           = $PID
+        ProcessStartTimeUtc = $SelfStart.ToString('o')
+        RunStartTimeUtc     = $RunStartTime.ToUniversalTime().ToString('o')
+        HeartbeatUtc        = [datetime]::UtcNow.ToString('o')
+        InvocationId        = $InvocationId
+        RunspaceId          = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace.Id
+    }
+    # Linux: which process this is, in a form a clock step does not move.
+    $BootId = Get-RunLockBootId
+    $Start = Get-RunLockLinuxStart -ProcessId $PID
+    if ($null -ne $BootId -and $null -ne $Start)
+    {
+        $Record['BootId'] = $BootId
+        $Record['ProcessStartTicks'] = $Start.Ticks
+    }
+    return $Record
+}
+
+# Whether the lock file at Path is still this run's: the same machine name,
+# process id, process start time and run id as Record (the lock record, or a
+# state's Identity). Returns State (Ours, Other, Missing or Unreadable: the
+# file could not be read now) and Holder (who holds it, or why it cannot be
+# read). A file that is not a valid lock is not this run's. Self-contained,
+# because the heartbeat runspace runs it too.
+function Test-RunLockOwner
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Record
+    )
+    try
+    {
+        $Text = [System.IO.File]::ReadAllText($Path)
+    }
+    catch [System.IO.FileNotFoundException]
+    {
+        return [pscustomobject]@{ State = 'Missing'; Holder = $null }
+    }
+    catch
+    {
+        $Problem = if ($null -ne $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        return [pscustomobject]@{ State = 'Unreadable'; Holder = $Problem }
+    }
+    $Values = @{}
+    try
+    {
+        $Document = [System.Text.Json.JsonDocument]::Parse($Text)
+        try
+        {
+            foreach ($Property in $Document.RootElement.EnumerateObject()) { $Values[$Property.Name] = $Property.Value.ToString() }
+        }
+        finally
+        {
+            $Document.Dispose()
+        }
+    }
+    catch
+    {
+        return [pscustomobject]@{ State = 'Other'; Holder = 'a file that is not a valid run lock' }
+    }
+    foreach ($Name in 'MachineName', 'ProcessId', 'ProcessStartTimeUtc', 'InvocationId')
+    {
+        if ([string]$Values[$Name] -cne [string]$Record[$Name])
+        {
+            $Holder = if ([string]$Values['ProcessId'] -eq [string]$PID -and [string]::Equals([string]$Values['MachineName'], [string]$Record['MachineName'], [System.StringComparison]::OrdinalIgnoreCase)) { 'another run in this process' } else { 'process {0} on {1}' -f $Values['ProcessId'], $Values['MachineName'] }
+            return [pscustomobject]@{ State = 'Other'; Holder = $Holder }
+        }
+    }
+    return [pscustomobject]@{ State = 'Ours'; Holder = $null }
+}
+
+# Rewrites (NewText) or removes (-Remove) this run's lock file, only while it
+# is still this run's (Test-RunLockOwner). Once it is not (another lock is in
+# its place, or it is gone), Released is set and this run never writes or
+# removes that file again. The heartbeat, the release and the release at
+# process exit of one run take the state's own lock (its SyncRoot) first, so
+# they never interleave. A rewrite goes through a temporary file written to
+# disk and a rename, so a reader never sees a half-written lock. Returns
+# Outcome (Written, Removed, Released (this run no longer touches the file),
+# Missing, Other, Busy (another part of this run held the state for
+# TimeoutSeconds) or Failed), Holder (for Other) and Problem. Self-contained,
+# because the heartbeat runspace runs it too.
+function Invoke-RunLockFileChange
+{
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [string]$NewText,
+        [switch]$Remove,
+        [int]$TimeoutSeconds = 10
+    )
+    $Gate = $State.SyncRoot
+    $Held = $false
+    try
+    {
+        $Held = [System.Threading.Monitor]::TryEnter($Gate, [TimeSpan]::FromSeconds($TimeoutSeconds))
+        if (-not $Held) { return [pscustomobject]@{ Outcome = 'Busy'; Holder = $null; Problem = ('another part of this run held the run lock state for {0} seconds' -f $TimeoutSeconds) } }
+        if ($State['Released']) { return [pscustomobject]@{ Outcome = 'Released'; Holder = $null; Problem = $null } }
+        $Path = [string]$State['Path']
+        $Owner = Test-RunLockOwner -Path $Path -Record $State['Identity']
+        if ($Owner.State -eq 'Unreadable') { return [pscustomobject]@{ Outcome = 'Failed'; Holder = $null; Problem = $Owner.Holder } }
+        if ($Owner.State -eq 'Missing' -or $Owner.State -eq 'Other')
+        {
+            $State['Released'] = $true
+            return [pscustomobject]@{ Outcome = $Owner.State; Holder = $Owner.Holder; Problem = $null }
+        }
+        if ($Remove)
+        {
+            [System.IO.File]::Delete($Path)
+            $State['Released'] = $true
+            return [pscustomobject]@{ Outcome = 'Removed'; Holder = $null; Problem = $null }
+        }
+        $Temp = '{0}.{1}.tmp' -f $Path, [guid]::NewGuid().ToString('N').Substring(0, 8)
+        try
+        {
+            # Written to disk before the rename, so a crash does not leave an
+            # empty lock in its place.
+            $TempStream = [System.IO.File]::Open($Temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try
+            {
+                $TempBytes = [System.Text.Encoding]::UTF8.GetBytes($NewText)
+                $TempStream.Write($TempBytes, 0, $TempBytes.Length)
+                $TempStream.Flush($true)
+            }
+            finally
+            {
+                $TempStream.Dispose()
+            }
+            [System.IO.File]::Move($Temp, $Path, $true)
+        }
+        catch
+        {
+            try { if ([System.IO.File]::Exists($Temp)) { [System.IO.File]::Delete($Temp) } }
+            catch { Write-Verbose ('Could not remove {0}: {1}' -f $Temp, $_.Exception.Message) }
+            throw
+        }
+        return [pscustomobject]@{ Outcome = 'Written'; Holder = $null; Problem = $null }
+    }
+    catch
+    {
+        $Problem = if ($_.Exception -is [System.Management.Automation.MethodInvocationException] -and $null -ne $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        return [pscustomobject]@{ Outcome = 'Failed'; Holder = $null; Problem = $Problem }
+    }
+    finally
+    {
+        if ($Held) { [System.Threading.Monitor]::Exit($Gate) }
+    }
+}
+
+# Removes this run's lock when the process exits, if a run of the wrapper still
+# holds it then: a 'pwsh -File' run that was interrupted (Ctrl+C) or ended
+# with an error ends its process right after its clean-up, before the
+# heartbeat may see it. Compiled, because a process-exit handler runs on a
+# thread with no PowerShell runspace. Same checks as Invoke-RunLockFileChange.
+$script:RunLockTypeSource = @'
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+
+namespace RdaRunLock
+{
+    public static class ExitReleaseV3
+    {
+        private static readonly object Gate = new object();
+        private static readonly List<Hashtable> States = new List<Hashtable>();
+        private static bool hooked;
+
+        public static void Add(Hashtable state)
+        {
+            lock (Gate)
+            {
+                if (!States.Contains(state)) { States.Add(state); }
+                if (!hooked)
+                {
+                    AppDomain.CurrentDomain.ProcessExit += OnExit;
+                    hooked = true;
+                }
+            }
+        }
+
+        public static void Remove(Hashtable state)
+        {
+            lock (Gate) { States.Remove(state); }
+        }
+
+        private static void OnExit(object sender, EventArgs e)
+        {
+            Hashtable[] all;
+            lock (Gate) { all = States.ToArray(); }
+            foreach (Hashtable state in all)
+            {
+                try { Release(state); } catch (Exception) { }
+            }
+        }
+
+        private static void Release(Hashtable state)
+        {
+            object gate = state.SyncRoot;
+            if (!Monitor.TryEnter(gate, TimeSpan.FromSeconds(5))) { return; }
+            try
+            {
+                if (true.Equals(state["Released"])) { return; }
+                string path = Convert.ToString(state["Path"], CultureInfo.InvariantCulture);
+                string text;
+                try { text = File.ReadAllText(path); }
+                catch (IOException) { return; }
+                catch (UnauthorizedAccessException) { return; }
+                if (IsOwn(text, state["Identity"] as Hashtable))
+                {
+                    File.Delete(path);
+                    state["Released"] = true;
+                }
+            }
+            finally
+            {
+                Monitor.Exit(gate);
+            }
+        }
+
+        private static bool IsOwn(string text, Hashtable identity)
+        {
+            if (identity == null) { return false; }
+            try
+            {
+                using (JsonDocument document = JsonDocument.Parse(text))
+                {
+                    if (document.RootElement.ValueKind != JsonValueKind.Object) { return false; }
+                    foreach (string name in new[] { "MachineName", "ProcessId", "ProcessStartTimeUtc", "InvocationId" })
+                    {
+                        JsonElement value;
+                        if (!document.RootElement.TryGetProperty(name, out value)) { return false; }
+                        if (!string.Equals(value.ToString(), Convert.ToString(identity[name], CultureInfo.InvariantCulture), StringComparison.Ordinal)) { return false; }
+                    }
+                    return true;
+                }
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+        }
+    }
+}
+'@
+
+# The state of a lock this run has just taken (see Get-RunLockRegistry): the
+# values that make the lock this run's, and the runspace and the command that
+# took it.
+function New-RunLockState
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Record
+    )
+    $Identity = @{}
+    foreach ($Name in 'MachineName', 'ProcessId', 'ProcessStartTimeUtc', 'InvocationId') { $Identity[$Name] = [string]$Record[$Name] }
+    return [hashtable]::Synchronized(@{
+            Path         = $Path
+            Identity     = $Identity
+            InvocationId = [string]$Record['InvocationId']
+            Runspace     = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace
+            Pipeline     = (Get-RunLockCurrentPipeline)
+            Stopped      = $false
+            Released     = $false
+            Warned       = $false
+            Beating      = $false
+        })
+}
+
+# The runspace the heartbeat runs in.
+function New-RunLockHeartbeatRunspace
+{
+    $Runspace = [runspacefactory]::CreateRunspace($Host)
+    $Runspace.Open()
+    return $Runspace
+}
+
+# Starts the background runspace that rewrites the heartbeat every
+# IntervalSeconds and, once the command that started the run has finished (its
+# clean-up included), releases the lock and stops. That covers a run ended by
+# an error or by Ctrl+C in an interactive session, where the process goes on
+# (Cloud Shell runs every command in one pwsh process). In 'pwsh -File' the
+# process exits right after the run, so the lock is also released at process
+# exit. A runspace of its own rather than Start-ThreadJob: thread jobs share
+# one limit of five running jobs per process, and on a sequential run the
+# metrics phase (Extension/Metrics.ps1) runs its calls as thread jobs in this
+# process, so a heartbeat thread job would hold one of those five for the
+# whole run. Returns $false, after one ERROR line, when the heartbeat cannot
+# start: without it the lock would not be released when the command ends in a
+# session that goes on, so the caller stops before reading or writing any run
+# state. The release at process exit needs a compiled handler; when that
+# cannot be set up, one warning says so and the run goes on.
+function Start-RunLockHeartbeat
+{
+    param(
+        [Parameter(Mandatory = $true)]$Lock,
+        [int]$IntervalSeconds = 60
+    )
+    # Request-RunLock listed the run when it took the lock; the heartbeat
+    # attaches to that entry.
+    $State = $Lock.State
+    if ($null -eq $State)
+    {
+        $State = New-RunLockState -Path $Lock.Path -Record $Lock.Record
+        $Lock.State = $State
+        Register-RunLockInvocation -State $State
+    }
+    try
+    {
+        $Runspace = New-RunLockHeartbeatRunspace
+        $PowerShell = [powershell]::Create()
+        $PowerShell.Runspace = $Runspace
+        $Loop = {
+            param($State, $Record, $IntervalSeconds, $Functions)
+            foreach ($Name in $Functions.Keys) { Set-Item -Path ('Function:{0}' -f $Name) -Value ([scriptblock]::Create($Functions[$Name])) }
+            $Warned = $false
+            $Due = [datetime]::UtcNow.AddSeconds($IntervalSeconds)
+            while (-not $State['Stopped'] -and -not $State['Released'])
+            {
+                Start-Sleep -Milliseconds 250
+                if ((Get-RunLockInvocationState -State $State) -eq 'Ended')
+                {
+                    $null = Invoke-RunLockFileChange -State $State -Remove
+                    $State['Stopped'] = $true
+                    Unregister-RunLockInvocation -State $State
+                    break
+                }
+                if ([datetime]::UtcNow -lt $Due) { continue }
+                $Due = [datetime]::UtcNow.AddSeconds($IntervalSeconds)
+                $Copy = [ordered]@{}
+                foreach ($Key in $Record.Keys) { $Copy[$Key] = $Record[$Key] }
+                $Copy['HeartbeatUtc'] = [datetime]::UtcNow.ToString('o')
+                $Change = Invoke-RunLockFileChange -State $State -NewText ($Copy | ConvertTo-Json -Compress)
+                if ($Change.Outcome -eq 'Failed' -or $Change.Outcome -eq 'Busy')
+                {
+                    if (-not $Warned)
+                    {
+                        Write-Host ('WARNING: Could not refresh the run lock {0}: {1}. The run goes on; the lock shows the time of its last refresh.' -f $State['Path'], $Change.Problem) -ForegroundColor Yellow
+                        $Warned = $true
+                    }
+                    continue
+                }
+                if ($Change.Outcome -eq 'Other' -or $Change.Outcome -eq 'Missing')
+                {
+                    $Why = if ($Change.Outcome -eq 'Missing') { 'it was removed' } else { 'it is now held by {0}' -f $Change.Holder }
+                    Write-Host ('WARNING: This run no longer refreshes or removes the run lock {0}: {1}. The run goes on.' -f $State['Path'], $Why) -ForegroundColor Yellow
+                    $State['Warned'] = $true
+                    $State['Stopped'] = $true
+                    break
+                }
+            }
+        }
+        $Functions = @{}
+        foreach ($Name in 'Get-RunLockInvocationState', 'Invoke-RunLockFileChange', 'Test-RunLockOwner', 'Get-RunLockRegistry', 'Unregister-RunLockInvocation')
+        {
+            $Functions[$Name] = (Get-Command -Name $Name -CommandType Function).ScriptBlock.ToString()
+        }
+        $null = $PowerShell.AddScript($Loop.ToString()).AddArgument($State).AddArgument($Lock.Record).AddArgument($IntervalSeconds).AddArgument($Functions)
+        $Lock.Heartbeat = [pscustomobject]@{ PowerShell = $PowerShell; Runspace = $Runspace; Handle = $PowerShell.BeginInvoke() }
+        $State['Beating'] = $true
+    }
+    catch
+    {
+        Write-Host ''
+        Write-Host ('ERROR: Could not start the heartbeat of the run lock {0}: {1}' -f $Lock.Path, (Get-RunLockErrorText -ErrorRecord $_)) -ForegroundColor Red
+        Write-Host '  Without it, this run''s lock would not be refreshed, and would not be removed if the run ended with an error in a session that goes on, so this run stopped before reading or writing any run state.' -ForegroundColor Red
+        # Release the new lock and take the run off the list now.
+        Remove-RunLock -Lock $Lock
+        return $false
+    }
+    try
+    {
+        # A run in another runspace of this process may compile it at the same
+        # moment; the type it compiled serves this run too.
+        try { if (-not ('RdaRunLock.ExitReleaseV3' -as [type])) { Add-Type -TypeDefinition $script:RunLockTypeSource -ErrorAction Stop } }
+        catch { if (-not ('RdaRunLock.ExitReleaseV3' -as [type])) { throw } }
+        ('RdaRunLock.ExitReleaseV3' -as [type])::Add($State)
+    }
+    catch
+    {
+        Write-Host ('WARNING: Could not set up the release of the run lock {0} at process exit: {1}. The run goes on; if it is interrupted or ends with an error, its lock stays and the next run stops with the command to remove it.' -f $Lock.Path, (Get-RunLockErrorText -ErrorRecord $_)) -ForegroundColor Yellow
+    }
+    return $true
+}
+
+function Stop-RunLockHeartbeat
+{
+    param([Parameter(Mandatory = $true)]$Lock)
+    if ($null -ne $Lock.State) { $Lock.State['Stopped'] = $true }
+    if ($null -eq $Lock.Heartbeat) { return }
+    try
+    {
+        $Lock.Heartbeat.PowerShell.Stop()
+        $Lock.Heartbeat.PowerShell.Dispose()
+        $Lock.Heartbeat.Runspace.Dispose()
+    }
+    catch
+    {
+        Write-Verbose ('Stopping the run lock heartbeat failed: {0}' -f $_.Exception.Message)
+    }
+    $Lock.Heartbeat = $null
+}
+
+# How long ago a time was, for the messages: seconds under 2 minutes, minutes
+# under 2 hours, hours under 2 days, then days.
+function Format-RunLockAge
+{
+    param([Parameter(Mandatory = $true)][int]$Seconds)
+    if ($Seconds -lt 120) { return ('{0} seconds' -f $Seconds) }
+    if ($Seconds -lt 7200) { return ('{0} minutes' -f [int][math]::Floor($Seconds / 60)) }
+    if ($Seconds -lt 172800) { return ('{0} hours' -f [int][math]::Floor($Seconds / 3600)) }
+    return ('{0} days' -f [int][math]::Floor($Seconds / 86400))
+}
+
+# Removes, with one line each, the temporary files '<lock>.<8 hex>.tmp' that a
+# run leaves next to the lock when it is killed while it refreshes its lock
+# (Invoke-RunLockFileChange). Called right after this run created the lock:
+# only the run that holds the lock writes them, so one that is there now was
+# left by an earlier run.
+function Remove-RunLockTemp
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Folder = Split-Path -Path $Path -Parent
+    $Leaf = Split-Path -Path $Path -Leaf
+    $Pattern = '^{0}\.[0-9a-f]{{8}}\.tmp$' -f [regex]::Escape($Leaf)
+    try
+    {
+        $Files = @([System.IO.Directory]::EnumerateFiles($Folder, ($Leaf + '.*.tmp')) | Where-Object { [System.IO.Path]::GetFileName($_) -match $Pattern } | Sort-Object)
+    }
+    catch
+    {
+        Write-Verbose ('Could not list {0}: {1}' -f $Folder, (Get-RunLockErrorText -ErrorRecord $_))
+        return
+    }
+    foreach ($File in $Files)
+    {
+        try
+        {
+            [System.IO.File]::Delete($File)
+            Write-Host ('Removed {0}: a run left it when it was stopped while it refreshed its run lock.' -f $File) -ForegroundColor Yellow
+        }
+        catch
+        {
+            Write-Host ('WARNING: Could not remove {0}, left by a run that was stopped while it refreshed its run lock: {1}' -f $File, (Get-RunLockErrorText -ErrorRecord $_)) -ForegroundColor Yellow
+        }
+    }
+}
+
+# Takes the lock for this run. The run is listed in the process's table first
+# (Register-RunLockInvocation), so a run in another runspace of this process
+# that reads the new lock finds it listed, and it is taken off the list again
+# when the request ends without the lock. The file is created only if it is
+# absent, so of two runs that start together exactly one gets it, and it is
+# written to disk before the run goes on. A lock that is there already is never
+# replaced or removed: the run does not get the lock, and Held (the lock as
+# read) and Holder (Get-RunLockHolder) say who holds it. When the lock is gone
+# again by the time it is read (its run released it in between), the run tries
+# to create it again, at most MaxAttempts times in all. When it is the lock of
+# a run in this process whose command has ended and whose own heartbeat is
+# about to remove it (Holder.Ending), the run waits up to
+# EndedRunWaitMilliseconds, once, for that heartbeat to remove it, then tries
+# to create it again. Returns Acquired, Path,
+# Record, Text (the lock as written), State and Heartbeat (set by
+# Start-RunLockHeartbeat), Held, Holder and Problem (why the lock could not be
+# created, when there is no lock to name).
+function Request-RunLock
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][datetime]$RunStartTime,
+        [int]$MaxAttempts = 3,
+        [int]$EndedRunWaitMilliseconds = 1000
+    )
+    $Result = [pscustomobject]@{ Acquired = $false; Path = $Path; Record = $null; Text = $null; State = $null; Heartbeat = $null; Held = $null; Holder = $null; Problem = $null }
+    $InvocationId = [guid]::NewGuid().ToString()
+    $State = New-RunLockState -Path $Path -Record (New-RunLockRecord -RunStartTime $RunStartTime -InvocationId $InvocationId)
+    $null = (Get-RunLockRegistry).TryAdd($InvocationId, $State)
+    try
+    {
+        return (Request-RunLockListed -Result $Result -State $State -RunStartTime $RunStartTime -InvocationId $InvocationId -MaxAttempts $MaxAttempts -EndedRunWaitMilliseconds $EndedRunWaitMilliseconds)
+    }
+    finally
+    {
+        if (-not $Result.Acquired) { Unregister-RunLockInvocation -State $State }
+    }
+}
+
+# The attempts of Request-RunLock, made while this run is listed.
+function Request-RunLockListed
+{
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][datetime]$RunStartTime,
+        [Parameter(Mandatory = $true)][string]$InvocationId,
+        [int]$MaxAttempts = 3,
+        [int]$EndedRunWaitMilliseconds = 1000
+    )
+    $Path = $Result.Path
+    $Waited = $false
+    for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++)
+    {
+        $Record = New-RunLockRecord -RunStartTime $RunStartTime -InvocationId $InvocationId
+        $Text = $Record | ConvertTo-Json -Compress
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $Stream = $null
+        try
+        {
+            $Stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        }
+        catch
+        {
+            $Result.Problem = Get-RunLockErrorText -ErrorRecord $_
+        }
+        if ($null -ne $Stream)
+        {
+            try
+            {
+                $Stream.Write($Bytes, 0, $Bytes.Length)
+                # On disk before the run goes on, so a crash does not leave an
+                # empty lock.
+                $Stream.Flush($true)
+                $Stream.Dispose()
+            }
+            catch
+            {
+                # Created but not written (for example a full disk): remove the
+                # empty file so later runs do not stop on it.
+                $Result.Problem = Get-RunLockErrorText -ErrorRecord $_
+                $Stream.Dispose()
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            $Result.State = $State
+            Register-RunLockInvocation -State $State
+            Remove-RunLockTemp -Path $Path
+            $Result.Acquired = $true
+            $Result.Record = $Record
+            $Result.Text = $Text
+            $Result.Held = $null
+            $Result.Holder = $null
+            $Result.Problem = $null
+            return $Result
+        }
+        $Held = Read-RunLock -Path $Path
+        # Gone already: its run released it in between (or the file could not
+        # be created for another reason, kept in Problem). Try again.
+        if (-not $Held.Exists) { continue }
+        $Result.Held = $Held
+        $Result.Holder = Get-RunLockHolder -Lock $Held
+        $Result.Problem = $null
+        if ($Result.Holder.Ending -and -not $Waited -and $Attempt -lt $MaxAttempts)
+        {
+            # That run's own heartbeat removes it; nothing is taken over.
+            $Waited = $true
+            $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+            while ([System.IO.File]::Exists($Path) -and $Clock.ElapsedMilliseconds -lt $EndedRunWaitMilliseconds) { Start-Sleep -Milliseconds 25 }
+            continue
+        }
+        return $Result
+    }
+    return $Result
+}
+
+# What a run that did not get the lock prints before it stops with exit 1:
+# who holds the lock (host name, process id and start, the last refresh and
+# how long ago), then one of four things by what Get-RunLockHolder found:
+# the process is running on this machine (wait for it or stop it; no remove
+# command, since removing a live lock would give two holders); it is not
+# running (the remove command); another machine, or this machine but the
+# process cannot be told apart (how to check, and the remove command for once
+# no run is using the folder); the lock cannot be read (the remove command,
+# with the same check first). When there was no lock to name, the reason the
+# lock could not be created.
+function Write-RunLockHeldMessage
+{
+    param(
+        [Parameter(Mandatory = $true)]$Request,
+        [Parameter(Mandatory = $true)][string]$Tenant
+    )
+    $Held = $Request.Held
+    $Holder = $Request.Holder
+    $Remove = "    Remove-Item -LiteralPath '{0}' -Force" -f ($Request.Path -replace "'", "''")
+    $Stopped = 'so this run stopped before reading or writing any run state.'
+    Write-Host ''
+    if ($null -eq $Held -or $null -eq $Holder)
+    {
+        Write-Host ('ERROR: Could not create the run lock for tenant {0}, {1}' -f $Tenant, $Stopped) -ForegroundColor Red
+        Write-Host ('  Lock file: {0}' -f $Request.Path) -ForegroundColor Red
+        Write-Host ('  Reason:    {0}' -f $Request.Problem) -ForegroundColor Red
+        return
+    }
+    if ($Holder.Kind -eq 'Unreadable')
+    {
+        Write-Host ('ERROR: The run lock for tenant {0} cannot be read ({1}), {2}' -f $Tenant, $Held.Problem, $Stopped) -ForegroundColor Red
+        Write-Host ('  Lock file:    {0}' -f $Request.Path) -ForegroundColor Red
+        if ($null -ne $Held.FileWriteTimeUtc) { Write-Host ('  Last written: {0} ({1} ago)' -f (Format-RunLockTime -Value $Held.FileWriteTimeUtc), (Format-RunLockAge -Seconds ([int][math]::Floor([math]::Max(0, ([datetime]::UtcNow - $Held.FileWriteTimeUtc).TotalSeconds))))) -ForegroundColor Red }
+        Write-Host '  It was read again for about 2 seconds. Which machine and process hold it is not known; it may have been left by a run that stopped while it was writing it.' -ForegroundColor Yellow
+        Write-Host '  Check that no run for this tenant is going on any machine that uses this folder. Then remove the lock and run this command again:' -ForegroundColor Yellow
+        Write-Host $Remove -ForegroundColor Yellow
+        return
+    }
+    $Started = Format-RunLockTime -Value $Held.ProcessStartTimeUtc
+    Write-Host ('ERROR: Another run for tenant {0} holds the lock on this inventory folder, {1}' -f $Tenant, $Stopped) -ForegroundColor Red
+    Write-Host ('  Lock file:    {0}' -f $Request.Path) -ForegroundColor Red
+    Write-Host ('  Held by:      process {0} on {1}, started {2}; its run started {3}' -f $Held.ProcessId, $Held.MachineName, $Started, (Format-RunLockTime -Value $Held.RunStartTimeUtc)) -ForegroundColor Red
+    Write-Host ('  Last refresh: {0} ({1} ago)' -f (Format-RunLockTime -Value $Held.HeartbeatUtc), (Format-RunLockAge -Seconds $Holder.AgeSeconds)) -ForegroundColor Red
+    $Check = "Get-Process -Id {0} | Select-Object Id, ProcessName, @{{ Name = 'StartTimeUtc'; Expression = {{ `$_.StartTime.ToUniversalTime() }} }}" -f $Held.ProcessId
+    switch ($Holder.Kind)
+    {
+        'Running'
+        {
+            Write-Host ('  Process {0} on this machine is still running, so a run is using this folder.' -f $Held.ProcessId) -ForegroundColor Yellow
+            Write-Host '  Wait for that run to finish, or stop it, then run this command again.' -ForegroundColor Yellow
+        }
+        'Ended'
+        {
+            $Why = switch ($Holder.Why)
+            {
+                'ProcessIdReused' { 'process {0} on this machine is now another process' -f $Held.ProcessId }
+                'Restarted' { 'this machine has restarted since' }
+                'RunEnded' { 'it was an earlier run in this PowerShell session, and it has ended' }
+                default { 'process {0} is not running on this machine' -f $Held.ProcessId }
+            }
+            Write-Host ('  That run is no longer running ({0}). It ended without removing its lock, for example because it was killed or its terminal or Cloud Shell session was closed.' -f $Why) -ForegroundColor Yellow
+            Write-Host '  Remove the lock, then run this command again:' -ForegroundColor Yellow
+            Write-Host $Remove -ForegroundColor Yellow
+        }
+        'Unknown'
+        {
+            $Why = if ($Holder.Why -eq 'StartTimeDiffers') { 'its start time differs from the recorded one, and a change of the clock also moves it' } else { 'its start time cannot be read' }
+            Write-Host ('  A process {0} is running on this machine, but whether it is the run that wrote the lock cannot be told ({1}).' -f $Held.ProcessId, $Why) -ForegroundColor Yellow
+            Write-Host ('  To check: {0}' -f $Check) -ForegroundColor Yellow
+            Write-Host ('  Once you know that no run is using this folder (no process {0} that started at {1} is running), remove the lock, then run this command again:' -f $Held.ProcessId, $Started) -ForegroundColor Yellow
+            Write-Host $Remove -ForegroundColor Yellow
+        }
+        default
+        {
+            if ($Holder.Why -eq 'OtherBoot') { Write-Host ('  The lock names this host name, {0}, but another start of the machine, and it was refreshed after this machine started: it is from another machine with the same name, so whether that run is still going cannot be checked from here.' -f $Held.MachineName) -ForegroundColor Yellow }
+            else { Write-Host ('  The lock is from another machine, {0}, so whether that run is still going cannot be checked from here.' -f $Held.MachineName) -ForegroundColor Yellow }
+            Write-Host ('  To check, on {0}: {1}' -f $Held.MachineName, $Check) -ForegroundColor Yellow
+            Write-Host ('  Once you know that no run is using this folder (no process {0} that started at {1} is running on {2}), remove the lock, then run this command again:' -f $Held.ProcessId, $Started, $Held.MachineName) -ForegroundColor Yellow
+            Write-Host $Remove -ForegroundColor Yellow
+        }
+    }
+}
+
+# Releases this run's lock on its way out: removes the lock file only while it
+# is still this run's (Invoke-RunLockFileChange), then stops the heartbeat.
+# Safe to call twice. A lock that is no longer this run's is left in place,
+# with one warning for the run (none when the heartbeat already gave it).
+function Remove-RunLock
+{
+    param($Lock)
+    if ($null -eq $Lock -or -not $Lock.Acquired) { return }
+    $Lock.Acquired = $false
+    $State = $Lock.State
+    if ($null -eq $State)
+    {
+        # A lock object that Request-RunLock did not make.
+        $State = New-RunLockState -Path ([string]$Lock.Path) -Record $Lock.Record
+        $State['Stopped'] = $true
+    }
+    $Change = Invoke-RunLockFileChange -State $State -Remove
+    Stop-RunLockHeartbeat -Lock $Lock
+    Unregister-RunLockInvocation -State $State
+    if ($Change.Outcome -eq 'Other' -and -not $State['Warned'])
+    {
+        Write-Host ('WARNING: Left the run lock {0} in place: it is now held by {1}.' -f $Lock.Path, $Change.Holder) -ForegroundColor Yellow
+        $State['Warned'] = $true
+    }
+    elseif ($Change.Outcome -eq 'Failed' -or $Change.Outcome -eq 'Busy')
+    {
+        Write-RunLockNotRemoved -Path $Lock.Path -Reason $Change.Problem
+    }
+}
+
+function Write-RunLockNotRemoved
+{
+    param([string]$Path, [string]$Reason)
+    Write-Host ('WARNING: The run lock {0} was not removed: {1}' -f $Path, $Reason) -ForegroundColor Yellow
+    Write-Host ("  Until it is removed, every run for this tenant in this folder stops with exit 1. To remove it now: Remove-Item -LiteralPath '{0}' -Force" -f ($Path -replace "'", "''")) -ForegroundColor Yellow
 }
 
 # ---- Stream worker output + per-stream state --------------------------------

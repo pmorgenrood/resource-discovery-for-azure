@@ -1987,6 +1987,13 @@ exit 1
                 throw ('The wrapper run did not end within {0} seconds.' -f $TimeoutSeconds)
             }
             $Proc.WaitForExit()
+            # A run ended this way is killed, so it leaves its run lock, which no
+            # run takes over: the next run would stop on it and print the command
+            # that removes it. That command is run here, as a user would run it.
+            if ($Ended)
+            {
+                foreach ($Lock in @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter '.run-lock-*.json' -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $Lock.FullName -Force }
+            }
             $Text = @(([string]$Out.Result -replace "`e\[[0-9;]*m", '') -split "`r?`n")
             return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Ended = $Ended; Text = $Text; Error = [string]$Err.Result; Root = $script:CaseRoot }
         }
@@ -2537,6 +2544,14 @@ exit 1
         $R1.Text | Should -Contain ('  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f (Split-Path -Path $script:CaseState -Leaf))
         Test-Path -LiteralPath $script:CaseState | Should -BeTrue
         @(script:Get-StreamStateFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $StreamNames
+
+        # The read-only folder also refused the removal of the run's own lock, and
+        # the run said so with the command that removes it. The lock is never
+        # taken over, so that command is run once the folder can be written.
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The run lock * was not removed: *' }).Count | Should -Be 1
+        $Remove = @(foreach ($Line in $R1.Text) { if ($Line -match 'To remove it now: (Remove-Item -LiteralPath .+ -Force)$') { $Matches[1] } })
+        $Remove.Count | Should -Be 1
+        & ([scriptblock]::Create($Remove[0]))
 
         # The folder can be written again: the next -Resume finishes and clears everything.
         script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id
