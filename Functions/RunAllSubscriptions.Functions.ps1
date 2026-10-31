@@ -515,11 +515,17 @@ function Write-WrongShapeNotMovedLine
 {
     param([Parameter(Mandatory = $true)][object]$File)
     $What = if ($File.Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
+    if ($File.PSObject.Properties['Unreadable'] -and $File.Unreadable)
+    {
+        Write-Host ('ERROR: The {0} {1} could not be read, and it could not be moved aside: {2}' -f $What, $File.Name, $File.Reason) -ForegroundColor Red
+        return
+    }
     Write-Host ('ERROR: The {0} {1} is not the right shape ({2}), and it could not be moved aside: {3}' -f $What, $File.Name, $File.Problem, $File.Reason) -ForegroundColor Red
 }
 
-# Stop the run with exit 1 for state files that are not the right shape and
-# could not be moved aside (-Files, from Move-WrongShapeResumeStateFile): name
+# Stop the run with exit 1 for state files that are not the right shape, or
+# per-stream files that cannot be read, and could not be moved aside (-Files,
+# from Move-WrongShapeResumeStateFile or Move-UnreadableStreamStateFile): name
 # each one with the reason; say what this run did and did not do, and what
 # later runs do while the file stays; print the command that removes each file
 # and the command to run next. The remove command is a Remove-Item -LiteralPath
@@ -531,10 +537,11 @@ function Write-WrongShapeNotMovedLine
 # run, which left them alone. When the per-subscription output check passes,
 # the run first finishes (its consolidated zip, main summary and end-of-run
 # summary) and calls this at its end. When that check fails, it calls this right
-# after the check's lines, before the consolidated zip and the summaries, where
-# it would otherwise end with exit 2; exit 1 replaces that 2. That case has its
-# own branch below; without it the run stops at its start, before it collects
-# any subscription.
+# after the check's lines, before the consolidated zip and the summaries, and
+# ends with exit 2. In both cases -NoExit is given and the wrapper sets the exit
+# code (exit 1 in place of 0 and 3-5; exit 2 keeps its code). Without
+# -AfterCollection the run stops at its start, before it collects any
+# subscription.
 function Stop-WrongShapeStateNotMoved
 {
     param(
@@ -555,9 +562,17 @@ function Stop-WrongShapeStateNotMoved
     {
         Write-Host "  This run stops here (exit 1), before it collects any subscription or writes any resume state. It does not use the file's records and does not write over it." -ForegroundColor Red
     }
+    $IsUnreadable = { param($F) $null -ne $F.PSObject.Properties['Unreadable'] -and [bool]$F.Unreadable }
     if (@($Files | Where-Object { $_.Kind -eq 'Main' }).Count -gt 0)
     {
         Write-Host '  While the file cannot be moved aside, every later run reads it at its start and stops the same way.' -ForegroundColor Yellow
+    }
+    elseif (@($Files | Where-Object { -not (& $IsUnreadable $_) }).Count -eq 0)
+    {
+        # Only per-stream files that cannot be read: the startup fold of
+        # -Resume and -ResumeFailedOnly reads them, and the end-of-run merge of
+        # a run with more than one stream.
+        Write-Host '  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.' -ForegroundColor Yellow
     }
     else
     {
@@ -1099,8 +1114,14 @@ function Read-StreamResumeStateFile
 # <name>.unreadable-<UTC time> and kept for inspection: that name ends neither
 # in '.json' nor matches Get-StreamResumeStateFiles, so no later run reads it
 # and no zip step that picks files by '*.json' takes it. Prints a warning
-# naming the file, never its content. Returns { Name; MovedTo } (MovedTo is
-# $null when the rename failed).
+# naming the file, never its content. Returns { Kind; Name; MovedTo; Path;
+# Problem; Reason; NotMoved; Unreadable }.
+# When the file cannot be renamed, later runs would read it again and warn
+# again with no end, so the run stops the way it does for a file that is not
+# the right shape (Stop-WrongShapeStateNotMoved): the result has NotMoved set
+# and MovedTo $null, and this prints nothing at startup, where the caller stops
+# with exit 1 before any file is folded in; with -AtRunEnd it prints the notice
+# and the wrapper stops at the end of the run under the exit-2 rule.
 function Move-UnreadableStreamStateFile
 {
     param(
@@ -1116,13 +1137,11 @@ function Move-UnreadableStreamStateFile
     if ($AtRunEnd)
     {
         $Lead = 'WARNING: The per-stream state file {0} could not be read, so its records are not used: the subscriptions it lists are not counted as completed, and a later -Resume collects them again.' -f $File.Name
-        $Again = 'a later run'
     }
     else
     {
         $Then = if ($ResumeFailedOnly) { 'a later -Resume collects them (-ResumeFailedOnly retries only the retry list)' } else { 'this run collects them again' }
         $Lead = 'WARNING: The per-stream state file {0} from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and {1}.' -f $File.Name, $Then
-        $Again = 'a later -Resume'
     }
     try
     {
@@ -1131,10 +1150,15 @@ function Move-UnreadableStreamStateFile
     }
     catch
     {
-        $MovedTo = $null
-        Write-Host ('{0} It could not be moved aside ({1}), so {2} finds it again.' -f $Lead, $_.Exception.Message, $Again) -ForegroundColor Yellow
+        $NotMoved = [pscustomobject]@{ Kind = 'Stream'; Name = $File.Name; MovedTo = $null; Path = $File.FullName; Problem = $null; Reason = $_.Exception.Message; NotMoved = $true; Unreadable = $true }
+        if ($AtRunEnd)
+        {
+            Write-WrongShapeNotMovedLine -File $NotMoved
+            Write-Host "  This run does not use the file's records and does not write over it. It goes on as usual and ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end." -ForegroundColor Red
+        }
+        return $NotMoved
     }
-    return [pscustomobject]@{ Name = $File.Name; MovedTo = $MovedTo }
+    return [pscustomobject]@{ Kind = 'Stream'; Name = $File.Name; MovedTo = $MovedTo; Path = $File.FullName; Problem = $null; Reason = $null; NotMoved = $false; Unreadable = $true }
 }
 
 # The end-of-run line for each per-stream state file this run could not read

@@ -1666,3 +1666,98 @@ Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindo
         script:Get-Calls | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Wrapper end to end: a per-stream state file that cannot be read and cannot be moved aside' -Skip:$IsWindows {
+    # The stand-in Rename-Item refuses to rename the listed file, as for a file
+    # another program holds open; the run can read and write everything else.
+    BeforeEach {
+        script:New-Case
+        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+        $script:LaterUnreadable = '  While the file cannot be moved aside, every later -Resume or -ResumeFailedOnly run reads it at its start and stops the same way. A later run without either switch does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.'
+    }
+    BeforeAll {
+        function script:Get-UnreadableStopLines { param($Run) @($Run.Text | Where-Object { $_ -like 'ERROR: The per-stream state file * could not be read, and it could not be moved aside: *' }) }
+    }
+
+    It 'at the start of <Switch>: the run stops with exit 1 before any work and prints the command; the next run stops the same way; after the command the next -Resume ends clean' -ForEach @(
+        @{ Switch = '-Resume'; Streams = 1 },
+        @{ Switch = '-ResumeFailedOnly'; Streams = 2 }
+    ) {
+        script:Set-Scenario -RenameRefused $script:Stream0Name
+        # A write of the stream 0 file that was cut short.
+        $Seeded = script:Write-StreamText -Text '{"Completed": ["sub-a"], "FailedAt'
+        $StreamPath = Join-Path $script:Root $script:Stream0Name
+        $Before = script:Get-RootSnapshot
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper -Arguments $Switch -Streams $Streams
+            $R.ExitCode | Should -Be 1
+            script:Get-UnreadableStopLines $R | Should -BeLike ('ERROR: The per-stream state file {0} could not be read, and it could not be moved aside: The process cannot access the file *' -f $script:Stream0Name)
+            $R.Text | Should -Contain $script:StopStart
+            $R.Text | Should -Contain $script:LaterUnreadable
+            $R.Text | Should -Contain $(if ($Switch -eq '-ResumeFailedOnly') { $script:ThenResume } else { $script:ThenSame })
+            script:Get-RemoveCommand $R | Should -Be @("Remove-Item -LiteralPath '{0}' -Force" -f $StreamPath)
+            @($R.Text | Where-Object { $_ -like '*finds it again*' }) | Should -BeNullOrEmpty
+            $R.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+            script:Get-Calls | Should -BeNullOrEmpty
+            Get-Content -LiteralPath $StreamPath -Raw | Should -Be $Seeded
+            script:Get-RootSnapshot | Should -Be $Before
+            $R.Error | Should -BeNullOrEmpty
+        }
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R)[0])
+        Test-Path -LiteralPath $StreamPath | Should -BeFalse
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        $R3.ExitCode | Should -Be 0
+        $R3.Error | Should -BeNullOrEmpty
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+
+    It 'found by the end-of-run merge (<Label>): the run finishes, then stops with exit <ExitCode>; the next -Resume stops at its start with exit 1; after the command the next -Resume ends clean' -ForEach @(
+        @{ Label = 'every subscription collected'; Fail = @(); ExitCode = 1 },
+        # A failed subscription is exit 2, which keeps its code over the stop.
+        @{ Label = 'Sub B failing'; Fail = @('B'); ExitCode = 2 }
+    ) {
+        script:Set-Scenario -RenameRefused $script:Stream5Name -Fail $Fail
+        # A stream 5 file left cut short: a two-stream run does not write it, and
+        # its end-of-run merge reads it.
+        $Seeded = script:Write-StreamText -Text '{"Completed": ["sub-a"' -StreamId 5
+        $Stale = Join-Path $script:Root $script:Stream5Name
+        $R1 = script:Invoke-Wrapper -Streams 2
+        $R1.ExitCode | Should -Be $ExitCode
+        $R1.Error | Should -BeNullOrEmpty
+        @(script:Get-Calls) | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R1.Text | Should -Contain $script:MergeNotice
+        $R1.Text | Should -Contain '================ Summary ================'
+        @(script:Get-UnreadableStopLines $R1).Count | Should -Be 2
+        $Last = @($R1.Text | Where-Object { $_ -match '\S' })
+        $At = [array]::IndexOf($Last, $script:StopAfter)
+        $At | Should -BeGreaterThan ([array]::IndexOf($Last, '================ Summary ================'))
+        $R1.Text | Should -Contain $script:LaterUnreadable
+        script:Get-RemoveCommand $R1 | Should -Be @("Remove-Item -LiteralPath '{0}' -Force" -f $Stale)
+        $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        Get-Content -LiteralPath $Stale -Raw | Should -Be $Seeded
+
+        # Run 2: a -Resume reads the file at its start and stops there with exit 1,
+        # before it collects anything.
+        script:Set-Scenario -RenameRefused $script:Stream5Name
+        $CallsBefore = @(script:Get-Calls).Count
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R2.ExitCode | Should -Be 1
+        $R2.Text | Should -Contain $script:StopStart
+        @(script:Get-UnreadableStopLines $R2).Count | Should -Be 1
+        @(script:Get-Calls).Count | Should -Be $CallsBefore
+
+        # Run 3: the cause gone, the printed command, then the same -Resume.
+        script:Set-Scenario
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command (@(script:Get-RemoveCommand $R2)[0])
+        Test-Path -LiteralPath $Stale | Should -BeFalse
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R3.ExitCode | Should -Be 0
+        $R3.Error | Should -BeNullOrEmpty
+        script:Test-CleanLine $R3 | Should -BeTrue
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+    }
+}

@@ -2026,18 +2026,24 @@ Describe 'The per-stream and resume state helpers' {
         @(Get-StreamStateRecordIds -State ('{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
     }
 
-    It 'leaves the file in place and says so when it cannot be renamed' {
+    It 'leaves the file in place and returns it for the stop when it cannot be renamed' {
         $Path = Join-Path $script:UnitDir '.resume-state-t-stream-4.json'
         Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
         # A folder already has the new name, so the rename fails.
         New-Item -ItemType Directory -Path (Join-Path $script:UnitDir '.resume-state-t-stream-4.json.unreadable-20260102-030405') -Force | Out-Null
+        # At startup it prints nothing: the wrapper stops with exit 1 and names it.
         $Out = Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime() 6>&1
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
         $Result.MovedTo | Should -BeNullOrEmpty
+        $Result.NotMoved | Should -BeTrue
+        $Result.Path | Should -Be $Path
+        $Result.Reason | Should -Not -BeNullOrEmpty
         Test-Path -LiteralPath $Path | Should -BeTrue
-        $Warning = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
-        $Warning.Count | Should -Be 1
-        $Warning[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-t-stream-4.json*could not be read, * It could not be moved aside (*), so a later * finds it again.'
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) | Should -BeNullOrEmpty
+        # At the end of a run it names the file and says the run ends with the stop.
+        $End = @(Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime() -AtRunEnd 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
+        $End[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-4.json could not be read, and it could not be moved aside: *'
+        $End[1] | Should -BeLike '*ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end.'
         $Summary = @(Write-UnreadableStreamStateSummary -Unreadable @($Result) -StateKept $true 6>&1 | ForEach-Object { [string]$_ })
         $Summary | Should -Be @('Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-4.json could not be read and was left in place (it could not be moved aside); its records were not used.')
     }

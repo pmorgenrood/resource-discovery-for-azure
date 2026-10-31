@@ -676,8 +676,11 @@ if ($Resume -or $ResumeFailedOnly)
         # (Move-WrongShapeResumeStateFile): one that is not the right shape is
         # moved aside and left out, and one that cannot be moved aside stops the
         # run here, before any file is folded in or any state written. A file
-        # that cannot be parsed, or parses to nothing, is left to the read below.
+        # that cannot be read (it cannot be parsed, or parses to nothing) is
+        # moved aside too (Move-UnreadableStreamStateFile); when one cannot be
+        # moved aside the run stops after this check with exit 1, the same way.
         $ShapeCheckedStreamFiles = @()
+        $UnreadableNotMoved = @()
         foreach ($StreamFile in $StrandedStreamFiles)
         {
             $Parsed = $true
@@ -688,8 +691,16 @@ if ($Resume -or $ResumeFailedOnly)
                 $Moved = Move-WrongShapeResumeStateFile -Path $StreamFile.FullName -Kind Stream -Record $Record -Resume:($Resume -and -not $ResumeFailedOnly) -ResumeFailedOnly:$ResumeFailedOnly
                 if ($Moved) { $WrongShapeStateFiles += $Moved; continue }
             }
+            if ($null -eq (Read-StreamResumeStateFile -Path $StreamFile.FullName))
+            {
+                $Unreadable = Move-UnreadableStreamStateFile -File $StreamFile -ResumeFailedOnly:$ResumeFailedOnly
+                if ($Unreadable.NotMoved) { $UnreadableNotMoved += $Unreadable }
+                else { $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + $Unreadable) }
+                continue
+            }
             $ShapeCheckedStreamFiles += $StreamFile
         }
+        if ($UnreadableNotMoved.Count -gt 0) { Stop-WrongShapeStateNotMoved -Files $UnreadableNotMoved -ResumeFailedOnly:$ResumeFailedOnly }
         $StrandedStreamFiles = $ShapeCheckedStreamFiles
         foreach ($StreamFile in $StrandedStreamFiles)
         {
@@ -1919,8 +1930,12 @@ else
                 {
                     # Its records are not used, so none of the subscriptions it
                     # lists counts as completed and a later -Resume collects
-                    # them. Moved aside with a warning, not deleted.
-                    $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + (Move-UnreadableStreamStateFile -File $StreamFile -AtRunEnd))
+                    # them. Moved aside with a warning, not deleted. One that
+                    # cannot be moved aside stops the run at its end, as a file
+                    # that is not the right shape does.
+                    $Unreadable = Move-UnreadableStreamStateFile -File $StreamFile -AtRunEnd
+                    $UnreadableStreamFiles = @(@($UnreadableStreamFiles | Where-Object { $null -ne $_ }) + $Unreadable)
+                    if ($Unreadable.NotMoved) { $StreamStateNotMoved += $Unreadable }
                     $UnreadableAtMerge += $PerStreamFile
                     continue
                 }

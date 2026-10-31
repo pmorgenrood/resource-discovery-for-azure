@@ -1672,7 +1672,7 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
         @(Get-ChildItem -LiteralPath $script:Dir -Force -File -Filter '*.json') | Should -BeNullOrEmpty
     }
 
-    It 'Move-UnreadableStreamStateFile says so when the file cannot be moved, and keeps the file in place' {
+    It 'Move-UnreadableStreamStateFile returns the file for the stop when it cannot be moved, and keeps the file in place' {
         $File = Join-Path $script:Dir '.resume-state-t-stream-0.json'
         Set-Content -LiteralPath $File -Value 'cut'
         $Now = [datetime]'2026-10-29T14:02:55'
@@ -1681,7 +1681,9 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
         $R.MovedTo | Should -BeNullOrEmpty
         Test-Path -LiteralPath $File | Should -BeTrue
         Get-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Raw | Should -Match 'an earlier one'
-        $script:Lines[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-t-stream-0.json from an interrupted parallel run could not be read, so its records are not used: * It could not be moved aside (*), so a later -Resume finds it again.'
+        $R.NotMoved | Should -BeTrue
+        # At startup the wrapper stops with exit 1 and names the file; nothing is printed here.
+        @($script:Lines) | Should -BeNullOrEmpty
     }
 
     It 'Write-UnreadableStreamStateSummary says whether the state was cleared or kept, and where the file went' {
