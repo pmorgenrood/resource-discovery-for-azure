@@ -1727,7 +1727,8 @@ Describe 'A run that stops before it starts collecting keeps the earlier run id'
         $Worker = Join-Path (Split-Path -Path $script:Wrapper -Parent) 'Run-AllSubscriptions.Stream.ps1'
         switch ($Stop)
         {
-            'Access' { script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'B' }
+            # #38 stops a run only when no subscription it checks can be read.
+            'Access' { script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'A', 'B', 'C' }
             'Consumption' { script:Set-Scenario -Subs 'A', 'B', 'C' -ConsumptionDenied }
             'Worker' { script:Set-Scenario -Subs 'A', 'B', 'C'; Rename-Item -LiteralPath $Worker -NewName 'Run-AllSubscriptions.Stream.ps1.away' }
         }

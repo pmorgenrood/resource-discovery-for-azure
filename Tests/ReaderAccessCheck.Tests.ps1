@@ -2000,7 +2000,12 @@ exit 1
 
         # The per-stream state files a parallel run leaves in the inventory root
         # until it merges them, and the subscriptions they record as completed.
-        function script:Get-StreamStateFiles
+        function script:Get-StateCompletedIdsOrNone
+    {
+        if (-not (Test-Path -LiteralPath $script:CaseState)) { return @() }
+        @((Get-Content -LiteralPath $script:CaseState -Raw | ConvertFrom-Json).CompletedSubscriptionIds | Where-Object { $_ })
+    }
+    function script:Get-StreamStateFiles
         {
             if (-not (Test-Path -LiteralPath $script:CaseRoot)) { return @() }
             @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:WrapperTenant))
@@ -2270,7 +2275,9 @@ exit 1
         $Run1 = script:Invoke-WrapperRun -Streams 2 -EndWhen { (Test-Path -LiteralPath (Join-Path $script:CaseHome ('waiting-' + $script:SubX.Id))) -and (@(script:Get-StreamCompletedIds) -join ',') -eq 'sub-a,sub-b' }
         $Run1.Ended | Should -BeTrue
         @(script:Get-StreamStateFiles).Count | Should -Be 2
-        Test-Path -LiteralPath $script:CaseState | Should -BeFalse -Because 'a parallel run merges its stream files only at its end'
+        # A parallel run merges its stream files only at its end; the main state
+        # holds only the run id written before collection began.
+        @(script:Get-StateCompletedIdsOrNone) | Should -BeNullOrEmpty -Because 'a parallel run merges its stream files only at its end'
 
         # Sub X cannot be read any more.
         script:Set-WrapperScenario -Subs $Subs -Unreadable $script:SubX.Id
