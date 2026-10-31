@@ -60,8 +60,9 @@ BeforeAll {
     $script:Wrapper = Join-Path $script:ToolRoot 'Run-AllSubscriptions.ps1'
     $StandInInner = @'
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit, [string]$ConsumptionWindowStart, [string]$ConsumptionWindowEnd)
-# One line per call: the subscription, the settings and the cost window it was given.
-Add-Content -LiteralPath (Join-Path $HOME 'calls.log') -Value ('{0}|Obfuscate={1}|SkipMetrics={2}|SkipConsumption={3}|Window={4}..{5}' -f $SubscriptionID, [bool]$Obfuscate, [bool]$SkipMetrics, [bool]$SkipConsumption, $ConsumptionWindowStart, $ConsumptionWindowEnd)
+# One file per call (streams run at once, so one shared file could lose a line):
+# the subscription, the settings and the cost window it was given.
+Set-Content -LiteralPath (Join-Path $HOME ('call-' + [guid]::NewGuid().ToString() + '.log')) -Value ('{0}|Obfuscate={1}|SkipMetrics={2}|SkipConsumption={3}|Window={4}..{5}' -f $SubscriptionID, [bool]$Obfuscate, [bool]$SkipMetrics, [bool]$SkipConsumption, $ConsumptionWindowStart, $ConsumptionWindowEnd)
 $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
 if (@($Scenario.FailIds) -contains $SubscriptionID) { throw $(if ($Scenario.FailReason) { [string]$Scenario.FailReason } else { 'stand-in failure for this subscription' }) }
 # A run of this subscription that ends without writing its zip.
@@ -181,7 +182,7 @@ function Invoke-AzRestMethod
     }
     if ($Path -match '^/subscriptions/([^/?]+)/providers/Microsoft\.Commerce/UsageAggregates\?')
     {
-        Add-Content -LiteralPath (Join-Path $HOME 'usage.log') -Value $Path
+        Set-Content -LiteralPath (Join-Path $HOME ('usage-' + [guid]::NewGuid().ToString() + '.log')) -Value $Path
         # No usage access: #38's consumption check reads this path, as the billing phase's cmdlet does.
         if ((Get-RdaStandInScenario).ConsumptionDenied) { return & $Answer 403 @{ error = @{ code = 'AuthorizationFailed'; message = 'stand-in: the client does not have authorization to read usage' } } }
         return & $Answer 200 @{ value = @(@{ properties = @{ quantity = 1.5; meterCategory = 'Stand-in'; instanceData = '' } }) }
@@ -518,9 +519,9 @@ function global:Compress-Archive
     # The calls the stand-in ResourceInventory.ps1 logged ('<id>|Obfuscate=..|
     # SkipMetrics=..|SkipConsumption=..|Window=<start>..<end>'), and the usage
     # paths the up-front consumption check read, since the last Clear-Calls.
-    function script:Get-Calls { $F = Join-Path $script:CaseHome 'calls.log'; if (Test-Path -LiteralPath $F) { @(Get-Content -LiteralPath $F) } else { @() } }
-    function script:Get-UsagePaths { $F = Join-Path $script:CaseHome 'usage.log'; if (Test-Path -LiteralPath $F) { @(Get-Content -LiteralPath $F) } else { @() } }
-    function script:Clear-Calls { foreach ($Name in 'calls.log', 'usage.log') { Remove-Item -LiteralPath (Join-Path $script:CaseHome $Name) -Force -ErrorAction SilentlyContinue } }
+    function script:Get-Calls { @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'call-*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName }) }
+    function script:Get-UsagePaths { @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'usage-*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName }) }
+    function script:Clear-Calls { Get-ChildItem -LiteralPath $script:CaseHome -File | Where-Object { $_.Name -like 'call-*.log' -or $_.Name -like 'usage-*.log' } | Remove-Item -Force }
 
     # Set (or, with a $null value, remove) keys of the resume state file.
     function script:Set-StateKeys
@@ -949,7 +950,7 @@ Describe 'Resume by default under strict mode' -Skip:$IsWindows {
         @(script:Get-StartLines $New)[0] | Should -BeLike 'Starting a new run (-Fresh).*'
         foreach ($R in $Stop, $Continue, $New)
         {
-            @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunStart|StoredRun|RunInfo|NewRunInfo|RunDataSettings|DoneCount|PastLimitCount|InScopeIds|Fill|IsWindowKey|IdsWithoutReports|ConvertFrom-ResumeRunStartTime|Read-ResumeRunInfo|Resolve-RunStart|Get-RunContinueLine|Write-ResumeStateRunInfo|Get-ResumeStateRunInfoValues' }) | Should -BeNullOrEmpty
+            @($R.Error -split "`r?`n" | Where-Object { $_ -match '^\s*\d+ \|' -and $_ -match 'RunStart|StoredRun|RunInfo|NewRunInfo|RunDataSettings|DoneCount|PastLimitCount|InScopeIds|Fill|IsWindowKey|IdsWithoutReports|NoRole|StateKept|ConvertFrom-ResumeRunStartTime|Read-ResumeRunInfo|Resolve-RunStart|Get-RunContinueLine|Write-ResumeStateRunInfo|Get-ResumeStateRunInfoValues' }) | Should -BeNullOrEmpty
         }
     }
 }
@@ -1217,6 +1218,34 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
             script:Get-Collected $R | Should -BeNullOrEmpty
             @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 4 runs in a row;*start a new run with -Fresh*' }).Count | Should -Be 1
         }
+    }
+
+    It 'a subscription on the retry list that loses its read role is taken off it: the run ends clean with exit 0, and the next two runs are new runs with exit 0' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 2
+        (script:Read-State).Failed | Should -Be (script:Get-Ids 'B')
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $R2 = script:Invoke-Wrapper -Streams 1
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain 'Taken off the retry list: Sub B (sub-b): the signed-in identity has no read role on it, so no run can retry it. It is listed with the subscriptions skipped as not readable; once the role is granted, the next run collects it.'
+        @($R2.Text | Where-Object { $_ -like 'Subscriptions skipped (not readable by the signed-in identity): 1*' }).Count | Should -Be 1
+        @($R2.Text | Where-Object { $_ -like 'Pending Retries:*' }) | Should -BeNullOrEmpty
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+        foreach ($N in 3, 4)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 0
+            script:Get-StartLines $R | Should -Be @('Starting a new run.')
+            script:Get-Collected $R | Should -Be (script:Get-Ids 'A')
+            script:Read-State | Should -BeNullOrEmpty
+        }
+        # The role is granted again: the next run collects it.
+        script:Set-Scenario -Subs 'A', 'B'
+        $R5 = script:Invoke-Wrapper -Streams 1
+        $R5.ExitCode | Should -Be 0
+        script:Get-Collected $R5 | Should -Be (script:Get-Ids 'A', 'B')
     }
 
     It 'the state kept because the consolidated zip was lost: -ResumeFailedOnly ends with exit 2 twice and changes nothing; a run without it builds the zip and ends clean' {

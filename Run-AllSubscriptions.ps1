@@ -1041,7 +1041,20 @@ if ($ScopeForProbe.Count -gt 0)
     # list as a failed run, also when the run stops here, so the state is kept
     # and the retry limit ends its retries (Add-RoleCheckRetryAttempts).
     $RoleCheckRetry = Add-RoleCheckRetryAttempts -FailedAttempts $FailedAttempts -CompletedIds $CompletedIds -Decision $AccessDecision
-    if ($RoleCheckRetry.Added.Count -gt 0)
+    # A subscription on the retry list that this check finds with no read role
+    # is taken off it, as one with no read role is never put on it: no run can
+    # retry it until the role is granted, and a retry entry would keep the
+    # resume state, so every later run would continue this one and carry its
+    # reports for as long as the role is missing. The run lists it with the
+    # subscriptions skipped as not readable; once the role is granted, the next
+    # run collects it.
+    $NoRole = Remove-NoRoleRetryAttempts -FailedAttempts $RoleCheckRetry.FailedAttempts -Decision $AccessDecision
+    foreach ($Entry in $NoRole.Removed)
+    {
+        Write-Host ("Taken off the retry list: {0} ({1}): the signed-in identity has no read role on it, so no run can retry it. It is listed with the subscriptions skipped as not readable; once the role is granted, the next run collects it." -f $Entry.Name, $Entry.Id) -ForegroundColor Yellow
+    }
+    if ($NoRole.Removed.Count -gt 0) { $RoleCheckRetry.FailedAttempts = $NoRole.FailedAttempts }
+    if ($RoleCheckRetry.Added.Count -gt 0 -or $NoRole.Removed.Count -gt 0)
     {
         $FailedAttempts = $RoleCheckRetry.FailedAttempts
         $CompletedIds = $RoleCheckRetry.CompletedIds

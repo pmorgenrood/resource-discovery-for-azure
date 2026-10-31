@@ -2008,6 +2008,22 @@ function Invoke-FoldedStreamStateCleanup
 # that keeps failing. A subscription skipped for a missing role is not added:
 # it needs Reader first. Pure; the caller persists. Returns
 # { FailedAttempts; CompletedIds; Added }.
+# The retry-list entries ($FailedAttempts) of the subscriptions the up-front
+# role check ($Decision) skipped because the identity has no read role on them
+# (State NoAccess), and the list without them: { FailedAttempts; Removed }. A
+# check that could not finish, or answers that disagree, keep their entries
+# (Add-RoleCheckRetryAttempts).
+function Remove-NoRoleRetryAttempts
+{
+    param([object]$FailedAttempts, $Decision)
+    $NoRoleIds = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and [string]$_.State -eq 'NoAccess' } | ForEach-Object { [string]$_.Id } })
+    $List = @($FailedAttempts | Where-Object { $null -ne $_ })
+    return [pscustomobject]@{
+        FailedAttempts = @($List | Where-Object { $NoRoleIds -notcontains [string]$_.Id })
+        Removed        = @($List | Where-Object { $NoRoleIds -contains [string]$_.Id })
+    }
+}
+
 function Add-RoleCheckRetryAttempts
 {
     param([object]$FailedAttempts, [object]$CompletedIds, $Decision)

@@ -2160,7 +2160,9 @@ exit 1
         $R.ExitCode | Should -Be 1
         $R.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then run -Resume again.'
         $R.Text | Should -Contain '  A run without -Resume checks the same subscriptions, so it stops here too.'
-        (script:Read-WrapperState).Failed | Should -Be @($script:SubB.Id)
+        # Sub B has no read role now, so it is taken off the retry list.
+        $R.Text | Should -Contain 'Taken off the retry list: Sub B (sub-b): the signed-in identity has no read role on it, so no run can retry it. It is listed with the subscriptions skipped as not readable; once the role is granted, the next run collects it.'
+        @((script:Read-WrapperState).Failed) | Should -BeNullOrEmpty
 
         # A new run (-Fresh) checks the same subscriptions and stops the same way.
         $Fresh = script:Invoke-WrapperRun -Arguments '-Fresh'
@@ -2310,45 +2312,30 @@ exit 1
         @(script:Get-StreamStateFiles) | Should -BeNullOrEmpty
     }
 
-    It 'names a skipped subscription on the retry list under Pending Retries, and -ResumeFailedOnly is unchanged' {
-        $Advice = @(
-            'Pending Retries:         1 subscription(s) on the retry list (FailedAttempts)'
-            '  1 of them were skipped by this run''s role check:'
-            $script:SkippedXLine
-            '  To retry them: Grant the identity Reader on these subscriptions, then run -ResumeFailedOnly.'
-            'Re-run with -ResumeFailedOnly to retry them.'
-        )
-        $AdviceIn = {
-            param($Run)
-            $At = [array]::IndexOf($Run.Text, $Advice[0])
-            if ($At -lt 0) { return @() }
-            @($Run.Text[$At..($At + $Advice.Count - 1)])
-        }
+    It 'takes a subscription on the retry list off it once it has no read role, ends clean, and the next run collects it once the role is granted' {
         # Run 0: Sub A completes, Sub X fails. Then Sub X cannot be read.
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Fail $script:SubX.Id
         $null = script:Invoke-WrapperRun -Arguments '-Obfuscate'
         (script:Read-WrapperState).Failed | Should -Be @($script:SubX.Id)
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubX.Id
 
+        # A run that continues it takes Sub X off the retry list, lists it as
+        # skipped, and ends clean: no retry entry keeps the state.
         $Plain = script:Invoke-WrapperRun -Arguments '-Obfuscate'
         $Plain.ExitCode | Should -Be 0
-        & $AdviceIn $Plain | Should -Be $Advice
-
-        $FailedOnly = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
-        $FailedOnly.ExitCode | Should -Be 1
-        $FailedOnly.Text | Should -Contain '  No subscription is readable. Stopping before any work. Grant the identity Reader on these subscriptions, then re-run.'
-        (script:Read-WrapperState).Failed | Should -Be @($script:SubX.Id)
-
-        $Resume = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
-        $Resume.ExitCode | Should -Be 0
-        $Resume.Text | Should -Contain $script:FinishLine
-        & $AdviceIn $Resume | Should -Be $Advice
-        (script:Read-WrapperState).Failed | Should -Be @($script:SubX.Id) -Because 'the retry list keeps the state'
+        $Plain.Text | Should -Contain ('Taken off the retry list: Sub X ({0}): the signed-in identity has no read role on it, so no run can retry it. It is listed with the subscriptions skipped as not readable; once the role is granted, the next run collects it.' -f $script:SubX.Id)
+        $Plain.Text | Should -Contain $script:SkippedXLine
+        @($Plain.Text | Where-Object { $_ -like 'Pending Retries:*' }) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:CaseState | Should -BeFalse
         @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains($script:SubX.Id) -or $_.Name.Contains($script:SubX.Id) -or $_.Text.Contains($script:SubX.Name) } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
 
-        # Reader granted: -ResumeFailedOnly retries Sub X and the state clears.
+        # Nothing is left to retry: -ResumeFailedOnly has no unfinished run.
+        $FailedOnly = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
+        $FailedOnly.ExitCode | Should -Be 1
+
+        # Reader granted: the next run collects Sub X and ends clean.
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX
-        $Granted = script:Invoke-WrapperRun -Arguments '-ResumeFailedOnly', '-Obfuscate'
+        $Granted = script:Invoke-WrapperRun -Arguments '-Obfuscate'
         $Granted.ExitCode | Should -Be 0
         $Granted.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
