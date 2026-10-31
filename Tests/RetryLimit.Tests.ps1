@@ -847,3 +847,79 @@ Describe 'A subscription past the retry limit that is no longer listed' {
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 }
+
+Describe 'A retry-list entry for a subscription whose stream did not load its Az context snapshot' {
+    It 'keeps the count of failed runs (0 for a new entry), is never past the limit for it, and a later failed run counts from it' {
+        $When = (Get-Date).AddHours(-1).ToString('o')
+        $List = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = $When; Reason = 'collector error'; Attempts = 2 })
+        $List = Add-FailedAttempt -Existing $List -Id 'sub-x' -Name 'Sub X' -Reason 'stream did not start: Az context autosave could not be turned off' -NotCounted
+        $List = Add-FailedAttempt -Existing $List -Id 'sub-y' -Name 'Sub Y' -Reason 'stream did not start: Az context import failed' -NotCounted
+        $X = @($List | Where-Object { $_.Id -eq 'sub-x' })
+        $Y = @($List | Where-Object { $_.Id -eq 'sub-y' })
+        $X.Count | Should -Be 1
+        $X[0].Attempts | Should -Be 2 -Because 'the count of failed runs is unchanged'
+        $X[0].Reason | Should -Be 'stream did not start: Az context autosave could not be turned off'
+        $X[0].LastFailedAt | Should -Not -Be $When
+        $Y[0].Attempts | Should -Be 0 -Because 'no run has failed it'
+        $X[0].NotCounted | Should -BeTrue
+        $Y[0].NotCounted | Should -BeTrue
+        Get-FailedAttemptCount -Entry $Y[0] | Should -Be 0
+
+        # The same cause on and on never reaches the limit.
+        foreach ($Run in 1..5) { $List = Add-FailedAttempt -Existing $List -Id 'sub-y' -Name 'Sub Y' -Reason 'stream did not start: Az context import failed' -NotCounted }
+        @(Get-RetryLimitedAttempts -FailedAttempts $List).Count | Should -Be 0
+        (@($List | Where-Object { $_.Id -eq 'sub-y' }))[0].Attempts | Should -Be 0
+
+        # A failed run of the subscription itself counts from 0, and the entry
+        # is no longer marked as not counted.
+        $List = Add-FailedAttempt -Existing $List -Id 'sub-y' -Name 'Sub Y' -Reason 'collector error'
+        (@($List | Where-Object { $_.Id -eq 'sub-y' }))[0].Attempts | Should -Be 1
+        $null -eq (@($List | Where-Object { $_.Id -eq 'sub-y' }))[0].PSObject.Properties['NotCounted'] | Should -BeTrue
+    }
+}
+
+Describe 'A stream that did not start on the parallel path' {
+    BeforeAll {
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    It 'counts a failed run when the stream could not load Az.Accounts, and names that cause' {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { throw 'stand-in: the module cannot be loaded' }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        $Global:RdaRlFailIds = @()
+        $Run = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2
+        foreach ($Id in 'sub-a', 'sub-b')
+        {
+            $Entry = script:Get-Entry -Id $Id
+            [int]$Entry.Attempts | Should -Be 1
+            $Entry.Reason | Should -Be 'stream did not start: the Az.Accounts module could not be loaded'
+        }
+        @(script:Get-Lines -Run $Run -Like 'Not counted toward the retry limit:*') | Should -BeNullOrEmpty
+        $Run.Result.WrapperExitCode | Should -Be 2
+    }
+
+    It 'keeps the count, names the import cause, and says which entries were not counted, when the stream did not load its snapshot' {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'CurrentUser'; ContextFile = 'AzureRmContext.json'; CacheFile = 'msal.cache' } }
+        $Global:RdaRlFailIds = @()
+        $Run = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2
+        foreach ($Id in 'sub-a', 'sub-b')
+        {
+            $Entry = script:Get-Entry -Id $Id
+            [int]$Entry.Attempts | Should -Be 0
+            $Entry.Reason | Should -Be 'stream did not start: Az context autosave could not be turned off'
+        }
+        @(script:Get-Lines -Run $Run -Like 'Not counted toward the retry limit:*') | Should -Be @("Not counted toward the retry limit: 2 (Sub A, Sub B) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. Run with -ParallelStreams 1 to collect them without stream workers.")
+        $Run.Result.WrapperExitCode | Should -Be 2
+
+        # A run whose stream starts and fails a subscription counts it, and the
+        # line no longer names it.
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        $Global:RdaRlFailIds = @('sub-a')
+        $Next = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2 -Resume
+        [int](script:Get-Entry -Id 'sub-a').Attempts | Should -Be 1
+        @(script:Get-Lines -Run $Next -Like 'Not counted toward the retry limit:*') | Should -BeNullOrEmpty
+    }
+}

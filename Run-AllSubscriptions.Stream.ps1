@@ -119,7 +119,7 @@ Write-Stream ("starting; subs in slice: {0}" -f $SubscriptionIds.Count) 'Cyan'
 # child process a working Az context without prompting for sign-in. The file
 # holds a token cache and nothing reads it again, so it is deleted in the
 # `finally`, whether the import worked or not.
-$ImportStep = 'import'
+$ImportStep = 'module'
 try
 {
     Import-Module Az.Accounts -ErrorAction Stop -Force | Out-Null
@@ -151,6 +151,11 @@ catch
         Write-Stream ("FATAL: {0} Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers." -f $Reason) 'Red'
         $SubReason = 'stream did not start: Az context autosave could not be turned off'
     }
+    elseif ($ImportStep -eq 'module')
+    {
+        Write-Stream ("FATAL: could not load the Az.Accounts module: {0}" -f $Reason) 'Red'
+        $SubReason = 'stream did not start: the Az.Accounts module could not be loaded'
+    }
     else
     {
         Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $Reason) 'Red'
@@ -163,6 +168,10 @@ catch
         Tenant        = $TenantID
         Status        = 'failed-to-start'
         Reason        = $Reason
+        # The step that stopped the stream: 'module' (Az.Accounts did not
+        # load), 'autosave' or 'import' (its Az context snapshot was not
+        # loaded). The parent counts no failed run for the last two.
+        FailedStep    = $ImportStep
         Completed     = @()
         Failed        = @(0..([Math]::Max($SubscriptionIds.Count, $SubscriptionNames.Count) - 1) | ForEach-Object {
                 $Name = if ($_ -lt $SubscriptionNames.Count) { $SubscriptionNames[$_] } else { '<unknown>' }

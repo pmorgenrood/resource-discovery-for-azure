@@ -224,10 +224,10 @@ exit 1
     $script:Perl = Get-Command -Name perl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     function script:Start-Wrapper
     {
-        param([int]$Streams = 2, [string]$Tenant = $script:Tenant, [switch]$HoldImport, [string]$Autosave = '', [string[]]$Script = @())
+        param([int]$Streams = 2, [string]$Tenant = $script:Tenant, [switch]$HoldImport, [string]$Autosave = '', [string[]]$Script = @(), [switch]$Resume)
         $Scenario = script:New-Scenario -Tenant $Tenant
         $Command = if ($Script.Count -gt 0) { @($script:Pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File') + $Script }
-        else { @($script:Pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $Tenant, '-ParallelStreams', [string]$Streams, '-SkipMetrics', '-SkipConsumption') }
+        else { @($script:Pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $Tenant, '-ParallelStreams', [string]$Streams, '-SkipMetrics', '-SkipConsumption') + @(if ($Resume) { '-Resume' }) }
         if ($script:Perl)
         {
             $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Perl.Source)
@@ -271,8 +271,8 @@ exit 1
 
     function script:Invoke-Wrapper
     {
-        param([int]$Streams = 2, [string]$Tenant = $script:Tenant, [string]$Autosave = '')
-        script:Wait-Wrapper -Started (script:Start-Wrapper -Streams $Streams -Tenant $Tenant -Autosave $Autosave)
+        param([int]$Streams = 2, [string]$Tenant = $script:Tenant, [string]$Autosave = '', [switch]$Resume)
+        script:Wait-Wrapper -Started (script:Start-Wrapper -Streams $Streams -Tenant $Tenant -Autosave $Autosave -Resume:$Resume)
     }
 
     # Waits until Count workers are held in the stand-in Import-AzContext and
@@ -920,6 +920,36 @@ Start-Sleep -Seconds 600
 
         # The next two runs, with autosave turned off as usual.
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the next run'
+        script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
+    }
+
+    It 'keeps the subscriptions of a stream that did not load its snapshot on the retry list without counting a failed run, on every -Resume run, until the cause is fixed' {
+        $State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $Read = {
+            $Entries = @((Get-Content -LiteralPath $State -Raw | ConvertFrom-Json).FailedAttempts | Where-Object { $null -ne $_ })
+            @($Entries | Sort-Object -Property Id | ForEach-Object { '{0}={1}' -f $_.Id, $_.Attempts })
+        }
+        # The cause stays: the first run and the next four -Resume runs (one more
+        # than the retry limit) each fail both streams, collect nothing, exit 2
+        # with the reason, and leave both subscriptions on the retry list at 0.
+        foreach ($Which in 'the first run', '-Resume 1', '-Resume 2', '-Resume 3', '-Resume 4')
+        {
+            $Result = script:Invoke-Wrapper -Streams 2 -Autosave 'stuck' -Resume:($Which -ne 'the first run')
+            $Result.ExitCode | Should -Be 2 -Because ('{0}: {1}' -f $Which, ($Result.Text -join ' | '))
+            @($Result.Text | Where-Object { $_ -like '`[stream-?`] FATAL: Az context autosave could not be turned off for this stream*' }).Count | Should -Be 2 -Because $Which
+            @($Result.Text | Where-Object { $_ -like 'Not retried:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 0 -Because ('{0}: the cause is the stream''s sign-in, not the subscriptions' -f $Which)
+            @($Result.Text | Where-Object { $_ -like 'Not counted toward the retry limit: 2 (Sub A, Sub B) - *' }).Count | Should -Be 1 -Because $Which
+            @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 0 -Because $Which
+            & $Read | Should -Be @('sub-a=0', 'sub-b=0') -Because $Which
+            Write-Host ('{0}: exit {1}, retry list {2}' -f $Which, $Result.ExitCode, ((& $Read) -join ', '))
+        }
+        # The cause fixed: the next -Resume collects both and clears the entries;
+        # the run after it is a clean run.
+        $Fixed = script:Invoke-Wrapper -Streams 2 -Resume
+        $Fixed.ExitCode | Should -Be 0 -Because ($Fixed.Text -join ' | ')
+        @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 2
+        Test-Path -LiteralPath $State | Should -BeFalse -Because 'every subscription is collected, so the resume state is cleared'
+        Write-Host ('cause fixed, -Resume: exit {0}, resume state left: {1}' -f $Fixed.ExitCode, (Test-Path -LiteralPath $State))
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
     }
 

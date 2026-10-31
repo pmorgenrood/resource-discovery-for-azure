@@ -419,7 +419,7 @@ function Get-ResumeStateShapeProblem
         if ($Entry -isnot [System.Management.Automation.PSCustomObject]) { return ('FailedAttempts entry {0} is not an object' -f $N) }
         if ($Entry.Id -isnot [string] -or [string]::IsNullOrWhiteSpace($Entry.Id)) { return ('FailedAttempts entry {0} has no text Id' -f $N) }
         # Attempts is not checked: an entry whose Attempts is missing or is not a
-        # whole number of at least 1 counts as one failed run (Get-FailedAttemptCount),
+        # whole number of at least 0 counts as one failed run (Get-FailedAttemptCount),
         # so its file is used, not moved aside.
         # ConvertFrom-Json turns an ISO 8601 date text into a [datetime]; any
         # other text must parse as one the way the [datetime] cast does.
@@ -837,18 +837,24 @@ function Add-FailedAttempt
         [object]$Existing,
         [string]$Id,
         [string]$Name,
-        [string]$Reason
+        [string]$Reason,
+        # The subscription was not attempted (its stream did not load its Az
+        # context snapshot): keep it on the retry list with its count of failed
+        # runs unchanged, 0 when it had no entry, and mark the entry so the end
+        # of the run can say it was not counted.
+        [switch]$NotCounted
     )
     $List = @($Existing | Where-Object { $_ })
     $ExistingEntry = $List | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
+    $Added = if ($NotCounted) { 0 } else { 1 }
     if ($null -ne $ExistingEntry)
     {
         $List = @($List | Where-Object { $_.Id -ne $Id })
-        $Attempts = (Get-FailedAttemptCount -Entry $ExistingEntry) + 1
+        $Attempts = (Get-FailedAttemptCount -Entry $ExistingEntry) + $Added
     }
     else
     {
-        $Attempts = 1
+        $Attempts = $Added
     }
     $List += [pscustomobject]@{
         Id           = $Id
@@ -857,7 +863,19 @@ function Add-FailedAttempt
         Reason       = $Reason
         Attempts     = $Attempts
     }
+    if ($NotCounted) { $List[-1] | Add-Member -NotePropertyName NotCounted -NotePropertyValue $true }
     return $List
+}
+
+# Name the retry-list entries whose last run was not counted toward the retry
+# limit (Add-FailedAttempt -NotCounted): their stream did not load its Az
+# context snapshot. Prints nothing when there are none.
+function Write-NotCountedRetrySummary
+{
+    param([object]$FailedAttempts)
+    $List = @(@($FailedAttempts) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['NotCounted'] -and $_.NotCounted -eq $true })
+    if ($List.Count -eq 0) { return }
+    Write-Host ("Not counted toward the retry limit: {0} ({1}) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. Run with -ParallelStreams 1 to collect them without stream workers." -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
 }
 
 # Remove a sub's FailedAttempts entry once it has succeeded on a retry, so
@@ -1624,14 +1642,16 @@ function Write-NotCollectedSummary
 }
 
 # The number of failed runs a retry-list entry records (its Attempts): one more
-# for each run that failed the subscription, removed when it completes. An entry
-# without a whole number of at least 1 there (written by hand, or damaged) counts
-# as one failed run, so it is retried as before instead of stopping the run.
+# for each run that failed the subscription, removed when it completes. 0 is a
+# subscription on the retry list that no run has failed: its stream did not load
+# its Az context snapshot (Add-FailedAttempt -NotCounted). An entry without a
+# whole number of at least 0 there (written by hand, or damaged) counts as one
+# failed run, so it is retried as before instead of stopping the run.
 function Get-FailedAttemptCount
 {
     param([object]$Entry)
     $Count = 0
-    if ($null -ne $Entry -and [int]::TryParse([string]$Entry.Attempts, [ref]$Count) -and $Count -ge 1) { return $Count }
+    if ($null -ne $Entry -and [int]::TryParse([string]$Entry.Attempts, [ref]$Count) -and $Count -ge 0) { return $Count }
     return 1
 }
 

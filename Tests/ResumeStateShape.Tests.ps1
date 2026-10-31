@@ -503,12 +503,19 @@ Describe 'Get-ResumeStateShapeProblem: records as the wrapper and the stream wor
         @{ Kind = 'Main'; Label = 'with a retry entry without Attempts'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
         @{ Kind = 'Main'; Label = 'with Attempts "abc"'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":"abc","LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
         @{ Kind = 'Main'; Label = 'with Attempts 2.5'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":2.5,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
-        @{ Kind = 'Main'; Label = 'with Attempts 0'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":0,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
         @{ Kind = 'Stream'; Label = 'with Attempts true'; Json = '{"Completed":[],"FailedAttempts":[{"Id":"sub-a","Attempts":true,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' },
         @{ Kind = 'Main'; Label = 'with Attempts larger than a whole number holds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":99999999999,"LastFailedAt":"2026-10-29T00:00:00Z"}]}' }
     ) {
         Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record $Json) -Kind $Kind | Should -BeNullOrEmpty
         Get-FailedAttemptCount -Entry (script:ConvertTo-Record $Json).FailedAttempts[0] | Should -Be 1
+    }
+
+    # 0 is the count a retry entry keeps while its stream did not load its
+    # sign-in copy (Add-FailedAttempt -NotCounted): no failed run.
+    It 'a retry entry with Attempts 0 has the right shape: it counts as no failed run' {
+        $Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-a","Attempts":0,"LastFailedAt":"2026-10-29T00:00:00Z"}]}'
+        Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record $Json) -Kind Main | Should -BeNullOrEmpty
+        Get-FailedAttemptCount -Entry (script:ConvertTo-Record $Json).FailedAttempts[0] | Should -Be 0
     }
 
     It 'every Attempts and LastFailedAt value it accepts converts as Add-FailedAttempt and Merge-FailedAttempts convert it' {

@@ -1602,7 +1602,7 @@ Describe 'Write-PendingRetrySkippedSummary (skipped subscriptions on the retry l
 
     It 'is called in the wrapper between the Pending Retries line and its advice' {
         $Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
-        $Wrapper | Should -Match ('"Pending Retries: [^\r\n]*\r?\n(\s*#[^\n]*\n)*\s*' + [regex]::Escape('Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision') + '\r?\n\s*' + [regex]::Escape('Write-Host "Re-run with -ResumeFailedOnly to retry them."'))
+        $Wrapper | Should -Match ('"Pending Retries: [^\r\n]*\r?\n(\s*#[^\n]*\n)*\s*' + [regex]::Escape('Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision') + '\r?\n(\s*' + [regex]::Escape('Write-NotCountedRetrySummary -FailedAttempts $FailedAttempts') + '\r?\n)?\s*' + [regex]::Escape('Write-Host "Re-run with -ResumeFailedOnly to retry them."'))
     }
 }
 

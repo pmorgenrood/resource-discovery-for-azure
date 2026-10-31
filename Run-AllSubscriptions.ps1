@@ -1807,7 +1807,15 @@ else
                         # Not collected this run either: each goes on the retry
                         # list as a failed run (below), so -ResumeFailedOnly
                         # retries it and its count of failed runs goes up.
-                        $StreamNotStarted += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and [string]$_.Id -ne '<unknown>' })
+                        # A stream that did not load its Az context snapshot
+                        # failed for its own sign-in, not for any of its
+                        # subscriptions: they go on the retry list with their
+                        # count of failed runs unchanged, so the retry limit
+                        # never skips them for it. A stream that could not load
+                        # Az.Accounts ('module') still counts one failed run.
+                        $NotCounted = @('autosave', 'import') -contains [string]$StreamSummary.FailedStep
+                        $StreamNotStarted += @($StreamSummary.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and [string]$_.Id -ne '<unknown>' } |
+                                ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; Name = [string]$_.Name; Reason = [string]$_.Reason; NotCounted = $NotCounted } })
                     }
                 }
 
@@ -1995,10 +2003,11 @@ else
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
             # A stream that did not start wrote no state, so its subs are added
             # here, one more failed run each (Add-FailedAttempt counts on), after
-            # the merge, which drops entries of completed subs.
+            # the merge, which drops entries of completed subs. The subs of a
+            # stream that did not load its snapshot keep their count.
             foreach ($NotStarted in @($StreamNotStarted | Where-Object { $null -ne $_ }))
             {
-                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$NotStarted.Id) -Name ([string]$NotStarted.Name) -Reason ([string]$NotStarted.Reason)
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$NotStarted.Id) -Name ([string]$NotStarted.Name) -Reason ([string]$NotStarted.Reason) -NotCounted:([bool]$NotStarted.NotCounted)
             }
             if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $NotCompletedThisRun.Count -gt 0)
             {
@@ -2500,6 +2509,7 @@ if ($CollectorFailuresList.Count -gt 0)
 if ($FailedSubscriptions.Count -gt 0)
 {
     Write-Host ("Subscriptions Failed:    {0} ({1})" -f $FailedSubscriptions.Count, ($FailedSubscriptions -join ', ')) -ForegroundColor Red
+    Write-NotCountedRetrySummary -FailedAttempts $FailedAttempts
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     Write-Host "Re-run with -Resume to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
     Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
@@ -2523,6 +2533,7 @@ elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)
     Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $FailedAttempts.Count) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
+    Write-NotCountedRetrySummary -FailedAttempts $FailedAttempts
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
 }
 if ($NotCollected.Count -gt 0)
