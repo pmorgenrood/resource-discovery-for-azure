@@ -1161,13 +1161,13 @@ if ($ParallelStreams -le 1)
                 # The run left no zip, so there is no report a later -Resume could
                 # carry: the sub is not completed. As after a failed attempt, an
                 # earlier run's completion of it ends here, so the next -Resume
-                # collects it again instead of carrying the older report.
-                if ($CompletedIds -contains $Sub.Id)
-                {
-                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                    $StateChanged = $true
-                }
+                # collects it again instead of carrying the older report. It goes
+                # on the retry list as a failed run, so -ResumeFailedOnly retries
+                # it and the retry limit ends a cause that does not go away.
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'the run wrote no report zip (see the errors above)'
+                $StateChanged = $true
             }
             else
             {
@@ -1361,13 +1361,12 @@ else
                 if ($null -eq $NewReport)
                 {
                     # Same as the sequential branch: a run that left no zip does not
-                    # complete the sub, and ends an earlier run's completion of it.
-                    if ($CompletedIds -contains $Sub.Id)
-                    {
-                        $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                        $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
-                    }
+                    # complete the sub, ends an earlier run's completion of it and
+                    # puts it on the retry list as a failed run.
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
+                    $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'the run wrote no report zip (see the errors above)'
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
                 elseif (-not ($CompletedIds -contains $Sub.Id))
                 {

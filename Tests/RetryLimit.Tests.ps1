@@ -47,7 +47,9 @@ New-Item -ItemType Directory -Path $Folder -Force | Out-Null
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 $Html = Join-Path $Folder ('ResourcesReport_{0}.html' -f $Stamp)
 Set-Content -LiteralPath $Html -Value '<html></html>' -Encoding utf8
-Compress-Archive -Path $Html -DestinationPath $Zip -Force
+# The ids in $Global:RdaRlNoZipIds end without a report zip, as a direct run
+# does after 5 collector failures in a row (exit 0 under -RunAllSubs).
+if (@($Global:RdaRlNoZipIds) -notcontains $SubscriptionID) { Compress-Archive -Path $Html -DestinationPath $Zip -Force }
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
@@ -218,6 +220,7 @@ $Global:ResourceCount = 1
         $Global:RdaRlRoot = $script:Root
         $Global:RdaRlFailIds = @()
         $Global:RdaRlIncompleteIds = @()
+        $Global:RdaRlNoZipIds = @()
         # Subscriptions Azure lists that are not in the run's set (for example
         # disabled ones without -IncludeDisabled).
         $Global:RdaRlAlsoVisible = @()
@@ -226,7 +229,7 @@ $Global:ResourceCount = 1
 }
 
 AfterAll {
-    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -525,6 +528,35 @@ Describe 'Retry limit for a subscription whose metrics stay incomplete' {
 
         @($Run4.Calls) | Should -Not -Contain 'sub-x'
         @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: Metrics incomplete*').Count | Should -Be 1
+    }
+}
+
+Describe 'Retry limit for a subscription whose run writes no report zip' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    # Without a retry entry such a subscription kept the state and ended every
+    # -Resume with exit 2 forever: the retry limit never counted it.
+    It 'counts each run that writes no zip, and the fourth -Resume run does not collect it, on either path' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlNoZipIds = @('sub-x')
+        $Subs = @($script:A, $script:B, $script:X)
+        $Attempts = @()
+        $null = script:Invoke-Run -Subs $Subs -Streams $Streams
+        $Attempts += [int](script:Get-Entry -Id 'sub-x').Attempts
+        foreach ($n in 2..3)
+        {
+            $null = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+            $Attempts += [int](script:Get-Entry -Id 'sub-x').Attempts
+        }
+        $Run4 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+
+        $Attempts | Should -Be @(1, 2, 3) -Because 'each run that writes no zip is one more failed run'
+        @($Run4.Calls) | Should -Not -Contain 'sub-x'
+        @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: the run wrote no report zip*').Count | Should -Be 1
     }
 }
 
