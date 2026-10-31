@@ -1254,6 +1254,9 @@ function Get-ResumeStateRecordLists
     return @(
         [pscustomobject]@{ State = 'CompletedSubscriptionIds'; Stream = 'Completed'; Run = 'CompletedIds'; CompletedOnly = $false }
         [pscustomobject]@{ State = 'FailedAttempts'; Stream = 'FailedAttempts'; Run = 'FailedAttempts'; CompletedOnly = $false }
+        # The report zip of each completed subscription (New-CompletedReportRecord):
+        # 'CompletedReports' in the resume state, 'Reports' in a per-stream file.
+        [pscustomobject]@{ State = 'CompletedReports'; Stream = 'Reports'; Run = 'CompletedReports'; CompletedOnly = $true }
     )
 }
 

@@ -1844,6 +1844,10 @@ Describe 'The per-stream and resume state helpers' {
         Get-StreamStateUntrackedLists -State ([pscustomobject]$State | ConvertTo-Json -Depth 4 | ConvertFrom-Json) | Should -Be @('Notes', 'Labels')
         @(Get-StreamStateUntrackedLists -State ('{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
         @(Get-StreamStateUntrackedLists -State $null) | Should -BeNullOrEmpty
+        # The report records a stream worker writes ('Reports') are a list this
+        # version keeps, so a per-stream file holding them is not renamed aside.
+        @(Get-ResumeStateRecordLists | Where-Object { $_.Stream -eq 'Reports' } | ForEach-Object { $_.State }) | Should -Be @('CompletedReports')
+        @(Get-StreamStateUntrackedLists -State ('{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[],"Reports":[{"Id":"sub-a","Name":"Sub A","Zip":"a.zip","Obfuscated":false}]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
     }
 
     It 'Get-ResumeStateRunId, Set-ResumeStateRunId, Test-StreamStateRunId and Save-CompletedSubscriptionIds carry the run id' {
