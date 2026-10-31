@@ -652,13 +652,11 @@ $NewRunId = if ($Resume -or $ResumeFailedOnly) { '' } else { [guid]::NewGuid().T
 # the run, or Exit-Wrapper when the run ends early, deletes them once the resume
 # state no longer needs them (cleared, or written and read back holding those
 # records), or a later run would recover them again from a cycle that already
-# finished. After the end-of-run merge of a parallel run they are the files
-# its streams wrote, deleted at the same points ($FoldedSource names them in
-# the warning). A file that cannot be read, here or in the end-of-run merge of
-# a parallel run, is moved aside with a warning (Move-UnreadableStreamStateFile)
-# and collected in $UnreadableStreamFiles; its records are not used.
-# $StreamFilesLeft collects the per-stream files the end-of-run merge of a
-# parallel run could not remove.
+# finished. $StreamFilesLeft collects the per-stream files the end-of-run
+# merge of a parallel run could not remove. A file that cannot be read, here or
+# in the end-of-run merge of a parallel run, is moved aside with a warning
+# (Move-UnreadableStreamStateFile) and collected in $UnreadableStreamFiles; its
+# records are not used.
 $FoldedStreamFiles = @()
 $FoldedRecordIds = @()
 $StreamFilesLeft = @()
@@ -2705,7 +2703,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollect
 # -Resume folds them in again (Invoke-FoldedStreamStateCleanup).
 if (-not $ResumeStateClearTried)
 {
-    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Source $FoldedSource
+    $null = Invoke-FoldedStreamStateCleanup -Files $FoldedStreamFiles -ResumeStateFile $ResumeStateFile -Tenant $TenantID -Ids $FoldedRecordIds -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts
     $FoldedStreamFiles = @()
 }
 
