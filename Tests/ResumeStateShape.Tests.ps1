@@ -25,8 +25,8 @@
 #
 # The end-to-end runs start Run-AllSubscriptions.ps1 itself as its own pwsh
 # process from a copy of the tool whose ResourceInventory.ps1 is a stand-in.
-# Azure is a set of stand-in Az modules and an az command, found first on the
-# module path and PATH of that process, which answer from a scenario file: the
+# Azure is a set of stand-in Az modules, found first on the module path of that
+# process (the tool signs in with Az PowerShell only), which answer from a scenario file: the
 # subscriptions, the ones that fail, and whether the inventory root becomes
 # read-only once the subscriptions are listed or once given reports are written.
 # The stand-in collection records each call in the home folder. The process's home is a scratch folder,
@@ -115,6 +115,7 @@ function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Contex
 function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
 function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
 function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
+function Get-AzContextAutosaveSetting { [CmdletBinding()] param($Scope) [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
 function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
 function Get-AzAccessToken
 {
@@ -173,17 +174,6 @@ function Get-UsageAggregates
         Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psd1')) -Value ("@{{ ModuleVersion = '99.0.0'; RootModule = '{0}.psm1'; FunctionsToExport = '*' }}" -f $Module.Name) -Encoding utf8
     }
 
-    # The az command: signed in to the scenario's tenant, with a token.
-    $script:Bin = Join-Path $script:TestBase 'bin'
-    New-Item -ItemType Directory -Path $script:Bin -Force | Out-Null
-    $Az = @'
-$Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
-if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'show') { [pscustomobject]@{ tenantId = $Scenario.Tenant } | ConvertTo-Json -Compress; exit 0 }
-if ($args.Count -ge 2 -and $args[0] -eq 'account' -and $args[1] -eq 'get-access-token') { exit 0 }
-exit 1
-'@
-    Set-Content -LiteralPath (Join-Path $script:Bin 'az.ps1') -Value $Az -Encoding utf8
-
     $script:Subs = @{}
     foreach ($Letter in 'A', 'B', 'C') { $script:Subs[$Letter] = @{ Id = ('sub-' + $Letter.ToLowerInvariant()); Name = ('Sub ' + $Letter) } }
 
@@ -230,7 +220,6 @@ exit 1
         $Info.RedirectStandardError = $true
         $Info.Environment['HOME'] = $script:CaseHome
         $Info.Environment['PSModulePath'] = $script:Modules
-        $Info.Environment['PATH'] = $script:Bin + [IO.Path]::PathSeparator + $env:PATH
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['NO_COLOR'] = '1'
         foreach ($Key in $Environment.Keys) { $Info.Environment[$Key] = [string]$Environment[$Key] }
@@ -317,7 +306,10 @@ exit 1
     # Name, length and hash of every file in the inventory root but the run transcripts.
     function script:Get-RootSnapshot
     {
-        @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike 'RunAllSubscriptions_transcript_*' } | Sort-Object FullName | ForEach-Object { '{0} {1} {2}' -f $_.FullName.Substring($script:Root.Length), $_.Length, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+        # The run lock is the run's own file, not run state; in a folder made
+        # read-only after the write probe the run cannot remove it, and the next
+        # run takes it over.
+        @(Get-ChildItem -LiteralPath $script:Root -Force -Recurse -File | Where-Object { $_.Name -notlike 'RunAllSubscriptions_transcript_*' -and $_.Name -notlike '.run-lock-*' } | Sort-Object FullName | ForEach-Object { '{0} {1} {2}' -f $_.FullName.Substring($script:Root.Length), $_.Length, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
     }
     # True when a read-only folder refuses a new file here (not the case as root).
     function script:Test-ReadOnlyRefused
@@ -965,14 +957,15 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         script:Test-CleanLine $R3 | Should -BeTrue
     }
 
-    It 'a <Label> resume state file is handled as before: -ResumeFailedOnly has nothing to retry and exits 0, nothing is moved' -TestCases @(
+    It 'a <Label> resume state file is handled as before: -ResumeFailedOnly has nothing to retry and, with subscriptions no run has completed, exits 2; nothing is moved' -TestCases @(
         @{ Label = '0-byte'; Text = '' },
         @{ Label = 'whitespace-only'; Text = "  `n`t`n " }
     ) {
         script:Set-Scenario
         script:Write-RawText -Path $script:State -Text $Text
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
-        $R1.ExitCode | Should -Be 0
+        # Nothing to retry while subscriptions no run has completed remain is exit 2.
+        $R1.ExitCode | Should -Be 2
         $R1.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
         script:Get-MovedAside | Should -BeNullOrEmpty
@@ -1041,7 +1034,8 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         script:Set-Scenario -Fail 'A', 'B', 'C'
         $R1 = script:Invoke-Wrapper
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
-        foreach ($R in $R1, $R2) { @(script:Get-ShapeWarnings $R) | Should -BeNullOrEmpty; $R.ExitCode | Should -Be 0 }
+        # Every subscription failed, so both runs end with exit 2.
+        foreach ($R in $R1, $R2) { @(script:Get-ShapeWarnings $R) | Should -BeNullOrEmpty; $R.ExitCode | Should -Be 2 }
         @((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).FailedAttempts | Where-Object { $_ } | ForEach-Object { $_.Id } | Sort-Object) | Should -Be (script:Get-Ids 'A', 'B', 'C')
         script:Set-Scenario
         $R3 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
