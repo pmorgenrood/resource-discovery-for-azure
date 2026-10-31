@@ -534,7 +534,11 @@ function global:Compress-Archive
     function script:Get-StateStartText
     {
         $Raw = Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json
-        $When = $Raw.RunStartedAt
+        $When = $Raw.PSObject.Properties['RunStartedAt']
+        # A version that records no start time: a text no start line holds, so
+        # the test goes on to the run and fails on what the run does.
+        if ($null -eq $When) { return '(no start time recorded)' }
+        $When = $When.Value
         if ($When -isnot [datetime]) { $When = [datetime]::Parse([string]$When, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) }
         return ($When.ToUniversalTime().ToString('d MMM yyyy HH:mm', [cultureinfo]::InvariantCulture) + ' UTC')
     }
