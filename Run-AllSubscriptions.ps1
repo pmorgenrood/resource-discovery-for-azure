@@ -756,6 +756,49 @@ if ($ResumeFailedOnly -and $WrongShapeStateFiles.Count -gt 0)
 # completed list is only checked to defend against a sub that succeeded on a
 # previous retry but whose FailedAttempts entry was not yet pruned (shouldn't
 # happen if the catch/success paths are correct, but cheap to defend).
+# A retry-list entry for a subscription the signed-in identity no longer sees
+# at all (deleted, moved to another tenant) can never be retried or counted, so
+# it would keep the resume state forever. Every run drops it, with or without
+# -Resume (a run without it reads and writes the same retry list), before the
+# entries past the retry limit are worked out, so a gone one is never owed.
+# A disabled subscription is still listed by Get-AzSubscription, so its entry
+# stays (-IncludeDisabled retries it). A listing that came back with warnings or
+# errors can leave out a subscription that is only hidden for now, so then no
+# entry is dropped, and the warnings and errors are printed.
+$DroppedGoneEntries = $false
+$KeptNotListedIds = @()
+if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
+{
+    $VisibleIds = @($AllSubscriptions | ForEach-Object { [string]$_.Id })
+    $GoneAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $VisibleIds -notcontains [string]$_.Id })
+    $ListingProblems = @(@($SubWarnings) + @($SubErrors) | Where-Object { $_ } | ForEach-Object {
+            $Text = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } elseif ($_ -is [System.Management.Automation.WarningRecord]) { $_.Message } else { [string]$_ }
+            # The first line, at most 300 characters: what to fix, not the whole record.
+            $Line = @(([string]$Text) -split "`r?`n" | Where-Object { $_.Trim() })[0]
+            if ($null -eq $Line) { $Line = '' }
+            if ($Line.Length -gt 300) { $Line = $Line.Substring(0, 300) + '...' }
+            $Line.Trim()
+        } | Where-Object { $_ } | Select-Object -Unique)
+    if ($GoneAttempts.Count -gt 0 -and $ListingProblems.Count -gt 0)
+    {
+        Write-Host ("Kept on the retry list: {0} subscription(s) not in the subscription list ({1}), because Get-AzSubscription returned warnings or errors, so the list may be incomplete:" -f $GoneAttempts.Count, (@($GoneAttempts | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', ')) -ForegroundColor Yellow
+        foreach ($Problem in @($ListingProblems | Select-Object -First 5)) { Write-Host ("  - {0}" -f $Problem) -ForegroundColor Yellow }
+        if ($ListingProblems.Count -gt 5) { Write-Host ("  - ... and {0} more" -f ($ListingProblems.Count - 5)) -ForegroundColor Yellow }
+        $KeptNotListedIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
+    }
+    elseif ($GoneAttempts.Count -gt 0)
+    {
+        foreach ($Gone in $GoneAttempts)
+        {
+            Write-Host ("Dropped from the retry list: {0} ({1}) is no longer visible to the signed-in identity, so no run can retry it." -f $Gone.Name, $Gone.Id) -ForegroundColor Yellow
+        }
+        $GoneIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
+        $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $GoneIds -notcontains [string]$_.Id })
+        Update-ResumeStateRetryList -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+        $DroppedGoneEntries = $true
+    }
+}
+
 if ($ResumeFailedOnly)
 {
     if ($FailedAttempts.Count -eq 0)
@@ -765,29 +808,15 @@ if ($ResumeFailedOnly)
         # After an interrupted run the state still lists what completed, so name
         # the subscriptions it never reached. Without a state file (a clean run
         # deleted it) there is nothing to name.
+        # Exit 2 while that list is not empty: work remains that this mode does
+        # not do, so the run is not reported as a success (a -Resume collects it).
+        $NotReachedIds = @()
         if (Test-Path -Path $ResumeStateFile -PathType Leaf)
         {
             $NotReached = @(Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds -NotReadableIds $NotReadableIds)
             $NotReachedIds = @($NotReached | Where-Object { $null -ne $_ })
             Write-NotCollectedSummary -NotCollected $NotReached -ResumeStateFile $ResumeStateFile
         }
-        Exit-Wrapper -Code 2
-    }
-    $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
-    $BeforeCount = $Subscriptions.Count
-    # Kept for the resume-state cleanup at the end, which names any of these that
-    # no run has completed. Copied here because in the sequential path the inner
-    # script can replace $Subscriptions.
-    $EligibleBeforeRetryFilter = @($Subscriptions)
-    $Subscriptions = @($Subscriptions | Where-Object { $FailedIds -contains $_.Id })
-    Write-Host ("ResumeFailedOnly: filtered to {0} previously-failed subscription(s) (was {1})." -f $Subscriptions.Count, $BeforeCount) -ForegroundColor Cyan
-    if ($Subscriptions.Count -eq 0)
-    {
-        # Could happen if the visible-subs list no longer contains the failed
-        # IDs (sub was deleted, identity lost access, IncludeDisabled toggled
-        # off relative to the prior run). Tell the user instead of silently
-        # processing nothing.
-        Write-Host "WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set. Verify access and -IncludeDisabled flag matches the prior run." -ForegroundColor Yellow
         # The drop above emptied the retry list and no subscription is left that
         # no run has completed: nothing is owed, so the state is removed as at the
         # end of a clean run. Otherwise it would stay behind on every repeat.
@@ -804,6 +833,25 @@ if ($ResumeFailedOnly)
             }
         }
         Exit-Wrapper -Code $(if ($NotReachedIds.Count -gt 0) { 2 } else { 0 })
+    }
+    $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
+    $BeforeCount = $Subscriptions.Count
+    # Kept for the resume-state cleanup at the end, which names any of these that
+    # no run has completed. Copied here because in the sequential path the inner
+    # script can replace $Subscriptions.
+    $EligibleBeforeRetryFilter = @($Subscriptions)
+    $Subscriptions = @($Subscriptions | Where-Object { $FailedIds -contains $_.Id })
+    Write-Host ("ResumeFailedOnly: filtered to {0} previously-failed subscription(s) (was {1})." -f $Subscriptions.Count, $BeforeCount) -ForegroundColor Cyan
+    if ($Subscriptions.Count -eq 0)
+    {
+        # Could happen if the visible-subs list no longer contains the failed
+        # IDs (sub was deleted, identity lost access, IncludeDisabled toggled
+        # off relative to the prior run). Tell the user instead of silently
+        # processing nothing.
+        # The retry list still holds them (the state is kept), so this is not a
+        # success: exit 2, as for any report the run could not produce.
+        Write-Host "WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set. Verify access and -IncludeDisabled flag matches the prior run." -ForegroundColor Yellow
+        Exit-Wrapper -Code 2
     }
 }
 
@@ -859,49 +907,6 @@ $RetryLimitedNotInRunIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAtt
 # state records some subscriptions in scope as completed, the run does not
 # stop even if none of the checked ones is readable: it skips them as above
 # and finishes with nothing left to collect, with one stream (see
-# A retry-list entry for a subscription the signed-in identity no longer sees
-# at all (deleted, moved to another tenant) can never be retried or counted, so
-# it would keep the resume state forever. Every run drops it, with or without
-# -Resume (a run without it reads and writes the same retry list), before the
-# entries past the retry limit are worked out, so a gone one is never owed.
-# A disabled subscription is still listed by Get-AzSubscription, so its entry
-# stays (-IncludeDisabled retries it). A listing that came back with warnings or
-# errors can leave out a subscription that is only hidden for now, so then no
-# entry is dropped, and the warnings and errors are printed.
-$DroppedGoneEntries = $false
-$KeptNotListedIds = @()
-if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
-{
-    $VisibleIds = @($AllSubscriptions | ForEach-Object { [string]$_.Id })
-    $GoneAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $VisibleIds -notcontains [string]$_.Id })
-    $ListingProblems = @(@($SubWarnings) + @($SubErrors) | Where-Object { $_ } | ForEach-Object {
-            $Text = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } elseif ($_ -is [System.Management.Automation.WarningRecord]) { $_.Message } else { [string]$_ }
-            # The first line, at most 300 characters: what to fix, not the whole record.
-            $Line = @(([string]$Text) -split "`r?`n" | Where-Object { $_.Trim() })[0]
-            if ($null -eq $Line) { $Line = '' }
-            if ($Line.Length -gt 300) { $Line = $Line.Substring(0, 300) + '...' }
-            $Line.Trim()
-        } | Where-Object { $_ } | Select-Object -Unique)
-    if ($GoneAttempts.Count -gt 0 -and $ListingProblems.Count -gt 0)
-    {
-        Write-Host ("Kept on the retry list: {0} subscription(s) not in the subscription list ({1}), because Get-AzSubscription returned warnings or errors, so the list may be incomplete:" -f $GoneAttempts.Count, (@($GoneAttempts | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', ')) -ForegroundColor Yellow
-        foreach ($Problem in @($ListingProblems | Select-Object -First 5)) { Write-Host ("  - {0}" -f $Problem) -ForegroundColor Yellow }
-        if ($ListingProblems.Count -gt 5) { Write-Host ("  - ... and {0} more" -f ($ListingProblems.Count - 5)) -ForegroundColor Yellow }
-        $KeptNotListedIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
-    }
-    elseif ($GoneAttempts.Count -gt 0)
-    {
-        foreach ($Gone in $GoneAttempts)
-        {
-            Write-Host ("Dropped from the retry list: {0} ({1}) is no longer visible to the signed-in identity, so no run can retry it." -f $Gone.Name, $Gone.Id) -ForegroundColor Yellow
-        }
-        $GoneIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
-        $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $GoneIds -notcontains [string]$_.Id })
-        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
-        $DroppedGoneEntries = $true
-    }
-}
-
 # $NothingLeftToCollect below). A subscription skipped because its check could
 # not finish, or because the two answers disagree, also stays on the retry list
 # (Add-RoleCheckRetryAttempts). Runs once in the parent, before
@@ -911,9 +916,6 @@ $AccessProbed = @()
 $AccessDecision = $null
 $ScopeForProbe = if ($Resume) { @($Subscriptions | Where-Object { -not ($CompletedIds -contains $_.Id) }) } else { @($Subscriptions) }
 if ($ScopeForProbe.Count -gt 0)
-        # Exit 2 while that list is not empty: work remains that this mode does
-        # not do, so the run is not reported as a success (a -Resume collects it).
-        $NotReachedIds = @()
 {
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $ScopeForProbe.Count) -ForegroundColor Cyan
     $AccessProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $ScopeForProbe -IncludeUsage:(-not $SkipConsumption))
@@ -934,8 +936,6 @@ if ($ScopeForProbe.Count -gt 0)
     if ($AccessDecision.ShouldBlock)
     {
         Exit-Wrapper -Code 1
-        # The retry list still holds them (the state is kept), so this is not a
-        # success: exit 2, as for any report the run could not produce.
     }
     if ($AccessDecision.Inaccessible.Count -gt 0)
     {
@@ -1024,10 +1024,10 @@ $ConcurrencySrc = if ($ConcurrencyAuto) { 'auto' } else { 'explicit' }
 Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundColor DarkGray
 # On -Resume with nothing left to collect (the role check skipped every
 # subscription left to check, and the others were completed by an earlier
-# run), use one stream: the sequential loop skips the completed subscriptions,
-# while the parallel streams and the one-subscription path would collect them
-# again. When this run clears the resume state, it also deletes the per-stream
-# state files an interrupted parallel run left (see the clean-up below).
+# run), use one stream: nothing is left to split across streams, and the
+# sequential loop skips and carries the completed subscriptions. When this run
+# clears the resume state, it also deletes the per-stream state files an
+# interrupted parallel run left (see the clean-up below).
 $NothingLeftToCollect = $Resume -and $null -ne $AccessDecision -and $AccessDecision.ReadableCount -eq 0 -and $AccessDecision.CompletedCount -gt 0
 if ($NothingLeftToCollect -and $ParallelStreams -gt 1)
 {
@@ -2235,7 +2235,10 @@ $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
 # clean run, so it says so instead.
 $ResumeStateClearTried = $false
 $CleanRun = $false
-if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
+# A consolidated zip that could not be built keeps the state too: the next
+# -Resume then skips the completed subscriptions and carries their reports
+# into a new zip instead of collecting them all again (exit 2 says why).
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $null -eq $BundleBuildError -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
     $ResumeStateClearTried = $true
     try
@@ -2758,7 +2761,7 @@ if ($null -ne $BundleBuildError)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0))
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode

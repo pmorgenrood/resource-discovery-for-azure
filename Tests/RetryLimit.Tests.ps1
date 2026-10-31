@@ -167,6 +167,8 @@ $Global:ResourceCount = 1
 
     $Start = $Params + $Prologue + $StartText + "`n" + $GateText + $RecordText + "`n"
     $script:SequentialBlock = [scriptblock]::Create($Start + ". " + $SeqText + $Tail)
+    # The same run, with a consolidated zip that could not be built.
+    $script:SequentialZipFailBlock = [scriptblock]::Create($Start + ". " + $SeqText + "`n`$BundleBuildError = 'stand-in: the consolidated zip could not be built'" + $Tail)
     $script:ParallelBlock = [scriptblock]::Create($Start + $JobShims + ". " + $ParText + $Tail)
     $script:InterruptedParallelBlock = [scriptblock]::Create($Start + $JobShims + $ParLaunchPrelude + ". {`n" + $ParLaunchText + "`n}" + "`n[pscustomobject]@{ Kind = 'run-result' }")
 
@@ -175,8 +177,8 @@ $Global:ResourceCount = 1
     # and the ids the stand-in was called for.
     function script:Invoke-Run
     {
-        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [int]$Streams = 1, [switch]$Interrupted, [switch]$Obfuscate)
-        $Block = if ($Interrupted) { $script:InterruptedParallelBlock } elseif ($Streams -gt 1) { $script:ParallelBlock } else { $script:SequentialBlock }
+        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [int]$Streams = 1, [switch]$Interrupted, [switch]$Obfuscate, [switch]$ZipFails)
+        $Block = if ($Interrupted) { $script:InterruptedParallelBlock } elseif ($Streams -gt 1) { $script:ParallelBlock } elseif ($ZipFails) { $script:SequentialZipFailBlock } else { $script:SequentialBlock }
         $Global:RdaRlCalls = @()
         $global:LASTEXITCODE = 0
         $Lines = [System.Collections.Generic.List[string]]::new()
@@ -286,7 +288,7 @@ Describe 'Retry limit on the sequential path' {
         [int](script:Get-Entry -Id 'sub-y').Attempts | Should -Be 2
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3 -Because 'a skipped run is not a failed run'
         $Run4.ExitCode | Should -BeNullOrEmpty
-        $Run4.Result.WrapperExitCode | Should -Be 2 -Because 'the report of Sub X, skipped for the retry limit, is missing from the consolidated zip'
+        $Run4.Result.WrapperExitCode | Should -Be 2 -Because 'Sub Y failed in this run, and a run with a failed subscription is not clean'
     }
 
     It '-ResumeFailedOnly with only skipped subscriptions left says nothing is left to retry, names them and exits 2' {
@@ -390,7 +392,7 @@ Describe 'Retry limit on the sequential path' {
         @(script:Get-Lines -Run $Run4 -Like 'Not retried:*') | Should -BeNullOrEmpty
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 4
         Test-Path -LiteralPath $script:State | Should -BeTrue -Because 'it failed again in this run'
-        $Run4.Result.WrapperExitCode | Should -Be 0
+        $Run4.Result.WrapperExitCode | Should -Be 2 -Because 'Sub X failed in this run'
         $Global:RdaRlFailIds = @()
         $Run5 = script:Invoke-Run -Subs $Subs
         @($Run5.Calls) | Should -Contain 'sub-x'
@@ -572,6 +574,32 @@ Describe 'Retry limit for a subscription whose run writes no report zip' {
         $Attempts | Should -Be @(1, 2, 3) -Because 'each run that writes no zip is one more failed run'
         @($Run4.Calls) | Should -Not -Contain 'sub-x'
         @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: the run wrote no report zip*').Count | Should -Be 1
+    }
+}
+
+Describe 'Resume state after a consolidated zip that could not be built' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    It 'is kept, so the next -Resume skips the completed subscriptions instead of collecting them all again' {
+        $Global:RdaRlFailIds = @('sub-x')
+        $Subs = @($script:A, $script:B, $script:X)
+        $null = script:Invoke-Run -Subs $Subs
+        $Global:RdaRlFailIds = @()
+        # Run 2 collects Sub X; everything is done, but the zip could not be built.
+        $R2 = script:Invoke-Run -Subs $Subs -Resume -ZipFails
+        @($R2.Calls) | Should -Be @('sub-x')
+        Test-Path -LiteralPath $script:State | Should -BeTrue -Because 'the completed records are what lets -Resume build the zip from the reports on disk'
+        @(script:Get-Lines -Run $R2 -Like 'Resume state cleared (clean run).') | Should -BeNullOrEmpty
+        # Run 3: nothing is collected again, and the state clears.
+        $R3 = script:Invoke-Run -Subs $Subs -Resume
+        @($R3.Calls) | Should -BeNullOrEmpty
+        @(script:Get-Lines -Run $R3 -Like 'Resume state cleared (clean run).').Count | Should -Be 1
+        Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 }
 
