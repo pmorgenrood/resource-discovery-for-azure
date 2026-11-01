@@ -210,6 +210,7 @@ exit 1
         $Info.RedirectStandardError = $true
         $Info.Environment['HOME'] = $script:CaseHome
         $Info.Environment['PSModulePath'] = $script:Modules
+        $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
         $Info.Environment['PATH'] = $script:Bin + [IO.Path]::PathSeparator + $env:PATH
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['RDA_STANDIN_HOLD'] = $Hold
