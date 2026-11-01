@@ -18,6 +18,9 @@
 #     tenant. A snapshot from another machine or with a name in another form
 #     is kept and named, with the command that removes it.
 #   - The consolidated zip and the -PackageZip bundle never hold a snapshot.
+#   - When a snapshot cannot be written, the run stops with exit 1, names
+#     -ParallelStreams 1 as the way to run without stream workers, and leaves
+#     no snapshot.
 # Each end-to-end case is followed by the next two runs.
 #
 # The end-to-end runs are Run-AllSubscriptions.ps1 itself, each started as its
@@ -93,7 +96,8 @@ $Global:ResourceCount = 1
     Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Value $StandInInner -Encoding utf8
 
     # --- Stand-in Azure. Save-AzContext writes a placeholder token cache in
-    # place, as the real cmdlet does. Import-AzContext, when
+    # place, as the real cmdlet does, and throws while a file named
+    # save-fails is in the run's home folder. Import-AzContext, when
     # RDA_STANDIN_HOLD_IMPORT is set, waits before it opens the file until the
     # test releases it, then records the path and mode of the file. Autosave
     # is on (CurrentUser) until Disable-AzContextAutosave turns it off for the
@@ -120,7 +124,12 @@ function Get-RdaStandInContext
 }
 function Get-AzContext { [CmdletBinding()] param() Get-RdaStandInContext }
 function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context, $Scope) Get-RdaStandInContext }
-function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) [System.IO.File]::WriteAllText($Path, '{"Contexts":{"placeholder":{"TokenCache":{"CacheData":"cGxhY2Vob2xkZXI="}}}}') }
+function Save-AzContext
+{
+    [CmdletBinding()] param($Path, [switch]$Force)
+    if (Test-Path -LiteralPath (Join-Path $HOME 'save-fails')) { throw 'stand-in: the context cannot be saved' }
+    [System.IO.File]::WriteAllText($Path, '{"Contexts":{"placeholder":{"TokenCache":{"CacheData":"cGxhY2Vob2xkZXI="}}}}')
+}
 function Import-AzContext
 {
     [CmdletBinding()] param($Path)
@@ -977,6 +986,25 @@ Start-Sleep -Seconds 600
         @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 2
         Test-Path -LiteralPath $State | Should -BeFalse -Because 'every subscription is collected, so the resume state is cleared'
         Write-Host ('cause fixed, -Resume: exit {0}, resume state left: {1}' -f $Fixed.ExitCode, (Test-Path -LiteralPath $State))
+        script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
+    }
+
+    It 'stops with exit 1 when a snapshot cannot be written, names -ParallelStreams 1 as the way out, and leaves no snapshot' {
+        # Without -ParallelStreams a host with enough vCPUs and memory still
+        # runs parallel streams, so only -ParallelStreams 1 avoids the stop.
+        $Marker = Join-Path $script:CaseHome 'save-fails'
+        Set-Content -LiteralPath $Marker -Value 'x'
+        $Result = script:Invoke-Wrapper -Streams 2
+        $Result.ExitCode | Should -Be 1 -Because ($Result.Text -join ' | ')
+        $At = [array]::IndexOf($Result.Text, 'ERROR: could not snapshot Az context for stream workers: stand-in: the context cannot be saved')
+        $At | Should -BeGreaterOrEqual 0 -Because ($Result.Text -join ' | ')
+        $Result.Text[$At + 1] | Should -Be 'Re-run with -ParallelStreams 1 to use the sequential code path.'
+        @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 0 -Because 'no stream started'
+        @(script:Get-Snapshot).Count | Should -Be 0 -Because 'the run deletes a file whose write failed'
+
+        # The next two runs, with the context saved as usual.
+        Remove-Item -LiteralPath $Marker -Force
+        script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the next run'
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
     }
 

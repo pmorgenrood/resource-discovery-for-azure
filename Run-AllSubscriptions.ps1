@@ -1892,7 +1892,7 @@ else
                 catch
                 {
                     Write-Host ("ERROR: could not snapshot Az context for stream workers: {0}" -f $_.Exception.Message) -ForegroundColor Red
-                    Write-Host "Re-run without -ParallelStreams to use the sequential code path." -ForegroundColor Yellow
+                    Write-Host "Re-run with -ParallelStreams 1 to use the sequential code path." -ForegroundColor Yellow
                     Exit-Wrapper -Code 1
                 }
                 $SnapshotContent = $Snapshot.Content
