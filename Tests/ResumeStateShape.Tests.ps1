@@ -710,7 +710,8 @@ Describe 'Move-WrongShapeResumeStateFile' {
         @($Lines | Where-Object { $_ -like "  Remove-Item -LiteralPath '*' -Force" }) | Should -Be @($Files | ForEach-Object { "  Remove-Item -LiteralPath '{0}' -Force" -f $_.Path })
     }
 
-    It 'after the collection, a file that cannot be moved aside is left as it is and returned, with a notice, and the run is not stopped yet' {
+    # chmod makes the folder read-only here; Windows has no chmod.
+    It 'after the collection, a file that cannot be moved aside is left as it is and returned, with a notice, and the run is not stopped yet' -Skip:$IsWindows {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
         $Path = Join-Path $script:Dir '.resume-state-t-stream-5.json'
         Set-Content -LiteralPath $Path -Value '{"Completed":5}'
@@ -729,7 +730,8 @@ Describe 'Move-WrongShapeResumeStateFile' {
         Get-Content -LiteralPath $Path -Raw | Should -BeLike '*"Completed":5*'
     }
 
-    It 'quotes a path holding a single quote in the remove command, and the command removes the file' {
+    # chmod makes the folder read-only here; Windows has no chmod.
+    It 'quotes a path holding a single quote in the remove command, and the command removes the file' -Skip:$IsWindows {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
         $Odd = Join-Path $script:Dir "it's here"
         New-Item -ItemType Directory -Path $Odd | Out-Null
