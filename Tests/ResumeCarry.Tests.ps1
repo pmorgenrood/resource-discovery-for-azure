@@ -25,6 +25,13 @@ BeforeAll {
     . (Join-Path $script:RepoRoot 'Functions/AllSubHtmlSummary.Functions.ps1')
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+    # Stand-ins for the Az.Accounts commands the stream worker calls, which the
+    # tests below mock. Without them, Mock resolves the installed module's
+    # commands, which imports Az.Accounts, and that import looks up
+    # management.azure.com.
+    function script:Disable-AzContextAutosave { [CmdletBinding()] param([string]$Scope) }
+    function script:Import-AzContext { [CmdletBinding()] param([string]$Path) }
+
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { '/tmp' }
     $script:TestBase = Join-Path $TmpBase ('ResumeCarryTest_' + [guid]::NewGuid().ToString().Substring(0, 8))
     New-Item -ItemType Directory -Path $script:TestBase -Force | Out-Null
