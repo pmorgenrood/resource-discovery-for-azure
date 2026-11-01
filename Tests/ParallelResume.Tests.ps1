@@ -1657,15 +1657,16 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
         # Each failed write names the folder and the command that removes it.
         $Folder = @($R1.Text | Where-Object { $_ -like 'WARNING: * is a folder with content*' } | Sort-Object -Unique)
-        $Folder | Should -Be @(("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: rm -r '{0}'" -f ($script:State + '.tmp')))
+        $Folder | Should -Be @(("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: Remove-Item -LiteralPath '{1}' -Recurse -Force" -f ($script:State + '.tmp'), ($script:State + '.tmp').Replace("'", "''")))
         # The folder is left as it was.
         Test-Path -LiteralPath (Join-Path ($script:State + '.tmp') 'kept') -PathType Leaf | Should -BeTrue
         script:Test-CleanLine $R1 | Should -BeFalse
 
-        # Once the folder is gone, -Fresh (the next step the warning names)
-        # writes the state and ends clean; the next -Resume finds no state.
-        Get-ChildItem -LiteralPath ($script:State + '.tmp') -Force | Remove-Item -Force
-        Remove-Item -LiteralPath ($script:State + '.tmp') -Force
+        # The printed command removes the folder. Then -Fresh (the next step the
+        # warning names) writes the state and ends clean; the next -Resume finds
+        # no state.
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command ($Folder[0].Substring($Folder[0].IndexOf(', then remove it: ') + ', then remove it: '.Length))
+        Test-Path -LiteralPath ($script:State + '.tmp') | Should -BeFalse
         $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
         $R2.Error | Should -BeNullOrEmpty
@@ -2174,7 +2175,7 @@ Describe 'The per-stream and resume state helpers' {
         $Summary | Should -Be @('Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-4.json could not be read and was left in place (it could not be moved aside); its records were not used.')
     }
 
-    It 'Remove-ResumeStateTempPath leaves a folder with content, and the command it prints removes it from a path holding a single quote' {
+    It 'Remove-ResumeStateTempPath leaves a folder with content, and the PowerShell command it prints removes it from a path holding a single quote' {
         $Folder = Join-Path (Join-Path $script:UnitDir "it's here") '.resume-state-t.json.tmp'
         New-Item -ItemType Directory -Path $Folder -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Folder 'kept') -Value 'x' -Encoding utf8
@@ -2183,16 +2184,9 @@ Describe 'The per-stream and resume state helpers' {
         Test-Path -LiteralPath (Join-Path $Folder 'kept') -PathType Leaf | Should -BeTrue
         $Lines[0] | Should -BeLike ('WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: *' -f $Folder)
         $Command = $Lines[0].Substring($Lines[0].IndexOf(', then remove it: ') + ', then remove it: '.Length)
-        if ($IsWindows)
-        {
-            $Command | Should -Be ("Remove-Item -LiteralPath '{0}' -Recurse" -f $Folder.Replace("'", "''"))
-            & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Command
-        }
-        else
-        {
-            $Command | Should -Be ("rm -r '{0}'" -f $Folder.Replace("'", "'\''"))
-            & /bin/sh -c $Command
-        }
+        # The same PowerShell command on every OS, for the session the tool runs in.
+        $Command | Should -Be ("Remove-Item -LiteralPath '{0}' -Recurse -Force" -f $Folder.Replace("'", "''"))
+        & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Command
         Test-Path -LiteralPath $Folder | Should -BeFalse
         Test-Path -LiteralPath (Split-Path -Path $Folder -Parent) -PathType Container | Should -BeTrue
     }

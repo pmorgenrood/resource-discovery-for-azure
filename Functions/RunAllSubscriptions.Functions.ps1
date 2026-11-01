@@ -838,11 +838,12 @@ function Remove-ResumeStateTempPath
     }
     catch
     {
-        # Quoted so the command also works on a path holding a quote: doubled
-        # for PowerShell, as in the stop's remove command (Stop-WrongShapeStateNotMoved),
-        # and closed, escaped and reopened ('\'') for sh, where doubling it
-        # would name another path.
-        $Command = if ($IsWindows) { "Remove-Item -LiteralPath '{0}' -Recurse" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path) } else { "rm -r '{0}'" -f $Path.Replace("'", "'\''") }
+        # The same PowerShell command on every OS, as the stop's remove command
+        # (Stop-WrongShapeStateNotMoved): it is pasted into the PowerShell
+        # session the tool runs in. A quote in the path is doubled. -Force
+        # because on Linux and macOS PowerShell treats a name that starts with a
+        # dot as hidden and does not remove it without -Force.
+        $Command = "Remove-Item -LiteralPath '{0}' -Recurse -Force" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path)
         Write-Host ("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: {1}" -f $Path, $Command) -ForegroundColor Yellow
     }
 }
