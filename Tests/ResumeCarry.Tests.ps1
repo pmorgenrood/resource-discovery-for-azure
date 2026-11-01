@@ -548,11 +548,11 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $FailInner = $Parts[0] + "`nif (@(`$Global:RdaCarryTestFailIds) -contains `$SubscriptionID) { throw 'stand-in failure for this subscription' }`n" + $NoZipLine + $Parts[1]
         Set-Content -LiteralPath (Join-Path $script:FailRoot 'ResourceInventory.ps1') -Value $FailInner -Encoding utf8
 
-        # The sequential catch writes its failure log under $HOME/InventoryReports;
-        # point that at a scratch folder.
+        # The sequential catch writes its failure log under $HOME/InventoryReports
+        # (C:\InventoryReports on Windows); point that at a scratch folder.
         $Global:RdaCarryTestHome = Join-Path $script:TestBase 'home'
         New-Item -ItemType Directory -Path $Global:RdaCarryTestHome -Force | Out-Null
-        $script:SeqBlock = [scriptblock]::Create(($script:SequentialBlock.ToString() -replace '\$HOME\b', '$Global:RdaCarryTestHome'))
+        $script:SeqBlock = [scriptblock]::Create((($script:SequentialBlock.ToString() -replace '\$HOME\b', '$Global:RdaCarryTestHome') -replace '"C:\\InventoryReports"', '"$Global:RdaCarryTestHome/InventoryReports"'))
 
         # The one-subscription fallback of the parallel path, lifted as written.
         $Tokens = $null
