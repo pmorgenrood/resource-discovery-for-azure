@@ -2764,15 +2764,16 @@ if ($FailedSubscriptions.Count -gt 0)
         Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Red
     }
 }
-elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)
+elseif ((@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimited.Count) -gt 0)
 {
     # No subscription failed this run, but the retry list is not empty: entries
     # from a prior run that were not retried, subscriptions this run's role check
     # skipped for a cause that can pass on a later run, or subscriptions whose
     # metrics or consumption this run left incomplete. Surface them so the
     # operator does not lose track of them simply because no subscription failed
-    # outright.
-    Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $FailedAttempts.Count) -ForegroundColor Yellow
+    # outright. The entries past the retry limit are named below instead;
+    # -ResumeFailedOnly does not retry them.
+    Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f (@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimited.Count)) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
     Write-NotCountedRetrySummary -FailedAttempts $FailedAttempts
