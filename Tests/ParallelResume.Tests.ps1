@@ -647,6 +647,30 @@ Describe 'Parallel -Resume collects only what no earlier run completed' -Skip:$I
         script:Read-State | Should -BeNullOrEmpty
     }
 
+    It 'on a -Resume whose stream files list earlier completions, each stream''s end line counts only its slice, and the next run''s lines too' {
+        # Streams 0 and 1 of the interrupted run list Sub A and Sub B as completed;
+        # the -Resume gives stream 0 Sub D and Sub F, and stream 1 Sub E.
+        script:Invoke-InterruptedThreeStreamRun
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'D', 'E', 'F')
+        @($R1.Text | Where-Object { $_ -match '^\[stream-\d+\] complete: ' } | Sort-Object) | Should -Be @(
+            '[stream-0] complete: 2/2 succeeded, 0 failed',
+            '[stream-1] complete: 1/1 succeeded, 0 failed'
+        )
+        script:Test-CleanLine $R1 | Should -BeTrue
+
+        # Run 2 finds no state: three subscriptions in each slice.
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 2
+        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        @($R2.Text | Where-Object { $_ -match '^\[stream-\d+\] complete: ' } | Sort-Object) | Should -Be @(
+            '[stream-0] complete: 3/3 succeeded, 0 failed',
+            '[stream-1] complete: 3/3 succeeded, 0 failed'
+        )
+        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Read-State | Should -BeNullOrEmpty
+    }
+
     It 'on the one-subscription path, which collects a completed subscription no more' {
         # Interrupted 2-stream run: A completes, B hangs.
         script:Set-Scenario -Subs 'A', 'B' -Hang 'B'
@@ -2019,6 +2043,14 @@ Describe 'The per-stream and resume state helpers' {
         Test-StreamStateRunId -State $Without -RunId '' | Should -BeTrue
         Test-StreamStateRunId -State $Without -RunId 'x' | Should -BeFalse
         Test-StreamStateRunId -State $null -RunId '' | Should -BeFalse
+        # Only a text RunId is compared: the number 5 is not the run id '5'. A
+        # null RunId reads as none.
+        $Numeric = '{"Tenant":"t","StreamId":"0","RunId":5,"Completed":["sub-a"],"FailedAttempts":[]}' | ConvertFrom-Json
+        Test-StreamStateRunId -State $Numeric -RunId '5' | Should -BeFalse
+        Test-StreamStateRunId -State $Numeric -RunId '' | Should -BeFalse
+        $NullId = '{"Tenant":"t","StreamId":"0","RunId":null,"Completed":["sub-a"],"FailedAttempts":[]}' | ConvertFrom-Json
+        Test-StreamStateRunId -State $NullId -RunId '' | Should -BeTrue
+        Test-StreamStateRunId -State $NullId -RunId 'x' | Should -BeFalse
         # The start-of-run write keeps every other key of the file, and writes a
         # bare state when there is none or it is for another tenant.
         '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"FailedAttempts":[],"Extra":[{"Id":"sub-a","Zip":"r.zip"}]}' | Set-Content -LiteralPath $Path -Encoding utf8
@@ -2098,18 +2130,40 @@ Describe 'The per-stream and resume state helpers' {
         @(Get-StreamStateRecordIds -State ('{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[]}' | ConvertFrom-Json)) | Should -BeNullOrEmpty
     }
 
+    It 'adds -2 to the name when it is taken, and -3 when that is taken too; the files already there are kept' {
+        $Path = Join-Path $script:UnitDir '.resume-state-t-stream-7.json'
+        $Base = '.resume-state-t-stream-7.json.unreadable-20260102-030405'
+        Set-Content -LiteralPath (Join-Path $script:UnitDir $Base) -Value 'an earlier one' -Encoding utf8
+        Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
+        $Now = ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime()
+        $Out = @(Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now $Now 6>&1)
+        $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
+        $Result.MovedTo | Should -Be ($Base + '-2')
+        $Result.NotMoved | Should -BeFalse
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -BeLike ('* It was moved aside to {0}-2.' -f $Base)
+        # A second unreadable file of the same stream in the same second.
+        Set-Content -LiteralPath $Path -Value '{"Tenant"' -Encoding utf8
+        (Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now $Now 6>$null).MovedTo | Should -Be ($Base + '-3')
+        Get-Content -LiteralPath (Join-Path $script:UnitDir $Base) -Raw | Should -Be ('an earlier one' + [Environment]::NewLine)
+        Get-Content -LiteralPath (Join-Path $script:UnitDir ($Base + '-2')) -Raw | Should -Be ('{' + [Environment]::NewLine)
+        Get-Content -LiteralPath (Join-Path $script:UnitDir ($Base + '-3')) -Raw | Should -Be ('{"Tenant"' + [Environment]::NewLine)
+        Test-Path -LiteralPath $Path | Should -BeFalse
+    }
+
     It 'leaves the file in place and returns it for the stop when it cannot be renamed' {
         $Path = Join-Path $script:UnitDir '.resume-state-t-stream-4.json'
         Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
-        # A folder already has the new name, so the rename fails.
-        New-Item -ItemType Directory -Path (Join-Path $script:UnitDir '.resume-state-t-stream-4.json.unreadable-20260102-030405') -Force | Out-Null
+        # The new name and -2 to -100 are all taken, so the rename fails.
+        $Base = '.resume-state-t-stream-4.json.unreadable-20260102-030405'
+        New-Item -ItemType Directory -Path (Join-Path $script:UnitDir $Base) -Force | Out-Null
+        foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:UnitDir ('{0}-{1}' -f $Base, $N)) -Force | Out-Null }
         # At startup it prints nothing: the wrapper stops with exit 1 and names it.
         $Out = Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime() 6>&1
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
         $Result.MovedTo | Should -BeNullOrEmpty
         $Result.NotMoved | Should -BeTrue
         $Result.Path | Should -Be $Path
-        $Result.Reason | Should -Not -BeNullOrEmpty
+        $Result.Reason | Should -Be ('every name from {0} to {0}-100 is taken' -f $Base)
         Test-Path -LiteralPath $Path | Should -BeTrue
         @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) | Should -BeNullOrEmpty
         # At the end of a run it names the file and says the run ends with the stop.
@@ -2118,6 +2172,29 @@ Describe 'The per-stream and resume state helpers' {
         $End[1] | Should -BeLike '*ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end.'
         $Summary = @(Write-UnreadableStreamStateSummary -Unreadable @($Result) -StateKept $true 6>&1 | ForEach-Object { [string]$_ })
         $Summary | Should -Be @('Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-4.json could not be read and was left in place (it could not be moved aside); its records were not used.')
+    }
+
+    It 'Remove-ResumeStateTempPath leaves a folder with content, and the command it prints removes it from a path holding a single quote' {
+        $Folder = Join-Path (Join-Path $script:UnitDir "it's here") '.resume-state-t.json.tmp'
+        New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Folder 'kept') -Value 'x' -Encoding utf8
+        $Lines = @(Remove-ResumeStateTempPath -Path $Folder 6>&1 | ForEach-Object { [string]$_ })
+        $Lines.Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $Folder 'kept') -PathType Leaf | Should -BeTrue
+        $Lines[0] | Should -BeLike ('WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: *' -f $Folder)
+        $Command = $Lines[0].Substring($Lines[0].IndexOf(', then remove it: ') + ', then remove it: '.Length)
+        if ($IsWindows)
+        {
+            $Command | Should -Be ("Remove-Item -LiteralPath '{0}' -Recurse" -f $Folder.Replace("'", "''"))
+            & $script:Pwsh -NoLogo -NoProfile -NonInteractive -Command $Command
+        }
+        else
+        {
+            $Command | Should -Be ("rm -r '{0}'" -f $Folder.Replace("'", "'\''"))
+            & /bin/sh -c $Command
+        }
+        Test-Path -LiteralPath $Folder | Should -BeFalse
+        Test-Path -LiteralPath (Split-Path -Path $Folder -Parent) -PathType Container | Should -BeTrue
     }
 }
 

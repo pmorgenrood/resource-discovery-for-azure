@@ -446,6 +446,9 @@ function Resolve-TenantId
 #   - The record is a JSON object.
 #   - Main: TenantID is text, and CompletedSubscriptionIds is a list of text
 #     ids. Stream: Completed is a list of text ids.
+#   - RunId, when the record has one, is text: it is compared as text with the
+#     run's id (Test-StreamStateRunId), so a number 5 must not match the text
+#     '5'. A null RunId reads as none, like a record without the key.
 #   - FailedAttempts (the retry list) is a list. Each entry is an object with a
 #     non-empty text Id and LastFailedAt a date, the values Add-FailedAttempt
 #     and Merge-FailedAttempts convert (a missing or unreadable Attempts counts
@@ -469,6 +472,8 @@ function Get-ResumeStateShapeProblem
     if ($null -eq $Record) { return $null }
     if ($Record -isnot [System.Management.Automation.PSCustomObject]) { return 'it is not a JSON object' }
     if ($Kind -eq 'Main' -and $Record.TenantID -isnot [string]) { return 'TenantID is not text' }
+    $RunIdProp = $Record.PSObject.Properties['RunId']
+    if ($null -ne $RunIdProp -and $null -ne $RunIdProp.Value -and $RunIdProp.Value -isnot [string]) { return 'RunId is not text' }
     $IdsKey = if ($Kind -eq 'Main') { 'CompletedSubscriptionIds' } else { 'Completed' }
     if ($null -eq $Record.PSObject.Properties[$IdsKey]) { return ('{0} is missing' -f $IdsKey) }
     if ($null -ne $Record.$IdsKey -and $Record.$IdsKey -isnot [array]) { return ('{0} is not a list' -f $IdsKey) }
@@ -833,7 +838,11 @@ function Remove-ResumeStateTempPath
     }
     catch
     {
-        $Command = if ($IsWindows) { "Remove-Item -LiteralPath '{0}' -Recurse" -f $Path } else { "rm -r '{0}'" -f $Path }
+        # Quoted so the command also works on a path holding a quote: doubled
+        # for PowerShell, as in the stop's remove command (Stop-WrongShapeStateNotMoved),
+        # and closed, escaped and reopened ('\'') for sh, where doubling it
+        # would name another path.
+        $Command = if ($IsWindows) { "Remove-Item -LiteralPath '{0}' -Recurse" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path) } else { "rm -r '{0}'" -f $Path.Replace("'", "'\''") }
         Write-Host ("WARNING: {0} is a folder with content, so no write of the resume state can succeed while it is there. Check what it holds, then remove it: {1}" -f $Path, $Command) -ForegroundColor Yellow
     }
 }
@@ -1794,7 +1803,11 @@ function Test-StreamStateRunId
     param([object]$State, [string]$RunId)
     if ($null -eq $State) { return $false }
     $Prop = $State.PSObject.Properties['RunId']
-    $FileRunId = if ($null -eq $Prop) { '' } else { [string]$Prop.Value }
+    # A RunId that is not text belongs to no run: [string] of the number 5
+    # would match a run id '5' (Get-ResumeStateShapeProblem also rejects it).
+    if ($null -eq $Prop -or $null -eq $Prop.Value) { $FileRunId = '' }
+    elseif ($Prop.Value -is [string]) { $FileRunId = $Prop.Value }
+    else { return $false }
     return ($FileRunId -eq [string]$RunId)
 }
 
@@ -1910,8 +1923,9 @@ function Read-StreamResumeStateFile
 # completed: at startup a -Resume run collects them again, and under
 # -ResumeFailedOnly a later -Resume does; after the end-of-run merge a later
 # -Resume collects them. The file is renamed in place to
-# <name>.unreadable-<UTC time> and kept for inspection: that name ends neither
-# in '.json' nor matches Get-StreamResumeStateFiles, so no later run reads it
+# <name>.unreadable-<UTC time>, with -2, -3 and so on added when that name is
+# taken, and kept for inspection: that name ends neither in '.json' nor
+# matches Get-StreamResumeStateFiles, so no later run reads it
 # and no zip step that picks files by '*.json' takes it. Prints a warning
 # naming the file, never its content. Returns { Kind; Name; MovedTo; Path;
 # Problem; Reason; NotMoved; Unreadable }.
@@ -1932,7 +1946,17 @@ function Move-UnreadableStreamStateFile
         # Found by the end-of-run merge of a parallel run, after collection.
         [switch]$AtRunEnd
     )
-    $MovedTo = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
+    $Base = '{0}.unreadable-{1}' -f $File.Name, $Now.ToString('yyyyMMdd-HHmmss')
+    # As in Move-WrongShapeResumeStateFile: a second move in the same second, or
+    # a name an earlier run left, must not make the rename fail. Up to 100 names
+    # are tried.
+    $MovedTo = $Base
+    $N = 1
+    while ($null -ne $MovedTo -and (Test-Path -LiteralPath (Join-Path $File.DirectoryName $MovedTo)))
+    {
+        $N++
+        $MovedTo = if ($N -le 100) { '{0}-{1}' -f $Base, $N } else { $null }
+    }
     if ($AtRunEnd)
     {
         $Lead = 'WARNING: The per-stream state file {0} could not be read, so its records are not used: the subscriptions it lists are not counted as completed, and a later -Resume collects them again.' -f $File.Name
@@ -1944,6 +1968,7 @@ function Move-UnreadableStreamStateFile
     }
     try
     {
+        if ($null -eq $MovedTo) { throw ('every name from {0} to {0}-100 is taken' -f $Base) }
         Rename-Item -LiteralPath $File.FullName -NewName $MovedTo -ErrorAction Stop
         Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
     }

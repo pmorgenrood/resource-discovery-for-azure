@@ -444,6 +444,15 @@ Describe 'Get-ResumeStateShapeProblem: records as the wrapper and the stream wor
         Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record '{"TenantID":"t","CompletedSubscriptionIds":["sub-a"],"LastUpdated":"2026-05-15T00:00:00Z"}') -Kind Main | Should -BeNullOrEmpty
     }
 
+    It 'a RunId that is <Label> has the right shape (<Kind>)' -TestCases @(
+        @{ Kind = 'Main'; Label = 'text'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"RunId":"run-a"}' },
+        @{ Kind = 'Stream'; Label = 'text'; Json = '{"RunId":"run-a","Completed":[],"FailedAttempts":[]}' },
+        @{ Kind = 'Stream'; Label = 'empty text (a stream of a run without an id)'; Json = '{"RunId":"","Completed":[],"FailedAttempts":[]}' },
+        @{ Kind = 'Stream'; Label = 'null'; Json = '{"RunId":null,"Completed":[],"FailedAttempts":[]}' }
+    ) {
+        Get-ResumeStateShapeProblem -Record (script:ConvertTo-Record $Json) -Kind $Kind | Should -BeNullOrEmpty
+    }
+
     It 'a per-stream state file as the stream worker writes it has the right shape (<Label>)' -TestCases @(
         @{ Label = 'completed and failed'; Completed = @('sub-a'); Failed = 'sub-b' },
         @{ Label = 'nothing completed yet'; Completed = @(); Failed = '' },
@@ -542,6 +551,9 @@ Describe 'Get-ResumeStateShapeProblem: wrong shapes are named by their field' {
         @{ Kind = 'Stream'; Label = 'a number'; Json = '5'; Expected = 'it is not a JSON object' },
         @{ Kind = 'Main'; Label = 'without TenantID'; Json = '{"CompletedSubscriptionIds":[]}'; Expected = 'TenantID is not text' },
         @{ Kind = 'Main'; Label = 'with a number for TenantID'; Json = '{"TenantID":5,"CompletedSubscriptionIds":[]}'; Expected = 'TenantID is not text' },
+        @{ Kind = 'Main'; Label = 'with a number for RunId'; Json = '{"TenantID":"t","CompletedSubscriptionIds":[],"RunId":5}'; Expected = 'RunId is not text' },
+        @{ Kind = 'Stream'; Label = 'with a number for RunId'; Json = '{"RunId":5,"Completed":[],"FailedAttempts":[]}'; Expected = 'RunId is not text' },
+        @{ Kind = 'Stream'; Label = 'with a list for RunId'; Json = '{"RunId":["run-a"],"Completed":[],"FailedAttempts":[]}'; Expected = 'RunId is not text' },
         @{ Kind = 'Main'; Label = 'without CompletedSubscriptionIds'; Json = '{"TenantID":"t"}'; Expected = 'CompletedSubscriptionIds is missing' },
         @{ Kind = 'Main'; Label = 'with a text for CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"sub-a"}'; Expected = 'CompletedSubscriptionIds is not a list' },
         @{ Kind = 'Main'; Label = 'with a number in CompletedSubscriptionIds'; Json = '{"TenantID":"t","CompletedSubscriptionIds":["sub-a",5]}'; Expected = 'CompletedSubscriptionIds holds an entry that is not a text id' },
@@ -1544,13 +1556,52 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
     }
 }
 
-# With the parallel -Resume change, every run without -Resume or
-# -ResumeFailedOnly writes a run id into the resume state file, and a run that
-# ends clean removes the per-stream files of other runs.
+# Every run without -Resume or -ResumeFailedOnly writes a run id into the
+# resume state file, and a run that ends clean removes the per-stream files of
+# other runs.
 Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindows {
     BeforeEach {
         script:New-Case
         $script:Stream1Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+    }
+
+    # A RunId is compared as text: the number 5 in a per-stream file must not
+    # match the text '5' of the run it is read by.
+    It 'a per-stream file whose RunId is the number 5, beside a resume state file whose RunId is the text 5: -Resume with <Streams> stream(s) moves it aside and collects its subscription again; the next two runs end clean' -ForEach @(
+        @{ Streams = 1 },
+        @{ Streams = 2 }
+    ) {
+        script:Set-Scenario
+        script:Write-RawText -Path $script:State -Text ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": [], "FailedAttempts": [], "RunId": "5"}')
+        $Seeded = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", "RunId": 5, "Completed": ["sub-a"], "FailedAttempts": []}')
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        $R1.ExitCode | Should -Be 0
+        $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:Stream0Name -Field 'RunId is not text' -Content $Seeded
+        @($R1.Text | Where-Object { $_ -like 'Recovered per-stream state*' -or $_ -like 'Skipping (already completed)*' }) | Should -BeNullOrEmpty
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        foreach ($N in 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+            script:Assert-NextRunClean -Run $R -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
+        }
+    }
+
+    It 'a resume state file whose RunId is the number 5: -Resume moves it aside, starts fresh and collects every subscription; the next two runs end clean' {
+        script:Set-Scenario
+        script:Write-RawText -Path $script:State -Text ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": ["sub-a"], "FailedAttempts": [], "RunId": 5}')
+        $Seeded = Get-Content -LiteralPath $script:State -Raw
+        $R1 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R1.ExitCode | Should -Be 0
+        $Moved = script:Assert-MovedAside -Run $R1 -FileName $script:StateName -Field 'RunId is not text' -Content $Seeded
+        $R1.Text | Should -Contain '  Starting fresh: this run does not use the completed list or retry list of the resume state file moved aside above.'
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        foreach ($N in 2, 3)
+        {
+            $R = script:Invoke-Wrapper -Arguments '-Resume'
+            script:Assert-NextRunClean -Run $R -Moved $Moved -Content $Seeded -Collected 'A', 'B', 'C'
+        }
     }
 
     It 'a one-stream run without either switch leaves a wrong-shaped per-stream file (<Label>) as it is on two runs: not removed or named as another run''s; a -Resume then moves it aside' -ForEach @(

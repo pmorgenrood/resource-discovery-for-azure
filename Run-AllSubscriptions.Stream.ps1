@@ -487,5 +487,8 @@ catch
     exit 1
 }
 
-Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $Completed.Count, $PairCount, $FailedSubs.Count) 'Green'
+# Count only this slice's subscriptions, as the resume line above does: on
+# -Resume the state file can list completions of earlier slices too.
+$SucceededInSlice = @($Completed | Where-Object { $SubscriptionIds -contains $_ }).Count
+Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $SucceededInSlice, $PairCount, $FailedSubs.Count) 'Green'
 exit 0
