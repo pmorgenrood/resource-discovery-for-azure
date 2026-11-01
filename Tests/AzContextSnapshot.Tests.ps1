@@ -31,7 +31,18 @@
 # so the end-to-end tests and the mode checks do not run there; the Windows
 # access-list check is tested on its rules only.
 #
+# One case loads the installed Az.Accounts and turns its autosave setting on
+# and off for the CurrentUser scope of a scratch home folder. Loading the real
+# module can reach the network, so that case is skipped unless
+# RDA_TEST_REAL_AZ_ACCOUNTS=1 is set. It is always skipped on Windows, where
+# Az.Accounts ignores the HOME and USERPROFILE redirect and would change the
+# Az profile of the user running the tests. Elsewhere it first checks that
+# Az.Accounts puts the CurrentUser files in the scratch home folder, and
+# changes nothing if it does not.
+#
 # Run with: Invoke-Pester ./Tests/AzContextSnapshot.Tests.ps1 -Output Detailed
+# With the real Az.Accounts case (Linux and macOS):
+#   $env:RDA_TEST_REAL_AZ_ACCOUNTS = '1'; Invoke-Pester ./Tests/AzContextSnapshot.Tests.ps1 -Output Detailed
 
 BeforeAll {
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
@@ -245,6 +256,7 @@ exit 1
         $Info.RedirectStandardError = $true
         $Info.Environment['HOME'] = $script:CaseHome
         $Info.Environment['PSModulePath'] = $script:Modules
+        $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
         $Info.Environment['PATH'] = $script:Bin + [IO.Path]::PathSeparator + $env:PATH
         $Info.Environment['RDA_STANDIN_AZURE'] = $Scenario
         $Info.Environment['RDA_STANDIN_HOLD_IMPORT'] = $(if ($HoldImport) { '1' } else { '' })
@@ -559,6 +571,16 @@ Describe 'Az context snapshot names, owners and files' {
     }
 
     It 'reads the real Az.Accounts autosave setting right, with autosave on for the user and with it off' {
+        if ($IsWindows)
+        {
+            Set-ItResult -Skipped -Because 'on Windows Az.Accounts ignores the HOME and USERPROFILE redirect, so this case would change the Az autosave setting of the user running the tests'
+            return
+        }
+        if ($env:RDA_TEST_REAL_AZ_ACCOUNTS -ne '1')
+        {
+            Set-ItResult -Skipped -Because 'it loads the installed Az.Accounts, which can reach the network; set RDA_TEST_REAL_AZ_ACCOUNTS=1 to run it'
+            return
+        }
         $Real = @(Get-Module -ListAvailable -Name Az.Accounts | Where-Object { $_.Version -lt [version]'99.0' })
         if ($Real.Count -eq 0)
         {
@@ -568,9 +590,13 @@ Describe 'Az context snapshot names, owners and files' {
         $UserHome = Join-Path $script:CaseHome 'az-home'
         New-Item -ItemType Directory -Path $UserHome -Force | Out-Null
         $Functions = Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1'
+        # The probe changes the CurrentUser autosave setting only after Az.Accounts
+        # reports its CurrentUser files inside the scratch home; otherwise it
+        # prints 'outside=' and changes nothing.
+        $InHome = "`$Home_ = [IO.Path]::GetFullPath(`$env:HOME).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar; `$User = Get-AzContextAutosaveSetting -Scope CurrentUser; foreach (`$Dir in @(`$User.ContextDirectory, `$User.CacheDirectory)) { if (-not `$Dir -or -not ([IO.Path]::GetFullPath(`$Dir) + [IO.Path]::DirectorySeparatorChar).StartsWith(`$Home_, [StringComparison]::Ordinal)) { 'outside=' + `$Dir; exit 1 } }"
         $Probe = {
             param([string]$Before)
-            $Script = ". '{0}'; Import-Module Az.Accounts -ErrorAction Stop; {1}; 'before=' + (Get-AzContextAutosaveCheck).Disabled; Disable-AzContextAutosave -Scope Process | Out-Null; 'after=' + (Get-AzContextAutosaveCheck).Disabled" -f $Functions.Replace("'", "''"), $Before
+            $Script = ". '{0}'; Import-Module Az.Accounts -ErrorAction Stop; {1}; {2}; 'before=' + (Get-AzContextAutosaveCheck).Disabled; Disable-AzContextAutosave -Scope Process | Out-Null; 'after=' + (Get-AzContextAutosaveCheck).Disabled" -f $Functions.Replace("'", "''"), $InHome, $Before
             $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
             foreach ($Arg in @('-NoProfile', '-NonInteractive', '-Command', $Script)) { $Info.ArgumentList.Add($Arg) }
             $Info.UseShellExecute = $false
@@ -578,11 +604,12 @@ Describe 'Az context snapshot names, owners and files' {
             $Info.RedirectStandardOutput = $true
             $Info.Environment['HOME'] = $UserHome
             $Info.Environment['USERPROFILE'] = $UserHome
+            $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
             $Proc = [System.Diagnostics.Process]::Start($Info)
             $Proc.StandardInput.Close()
             $Out = $Proc.StandardOutput.ReadToEnd()
             $null = $Proc.WaitForExit(120000)
-            @($Out -split "`r?`n" | Where-Object { $_ -match '^(before|after)=' })
+            @($Out -split "`r?`n" | Where-Object { $_ -match '^(before|after|outside)=' })
         }
         & $Probe 'Enable-AzContextAutosave -Scope CurrentUser | Out-Null' | Should -Be @('before=False', 'after=True') -Because 'autosave on for the user: only the Process-scope switch turns it off'
         & $Probe 'Disable-AzContextAutosave -Scope CurrentUser | Out-Null' | Should -Be @('before=True', 'after=True') -Because 'autosave already off for the user'
