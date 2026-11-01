@@ -968,3 +968,48 @@ Describe 'A resume state that lists exactly one completed subscription' {
         $Next.Result.WrapperExitCode | Should -Be 0
     }
 }
+
+Describe 'A subscription past the retry limit that the access check finds not readable' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    # The access check here could not finish for Sub X. One with no read role is
+    # taken off the retry list by the check instead (not this case).
+    It 'keeps its entry, exits 2 under -AllowPartialAccess with advice that names the access problem, and the run after access is fixed collects it (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlFailIds = @('sub-x')
+        $Subs = @($script:A, $script:X)
+        $null = script:Invoke-Run -Subs $Subs
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
+        $Global:RdaRlFailIds = @()
+        $Global:RdaRlUnreadableIds = @('sub-x')
+        $Global:RdaRlAllowPartialAccess = $true
+
+        # The run the advice names, without -Resume: the access check skips Sub X.
+        $R = script:Invoke-Run -Subs $Subs -Streams $Streams
+        @($R.Calls) | Should -Not -Contain 'sub-x'
+        @($R.Calls) | Should -Contain 'sub-a'
+        $R.ExitCode | Should -BeNullOrEmpty
+        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 4 -Because 'a subscription the check could not finish counts as a failed run'
+        $R.Result.WrapperExitCode | Should -Be 2 -Because 'Sub X stays on the retry list and its report is missing'
+        @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these')
+        @(script:Get-Lines -Run $R -Like '  Sub X was skipped by the access check*') | Should -Be @('  Sub X was skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for it, start a new run with -Fresh, for example:')
+        @(script:Get-Lines -Run $R -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t -Fresh')
+        @($R.Text | Where-Object { $_ -match 'IncludeDisabled' }) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+
+        # Access fixed: the same run collects it and ends clean.
+        $Global:RdaRlUnreadableIds = @()
+        $R2 = script:Invoke-Run -Subs $Subs -Streams $Streams
+        @($R2.Calls) | Should -Contain 'sub-x'
+        script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
+        $R2.Result.WrapperExitCode | Should -Be 0
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+}

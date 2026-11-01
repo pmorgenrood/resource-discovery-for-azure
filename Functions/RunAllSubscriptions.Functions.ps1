@@ -2471,7 +2471,7 @@ function Get-RetryLimitedAttempts
 # empty list.
 function Write-RetryLimitSummary
 {
-    param([object]$RetryLimited, [string]$TenantID, [string[]]$NotListedIds = @())
+    param([object]$RetryLimited, [string]$TenantID, [string[]]$NotListedIds = @(), [string[]]$NotReadableIds = @())
     $List = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     if ($List.Count -eq 0) { return }
     Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
@@ -2490,6 +2490,18 @@ function Write-RetryLimitSummary
         Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0}" -f $TenantID) -ForegroundColor Yellow
     }
     $List = @($List | Where-Object { @($NotListedIds) -notcontains [string]$_.Id })
+    if ($List.Count -eq 0) { return }
+    # A subscription this run's access check skipped stays out of every run until
+    # the check passes for it, so the advice names that first. Such an entry is
+    # one whose check could not finish or whose two answers disagree; one with no
+    # read role was taken off the retry list by the check.
+    $NotReadable = @($List | Where-Object { @($NotReadableIds) -contains [string]$_.Id })
+    if ($NotReadable.Count -gt 0)
+    {
+        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, start a new run with -Fresh, for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
+        Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh" -f $TenantID) -ForegroundColor Yellow
+    }
+    $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
     Write-Host "  To try them again, start a new run with -Fresh (it collects every subscription again), for example:" -ForegroundColor Yellow
     Write-Host ("    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh" -f $TenantID) -ForegroundColor Yellow
