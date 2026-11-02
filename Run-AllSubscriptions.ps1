@@ -2803,7 +2803,9 @@ Write-NoUsageSummary -ConsumptionResult $ConsumptionCheck
 # this the metrics sheet is silently empty and looks like "no metric-eligible
 # resources" rather than an auth failure. Listed per-subscription so the
 # operator knows exactly which subs are missing metrics.
-$MetricsFailures = if ($null -ne $Global:MetricsFailedSubs) { @($Global:MetricsFailedSubs) } else { @() }
+# Metrics left incomplete because Azure Monitor kept failing (Complete = $false)
+# are not a sign-in problem: they are in FAILED (metrics) at the end of the run.
+$MetricsFailures = if ($null -ne $Global:MetricsFailedSubs) { @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) }) } else { @() }
 if ($MetricsFailures.Count -gt 0)
 {
     Write-Host ""
@@ -3139,7 +3141,7 @@ if ($null -ne $BundleBuildError)
 # annotated (server-side ingestion expects fixed columns); this banner is the
 # human-facing signal, and the non-zero exit below is the machine-facing one.
 $AuthSkippedPhases = @()
-if (@($Global:MetricsFailedSubs).Count -gt 0) { $AuthSkippedPhases += 'Metrics' }
+if (@(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) }).Count -gt 0) { $AuthSkippedPhases += 'Metrics' }
 $ConsumptionAuthSkipped = @(
     if ($null -ne $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs } else { @() }
 ) | Where-Object { $_.Id -eq '(auth)' }
@@ -3205,6 +3207,11 @@ if (@($UncarriedSkipped).Count -gt 0)
 # exited 3 for it.
 Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID)
 
+# A subscription whose grouped Azure Monitor request still failed after its
+# retries (throttling, timeout, server error) has incomplete metrics: the same
+# retry list, retry limit and exit 3 (5) as a failed billing download above.
+Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID)
+
 # A subscription completed this run whose report zip is missing is not in the
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
@@ -3255,7 +3262,7 @@ if ($null -ne $BundleBuildError)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or ($MissingReportCount -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0) -ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0)
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or ($MissingReportCount -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0) -ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0) -MetricsIncomplete (@(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count -gt 0)
 # A per-stream state file the merge could not move aside stops the next run at
 # its start: exit 1, in place of 0 and 3-5, so a caller acts on it. Exit 2
 # (reports missing or subscriptions failed) keeps its code; the stop above

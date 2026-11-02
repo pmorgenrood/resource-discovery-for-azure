@@ -59,6 +59,14 @@ $Root = $Global:RdaRlRoot
 $Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + $SubscriptionID
 $Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
 New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+# The ids in $Global:RdaRlMetricsIds run the real metrics phase for one managed
+# disk, against the Az.Monitor stand-in written in BeforeAll.
+if (@($Global:RdaRlMetricsIds) -contains $SubscriptionID)
+{
+    $Global:DefaultPath = $Folder + '/'
+    $Disk = [pscustomobject]@{ TYPE = 'microsoft.compute/disks'; Id = "/subscriptions/$SubscriptionID/resourceGroups/rg/providers/Microsoft.Compute/disks/disk-1"; subscriptionId = $SubscriptionID; ResourceGroup = 'rg'; Name = 'disk-1'; Location = 'westeurope'; ManagedBy = "/subscriptions/$SubscriptionID/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-1" }
+    $null = & (Join-Path $PSScriptRoot 'Extension/Metrics.ps1') -Subscriptions @([pscustomobject]@{ id = $SubscriptionID; Name = $SubscriptionID }) -Resources @($Disk) -Task 'Processing' -ConcurrencyLimit 4 -FilePath (Join-Path $Folder 'Metrics_test_') -Obfuscate $false *>&1
+}
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 $Html = Join-Path $Folder ('ResourcesReport_{0}.html' -f $Stamp)
 Set-Content -LiteralPath $Html -Value '<html></html>' -Encoding utf8
@@ -70,6 +78,31 @@ $Global:Resources = @(1)
 $Global:ResourceCount = 1
 '@
     Set-Content -LiteralPath (Join-Path $script:FakeRoot 'ResourceInventory.ps1') -Value $FakeInner -Encoding utf8
+    New-Item -ItemType Directory -Path (Join-Path $script:FakeRoot 'Extension') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Extension/Metrics.ps1') -Destination (Join-Path $script:FakeRoot 'Extension')
+
+    # Get-AzMetric runs in thread jobs, so the stand-in is an Az.Monitor module first
+    # on PSModulePath. While $env:RDA_RL_METRICS_THROTTLE is set, every request that
+    # names more than one metric fails with TooManyRequests.
+    $script:ModuleRoot = Join-Path $script:TestBase 'modules'
+    New-Item -ItemType Directory -Path (Join-Path $script:ModuleRoot 'Az.Monitor') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $script:ModuleRoot 'Az.Monitor/Az.Monitor.psm1') -Encoding utf8 -Value @'
+function Get-AzMetric
+{
+    [CmdletBinding()]
+    param([string]$ResourceId, [string[]]$MetricName, [datetime]$StartTime, [datetime]$EndTime, [timespan]$TimeGrain, [string]$AggregationType, $DefaultProfile, [switch]$DetailedOutput)
+    $Names = @($MetricName)
+    if ($Names.Count -gt 1 -and $env:RDA_RL_METRICS_THROTTLE) { throw "Operation returned an invalid status code 'TooManyRequests'" }
+    foreach ($Name in $Names)
+    {
+        $Points = for ($P = 0; $P -lt 24; $P++) { [pscustomobject]@{ TimeStamp = $StartTime.AddHours($P); Average = [double]$P; Minimum = [double]$P; Maximum = [double]($P + 1); Total = [double]($P * 2); Count = [double]1 } }
+        [pscustomobject]@{ Id = $ResourceId + '/providers/Microsoft.Insights/metrics/' + $Name; Name = [pscustomobject]@{ Value = $Name; LocalizedValue = $Name }; Data = $Points }
+    }
+}
+Export-ModuleMember -Function Get-AzMetric
+'@
+    $script:OriginalModulePath = $env:PSModulePath
+    $env:PSModulePath = $script:ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
 
     # --- Wrapper code lifted from its AST and run as written ------------------
     $Tokens = $null
@@ -162,6 +195,9 @@ $Global:ResourceCount = 1
     # The FAILED (consumption) lines at the end of the run, where the wrapper has them.
     $ConsumptionBanner = @($Top | Where-Object { $_.Extent.Text.StartsWith('Write-ConsumptionFailedBanner ') })
     $ConsumptionBannerText = if ($ConsumptionBanner.Count -eq 1) { $ConsumptionBanner[0].Extent.Text } else { '' }
+    # The FAILED (metrics) lines, where the wrapper has them.
+    $MetricsBanner = @($Top | Where-Object { $_.Extent.Text.StartsWith('Write-MetricsIncompleteBanner ') })
+    $ConsumptionBannerText += "`n" + $(if ($MetricsBanner.Count -eq 1) { $MetricsBanner[0].Extent.Text } else { '' })
 
     # Each run starts the way a new wrapper process does: run-wide totals empty.
     # The lifted blocks keep the run's lists in this block's scope, where a real
@@ -249,6 +285,8 @@ $Global:ResourceCount = 1
         $Global:RdaRlIncompleteIds = @()
         $Global:RdaRlConsumptionFailIds = @()
         $Global:RdaRlNoZipIds = @()
+        $Global:RdaRlMetricsIds = @()
+        $env:RDA_RL_METRICS_THROTTLE = ''
         # Subscriptions Azure lists that are not in the run's set (for example
         # disabled ones without -IncludeDisabled).
         $Global:RdaRlAlsoVisible = @()
@@ -264,7 +302,9 @@ $Global:ResourceCount = 1
 }
 
 AfterAll {
-    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlConsumptionFailIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors, RdaRlUnreadableIds, RdaRlAllowPartialAccess -Scope Global -ErrorAction SilentlyContinue
+    if ($null -ne $script:OriginalModulePath) { $env:PSModulePath = $script:OriginalModulePath }
+    $env:RDA_RL_METRICS_THROTTLE = ''
+    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlConsumptionFailIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors, RdaRlUnreadableIds, RdaRlAllowPartialAccess, RdaRlMetricsIds, DefaultPath -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -1101,5 +1141,67 @@ Describe 'The Pending Retries line' {
         $R = script:Invoke-Run -Subs @($script:A, $script:X) -Resume
         @($R.Result.FailedSubscriptions) | Should -BeNullOrEmpty
         @(script:Get-Lines -Run $R -Like 'Pending Retries:*') | Should -Be @('Pending Retries:         1 subscription(s) on the retry list (FailedAttempts)')
+    }
+}
+
+Describe 'A subscription whose grouped metric requests still fail after their retries' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        Mock Import-AzContext -MockWith { }
+        # The metrics phase reads the current Az context once; none keeps it offline.
+        function script:Get-AzContext { return $null }
+    }
+    BeforeEach { script:New-Case }
+
+    # The real metrics phase runs for Sub X, and every grouped request it makes is
+    # throttled on each attempt. The subscription is metrics incomplete: FAILED
+    # (metrics), not the sign-in lines, the retry list and exit 3.
+    It 'exits 3 and lists it as metrics incomplete, and the next run collects it, exits 0 and clears the resume state (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlMetricsIds = @('sub-x')
+        $env:RDA_RL_METRICS_THROTTLE = '1'
+        $Subs = @($script:A, $script:B, $script:X)
+        $Run1 = script:Invoke-Run -Subs $Subs -Streams $Streams
+
+        $Run1.Result.WrapperExitCode | Should -Be 3
+        $At = [array]::IndexOf(@($Run1.Text), '=================== FAILED (metrics) ===================')
+        $At | Should -BeGreaterOrEqual 0
+        @($Run1.Text[($At + 1)..($At + 2)]) | Should -Be @('Metrics are incomplete for 1 subscription(s): Azure Monitor requests still failed after their retries (throttling, timeout or server error):', '  - sub-x (sub-x)')
+        @(script:Get-Lines -Run $Run1 -Like '  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly') | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
+        @(script:Get-Lines -Run $Run1 -Like 'Metrics Auth Failures*').Count | Should -Be 0 -Because 'a throttled subscription is not a sign-in problem'
+        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 1
+        [string](script:Get-Entry -Id 'sub-x').Reason | Should -BeLike 'Metrics incomplete: Azure Monitor requests for 1 resource(s) still failed after their retries*'
+
+        $env:RDA_RL_METRICS_THROTTLE = ''
+        $Run2 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+
+        @($Run2.Calls) | Should -Contain 'sub-x'
+        $Run2.Result.WrapperExitCode | Should -Be 0
+        @(script:Get-Lines -Run $Run2 -Like '*FAILED (metrics)*').Count | Should -Be 0
+        @(script:Get-Lines -Run $Run2 -Like 'Resume state cleared (clean run).').Count | Should -Be 1
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+
+    # It never stops: exit 3 for three runs, and the fourth run leaves it to the
+    # retry limit (Not retried, exit 2), exactly as for a failed billing download.
+    It 'exits 3, 3, 3 and the fourth run leaves it to the retry limit (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlMetricsIds = @('sub-x')
+        $env:RDA_RL_METRICS_THROTTLE = '1'
+        $Subs = @($script:A, $script:B, $script:X)
+        $Codes = @()
+        foreach ($n in 1..3)
+        {
+            $Run = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume:($n -gt 1)
+            $Codes += $Run.Result.WrapperExitCode
+            @(script:Get-Lines -Run $Run -Like '*FAILED (metrics)*').Count | Should -Be 1
+        }
+        $Run4 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+
+        $Codes | Should -Be @(3, 3, 3)
+        @($Run4.Calls) | Should -Not -Contain 'sub-x'
+        @(script:Get-Lines -Run $Run4 -Like '*FAILED (metrics)*').Count | Should -Be 0
+        @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: Metrics incomplete*').Count | Should -Be 1
+        $Run4.Result.WrapperExitCode | Should -Be 2
     }
 }
