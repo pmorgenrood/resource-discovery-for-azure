@@ -16,6 +16,8 @@
 #   -SignInFirst     no cached sign-in and no -TenantID: the run signs in itself
 #                    (-DeviceLogin, so no browser is needed).
 #   -Obfuscate       pass -Obfuscate.
+#   -NoResources     the subscriptions hold no resources and have no usage.
+#   -DebugOutput     pass -Debug.
 #
 # Every subscription holds one disk in resource group RG-INFRA, and its usage
 # page has one row for that disk with a consumption meter in additionalInfo.
@@ -30,7 +32,9 @@ param(
     [switch]$AllSubs,
     [string]$ResourceGroup = '',
     [switch]$SignInFirst,
-    [switch]$Obfuscate
+    [switch]$Obfuscate,
+    [switch]$NoResources,
+    [switch]$DebugOutput
 )
 $PSStyle.OutputRendering = 'PlainText'
 [System.Globalization.CultureInfo]::CurrentCulture = $Culture
@@ -43,6 +47,7 @@ $Ids = @($SubIds -split ',' | Where-Object { $_ })
 $Global:StandInSubs = @(for ($i = 0; $i -lt $Ids.Count; $i++) { [pscustomobject]@{ id = $Ids[$i]; name = ('Demo Subscription {0}' -f ($i + 1)); tenantId = $Global:StandInTenant; state = 'Enabled' } })
 $Global:StandInSignedIn = -not $SignInFirst
 $Global:StandInContextSub = $Ids[0]
+$Global:StandInNoResources = [bool]$NoResources
 
 # The disk each subscription holds, with ids as Azure spells them.
 function global:Get-StandInDiskId([string]$Sub) { '/subscriptions/{0}/resourceGroups/RG-INFRA/providers/Microsoft.Compute/disks/DISK-INFRA' -f $Sub }
@@ -62,6 +67,7 @@ function global:Invoke-StandInGraph
             }
         }
         if ($Subs.Count -eq 0) { $Subs = @($Global:StandInSubs | ForEach-Object { [string]$_.id }) }
+        if ($Global:StandInNoResources) { $Subs = @() }
         # Resource Graph keeps the resource group in small letters; == is case-sensitive.
         $Rows = @(foreach ($Sub in $Subs)
             {
@@ -104,6 +110,7 @@ function global:Get-AzMetric { [CmdletBinding()] param($ResourceId, $MetricName,
 function global:Get-AzUsageAggregate
 {
     [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
+    if ($Global:StandInNoResources) { return [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
     $Instance = @{ 'Microsoft.Resources' = @{ resourceUri = (Get-StandInDiskId $Global:StandInContextSub); location = 'eastus'; additionalInfo = @{ ConsumptionMeter = 'meter-1'; ImageType = 'Standard' } } } | ConvertTo-Json -Depth 5 -Compress
     $Row = [pscustomobject]@{ InstanceData = $Instance; MeterCategory = 'Storage'; MeterId = 'meter-1'; MeterName = 'P4 Disks'; MeterRegion = 'US East'; MeterSubCategory = 'Premium SSD Managed Disks'; Quantity = 1; Unit = '1/Month'; UsageStartTime = (Get-Date).AddDays(-2).Date; UsageEndTime = (Get-Date).AddDays(-1).Date }
     [pscustomobject]@{ UsageAggregations = @([pscustomobject]@{ Properties = $Row }); ContinuationToken = $null }
@@ -119,10 +126,17 @@ function global:Invoke-AzRestMethod
     if ($Target -match '/roleDefinitions/') { return (& $Json @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } }) }
     if ($Target -match '/providers/Microsoft\.Authorization/permissions\?') { return (& $Json @{ value = @(@{ actions = @('*/read'); notActions = @() }) }) }
     if ($Target -match '/UsageAggregates\?') { return (& $Json @{ value = @() }) }
-    if ($Target -match 'Microsoft\.ResourceGraph/resources') { return (& $Json @{ data = @($Global:StandInSubs | ForEach-Object { @{ subscriptionId = [string]$_.id; ResourceCount = 1 } }) }) }
+    if ($Target -match 'Microsoft\.ResourceGraph/resources') { return (& $Json @{ data = @($Global:StandInSubs | Where-Object { -not $Global:StandInNoResources } | ForEach-Object { @{ subscriptionId = [string]$_.id; ResourceCount = 1 } }) }) }
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 function global:Start-Sleep { param($Seconds, $Milliseconds) }
+
+# The stand-ins exist only in this runspace, so the up-front checks of a run
+# over several subscriptions check one subscription at a time.
+$Global:PSDefaultParameterValues = @{
+    'Test-SubscriptionRoleAccessAll:ThrottleLimit' = 1
+    'Invoke-ConsumptionDataCheck:ThrottleLimit'    = 1
+}
 
 # Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
 . (Join-Path $PSScriptRoot 'AzPsStandIns.ps1')
@@ -133,6 +147,7 @@ if (-not $AllSubs) { $Params.SubscriptionID = $Ids[0] }
 if ($Out) { $Params.OutputDirectory = $Out }
 if ($ResourceGroup) { $Params.ResourceGroup = $ResourceGroup }
 if ($Obfuscate) { $Params.Obfuscate = $true }
+if ($DebugOutput) { $Params.Debug = $true }
 Set-Location -LiteralPath $Tree
 & (Join-Path $Tree 'ResourceInventory.ps1') @Params
 exit $LASTEXITCODE
