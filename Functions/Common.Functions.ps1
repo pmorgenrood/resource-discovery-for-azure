@@ -1338,9 +1338,11 @@ function Get-ConsumptionErrorStatusCode
 # Pure: 'Permanent' for the failures a retry cannot change: 400 (malformed
 # request), 401/403 (no permission) and 404 (not found). Without a status code
 # the message decides: it is permanent only when it names one of those (by
-# name or number) or says access was denied. Everything else is 'Transient'
-# (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
-# off part-way, and any error not recognised here.
+# name or number), says access was denied or that something could not be
+# found, or says the sign-in cannot be used (the same as a 401: a retry signs
+# in no better). Everything else is 'Transient' (worth a bounded retry):
+# throttling, timeouts, server errors, a transfer cut off part-way, and any
+# error not recognised here.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
@@ -1351,7 +1353,11 @@ function Get-ConsumptionErrorKind
         return 'Transient'
     }
     $Message = [string]$Exception.Message
-    if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization')
+    if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
+    {
+        return 'Permanent'
+    }
+    if ($Message -match '(?i)connect-azaccount|\bAADSTS\d+|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
     {
         return 'Permanent'
     }
@@ -1360,7 +1366,8 @@ function Get-ConsumptionErrorKind
 
 # Runs $Operation (a scriptblock taking one argument) and retries it with
 # exponential backoff (2, 4, 8 s) unless the failure is one a retry cannot
-# change (Get-ConsumptionErrorKind: 400, 401, 403, 404, access denied). Returns
+# change (Get-ConsumptionErrorKind: 400, 401, 403, 404, access denied, not
+# found, a sign-in that cannot be used). Returns
 # { Value; Error; Attempts }; Error is the last exception, or $null on success.
 function Invoke-ConsumptionCallWithRetry
 {
