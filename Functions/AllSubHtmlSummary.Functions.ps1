@@ -360,7 +360,14 @@ function New-RdaAllSubHtmlSummary
     # read-only; a null/empty collection renders nothing.
     $FailedList = @(@($FailedSubscriptions) | Where-Object { $_ })
     $ConsumpList = @(@($ConsumptionFailedSubs) | Where-Object { $_ -and $_.Id -ne '(auth)' })
-    $MetricsList = @(@($MetricsFailedSubs) | Where-Object { $_ })
+    # Metrics skipped for the sign-in, and metrics left incomplete because Azure
+    # Monitor kept failing (Complete = $false), each with its own banner and count.
+    # The two are told apart by Functions/Common.Functions.ps1, which the wrapper
+    # (the caller that passes metrics entries) has loaded; with no entries it is
+    # not needed, as for Build-MainSummaryFromZip.ps1.
+    $MetricsEntries = @(@($MetricsFailedSubs) | Where-Object { $_ })
+    $MetricsList = @($MetricsEntries | Where-Object { -not (Test-MetricsIncompleteEntry -Entry $_) })
+    $MetricsIncompleteList = if ($MetricsEntries.Count -gt 0) { @(Get-MetricsIncompleteEntries -Entries $MetricsEntries) } else { @() }
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
 
     $Banners = New-Object System.Text.StringBuilder
@@ -411,11 +418,22 @@ function New-RdaAllSubHtmlSummary
     {
         if ($IsObfuscated)
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had metrics issues.</b> Metric data may be incomplete for those subscriptions.</div>', $MetricsList.Count)
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics auth-skipped: {0} subscription(s).</b> Metrics were skipped because the sign-in could not be refreshed for those subscriptions.</div>', $MetricsList.Count)
         }
         else
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had metrics issues.</b> Metric data may be incomplete for: {1}</div>', $MetricsList.Count, (ConvertTo-HtmlSafe (($MetricsList | ForEach-Object { [string]$_.Name }) -join ', ')))
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics auth-skipped: {0} subscription(s).</b> Metrics were skipped because the sign-in could not be refreshed for: {1}</div>', $MetricsList.Count, (ConvertTo-HtmlSafe (($MetricsList | ForEach-Object { [string]$_.Name }) -join ', ')))
+        }
+    }
+    if ($MetricsIncompleteList.Count -gt 0)
+    {
+        if ($IsObfuscated)
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for those subscriptions.</div>', $MetricsIncompleteList.Count)
+        }
+        else
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for: {1}</div>', $MetricsIncompleteList.Count, (ConvertTo-HtmlSafe (($MetricsIncompleteList | ForEach-Object { [string]$_.Name }) -join ', ')))
         }
     }
     if ($CollectorList.Count -gt 0)
