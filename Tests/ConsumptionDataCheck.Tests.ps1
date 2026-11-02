@@ -1226,6 +1226,24 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status code does not indicate success: 401.')) | Should -Be 'Permanent'
     }
 
+    It 'treats a sign-in that cannot be used, without a status code, as permanent, as a 401 is: <Text>' -ForEach @(
+        @{ Text = 'Run Connect-AzAccount to login.' }
+        @{ Text = 'AADSTS700082: The refresh token has expired due to inactivity.' }
+        @{ Text = "The access token is invalid. Code: 'InvalidAuthenticationToken'" }
+        @{ Text = "The token has expired. Code: 'ExpiredAuthenticationToken'" }
+        @{ Text = 'The access token has expired.' }
+        @{ Text = 'Interaction required: the sign-in needs the user.' }
+        @{ Text = "The subscription 'sub-a' could not be found." }
+    ) {
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text)) | Should -Be 'Permanent'
+    }
+
+    It 'still retries an unrecognised error once sign-in and not-found texts are known' {
+        # Near the new texts, but none of them.
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The remote name could not be resolved.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The token request was cancelled.')) | Should -Be 'Transient'
+    }
+
     It 'treats an error it does not recognise, and any other status code, as transient' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
