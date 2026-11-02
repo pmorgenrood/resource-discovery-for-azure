@@ -2731,6 +2731,38 @@ function Get-ResumeCarriedReports
     return [pscustomobject]@{ Carried = $Carried; Missing = $Missing }
 }
 
+# A new, empty file <Stem><Extension> in Directory, or, when that name is taken,
+# <Stem>-2<Extension> to <Stem>-100<Extension> (the names Move-UnreadableStreamStateFile
+# also tries). It is created here, only if absent, so a run that starts or ends in
+# the same second for another tenant never writes over it, and this run never
+# writes over another's. Returns its path; throws when every name is taken or the
+# file cannot be created.
+function New-RunOutputFile
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Stem,
+        [Parameter(Mandatory = $true)][string]$Extension
+    )
+    for ($N = 1; $N -le 100; $N++)
+    {
+        $Name = if ($N -eq 1) { $Stem + $Extension } else { '{0}-{1}{2}' -f $Stem, $N, $Extension }
+        $Path = Join-Path $Directory $Name
+        try
+        {
+            $Stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $Stream.Dispose()
+            return $Path
+        }
+        catch [System.IO.IOException]
+        {
+            # Taken: try the next name. Any other failure is the caller's.
+            if (-not ([System.IO.File]::Exists($Path) -or [System.IO.Directory]::Exists($Path))) { throw }
+        }
+    }
+    throw ('every name from {0}{1} to {0}-100{1} is taken' -f $Stem, $Extension)
+}
+
 # The short key of a run: the first 8 hex characters of the random id its run
 # lock records (InvocationId), known from the moment the lock is taken. It
 # names this run's own files in the inventory folder, so a run for another
