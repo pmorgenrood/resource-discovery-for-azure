@@ -17,6 +17,9 @@
 BeforeAll {
     $RepoRoot = Split-Path $PSScriptRoot -Parent
     $script:FunctionsPath = Join-Path $RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1'
+    # Get-RunSummaryLogContent, which the fold block calls, uses the metrics
+    # helpers of Functions/Common.Functions.ps1; the wrapper loads both files.
+    . (Join-Path $RepoRoot 'Functions/Common.Functions.ps1')
     . $script:FunctionsPath
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
