@@ -296,6 +296,21 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
     }
+
+    It 'the found count says what it counts: this run''s report records, plus the reports carried from an earlier run' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+        $R1.Text | Should -Contain "  Found zips:    2 (this run's report records)"
+
+        # The next run carries the reports of A and C and collects B, which again writes no zip.
+        $R2 = script:Invoke-Wrapper
+        $R2.ExitCode | Should -Be 2 -Because ($R2.Text -join "`n")
+        $R2.Text | Should -Contain "  Found zips:    2 (this run's report records, plus 2 carried from an earlier run)"
+    }
 }
 
 Describe 'The summaries of a consolidated zip that lacks some reports' -Skip:$IsWindows {
