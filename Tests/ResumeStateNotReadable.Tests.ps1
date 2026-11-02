@@ -46,6 +46,9 @@ BeforeAll {
     $StandInInner = @'
 param([string]$TenantID, [string]$SubscriptionID, [switch]$RunAllSubs, [switch]$Obfuscate, [switch]$SkipMetrics, [switch]$SkipConsumption, [switch]$DeviceLogin, [int]$ConcurrencyLimit)
 $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
+# As the real one does: every subscription of the tenant, in the global scope
+# (under pwsh -File that is also the wrapper's top level).
+$Global:Subscriptions = @($Scenario.Subscriptions)
 # The session ends while this subscription is collected.
 if (@($Scenario.EndSessionIds) -contains $SubscriptionID) { [Environment]::Exit(137) }
 if (@($Scenario.FailIds) -contains $SubscriptionID) { throw 'stand-in failure for this subscription' }
@@ -305,6 +308,28 @@ Describe 'A subscription on the not-readable record that a later check can read'
         $R3.ExitCode | Should -Be 0
         @($R3.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 1
         Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+}
+
+Describe 'The Eligible and Processed counts at the end of a run' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    # ResourceInventory.ps1 sets $Global:Subscriptions to every subscription of
+    # the tenant, and under pwsh -File the wrapper's top level is the global
+    # scope, so its own $Subscriptions is that list after the first subscription.
+    It 'count the subscriptions of the run, not every subscription of the tenant (sequential)' {
+        $D = @{ Id = 'sub-d-disabled'; Name = 'Sub D' }
+        script:Set-Scenario -Subs $script:A, $script:B, $D -Disabled $D.Id
+        $Run = script:Invoke-Wrapper
+        $Run.ExitCode | Should -Be 0
+        $Run.Text | Should -Contain 'Subscriptions to process: 2'
+        $Run.Text | Should -Contain 'Subscriptions Eligible:  2'
+        $Run.Text | Should -Contain 'Subscriptions Processed: 2'
+        $Summary = @(script:Get-ZipEntries | Where-Object { $_.Zip -like 'AllSubscriptions_*' -and $_.Name -eq 'RunSummary.log' })
+        $Summary.Count | Should -Be 1
+        $Lines = @($Summary[0].Text -split "`r?`n")
+        $Lines | Should -Contain '  Eligible  : 2'
+        $Lines | Should -Contain '  Processed : 2'
     }
 }
 

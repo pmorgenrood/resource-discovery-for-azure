@@ -1207,6 +1207,10 @@ $RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
 # one is still on the retry list at the end, the run is not a success (exit 2).
 $RetryNotInRunIds = @($FailedAttempts | Where-Object { $null -ne $_ -and $RunSubscriptionIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
 $RetryLimitedNotInRunIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $RunSubscriptionIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
+# Counted here for the summaries at the end. Under pwsh -File this script's top
+# level is the global scope, so $Subscriptions is $Global:Subscriptions, which
+# ResourceInventory.ps1 sets to every subscription of the tenant.
+$EligibleCount = $RunSubscriptionIds.Count
 
 # ---------------------------------------------------------------------------
 # Up-front consumption (billing) access gate. Consumption was REQUESTED unless
@@ -2462,14 +2466,14 @@ if ($Excluded.Count -gt 0)
 {
     Write-Host ("Subscriptions Excluded:  {0} (non-Enabled; use -IncludeDisabled to inventory them)" -f $Excluded.Count) -ForegroundColor Green
 }
-Write-Host ("Subscriptions Eligible:  {0}" -f $Subscriptions.Count) -ForegroundColor Green
+Write-Host ("Subscriptions Eligible:  {0}" -f $EligibleCount) -ForegroundColor Green
 # In parallel mode the parent counts $SkippedCount as it builds the list it
 # slices (the completed subscriptions it leaves out on -Resume).
 if ($Resume)
 {
     Write-Host ("Subscriptions Skipped:   {0} (already completed)" -f $SkippedCount) -ForegroundColor Green
 }
-Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green
+Write-Host ("Subscriptions Processed: {0}" -f ($EligibleCount - $SkippedCount)) -ForegroundColor Green
 
 # Surface the per-subscription resource-count result so the user does not have
 # to scan individual transcripts to find subs that came back empty. Empty subs
@@ -2750,7 +2754,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -Version $BundleVer `
             -StartTime $RunStartTime -EndTime (Get-Date) `
             -Visible $AllSubscriptions.Count -Excluded $Excluded.Count `
-            -Eligible $Subscriptions.Count -Processed ($Subscriptions.Count - $SkippedCount) -Skipped $SkippedCount `
+            -Eligible $EligibleCount -Processed ($EligibleCount - $SkippedCount) -Skipped $SkippedCount `
             -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined $UnknownSubs `
             -FailedSubscriptions $FailedSubscriptions `
             -CollectorFailures $Global:CollectorFailures `
