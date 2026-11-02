@@ -1526,7 +1526,7 @@ Describe 'Write-SkippedSubscriptionSummary (end-of-run list)' {
 
     It 'is called at the end of both scripts with the role check decision, after the counts in the wrapper' {
         $Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
-        $Wrapper | Should -Match ([regex]::Escape('Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green') + '\s*\r?\n(#[^\n]*\n)*Write-SkippedSubscriptionSummary -Decision \$AccessDecision')
+        $Wrapper | Should -Match ([regex]::Escape('Write-Host ("Subscriptions Processed: {0}" -f ($EligibleCount - $SkippedCount)) -ForegroundColor Green') + '\s*\r?\n(#[^\n]*\n)*Write-SkippedSubscriptionSummary -Decision \$AccessDecision')
         $Direct = (Get-Content -Path (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw).TrimEnd()
         # After the report and zip logging the direct script prints the no-usage and
         # skipped-subscription lists. The only code allowed after them is the direct-run

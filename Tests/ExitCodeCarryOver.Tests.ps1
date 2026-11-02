@@ -34,6 +34,10 @@
 # wrapper writes to C:\InventoryReports instead, so these tests do not run
 # there. Placeholder ids only. No live Azure.
 #
+# The same runs check the Eligible and Processed counts of the summary and of
+# RunSummary.log: under pwsh -File the wrapper's $Subscriptions is the global
+# one, which ResourceInventory.ps1 replaces with every subscription of the tenant.
+#
 # Run with: Invoke-Pester ./Tests/ExitCodeCarryOver.Tests.ps1 -Output Detailed
 # =============================================================================
 
@@ -96,7 +100,7 @@ function Get-AzSubscription
 {
     [CmdletBinding()] param($TenantId, $SubscriptionId, $SubscriptionName)
     $Scenario = Get-RdaStandInScenario
-    @($Scenario.Subscriptions | Where-Object { -not $SubscriptionId -or $_.Id -eq $SubscriptionId } | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = 'Enabled'; TenantId = $Scenario.Tenant; HomeTenantId = $Scenario.Tenant } })
+    @($Scenario.Subscriptions | Where-Object { -not $SubscriptionId -or $_.Id -eq $SubscriptionId } | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = $(if ($_.State) { [string]$_.State } else { 'Enabled' }); TenantId = $Scenario.Tenant; HomeTenantId = $Scenario.Tenant } })
 }
 function Invoke-AzRestMethod
 {
@@ -207,10 +211,29 @@ if ($FailSub)
             $Proc.WaitForExit()
             $StateFile = Join-Path $CaseHome ('InventoryReports/.resume-state-{0}.json' -f $script:Tenant)
             $State = if (Test-Path -LiteralPath $StateFile) { Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } else { $null }
+            # RunSummary.log from the run's consolidated zip, when it wrote one.
+            $RunSummary = $null
+            $OuterZip = Get-ChildItem -Path (Join-Path $CaseHome 'InventoryReports') -Filter 'AllSubscriptions_*.zip' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $OuterZip)
+            {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $Archive = [System.IO.Compression.ZipFile]::OpenRead($OuterZip.FullName)
+                try
+                {
+                    $Entry = $Archive.Entries | Where-Object { $_.FullName -eq 'RunSummary.log' } | Select-Object -First 1
+                    if ($null -ne $Entry)
+                    {
+                        $Reader = [System.IO.StreamReader]::new($Entry.Open())
+                        try { $RunSummary = $Reader.ReadToEnd() } finally { $Reader.Dispose() }
+                    }
+                }
+                finally { $Archive.Dispose() }
+            }
             return [pscustomobject]@{
-                ExitCode  = $Proc.ExitCode
-                Console   = ($Out.Result + $Err.Result)
-                FailedIds = @(if ($null -ne $State) { @($State.FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } })
+                ExitCode   = $Proc.ExitCode
+                Console    = ($Out.Result + $Err.Result)
+                RunSummary = $RunSummary
+                FailedIds  = @(if ($null -ne $State) { @($State.FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } })
             }
         }
 
@@ -359,6 +382,22 @@ if ($FailSub)
         $Session.Console | Should -Match 'ERROR processing Sub A: Script exited with code 1'
         $Session.After | Should -Be @('after1: 2', 'after2: 0') -Because $Session.Console
         $Session.Open | Should -BeTrue
+    }
+
+    # ResourceInventory.ps1 sets $Global:Subscriptions to every subscription of
+    # the tenant, and under pwsh -File the wrapper's top level is the global
+    # scope, so its own $Subscriptions is that list after the first subscription.
+    It 'pwsh -File, sequential: Eligible and Processed count the subscriptions of the run, not every subscription of the tenant' {
+        $SubD = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'd').ToString(); Name = 'Sub D'; State = 'Disabled' }
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $SubD)
+        $Lines = @($Run.Console -split "`r?`n")
+        $Lines | Should -Contain 'Subscriptions to process: 2'
+        $Lines | Should -Contain 'Subscriptions Eligible:  2'
+        $Lines | Should -Contain 'Subscriptions Processed: 2'
+        $Summary = @($Run.RunSummary -split "`r?`n")
+        $Summary | Should -Contain '  Eligible  : 2'
+        $Summary | Should -Contain '  Processed : 2'
+        $Run.ExitCode | Should -Be 0
     }
 
     It 'pwsh -File: a clean run with 2 streams exits 0' {
