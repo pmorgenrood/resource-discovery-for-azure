@@ -215,6 +215,21 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         @($R.Printed | Where-Object { $_ -like 'Reporting Data File:*' }).Count | Should -Be 0
         $R.BundleBuildError | Should -BeLike '*: 1 of the 2 per-subscription zip(s) are not in it.'
         $R.OuterZipFile | Should -BeNullOrEmpty
+        # Neither the zip that failed the check nor the file it was written to is left.
+        @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -like 'AllSubscriptions_*.zip' -or $_.Name -like '.rda-*.partial' }) | Should -BeNullOrEmpty
+    }
+
+    It 'a written zip that cannot be read fails the check before it takes the name: no file is left under the name or the name it was written to' {
+        $Root = Join-Path $TestDrive 'unreadable'
+        $null = New-SubReport -Root $Root -Stamp 'U1'
+        # Writes bytes that are not a zip, without an error.
+        Mock Compress-Archive -ParameterFilter { -not $Update } { Set-Content -LiteralPath $DestinationPath -Value 'not a zip' -NoNewline }
+        $R = Invoke-BundleBlock -Root $Root
+
+        $R.BundleBuildError | Should -BeLike '*: the zip cannot be read: *'
+        $R.OuterZipFile | Should -BeNullOrEmpty
+        @($R.Printed | Where-Object { $_ -like 'Reporting Data File:*' }).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -like 'AllSubscriptions_*.zip' -or $_.Name -like '.rda-*.partial' }) | Should -BeNullOrEmpty
     }
 
     It 'a zip that is built holds every report, and its path waits for the last check' {
