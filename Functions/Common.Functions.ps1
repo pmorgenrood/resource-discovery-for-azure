@@ -1359,7 +1359,8 @@ function Get-ConsumptionErrorKind
         return 'Permanent'
     }
     $Message = [string]$Exception.Message
-    if ($Message -match '(?i)timed? ?out|timeout|throttl|too many requests|\b429\b|\b50[0-4]\b|temporar|service unavailable|task was cancel|connection (was )?(reset|closed|refused)|name could not be resolved|name or service not known')
+    # 'Error while copying content to a stream': a transfer cut off part-way.
+    if ($Message -match '(?i)timed? ?out|timeout|throttl|too many requests|\b429\b|\b50[0-4]\b|temporar|service unavailable|task was cancel|connection (was )?(reset|closed|refused)|name could not be resolved|name or service not known|error while copying content to a stream')
     {
         return 'Transient'
     }
