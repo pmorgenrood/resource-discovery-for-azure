@@ -44,9 +44,10 @@ $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-J
 # (its job is Blocked until the wrapper answers) or its worker process is killed.
 if (@($Scenario.PromptIds) -contains $SubscriptionID -or @($Scenario.DieIds) -contains $SubscriptionID)
 {
-    $OtherDone = Join-Path (Join-Path $HOME 'InventoryReports') '.rda-stream-1-summary.json'
+    # The stream summary is named with the run's key: .rda-stream-<run key>-<N>-summary.json.
+    $OtherRoot = Join-Path $HOME 'InventoryReports'
     $Deadline = (Get-Date).AddSeconds(240)
-    while (-not (Test-Path -LiteralPath $OtherDone) -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
+    while (@(Get-ChildItem -LiteralPath $OtherRoot -Force -File -Filter '.rda-stream-*-1-summary.json' -ErrorAction SilentlyContinue).Count -eq 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
     if (@($Scenario.DieIds) -contains $SubscriptionID) { Stop-Process -Id $PID -Force }
     foreach ($N in 1..3)
     {

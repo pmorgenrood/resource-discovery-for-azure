@@ -100,9 +100,10 @@ if (@($Scenario.ReadOnlyAfterIds) -contains $SubscriptionID)
 if ($Scenario.CutStreamFile -and $Scenario.CutStreamFile.AfterId -eq $SubscriptionID)
 {
     $Cut = $Scenario.CutStreamFile
-    $Done = Join-Path $Root ('.rda-stream-{0}-summary.json' -f $Cut.Stream)
+    # The stream summary is named with the run's key: .rda-stream-<run key>-<N>-summary.json.
+    $Done = '.rda-stream-*-{0}-summary.json' -f $Cut.Stream
     $Deadline = (Get-Date).AddSeconds(240)
-    while (-not (Test-Path -LiteralPath $Done) -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
+    while (@(Get-ChildItem -LiteralPath $Root -Force -File -Filter $Done -ErrorAction SilentlyContinue).Count -eq 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
     $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f $TenantID, $Cut.Stream)
     if ($Cut.Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Target, [byte[]]@()) }
     else { $Raw = Get-Content -LiteralPath $Target -Raw; Set-Content -LiteralPath $Target -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }

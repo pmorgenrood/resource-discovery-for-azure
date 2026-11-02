@@ -270,6 +270,9 @@ $SkippedSubs = @()
 # Subs this stream collected without a zip being written; reported in the
 # summary so the parent takes them off the unified completed list.
 $NoReportSubs = @()
+# The report zip of every subscription this stream collected that wrote one,
+# complete or not: the parent builds the consolidated zip from these.
+$RunReports = @()
 # Subs this stream collected with metrics or consumption left incomplete; they
 # are in the retry list, and the summary names them so the parent also takes
 # them off the unified completed list.
@@ -352,6 +355,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
         if ($null -ne $NewReport)
         {
             $Reports = @(@($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId }) + $NewReport)
+            $RunReports = @(@($RunReports) + $NewReport)
         }
         $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
 
@@ -469,6 +473,7 @@ $Summary = [pscustomobject]@{
     Skipped                = @($SkippedSubs)
     NoReport               = @($NoReportSubs)
     Incomplete             = @($IncompleteSubs)
+    RunReports             = @($RunReports)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
     # Every entry (one per subscription). Not Select-Object -Unique: it treats any

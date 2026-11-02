@@ -2731,6 +2731,42 @@ function Get-ResumeCarriedReports
     return [pscustomobject]@{ Carried = $Carried; Missing = $Missing }
 }
 
+# The short key of a run: the first 8 hex characters of the random id its run
+# lock records (InvocationId), known from the moment the lock is taken. It
+# names this run's own files in the inventory folder, so a run for another
+# tenant in the same folder never reads or removes them. It holds no tenant
+# data. $null when the record has no usable id.
+function Get-RunLockRunKey
+{
+    param($Record)
+    $Id = if ($null -ne $Record) { [string]$Record['InvocationId'] } else { '' }
+    $Hex = $Id -replace '[^0-9a-fA-F]', ''
+    if ($Hex.Length -lt 8) { return $null }
+    return $Hex.Substring(0, 8).ToLowerInvariant()
+}
+
+# The report zips this run wrote, from its own records (New-CompletedReportRecord,
+# one per subscription that wrote a zip this run, complete or not), each once and
+# only when it is still on disk under the inventory root. Not every zip written
+# since the run started: a run for another tenant in the same folder writes zips
+# in that time too.
+function Get-RunReportZipItems
+{
+    param([string]$InventoryRoot, [object]$Reports = @())
+    $Seen = @{}
+    foreach ($Report in @($Reports))
+    {
+        if ($null -eq $Report -or $Report -is [string] -or $Report -is [ValueType]) { continue }
+        $Zip = $Report.PSObject.Properties['Zip']
+        if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
+        if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..')) { continue }
+        $Item = Get-Item -LiteralPath (Join-Path $InventoryRoot $Zip.Value) -ErrorAction SilentlyContinue
+        if ($null -eq $Item -or $Item.PSIsContainer -or $Seen.ContainsKey($Item.FullName)) { continue }
+        $Seen[$Item.FullName] = $true
+        $Item
+    }
+}
+
 # This run's per-subscription zips plus the zips carried from an earlier run
 # (Get-ResumeCarriedReports), each file once, this run's first. Used by both the
 # output verification and the consolidation so they always count the same set.

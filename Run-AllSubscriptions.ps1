@@ -502,6 +502,10 @@ if (-not $RunLock.Acquired)
     Exit-Wrapper -Code 1
 }
 if (-not (Start-RunLockHeartbeat -Lock $RunLock)) { Exit-Wrapper -Code 1 }
+# This run's own key (Get-RunLockRunKey): it names the files only this run uses
+# (the stream summaries, the per-stream failure logs, the bundle staging folder).
+$RunKey = Get-RunLockRunKey -Record $RunLock.Record
+if ([string]::IsNullOrEmpty($RunKey)) { $RunKey = [guid]::NewGuid().ToString('N').Substring(0, 8) }
 
 # Resume state helpers
 $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $TenantID)
@@ -1318,6 +1322,10 @@ $DiagFile = $null
 # explanation is that the signed-in identity does not have Reader on the
 # subscription, but it can also legitimately mean the subscription is empty).
 $SubResourceCounts = @()
+# The report zip of every subscription this run collected that wrote one
+# (complete or not): the consolidated zip and the summaries are built from
+# these and the carried reports only (Get-RunReportZipItems).
+$RunReports = @()
 
 # A run without -Resume or -ResumeFailedOnly: first the shape of the per-stream
 # state file of each stream it will use (more than one stream: set by
@@ -1426,6 +1434,7 @@ if ($ParallelStreams -le 1)
             $StateChanged = $false
             # Record the zip this run wrote, replacing any earlier record for the sub.
             $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
+            if ($null -ne $NewReport) { $RunReports = @(@($RunReports) + $NewReport) }
             $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
             if ($null -eq $NewReport)
             {
@@ -1688,7 +1697,7 @@ else
                 }
                 $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
                 $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
-                if ($null -ne $NewReport) { $CompletedReports = @(@($CompletedReports) + $NewReport) }
+                if ($null -ne $NewReport) { $CompletedReports = @(@($CompletedReports) + $NewReport); $RunReports = @(@($RunReports) + $NewReport) }
                 if ($null -eq $NewReport)
                 {
                     # Same as the sequential branch: a run that left no zip does not
@@ -1840,8 +1849,10 @@ else
                 $SliceIds = @($SliceList | ForEach-Object { $_.Id })
                 $SliceNames = @($SliceList | ForEach-Object { $_.Name })
 
-                $SummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-summary.json" -f $S)
-                $FailuresPath = Join-Path $InventoryRoot ("RunAllSubscriptions_failures_{0}_stream-{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'), $S)
+                # Named with this run's key, so a run for another tenant in the
+                # same folder never reads or removes them.
+                $SummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-{1}-summary.json" -f $RunKey, $S)
+                $FailuresPath = Join-Path $InventoryRoot ("RunAllSubscriptions_failures_{0}_{1}_stream-{2}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'), $RunKey, $S)
 
                 $StreamSummaries += [pscustomobject]@{
                     StreamId     = $S
@@ -2004,6 +2015,10 @@ else
                     $ReasonText = if ($StreamSummary.Reason) { $StreamSummary.Reason } else { '(no reason given)' }
                     Write-Host ("[stream-{0}] stream status: {1} - {2}" -f $S.StreamId, $StreamSummary.Status, $ReasonText) -ForegroundColor Red
                 }
+
+                # The report zip of each subscription this stream collected
+                # that wrote one, complete or not.
+                if ($StreamSummary.RunReports) { $RunReports = @(@($RunReports) + @($StreamSummary.RunReports | Where-Object { $null -ne $_ })) }
 
                 if ($StreamSummary.ResourceCounts)
                 {
@@ -2394,7 +2409,7 @@ $MissingReports = @()
 $MissingReportCount = 0
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
-    $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    $ActualSubZips = @(Get-RunReportZipItems -InventoryRoot $InventoryRoot -Reports $RunReports)
     $ActualSubZips = @(Join-CarriedReportZips -Zips $ActualSubZips -CarriedReports $CarriedReports)
     $ActualZipCount = $ActualSubZips.Count
     if ($ActualZipCount -lt $ExpectedZipCount)
@@ -2475,8 +2490,9 @@ $BundleBuildError = $null
 
 if (Test-Path -Path $InventoryRoot -PathType Container)
 {
-    # Filter ZIPs by current run timestamp only, plus the zips carried from an earlier run on -Resume
-    $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # This run's own report zips (its records), plus the zips carried from an
+    # earlier run on -Resume; never another run's zips written in the same time.
+    $SubZips = @(Get-RunReportZipItems -InventoryRoot $InventoryRoot -Reports $RunReports)
     $SubZips = @(Join-CarriedReportZips -Zips $SubZips -CarriedReports $CarriedReports)
     if ($SubZips.Count -gt 0)
     {
@@ -2875,7 +2891,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
 {
     try
     {
-        $BundleStage = Join-Path $InventoryRoot ('.rda-bundle-{0}' -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        $BundleStage = Join-Path $InventoryRoot ('.rda-bundle-{0}-{1}' -f $RunKey, ([guid]::NewGuid().ToString('N').Substring(0, 4)))
         New-Item -ItemType Directory -Path $BundleStage -Force | Out-Null
 
         # Version is display-only. Prefer Version.json (in parallel mode the
