@@ -1157,6 +1157,10 @@ if ($ScopeForProbe.Count -gt 0)
 # still on the retry list at the end, its report is missing, so the run ends
 # with exit 2.
 $RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+# Counted here for the summaries at the end. Under pwsh -File this script's top
+# level is the global scope, so $Subscriptions is $Global:Subscriptions, which
+# ResourceInventory.ps1 sets to every subscription of the tenant.
+$EligibleCount = $RunSubscriptionIds.Count
 $RetryLimitedNotInRunIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $RunSubscriptionIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
 
 # ---------------------------------------------------------------------------
@@ -2566,12 +2570,12 @@ if ($Excluded.Count -gt 0)
     $IncludeHow = Get-RunGoOnCommand -Switches '-IncludeDisabled' -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly)
     Write-Host ("Subscriptions Excluded:  {0} (non-Enabled; {1} to inventory them)" -f $Excluded.Count, $IncludeHow) -ForegroundColor Green
 }
-Write-Host ("Subscriptions Eligible:  {0}" -f $Subscriptions.Count) -ForegroundColor Green
+Write-Host ("Subscriptions Eligible:  {0}" -f $EligibleCount) -ForegroundColor Green
 if ($Resume)
 {
     Write-Host ("Subscriptions Skipped:   {0} (already completed)" -f $SkippedCount) -ForegroundColor Green
 }
-Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCount)) -ForegroundColor Green
+Write-Host ("Subscriptions Processed: {0}" -f ($EligibleCount - $SkippedCount)) -ForegroundColor Green
 # Subscriptions the up-front role check skipped (not readable), listed again
 # so a report without them is not taken for a complete one.
 Write-SkippedSubscriptionSummary -Decision $AccessDecision
@@ -2843,7 +2847,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -Version $BundleVer `
             -StartTime $RunStartTime -EndTime (Get-Date) `
             -Visible $AllSubscriptions.Count -Excluded $Excluded.Count `
-            -Eligible $Subscriptions.Count -Processed ($Subscriptions.Count - $SkippedCount) -Skipped $SkippedCount `
+            -Eligible $EligibleCount -Processed ($EligibleCount - $SkippedCount) -Skipped $SkippedCount `
             -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined $UnknownSubs `
             -FailedSubscriptions $FailedSubscriptions `
             -CollectorFailures $Global:CollectorFailures `
