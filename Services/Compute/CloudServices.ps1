@@ -13,7 +13,8 @@ if ($Task -eq 'Processing')
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
 
-            $Roles = $Data.roleProfile
+            # roleProfile is an object; its 'roles' member holds the list of roles.
+            $Roles = @($Data.roleProfile.roles | Where-Object { $null -ne $_ })
 
             $Obj = @{
                 'ID'                   = $1.id;
@@ -23,8 +24,9 @@ if ($Task -eq 'Processing')
                 'Location'             = $1.location;
             }
 
-            $Obj | Add-Member -MemberType NoteProperty -Name Roles -Value NotSet
-            $Obj.Roles = [System.Collections.Generic.List[object]]::new()
+            # A plain key, so the roles are written with the row. A NoteProperty of
+            # the same name would hide the key from the JSON writer.
+            $Obj['Roles'] = [System.Collections.Generic.List[object]]::new()
 
             foreach ($roleProfile in $Roles)
             {
