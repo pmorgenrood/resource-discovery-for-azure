@@ -66,7 +66,7 @@ AfterAll {
 
 Describe 'Cloud Services roles' {
     It 'writes one role per entry of roleProfile.roles, with name and SKU' {
-        $Rows = Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @((New-Role 'WebRole1' 'Standard_D1_v2' 2), (New-Role 'WorkerRole1' 'Standard_D2_v2' 3)) }))
+        $Rows = Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @((New-Role -Name 'WebRole1' -Sku 'Standard_D1_v2' -Capacity 2), (New-Role -Name 'WorkerRole1' -Sku 'Standard_D2_v2' -Capacity 3)) }))
         $Rows.Count | Should -Be 1
         $Roles = @($Rows[0].Roles)
         $Roles.Count | Should -Be 2
@@ -138,7 +138,7 @@ Describe 'Cloud Services roles' {
 
 Describe 'Cloud Services roles in the Inventory JSON' {
     It 'writes every role under Roles on the row' {
-        $Rows = Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @((New-Role 'WebRole1' 'Standard_D1_v2' 2), (New-Role 'WorkerRole1' 'Standard_D2_v2' 3)) }))
+        $Rows = Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @((New-Role -Name 'WebRole1' -Sku 'Standard_D1_v2' -Capacity 2), (New-Role -Name 'WorkerRole1' -Sku 'Standard_D2_v2' -Capacity 3)) }))
         $Json = Write-AndRead $Rows
         $Row = @($Json.CloudServices)[0]
         $Row.PSObject.Properties.Name | Should -Contain 'Roles'
