@@ -104,6 +104,24 @@ Describe 'Cloud Services roles' {
         $Roles.Count | Should -Be 1
     }
 
+    It 'skips an entry in roles that is not an object (<Case>)' -ForEach @(
+        @{ Case = 'a string'; Entry = 'WebRole2' }
+        @{ Case = 'a number'; Entry = 5 }
+    ) {
+        $Roles = @((Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @((New-Role 'WebRole1'), $Entry) })))[0].Roles)
+        $Roles.Count | Should -Be 1
+        $Roles[0].RoleName | Should -BeExactly 'WebRole1'
+    }
+
+    It 'keeps a role given as a dictionary' {
+        $Role = @{ name = 'WebRole1'; sku = @{ name = 'Standard_D1_v2'; tier = 'Standard'; capacity = 2 } }
+        $Roles = @((Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @($Role) })))[0].Roles)
+        $Roles.Count | Should -Be 1
+        $Roles[0].RoleName | Should -BeExactly 'WebRole1'
+        $Roles[0].SkuName | Should -BeExactly 'Standard_D1_v2'
+        $Roles[0].SkuCapacity | Should -Be 2
+    }
+
     It 'writes a role with no sku with empty SKU fields' {
         $Roles = @((Invoke-Collector @(New-CloudService -RoleProfile ([pscustomobject]@{ roles = @([pscustomobject]@{ name = 'WebRole1' }) })))[0].Roles)
         $Roles.Count | Should -Be 1
