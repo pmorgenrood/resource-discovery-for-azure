@@ -216,6 +216,13 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
         $script:Skipped.Console | Should -Match 'Consumption: SKIPPED'
     }
 
+    It 'says at the end that the consumption of both subscriptions is missing, and names each' {
+        $script:Skipped.End | Should -Match 'Consumption Failures:\s+2 subscription\(s\)'
+        $script:Skipped.End | Should -Match '(?m)^  - Sub A \(12345678-1234-1234-1234-123456789012\)$'
+        $script:Skipped.End | Should -Match '(?m)^  - Sub B \(placeholder-subscription-b\)$'
+        $script:Skipped.End | Should -Not -Match '\(all subscriptions\)'
+    }
+
     It 'ends with FAILED (consumption), naming every subscription of the run and the command that collects it again' {
         $Lines = @($script:Skipped.Console -split "`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
         $At = [array]::LastIndexOf($Lines, '================= FAILED (consumption) =================')
