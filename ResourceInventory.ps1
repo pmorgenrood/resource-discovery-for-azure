@@ -1338,6 +1338,9 @@ function ExecuteInventoryProcessing()
 
                 if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
                 $MetricsSkipMsg = 'Metrics phase skipped: no usable Azure context/token after one reconnect attempt.'
+                # The report folder this run writes to, as the consumption phase records it,
+                # so the wrapper's main summary marks that report's row.
+                $MetricsReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
                 $AffectedSubs = @(
                     if (![string]::IsNullOrEmpty($SubscriptionID))
                     {
@@ -1351,13 +1354,13 @@ function ExecuteInventoryProcessing()
                 if ($AffectedSubs.Count -eq 0)
                 {
                     $IdLabel = if (![string]::IsNullOrEmpty($SubscriptionID)) { $SubscriptionID } else { '(unknown)' }
-                    $Global:MetricsFailedSubs += [pscustomobject]@{ Name = '(subscription)'; Id = $IdLabel; Message = $MetricsSkipMsg }
+                    $Global:MetricsFailedSubs += [pscustomobject]@{ Name = '(subscription)'; Id = $IdLabel; Message = $MetricsSkipMsg; ReportFolder = $MetricsReportFolder }
                 }
                 else
                 {
                     foreach ($asub in $AffectedSubs)
                     {
-                        $Global:MetricsFailedSubs += [pscustomobject]@{ Name = $asub.Name; Id = $asub.Id; Message = $MetricsSkipMsg }
+                        $Global:MetricsFailedSubs += [pscustomobject]@{ Name = $asub.Name; Id = $asub.Id; Message = $MetricsSkipMsg; ReportFolder = $MetricsReportFolder }
                     }
                 }
                 return
