@@ -355,19 +355,60 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Global:ConsumptionRecordCount | Should -Be 1
     }
 
-    It 'says how many rows were written when a page fails part-way' {
+    It 'says how many rows were written when a later page fails' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         Mock Start-Sleep { }
         Mock Get-UsageAggregates {
-            $Bad = New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-2'
-            $Bad.Properties.InstanceData = $null
-            [pscustomobject]@{ UsageAggregations = @((New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'), $Bad); ContinuationToken = $null }
+            if ($ContinuationToken -eq 'page-2') { throw (New-StatusException -Message 'stand-in: the usage request was refused' -Status Forbidden) }
+            $Rows = @(
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-2')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = 'page-2' }
         }
         GetResorceConsumption
         @($Global:ConsumptionFailedSubs).Count | Should -Be 1
-        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 0
-        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'after 0 record\(s\)'
-        $Global:ConsumptionRecordCount | Should -Be 0
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 2
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 2, after 2 record\(s\)'
+        $Global:ConsumptionRecordCount | Should -Be 2
+    }
+
+    # The up-front check reads such a row as having no resource URI
+    # (Get-ConsumptionRowResourceUri); the billing phase keeps its cost.
+    It 'keeps a usage row whose InstanceData is <Case>, with blank resource fields, and collects the rest of the subscription' -ForEach @(
+        @{ Case = 'missing'; Value = $null }
+        @{ Case = 'empty'; Value = '' }
+        @{ Case = 'not JSON'; Value = '{"Microsoft.Resources": {' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:BadInstance = $Value
+        Mock Get-UsageAggregates {
+            if ($ContinuationToken -eq 'page-2')
+            {
+                return [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-3'); ContinuationToken = $null }
+            }
+            $Bad = New-UsageRow -ResourceUri 'placeholder' -Quantity 7.25
+            $Bad.Properties.InstanceData = $script:BadInstance
+            $Bad.Properties.MeterCategory = 'Support'
+            [pscustomobject]@{ UsageAggregations = @((New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'), $Bad); ContinuationToken = 'page-2' }
+        }
+        GetResorceConsumption
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        $Rows = @(Import-Csv -Path $Global:ConsumptionFileCsv)
+        $Rows.Count | Should -Be 3
+        $Global:ConsumptionRecordCount | Should -Be 3
+        $Kept = @($Rows | Where-Object { $_.MeterCategory -eq 'Support' })
+        $Kept.Count | Should -Be 1
+        $Kept[0].Quantity | Should -Be '7.25'
+        $Kept[0].ResourceId | Should -BeNullOrEmpty
+        $Kept[0].ResourceLocation | Should -BeNullOrEmpty
+        # Every field keeps the type it has in the other rows: blank text, not null.
+        $Instance = $Kept[0].InstanceData | ConvertFrom-Json
+        $Instance.'Microsoft.Resources'.ResourceUri | Should -BeExactly ''
+        $Instance.'Microsoft.Resources'.Location | Should -BeExactly ''
+        $Instance.'Microsoft.Resources'.additionalInfo.vCores | Should -Be 0
+        $Instance.'Microsoft.Resources'.additionalInfo.ServiceType | Should -BeExactly ''
     }
 
     It 'does not say a -ResourceGroup run cannot filter consumption by resource group, since it does' {

@@ -74,7 +74,9 @@ crash](#recovering-from-a-consumption-crash)).
 ## The columns
 
 The CSV has 15 columns. Ten come straight from each usage-aggregation record;
-five are derived from the `InstanceData` JSON on each record.
+five are derived from the `InstanceData` JSON on each record. A record whose
+`InstanceData` is missing or is not JSON is kept: its other columns are as
+returned and these five are empty.
 
 | Column | Source | Meaning |
 |--------|--------|---------|

@@ -1786,7 +1786,22 @@ function ExecuteInventoryProcessing()
 
                     for ($Item = 0; $Item -lt $UsageDataExport.Count; $Item++)
                     {
-                        $InstanceInfo = ($UsageDataExport[$Item].InstanceData.tolower() | ConvertFrom-Json)
+                        # A row whose InstanceData is missing or not JSON keeps its cost with
+                        # blank resource fields, as the up-front check reads such a row
+                        # (Get-ConsumptionRowResourceUri); it does not stop the subscription.
+                        # The blank fields are empty text, not null, so each field keeps the
+                        # type it has in every other row.
+                        $InstanceInfo = $null
+                        $InstanceText = [string]$UsageDataExport[$Item].InstanceData
+                        if (-not [string]::IsNullOrWhiteSpace($InstanceText))
+                        {
+                            try { $InstanceInfo = ($InstanceText.tolower() | ConvertFrom-Json -ErrorAction Stop) }
+                            catch { $InstanceInfo = $null }
+                        }
+                        if ($null -eq $InstanceInfo)
+                        {
+                            $InstanceInfo = [pscustomobject]@{ 'microsoft.resources' = [pscustomobject]@{ resourceuri = ''; location = ''; additionalinfo = [pscustomobject]@{} } }
+                        }
 
                         if (![string]::IsNullOrEmpty($ResourceGroup))
                         {
