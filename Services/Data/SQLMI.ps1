@@ -14,6 +14,15 @@ if ($Task -eq 'Processing')
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
             $Databases = $SQLSERVERMIDB | Where-Object { $_.Id -like "$($1.Id)/databases/*" }
+            # Backup storage redundancy: older API shapes name it storageAccountType,
+            # current ones report currentBackupStorageRedundancy (in effect) and
+            # requestedBackupStorageRedundancy (asked for). Take the first that is a
+            # non-empty string.
+            $BackupStorage = $null
+            foreach ($Candidate in @($Data.storageAccountType, $Data.currentBackupStorageRedundancy, $Data.requestedBackupStorageRedundancy))
+            {
+                if ($Candidate -is [string] -and $Candidate -ne '') { $BackupStorage = $Candidate; break }
+            }
 
             $Obj = @{
                 'ID'                            = $1.id;
@@ -28,7 +37,7 @@ if ($Task -eq 'Processing')
                 'InstancePoolName'              = if (![string]::IsNullOrEmpty($Data.instancePoolId) -and $null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { if ($ResourceIdDictionary.ContainsKey($Data.instancePoolId)) { $ResourceIdDictionary[$Data.instancePoolId] } else { 'obfuscated' } } else { $Data.instancePoolId };
                 'vCores'                        = $Data.vCores;
                 'StorageGB'                     = $Data.storageSizeInGB;
-                'StorageAccountType'            = $Data.storageAccountType;
+                'StorageAccountType'            = $BackupStorage;
                 'LicenseType'                   = $Data.licenseType;
                 'State'                         = $Data.state;
                 'ManagedInstanceCreateMode'     = $Data.managedInstanceCreateMode;
