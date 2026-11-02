@@ -11,7 +11,9 @@
 # made. Every result is derived from the inputs. The disk name selects one
 # behaviour for the 'Composite Disk Read Operations/sec' call of that disk:
 #   -throttled   429 error on every attempt (outcome Throttled)
-#   -badmetric   invalid metric name error on every attempt (outcome Error)
+#   -badmetric   invalid metric name error on every attempt, as Get-AzMetric
+#                throws it: a PSInvalidOperationException whose message holds
+#                the HTTP 400 BadRequest status (outcome Error)
 #   -empty       no data points (outcome Success)
 #   -slow<ms>    succeeds after the given delay
 # Durations are measured by the script, so the seconds are masked when lines
@@ -29,7 +31,9 @@ BeforeAll {
     $script:SubId = '12345678-1234-1234-1234-123456789012'
     $script:ReadOps = 'Composite Disk Read Operations/sec'
     $script:ThrottleMessage = "Operation returned an invalid status code 'TooManyRequests' (429)"
-    $script:BadMetricMessage = 'Failed to find metric configuration for provider: Microsoft.Compute, resource Type: disks, metric: {0}' -f $script:ReadOps
+    # Get-AzMetric's outer error for a metric name Azure rejects: it has no
+    # status code of its own, and its message names the 400 BadRequest answer.
+    $script:BadMetricMessage = "Exception type: ErrorResponseException, Message: Microsoft.Azure.Management.Monitor.Models.ErrorResponseException: Operation returned an invalid status code 'BadRequest'. Failed to find metric configuration for provider: Microsoft.Compute, resource Type: disks, metric: {0}" -f $script:ReadOps
 
     $StubModuleDir = Join-Path $TestDrive 'Modules/RdaMetricStub'
     New-Item -ItemType Directory -Path $StubModuleDir -Force | Out-Null
@@ -49,7 +53,7 @@ function Get-AzMetric
     if ($Names.Count -eq 1 -and $Names[0] -eq '__READOPS__')
     {
         if ($DiskName -like '*-throttled') { throw "__THROTTLE__" }
-        if ($DiskName -like '*-badmetric') { throw "__BADMETRIC__" }
+        if ($DiskName -like '*-badmetric') { throw [System.Management.Automation.PSInvalidOperationException]::new("__BADMETRIC__") }
         if ($DiskName -match '-slow(\d+)$') { Start-Sleep -Milliseconds ([int]$Matches[1]) }
     }
 
@@ -223,12 +227,17 @@ Describe 'Metrics phase diagnostics across several batches' {
 
     It 'writes the summary sections in order' {
         $Log = $script:Run.Log
-        $Log.Count | Should -Be 14
+        # 14 summary lines, then the metrics-incomplete line (the next case).
+        $Log.Count | Should -Be 15
         $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
         $Log[1] | Should -Be '[Metrics] ===== Metrics phase summary ====='
         $Log[3] | Should -Be '[Metrics] Azure Monitor requests: 207 for 800 metric definition(s), of which 7 single-metric fallback request(s); retries not counted'
         $Log[4] | Should -Be '[Metrics] Non-success calls (where it got stuck):'
         $Log[8] | Should -Be '[Metrics] Slowest 5 calls:'
+    }
+
+    It 'marks the subscription metrics incomplete for the single-metric request that kept failing without BadRequest (the throttled one) only, not for the metric names Azure rejected with BadRequest' {
+        $script:Run.Log[14] | Should -Be '[Metrics] Metrics incomplete for 1 subscription(s): Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
     }
 
     It 'counts every call by outcome, including a status seen only in the first batch' {
