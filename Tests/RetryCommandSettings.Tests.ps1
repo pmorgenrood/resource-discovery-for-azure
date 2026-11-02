@@ -194,6 +194,21 @@ Describe 'The sign-in and output switches a printed command carries' {
         $Values['Appid'] | Should -Be 'app-a'
     }
 
+    It 'a path with a <Label> single quote gives a command that parses and passes the path back unchanged' -ForEach @(
+        @{ Label = 'typographic'; Quote = [string][char]0x2019 }
+        @{ Label = 'plain'; Quote = "'" }
+    ) {
+        $Path = '/tmp/it{0}s here/out' -f $Quote
+        $Command = Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -OutputDirectory $Path
+        $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Command, [ref]$null, [ref]$Errors)
+        @($Errors) | Should -BeNullOrEmpty
+        $Elements = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))[0].CommandElements
+        $At = [array]::IndexOf(@($Elements | ForEach-Object { if ($_ -is [System.Management.Automation.Language.CommandParameterAst]) { $_.ParameterName } else { '' } }), 'OutputDirectory')
+        $At | Should -BeGreaterThan 0
+        $Elements[$At + 1].SafeGetValue() | Should -BeExactly $Path
+    }
+
     It 'a value not given is left out' {
         Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -Appid '' -Service @() -OutputDirectory '' -ObfuscationDictionary '' | Should -Be './ResourceInventory.ps1 -SubscriptionID sub-a'
     }

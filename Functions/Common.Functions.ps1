@@ -1891,12 +1891,15 @@ function Format-RunDataSwitches
     return (-join @(foreach ($Name in @($Settings.Keys)) { if ($Settings[$Name]) { ' -' + $Name } }))
 }
 
-# A value as a printed command gives it: in single quotes, a single quote in it
-# doubled, so a path with spaces, quotes or parentheses is passed as one value.
+# A value as a printed command gives it: in single quotes, escaped by
+# PowerShell's own CodeGeneration API (as the Remove-Item commands in
+# Functions/RunAllSubscriptions.Functions.ps1 are), which also doubles the
+# typographic single quotes PowerShell reads as quotes, so a path with spaces,
+# quotes or parentheses is passed as one value.
 function Format-CommandValue
 {
     param([string]$Value)
-    return ("'{0}'" -f ($Value -replace "'", "''"))
+    return ("'{0}'" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value))
 }
 
 # The command that collects one subscription again with a direct
