@@ -7,8 +7,8 @@
 # that the run then says so, does not print the zip's path as written, and ends
 # with exit code 2, and that the path is printed only after the last check.
 #
-# The bundling block, the fold block, the check after it, the banner and the
-# exit-code statements are taken from the wrapper's parsed source and run as written. The wrapper itself
+# The report zip check, the bundling block, the fold block, the check after it,
+# the banner and the exit-code statements are taken from the wrapper's parsed source and run as written. The wrapper itself
 # cannot run here (it needs a signed-in Azure session). Compress-Archive is real,
 # except where a test says it is mocked.
 #
@@ -334,17 +334,46 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         $script:EmptyLists = @($TailAst.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
                 ForEach-Object { $_.VariablePath.UserPath } | Sort-Object -Unique | Where-Object { $Assigned -notcontains $_ -and $Given -notcontains $_ })
 
-        # Runs the wrapper's tail in a child pwsh, since it ends with 'exit'. Returns the exit code.
+        # The end of a run as the wrapper has it, from the expected report zip count
+        # through the report zip check and the bundling block, for a run that
+        # completed $RunCount subscriptions and carried $CarriedCount reports, with
+        # its inventory folder at $Root.
+        $ExpectedAssignment = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$ExpectedZipCount' })
+        if ($ExpectedAssignment.Count -ne 1) { throw ('expected exactly one top-level $ExpectedZipCount assignment in Run-AllSubscriptions.ps1, found {0}' -f $ExpectedAssignment.Count) }
+        $script:EndOfRunText = @(
+            $ExpectedAssignment[0].Extent.Text
+            '$MissingReports = @()'
+            '$MissingReportCount = 0'
+            (Find-WrapperIf -Condition '$ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container)' -Contains 'Per-subscription output verification').Extent.Text
+            '$OuterZipFile = $null'
+            '$BundleBuildError = $null'
+            (Find-WrapperIf -Condition 'Test-Path -Path $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text
+        ) -join "`n"
+        function script:Get-EndOfRunText
+        {
+            param([string]$Root, [int]$RunCount, [int]$CarriedCount)
+            @(
+                ('$InventoryRoot = ''{0}''' -f $Root.Replace("'", "''"))
+                # -First: 1..0 counts down to 0, so it is not an empty range.
+                ('$SubResourceCounts = @(1..{0} | Select-Object -First {0} | ForEach-Object {{ [pscustomobject]@{{ Name = ''sub-'' + $_; Id = ''sub-'' + $_; Count = 1 }} }})' -f $RunCount)
+                ('$CarriedReports = @(1..{0} | Select-Object -First {0} | ForEach-Object {{ [pscustomobject]@{{ Name = ''carried-'' + $_; Id = ''carried-'' + $_ }} }})' -f $CarriedCount)
+                '$RunReports = @()'
+                $script:EndOfRunText
+            ) -join "`n"
+        }
+
+        # Runs the wrapper's tail in a child pwsh, since it ends with 'exit'. Returns
+        # the exit code. -Before is wrapper text run ahead of the tail.
         function script:Invoke-Tail
         {
-            param([string]$BundleBuildError, [string[]]$AuthSkippedPhases = @(), [int]$CollectorFailureCount = 0)
+            param([string]$BundleBuildError, [string[]]$AuthSkippedPhases = @(), [int]$CollectorFailureCount = 0, [string]$Before = '')
             $Script = Join-Path $TestDrive ('tail-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
             $Preamble = @(
                 ('. ''{0}''' -f $script:FunctionsPath.Replace("'", "''"))
                 $(if ($BundleBuildError) { '$BundleBuildError = ''{0}''' -f $BundleBuildError.Replace("'", "''") } else { '$BundleBuildError = $null' })
                 ('$AuthSkippedPhases = @({0})' -f ((@($AuthSkippedPhases) | ForEach-Object { "'$_'" }) -join ','))
                 $(if ($CollectorFailureCount -gt 0) { '$Global:CollectorFailures = @(1..{0} | ForEach-Object {{ [pscustomobject]@{{ Id = ''sub'' }} }})' -f $CollectorFailureCount } else { '$Global:CollectorFailures = @()' })
-            ) + @($script:EmptyLists | ForEach-Object { '${0} = @()' -f $_ })
+            ) + @($script:EmptyLists | ForEach-Object { '${0} = @()' -f $_ }) + @($Before)
             Set-Content -LiteralPath $Script -Value (($Preamble -join "`n") + "`n" + $script:TailText)
             & $script:Pwsh -NoProfile -NonInteractive -File $Script *> $null
             $LASTEXITCODE
@@ -383,6 +412,17 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
     It 'exit code 2 when the zip is missing, also over 3-5' {
         Invoke-Tail -BundleBuildError 'Could not build x: y' | Should -Be 2
         Invoke-Tail -BundleBuildError 'Could not build x: y' -AuthSkippedPhases 'Metrics' -CollectorFailureCount 1 | Should -Be 2
+    }
+
+    It 'the inventory folder gone at the end of a run that expected report zips: every one of them counts as missing, exit code 2' {
+        $Gone = Join-Path $TestDrive 'folder-gone'
+        $Printed = @(. ([scriptblock]::Create((Get-EndOfRunText -Root $Gone -RunCount 1 -CarriedCount 1))) 6>&1 | ConvertTo-Lines)
+        $Printed | Should -Contain ('Inventory root not found at {0}. Nothing to consolidate.' -f $Gone)
+        $MissingReportCount | Should -Be 2
+        $OuterZipFile | Should -BeNullOrEmpty
+        Invoke-Tail -BundleBuildError $null -Before (Get-EndOfRunText -Root $Gone -RunCount 1 -CarriedCount 0) | Should -Be 2
+        # A run that expected no report zip keeps its exit code.
+        Invoke-Tail -BundleBuildError $null -Before (Get-EndOfRunText -Root $Gone -RunCount 0 -CarriedCount 0) | Should -Be 0
     }
 
     It 'the other exit codes are unchanged when the zip was built' {

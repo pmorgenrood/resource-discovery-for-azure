@@ -2592,6 +2592,9 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
 else
 {
     Write-Host ("Inventory root not found at {0}. Nothing to consolidate." -f $InventoryRoot) -ForegroundColor Yellow
+    # Every report zip the run expected went with the folder, so none of them is
+    # in a consolidated zip (exit code 2 below).
+    if ($ExpectedZipCount -gt 0) { $MissingReportCount = $ExpectedZipCount }
 }
 
 # Aggregate "main" HTML summary across all per-subscription reports from
