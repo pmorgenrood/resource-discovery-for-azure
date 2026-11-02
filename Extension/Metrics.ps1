@@ -526,6 +526,11 @@ if ($Task -eq 'Processing')
     # lock (Monitor) on the array itself.
     $MetricRequestCounts = [long[]]::new(2)
 
+    # The resource id of every grouped request that still failed after its retries
+    # for a reason other than BadRequest (throttling, timeout, server error). Their
+    # subscriptions are recorded as metrics incomplete at the end of the phase.
+    $MetricFailedGroupIds = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
     # $MetricCount is the number of definitions to send, as it was when the batch
     # loop counted definitions: with none to send, no group and no call is made.
     if ($MetricCount -gt 0)
@@ -571,6 +576,7 @@ if ($Task -eq 'Processing')
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
                 $RequestCounts = $using:MetricRequestCounts
+                $FailedGroupIds = $using:MetricFailedGroupIds
                 # Start-ThreadJob has its own process-wide throttle (5 by default), so the
                 # run's limit is passed to it too; otherwise no more than 5 calls are in
                 # flight whatever -ConcurrencyLimit says.
@@ -913,6 +919,10 @@ if ($Task -eq 'Processing')
                     # reports this time even when it is recorded after a fallback request
                     # for another metric of the group.
                     $GroupSeconds = $CallStopwatch.Elapsed.TotalSeconds
+                    if (-not $Request.Succeeded -and -not $Request.BadRequest)
+                    {
+                        $FailedGroupIds.Add([string]$GroupDefs[0].Id)
+                    }
 
                     # Index the response by metric name so each definition gets its own metric.
                     $ReturnedMetrics = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -1047,6 +1057,28 @@ if ($Task -eq 'Processing')
         {
             Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6})" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome)
         }
+    }
+
+    # A subscription with a grouped request that still failed after its retries
+    # (not BadRequest) is metrics incomplete: one entry in $Global:MetricsFailedSubs,
+    # as for metrics skipped for the sign-in, with Complete = $false so the wrapper
+    # tells the two apart. The wrapper lists it at the end of the run and keeps it
+    # on the retry list; the failed records stay in the report with MetricError true.
+    if ($MetricFailedGroupIds.Count -gt 0)
+    {
+        $FailedIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MetricFailedGroupIds), [System.StringComparer]::OrdinalIgnoreCase)
+        $FailedSubIds = @($Resources | Where-Object { $null -ne $_ -and $FailedIdSet.Contains([string]$_.Id) } | ForEach-Object { [string]$_.subscriptionId } | Select-Object -Unique)
+        $MetricsReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
+        $IncompleteMsg = ('Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.' -f $FailedIdSet.Count)
+        if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
+        foreach ($FailedSubId in $FailedSubIds)
+        {
+            $FailedSub = $SubLookup[$FailedSubId]
+            $FailedSubName = if ($null -ne $FailedSub -and -not [string]::IsNullOrEmpty([string]$FailedSub.Name)) { [string]$FailedSub.Name } else { '(subscription)' }
+            $Global:MetricsFailedSubs += [pscustomobject]@{ Name = $FailedSubName; Id = $FailedSubId; Message = $IncompleteMsg; ReportFolder = $MetricsReportFolder; Complete = $false }
+        }
+        Write-MetricsDiag ("Metrics incomplete for {0} subscription(s): {1}" -f $FailedSubIds.Count, $IncompleteMsg)
+        Write-Log -Message ('Metrics incomplete: {0}' -f $IncompleteMsg) -Severity 'Warning'
     }
 
     $WarningPreference = "Continue"

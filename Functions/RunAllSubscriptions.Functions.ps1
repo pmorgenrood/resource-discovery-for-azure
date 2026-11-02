@@ -751,10 +751,15 @@ function Get-WrapperExitCode
 {
     param(
         [bool]$AuthSkipped,
-        [bool]$CollectorsFailed
+        [bool]$CollectorsFailed,
+        # A subscription's grouped Azure Monitor request still failed after its
+        # retries (throttling, timeout, server error): its metrics are
+        # incomplete, so 3, as for a data phase skipped for the sign-in.
+        [bool]$MetricsIncomplete = $false
     )
-    if ($AuthSkipped -and $CollectorsFailed) { return 5 }
-    if ($AuthSkipped) { return 3 }
+    $DataIncomplete = $AuthSkipped -or $MetricsIncomplete
+    if ($DataIncomplete -and $CollectorsFailed) { return 5 }
+    if ($DataIncomplete) { return 3 }
     if ($CollectorsFailed) { return 4 }
     return 0
 }

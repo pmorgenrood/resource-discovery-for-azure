@@ -1943,7 +1943,9 @@ if ($ConsumptionFailures.Count -gt 0)
 # this the metrics sheet is silently empty and looks like "no metric-eligible
 # resources" rather than an auth failure. Listed per-subscription so the
 # operator knows exactly which subs are missing metrics.
-$MetricsFailures = if ($null -ne $Global:MetricsFailedSubs) { @($Global:MetricsFailedSubs) } else { @() }
+# Metrics left incomplete because Azure Monitor kept failing (Complete = $false)
+# are not a sign-in problem: they are in FAILED (metrics) at the end of the run.
+$MetricsFailures = if ($null -ne $Global:MetricsFailedSubs) { @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) }) } else { @() }
 if ($MetricsFailures.Count -gt 0)
 {
     Write-Host ""
@@ -2130,7 +2132,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
 # annotated (server-side ingestion expects fixed columns); this banner is the
 # human-facing signal, and the non-zero exit below is the machine-facing one.
 $AuthSkippedPhases = @()
-if (@($Global:MetricsFailedSubs).Count -gt 0) { $AuthSkippedPhases += 'Metrics' }
+if (@(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) }).Count -gt 0) { $AuthSkippedPhases += 'Metrics' }
 $ConsumptionAuthSkipped = @(
     if ($null -ne $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs } else { @() }
 ) | Where-Object { $_.Id -eq '(auth)' }
@@ -2147,6 +2149,13 @@ if ($AuthSkippedPhases.Count -gt 0)
     Write-Host "The rest of the inventory completed and the report was still produced." -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Red
 }
+
+# A subscription whose grouped Azure Monitor request still failed after its
+# retries (throttling, timeout, server error) has incomplete metrics: listed
+# with the command that collects it again, and exit 3 (5 with collector
+# failures), as for a data phase skipped for the sign-in.
+$MetricsIncompleteEntries = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
+Write-MetricsIncompleteBanner -Entries $MetricsIncompleteEntries -Advice (@('To collect one again, run:') + @($MetricsIncompleteEntries | ForEach-Object { '  ./ResourceInventory.ps1 -TenantID {0} -SubscriptionID {1}' -f $TenantID, $_.Id }))
 
 # Machine-facing signal for collector failures (#22), distinct from the auth
 # banner above. A collector failure is not an auth problem - it means one or
@@ -2178,7 +2187,7 @@ if ($WrapperTranscriptStarted)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -MetricsIncomplete ($MetricsIncompleteEntries.Count -gt 0)
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode

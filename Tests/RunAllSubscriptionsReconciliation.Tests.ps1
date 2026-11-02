@@ -155,6 +155,21 @@ Describe 'Merge-FailedAttempts' {
     }
 }
 
+Describe 'Get-WrapperExitCode with incomplete metrics' {
+    It 'returns 3 when only the metrics of a subscription are incomplete' {
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $false -MetricsIncomplete $true | Should -Be 3
+    }
+
+    It 'returns 5 when metrics are incomplete and a collector failed' {
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $true -MetricsIncomplete $true | Should -Be 5
+    }
+
+    It 'keeps 0 and 4 when metrics are complete' {
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $false -MetricsIncomplete $false | Should -Be 0
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $true -MetricsIncomplete $false | Should -Be 4
+    }
+}
+
 Describe 'Get-WrapperExitCode' {
     It 'Returns 0 when neither auth-skip nor collector failures occurred' {
         Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $false | Should -Be 0

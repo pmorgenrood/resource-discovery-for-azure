@@ -608,3 +608,58 @@ Describe 'Metrics.ps1 batches' {
         $Run.Calls.Count | Should -Be 125
     }
 }
+
+Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its retries' {
+    BeforeAll {
+        $script:IncompleteDisk = New-TestDisk -Name 'disk-incomplete'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_incomplete') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'records the subscription as metrics incomplete when the grouped request fails with <MultiError> on every attempt' -ForEach @(@{ MultiError = 'Throttled' }, @{ MultiError = 'ServerError' }) {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName ('incomplete-' + $MultiError) -MultiError $MultiError
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Name | Should -Be 'test-subscription'
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeOfType [bool]
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].ReportFolder | Should -Be 'ResourcesReport_incomplete'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
+
+        # The grouped request is kept: no request for one metric is made.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -ne 4 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        foreach ($Record in $Run.Records)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricTotalCount | Should -Be 0
+        }
+        @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 1 subscription(s): Azure Monitor requests for 1 resource(s) still failed after their retries*' }).Count | Should -Be 1
+    }
+
+    It 'does not record it when Azure rejects the grouped request with BadRequest and each metric succeeds on its own' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-badrequest' -MultiError 'BadRequest'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'does not record a subscription whose requests succeed' {
+        $null = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-clean'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+    }
+}

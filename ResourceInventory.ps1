@@ -1832,3 +1832,18 @@ catch
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+
+# A direct run whose metrics are incomplete because a grouped Azure Monitor
+# request still failed after its retries (throttling, timeout, server error)
+# names each subscription with the command that collects it again, and exits 3.
+# Under -RunAllSubs the wrapper does this for the whole run.
+if (-not $RunAllSubs.IsPresent)
+{
+    $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
+    if ($MetricsIncomplete.Count -gt 0)
+    {
+        $RetryTenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
+        Write-MetricsIncompleteBanner -Entries $MetricsIncomplete -Advice (@('To collect one again, run:') + @($MetricsIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+        exit 3
+    }
+}

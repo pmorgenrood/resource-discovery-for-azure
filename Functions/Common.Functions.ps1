@@ -252,3 +252,43 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
         }
     }
 }
+
+# The metrics entries of the subscriptions whose grouped Azure Monitor request
+# still failed after its retries (Extension/Metrics.ps1 records them with
+# Complete = $false), unique by name and id. Leaves out the entries for metrics
+# skipped because the sign-in could not be refreshed, which the wrapper reports
+# in its FAILED (auth) banner.
+function Get-MetricsIncompleteEntries
+{
+    param([object[]]$Entries)
+    @(@($Entries) | Where-Object { Test-MetricsIncompleteEntry -Entry $_ } | Sort-Object Name, Id -Unique)
+}
+
+# True for a metrics entry recorded as incomplete (Complete = $false), false for
+# one recorded because the sign-in could not be refreshed (no Complete field).
+function Test-MetricsIncompleteEntry
+{
+    param([object]$Entry)
+    $null -ne $Entry -and $null -ne $Entry.PSObject.Properties['Complete'] -and $Entry.Complete -eq $false
+}
+
+# The last lines of a run in which the metrics of one or more subscriptions are
+# incomplete because Azure Monitor kept failing: each subscription, then $Advice
+# (the command that collects them again). Run-AllSubscriptions.ps1 and direct
+# runs of ResourceInventory.ps1 then exit 3 (5 with a collector failure).
+# Prints nothing when there are none.
+function Write-MetricsIncompleteBanner
+{
+    param([object[]]$Entries, [string[]]$Advice)
+    $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '=================== FAILED (metrics) ===================' -ForegroundColor Red
+    Write-Host ('Metrics are incomplete for {0} subscription(s): Azure Monitor requests still failed after their retries (throttling, timeout or server error):' -f $List.Count) -ForegroundColor Red
+    foreach ($Entry in $List)
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Red
+    }
+    foreach ($Line in @($Advice)) { Write-Host $Line -ForegroundColor Red }
+    Write-Host '========================================================' -ForegroundColor Red
+}
