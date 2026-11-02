@@ -2252,6 +2252,13 @@ Describe 'A lock this run cannot keep safely' -Skip:$IsWindows {
     }
 
     It 'the release at process exit cannot be compiled: one warning and the run goes on; an error that ends it then leaves its lock, the next run stops with the remove command, and after it the next two runs proceed' {
+        # Without the release at process exit, the heartbeat is what removes the
+        # lock once the command that started the run has ended; it checks every
+        # 250 ms. A 'pwsh -File' run that ends with an error leaves its lock when
+        # its process exits before that check, which is the case this test is
+        # about. On a slow host the process can outlive the check, so the
+        # stand-in keeps the heartbeat from seeing the end, as when the process
+        # exits at once.
         $Variant = script:New-ToolVariant -Name 'no-compiler' -Append @'
 function Add-Type
 {
@@ -2260,6 +2267,7 @@ function Add-Type
     if ($TypeDefinition) { throw 'stand-in: no compiler' }
     Microsoft.PowerShell.Utility\Add-Type -AssemblyName $AssemblyName
 }
+function Get-RunLockInvocationState { param([Parameter(Mandatory = $true)]$State) return 'Running' }
 '@
         script:Set-Scenario -Subs 'A'
         $Run = script:Invoke-Wrapper -Run 'r1' -Wrapper $Variant
