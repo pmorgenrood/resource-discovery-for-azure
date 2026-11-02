@@ -290,7 +290,7 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         script:Get-Banner $R1 | Should -Be @(
             '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
             ('  - {0} ({1})' -f $B.Name, $B.Id)
-            'The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
+            'The resume state is kept. Run the same command again (without -Fresh), or with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
         )
         @($R1.State.CompletedSubscriptionIds | Sort-Object) | Should -Be (script:Get-Ids 'A', 'C')
         $Entries = @($R1.State.FailedAttempts)
