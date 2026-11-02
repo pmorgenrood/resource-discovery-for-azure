@@ -2412,9 +2412,19 @@ $CollectorFailureCount = @(@($script:CollectorFailuresThisRun) | Where-Object { 
 $ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
 if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFile))
 {
+    # A consumption phase skipped because the sign-in could not be refreshed
+    # (the '(auth)' entry) collected no billing data for any subscription of
+    # the run: each of them is listed the same way and the run exits 3 (5), as
+    # the wrapper does for a sign-in skip.
+    $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
+    if ($ConsumptionSignInSkipped)
+    {
+        $ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries (@($ConsumptionIncomplete) + @(@($Global:Subscriptions) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Id = $_.Id } })))
+    }
     $RetryTenant = if (-not [string]::IsNullOrEmpty($TenantID)) { $TenantID } else { $script:RdaRunTenant }
     $RetryTenantArg = if (-not [string]::IsNullOrEmpty($RetryTenant)) { ' -TenantID {0}' -f $RetryTenant } else { '' }
-    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
     $DirectExitCode = if ($ConsumptionIncomplete.Count -gt 0 -and $CollectorFailureCount -gt 0) { 5 } elseif ($ConsumptionIncomplete.Count -gt 0) { 3 } elseif ($CollectorFailureCount -gt 0) { 4 } else { 0 }
     if ($DirectExitCode -ne 0) { exit $DirectExitCode }
 }

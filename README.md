@@ -709,10 +709,10 @@ A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) also sets an exit c
 
 | Code | Meaning |
 |---|---|
-| `0` | Completed; the report and zip were written, no collector failed and every consumption download finished. |
+| `0` | Completed; the report and zip were written, no collector failed and every consumption download finished (or `-SkipConsumption` was given). |
 | `1` | The run stopped during setup, before it collected anything, and the red error line printed before it gives the cause: for example a pre-flight check (`-Service` matched no collector, the `-ObfuscationDictionary` file is missing or not valid JSON), the output folder cannot be written, a required Az PowerShell module is missing, a service principal sign-in has no `-Secret`, `-ResourceGroup` is given without `-SubscriptionID`, or the consumption data check stopped it. |
 | `2` | The run ended without writing its report zip, and its last console line says `No report was written`. This happens, for example, when 5 collectors failed in a row and collection stopped, or when the HTML report or the zip could not be written; the errors printed before that line give the cause. |
-| `3` | Completed and the report and zip were written, but the consumption (billing) download of one or more subscriptions failed or stopped part-way, so their cost data is missing or incomplete. The run ends with the "FAILED (consumption)" lines, which name each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. A direct run keeps no retry list. |
+| `3` | Completed and the report and zip were written, but the consumption (billing) download of one or more subscriptions failed or stopped part-way, or the consumption phase was skipped because the sign-in could not be refreshed (no usable Azure context/token after one reconnect attempt), so their cost data is missing or incomplete. The run ends with the "FAILED (consumption)" lines, which name each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. A direct run keeps no retry list. |
 | `4` | Completed and the report and zip were written, but one or more `Services/*/*.ps1` collectors failed. Those resource types are missing (not empty) from the report; its "Incomplete collection" banner names them. |
 | `5` | Both `3` and `4` occurred in the same run. |
 
