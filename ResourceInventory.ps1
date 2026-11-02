@@ -2421,6 +2421,10 @@ if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFil
     $RetryTenantArg = if (-not [string]::IsNullOrEmpty($RetryTenant)) { ' -TenantID {0}' -f $RetryTenant } else { '' }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
     Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
-    $DirectExitCode = if ($ConsumptionIncomplete.Count -gt 0 -and $CollectorFailureCount -gt 0) { 5 } elseif ($ConsumptionIncomplete.Count -gt 0) { 3 } elseif ($CollectorFailureCount -gt 0) { 4 } else { 0 }
+    # Metrics left incomplete because Azure Monitor kept failing: the same lines and codes.
+    $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
+    Write-MetricsIncompleteBanner -Entries $MetricsIncomplete -Advice (@('To collect one again, run:') + @($MetricsIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    $DataIncomplete = $ConsumptionIncomplete.Count -gt 0 -or $MetricsIncomplete.Count -gt 0
+    $DirectExitCode = if ($DataIncomplete -and $CollectorFailureCount -gt 0) { 5 } elseif ($DataIncomplete) { 3 } elseif ($CollectorFailureCount -gt 0) { 4 } else { 0 }
     if ($DirectExitCode -ne 0) { exit $DirectExitCode }
 }

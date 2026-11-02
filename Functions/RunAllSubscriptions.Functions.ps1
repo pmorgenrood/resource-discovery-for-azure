@@ -2843,6 +2843,10 @@ function Get-WrapperExitCode
         # reason other than the sign-in: its cost data is incomplete, so 3, as
         # for a data phase skipped for the sign-in.
         [bool]$ConsumptionFailed = $false,
+        # A subscription's grouped Azure Monitor request still failed after its
+        # retries (throttling, timeout, server error): its metrics are
+        # incomplete, so 3, as for a failed billing download.
+        [bool]$MetricsIncomplete = $false,
         # A -Resume run skipped a subscription whose earlier report zip could not
         # be carried into the consolidated zip, so that report is missing from it.
         # Same meaning as the verification gap (2) and takes precedence over 3-5:
@@ -2854,7 +2858,7 @@ function Get-WrapperExitCode
         [bool]$SubscriptionsFailed = $false
     )
     if ($ReportsMissing -or $SubscriptionsFailed) { return 2 }
-    $DataIncomplete = $AuthSkipped -or $ConsumptionFailed
+    $DataIncomplete = $AuthSkipped -or $ConsumptionFailed -or $MetricsIncomplete
     if ($DataIncomplete -and $CollectorsFailed) { return 5 }
     if ($DataIncomplete) { return 3 }
     if ($CollectorsFailed) { return 4 }
