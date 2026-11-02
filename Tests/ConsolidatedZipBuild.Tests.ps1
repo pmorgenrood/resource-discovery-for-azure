@@ -119,6 +119,28 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         }
     }
 
+    It 'a consolidated zip of another run with the same second''s name is never written over: this run takes the next free name' {
+        $Root = Join-Path $TestDrive 'same-second'
+        $null = New-SubReport -Root $Root -Stamp 'X1'
+        Mock Get-Date { [datetime]'2026-11-02T15:04:05' } -ParameterFilter { $Format -eq 'yyyy-MM-dd_HH-mm-ss' }
+        $Other = Join-Path $Root 'AllSubscriptions_ResourcesReport_2026-11-02_15-04-05.zip'
+        Set-Content -LiteralPath $Other -Value 'another run' -NoNewline
+        $R = Invoke-BundleBlock -Root $Root
+        $R.BundleBuildError | Should -BeNullOrEmpty
+        $R.OuterZipFile | Should -Be (Join-Path $Root 'AllSubscriptions_ResourcesReport_2026-11-02_15-04-05-2.zip')
+        Get-Content -LiteralPath $Other -Raw | Should -Be 'another run'
+        (Get-ZipEntryNames -Path $R.OuterZipFile) | Should -Be @('ResourcesReport_X1.zip')
+    }
+
+    It 'a consolidated zip that cannot be built leaves no empty file under the name it took' {
+        $Root = Join-Path $TestDrive 'reserved-failed'
+        $null = New-SubReport -Root $Root -Stamp 'F9'
+        Mock Compress-Archive { throw [System.IO.IOException]::new('No space left on device') } -ParameterFilter { -not $Update }
+        $R = Invoke-BundleBlock -Root $Root
+        $R.BundleBuildError | Should -Not -BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath $Root -Filter 'AllSubscriptions_ResourcesReport_*.zip' -File) | Should -BeNullOrEmpty
+    }
+
     It 'a report zip held open by another process: the error names it, no zip is reported as written' {
         $Root = Join-Path $TestDrive 'locked'
         $null = New-SubReport -Root $Root -Stamp 'L1'
@@ -326,5 +348,31 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         Invoke-Tail -BundleBuildError $null -AuthSkippedPhases 'Metrics' | Should -Be 3
         Invoke-Tail -BundleBuildError $null -CollectorFailureCount 1 | Should -Be 4
         Invoke-Tail -BundleBuildError $null -AuthSkippedPhases 'Metrics' -CollectorFailureCount 1 | Should -Be 5
+    }
+}
+
+Describe 'New-RunOutputFile: a new file, never one that is there' {
+    It 'creates the name given when it is free' {
+        $Path = New-RunOutputFile -Directory $TestDrive -Stem 'MainSummary_2026-11-02_15-04-05' -Extension '.html'
+        $Path | Should -Be (Join-Path $TestDrive 'MainSummary_2026-11-02_15-04-05.html')
+        (Get-Item -LiteralPath $Path).Length | Should -Be 0
+    }
+
+    It 'takes -2, then -3, when the names before are there, and leaves those files as they were' {
+        $Dir = Join-Path $TestDrive 'taken'
+        $null = New-Item -ItemType Directory -Path $Dir
+        Set-Content -LiteralPath (Join-Path $Dir 'RunAllSubscriptions_transcript_x.txt') -Value 'first' -NoNewline
+        (New-RunOutputFile -Directory $Dir -Stem 'RunAllSubscriptions_transcript_x' -Extension '.txt') | Should -Be (Join-Path $Dir 'RunAllSubscriptions_transcript_x-2.txt')
+        (New-RunOutputFile -Directory $Dir -Stem 'RunAllSubscriptions_transcript_x' -Extension '.txt') | Should -Be (Join-Path $Dir 'RunAllSubscriptions_transcript_x-3.txt')
+        Get-Content -LiteralPath (Join-Path $Dir 'RunAllSubscriptions_transcript_x.txt') -Raw | Should -Be 'first'
+    }
+
+    It 'says so when every name up to -100 is taken, and creates nothing' {
+        $Dir = Join-Path $TestDrive 'full'
+        $null = New-Item -ItemType Directory -Path $Dir
+        $null = New-Item -ItemType File -Path (Join-Path $Dir 'z.zip')
+        foreach ($N in 2..100) { $null = New-Item -ItemType File -Path (Join-Path $Dir ('z-{0}.zip' -f $N)) }
+        { New-RunOutputFile -Directory $Dir -Stem 'z' -Extension '.zip' } | Should -Throw 'every name from z.zip to z-100.zip is taken'
+        @(Get-ChildItem -LiteralPath $Dir -File).Count | Should -Be 100
     }
 }

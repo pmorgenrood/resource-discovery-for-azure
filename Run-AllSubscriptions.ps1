@@ -436,6 +436,8 @@ $OtherRunLineReady = $false
 $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
 try
 {
+    # Never another run's transcript of the same second (New-RunOutputFile).
+    $WrapperTranscriptFile = New-RunOutputFile -Directory $InventoryRoot -Stem ("RunAllSubscriptions_transcript_{0}" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')) -Extension '.txt'
     Start-Transcript -Path $WrapperTranscriptFile -UseMinimalHeader -Force | Out-Null
     $WrapperTranscriptStarted = $true
     Write-Host ("Wrapper transcript: {0}" -f $WrapperTranscriptFile) -ForegroundColor DarkGray
@@ -2515,9 +2517,14 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
     {
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $OuterZipFile = Join-Path $InventoryRoot "AllSubscriptions_ResourcesReport_$Timestamp.zip"
-        Write-Host ("Compressing {0} per-subscription report(s) into: {1}" -f $SubZips.Count, $OuterZipFile) -ForegroundColor Cyan
+        $Reserved = $null
         try
         {
+            # Today's name, or the next free one (-2, -3, ...): never another
+            # run's consolidated zip of the same second (New-RunOutputFile).
+            $OuterZipFile = New-RunOutputFile -Directory $InventoryRoot -Stem "AllSubscriptions_ResourcesReport_$Timestamp" -Extension '.zip'
+            $Reserved = $OuterZipFile
+            Write-Host ("Compressing {0} per-subscription report(s) into: {1}" -f $SubZips.Count, $OuterZipFile) -ForegroundColor Cyan
             Compress-Archive -Path $SubZips.FullName -DestinationPath $OuterZipFile -Force -ErrorAction Stop
             $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
             if ($ZipProblem)
@@ -2531,6 +2538,8 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
         {
             $BundleBuildError = "Could not build {0}: {1}" -f $OuterZipFile, $_.Exception.Message
             Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
+            # The name this run reserved, still empty: nothing of it is left.
+            if ($null -ne $Reserved) { $Left = Get-Item -LiteralPath $Reserved -ErrorAction SilentlyContinue; if ($null -ne $Left -and $Left.Length -eq 0) { Remove-Item -LiteralPath $Reserved -Force -ErrorAction SilentlyContinue } }
             # The main summary, the fold and the final check below all key on
             # $OuterZipFile, so none of them may point at the missing zip.
             $OuterZipFile = $null
@@ -2589,7 +2598,8 @@ if ($null -ne $OuterZipFile)
             throw "Main summary functions not found at '$AllSubSummaryFunctions'."
         }
         . $AllSubSummaryFunctions
-        $MainSummaryFile = Join-Path $InventoryRoot ("MainSummary_{0}.html" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
+        # Never another run's main summary of the same second (New-RunOutputFile).
+        $MainSummaryFile = New-RunOutputFile -Directory $InventoryRoot -Stem ("MainSummary_{0}" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')) -Extension '.html'
         # Source the version from Version.json rather than $Global:Version:
         # in parallel mode the inner script runs in child processes, so the
         # wrapper's $Global:Version is never set. Fall back to it (and then
