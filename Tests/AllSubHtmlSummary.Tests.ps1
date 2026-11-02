@@ -178,6 +178,28 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         $Html | Should -Match 'privacy-banner identifiable'
     }
 
+    It 'shows the obfuscated banner under -Obfuscated when the reports hold no records to sample' {
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{} -Obfuscated | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'privacy-banner obfuscated'
+        $Html | Should -Not -Match 'privacy-banner identifiable'
+    }
+
+    It 'shows the identifiable banner without -Obfuscated when the reports hold no records to sample' {
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{} -SubName 'sub-a' | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'privacy-banner identifiable'
+        $Html | Should -Not -Match 'privacy-banner obfuscated'
+    }
+
     It 'renders run-wide charts only when -Detailed is passed' {
         $Run = New-Run
         New-SubFolder -Root $Run -Services @{ VirtualMachines = 2; StorageAcc = 1; AppServices = 1 } -SubName 'Sub A' | Out-Null
