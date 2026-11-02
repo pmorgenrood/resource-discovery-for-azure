@@ -2341,6 +2341,11 @@ catch
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
 
+# Direct runs only (the wrapper prints its own): the subscriptions whose
+# consumption failed or is incomplete. Printed ahead of the report check below,
+# so a run that wrote no report still ends with its 'No report was written' line.
+if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs }
+
 # A direct run reaches this point even when it wrote no report (collection stopped,
 # or the HTML report or the zip failed), so it must not end as a success. Under
 # -RunAllSubs the exit code is left alone: the wrapper treats any non-zero exit as a

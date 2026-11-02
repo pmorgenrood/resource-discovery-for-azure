@@ -142,7 +142,10 @@ recorded (in `$Global:ConsumptionFailedSubs`) with:
 
 In a `Run-AllSubscriptions.ps1` run, the main summary marks that
 subscription's row **consumption incomplete** (found through `ReportFolder`),
-so the obfuscated main summary also says which subscription it is.
+so the obfuscated main summary also says which subscription it is. Both
+`Run-AllSubscriptions.ps1` and a direct run of `ResourceInventory.ps1` list
+these subscriptions by name and id under **Consumption Failures** at the end
+of the run.
 
 On an obfuscated run this is surfaced in the shareable
 `Diagnostics_<ReportName>_<timestamp>.log` under **"Consumption
