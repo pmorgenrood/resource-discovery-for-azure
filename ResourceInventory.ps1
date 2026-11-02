@@ -1969,6 +1969,11 @@ catch
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
+
+# Direct runs only (the wrapper prints its own): the subscriptions whose
+# consumption failed or is incomplete.
+if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs }
+
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
 
 # Direct runs only (the wrapper prints its own): subscriptions the up-front

@@ -1910,6 +1910,31 @@ function Write-ConsumptionDataCheckReport
     Write-Host '  3. Or re-run with -SkipConsumption to inventory without consumption data.' -ForegroundColor Yellow
 }
 
+# End of a direct ResourceInventory.ps1 run (Run-AllSubscriptions.ps1 prints its
+# own 'Consumption Failures' block): the subscriptions whose consumption could
+# not be collected or is incomplete, by name and id, and each distinct reason.
+# Without it the only sign is the warning printed when the billing call failed,
+# long before the end of the run.
+function Write-ConsumptionFailureSummary
+{
+    param([object[]]$Failures)
+    $Entries = @(@($Failures) | Where-Object { $null -ne $_ })
+    if ($Entries.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host ('Consumption Failures:    {0} subscription(s)' -f $Entries.Count) -ForegroundColor Yellow
+    # Unique by name and id: two subscriptions can share a display name. The
+    # '(auth)' entry stands for the whole phase, not one subscription.
+    foreach ($Entry in @($Entries | Where-Object { $_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique))
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Yellow
+    }
+    foreach ($Message in @($Entries | ForEach-Object { [string]$_.Message } | Where-Object { $_ } | Select-Object -Unique))
+    {
+        Write-Host ('  - {0}' -f $Message) -ForegroundColor Yellow
+    }
+    Write-Host '  Note: the consumption sheet in this report is empty or incomplete for these subscriptions.' -ForegroundColor Yellow
+}
+
 # End-of-run list of the subscriptions the consumption data check passed with
 # outcome 'NoUsage', so their empty consumption sheet is not read as a
 # collection failure. Those whose check stopped at the page cap are listed

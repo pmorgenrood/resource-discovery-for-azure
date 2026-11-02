@@ -137,6 +137,10 @@ recorded (in `$Global:ConsumptionFailedSubs`) with:
 - `RecordsCollected` — how many rows were written before it stopped
 - a message ending `… this subscription's consumption is INCOMPLETE`
 
+Both `Run-AllSubscriptions.ps1` and a direct run of `ResourceInventory.ps1`
+list these subscriptions by name and id under **Consumption Failures** at the
+end of the run.
+
 On an obfuscated run this is surfaced in the shareable
 `Diagnostics_<ReportName>_<timestamp>.log` under **"Consumption
 failed/incomplete subscriptions"**, so a truncated billing sheet is obvious in
