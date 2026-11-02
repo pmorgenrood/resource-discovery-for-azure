@@ -1678,7 +1678,9 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
         $File = Join-Path $script:Dir '.resume-state-t-stream-0.json'
         Set-Content -LiteralPath $File -Value 'cut'
         $Now = [datetime]'2026-10-29T14:02:55'
+        # The new name and -2 to -100 are all taken, so the rename fails.
         Set-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Value 'an earlier one'
+        foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:Dir ('.resume-state-t-stream-0.json.unreadable-20261029-140255-{0}' -f $N)) -Force | Out-Null }
         $R = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now $Now
         $R.MovedTo | Should -BeNullOrEmpty
         Test-Path -LiteralPath $File | Should -BeTrue
