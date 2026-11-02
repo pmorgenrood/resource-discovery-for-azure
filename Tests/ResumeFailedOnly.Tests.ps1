@@ -211,6 +211,15 @@ Describe '-ResumeFailedOnly after an interrupted run' {
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 
+    It 'a run with a failed subscription says to run the same command again (without -Fresh), or with -Resume, not to add -Resume alone' {
+        $Global:RdaRfoFailIds = @('sub-b')
+        $R = script:Invoke-Run -Subs @($script:A, $script:B)
+
+        @($R.Text | Where-Object { $_ -like 'Subscriptions Failed:*Sub B*' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -eq 'Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions.' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -like 'Re-run with -Resume to retry failed*' }).Count | Should -Be 0
+    }
+
     It 'a subscription still on the retry list is reported as failed, not as not collected' {
         $Global:RdaRfoFailIds = @('sub-b')
         $null = script:Invoke-Run -Subs @($script:A, $script:B) -Interrupted
