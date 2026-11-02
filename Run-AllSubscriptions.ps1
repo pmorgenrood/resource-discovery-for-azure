@@ -514,8 +514,12 @@ if (-not $RunLock.Acquired)
 if (-not (Start-RunLockHeartbeat -Lock $RunLock)) { Exit-Wrapper -Code 1 }
 # This run's own key (Get-RunLockRunKey): it names the files only this run uses
 # (the stream summaries, the per-stream failure logs, the bundle staging folder).
-$RunKey = Get-RunLockRunKey -Record $RunLock.Record
+$RunKey = Get-RunLockRunKey -InvocationId ([string]$RunLock.Record['InvocationId'])
 if ([string]::IsNullOrEmpty($RunKey)) { $RunKey = [guid]::NewGuid().ToString('N').Substring(0, 8) }
+# One line the transcript keeps: which lock this run holds, and the process and
+# run key a later run's stop message names for it. The lock's name holds the
+# tenant key, not the tenant id (Get-TenantFileKey).
+Write-Host ('Run lock: {0} (this run: process {1}, run {2})' -f (Split-Path -Path $RunLockPath -Leaf), $PID, $RunKey) -ForegroundColor DarkGray
 
 # Resume state helpers. The file names hold the tenant key, not the tenant id
 # (Get-TenantFileKey); files an earlier version named with the tenant id are

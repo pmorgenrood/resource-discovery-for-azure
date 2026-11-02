@@ -348,12 +348,13 @@ A run holds a lock file for its tenant in the inventory folder, `InventoryReport
 
 A run creates the lock only when there is none. The file is created only if it is absent, so of two runs that start at the same moment exactly one gets it, and it is written to disk before the run goes on. Only that run refreshes the lock (every minute) and removes it. A lock is never taken over: a run that finds a lock stops with exit code `1` before it reads or writes any run state, whoever wrote it, whether that run's process is still running or not, and also when the lock cannot be read.
 
-The message names who holds the lock and says what to do. For example, while another run is going on this machine:
+When a run takes the lock it prints one line, which its transcript keeps: `Run lock: .run-lock-<tenant key>.json (this run: process <id>, run <run key>)`. The message of a run that finds a lock names the holder's process, machine, start time and run key, so it can be matched to that line, and says what to do. Neither the `Run lock` line nor the `Run key` line holds the tenant id. The wrapper transcript stays in the inventory folder; it is never put into a ZIP. For example, while another run is going on this machine:
 
 ```text
 ERROR: Another run for tenant 12345678-1234-1234-1234-123456789012 holds the lock on this inventory folder, so this run stopped before reading or writing any run state.
   Lock file:    /home/user/InventoryReports/.run-lock-a3a8ee437933.json
   Held by:      process 4242 on host-a.example, started 2026-10-29 14:02:11 UTC; its run started 2026-10-29 14:02:15 UTC
+  Run key:      4f2c9a1b
   Last refresh: 2026-10-29 14:40:15 UTC (12 seconds ago)
   Process 4242 on this machine is still running, so a run is using this folder.
   Wait for that run to finish, or stop it, then run this command again.

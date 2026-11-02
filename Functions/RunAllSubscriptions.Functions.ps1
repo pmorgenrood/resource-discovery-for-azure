@@ -2738,9 +2738,8 @@ function Get-ResumeCarriedReports
 # data. $null when the record has no usable id.
 function Get-RunLockRunKey
 {
-    param($Record)
-    $Id = if ($null -ne $Record) { [string]$Record['InvocationId'] } else { '' }
-    $Hex = $Id -replace '[^0-9a-fA-F]', ''
+    param([string]$InvocationId)
+    $Hex = [string]$InvocationId -replace '[^0-9a-fA-F]', ''
     if ($Hex.Length -lt 8) { return $null }
     return $Hex.Substring(0, 8).ToLowerInvariant()
 }
@@ -3960,6 +3959,9 @@ function Write-RunLockHeldMessage
     Write-Host ('ERROR: Another run for tenant {0} holds the lock on this inventory folder, {1}' -f $Tenant, $Stopped) -ForegroundColor Red
     Write-Host ('  Lock file:    {0}' -f $Request.Path) -ForegroundColor Red
     Write-Host ('  Held by:      process {0} on {1}, started {2}; its run started {3}' -f $Held.ProcessId, $Held.MachineName, $Started, (Format-RunLockTime -Value $Held.RunStartTimeUtc)) -ForegroundColor Red
+    # The run key the holder printed when it took the lock ('Run lock: ...').
+    $HeldKey = Get-RunLockRunKey -InvocationId ([string]$Held.InvocationId)
+    if (-not [string]::IsNullOrEmpty($HeldKey)) { Write-Host ('  Run key:      {0}' -f $HeldKey) -ForegroundColor Red }
     Write-Host ('  Last refresh: {0} ({1} ago)' -f (Format-RunLockTime -Value $Held.HeartbeatUtc), (Format-RunLockAge -Seconds $Holder.AgeSeconds)) -ForegroundColor Red
     $Check = "Get-Process -Id {0} | Select-Object Id, ProcessName, @{{ Name = 'StartTimeUtc'; Expression = {{ `$_.StartTime.ToUniversalTime() }} }}" -f $Held.ProcessId
     switch ($Holder.Kind)

@@ -586,7 +586,8 @@ $Runs = @(foreach ($Number in 2, 3)
     function script:Get-LockLines
     {
         param([string[]]$Text)
-        @($Text | Where-Object { $_ -match 'run lock|Took over|^Removed ' })
+        # Leaves out the one line every run prints when it takes its lock.
+        @($Text | Where-Object { $_ -match 'run lock|Took over|^Removed ' -and $_ -notmatch '^Run lock: \.run-lock-[0-9a-f]{12}\.json \(this run: process \d+, run [0-9a-f]{8}\)$' })
     }
 
     # Whether the run named Run held its lock when it read the subscription
@@ -1731,6 +1732,16 @@ Describe 'Runs of the wrapper that find a lock' -Skip:$IsWindows {
         $FirstEnd.ExitCode | Should -Be 0
         script:Get-Collected -Run 'r1' | Should -Be @('A', 'B', 'C', 'D')
         Test-Path -LiteralPath $script:LockPath | Should -BeFalse
+        # The first run named its lock, process and run key when it took the lock,
+        # in its transcript too; the second run's stop names the same run key. No
+        # line holds the tenant id.
+        $Key = ([string]$Holder.InvocationId -replace '[^0-9a-fA-F]', '').Substring(0, 8).ToLowerInvariant()
+        $Taken = 'Run lock: {0} (this run: process {1}, run {2})' -f (Split-Path -Path $script:LockPath -Leaf), $First.Process.Id, $Key
+        $FirstEnd.Text | Should -Contain $Taken
+        $Transcript = @(Get-ChildItem -LiteralPath $script:Root -Filter 'RunAllSubscriptions_transcript_*.txt' -File | ForEach-Object { Get-Content -LiteralPath $_.FullName })
+        $Transcript | Should -Contain $Taken
+        $Second.Text | Should -Contain ('  Run key:      {0}' -f $Key)
+        $Taken | Should -Not -Match ([regex]::Escape($script:Tenant))
 
         foreach ($Next in 'r3', 'r4')
         {
@@ -2128,7 +2139,7 @@ $global:RdaStandInRun = 'tb'
 $global:LASTEXITCODE = 0
 $Lines = @(& $Wrapper -TenantID $TenantB -ParallelStreams 1 *>&1 | ForEach-Object { [string]$_ })
 $Result.BExit = $global:LASTEXITCODE
-$Result.BLockLines = @($Lines | Where-Object { $_ -match 'run lock' })
+$Result.BLockLines = @($Lines | Where-Object { $_ -match 'run lock' -and $_ -notmatch '^Run lock: \.run-lock-[0-9a-f]{12}\.json \(this run: process \d+, run [0-9a-f]{8}\)$' })
 $Result.BProcessed = ($Lines -contains 'All subscriptions processed!')
 $Result.ALockAfterB = [System.IO.File]::Exists($LockA)
 $Result.BLockAfterB = [System.IO.File]::Exists($LockB)
