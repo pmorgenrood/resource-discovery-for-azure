@@ -2891,11 +2891,22 @@ function Get-WrapperExitCode
 # themselves still record the full tenant id, and the resume state readers
 # check it, so two tenants whose keys clash never share a resume state; a lock
 # whose key clashes stops the other tenant's run, as any lock does.
+# SHA256.Create() and ComputeHash, with the hex written byte by byte, run on
+# every PowerShell the scripts accept (#Requires -Version 7.0); SHA256.HashData
+# and Convert.ToHexString need .NET 5, which PowerShell 7.0 does not have.
 function Get-TenantFileKey
 {
     param([Parameter(Mandatory = $true)][string]$Tenant)
-    $Bytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Tenant.Trim().ToLowerInvariant()))
-    return ([System.Convert]::ToHexString($Bytes)).Substring(0, 12).ToLowerInvariant()
+    $Sha = [System.Security.Cryptography.SHA256]::Create()
+    try
+    {
+        $Bytes = $Sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Tenant.Trim().ToLowerInvariant()))
+    }
+    finally
+    {
+        $Sha.Dispose()
+    }
+    return (@($Bytes | Select-Object -First 6 | ForEach-Object { $_.ToString('x2', [System.Globalization.CultureInfo]::InvariantCulture) }) -join '')
 }
 
 function Get-RunLockPath
