@@ -2596,8 +2596,17 @@ function Get-ZipOwedSubscriptionIds
 # consolidated zip (for example when every report of the run is missing).
 function Write-MissingReportBanner
 {
-    param([object[]]$MissingReports = @(), [int]$MissingReportCount = 0, [object]$RetryLimited, [bool]$ZipBuilt = $true, [string]$TenantID, [System.Collections.IDictionary]$Settings)
+    param([object[]]$MissingReports = @(), [int]$MissingReportCount = 0, [object]$RetryLimited, [bool]$ZipBuilt = $true, [string]$TenantID, [System.Collections.IDictionary]$Settings,
+        # The inventory folder, when it is gone at the end of the run: its report
+        # zips and the resume state went with it, so one line says that instead.
+        [string]$GoneFolder = '')
     if ($MissingReportCount -le 0) { return }
+    if (-not [string]::IsNullOrEmpty($GoneFolder))
+    {
+        Write-Host ""
+        Write-Host ("FAILED (report missing): the inventory folder {0} is gone, with the report zips and the resume state that were in it, so no consolidated zip was built. The next run starts a new run and collects every subscription again." -f $GoneFolder) -ForegroundColor Red
+        return
+    }
     $Named = @(@($MissingReports) | Where-Object { $null -ne $_ })
     $LimitIds = @(@($RetryLimited) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
     $AtLimit = @($Named | Where-Object { $LimitIds -contains [string]$_.Id })
