@@ -3110,8 +3110,7 @@ function Get-RunLockRegistry
 # Available while a 'pwsh -File' script is still running (measured). So this
 # reads the runspace's own record of its running command, a non-public
 # method, here only. When it cannot be read, the heartbeat keeps going and the
-# stop message of any run names the run as still going (see
-# Get-RunLockInvocationState and Test-RunLockRunspaceRunEnded).
+# lock is removed when the session is closed (see Get-RunLockInvocationState).
 function Get-RunLockCurrentPipeline
 {
     try
@@ -3142,22 +3141,6 @@ function Get-RunLockInvocationState
     return 'Running'
 }
 
-# Whether a run listed for the calling runspace has ended: its command has
-# finished, or it was started by the command that is running now (a script
-# that caught that run's error and went on). A run whose command is another
-# one that is still running is paused under a nested prompt (a debugger stop,
-# a suspended confirm prompt) and goes on later. When either command cannot
-# be read (Get-RunLockCurrentPipeline), the run counts as still going.
-function Test-RunLockRunspaceRunEnded
-{
-    param([Parameter(Mandatory = $true)]$Entry)
-    if ((Get-RunLockInvocationState -State $Entry) -eq 'Ended') { return $true }
-    $Recorded = $Entry['Pipeline']
-    $Current = Get-RunLockCurrentPipeline
-    if ($null -eq $Recorded -or $null -eq $Current) { return $false }
-    return [object]::ReferenceEquals($Recorded, $Current)
-}
-
 # Lists a run in the process's table (Request-RunLock does this before the
 # lock file can appear). An earlier run of the same runspace is left as it
 # is: its own heartbeat removes its lock once the command that started it has
@@ -3182,15 +3165,12 @@ function Unregister-RunLockInvocation
 # Who holds an existing lock (from Read-RunLock), only to choose what the stop
 # message says (Write-RunLockHeldMessage); no run acts on it. Returns Kind,
 # Why, AgeSeconds (how long ago the heartbeat was refreshed; $null for a lock
-# that is not valid) and Ending (the lock is of a run in this process whose
-# command has ended and whose own heartbeat is about to remove it). Kind is
-# one of:
+# that is not valid). Kind is one of:
 #   Running      this machine, and the process that wrote the lock is running
-#                (for this process: the run that wrote it is still going, also
-#                when it is paused under a nested prompt of this runspace);
+#                (Why: ThisSession when it is this process: a run of this
+#                PowerShell session always counts as still going);
 #   Ended        this machine, and that process is not running (Why:
-#                ProcessGone, ProcessIdReused, Restarted, or RunEnded for an
-#                earlier run in this process that has ended);
+#                ProcessGone, ProcessIdReused, Restarted);
 #   Unknown      this machine, a process with that id is running, but whether
 #                it is the one that wrote the lock cannot be told (Why:
 #                StartUnreadable, or StartTimeDiffers on Linux for a lock
@@ -3206,9 +3186,9 @@ function Unregister-RunLockInvocation
 function Get-RunLockHolder
 {
     param([Parameter(Mandatory = $true)]$Lock)
-    if (-not $Lock.Valid) { return [pscustomobject]@{ Kind = 'Unreadable'; Why = $null; AgeSeconds = $null; Ending = $false } }
+    if (-not $Lock.Valid) { return [pscustomobject]@{ Kind = 'Unreadable'; Why = $null; AgeSeconds = $null } }
     $Age = [int][math]::Floor([math]::Max(0, ([datetime]::UtcNow - $Lock.HeartbeatUtc).TotalSeconds))
-    $Holder = [pscustomobject]@{ Kind = 'Running'; Why = $null; AgeSeconds = $Age; Ending = $false }
+    $Holder = [pscustomobject]@{ Kind = 'Running'; Why = $null; AgeSeconds = $Age }
     if (-not (Test-RunLockThisMachine -Name $Lock.MachineName)) { $Holder.Kind = 'OtherMachine'; return $Holder }
     $BootId = $null
     if ($null -ne $Lock.BootId -and $null -ne $Lock.ProcessStartTicks) { $BootId = Get-RunLockBootId }
@@ -3236,27 +3216,12 @@ function Get-RunLockHolder
         else { $Holder.Kind = 'Ended'; $Holder.Why = 'ProcessIdReused' }
         return $Holder
     }
-    if ($Lock.ProcessId -eq $PID -and -not [string]::IsNullOrEmpty($Lock.InvocationId))
+    if ($Lock.ProcessId -eq $PID)
     {
-        # This process. A run is listed before its lock file can appear, so
-        # a run that is not listed has ended. A listed run has ended when its
-        # command has finished (then its own heartbeat removes the lock within
-        # a quarter of a second: Ending), or, for the asking runspace, when it
-        # was started by the command running now (Test-RunLockRunspaceRunEnded).
-        $Entry = $null
-        $Listed = (Get-RunLockRegistry).TryGetValue($Lock.InvocationId, [ref]$Entry)
-        if (-not $Listed) { $Holder.Kind = 'Ended'; $Holder.Why = 'RunEnded' }
-        elseif ((Get-RunLockInvocationState -State $Entry) -eq 'Ended')
-        {
-            $Holder.Kind = 'Ended'
-            $Holder.Why = 'RunEnded'
-            $Holder.Ending = ([bool]$Entry['Beating'] -and -not $Entry['Stopped'] -and -not $Entry['Released'])
-        }
-        elseif ([object]::ReferenceEquals($Entry['Runspace'], [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace) -and (Test-RunLockRunspaceRunEnded -Entry $Entry))
-        {
-            $Holder.Kind = 'Ended'
-            $Holder.Why = 'RunEnded'
-        }
+        # A run of this PowerShell session always counts as still going: its
+        # lock is removed when its command ends (its heartbeat) or when the
+        # session is closed (its release at process exit).
+        $Holder.Why = 'ThisSession'
     }
     return $Holder
 }
@@ -3734,10 +3699,10 @@ function Remove-RunLockTemp
 # read) and Holder (Get-RunLockHolder) say who holds it. When the lock is gone
 # again by the time it is read (its run released it in between), the run tries
 # to create it again, at most MaxAttempts times in all. When it is the lock of
-# a run in this process whose command has ended and whose own heartbeat is
-# about to remove it (Holder.Ending), the run waits up to
-# EndedRunWaitMilliseconds, once, for that heartbeat to remove it, then tries
-# to create it again. Returns Acquired, Path,
+# a run of this PowerShell session, the run waits up to
+# SessionWaitMilliseconds, once, for it to go (a command that ended an instant
+# ago is released by its heartbeat within a quarter of a second), then tries
+# to create it again; a lock still there is that of a run still going. Returns Acquired, Path,
 # Record, Text (the lock as written), State and Heartbeat (set by
 # Start-RunLockHeartbeat), Held, Holder and Problem (why the lock could not be
 # created, when there is no lock to name).
@@ -3747,7 +3712,7 @@ function Request-RunLock
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][datetime]$RunStartTime,
         [int]$MaxAttempts = 3,
-        [int]$EndedRunWaitMilliseconds = 1000
+        [int]$SessionWaitMilliseconds = 1000
     )
     $Result = [pscustomobject]@{ Acquired = $false; Path = $Path; Record = $null; Text = $null; State = $null; Heartbeat = $null; Held = $null; Holder = $null; Problem = $null }
     $InvocationId = [guid]::NewGuid().ToString()
@@ -3755,7 +3720,7 @@ function Request-RunLock
     $null = (Get-RunLockRegistry).TryAdd($InvocationId, $State)
     try
     {
-        return (Request-RunLockListed -Result $Result -State $State -RunStartTime $RunStartTime -InvocationId $InvocationId -MaxAttempts $MaxAttempts -EndedRunWaitMilliseconds $EndedRunWaitMilliseconds)
+        return (Request-RunLockListed -Result $Result -State $State -RunStartTime $RunStartTime -InvocationId $InvocationId -MaxAttempts $MaxAttempts -SessionWaitMilliseconds $SessionWaitMilliseconds)
     }
     finally
     {
@@ -3772,7 +3737,7 @@ function Request-RunLockListed
         [Parameter(Mandatory = $true)][datetime]$RunStartTime,
         [Parameter(Mandatory = $true)][string]$InvocationId,
         [int]$MaxAttempts = 3,
-        [int]$EndedRunWaitMilliseconds = 1000
+        [int]$SessionWaitMilliseconds = 1000
     )
     $Path = $Result.Path
     $Waited = $false
@@ -3827,12 +3792,12 @@ function Request-RunLockListed
         $Result.Held = $Held
         $Result.Holder = Get-RunLockHolder -Lock $Held
         $Result.Problem = $null
-        if ($Result.Holder.Ending -and -not $Waited -and $Attempt -lt $MaxAttempts)
+        if ($Result.Holder.Why -eq 'ThisSession' -and -not $Waited -and $Attempt -lt $MaxAttempts)
         {
-            # That run's own heartbeat removes it; nothing is taken over.
+            # Only that run removes it; nothing is taken over.
             $Waited = $true
             $Clock = [System.Diagnostics.Stopwatch]::StartNew()
-            while ([System.IO.File]::Exists($Path) -and $Clock.ElapsedMilliseconds -lt $EndedRunWaitMilliseconds) { Start-Sleep -Milliseconds 25 }
+            while ([System.IO.File]::Exists($Path) -and $Clock.ElapsedMilliseconds -lt $SessionWaitMilliseconds) { Start-Sleep -Milliseconds 25 }
             continue
         }
         return $Result
@@ -3888,8 +3853,16 @@ function Write-RunLockHeldMessage
     {
         'Running'
         {
-            Write-Host ('  Process {0} on this machine is still running, so a run is using this folder.' -f $Held.ProcessId) -ForegroundColor Yellow
-            Write-Host '  Wait for that run to finish, or stop it, then run this command again.' -ForegroundColor Yellow
+            if ($Holder.Why -eq 'ThisSession')
+            {
+                Write-Host ('  It is held by a run of this PowerShell session (process {0}), which counts as a run that is still going.' -f $Held.ProcessId) -ForegroundColor Yellow
+                Write-Host '  The lock is removed when that command ends, or when this session is closed; then run this command again.' -ForegroundColor Yellow
+            }
+            else
+            {
+                Write-Host ('  Process {0} on this machine is still running, so a run is using this folder.' -f $Held.ProcessId) -ForegroundColor Yellow
+                Write-Host '  Wait for that run to finish, or stop it, then run this command again.' -ForegroundColor Yellow
+            }
         }
         'Ended'
         {
@@ -3897,7 +3870,6 @@ function Write-RunLockHeldMessage
             {
                 'ProcessIdReused' { 'process {0} on this machine is now another process' -f $Held.ProcessId }
                 'Restarted' { 'this machine has restarted since' }
-                'RunEnded' { 'it was an earlier run in this PowerShell session, and it has ended' }
                 default { 'process {0} is not running on this machine' -f $Held.ProcessId }
             }
             Write-Host ('  That run is no longer running ({0}). It ended without removing its lock, for example because it was killed or its terminal or Cloud Shell session was closed.' -f $Why) -ForegroundColor Yellow

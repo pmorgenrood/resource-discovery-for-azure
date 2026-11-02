@@ -20,8 +20,9 @@
 #   - The heartbeat rewrites only the heartbeat time, and the heartbeat and
 #     the release touch the lock only while it is the run's own: a lock put in
 #     its place is never overwritten or removed, with one warning. Only the run
-#     that created a lock removes it; a later run in the same runspace, or
-#     under a nested prompt there, leaves it alone.
+#     that created a lock removes it; a later run in the same PowerShell
+#     session (another runspace, a nested prompt) counts it as a run that is
+#     still going and stops with no remove command.
 # Each case is followed by the next two runs.
 #
 # The end-to-end runs are Run-AllSubscriptions.ps1 itself, each started as its
@@ -641,6 +642,11 @@ $Runs = @(foreach ($Number in 2, 3)
         param([string]$ProcessId)
         @(('  Process {0} on this machine is still running, so a run is using this folder.' -f $ProcessId), '  Wait for that run to finish, or stop it, then run this command again.')
     }
+    function script:Get-SessionLines
+    {
+        param([string]$ProcessId)
+        @(('  It is held by a run of this PowerShell session (process {0}), which counts as a run that is still going.' -f $ProcessId), '  The lock is removed when that command ends, or when this session is closed; then run this command again.')
+    }
     function script:Get-EndedLines
     {
         param([string]$Why)
@@ -752,8 +758,8 @@ Describe 'The run lock file' {
         @{ Case = 'this machine, a running process that started at another time'; Kind = 'reused'; Holder = $(if ($IsLinux) { 'Unknown' } else { 'Ended' }); Why = $(if ($IsLinux) { 'StartTimeDiffers' } else { 'ProcessIdReused' }) }
         @{ Case = 'this machine, another running process that wrote it'; Kind = 'running'; Holder = 'Running'; Why = $null }
         @{ Case = 'this machine, another running process that wrote it, heartbeat 2 hours old'; Kind = 'running-old'; Holder = 'Running'; Why = $null }
-        @{ Case = 'this machine, this process, a run that is no longer listed (an earlier run in this session)'; Kind = 'self'; Holder = 'Ended'; Why = 'RunEnded' }
-        @{ Case = 'this machine, this process, a lock written without a run id'; Kind = 'self-no-id'; Holder = 'Running'; Why = $null }
+        @{ Case = 'this machine, this process, a run that is not listed: a run of this session counts as still going'; Kind = 'self'; Holder = 'Running'; Why = 'ThisSession' }
+        @{ Case = 'this machine, this process, a lock written without a run id'; Kind = 'self-no-id'; Holder = 'Running'; Why = 'ThisSession' }
         @{ Case = 'this machine, a running process whose start cannot be read'; Kind = 'unreadable-start'; Holder = 'Unknown'; Why = 'StartUnreadable' }
         @{ Case = 'another machine, heartbeat 2 minutes old'; Kind = 'other-2'; Holder = 'OtherMachine'; Why = $null }
         @{ Case = 'another machine, heartbeat 3 days old'; Kind = 'other-3d'; Holder = 'OtherMachine'; Why = $null }
@@ -923,33 +929,30 @@ $Lock = Request-RunLock -Path $Path -RunStartTime (Get-Date) 6>$null
         @(Get-Content -LiteralPath $Trace | Where-Object { $_ -match '^\d+ +fsync\(' }).Count | Should -BeGreaterOrEqual 1
     }
 
-    It 'an earlier run in this runspace that ended without releasing its lock: the next run stops on it, the earlier heartbeat never writes it again, and after the printed command the next two runs take the lock' {
+    It 'an earlier run in this runspace that has not released its lock: the next run stops on it as a run of this session that is still going, with no remove command, and leaves it alone; once that run releases it, the next two runs take the lock' {
         $First = Request-RunLock -Path $script:LockPath -RunStartTime (Get-Date).AddMinutes(-5)
         $null = Start-RunLockHeartbeat -Lock $First -IntervalSeconds 1
-        $FirstText = Get-Content -LiteralPath $script:LockPath -Raw
-        # The first run ends without releasing it (an error its caller caught).
+        # The first run has not released it (an error its caller caught).
         $Second = script:Invoke-Request
         $Second.Request.Acquired | Should -BeFalse
-        $Second.Request.Holder.Kind | Should -Be 'Ended'
-        $Second.Request.Holder.Why | Should -Be 'RunEnded'
+        $Second.Request.Holder.Kind | Should -Be 'Running'
+        $Second.Request.Holder.Why | Should -Be 'ThisSession'
         $Message = script:Get-HeldMessage -Request $Second.Request
-        script:Assert-Lines -Text $Message -Expected (script:Get-EndedLines -Why 'it was an earlier run in this PowerShell session, and it has ended')
-        script:Invoke-PrintedRemove -Text $Message
-        $Third = script:Invoke-Request
-        $Third.Request.Acquired | Should -BeTrue
-        $Third.Lines | Should -BeNullOrEmpty
-        $ThirdText = Get-Content -LiteralPath $script:LockPath -Raw
-        Start-Sleep -Milliseconds 2500
-        # The first run's heartbeat stopped when the third registered: the lock is the third's.
-        Get-Content -LiteralPath $script:LockPath -Raw | Should -Be $ThirdText
-        $ThirdText | Should -Not -Be $FirstText
-        $Printed = @(& { Remove-RunLock -Lock $Third.Request; Remove-RunLock -Lock $First } 6>&1 | ForEach-Object { [string]$_ })
+        script:Assert-Lines -Text $Message -Expected (script:Get-SessionLines -ProcessId $PID)
+        script:Get-RemoveLines -Text $Message | Should -BeNullOrEmpty
+        $First.State['Stopped'] | Should -BeFalse
+        # The end of the first run's command releases it.
+        $Printed = @(& { Remove-RunLock -Lock $First } 6>&1 | ForEach-Object { [string]$_ })
         $Printed | Should -BeNullOrEmpty
         Test-Path -LiteralPath $script:LockPath | Should -BeFalse
-        $Fourth = script:Invoke-Request
-        $Fourth.Request.Acquired | Should -BeTrue
-        Remove-RunLock -Lock $Fourth.Request
-        Test-Path -LiteralPath $script:LockPath | Should -BeFalse
+        foreach ($Next in 1, 2)
+        {
+            $After = script:Invoke-Request
+            $After.Request.Acquired | Should -BeTrue
+            $After.Lines | Should -BeNullOrEmpty
+            Remove-RunLock -Lock $After.Request
+            Test-Path -LiteralPath $script:LockPath | Should -BeFalse
+        }
     }
 
     It 'taken by a run in another runspace of this process that has not started its heartbeat yet: the process is running, so no remove command' {
@@ -967,8 +970,9 @@ $Lock = Request-RunLock -Path $Path -RunStartTime (Get-Date) 6>$null
             $Asked = script:Invoke-Request
             $Asked.Request.Acquired | Should -BeFalse
             $Asked.Request.Holder.Kind | Should -Be 'Running'
+            $Asked.Request.Holder.Why | Should -Be 'ThisSession'
             $Message = script:Get-HeldMessage -Request $Asked.Request
-            script:Assert-Lines -Text $Message -Expected (script:Get-RunningLines -ProcessId $PID)
+            script:Assert-Lines -Text $Message -Expected (script:Get-SessionLines -ProcessId $PID)
             script:Get-RemoveLines -Text $Message | Should -BeNullOrEmpty
         }
         finally
@@ -1101,15 +1105,16 @@ $Tail = $Next.Invoke()[0]
         $Result.CreatorGoing | Should -BeTrue -Because 'the creator was still inside its request when the other run asked'
         $Result.Asked.Acquired | Should -BeFalse
         $Result.Asked.Kind | Should -Be 'Running'
+        $Result.Asked.Why | Should -Be 'ThisSession'
         @($Result.Asked.Lines | Where-Object { $_ -match 'Remove-Item' }) | Should -BeNullOrEmpty
-        @($Result.Asked.Lines) | Should -Contain '  Wait for that run to finish, or stop it, then run this command again.'
+        @($Result.Asked.Lines) | Should -Contain '  The lock is removed when that command ends, or when this session is closed; then run this command again.'
         $Result.Unchanged | Should -BeTrue
         $Result.Tail.GoneAfterRelease | Should -BeTrue
         @($Result.Tail.Next) | Should -Be @($true, $true)
         $Result.Tail.LockLeft | Should -BeFalse
     }
 
-    It 'a run that ends and a later run in the same command for a lock in another folder: the later run leaves the earlier lock and its heartbeat in place; a run for that folder then stops with the remove command; after it the next two runs take the lock' {
+    It 'a run that ends and a later run in the same command for a lock in another folder: the later run leaves the earlier lock and its heartbeat in place; a run for that folder then stops on it as a run of this session that is still going, with no remove command; once that run releases it, the next two runs take the lock' {
         $FolderB = Join-Path $script:CaseHome 'other-folder'
         $null = New-Item -ItemType Directory -Path $FolderB -Force
         $PathB = Join-Path $FolderB (Split-Path -Path $script:LockPath -Leaf)
@@ -1133,6 +1138,8 @@ $AReleased = [bool]$A.State['Released']
 $Message = @(& { Write-RunLockHeldMessage -Request $script:AskA -Tenant 'tenant' } 6>&1 | ForEach-Object { [string]$_ })
 $Remove = @($Message | Where-Object { $_ -match '^    Remove-Item -LiteralPath ' })
 if ($Remove.Count -eq 1) { & ([scriptblock]::Create($Remove[0].Trim())) }
+# The end of run A's command releases its lock.
+Remove-RunLock -Lock $A
 $Next = @(foreach ($Number in 1, 2) { $R = Request-RunLock -Path $PathA -RunStartTime (Get-Date); [bool]$R.Acquired; Remove-RunLock -Lock $R })
 $Warnings = @(& { Remove-RunLock -Lock $script:B; Remove-RunLock -Lock $A } 6>&1 | ForEach-Object { [string]$_ })
 'RESULT ' + ([pscustomobject]@{ BAcquired = $BAcquired; AUnchanged = $AAfterB; AStopped = $AStopped; AReleasedByB = $AReleased; AskAcquired = [bool]$script:AskA.Acquired; Kind = $script:AskA.Holder.Kind; Why = $script:AskA.Holder.Why; Message = $Message; Removes = $Remove.Count; Printed = $Printed; Next = $Next; Warnings = $Warnings; LeftA = [System.IO.File]::Exists($PathA); LeftB = [System.IO.File]::Exists($PathB) } | ConvertTo-Json -Compress -Depth 4)
@@ -1146,10 +1153,10 @@ $Warnings = @(& { Remove-RunLock -Lock $script:B; Remove-RunLock -Lock $A } 6>&1
         $Result.AReleasedByB | Should -BeFalse
         $Result.AStopped | Should -BeFalse -Because 'the earlier run''s own heartbeat and release at process exit still remove its lock'
         $Result.AskAcquired | Should -BeFalse
-        $Result.Kind | Should -Be 'Ended'
-        $Result.Why | Should -Be 'RunEnded'
-        @($Result.Message) | Should -Contain '  That run is no longer running (it was an earlier run in this PowerShell session, and it has ended). It ended without removing its lock, for example because it was killed or its terminal or Cloud Shell session was closed.'
-        $Result.Removes | Should -Be 1
+        $Result.Kind | Should -Be 'Running'
+        $Result.Why | Should -Be 'ThisSession'
+        @($Result.Message) | Should -Contain (script:Get-SessionLines -ProcessId 0)[1]
+        $Result.Removes | Should -Be 0
         @($Result.Printed) | Should -BeNullOrEmpty
         @($Result.Next) | Should -Be @($true, $true)
         @($Result.Warnings) | Should -BeNullOrEmpty
@@ -2157,7 +2164,7 @@ $Result | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Out -Encoding utf8
         $First = @($Result.Runs | Where-Object { $_.Run -eq 'j1' })[0]
         $Second = @($Result.Runs | Where-Object { $_.Run -eq 'j2' })[0]
         $Second.Exit | Should -Be 1
-        script:Assert-Lines -Text @($Second.Lines) -Expected (script:Get-RunningLines -ProcessId $Result.ProcessId)
+        script:Assert-Lines -Text @($Second.Lines) -Expected (script:Get-SessionLines -ProcessId $Result.ProcessId)
         script:Get-RemoveLines -Text @($Second.Lines) | Should -BeNullOrEmpty
         script:Get-Collected -Run 'j2' | Should -BeNullOrEmpty
         # The second run left the first run's lock and its heartbeat alone.
@@ -2185,7 +2192,7 @@ $Result | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Out -Encoding utf8
         $First = @($Result.Runs | Where-Object { $_.Run -eq 'j1' })[0]
         $Second = @($Result.Runs | Where-Object { $_.Run -eq 'j2' })[0]
         $Second.Exit | Should -Be 1
-        script:Assert-Lines -Text @($Second.Lines) -Expected (script:Get-RunningLines -ProcessId $Result.ProcessId)
+        script:Assert-Lines -Text @($Second.Lines) -Expected (script:Get-SessionLines -ProcessId $Result.ProcessId)
         script:Get-RemoveLines -Text @($Second.Lines) | Should -BeNullOrEmpty
         script:Get-Collected -Run 'j2' | Should -BeNullOrEmpty
         $Result.StillHeld.InvocationId | Should -Be $Result.Held.InvocationId
