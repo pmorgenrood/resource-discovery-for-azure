@@ -311,6 +311,29 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @($Global:ConsumptionFailedSubs).Count | Should -Be 0
     }
 
+    # A direct run over several subscriptions: the first one's second page
+    # fails on every attempt, after its first page handed out a paging token.
+    It 'starts the next subscription''s pull with no paging token after one failed part-way' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:SubscriptionID = $null
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' })
+        $script:ContextSub = $null
+        $script:UsageCalls = [System.Collections.Generic.List[string]]::new()
+        Mock Set-AzContext { $script:ContextSub = $Subscription; [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $script:ContextSub } } }
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:UsageCalls.Add(('{0} [{1}]' -f $script:ContextSub, $ContinuationToken))
+            if ($script:ContextSub -eq 'sub-a' -and $ContinuationToken -eq 'token-a-page-2') { throw 'stand-in: the usage service returned an error for this page' }
+            $Next = if ($script:ContextSub -eq 'sub-a') { 'token-a-page-2' } else { $null }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ('/subscriptions/{0}/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1' -f $script:ContextSub)); ContinuationToken = $Next }
+        }
+        GetResorceConsumption
+        @($script:UsageCalls | Where-Object { $_ -like 'sub-b *' }) | Should -Be @('sub-b []') -Because 'a token handed out for Alpha must not be sent with Beta''s first request'
+        @($Global:ConsumptionFailedSubs).Id | Should -Be @('sub-a')
+        $Global:ConsumptionRecordCount | Should -Be 2
+    }
+
     # On an ICU host (Linux, macOS) the en-US time pattern has U+202F before
     # AM/PM, so the culture's default date text is not the same on every host.
     It 'writes UsageStartTime and UsageEndTime as M/d/yyyy h:mm:ss tt with a plain space, in ASCII' {
