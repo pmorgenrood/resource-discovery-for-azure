@@ -349,11 +349,38 @@ if ($Task -eq 'Processing')
 
     if ($AppServices)
     {
+        # Hosting plan id -> the plan's sku, from the plan rows already in $Resources,
+        # so reading an app's plan costs no Azure call. Keys are lower case because a
+        # site's serverFarmId can differ in case from the plan row's id.
+        $PlanSkuLookup = @{}
+        foreach ($PlanRow in ($Resources | Where-Object { $_.TYPE -eq 'microsoft.web/serverfarms' }))
+        {
+            if ($PlanRow.id -is [string] -and $PlanRow.id -ne '')
+            {
+                $PlanSkuLookup[$PlanRow.id.ToLowerInvariant()] = $PlanRow.sku
+            }
+        }
+
         foreach ($app in $AppServices)
         {
             $Subscription = $SubLookup[$app.subscriptionId]
 
-            if ($app.kind -match 'functionapp')
+            # A function app on a Flex Consumption plan (SKU FC1, tier FlexConsumption)
+            # does not offer FunctionExecutionCount or FunctionExecutionUnits, so they
+            # are not asked for. An app whose plan cannot be read (no plan id, plan row
+            # not listed, no SKU, or a malformed value) keeps both metrics.
+            $IsFlexConsumption = $false
+            $FarmId = $app.properties.serverFarmId
+            if ($FarmId -is [string] -and $FarmId -ne '')
+            {
+                $PlanSku = $PlanSkuLookup[$FarmId.ToLowerInvariant()]
+                if ($null -ne $PlanSku -and $PlanSku -isnot [string])
+                {
+                    $IsFlexConsumption = ($PlanSku.name -is [string] -and $PlanSku.name -eq 'FC1') -or ($PlanSku.tier -is [string] -and $PlanSku.tier -eq 'FlexConsumption')
+                }
+            }
+
+            if ($app.kind -match 'functionapp' -and -not $IsFlexConsumption)
             {
                 $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'FunctionExecutionCount'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
                 $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'FunctionExecutionUnits'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
