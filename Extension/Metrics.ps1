@@ -549,6 +549,10 @@ if ($Task -eq 'Processing')
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
                 $RequestCounts = $using:MetricRequestCounts
+                # Start-ThreadJob has its own process-wide throttle (5 by default), so the
+                # run's limit is passed to it too; otherwise no more than 5 calls are in
+                # flight whatever -ConcurrencyLimit says.
+                $ThreadJobLimit = $using:ConcurrencyLimit
 
                 # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
                 # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
@@ -686,7 +690,7 @@ if ($Task -eq 'Processing')
                             $Job = Start-ThreadJob -ScriptBlock {
                                 param($mArgs)
                                 Get-AzMetric @mArgs
-                            } -ArgumentList $MetricArgs
+                            } -ArgumentList $MetricArgs -ThrottleLimit $ThreadJobLimit
 
                             if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                             {
