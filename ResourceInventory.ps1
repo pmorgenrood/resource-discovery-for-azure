@@ -2397,9 +2397,21 @@ Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult
 Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
 
 # A direct run that lost a collector still writes the report and zip, then exits 4.
+# One whose billing download failed or stopped part-way for a subscription (other
+# than for the sign-in) ends with the FAILED (consumption) lines and exits 3, and
+# 5 when both happened: the codes Run-AllSubscriptions.ps1 uses. A direct run keeps
+# no retry list: the command printed collects the subscription again.
 # Under -RunAllSubs the wrapper treats any non-zero exit as a failed subscription and
-# reports collector failures through its own exit code, so this is skipped there.
-# The zip check keeps 4 to runs that produced their report: Compress-Archive writes no
-# zip when the HTML report is missing.
+# reports these through its own exit code, so this is skipped there.
+# The zip check keeps these codes to runs that produced their report: Compress-Archive
+# writes no zip when the HTML report is missing.
 $CollectorFailureCount = @(@($script:CollectorFailuresThisRun) | Where-Object { $null -ne $_ }).Count
-if (-not $RunAllSubs.IsPresent -and $CollectorFailureCount -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile)) { exit 4 }
+$ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
+if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFile))
+{
+    $RetryTenant = if (-not [string]::IsNullOrEmpty($TenantID)) { $TenantID } else { $script:RdaRunTenant }
+    $RetryTenantArg = if (-not [string]::IsNullOrEmpty($RetryTenant)) { ' -TenantID {0}' -f $RetryTenant } else { '' }
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    $DirectExitCode = if ($ConsumptionIncomplete.Count -gt 0 -and $CollectorFailureCount -gt 0) { 5 } elseif ($ConsumptionIncomplete.Count -gt 0) { 3 } elseif ($CollectorFailureCount -gt 0) { 4 } else { 0 }
+    if ($DirectExitCode -ne 0) { exit $DirectExitCode }
+}

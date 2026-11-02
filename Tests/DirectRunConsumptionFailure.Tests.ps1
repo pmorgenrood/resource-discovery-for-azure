@@ -11,6 +11,9 @@
 # a direct run now prints the same block after 'Reporting Time:', ahead of
 # 'Reporting Data File:'.
 #
+# Such a run now ends with the FAILED (consumption) lines and exit 3, as
+# Run-AllSubscriptions.ps1 does; a run with no failure still exits 0.
+#
 # The test copies the scripts to a temp folder and runs the REAL
 # ResourceInventory.ps1 directly in a child pwsh with HOME pointed at a temp
 # folder and offline stand-ins for the Az cmdlets: the up-front role and
@@ -135,6 +138,7 @@ exit $LASTEXITCODE
         {
             $env:HOME = $CaseHome
             $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Harness -Tree $script:Tree -StandIns $script:StandIns -Out $Out -FailIds $FailIds 2>&1 | ForEach-Object { [string]$_ })
+            $ExitCode = $LASTEXITCODE
         }
         finally
         {
@@ -144,6 +148,7 @@ exit $LASTEXITCODE
         $At = $Text.IndexOf('Reporting Time:')
         return [pscustomobject]@{
             Console = $Text
+            Exit    = $ExitCode
             End     = $(if ($At -ge 0) { $Text.Substring($At) } else { '' })
             Zip     = @(Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File)
         }
@@ -169,6 +174,23 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
         $script:Failed.End | Should -Match 'stand-in: the usage service returned an error for this page \(stopped at consumption page 1'
         $script:Failed.End | Should -Not -Match 'Sub B \('
     }
+
+    It 'ends with FAILED (consumption), naming the subscription and the command that collects it again' {
+        $Lines = @($script:Failed.Console -split "`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
+        $At = [array]::LastIndexOf($Lines, '================= FAILED (consumption) =================')
+        $At | Should -BeGreaterThan 0 -Because $script:Failed.Console
+        $Lines[($At + 1)..($Lines.Count - 1)] | Should -Be @(
+            'Consumption (billing) data is missing or incomplete for 1 subscription(s):'
+            '  - Sub A (12345678-1234-1234-1234-123456789012)'
+            'To collect one again, run:'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
+            '========================================================'
+        )
+    }
+
+    It 'exits 3' {
+        $script:Failed.Exit | Should -Be 3
+    }
 }
 
 Describe 'Direct run whose billing pull succeeded for every subscription' -Skip:$script:SkipReason {
@@ -177,5 +199,7 @@ Describe 'Direct run whose billing pull succeeded for every subscription' -Skip:
         $Clean.Zip.Count | Should -Be 1 -Because $Clean.Console
         $Clean.End | Should -Not -BeNullOrEmpty
         $Clean.End | Should -Not -Match 'Consumption Failures'
+        $Clean.Console | Should -Not -Match 'FAILED \(consumption\)'
+        $Clean.Exit | Should -Be 0
     }
 }

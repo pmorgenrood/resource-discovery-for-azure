@@ -16,7 +16,8 @@
 # stand-in that passes.
 # A stand-in ResourceInventory.ps1 writes one
 # report folder and zip per call, throws for the ids in $Global:RdaRlFailIds, and
-# records a metrics gap for the ids in $Global:RdaRlIncompleteIds.
+# records a metrics gap for the ids in $Global:RdaRlIncompleteIds and a failed
+# billing download for the ids in $Global:RdaRlConsumptionFailIds.
 #
 # Run with: Invoke-Pester ./Tests/RetryLimit.Tests.ps1 -Output Detailed
 
@@ -49,6 +50,10 @@ if (@($Global:RdaRlFailIds) -contains $SubscriptionID) { throw 'stand-in failure
 if (@($Global:RdaRlIncompleteIds) -contains $SubscriptionID)
 {
     $Global:MetricsFailedSubs = @(@($Global:MetricsFailedSubs | Where-Object { $null -ne $_ }) + [pscustomobject]@{ Name = $SubscriptionID; Id = $SubscriptionID; Message = 'stand-in metrics gap' })
+}
+if (@($Global:RdaRlConsumptionFailIds) -contains $SubscriptionID)
+{
+    $Global:ConsumptionFailedSubs = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) + [pscustomobject]@{ Name = $SubscriptionID; Id = $SubscriptionID; Message = "stand-in: access denied (stopped at consumption page 1, after 0 record(s); this subscription's consumption is INCOMPLETE)"; Complete = $false; PageAtFailure = 1; RecordsCollected = 0 })
 }
 $Root = $Global:RdaRlRoot
 $Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + $SubscriptionID
@@ -154,6 +159,9 @@ $Global:ResourceCount = 1
     # The exit code, as the wrapper computes it at the end.
     $ExitAt = script:Find-TopIndex -After $TimeAt -What 'the exit-code computation' -Match { param($s) $s.Extent.Text.StartsWith('$WrapperExitCode = Get-WrapperExitCode') }
     $ExitText = @($Top[($ExitAt - 2)..$ExitAt] | ForEach-Object { $_.Extent.Text }) -join "`n"
+    # The FAILED (consumption) lines at the end of the run, where the wrapper has them.
+    $ConsumptionBanner = @($Top | Where-Object { $_.Extent.Text.StartsWith('Write-ConsumptionFailedBanner ') })
+    $ConsumptionBannerText = if ($ConsumptionBanner.Count -eq 1) { $ConsumptionBanner[0].Extent.Text } else { '' }
 
     # Each run starts the way a new wrapper process does: run-wide totals empty.
     # The lifted blocks keep the run's lists in this block's scope, where a real
@@ -173,7 +181,7 @@ $Global:ResourceCount = 1
     "`$AutoTune = [pscustomobject]@{ VCpu = 2; RamGB = 4 }; `$StreamsSrc = 'explicit'; `$ConcurrencySrc = 'auto'; `$AuthSkippedPhases = @(); `$UncarriedSkipped = @()`n"
     $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$ParallelStreams, `$ObfuscateRun)`n"
     $Result = "`n[pscustomobject]@{ Kind = 'run-result'; SubResourceCounts = @(`$SubResourceCounts); FailedSubscriptions = @(`$FailedSubscriptions); RunSummary = @(`$RunSummaryLines); WrapperExitCode = `$WrapperExitCode }"
-    $Tail = "`n" + $CleanupText + "`n" + $AdviceText + "`n" + $RunSummaryText + "`n" + $ExitText + $Result
+    $Tail = "`n" + $CleanupText + "`n" + $AdviceText + "`n" + $RunSummaryText + "`n" + $ConsumptionBannerText + "`n" + $ExitText + $Result
 
     $Start = $Params + $Prologue + $StartText + "`n"
     $script:SequentialBlock = [scriptblock]::Create($Start + ". " + $SeqText + $Tail)
@@ -239,6 +247,7 @@ $Global:ResourceCount = 1
         $Global:RdaRlRoot = $script:Root
         $Global:RdaRlFailIds = @()
         $Global:RdaRlIncompleteIds = @()
+        $Global:RdaRlConsumptionFailIds = @()
         $Global:RdaRlNoZipIds = @()
         # Subscriptions Azure lists that are not in the run's set (for example
         # disabled ones without -IncludeDisabled).
@@ -255,7 +264,7 @@ $Global:ResourceCount = 1
 }
 
 AfterAll {
-    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors, RdaRlUnreadableIds, RdaRlAllowPartialAccess -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlConsumptionFailIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors, RdaRlUnreadableIds, RdaRlAllowPartialAccess -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -562,6 +571,58 @@ Describe 'Retry limit for a subscription whose metrics stay incomplete' {
 
         @($Run4.Calls) | Should -Not -Contain 'sub-x'
         @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: Metrics incomplete*').Count | Should -Be 1
+    }
+}
+
+Describe 'Retry limit for a subscription whose billing download fails on every run' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    # Each run that collects it ends with FAILED (consumption) and exit 3; the
+    # fourth run, past the retry limit, does not collect it, does not list it
+    # and is not exited 3 for it: the retry-limit rule gives that run exit 2.
+    It 'exits 3 and lists it for three runs, and the fourth run leaves it to the retry limit (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlConsumptionFailIds = @('sub-x')
+        $Subs = @($script:A, $script:B, $script:X)
+        $Codes = @()
+        $Listed = @()
+        $Attempts = @()
+        $Commands = [System.Collections.Generic.List[object]]::new()
+        foreach ($n in 1..3)
+        {
+            $Run = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume:($n -gt 1)
+            $Codes += $Run.Result.WrapperExitCode
+            $At = [array]::IndexOf(@($Run.Text), '================= FAILED (consumption) =================')
+            $Listed += $(if ($At -ge 0) { @($Run.Text[($At + 1)..($At + 2)]) -join '|' } else { '' })
+            $Attempts += [int](script:Get-Entry -Id 'sub-x').Attempts
+            @(script:Get-Lines -Run $Run -Like '*FAILED (consumption)*').Count | Should -Be 1
+            $Commands.Add(@(script:Get-Lines -Run $Run -Like '  ./Run-AllSubscriptions.ps1 -TenantID t *'))
+        }
+        $Run4 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+
+        $Codes | Should -Be @(3, 3, 3)
+        $Listed | Should -Be @(1..3 | ForEach-Object { 'Consumption (billing) data is missing or incomplete for 1 subscription(s):|  - sub-x (sub-x)' })
+        $Attempts | Should -Be @(1, 2, 3)
+        # Runs 1 and 2 name the retry; run 3, at the limit, names -Fresh instead.
+        $Commands[0] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
+        $Commands[1] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
+        @($Commands[2] | Where-Object { $_ -like '*-ResumeFailedOnly' }).Count | Should -Be 0
+        @($Commands[2] | Where-Object { $_ -eq '  ./Run-AllSubscriptions.ps1 -TenantID t -Fresh' }).Count | Should -BeGreaterThan 0
+        @($Run4.Calls) | Should -Not -Contain 'sub-x'
+        @(script:Get-Lines -Run $Run4 -Like '*FAILED (consumption)*').Count | Should -Be 0
+        @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: Consumption incomplete*').Count | Should -Be 1
+        $Run4.Result.WrapperExitCode | Should -Be 2 -Because 'the retry-limit rule decides that run, and it is not exited 3 for a subscription it did not collect'
+    }
+
+    It 'a run whose billing downloads all succeed exits 0' {
+        $Run = script:Invoke-Run -Subs @($script:A, $script:B)
+        $Run.Result.WrapperExitCode | Should -Be 0
+        @(script:Get-Lines -Run $Run -Like '*FAILED (consumption)*').Count | Should -Be 0
     }
 }
 

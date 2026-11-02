@@ -3095,6 +3095,14 @@ if (@($UncarriedSkipped).Count -gt 0)
     Write-Host "=================================================================" -ForegroundColor Red
 }
 
+# A subscription whose billing download failed or stopped part-way for a reason
+# other than the sign-in (that one is in FAILED (auth) above) is missing some or
+# all of its cost data: exit 3 below (5 with a collector failure). It is on the
+# retry list, so the next run collects it again; once it has failed 3 runs in a
+# row the retry limit leaves it out (Retry Limit Reached), and that run is not
+# exited 3 for it.
+Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID)
+
 # A per-stream state file the end-of-run merge could not move aside: the run
 # above is finished; the stop says what to do, and the exit code is set below
 # (exit 1 in place of 0 and 3-5; exit 2 keeps its code).
@@ -3124,7 +3132,7 @@ if ($null -ne $BundleBuildError)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0) -ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0)
 # A per-stream state file the merge could not move aside stops the next run at
 # its start: exit 1, in place of 0 and 3-5, so a caller acts on it. Exit 2
 # (reports missing or subscriptions failed) keeps its code; the stop above
