@@ -176,19 +176,32 @@ Describe 'VM billing-coverage banner' {
         $Html | Should -Match 'only 1 VMs'
     }
 
-    It 'counts rows with an empty ResourceId, and a file without the column, as before' {
+    It 'does not count rows with an empty or blank ResourceId, or a file without the column, as billed VMs' {
         $Inv = New-TestInventory -RunningVms 3 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_blank.csv'
         @(
             [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '' }
             [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '' }
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '   ' }
             [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = 'vm-a' }
         ) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
-        Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv | Should -Match 'only 2 VMs'
+        Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv | Should -Match 'only 1 VMs'
 
         $NoColumn = Join-Path $script:WorkDir 'con_nocol.csv'
         @('"MeterCategory","Quantity"', '"Virtual Machines","1"') | Set-Content -Path $NoColumn -Encoding utf8
         Invoke-Summary -Inventory $Inv -ConsumptionFile $NoColumn | Should -Match 'only 0 VMs'
+    }
+
+    It 'shows a one-VM billing gap that a row with an empty ResourceId would hide' {
+        $Inv = New-TestInventory -RunningVms 2 -DeallocatedVms 0
+        $Csv = Join-Path $script:WorkDir 'con_onegap.csv'
+        @(
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = 'vm-a' }
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '' }
+        ) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv
+        $Html | Should -Match '<div class="coverage-banner">'
+        $Html | Should -Match 'only 1 VMs'
     }
 
     # The check runs at the very end of a run, inside the inventory process; a
