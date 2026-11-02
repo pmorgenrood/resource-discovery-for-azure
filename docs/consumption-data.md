@@ -64,12 +64,13 @@ consumption phase (the rest of the inventory continues).
 Each page request is retried up to **3 times, with exponential backoff (2, 4
 and 8 seconds)**, unless the failure is one a retry cannot change: access
 refused (401, 403, or an error that says access was denied), a sign-in that
-cannot be used (an expired or invalid token, an `AADSTS` sign-in error, or an
+cannot be used (an expired or invalid token, one that needs the user, or an
 error that says to run `Connect-AzAccount`), a bad request (400) or not found
-(404, or an error that says it could not be found). Every other failure is
-retried, for example 429 throttling, a timeout, a server error (5xx), a transfer cut off part-way
-(`Error while copying content to a stream`) or an error that is not
-recognised. The **same** page is retried (the previous page's
+(404, or an error that says it could not be found), named by the error or by
+an error inside it. Every other failure is retried, for example 429
+throttling, a timeout, a server error (5xx), a transfer cut off part-way
+(`Error while copying content to a stream`), a sign-in service error that
+names only its code, or an error that is not recognised. The **same** page is retried (the previous page's
 `ContinuationToken` is preserved), so no rows are duplicated or skipped. This
 is the rule the up-front consumption data check uses. Either way
 a page that still fails is handled by the per-subscription failure path (see
