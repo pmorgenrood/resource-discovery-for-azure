@@ -1244,6 +1244,34 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The token request was cancelled.')) | Should -Be 'Transient'
     }
 
+    It 'retries a sign-in service error that names only its code: <Text>' -ForEach @(
+        @{ Text = 'AADSTS50000: There was an error issuing a token or an issue with our sign-in service.' }
+        @{ Text = 'AADSTS90033: A transient error has occurred. Please try again.' }
+        @{ Text = 'AADSTS90055: TenantThrottlingError: There are too many incoming requests.' }
+    ) {
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text)) | Should -Be 'Transient'
+    }
+
+    It 'reads the messages inside a wrapper: a sign-in that cannot be used, wrapped in a generic error, is not retried' {
+        $Inner = [System.Exception]::new("The access token is invalid. Code: 'InvalidAuthenticationToken'")
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('One or more errors occurred.', $Inner)) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Management.Automation.PSInvalidOperationException]::new('Operation failed.', ([System.Exception]::new('wrapped', ([System.Exception]::new('Run Connect-AzAccount to login.')))))) | Should -Be 'Permanent'
+        # The error of an ErrorRecord the outer exception carries is read too.
+        $Record = [System.Management.Automation.ErrorRecord]::new([System.Exception]::new('The access token has expired.'), 'TokenExpired', 'AuthenticationError', $null)
+        Get-ConsumptionErrorKind -Exception ([System.Management.Automation.RuntimeException]::new('Operation failed.', $null, $Record)) | Should -Be 'Permanent'
+        # A wrapper around an error not recognised is retried.
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('One or more errors occurred.', [System.Exception]::new('An error occurred while sending the request.'))) | Should -Be 'Transient'
+    }
+
+    It 'reads the chain to at most 10 errors' {
+        $Ex = [System.Exception]::new('Run Connect-AzAccount to login.')
+        foreach ($Level in 1..10) { $Ex = [System.Exception]::new('wrapped', $Ex) }
+        Get-ConsumptionErrorKind -Exception $Ex | Should -Be 'Transient'
+        $Near = [System.Exception]::new('Run Connect-AzAccount to login.')
+        foreach ($Level in 1..9) { $Near = [System.Exception]::new('wrapped', $Near) }
+        Get-ConsumptionErrorKind -Exception $Near | Should -Be 'Permanent'
+    }
+
     It 'treats an error it does not recognise, and any other status code, as transient' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
