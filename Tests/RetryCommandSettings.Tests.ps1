@@ -75,9 +75,10 @@ Describe 'The command that collects one subscription again with a direct run' {
 
     It 'is the command ResourceInventory.ps1 prints under FAILED (consumption) and FAILED (metrics), with the run''s resource group and settings' {
         $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
-        $Calls = [regex]::Matches($Inner, [regex]::Escape("'  ' + (Get-DirectRunRetryCommand -TenantID `$RetryTenant -SubscriptionID `$_.Id -ResourceGroup `$ResourceGroup -Settings `$RetrySettings)"))
+        $Calls = [regex]::Matches($Inner, [regex]::Escape("'  ' + (Get-DirectRunRetryCommand -TenantID `$RetryTenant -SubscriptionID `$_.Id @RetryArgs)"))
         $Calls.Count | Should -Be 2
-        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent }'))
+        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }'))
+        $Inner | Should -Match ([regex]::Escape('$RetryArgs = @{ ResourceGroup = $ResourceGroup; Settings = $RetrySettings; Appid = [string]$Appid; Service = $Service; OutputDirectory = [string]$OutputDirectory; ObfuscationDictionary = $ObfuscationDictionary }'))
     }
 }
 
@@ -140,8 +141,75 @@ Describe 'The commands under FAILED (earlier report not carried)' {
         $At = $Wrapper.IndexOf('FAILED (earlier report not carried)')
         $At | Should -BeGreaterThan 0
         $Banner = $Wrapper.Substring($At, $Wrapper.IndexOf('=================================================================', $At + 40) - $At)
-        $Banner | Should -Match ([regex]::Escape("Write-Host ('  ' + (Get-WrapperRunCommand -TenantID `$TenantID -Mode '-Fresh' -Settings `$RunDataSettings))"))
-        $Banner | Should -Match ([regex]::Escape("Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID `$TenantID -SubscriptionID `$U.Id -Settings `$RunDataSettings))"))
+        $Banner | Should -Match ([regex]::Escape("Write-Host ('  ' + (Get-WrapperRunCommand -TenantID `$TenantID -Mode '-Fresh' -Settings `$RetryCommandSettings))"))
+        $Banner | Should -Match ([regex]::Escape("Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID `$TenantID -SubscriptionID `$U.Id -Settings `$RetryCommandSettings))"))
         $Banner | Should -Not -Match ([regex]::Escape('./ResourceInventory.ps1 -TenantID {0}'))
+    }
+}
+
+Describe 'The sign-in and output switches a printed command carries' {
+    It 'a wrapper command carries -DeviceLogin when the run used it, after the run settings, and not otherwise' {
+        $On = Get-RetryCommandSettings -Settings (script:New-Settings -On 'SkipMetrics') -DeviceLogin $true
+        Get-WrapperRunCommand -TenantID $script:Tenant -Mode '-Resume' -Settings $On | Should -Be ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -SkipMetrics -DeviceLogin' -f $script:Tenant)
+        $Off = Get-RetryCommandSettings -Settings (script:New-Settings -On 'SkipMetrics') -DeviceLogin $false
+        Get-WrapperRunCommand -TenantID $script:Tenant -Mode '-Resume' -Settings $Off | Should -Be ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -SkipMetrics' -f $script:Tenant)
+    }
+
+    It 'leaves the run settings as they are, so the settings a continuing run must keep do not change' {
+        $Settings = script:New-Settings -On 'Obfuscate'
+        $null = Get-RetryCommandSettings -Settings $Settings -DeviceLogin $true
+        @($Settings.Keys) | Should -Be @(Get-RunDataSettingNames)
+        Format-RunDataSettings -Settings $Settings | Should -Be '-Obfuscate'
+    }
+
+    It 'the wrapper''s direct-run command carries -DeviceLogin and leaves out -IncludeDisabled' {
+        $S = Get-RetryCommandSettings -Settings (script:New-Settings -On 'IncludeDisabled', 'Obfuscate') -DeviceLogin $true
+        Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Settings $S | Should -Be ('./ResourceInventory.ps1 -TenantID {0} -SubscriptionID sub-a -Obfuscate -DeviceLogin' -f $script:Tenant)
+    }
+
+    It 'a direct-run command carries <Name> when the run was given it' -TestCases @(
+        @{ Name = 'DeviceLogin' }, @{ Name = 'UseManagedIdentity' }
+    ) {
+        $S = [ordered]@{ Obfuscate = $false; SkipMetrics = $false; SkipConsumption = $false; DeviceLogin = ($Name -eq 'DeviceLogin'); UseManagedIdentity = ($Name -eq 'UseManagedIdentity') }
+        Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -Settings $S | Should -Be ('./ResourceInventory.ps1 -SubscriptionID sub-a -{0}' -f $Name)
+    }
+
+    It 'a direct-run command carries -Appid, -Service, -OutputDirectory and -ObfuscationDictionary, quoted, a path with a space and a quote as one value' {
+        $Command = Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -ResourceGroup 'rg-a' -Appid 'app-a' -Service 'Compute', 'Network' -OutputDirectory "/tmp/out dir/it's here" -ObfuscationDictionary '/tmp/dict a.json' -Settings ([ordered]@{ SkipMetrics = $true })
+        $Command | Should -Be "./ResourceInventory.ps1 -SubscriptionID sub-a -ResourceGroup 'rg-a' -Appid 'app-a' -Service 'Compute','Network' -OutputDirectory '/tmp/out dir/it''s here' -ObfuscationDictionary '/tmp/dict a.json' -SkipMetrics"
+        # PowerShell reads the printed command back as these values.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Command, [ref]$null, [ref]$null)
+        $Elements = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))[0].CommandElements
+        $Values = @{}
+        for ($i = 1; $i -lt $Elements.Count; $i++)
+        {
+            if ($Elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $i + 1 -lt $Elements.Count -and $Elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst])
+            {
+                $Values[$Elements[$i].ParameterName] = $Elements[$i + 1].SafeGetValue()
+            }
+        }
+        $Values['OutputDirectory'] | Should -Be "/tmp/out dir/it's here"
+        $Values['ObfuscationDictionary'] | Should -Be '/tmp/dict a.json'
+        @($Values['Service']) | Should -Be @('Compute', 'Network')
+        $Values['Appid'] | Should -Be 'app-a'
+    }
+
+    It 'a value not given is left out' {
+        Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -Appid '' -Service @() -OutputDirectory '' -ObfuscationDictionary '' | Should -Be './ResourceInventory.ps1 -SubscriptionID sub-a'
+    }
+
+    It 'never prints a secret: the builder takes no secret, certificate or token, and the direct run passes none to it' {
+        @((Get-Command Get-DirectRunRetryCommand).Parameters.Keys | Where-Object { $_ -match 'Secret|Cert|Token|Password|Key' }) | Should -BeNullOrEmpty
+        $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $At = $Inner.IndexOf('$RetryArgs = @{')
+        $At | Should -BeGreaterThan 0
+        $Inner.Substring($At, $Inner.IndexOf("`n", $At) - $At) | Should -Not -Match 'Secret'
+    }
+
+    It 'the wrapper prints its commands with the run settings and -DeviceLogin, and checks a continuing run against the run settings only' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('$RetryCommandSettings = Get-RetryCommandSettings -Settings $RunDataSettings -DeviceLogin ([bool]$DeviceLogin)'))
+        $Wrapper | Should -Match ([regex]::Escape('Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings'))
+        @([regex]::Matches($Wrapper, '(Get-WrapperRunCommand|Get-DirectRunRetryCommand|Get-ConsumptionFailedAdvice|Write-RetryLimitSummary|Write-MissingReportBanner) [^\r\n]*-Settings \$RunDataSettings')) | Should -BeNullOrEmpty
     }
 }

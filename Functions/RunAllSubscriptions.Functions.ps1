@@ -1207,6 +1207,18 @@ function Format-RunDataSettings
     return ($On -join ' ')
 }
 
+# The switches the wrapper's printed commands carry: the run settings
+# (Get-RunDataSettings), then DeviceLogin. A new dictionary, so the run
+# settings themselves are left as they are.
+function Get-RetryCommandSettings
+{
+    param([System.Collections.IDictionary]$Settings, [bool]$DeviceLogin)
+    $All = [ordered]@{}
+    if ($null -ne $Settings) { foreach ($Name in @($Settings.Keys)) { $All[$Name] = $Settings[$Name] } }
+    $All['DeviceLogin'] = $DeviceLogin
+    return $All
+}
+
 # A printed Run-AllSubscriptions.ps1 command: the tenant, $Mode ('-Fresh',
 # '-Resume', or '' for a run that continues by default) and the switches of
 # $Settings that are on (Format-RunDataSwitches), so a continuing run does not

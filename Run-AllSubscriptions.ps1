@@ -566,6 +566,10 @@ $null = Move-LegacyResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenan
 # path) and false for one that starts a new run, so the rest of the run does
 # what -Resume, or a run without it, did before.
 $RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled)
+# The switches a printed retry or new-run command carries: these settings, and
+# -DeviceLogin when this run signed in that way. -DeviceLogin changes only how
+# a run signs in, so it is not one of the settings a continuing run must keep.
+$RetryCommandSettings = Get-RetryCommandSettings -Settings $RunDataSettings -DeviceLogin ([bool]$DeviceLogin)
 $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $TenantID
 $StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'main'
 # With no resume state file, or one that is not the right shape (moved aside
@@ -2971,12 +2975,12 @@ if ($ZipOwedIds.Count -gt 0)
 {
     # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
     Write-Host ("Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of {0} subscription(s) completed earlier in this run are not in it, and the resume state is kept. To put every report of the run into a new consolidated zip, continue the run:" -f $ZipOwedIds.Count) -ForegroundColor Yellow
-    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $RunDataSettings)) -ForegroundColor Yellow
+    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $RetryCommandSettings)) -ForegroundColor Yellow
 }
 if ($RetryLimited.Count -gt 0)
 {
     # Set by the resume-state cleanup above.
-    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -NotListedIds $KeptNotListedIds -NotReadableIds @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } | ForEach-Object { [string]$_ } }) -Settings $RunDataSettings
+    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -NotListedIds $KeptNotListedIds -NotReadableIds @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } | ForEach-Object { [string]$_ } }) -Settings $RetryCommandSettings
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($WrapperTranscriptStarted)
@@ -3275,11 +3279,11 @@ if (@($UncarriedSkipped).Count -gt 0)
     }
     # Each command carries the run's settings.
     Write-Host "Their reports are NOT in the consolidated zip. Start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
-    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RunDataSettings)) -ForegroundColor Red
+    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
     Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
     foreach ($U in @($UncarriedSkipped))
     {
-        Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID $TenantID -SubscriptionID $U.Id -Settings $RunDataSettings)) -ForegroundColor Red
+        Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID $TenantID -SubscriptionID $U.Id -Settings $RetryCommandSettings)) -ForegroundColor Red
     }
     Write-Host "=================================================================" -ForegroundColor Red
 }
@@ -3290,20 +3294,20 @@ if (@($UncarriedSkipped).Count -gt 0)
 # retry list, so the next run collects it again; once it has failed 3 runs in a
 # row the retry limit leaves it out (Retry Limit Reached), and that run is not
 # exited 3 for it.
-Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
+Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RetryCommandSettings)
 
 # A subscription whose Azure Monitor metric request (grouped or for one
 # metric) still failed after its retries (throttling, timeout, server error)
 # has incomplete metrics: the same retry list, retry limit and exit 3 (5) as a
 # failed billing download above.
-Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
+Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RetryCommandSettings)
 
 # A subscription completed this run whose report zip is missing is not in the
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
 # the others, unless it has now failed 3 runs in a row; sets exit code 2 below.
 # With the inventory folder gone, one line says so instead.
-Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RunDataSettings -GoneFolder $(if ($InventoryFolderGone) { $InventoryRoot } else { '' })
+Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RetryCommandSettings -GoneFolder $(if ($InventoryFolderGone) { $InventoryRoot } else { '' })
 
 # A per-stream state file the end-of-run merge could not move aside: the run
 # above is finished; the stop says what to do, and the exit code is set below
