@@ -548,7 +548,8 @@ Write-Host ('Run lock: {0} (this run: process {1}, run {2})' -f (Split-Path -Pat
 
 # Resume state helpers. The file names hold the tenant key, not the tenant id
 # (Get-TenantFileKey); files an earlier version named with the tenant id are
-# moved to these names once, now that this run holds the lock.
+# moved to these names, or aside when a name is taken, once, now that this run
+# holds the lock (Move-LegacyResumeStateFiles).
 $ResumeStateFile = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $TenantID
 $null = Move-LegacyResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID
 

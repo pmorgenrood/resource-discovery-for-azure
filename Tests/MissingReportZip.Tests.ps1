@@ -356,6 +356,45 @@ Describe 'File names in the inventory folder hold no tenant id' -Skip:$IsWindows
         script:Get-TenantNamedFiles | Should -BeNullOrEmpty
     }
 
+    It 'files an earlier version left under the tenant id next to an unfinished run under the tenant key: the next run moves each aside with one line and continues the tenant-key run; the run after prints nothing about them; after each run no file name holds the tenant id' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+        $New = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Key)
+        Test-Path -LiteralPath $New | Should -BeTrue
+        # What an earlier version of this tool leaves under the tenant id: its
+        # resume state (whose tenant-key name is taken now), a temporary state
+        # file, a state file set aside as unreadable and a run lock temporary file.
+        Copy-Item -LiteralPath $New -Destination (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant))
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json.tmp' -f $script:Tenant)) -Value '{' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-1.json.unreadable-20261101-101010' -f $script:Tenant)) -Value '{' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root ('.run-lock-{0}.json.0a1b2c3d.tmp' -f $script:Tenant)) -Value '{}' -Encoding utf8
+
+        script:Set-Scenario
+        $R2 = script:Invoke-Wrapper
+        $R2.ExitCode | Should -Be 0 -Because ($R2.Text -join "`n")
+        @($R2.Text | Where-Object { $_ -like '*of an earlier version of this tool*' } | Sort-Object) | Should -Be @(@(
+                ('WARNING: A resume state file of an earlier version of this tool, named with the tenant id, is not used, because .resume-state-{0}.json is there: it was moved aside to .resume-state-{0}.json.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a temporary resume state file of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}.json.tmp.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a resume state file set aside as unreadable of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}-stream-1.json.unreadable-20261101-101010.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a temporary run lock file of an earlier version of this tool, named with the tenant id, aside to .run-lock-{0}.json.0a1b2c3d.tmp.earlier-version, which no run reads.' -f $script:Key)
+            ) | Sort-Object)
+        $R2.Text | Should -Contain 'Resume: carrying 2 report(s) of subscription(s) completed by an earlier run into the consolidated zip.'
+        $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R2.Text | Should -Contain 'Resume state cleared (clean run).'
+        script:Get-TenantNamedFiles | Should -BeNullOrEmpty
+        ($R2.Text -join "`n") | Should -Not -Match '12345678-1234-1234-1234-123456789012\.json|\.resume-state-12345678|\.run-lock-12345678'
+
+        $R3 = script:Invoke-Wrapper
+        $R3.ExitCode | Should -Be 0 -Because ($R3.Text -join "`n")
+        @($R3.Text | Where-Object { $_ -like '*earlier version of this tool*' }) | Should -BeNullOrEmpty
+        $R3.Text | Should -Contain 'Starting a new run.'
+        script:Get-TenantNamedFiles | Should -BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath $script:Root -Force -Filter '*.earlier-version' | ForEach-Object { $_.Name }).Count | Should -Be 4
+    }
+
     It 'a run lock under the old name is never moved or taken over: the run stops with exit 1 and its remove command; after it the next two runs proceed and name no file with the tenant id' {
         script:New-Case
         script:Set-Scenario
@@ -461,5 +500,164 @@ Describe 'A tenant key the run cannot work out' -Skip:$IsWindows {
         $R.ExitCode | Should -Be 1 -Because ($R.Text -join "`n")
         $R.Text | Should -Contain ($script:KeyLine -f $PSVersionTable.PSVersion, 'it came out empty')
         Test-Path -LiteralPath $script:Root | Should -BeFalse
+    }
+}
+
+Describe 'Move-LegacyResumeStateFiles: files an earlier version named with the tenant id' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $script:Key = 'a3a8ee437933'
+        function script:New-Folder
+        {
+            $Dir = Join-Path $script:TestBase ('legacy-' + [guid]::NewGuid().ToString().Substring(0, 8))
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            return $Dir
+        }
+        function script:New-File { param([string]$Dir, [string]$Name, [string]$Text = 'x') Set-Content -LiteralPath (Join-Path $Dir $Name) -Value $Text -Encoding utf8 -NoNewline }
+        function script:Get-Names { param([string]$Dir) @(Get-ChildItem -LiteralPath $Dir -Force | ForEach-Object { $_.Name } | Sort-Object) }
+        # The lines the move prints, and the number it returns last.
+        function script:Invoke-Move
+        {
+            param([string]$Dir)
+            $Out = @(Move-LegacyResumeStateFiles -InventoryRoot $Dir -Tenant $script:Tenant 6>&1)
+            [pscustomobject]@{
+                Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
+                Moved = $Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] } | Select-Object -Last 1
+            }
+        }
+    }
+
+    It 'a resume state file (<Case>) whose tenant-key name is taken is moved aside under the tenant key with one line; the tenant-key file is left as it is' -ForEach @(
+        @{ Case = 'the run''s'; Rest = '.json' }
+        @{ Case = 'a stream''s'; Rest = '-stream-2.json' }
+    ) {
+        $Dir = script:New-Folder
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}{1}' -f $script:Key, $Rest) -Text 'new'
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}{1}' -f $script:Tenant, $Rest) -Text 'old'
+        $R = script:Invoke-Move $Dir
+        $R.Lines | Should -Be @(('WARNING: A resume state file of an earlier version of this tool, named with the tenant id, is not used, because .resume-state-{0}{1} is there: it was moved aside to .resume-state-{0}{1}.earlier-version, which no run reads.' -f $script:Key, $Rest))
+        $R.Moved | Should -Be 0
+        script:Get-Names $Dir | Should -Be @(('.resume-state-{0}{1}' -f $script:Key, $Rest), ('.resume-state-{0}{1}.earlier-version' -f $script:Key, $Rest))
+        Get-Content -LiteralPath (Join-Path $Dir ('.resume-state-{0}{1}' -f $script:Key, $Rest)) -Raw | Should -BeExactly 'new'
+        Get-Content -LiteralPath (Join-Path $Dir ('.resume-state-{0}{1}.earlier-version' -f $script:Key, $Rest)) -Raw | Should -BeExactly 'old'
+    }
+
+    It 'the temporary and set-aside files of that version are moved aside under the tenant key, one line each; its run lock and another tenant''s files are not touched' {
+        $Dir = script:New-Folder
+        $Old = @(
+            ('.resume-state-{0}.json.tmp' -f $script:Tenant)
+            ('.resume-state-{0}-stream-2.json.tmp' -f $script:Tenant)
+            ('.resume-state-{0}.json.unreadable-20261101-101010' -f $script:Tenant)
+            ('.resume-state-{0}-stream-1.json.unreadable-20261101-101010-3' -f $script:Tenant)
+            ('.run-lock-{0}.json.0a1b2c3d.tmp' -f $script:Tenant)
+        )
+        $Kept = @(
+            ('.run-lock-{0}.json' -f $script:Tenant)
+            '.resume-state-tenant-b.json', '.resume-state-tenant-b.json.tmp', '.resume-state-tenant-b.json.unreadable-20261101-101010', '.run-lock-tenant-b.json', '.run-lock-tenant-b.json.0a1b2c3d.tmp'
+            ('.resume-state-{0}.json' -f (Get-TenantFileKey -Tenant 'tenant-b'))
+        )
+        foreach ($Name in $Old + $Kept) { script:New-File -Dir $Dir -Name $Name -Text $Name }
+        $R = script:Invoke-Move $Dir
+        $R.Moved | Should -Be 0
+        @($R.Lines | Sort-Object) | Should -Be @(@(
+                ('Moved a temporary resume state file of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}.json.tmp.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a temporary resume state file of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}-stream-2.json.tmp.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a resume state file set aside as unreadable of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}.json.unreadable-20261101-101010.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a resume state file set aside as unreadable of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}-stream-1.json.unreadable-20261101-101010-3.earlier-version, which no run reads.' -f $script:Key)
+                ('Moved a temporary run lock file of an earlier version of this tool, named with the tenant id, aside to .run-lock-{0}.json.0a1b2c3d.tmp.earlier-version, which no run reads.' -f $script:Key)
+            ) | Sort-Object)
+        $Aside = @(
+            ('.resume-state-{0}.json.tmp.earlier-version' -f $script:Key)
+            ('.resume-state-{0}-stream-2.json.tmp.earlier-version' -f $script:Key)
+            ('.resume-state-{0}.json.unreadable-20261101-101010.earlier-version' -f $script:Key)
+            ('.resume-state-{0}-stream-1.json.unreadable-20261101-101010-3.earlier-version' -f $script:Key)
+            ('.run-lock-{0}.json.0a1b2c3d.tmp.earlier-version' -f $script:Key)
+        )
+        script:Get-Names $Dir | Should -Be @($Aside + $Kept | Sort-Object)
+        for ($I = 0; $I -lt $Old.Count; $I++) { Get-Content -LiteralPath (Join-Path $Dir $Aside[$I]) -Raw | Should -BeExactly $Old[$I] }
+        foreach ($Name in $Kept) { Get-Content -LiteralPath (Join-Path $Dir $Name) -Raw | Should -BeExactly $Name }
+    }
+
+    It 'no run reads, moves, merges or removes a file moved aside: the next move prints nothing, and the stream state list, the lock temporary file clean-up and the tenant-key names leave them alone' {
+        $Dir = script:New-Folder
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}.json' -f $script:Key) -Text 'new'
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}-stream-1.json' -f $script:Key) -Text 'new'
+        foreach ($Name in @(('.resume-state-{0}.json' -f $script:Tenant), ('.resume-state-{0}-stream-1.json' -f $script:Tenant), ('.resume-state-{0}-stream-1.json.tmp' -f $script:Tenant), ('.resume-state-{0}.json.unreadable-20261101-101010' -f $script:Tenant), ('.run-lock-{0}.json.0a1b2c3d.tmp' -f $script:Tenant)))
+        {
+            script:New-File -Dir $Dir -Name $Name -Text 'old'
+        }
+        (script:Invoke-Move $Dir).Lines.Count | Should -Be 5
+        $After = script:Get-Names $Dir
+        @($After | Where-Object { $_ -like '*.earlier-version' }).Count | Should -Be 5
+
+        $R = script:Invoke-Move $Dir
+        $R.Lines | Should -BeNullOrEmpty
+        $R.Moved | Should -Be 0
+        @(Get-StreamResumeStateFiles -InventoryRoot $Dir -Tenant $script:Tenant | ForEach-Object { $_.Name }) | Should -Be @(('.resume-state-{0}-stream-1.json' -f $script:Key))
+        $LockLines = @(Remove-RunLockTemp -Path (Get-RunLockPath -InventoryRoot $Dir -Tenant $script:Tenant) 6>&1 | ForEach-Object { [string]$_ })
+        $LockLines | Should -BeNullOrEmpty
+        foreach ($Path in @((Get-ResumeStatePath -InventoryRoot $Dir -Tenant $script:Tenant), (Get-ResumeStatePath -InventoryRoot $Dir -Tenant $script:Tenant -Stream '1'), (Get-RunLockPath -InventoryRoot $Dir -Tenant $script:Tenant), (Get-RunLockLegacyPath -InventoryRoot $Dir -Tenant $script:Tenant)))
+        {
+            @($After | Where-Object { $_ -like '*.earlier-version' }) | Should -Not -Contain (Split-Path -Path $Path -Leaf)
+        }
+        script:Get-Names $Dir | Should -Be $After
+    }
+
+    It 'the name moved aside to is taken: <Taken> name(s) taken, it is moved to the next free one, -2 up to -100' -ForEach @(
+        @{ Taken = 1; Expected = '.earlier-version-2' }
+        @{ Taken = 99; Expected = '.earlier-version-100' }
+    ) {
+        $Dir = script:New-Folder
+        $Base = '.resume-state-{0}.json.tmp.earlier-version' -f $script:Key
+        for ($N = 1; $N -le $Taken; $N++) { script:New-File -Dir $Dir -Name $(if ($N -eq 1) { $Base } else { '{0}-{1}' -f $Base, $N }) -Text 'taken' }
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}.json.tmp' -f $script:Tenant) -Text 'old'
+        $R = script:Invoke-Move $Dir
+        $R.Lines | Should -Be @(('Moved a temporary resume state file of an earlier version of this tool, named with the tenant id, aside to .resume-state-{0}.json.tmp{1}, which no run reads.' -f $script:Key, $Expected))
+        Get-Content -LiteralPath (Join-Path $Dir ('.resume-state-{0}.json.tmp{1}' -f $script:Key, $Expected)) -Raw | Should -BeExactly 'old'
+        @(Get-ChildItem -LiteralPath $Dir -Force | Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -eq 'taken' }).Count | Should -Be $Taken
+    }
+
+    It 'all 100 names taken: the file is left where it is, with one warning that holds no tenant id' {
+        $Dir = script:New-Folder
+        $Base = '.resume-state-{0}.json.earlier-version' -f $script:Key
+        for ($N = 1; $N -le 100; $N++) { script:New-File -Dir $Dir -Name $(if ($N -eq 1) { $Base } else { '{0}-{1}' -f $Base, $N }) -Text 'taken' }
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}.json' -f $script:Key) -Text 'new'
+        $Old = '.resume-state-{0}.json' -f $script:Tenant
+        script:New-File -Dir $Dir -Name $Old -Text 'old'
+        $R = script:Invoke-Move $Dir
+        $R.Lines | Should -Be @(('WARNING: Could not move a resume state file of an earlier version of this tool, named with the tenant id, aside: every name from {0} to {0}-100 is taken. It is left where it is.' -f $Base))
+        Get-Content -LiteralPath (Join-Path $Dir $Old) -Raw | Should -BeExactly 'old'
+        Get-Content -LiteralPath (Join-Path $Dir ('.resume-state-{0}.json' -f $script:Key)) -Raw | Should -BeExactly 'new'
+    }
+
+    It 'a move that fails (a read-only folder): one warning that holds no tenant id, and the file is left where it is' -Skip:$IsWindows {
+        $Dir = script:New-Folder
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}.json' -f $script:Key) -Text 'new'
+        foreach ($Name in @(('.resume-state-{0}.json' -f $script:Tenant), ('.resume-state-{0}.json.tmp' -f $script:Tenant))) { script:New-File -Dir $Dir -Name $Name -Text 'old' }
+        $Before = script:Get-Names $Dir
+        & chmod 555 $Dir
+        try { $R = script:Invoke-Move $Dir }
+        finally { & chmod 755 $Dir }
+        $R.Lines.Count | Should -Be 2
+        foreach ($Line in $R.Lines)
+        {
+            $Line | Should -BeLike 'WARNING: Could not move a * of an earlier version of this tool, named with the tenant id, aside to .resume-state-a3a8ee437933.json*.earlier-version: *. It is left where it is.'
+            $Line | Should -Not -Match '12345678'
+        }
+        script:Get-Names $Dir | Should -Be $Before
+    }
+
+    It 'no line names the tenant id in any of these cases' {
+        $Dir = script:New-Folder
+        script:New-File -Dir $Dir -Name ('.resume-state-{0}.json' -f $script:Key) -Text 'new'
+        foreach ($Name in @(('.resume-state-{0}.json' -f $script:Tenant), ('.resume-state-{0}-stream-3.json' -f $script:Tenant), ('.resume-state-{0}.json.tmp' -f $script:Tenant), ('.resume-state-{0}.json.unreadable-20261101-101010' -f $script:Tenant), ('.run-lock-{0}.json.0a1b2c3d.tmp' -f $script:Tenant)))
+        {
+            script:New-File -Dir $Dir -Name $Name -Text 'old'
+        }
+        $R = script:Invoke-Move $Dir
+        $R.Moved | Should -Be 1
+        $R.Lines.Count | Should -Be 5
+        ($R.Lines -join "`n") | Should -Not -Match '12345678'
+        @(script:Get-Names $Dir | Where-Object { $_ -match '12345678' }) | Should -BeNullOrEmpty
     }
 }

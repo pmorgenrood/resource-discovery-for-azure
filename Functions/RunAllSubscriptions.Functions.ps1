@@ -2944,44 +2944,118 @@ function Get-ResumeStatePath
     return (Join-Path $InventoryRoot ('.resume-state-{0}-stream-{1}.json' -f $Key, $Stream))
 }
 
-# Moves the resume state files an earlier version of this tool named with the
-# tenant id ('.resume-state-<tenant id>.json' and '-stream-<N>.json', the id in
-# any letter case) to their names with the tenant key, once, after this run took
-# its lock. A file whose new name is already taken is left where it is. Prints
-# one line per file moved or left, naming only the new names, and returns the
-# number moved.
+# Moves the files an earlier version of this tool named with the tenant id (the
+# id in any letter case) off those names, once, after this run took its lock:
+#   - a resume state file, '.resume-state-<tenant id>.json' or
+#     '-stream-<N>.json', goes to its name with the tenant key, and the run
+#     continues it;
+#   - such a file whose tenant-key name is already taken, and the temporary and
+#     set-aside files of that version ('<state file>.tmp',
+#     '<state file>.unreadable-<UTC time>[-N]' and
+#     '.run-lock-<tenant id>.json.<8 hex>.tmp'), are moved aside to their name
+#     with the tenant key plus '.earlier-version' (Move-LegacyTenantFileAside).
+#     That name ends neither in '.json' nor in '.tmp', so no run reads, moves,
+#     merges or removes it.
+# The run lock of that version, '.run-lock-<tenant id>.json', is never moved
+# (Get-RunLockLegacyPath), and the files of other tenants are not touched.
+# Prints one line per file, naming only tenant-key names, and returns the
+# number of resume state files moved to their tenant-key names.
 function Move-LegacyResumeStateFiles
 {
     param(
         [Parameter(Mandatory = $true)][string]$InventoryRoot,
         [Parameter(Mandatory = $true)][string]$Tenant
     )
-    $Id = $Tenant.Trim()
-    $Pattern = '^\.resume-state-{0}(-stream-(?<Stream>\d+))?\.json$' -f [regex]::Escape($Id)
+    $Id = [regex]::Escape($Tenant.Trim())
+    $Key = Get-TenantFileKey -Tenant $Tenant
+    $StatePattern = '^\.resume-state-{0}(-stream-(?<Stream>\d+))?\.json$' -f $Id
+    $LeftPattern = '^(?<Head>\.resume-state-){0}(?<Rest>(-stream-\d+)?\.json(\.tmp|\.unreadable-\d{{8}}-\d{{6}}(-\d+)?))$|^(?<Head>\.run-lock-){0}(?<Rest>\.json\.[0-9a-f]{{8}}\.tmp)$' -f $Id
+    # An error text can hold the file's old name; the lines name no tenant id.
+    $Masked = { param([string]$Text) [regex]::Replace($Text, $Id, '<tenant id>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) }
     $Moved = 0
-    $Files = @(Get-ChildItem -LiteralPath $InventoryRoot -Filter '.resume-state-*.json' -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Pattern })
-    foreach ($File in $Files)
+    $Files = @(foreach ($Filter in @('.resume-state-*', '.run-lock-*')) { Get-ChildItem -LiteralPath $InventoryRoot -Filter $Filter -File -Force -ErrorAction SilentlyContinue })
+    foreach ($File in @($Files | Sort-Object -Property Name))
     {
-        $null = $File.Name -match $Pattern
-        $Target = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $Tenant -Stream $Matches['Stream']
-        $TargetName = Split-Path -Path $Target -Leaf
-        if (Test-Path -LiteralPath $Target)
+        if ($File.Name -match $StatePattern)
         {
-            Write-Host ('WARNING: A resume state file of an earlier version of this tool, named with the tenant id, is still in the inventory folder; it is not used, because {0} is there: it was left where it is.' -f $TargetName) -ForegroundColor Yellow
+            $Target = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $Tenant -Stream $Matches['Stream']
+            $KeyName = Split-Path -Path $Target -Leaf
+            $What = 'resume state file'
+            if (-not (Test-Path -LiteralPath $Target))
+            {
+                try
+                {
+                    Move-Item -LiteralPath $File.FullName -Destination $Target -ErrorAction Stop
+                    Write-Host ('Renamed a resume state file of an earlier version of this tool to {0}: file names no longer hold the tenant id.' -f $KeyName) -ForegroundColor Cyan
+                    $Moved++
+                }
+                catch
+                {
+                    Write-Host ('WARNING: Could not rename a resume state file of an earlier version of this tool to {0}: {1}. It is not used.' -f $KeyName, (& $Masked $_.Exception.Message)) -ForegroundColor Yellow
+                }
+                continue
+            }
+        }
+        elseif ($File.Name -match $LeftPattern)
+        {
+            $KeyName = $Matches['Head'] + $Key + $Matches['Rest']
+            $What = if ($KeyName -like '.run-lock-*') { 'temporary run lock file' } elseif ($KeyName -like '*.tmp') { 'temporary resume state file' } else { 'resume state file set aside as unreadable' }
+        }
+        else
+        {
             continue
         }
+        $Base = $KeyName + '.earlier-version'
         try
         {
-            Move-Item -LiteralPath $File.FullName -Destination $Target -ErrorAction Stop
-            Write-Host ('Renamed a resume state file of an earlier version of this tool to {0}: file names no longer hold the tenant id.' -f $TargetName) -ForegroundColor Cyan
-            $Moved++
+            $MovedTo = Move-LegacyTenantFileAside -File $File -Base $Base
+            if ($null -eq $MovedTo)
+            {
+                Write-Host ('WARNING: Could not move a {0} of an earlier version of this tool, named with the tenant id, aside: every name from {1} to {1}-100 is taken. It is left where it is.' -f $What, $Base) -ForegroundColor Yellow
+            }
+            elseif ($What -eq 'resume state file')
+            {
+                Write-Host ('WARNING: A resume state file of an earlier version of this tool, named with the tenant id, is not used, because {0} is there: it was moved aside to {1}, which no run reads.' -f $KeyName, $MovedTo) -ForegroundColor Yellow
+            }
+            else
+            {
+                Write-Host ('Moved a {0} of an earlier version of this tool, named with the tenant id, aside to {1}, which no run reads.' -f $What, $MovedTo) -ForegroundColor Cyan
+            }
         }
         catch
         {
-            Write-Host ('WARNING: Could not rename a resume state file of an earlier version of this tool to {0}: {1}. It is not used.' -f $TargetName, $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host ('WARNING: Could not move a {0} of an earlier version of this tool, named with the tenant id, aside to {1}: {2}. It is left where it is.' -f $What, $Base, (& $Masked $_.Exception.Message)) -ForegroundColor Yellow
         }
     }
     return $Moved
+}
+
+# Moves File to Base, or, when that name is taken, to Base-2 up to Base-100 (as
+# New-RunOutputFile tries names), never over another file. Returns the name it
+# moved the file to, or $null when every name is taken; throws when the move
+# fails for another reason.
+function Move-LegacyTenantFileAside
+{
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$File,
+        [Parameter(Mandatory = $true)][string]$Base
+    )
+    for ($N = 1; $N -le 100; $N++)
+    {
+        $Name = if ($N -eq 1) { $Base } else { '{0}-{1}' -f $Base, $N }
+        $Path = Join-Path $File.DirectoryName $Name
+        try
+        {
+            [System.IO.File]::Move($File.FullName, $Path, $false)
+            return $Name
+        }
+        catch [System.IO.IOException]
+        {
+            # Taken: try the next name. Any other failure is the caller's.
+            if (-not ([System.IO.File]::Exists($Path) -or [System.IO.Directory]::Exists($Path))) { throw }
+        }
+    }
+    return $null
 }
 
 # The lock's times are written as round-trip UTC text ('o'). Returns that time
