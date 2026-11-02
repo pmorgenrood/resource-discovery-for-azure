@@ -2165,8 +2165,9 @@ if ($AuthSkippedPhases.Count -gt 0)
     Write-Host "=========================================================" -ForegroundColor Red
 }
 
-# A subscription whose grouped Azure Monitor request still failed after its
-# retries (throttling, timeout, server error) has incomplete metrics: listed
+# A subscription whose Azure Monitor metric request (grouped or for one
+# metric) still failed after its retries (throttling, timeout, server error)
+# has incomplete metrics: listed
 # with the command that collects it again, and exit 3 (5 with collector
 # failures), as for a data phase skipped for the sign-in.
 $MetricsIncompleteEntries = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)

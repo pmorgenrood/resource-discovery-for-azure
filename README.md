@@ -581,13 +581,13 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 | `0` | Clean run — no failures of any kind. |
 | `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). |
 | `2` | Per-subscription output verification gap (a subscription reported success but its output zip is missing). |
-| `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner — or a grouped Azure Monitor metric request of one or more subscriptions still failed after its retries (throttling, timeout or server error), so their metrics are incomplete — see the "FAILED (metrics)" banner, which names each one and the command that collects it again. |
+| `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner — or an Azure Monitor metric request (grouped or for one metric) of one or more subscriptions still failed after its retries (throttling, timeout or server error), so their metrics are incomplete — see the "FAILED (metrics)" banner, which names each one and the command that collects it again. |
 | `4` | Completed, but one or more `Services/*/*.ps1` collectors failed for one or more subscriptions — see the "FAILED (collectors)" banner and "Collector Failures" summary. Affected resource types are missing (not empty) from those subscriptions' reports. |
 | `5` | Both `3` and `4` occurred in the same run. |
 
 Codes `3`–`5` still mean the report was produced — they flag that it is **incomplete** in a specific, diagnosable way, rather than silently looking like a clean/empty result.
 
-A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose grouped Azure Monitor metric request of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip.
+A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor metric request (grouped or for one metric) of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip.
 
 ### Important Notes
 

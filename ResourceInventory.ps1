@@ -1833,8 +1833,9 @@ Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
 
-# A direct run whose metrics are incomplete because a grouped Azure Monitor
-# request still failed after its retries (throttling, timeout, server error)
+# A direct run whose metrics are incomplete because an Azure Monitor metric
+# request (grouped or for one metric) still failed after its retries
+# (throttling, timeout, server error)
 # names each subscription with the command that collects it again, and exits 3.
 # Under -RunAllSubs the wrapper does this for the whole run.
 if (-not $RunAllSubs.IsPresent)

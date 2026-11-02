@@ -253,9 +253,10 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     }
 }
 
-# The metrics entries of the subscriptions whose grouped Azure Monitor request
-# still failed after its retries (Extension/Metrics.ps1 records them with
-# Complete = $false), unique by name and id. Leaves out the entries for metrics
+# The metrics entries of the subscriptions whose Azure Monitor metric request
+# (grouped or for one metric) still failed after its retries
+# (Extension/Metrics.ps1 records them with Complete = $false), unique by name
+# and id. Leaves out the entries for metrics
 # skipped because the sign-in could not be refreshed, which the wrapper reports
 # in its FAILED (auth) banner.
 function Get-MetricsIncompleteEntries
