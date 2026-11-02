@@ -373,6 +373,59 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Global:ConsumptionRecordCount | Should -Be 2
     }
 
+    It 'does not retry a billing call that fails with <Status>, and records the subscription as incomplete' -ForEach @(
+        @{ Status = 'Unauthorized'; Shape = 'cloud' }
+        @{ Status = 'Forbidden'; Shape = 'cloud' }
+        @{ Status = 'BadRequest'; Shape = 'http' }
+        @{ Status = 'NotFound'; Shape = 'http' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailStatus = $Status
+        $script:FailShape = $Shape
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            if ($script:FailShape -eq 'cloud') { throw (New-CloudShapedException -Message 'stand-in: the usage request failed' -Status $script:FailStatus) }
+            throw (New-StatusException -Message 'stand-in: the usage request failed' -Status $script:FailStatus)
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stand-in: the usage request failed \(stopped at consumption page 1, after 0 record\(s\)'
+    }
+
+    It 'retries a billing call that fails with <Case>, waiting 2 then 4 seconds, and collects the subscription' -ForEach @(
+        @{ Case = 'throttling (429)'; Status = 'TooManyRequests' }
+        @{ Case = 'a server error (503)'; Status = 'ServiceUnavailable' }
+        @{ Case = 'a transfer cut off part-way'; Status = 'Dropped' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailStatus = $Status
+        $script:Calls = 0
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -le 2 -and $script:FailStatus -eq 'Dropped') { throw ([System.IO.IOException]::new('Error while copying content to a stream.')) }
+            if ($script:Calls -le 2) { throw (New-CloudShapedException -Message 'stand-in: try again later' -Status $script:FailStatus) }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 4 }
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'stops retrying a throttled billing call after 3 retries' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates { throw (New-StatusException -Message 'stand-in: too many requests' -Status TooManyRequests) }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 4 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+    }
+
     # The up-front check reads such a row as having no resource URI
     # (Get-ConsumptionRowResourceUri); the billing phase keeps its cost.
     It 'keeps a usage row whose InstanceData is <Case>, with blank resource fields, and collects the rest of the subscription' -ForEach @(
@@ -1050,6 +1103,11 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status BadGateway) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception (New-CloudShapedException -Message 'x' -Status InternalServerError) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.TimeoutException]::new('The operation has timed out.')) | Should -Be 'Transient'
+    }
+
+    It 'treats a transfer cut off part-way (Error while copying content to a stream) as transient' {
+        Get-ConsumptionErrorKind -Exception ([System.IO.IOException]::new('Error while copying content to a stream.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('Error while copying content to a stream.', [System.IO.IOException]::new('Unable to read data from the transport connection.'))) | Should -Be 'Transient'
     }
 
     It 'treats 400, 401, 403 and unclassified errors as permanent' {
