@@ -14,7 +14,8 @@ if ($Task -eq 'Processing')
             $Data = $1.PROPERTIES
 
             # roleProfile is an object; its 'roles' member holds the list of roles.
-            $Roles = @($Data.roleProfile.roles | Where-Object { $null -ne $_ })
+            # Only objects are roles: a string or number there has no name or SKU.
+            $Roles = @($Data.roleProfile.roles | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] -or $_ -is [System.Collections.IDictionary] })
 
             $Obj = @{
                 'ID'                   = $1.id;
