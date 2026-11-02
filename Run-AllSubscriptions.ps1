@@ -2462,7 +2462,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host ""
         Write-Host "ERROR: Per-subscription output verification failed." -ForegroundColor Red
         Write-Host ("  Expected zips: {0} (one per subscription that ran to completion this run{1})" -f $ExpectedZipCount, $CarriedNote) -ForegroundColor Red
-        Write-Host ("  Found zips:    {0} (filter: under {1}, LastWriteTime >= {2:o})" -f $ActualZipCount, $InventoryRoot, $RunStartTime) -ForegroundColor Red
+        Write-Host ("  Found zips:    {0} (this run's report records{1})" -f $ActualZipCount, $CarriedNote) -ForegroundColor Red
         Write-Host ("  Gap:           {0} missing per-subscription zip(s)." -f $MissingCount) -ForegroundColor Red
         Write-Host ""
         Write-Host "Subscriptions whose inner script reported success this run:" -ForegroundColor Yellow
