@@ -4375,6 +4375,11 @@ function Get-RunSummaryLogContent
         # Retry-list entries past the retry limit ({ Name; Id; Attempts; Reason }),
         # from Get-RetryLimitedAttempts.
         $RetryLimited = @(),
+        # Subscriptions completed this run whose report zip is missing, so the
+        # consolidated zip does not hold them: the count (some may not be
+        # nameable) and the ones named ({ Name; Id }).
+        [int]$MissingReportCount = 0,
+        $MissingReports = @(),
         [int]$ConsumptionRecordCount = 0,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
@@ -4408,6 +4413,8 @@ function Get-RunSummaryLogContent
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
     $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
+    $Missing = @(@($MissingReports) | Where-Object { $null -ne $_ })
+    $MissingTotal = [math]::Max($MissingReportCount, $Missing.Count)
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -4515,6 +4522,10 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
     $Lines.Add(('  Retry limit reached : {0} (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
+    if ($MissingTotal -gt 0)
+    {
+        $Lines.Add(('  Report missing      : {0} (completed, but their report zip is not in this zip; the next run collects them)' -f $MissingTotal))
+    }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
@@ -4551,6 +4562,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Retry limit reached (detail; to try them again, start a new run with -Fresh):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
+        }
+        if ($Missing.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Report missing (detail; not in this zip, the next run collects them):')
+            foreach ($MissingSub in $Missing) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
         {
