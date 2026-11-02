@@ -1336,30 +1336,44 @@ function Get-ConsumptionErrorStatusCode
 }
 
 # Pure: 'Permanent' for the failures a retry cannot change: 400 (malformed
-# request), 401/403 (no permission) and 404 (not found). Without a status code
-# the message decides: it is permanent only when it names one of those (by
-# name or number), says access was denied or that something could not be
-# found, or says the sign-in cannot be used (the same as a 401: a retry signs
-# in no better). Everything else is 'Transient' (worth a bounded retry):
-# throttling, timeouts, server errors, a transfer cut off part-way, and any
-# error not recognised here.
+# request), 401/403 (no permission) and 404 (not found). Otherwise the
+# messages decide, of the exception and of each one in its chain (inner
+# exceptions and an ErrorRecord's exception, at most 10, as
+# Test-MetricBadRequest in Extension/Metrics.ps1 reads them), since a wrapper
+# exception often carries the cause in an inner one: it is permanent when one
+# names a status above (by name or number), says access was denied or that
+# something could not be found, or says the sign-in cannot be used (the same
+# as a 401: a retry signs in no better). A sign-in error code alone (AADSTS...)
+# does not count: some of those are transient. Everything else is 'Transient'
+# (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
+# off part-way, and any error not recognised here.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
     $Status = Get-ConsumptionErrorStatusCode -Exception $Exception
-    if ($null -ne $Status)
+    if ($null -ne $Status -and ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404)) { return 'Permanent' }
+    $Pending = [System.Collections.Generic.Queue[object]]::new()
+    $Pending.Enqueue($Exception)
+    $Checked = 0
+    while ($Pending.Count -gt 0 -and $Checked -lt 10)
     {
-        if ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404) { return 'Permanent' }
-        return 'Transient'
-    }
-    $Message = [string]$Exception.Message
-    if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
-    {
-        return 'Permanent'
-    }
-    if ($Message -match '(?i)connect-azaccount|\bAADSTS\d+|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
-    {
-        return 'Permanent'
+        $Ex = $Pending.Dequeue()
+        if ($null -eq $Ex) { continue }
+        $Checked++
+        $Message = [string]$Ex.Message
+        if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
+        {
+            return 'Permanent'
+        }
+        if ($Message -match '(?i)connect-azaccount|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
+        {
+            return 'Permanent'
+        }
+        if ($null -ne $Ex.PSObject.Properties['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
+        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+        {
+            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+        }
     }
     return 'Transient'
 }
