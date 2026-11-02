@@ -2279,7 +2279,7 @@ function Get-RunLockInvocationState { param([Parameter(Mandatory = $true)]$State
         script:Set-Scenario -Subs 'A'
         $Run = script:Invoke-Wrapper -Run 'r1' -Wrapper $Variant
         $Run.ExitCode | Should -Be 0
-        $Run.Text | Should -Contain ('WARNING: Could not set up the release of the run lock {0} at process exit: stand-in: no compiler. The run goes on; if it is interrupted or ends with an error, its lock stays and the next run stops with the command to remove it.' -f $script:LockPath)
+        $Run.Text | Should -Contain ('WARNING: Could not set up the release of the run lock {0} at process exit: stand-in: no compiler. The run goes on. If it is interrupted or ends with an error, the lock is removed when its command ends; when its process exits before that (pwsh -File, a closed session), the lock stays and the next run stops with the command to remove it.' -f $script:LockPath)
         script:Get-Collected -Run 'r1' | Should -Be @('A')
         Test-Path -LiteralPath $script:LockPath | Should -BeFalse
         script:Set-Scenario -Subs 'A' -ThrowAtList

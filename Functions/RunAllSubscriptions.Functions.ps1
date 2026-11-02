@@ -3621,7 +3621,7 @@ function Start-RunLockHeartbeat
     }
     catch
     {
-        Write-Host ('WARNING: Could not set up the release of the run lock {0} at process exit: {1}. The run goes on; if it is interrupted or ends with an error, its lock stays and the next run stops with the command to remove it.' -f $Lock.Path, (Get-RunLockErrorText -ErrorRecord $_)) -ForegroundColor Yellow
+        Write-Host ('WARNING: Could not set up the release of the run lock {0} at process exit: {1}. The run goes on. If it is interrupted or ends with an error, the lock is removed when its command ends; when its process exits before that (pwsh -File, a closed session), the lock stays and the next run stops with the command to remove it.' -f $Lock.Path, (Get-RunLockErrorText -ErrorRecord $_)) -ForegroundColor Yellow
     }
     return $true
 }
