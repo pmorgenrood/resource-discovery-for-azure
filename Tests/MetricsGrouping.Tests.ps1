@@ -14,7 +14,7 @@
 #     and does not fall back to one call per metric;
 #   - a request, grouped or for one metric, that still fails after its retries
 #     for a reason other than BadRequest makes its subscription metrics
-#     incomplete;
+#     incomplete, and each subscription's entry counts its own failed resources;
 #   - one call never asks for more than 20 metric names;
 #   - the diagnostics summary counts metric definitions, not calls;
 #   - each metric's diagnostics time is the time of the request that answered it;
@@ -174,12 +174,12 @@ Export-ModuleMember -Function Get-AzMetric
 
     function New-TestResource
     {
-        param([string]$Type, [string]$Provider, [string]$Name, [string]$Kind = '', [string]$ManagedBy = '')
+        param([string]$Type, [string]$Provider, [string]$Name, [string]$Kind = '', [string]$ManagedBy = '', [string]$SubscriptionId = $script:SubscriptionId)
 
         return [PSCustomObject]@{
             TYPE           = $Type
-            Id             = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/{1}/{2}' -f $script:SubscriptionId, $Provider, $Name
-            subscriptionId = $script:SubscriptionId
+            Id             = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/{1}/{2}' -f $SubscriptionId, $Provider, $Name
+            subscriptionId = $SubscriptionId
             ResourceGroup  = 'rg-metrics-test'
             Name           = $Name
             Location       = 'westeurope'
@@ -190,9 +190,9 @@ Export-ModuleMember -Function Get-AzMetric
 
     function New-TestDisk
     {
-        param([string]$Name)
+        param([string]$Name, [string]$SubscriptionId = $script:SubscriptionId)
 
-        return New-TestResource -Type 'microsoft.compute/disks' -Provider 'Microsoft.Compute/disks' -Name $Name -ManagedBy ('/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/virtualMachines/vm-owner' -f $script:SubscriptionId)
+        return New-TestResource -Type 'microsoft.compute/disks' -Provider 'Microsoft.Compute/disks' -Name $Name -SubscriptionId $SubscriptionId -ManagedBy ('/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/virtualMachines/vm-owner' -f $SubscriptionId)
     }
 
     # Runs Metrics.ps1 against the stand-in module and returns the calls it made,
@@ -200,7 +200,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [object[]]$Subscriptions = $script:Subscriptions)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -223,7 +223,7 @@ Export-ModuleMember -Function Get-AzMetric
 
         try
         {
-            $null = & $script:MetricsScript -Subscriptions $script:Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
+            $null = & $script:MetricsScript -Subscriptions $Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
         }
         finally
         {
@@ -672,6 +672,29 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $null = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-clean'
 
         @($Global:MetricsFailedSubs).Count | Should -Be 0
+    }
+
+    It 'counts in each subscription''s entry only the failed resources of that subscription' {
+        $Subs = @($script:Subscriptions) + @([PSCustomObject]@{ id = 'sub-b'; Name = 'second-subscription' })
+        $Disks = @(
+            New-TestDisk -Name 'disk-a1'
+            New-TestDisk -Name 'disk-a2'
+            New-TestDisk -Name 'disk-b1' -SubscriptionId 'sub-b'
+        )
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'incomplete-two-subs' -MultiError 'ServerError' -Subscriptions $Subs
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 2
+        $First = @($Entries | Where-Object { $_.Id -eq $script:SubscriptionId })
+        $Second = @($Entries | Where-Object { $_.Id -eq 'sub-b' })
+        $First.Count | Should -Be 1
+        $Second.Count | Should -Be 1
+        $First[0].Name | Should -Be 'test-subscription'
+        $Second[0].Name | Should -Be 'second-subscription'
+        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        # The phase line covers the whole run.
+        @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 2 subscription(s): Azure Monitor requests for 3 resource(s) still failed after their retries*' }).Count | Should -Be 1
     }
 }
 
