@@ -1989,7 +1989,7 @@ Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Succe
 
 # Direct runs only (the wrapper prints its own): the subscriptions whose
 # consumption failed or is incomplete.
-if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs }
+if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs -RunSubscriptions @($Global:Subscriptions | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) }) }
 
 Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
 
@@ -2004,19 +2004,16 @@ Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
 # then ends with the FAILED (consumption) lines and exits 3, the code
 # Run-AllSubscriptions.ps1 uses. A consumption phase skipped because the sign-in
 # could not be refreshed (the '(auth)' entry) collected no billing data for any
-# subscription of the run: each of them is listed the same way and the run
-# exits 3, as the wrapper does for a sign-in skip. A direct run keeps no retry
-# list: the command printed collects the subscription again. Under -RunAllSubs
-# the wrapper reports this through its own exit code, so this is skipped there.
-# The zip check keeps the code to runs that produced their report.
-$ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
-$ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
-if ($ConsumptionSignInSkipped)
-{
-    $ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries (@($ConsumptionIncomplete) + @(@($Global:Subscriptions) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Id = $_.Id } })))
-}
+# subscription of the run: each of them is listed and the run exits 3, as the
+# wrapper does for a sign-in skip (Get-ConsumptionMissingEntries). A direct run
+# keeps no retry list: the command printed collects the subscription again.
+# Under -RunAllSubs the wrapper reports this through its own exit code, so this
+# is skipped there. The zip check keeps the code to runs that produced their
+# report.
+$ConsumptionIncomplete = @(Get-ConsumptionMissingEntries -Entries $Global:ConsumptionFailedSubs -RunSubscriptions @($Global:Subscriptions | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) }))
 if (-not $RunAllSubs.IsPresent -and $ConsumptionIncomplete.Count -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile))
 {
+    $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
     $RetryTenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
     Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
