@@ -619,7 +619,7 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 
 Codes `3`–`5` still mean the report was produced — they flag that it is **incomplete** in a specific, diagnosable way, rather than silently looking like a clean/empty result.
 
-A direct run of `ResourceInventory.ps1` also ends with exit code `1` when the consumption data check stops it, and with exit code `3` when it wrote its report and zip but the consumption (billing) download of one or more subscriptions failed or stopped part-way; it then ends with the "FAILED (consumption)" lines, which name each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `3`; the wrapper's codes above apply.
+A direct run of `ResourceInventory.ps1` also ends with exit code `1` when the consumption data check stops it, and with exit code `3` when it wrote its report and zip but the consumption (billing) download of one or more subscriptions failed or stopped part-way, or the consumption phase was skipped because the sign-in could not be refreshed (no usable Azure context/token after one reconnect attempt); it then ends with the "FAILED (consumption)" lines, which name each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `3`; the wrapper's codes above apply.
 
 ### Important Notes
 
