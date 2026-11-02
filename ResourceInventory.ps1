@@ -872,6 +872,13 @@ Function RunInventorySetup()
         }
     }
 
+    # The resources are sorted by their id in lower case. Resource Graph sorts
+    # text by its exact characters, upper case first, and the case of the
+    # resource group in an id can change between two reads of the same resource
+    # (a virtual machine that is starting or stopping switches several times).
+    # Sorted by the id as returned, such a resource moves between pages while
+    # they are read: it is listed twice or not at all, and the resource at a
+    # page edge is lost or listed twice with it.
     function ResourceInventoryLoop()
     {
         if (![string]::IsNullOrEmpty($ResourceGroup) -and [string]::IsNullOrEmpty($SubscriptionID))
@@ -901,7 +908,7 @@ Function RunInventorySetup()
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
                 $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
@@ -918,7 +925,7 @@ Function RunInventorySetup()
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
                 $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
@@ -938,7 +945,7 @@ Function RunInventorySetup()
             if ($EnvSizeCount -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by id asc"
+                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
                 $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.Data
