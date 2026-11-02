@@ -195,7 +195,7 @@ Describe 'A subscription with metrics or consumption left incomplete stays in th
     BeforeEach {
         $script:Root = Join-Path $script:TestBase ([guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $Global:RdaIncompleteTestRoot = $script:Root
         $Global:RdaIncompleteTestFailIds = @()
         $Global:RdaIncompleteTestMetricsIds = @()
@@ -288,7 +288,7 @@ Describe 'A subscription with metrics or consumption left incomplete stays in th
 
         $Global:RdaIncompleteTestConsumptionIds = @('sub-a')
         script:Invoke-Worker -Root $script:Root -Ids @('sub-a', 'sub-b') -Names @('Sub A', 'Sub B')
-        $StreamState = Get-Content -LiteralPath (Join-Path $script:Root '.resume-state-t-stream-0.json') -Raw | ConvertFrom-Json
+        $StreamState = Get-Content -LiteralPath (Join-Path $script:Root '.resume-state-e3b98a4da31a-stream-0.json') -Raw | ConvertFrom-Json
         $Summary = Get-Content -LiteralPath (Join-Path $script:Root '.rda-stream-0-summary.json') -Raw | ConvertFrom-Json
 
         @($StreamState.Completed) | Should -Be @('sub-b')

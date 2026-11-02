@@ -1895,7 +1895,7 @@ function Get-StreamResumeStateFiles
         [Parameter(Mandatory = $true)][string]$InventoryRoot,
         [Parameter(Mandatory = $true)][string]$Tenant
     )
-    return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
+    return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f (Get-TenantFileKey -Tenant $Tenant)) -File -Force -ErrorAction SilentlyContinue)
 }
 
 # Read one per-stream resume-state file. Returns its content, or $null when the
@@ -2849,16 +2849,93 @@ function Get-WrapperExitCode
 # what to do about it (Get-RunLockHolder, Write-RunLockHeldMessage).
 # Stream worker processes never take the lock; the wrapper holds it for them.
 
+# The key that names a tenant's files in the inventory folder (the run lock and
+# the resume state files): the first 12 hex characters of the SHA-256 of the
+# tenant id in small letters, so no file name holds the tenant id or any part
+# of it, and a tenant id typed in capitals names the same files. The files
+# themselves still record the full tenant id, and the resume state readers
+# check it, so two tenants whose keys clash never share a resume state; a lock
+# whose key clashes stops the other tenant's run, as any lock does.
+function Get-TenantFileKey
+{
+    param([Parameter(Mandatory = $true)][string]$Tenant)
+    $Bytes = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Tenant.Trim().ToLowerInvariant()))
+    return ([System.Convert]::ToHexString($Bytes)).Substring(0, 12).ToLowerInvariant()
+}
+
 function Get-RunLockPath
 {
     param(
         [Parameter(Mandatory = $true)][string]$InventoryRoot,
         [Parameter(Mandatory = $true)][string]$Tenant
     )
-    # Small letters: a tenant id typed in capitals names the same tenant, and
-    # on a file system that tells case apart it would otherwise get a lock of
-    # its own.
-    return (Join-Path $InventoryRoot ('.run-lock-{0}.json' -f $Tenant.ToLowerInvariant()))
+    return (Join-Path $InventoryRoot ('.run-lock-{0}.json' -f (Get-TenantFileKey -Tenant $Tenant)))
+}
+
+# The lock an earlier version of this tool names with the tenant id itself
+# ('.run-lock-<tenant id in small letters>.json'). A run of that version may
+# still hold it, so it is never moved or taken over: a run that finds it stops
+# on it as on its own lock (Get-RunLockHolder, Write-RunLockHeldMessage).
+function Get-RunLockLegacyPath
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant
+    )
+    return (Join-Path $InventoryRoot ('.run-lock-{0}.json' -f $Tenant.Trim().ToLowerInvariant()))
+}
+
+# The resume state file of a tenant, and its per-stream state files with -Stream.
+function Get-ResumeStatePath
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant,
+        [string]$Stream
+    )
+    $Key = Get-TenantFileKey -Tenant $Tenant
+    if ([string]::IsNullOrEmpty($Stream)) { return (Join-Path $InventoryRoot ('.resume-state-{0}.json' -f $Key)) }
+    return (Join-Path $InventoryRoot ('.resume-state-{0}-stream-{1}.json' -f $Key, $Stream))
+}
+
+# Moves the resume state files an earlier version of this tool named with the
+# tenant id ('.resume-state-<tenant id>.json' and '-stream-<N>.json', the id in
+# any letter case) to their names with the tenant key, once, after this run took
+# its lock. A file whose new name is already taken is left where it is. Prints
+# one line per file moved or left, naming only the new names, and returns the
+# number moved.
+function Move-LegacyResumeStateFiles
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$Tenant
+    )
+    $Id = $Tenant.Trim()
+    $Pattern = '^\.resume-state-{0}(-stream-(?<Stream>\d+))?\.json$' -f [regex]::Escape($Id)
+    $Moved = 0
+    $Files = @(Get-ChildItem -LiteralPath $InventoryRoot -Filter '.resume-state-*.json' -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Pattern })
+    foreach ($File in $Files)
+    {
+        $null = $File.Name -match $Pattern
+        $Target = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $Tenant -Stream $Matches['Stream']
+        $TargetName = Split-Path -Path $Target -Leaf
+        if (Test-Path -LiteralPath $Target)
+        {
+            Write-Host ('WARNING: A resume state file of an earlier version of this tool, named with the tenant id, is still in the inventory folder; it is not used, because {0} is there: it was left where it is.' -f $TargetName) -ForegroundColor Yellow
+            continue
+        }
+        try
+        {
+            Move-Item -LiteralPath $File.FullName -Destination $Target -ErrorAction Stop
+            Write-Host ('Renamed a resume state file of an earlier version of this tool to {0}: file names no longer hold the tenant id.' -f $TargetName) -ForegroundColor Cyan
+            $Moved++
+        }
+        catch
+        {
+            Write-Host ('WARNING: Could not rename a resume state file of an earlier version of this tool to {0}: {1}. It is not used.' -f $TargetName, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+    return $Moved
 }
 
 # The lock's times are written as round-trip UTC text ('o'). Returns that time

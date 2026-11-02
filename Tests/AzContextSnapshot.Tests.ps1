@@ -485,7 +485,7 @@ Describe 'Az context snapshot names, owners and files' {
         $Mine = script:New-LeftoverSnapshot -Name (script:Get-OwnedSnapshotName -ProcessId $PID -StartUtc ([System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime())) -AgeMinutes 600
         $Foreign = script:New-LeftoverSnapshot -Name (script:Get-OwnedSnapshotName -Machine 'another-host' -ProcessId $Ended -StartUtc ([datetime]::UtcNow.AddDays(-2))) -AgeMinutes 3000
         $Old = script:New-LeftoverSnapshot -Name ('.rda-stream-azcontext-{0}.json' -f [guid]::NewGuid().ToString()) -AgeMinutes 3000
-        $Others = @('.resume-state-{0}.json' -f $script:Tenant), ('.resume-state-{0}-stream-0.json' -f $script:Tenant), '.rda-stream-0-summary.json', ('.run-lock-{0}.json' -f $script:Tenant) |
+        $Others = @('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())), ('.resume-state-{0}-stream-0.json' -f $script:Tenant), '.rda-stream-0-summary.json', ('.run-lock-{0}.json' -f $script:Tenant) |
             ForEach-Object { $P = Join-Path $script:Root $_; Set-Content -LiteralPath $P -Value '{}'; (Get-Item -LiteralPath $P -Force).LastWriteTimeUtc = [datetime]::UtcNow.AddHours(-2); $P }
         $Result = Remove-OrphanedAzContextSnapshot -InventoryRoot $script:Root
         $Result.Removed | Should -Be 2
@@ -960,7 +960,7 @@ Start-Sleep -Seconds 600
     }
 
     It 'keeps the subscriptions of a stream that did not load its snapshot on the retry list without counting a failed run, on every -Resume run, until the cause is fixed' {
-        $State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $Read = {
             $Entries = @((Get-Content -LiteralPath $State -Raw | ConvertFrom-Json).FailedAttempts | Where-Object { $null -ne $_ })
             @($Entries | Sort-Object -Property Id | ForEach-Object { '{0}={1}' -f $_.Id, $_.Attempts })

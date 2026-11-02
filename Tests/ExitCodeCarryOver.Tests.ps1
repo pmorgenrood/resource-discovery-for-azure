@@ -209,7 +209,7 @@ if ($FailSub)
                 throw 'The wrapper run did not end within 300 seconds.'
             }
             $Proc.WaitForExit()
-            $StateFile = Join-Path $CaseHome ('InventoryReports/.resume-state-{0}.json' -f $script:Tenant)
+            $StateFile = Join-Path $CaseHome ('InventoryReports/.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
             $State = if (Test-Path -LiteralPath $StateFile) { Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } else { $null }
             # RunSummary.log from the run's consolidated zip, when it wrote one.
             $RunSummary = $null

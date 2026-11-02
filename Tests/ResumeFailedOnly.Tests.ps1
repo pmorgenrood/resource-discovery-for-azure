@@ -169,7 +169,7 @@ $Global:ResourceCount = 1
         $Global:RdaRfoRoot = $script:Root
         $Global:RdaRfoFailIds = @()
         $global:LASTEXITCODE = 0
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
     }
 }
 

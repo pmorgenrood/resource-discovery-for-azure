@@ -161,7 +161,7 @@ $Global:ResourceCount = 1
     function script:Invoke-Post
     {
         param($Root, $Since, $ThisRun, $Skipped, $Reports, [bool]$Obfuscate = $false)
-        $Out = @(& $script:PostBlock $script:RepoRoot $Root $Since @($ThisRun) @($Skipped) @($Reports) $true $Obfuscate (Join-Path $Root '.resume-state-t.json') 't' 6>&1)
+        $Out = @(& $script:PostBlock $script:RepoRoot $Root $Since @($ThisRun) @($Skipped) @($Reports) $true $Obfuscate (Join-Path $Root '.resume-state-e3b98a4da31a.json') 't' 6>&1)
         $Result = $Out | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['OuterZipFile'] } | Select-Object -Last 1
         $Text = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         return [pscustomobject]@{ Result = $Result; Text = $Text }
@@ -193,7 +193,7 @@ Describe 'Resume state: the report zip of each completed subscription' {
     BeforeEach { $script:Root = script:New-CaseRoot }
 
     It 'records one report per completed id, the last one given winning, none for an id not completed' {
-        $State = Join-Path $script:Root '.resume-state-t.json'
+        $State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $Reports = @(
             [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'old/a.zip'; Obfuscated = $false },
             [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'new/a.zip'; Obfuscated = $false },
@@ -207,14 +207,14 @@ Describe 'Resume state: the report zip of each completed subscription' {
     }
 
     It 'a state file written by an older version (no CompletedReports) still loads' {
-        $State = Join-Path $script:Root '.resume-state-t.json'
+        $State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         @{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a'); FailedAttempts = @(); LastUpdated = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -Path $State -Encoding utf8
         @(Get-CompletedSubscriptionIds -Path $State -Tenant 't') | Should -Be @('sub-a')
         @(Get-CompletedReports -Path $State -Tenant 't').Count | Should -Be 0
     }
 
     It 'Test-ResumeStateWithoutReports is true only for a state file of this tenant that has no CompletedReports key' {
-        $State = Join-Path $script:Root '.resume-state-t.json'
+        $State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeFalse -Because 'there is no state file'
         @{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a'); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath $State
         Test-ResumeStateWithoutReports -Path $State -Tenant 't' | Should -BeTrue
@@ -229,7 +229,7 @@ Describe 'Resume state: the report zip of each completed subscription' {
     }
 
     It 'an unparseable state file, or one for another tenant, reads as no reports' {
-        $State = Join-Path $script:Root '.resume-state-t.json'
+        $State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         Set-Content -Path $State -Value '{ "TenantID": "t", "CompletedReports": [ {' -Encoding utf8
         @(Get-CompletedReports -Path $State -Tenant 't').Count | Should -Be 0
         @{ TenantID = 'other'; CompletedReports = @(@{ Id = 'sub-a'; Zip = 'a.zip'; Obfuscated = $false }) } | ConvertTo-Json -Depth 4 | Set-Content -Path $State -Encoding utf8
@@ -237,7 +237,7 @@ Describe 'Resume state: the report zip of each completed subscription' {
     }
 
     It 'records with a missing, empty, numeric or object Id, and non-object entries, are ignored when saved' {
-        $State = Join-Path $script:Root '.resume-state-t.json'
+        $State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $Reports = @(
             'just text', 42, $null,
             [pscustomobject]@{ Name = 'no id'; Zip = 'a.zip'; Obfuscated = $false },
@@ -271,7 +271,7 @@ Describe 'Resume state: the report zip of each completed subscription' {
         Set-Variable -Name TenantID -Value 't'
         Set-Variable -Name StreamId -Value '0'
         Set-Variable -Name Tag -Value '[stream-0]'
-        $Path = Join-Path $script:Root '.resume-state-t-stream-0.json'
+        $Path = Join-Path $script:Root '.resume-state-e3b98a4da31a-stream-0.json'
         Write-StreamState -Path $Path -Completed @('sub-a') -FailedAttempts @() -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'a/a.zip'; Obfuscated = $false })
         $Read = Read-StreamState -Path $Path
         @($Read.Reports).Count | Should -Be 1
@@ -423,7 +423,7 @@ Describe 'Sequential path, end to end: interrupted run, then -Resume' {
         $script:Root = script:New-CaseRoot
         $Global:RdaCarryTestRoot = $script:Root
         $global:LASTEXITCODE = 0
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
         $script:B = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' }
 
@@ -504,11 +504,11 @@ Describe 'Parallel path, end to end: interrupted stream, then -Resume' {
     It 'the stream records its reports, a resumed stream reports what it skipped, and the bundle has every subscription' {
         $Root = script:New-CaseRoot
         $Global:RdaCarryTestRoot = $Root
-        $State = Join-Path $Root '.resume-state-t.json'
+        $State = Join-Path $Root '.resume-state-e3b98a4da31a.json'
 
         # Earlier run: stream 0 completed sub-a, then the parent was interrupted before merging.
         $null = script:Invoke-Worker -Root $Root -Ids @('sub-a') -Names @('Sub A')
-        $StreamFile = Join-Path $Root '.resume-state-t-stream-0.json'
+        $StreamFile = Join-Path $Root '.resume-state-e3b98a4da31a-stream-0.json'
         $Run1Reports = @((Get-Content -LiteralPath $StreamFile -Raw | ConvertFrom-Json).Reports | Where-Object { $null -ne $_ } | ForEach-Object Id)
         Get-ChildItem -LiteralPath $Root -Directory -Filter 'ResourcesReport*' | ForEach-Object {
             script:Set-ReportAge -Zip (Get-ChildItem -LiteralPath $_.FullName -Filter '*.zip' | Select-Object -First 1).FullName -When (Get-Date).AddHours(-2)
@@ -623,7 +623,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
             $Code = $null
             try
             {
-                & $script:PostBlock $script:RepoRoot $Root $Since @($ThisRun) @() @() $false $false (Join-Path $Root '.resume-state-t.json') 't' 6>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.InformationRecord]) { $Lines.Add([string]$_.MessageData) } }
+                & $script:PostBlock $script:RepoRoot $Root $Since @($ThisRun) @() @() $false $false (Join-Path $Root '.resume-state-e3b98a4da31a.json') 't' 6>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.InformationRecord]) { $Lines.Add([string]$_.MessageData) } }
             }
             catch
             {
@@ -652,7 +652,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $Global:RdaCarryTestFailIds = @()
         $Global:RdaCarryTestNoZipIds = @()
         $global:LASTEXITCODE = 0
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
         $script:B = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' }
         script:Invoke-EarlierRun -Root $script:Root -State $script:State
@@ -885,7 +885,7 @@ Describe 'A -Resume run on a state file written before CompletedReports existed'
         $script:Root = script:New-CaseRoot
         $Global:RdaCarryTestRoot = $script:Root
         $global:LASTEXITCODE = 0
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
         $script:A = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }
         $script:B = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' }
         # An older version completed sub-a (its zip is on disk, two hours old) and
@@ -919,7 +919,7 @@ Describe 'A -Resume run on a state file written before CompletedReports existed'
         # Reports. The stream that owns it skips sub-x on -Resume, so it is not one this
         # run collects again.
         [ordered]@{ TenantID = 't'; CompletedSubscriptionIds = @('sub-a', 'sub-b'); FailedAttempts = @(); LastUpdated = '2026-01-01T00:00:00Z' } | ConvertTo-Json | Set-Content -LiteralPath $script:State -Encoding utf8
-        @{ Tenant = 't'; StreamId = '0'; Completed = @('sub-x'); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t-stream-0.json') -Encoding utf8
+        @{ Tenant = 't'; StreamId = '0'; Completed = @('sub-x'); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-e3b98a4da31a-stream-0.json') -Encoding utf8
         $Start = @(& $script:StartupBlock $script:Root 't' $script:State $true 6>&1)
         $Loaded = $Start | Where-Object { $_ -is [pscustomobject] -and $_.PSObject.Properties['CompletedIds'] } | Select-Object -Last 1
         $Lines = @($Start | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData } | Where-Object { $_ -like 'Resume mode:*' })

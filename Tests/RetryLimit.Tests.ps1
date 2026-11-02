@@ -259,7 +259,7 @@ $Global:ResourceCount = 1
         # whether the run has -AllowPartialAccess.
         $Global:RdaRlUnreadableIds = @()
         $Global:RdaRlAllowPartialAccess = $false
-        $script:State = Join-Path $script:Root '.resume-state-t.json'
+        $script:State = Join-Path $script:Root '.resume-state-e3b98a4da31a.json'
     }
 }
 

@@ -115,7 +115,7 @@ Describe 'Build-MainSummaryFromZip -PackageZip into a folder that already holds 
         $script:Unrelated = @(
             (Join-Path $script:Reused 'ObfuscationDictionary_ResourcesReport_20251201000000003.json'),
             (Join-Path $script:Reused 'Inventory_ResourcesReport_20251201000000003.json'),
-            (Join-Path $script:Reused ('.resume-state-{0}.json' -f $script:PlaceholderId))
+            (Join-Path $script:Reused ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:PlaceholderId).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
         )
         '{"ResourceIdMap":{}}' | Out-File -FilePath $script:Unrelated[0] -Encoding utf8
         '{"Version":"3.2.3","PublicIP":[{"Name":"pip-plain"}]}' | Out-File -FilePath $script:Unrelated[1] -Encoding utf8
