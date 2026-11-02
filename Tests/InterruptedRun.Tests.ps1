@@ -342,7 +342,7 @@ sys.stdout.write('\nPTY-EXIT %s\n' % code)
     function script:Get-InterruptedLine { param([string[]]$Text) @($Text | Where-Object { $_ -like ($script:Line + '*') }) }
     function script:Format-InterruptedLine
     {
-        'Interrupted (Ctrl+C) before all subscriptions were processed. The resume state is kept in {0}; to continue, run the same command again with -Resume.' -f $script:Root
+        'Interrupted (Ctrl+C) before all subscriptions were processed. The resume state is kept in {0}; to continue, run the same command again (without -Fresh), or with -Resume.' -f $script:Root
     }
 
     # The next two runs after an interrupt: -Resume collects only Sub B and
