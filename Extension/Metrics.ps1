@@ -1077,15 +1077,24 @@ if ($Task -eq 'Processing')
     if ($MetricFailedGroupIds.Count -gt 0)
     {
         $FailedIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MetricFailedGroupIds), [System.StringComparer]::OrdinalIgnoreCase)
-        $FailedSubIds = @($Resources | Where-Object { $null -ne $_ -and $FailedIdSet.Contains([string]$_.Id) } | ForEach-Object { [string]$_.subscriptionId } | Select-Object -Unique)
+        $FailedResources = @($Resources | Where-Object { $null -ne $_ -and $FailedIdSet.Contains([string]$_.Id) })
+        $FailedSubIds = @($FailedResources | ForEach-Object { [string]$_.subscriptionId } | Select-Object -Unique)
         $MetricsReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
-        $IncompleteMsg = ('Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.' -f $FailedIdSet.Count)
+        $IncompleteFormat = 'Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $IncompleteMsg = ($IncompleteFormat -f $FailedIdSet.Count)
         if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
         foreach ($FailedSubId in $FailedSubIds)
         {
             $FailedSub = $SubLookup[$FailedSubId]
             $FailedSubName = if ($null -ne $FailedSub -and -not [string]::IsNullOrEmpty([string]$FailedSub.Name)) { [string]$FailedSub.Name } else { '(subscription)' }
-            $Global:MetricsFailedSubs += [pscustomobject]@{ Name = $FailedSubName; Id = $FailedSubId; Message = $IncompleteMsg; ReportFolder = $MetricsReportFolder; Complete = $false }
+            # Each subscription's entry counts only its own failed resources.
+            $SubFailedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($FailedResource in $FailedResources)
+            {
+                if ([string]$FailedResource.subscriptionId -eq $FailedSubId) { [void]$SubFailedIds.Add([string]$FailedResource.Id) }
+            }
+            $SubIncompleteMsg = ($IncompleteFormat -f $SubFailedIds.Count)
+            $Global:MetricsFailedSubs += [pscustomobject]@{ Name = $FailedSubName; Id = $FailedSubId; Message = $SubIncompleteMsg; ReportFolder = $MetricsReportFolder; Complete = $false }
         }
         Write-MetricsDiag ("Metrics incomplete for {0} subscription(s): {1}" -f $FailedSubIds.Count, $IncompleteMsg)
         Write-Log -Message ('Metrics incomplete: {0}' -f $IncompleteMsg) -Severity 'Warning'
