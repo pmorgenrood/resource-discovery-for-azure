@@ -1929,6 +1929,22 @@ function Get-ConsumptionIncompleteEntries
     @(@($Entries) | Where-Object { $null -ne $_ -and [string]$_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique)
 }
 
+# The subscriptions of a direct ResourceInventory.ps1 run whose consumption is
+# missing or incomplete, unique by name and id: those whose billing download
+# failed or stopped part-way, and, when the consumption phase was skipped for
+# the sign-in (the '(auth)' entry), every subscription of the run
+# (-RunSubscriptions), since the phase collected none of them.
+function Get-ConsumptionMissingEntries
+{
+    param([object[]]$Entries, [object[]]$RunSubscriptions)
+    $Missing = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if (@(@($Entries) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0)
+    {
+        $Missing += @(@($RunSubscriptions) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Id = [string]$_.Id } })
+    }
+    @(Get-ConsumptionIncompleteEntries -Entries $Missing)
+}
+
 # The last lines of a run in which the billing download of one or more
 # subscriptions failed or stopped part-way: each subscription, then $Advice
 # (the command that collects them again). Shared by Run-AllSubscriptions.ps1
@@ -1957,14 +1973,15 @@ function Write-ConsumptionFailedBanner
 # long before the end of the run.
 function Write-ConsumptionFailureSummary
 {
-    param([object[]]$Failures)
+    param([object[]]$Failures, [object[]]$RunSubscriptions)
     $Entries = @(@($Failures) | Where-Object { $null -ne $_ })
     if ($Entries.Count -eq 0) { return }
+    # The subscriptions whose consumption is missing (Get-ConsumptionMissingEntries):
+    # a sign-in skip ('(auth)') stands for every subscription of the run.
+    $Missing = @(Get-ConsumptionMissingEntries -Entries $Entries -RunSubscriptions $RunSubscriptions)
     Write-Host ''
-    Write-Host ('Consumption Failures:    {0} subscription(s)' -f $Entries.Count) -ForegroundColor Yellow
-    # Unique by name and id: two subscriptions can share a display name. The
-    # '(auth)' entry stands for the whole phase, not one subscription.
-    foreach ($Entry in @($Entries | Where-Object { $_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique))
+    Write-Host ('Consumption Failures:    {0} subscription(s)' -f $Missing.Count) -ForegroundColor Yellow
+    foreach ($Entry in $Missing)
     {
         Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Yellow
     }

@@ -2379,7 +2379,7 @@ Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Succe
 # Direct runs only (the wrapper prints its own): the subscriptions whose
 # consumption failed or is incomplete. Printed ahead of the report check below,
 # so a run that wrote no report still ends with its 'No report was written' line.
-if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs }
+if (-not $RunAllSubs.IsPresent) { Write-ConsumptionFailureSummary -Failures $Global:ConsumptionFailedSubs -RunSubscriptions @($Global:Subscriptions | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) }) }
 
 # A direct run reaches this point even when it wrote no report (collection stopped,
 # or the HTML report or the zip failed), so it must not end as a success. Under
@@ -2408,19 +2408,15 @@ Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
 # reports these through its own exit code, so this is skipped there.
 # The zip check keeps these codes to runs that produced their report: Compress-Archive
 # writes no zip when the HTML report is missing.
+# A consumption phase skipped because the sign-in could not be refreshed (the
+# '(auth)' entry) collected no billing data for any subscription of the run:
+# each of them is listed and the run exits 3 (5), as the wrapper does for a
+# sign-in skip (Get-ConsumptionMissingEntries).
 $CollectorFailureCount = @(@($script:CollectorFailuresThisRun) | Where-Object { $null -ne $_ }).Count
-$ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
+$ConsumptionIncomplete = @(Get-ConsumptionMissingEntries -Entries $Global:ConsumptionFailedSubs -RunSubscriptions @($Global:Subscriptions | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) }))
 if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFile))
 {
-    # A consumption phase skipped because the sign-in could not be refreshed
-    # (the '(auth)' entry) collected no billing data for any subscription of
-    # the run: each of them is listed the same way and the run exits 3 (5), as
-    # the wrapper does for a sign-in skip.
     $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
-    if ($ConsumptionSignInSkipped)
-    {
-        $ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries (@($ConsumptionIncomplete) + @(@($Global:Subscriptions) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or $_.Id -eq $SubscriptionID) } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Id = $_.Id } })))
-    }
     $RetryTenant = if (-not [string]::IsNullOrEmpty($TenantID)) { $TenantID } else { $script:RdaRunTenant }
     $RetryTenantArg = if (-not [string]::IsNullOrEmpty($RetryTenant)) { ' -TenantID {0}' -f $RetryTenant } else { '' }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
