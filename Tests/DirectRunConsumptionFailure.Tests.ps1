@@ -12,7 +12,9 @@
 # 'Reporting Data File:'.
 #
 # Such a run now ends with the FAILED (consumption) lines and exit 3, as
-# Run-AllSubscriptions.ps1 does; a run with no failure still exits 0.
+# Run-AllSubscriptions.ps1 does; a run with no failure still exits 0. So does
+# a run whose consumption phase was skipped because the sign-in could not be
+# refreshed: it lists every subscription of the run.
 #
 # The test copies the scripts to a temp folder and runs the REAL
 # ResourceInventory.ps1 directly in a child pwsh with HOME pointed at a temp
@@ -40,7 +42,7 @@ BeforeAll {
 
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
-param([string]$Tree, [string]$Out, [string]$FailIds = '')
+param([string]$Tree, [string]$Out, [string]$FailIds = '', [switch]$SignInLapse)
 $PSStyle.OutputRendering = 'PlainText'
 $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
@@ -50,6 +52,9 @@ $Global:StandInSubs = @(
     [pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012'; Name = 'Sub A' },
     [pscustomobject]@{ Id = 'placeholder-subscription-b'; Name = 'Sub B' })
 $Global:StandInFailIds = @($FailIds -split ',' | Where-Object { $_ })
+# -SignInLapse: the token cannot be refreshed when the consumption phase checks
+# the sign-in (Test-DataPlaneAuthReady), so the phase is skipped for the sign-in.
+$Global:StandInSignInLapse = $SignInLapse.IsPresent
 $Global:StandInContextSub = $Global:StandInSubs[0].Id
 # The stand-ins below are functions of this runspace, so the up-front checks
 # run one subscription at a time here.
@@ -85,7 +90,7 @@ function global:Invoke-StandInGraph
 }
 function global:Get-AzContext { [CmdletBinding()] param() [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012' }; Subscription = [pscustomobject]@{ Id = $Global:StandInContextSub; Name = 'stand-in' }; Account = [pscustomobject]@{ Id = 'tester' } } }
 function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $Context, $Tenant) if ($Subscription) { $Global:StandInContextSub = [string]$Subscription }; $null }
-function global:Get-AzAccessToken { [CmdletBinding()] param($ResourceUrl, $TenantId) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
+function global:Get-AzAccessToken { [CmdletBinding()] param($ResourceUrl, $TenantId) if ($Global:StandInSignInLapse -and @(Get-PSCallStack | Where-Object { $_.FunctionName -eq 'Test-DataPlaneAuthReady' }).Count -gt 0) { throw 'stand-in: the token cannot be refreshed' }; [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Import-AzContext { [CmdletBinding()] param($Path) }
 function global:Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
@@ -137,7 +142,7 @@ exit $LASTEXITCODE
 
     function Invoke-DirectRun
     {
-        param([string]$FailIds = '')
+        param([string]$FailIds = '', [switch]$SignInLapse)
         $CaseHome = Join-Path $script:WorkDir ('home_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $Out = Join-Path $CaseHome 'out'
         New-Item -ItemType Directory -Path $Out -Force | Out-Null
@@ -145,7 +150,7 @@ exit $LASTEXITCODE
         try
         {
             $env:HOME = $CaseHome
-            $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Harness -Tree $script:Tree -Out $Out -FailIds $FailIds 2>&1 | ForEach-Object { [string]$_ })
+            $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Harness -Tree $script:Tree -Out $Out -FailIds $FailIds -SignInLapse:$SignInLapse 2>&1 | ForEach-Object { [string]$_ })
             $ExitCode = $LASTEXITCODE
         }
         finally
@@ -198,6 +203,37 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
 
     It 'exits 3' {
         $script:Failed.Exit | Should -Be 3
+    }
+}
+
+Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:$script:SkipReason {
+    BeforeAll {
+        $script:Skipped = Invoke-DirectRun -SignInLapse
+    }
+
+    It 'writes the report and its zip' {
+        $script:Skipped.Zip.Count | Should -Be 1 -Because $script:Skipped.Console
+        $script:Skipped.Console | Should -Match 'Consumption: SKIPPED'
+    }
+
+    It 'ends with FAILED (consumption), naming every subscription of the run and the command that collects it again' {
+        $Lines = @($script:Skipped.Console -split "`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
+        $At = [array]::LastIndexOf($Lines, '================= FAILED (consumption) =================')
+        $At | Should -BeGreaterThan 0 -Because $script:Skipped.Console
+        $Lines[($At + 1)..($Lines.Count - 1)] | Should -Be @(
+            'Consumption (billing) data is missing or incomplete for 2 subscription(s):'
+            '  - Sub A (12345678-1234-1234-1234-123456789012)'
+            '  - Sub B (placeholder-subscription-b)'
+            'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.'
+            'To collect one again, run:'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b'
+            '========================================================'
+        )
+    }
+
+    It 'exits 3' {
+        $script:Skipped.Exit | Should -Be 3
     }
 }
 
