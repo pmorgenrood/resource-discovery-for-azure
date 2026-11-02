@@ -342,9 +342,13 @@ if ($Task -eq 'Processing')
             $Subscription = $SubLookup[$app.subscriptionId]
 
             # A function app on a Flex Consumption plan (SKU FC1, tier FlexConsumption)
-            # does not offer FunctionExecutionCount or FunctionExecutionUnits, so they
-            # are not asked for. An app whose plan cannot be read (no plan id, plan row
-            # not listed, no SKU, or a malformed value) keeps both metrics.
+            # does not offer FunctionExecutionCount or FunctionExecutionUnits. It is
+            # asked for its own five instead: executions and execution units, each
+            # split into always-ready and on-demand, and the always-ready baseline.
+            # They use the window, grain and aggregation of the two, so they share one
+            # request and their records have the same fields. An app whose plan cannot
+            # be read (no plan id, plan row not listed, no SKU, or a malformed value)
+            # keeps the two metrics.
             $IsFlexConsumption = $false
             $FarmId = $app.properties.serverFarmId
             if ($FarmId -is [string] -and $FarmId -ne '')
@@ -360,6 +364,14 @@ if ($Task -eq 'Processing')
             {
                 $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'FunctionExecutionCount'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
                 $MetricDefs.Add([PSCustomObject]@{ MetricIndex = $MetricCountId++; MetricName = 'FunctionExecutionUnits'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
+            }
+            elseif ($app.kind -match 'functionapp')
+            {
+                $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'AlwaysReadyFunctionExecutionCount'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
+                $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'OnDemandFunctionExecutionCount'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
+                $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'AlwaysReadyFunctionExecutionUnits'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
+                $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'OnDemandFunctionExecutionUnits'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
+                $MetricDefs.Add([RdaMetricDefinition]@{ MetricIndex = $MetricCountId++; MetricName = 'AlwaysReadyUnits'; StartTime = $MetricStartTime; EndTime = $MetricEndTime; Interval = '1.00:00:00'; Aggregation = 'Total'; Measure = 'Sum'; Id = $app.Id; SubName = $Subscription.Name; ResourceGroup = $app.ResourceGroup; Name = $app.Name; Location = $app.Location; Service = 'Functions'; Series = 'false' })
             }
         }
     }

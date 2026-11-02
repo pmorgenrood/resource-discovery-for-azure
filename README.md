@@ -468,6 +468,7 @@ captured.
 | cpu_used, dtu_used | SQL DB | 30-min |
 | physical_data_read_percent, log_write_percent | SQL DB | 1-hr |
 | FunctionExecutionCount/Units | Functions | daily |
+| AlwaysReadyFunctionExecutionCount/Units, OnDemandFunctionExecutionCount/Units, AlwaysReadyUnits | Functions on a Flex Consumption plan | daily |
 
 Capacity and point-in-time metrics (storage used, limits, CosmosDB throughput,
 ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
