@@ -1449,8 +1449,8 @@ function ExecuteInventoryProcessing()
                             $ConsumptionAttempt++
                             # Retried unless a retry cannot change the outcome, as the up-front
                             # check retries (Invoke-ConsumptionCallWithRetry): a refusal (401, 403,
-                            # access denied), a bad request (400) or not found (404) fails the same
-                            # way again. Any other failure, including one not recognised, is retried.
+                            # access denied), a sign-in that cannot be used, a bad request (400) or
+                            # not found (404) fails the same way again. Any other failure, including one not recognised, is retried.
                             if ($ConsumptionAttempt -gt $ConsumptionMaxRetries -or (Get-ConsumptionErrorKind -Exception $_.Exception) -ne 'Transient') { throw }
                             $ConsumptionBackoffSeconds = [int][math]::Pow(2, $ConsumptionAttempt)
                             Write-Log -Message ("Consumption page query failed for {0} (attempt {1}/{2}): {3}. Retrying in {4}s..." -f $sub.Name, $ConsumptionAttempt, $ConsumptionMaxRetries, $_.Exception.Message, $ConsumptionBackoffSeconds) -Severity 'Warning'
