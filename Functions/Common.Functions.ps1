@@ -1909,15 +1909,20 @@ function Format-CommandValue
 # (-ObfuscationDictionary) when the run was given them, then the switches of
 # $Settings that are on and that ResourceInventory.ps1 takes (it has no
 # -IncludeDisabled). Values are quoted (Format-CommandValue). No secret is
-# printed: there is no parameter for one.
+# printed: there is no parameter for one. A service principal sign-in
+# (-Appid) also needs -Secret and -TenantID, so the command asks for the
+# secret when it runs (-Secret (Read-Host -AsSecureString)), and for the
+# tenant too when it is not known here.
 function Get-DirectRunRetryCommand
 {
     param([string]$TenantID, [string]$SubscriptionID, [string]$ResourceGroup, [System.Collections.IDictionary]$Settings,
         [string]$Appid, [string[]]$Service, [string]$OutputDirectory, [string]$ObfuscationDictionary)
-    $TenantArg = if ([string]::IsNullOrEmpty($TenantID)) { '' } else { ' -TenantID {0}' -f $TenantID }
+    $TenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID }
+    elseif (-not [string]::IsNullOrEmpty($Appid)) { " -TenantID (Read-Host -Prompt 'Tenant ID')" }
+    else { '' }
     $ValueArgs = -join @(
         if (-not [string]::IsNullOrEmpty($ResourceGroup)) { ' -ResourceGroup ' + (Format-CommandValue $ResourceGroup) }
-        if (-not [string]::IsNullOrEmpty($Appid)) { ' -Appid ' + (Format-CommandValue $Appid) }
+        if (-not [string]::IsNullOrEmpty($Appid)) { ' -Appid ' + (Format-CommandValue $Appid) + ' -Secret (Read-Host -AsSecureString)' }
         $Services = @(@($Service) | Where-Object { -not [string]::IsNullOrEmpty($_) })
         if ($Services.Count -gt 0) { ' -Service ' + (@($Services | ForEach-Object { Format-CommandValue $_ }) -join ',') }
         if (-not [string]::IsNullOrEmpty($OutputDirectory)) { ' -OutputDirectory ' + (Format-CommandValue $OutputDirectory) }

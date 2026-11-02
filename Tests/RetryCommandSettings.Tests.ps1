@@ -176,14 +176,15 @@ Describe 'The sign-in and output switches a printed command carries' {
 
     It 'a direct-run command carries -Appid, -Service, -OutputDirectory and -ObfuscationDictionary, quoted, a path with a space and a quote as one value' {
         $Command = Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -ResourceGroup 'rg-a' -Appid 'app-a' -Service 'Compute', 'Network' -OutputDirectory "/tmp/out dir/it's here" -ObfuscationDictionary '/tmp/dict a.json' -Settings ([ordered]@{ SkipMetrics = $true })
-        $Command | Should -Be "./ResourceInventory.ps1 -SubscriptionID sub-a -ResourceGroup 'rg-a' -Appid 'app-a' -Service 'Compute','Network' -OutputDirectory '/tmp/out dir/it''s here' -ObfuscationDictionary '/tmp/dict a.json' -SkipMetrics"
+        $Command | Should -Be "./ResourceInventory.ps1 -TenantID (Read-Host -Prompt 'Tenant ID') -SubscriptionID sub-a -ResourceGroup 'rg-a' -Appid 'app-a' -Secret (Read-Host -AsSecureString) -Service 'Compute','Network' -OutputDirectory '/tmp/out dir/it''s here' -ObfuscationDictionary '/tmp/dict a.json' -SkipMetrics"
         # PowerShell reads the printed command back as these values.
         $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Command, [ref]$null, [ref]$null)
         $Elements = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))[0].CommandElements
         $Values = @{}
         for ($i = 1; $i -lt $Elements.Count; $i++)
         {
-            if ($Elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $i + 1 -lt $Elements.Count -and $Elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst])
+            # A prompt such as (Read-Host -AsSecureString) is run, not read, so it has no value here.
+            if ($Elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $i + 1 -lt $Elements.Count -and $Elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst] -and $Elements[$i + 1] -isnot [System.Management.Automation.Language.ParenExpressionAst])
             {
                 $Values[$Elements[$i].ParameterName] = $Elements[$i + 1].SafeGetValue()
             }
@@ -192,6 +193,34 @@ Describe 'The sign-in and output switches a printed command carries' {
         $Values['ObfuscationDictionary'] | Should -Be '/tmp/dict a.json'
         @($Values['Service']) | Should -Be @('Compute', 'Network')
         $Values['Appid'] | Should -Be 'app-a'
+    }
+
+    It 'a service principal command parses, asks for the secret when it runs and holds none, and carries the tenant' {
+        $Command = Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Appid 'app-a' -Settings ([ordered]@{ SkipMetrics = $true })
+        $Command | Should -Be ("./ResourceInventory.ps1 -TenantID {0} -SubscriptionID sub-a -Appid 'app-a' -Secret (Read-Host -AsSecureString) -SkipMetrics" -f $script:Tenant)
+        $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Command, [ref]$null, [ref]$Errors)
+        @($Errors) | Should -BeNullOrEmpty
+        $Elements = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true))[0].CommandElements
+        $Names = @($Elements | ForEach-Object { if ($_ -is [System.Management.Automation.Language.CommandParameterAst]) { $_.ParameterName } else { '' } })
+        $At = [array]::IndexOf($Names, 'Secret')
+        $At | Should -BeGreaterThan 0
+        # The value of -Secret is the prompt itself, not a value.
+        $Elements[$At + 1].Extent.Text | Should -BeExactly '(Read-Host -AsSecureString)'
+        $Names | Should -Contain 'TenantID'
+        # The tenant id is the only GUID-shaped text, so no secret or token rides along.
+        @([regex]::Matches($Command, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') | ForEach-Object { $_.Value }) | Should -Be @($script:Tenant)
+        # Without a known tenant the command asks for it too, and still parses.
+        $NoTenant = Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -Appid 'app-a'
+        $NoTenant | Should -BeLike "./ResourceInventory.ps1 -TenantID (Read-Host -Prompt 'Tenant ID') -SubscriptionID sub-a -Appid 'app-a' -Secret (Read-Host -AsSecureString)"
+        $Errors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseInput($NoTenant, [ref]$null, [ref]$Errors)
+        @($Errors) | Should -BeNullOrEmpty
+    }
+
+    It 'a command without -Appid names no -Secret' {
+        Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Settings ([ordered]@{ DeviceLogin = $true }) | Should -Not -Match 'Secret'
+        Get-DirectRunRetryCommand -SubscriptionID 'sub-a' -Settings ([ordered]@{ UseManagedIdentity = $true }) | Should -Be './ResourceInventory.ps1 -SubscriptionID sub-a -UseManagedIdentity'
     }
 
     It 'a path with a <Label> single quote gives a command that parses and passes the path back unchanged' -ForEach @(
