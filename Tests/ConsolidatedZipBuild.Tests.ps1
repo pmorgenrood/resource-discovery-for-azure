@@ -477,7 +477,7 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         # Set-Variable: read only by the lifted call.
         Set-Variable -Name RetryLimited -Value @()
         Set-Variable -Name TenantID -Value '12345678-1234-1234-1234-123456789012'
-        Set-Variable -Name RunDataSettings -Value (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false)
+        Set-Variable -Name RetryCommandSettings -Value (Get-RetryCommandSettings -Settings (Get-RunDataSettings) -DeviceLogin $false)
         $Lines = @(. ([scriptblock]::Create((Get-EndOfRunText -Root $Gone -RunCount 1 -CarriedCount 1) + "`n" + $BannerCall[0].Extent.Text)) 6>&1 | ConvertTo-Lines)
         $Text = @($Lines | Where-Object { $_ -and $_ -ne ('Inventory root not found at {0}. Nothing to consolidate.' -f $Gone) })
         $Text | Should -Be @(('FAILED (report missing): the inventory folder {0} is gone, with the report zips and the resume state that were in it, so no consolidated zip was built. The next run starts a new run and collects every subscription again.' -f $Gone))

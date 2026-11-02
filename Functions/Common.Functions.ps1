@@ -1877,19 +1877,38 @@ function Format-RunDataSwitches
     return (-join @(foreach ($Name in @($Settings.Keys)) { if ($Settings[$Name]) { ' -' + $Name } }))
 }
 
+# A value as a printed command gives it: in single quotes, a single quote in it
+# doubled, so a path with spaces, quotes or parentheses is passed as one value.
+function Format-CommandValue
+{
+    param([string]$Value)
+    return ("'{0}'" -f ($Value -replace "'", "''"))
+}
+
 # The command that collects one subscription again with a direct
 # ResourceInventory.ps1 run: the tenant when known, the subscription, the
-# resource group when the run had one, and the settings of $Settings that
-# ResourceInventory.ps1 takes (it has no -IncludeDisabled). A resource group
-# is quoted, since its name may hold parentheses.
+# resource group when the run had one, the client id (-Appid), the services
+# (-Service), the output folder (-OutputDirectory) and the dictionary
+# (-ObfuscationDictionary) when the run was given them, then the switches of
+# $Settings that are on and that ResourceInventory.ps1 takes (it has no
+# -IncludeDisabled). Values are quoted (Format-CommandValue). No secret is
+# printed: there is no parameter for one.
 function Get-DirectRunRetryCommand
 {
-    param([string]$TenantID, [string]$SubscriptionID, [string]$ResourceGroup, [System.Collections.IDictionary]$Settings)
+    param([string]$TenantID, [string]$SubscriptionID, [string]$ResourceGroup, [System.Collections.IDictionary]$Settings,
+        [string]$Appid, [string[]]$Service, [string]$OutputDirectory, [string]$ObfuscationDictionary)
     $TenantArg = if ([string]::IsNullOrEmpty($TenantID)) { '' } else { ' -TenantID {0}' -f $TenantID }
-    $GroupArg = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " -ResourceGroup '{0}'" -f ($ResourceGroup -replace "'", "''") }
+    $ValueArgs = -join @(
+        if (-not [string]::IsNullOrEmpty($ResourceGroup)) { ' -ResourceGroup ' + (Format-CommandValue $ResourceGroup) }
+        if (-not [string]::IsNullOrEmpty($Appid)) { ' -Appid ' + (Format-CommandValue $Appid) }
+        $Services = @(@($Service) | Where-Object { -not [string]::IsNullOrEmpty($_) })
+        if ($Services.Count -gt 0) { ' -Service ' + (@($Services | ForEach-Object { Format-CommandValue $_ }) -join ',') }
+        if (-not [string]::IsNullOrEmpty($OutputDirectory)) { ' -OutputDirectory ' + (Format-CommandValue $OutputDirectory) }
+        if (-not [string]::IsNullOrEmpty($ObfuscationDictionary)) { ' -ObfuscationDictionary ' + (Format-CommandValue $ObfuscationDictionary) }
+    )
     $Direct = [ordered]@{}
     if ($null -ne $Settings) { foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'IncludeDisabled') { $Direct[$Name] = $Settings[$Name] } } }
-    return ('./ResourceInventory.ps1{0} -SubscriptionID {1}{2}{3}' -f $TenantArg, $SubscriptionID, $GroupArg, (Format-RunDataSwitches -Settings $Direct))
+    return ('./ResourceInventory.ps1{0} -SubscriptionID {1}{2}{3}' -f $TenantArg, $SubscriptionID, $ValueArgs, (Format-RunDataSwitches -Settings $Direct))
 }
 
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
