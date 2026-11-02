@@ -23,6 +23,9 @@ BeforeAll {
     $FunctionsFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/AllSubHtmlSummary.Functions.ps1'
     if (-not (Test-Path $FunctionsFile)) { throw "AllSubHtmlSummary.Functions.ps1 not found at $FunctionsFile" }
     . $FunctionsFile
+    # The wrapper loads Common before it passes metrics entries: their two kinds
+    # are told apart by Test-MetricsIncompleteEntry there.
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
 
     $script:TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AllSubHtmlSummaryTest_' + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $script:TmpRoot -Force | Out-Null
@@ -392,7 +395,7 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
         # But the banners (and their counts) still render so the operator sees the health signal.
         $Html | Should -Match 'failed to process'
         $Html | Should -Match 'consumption \(billing\) issues'
-        $Html | Should -Match 'metrics issues'
+        $Html | Should -Match 'Metrics auth-skipped: 1 subscription\(s\)'
     }
 
     It 'without -Obfuscated a non-obfuscated bundle still lists the affected subscription names' {

@@ -314,7 +314,10 @@ function Write-RdaShareableDiagnosticsLog
         # array (the single $null) that would otherwise render a phantom "failure"
         # line. Filtering nulls yields a genuine "0" when there were none.
         $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ })
-        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ })
+        # Metrics skipped for the sign-in, and metrics left incomplete because Azure
+        # Monitor kept failing (Complete = $false), each with its own count.
+        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) })
+        $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
         $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()
@@ -355,6 +358,12 @@ function Write-RdaShareableDiagnosticsLog
         foreach ($msItem in $MetricsSkips)
         {
             $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$msItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$msItem.Message) $DiagScrubMap)))
+        }
+        $DiagLines.Add('')
+        $DiagLines.Add(('Metrics incomplete subscriptions: {0}' -f $MetricsIncomplete.Count))
+        foreach ($miItem in $MetricsIncomplete)
+        {
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$miItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$miItem.Message) $DiagScrubMap)))
         }
         $DiagLines.Add('')
         $DiagLines.Add(('Consumption failed/incomplete subscriptions: {0}' -f $ConsumpSkips.Count))

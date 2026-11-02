@@ -958,7 +958,10 @@ function Get-RunSummaryLogContent
     $Undetermined = @(@($EmptyUndetermined) | Where-Object { $null -ne $_ })
     $Failed = @(@($FailedSubscriptions) | Where-Object { $null -ne $_ })
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
-    $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
+    # Metrics skipped for the sign-in, and metrics left incomplete because Azure
+    # Monitor kept failing (Complete = $false), each with its own count.
+    $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) })
+    $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $MetricsFailedSubs)
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
@@ -1077,6 +1080,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Failed subscriptions          : {0}' -f $Failed.Count))
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
+    $Lines.Add(('  Metrics incomplete subs       : {0}' -f $MetricsIncomplete.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where
@@ -1107,6 +1111,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Metrics auth-skipped subscriptions (detail):')
             foreach ($MetricSub in $Metrics) { $Lines.Add(('  - {0} ({1}): {2}' -f [string]$MetricSub.Name, [string]$MetricSub.Id, [string]$MetricSub.Message)) }
+        }
+        if ($MetricsIncomplete.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Metrics incomplete subscriptions (detail):')
+            foreach ($MetricSub in $MetricsIncomplete) { $Lines.Add(('  - {0} ({1}): {2}' -f [string]$MetricSub.Name, [string]$MetricSub.Id, [string]$MetricSub.Message)) }
         }
         if ($Consumption.Count -gt 0)
         {
