@@ -2825,6 +2825,21 @@ if ($MetricsFailures.Count -gt 0)
     Write-Host ""
 }
 
+# Metrics left incomplete because Azure Monitor kept failing (Complete = $false),
+# with their own count, apart from the sign-in skips above.
+$MetricsIncompleteList = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
+if ($MetricsIncompleteList.Count -gt 0)
+{
+    Write-Host ""
+    Write-Host ("Metrics Incomplete:      {0} subscription(s)" -f $MetricsIncompleteList.Count) -ForegroundColor Yellow
+    foreach ($m in $MetricsIncompleteList)
+    {
+        Write-Host ("  - {0} ({1}): {2}" -f $m.Name, $m.Id, $m.Message) -ForegroundColor Yellow
+    }
+    Write-Host "  Note: the failed metrics are in the output report with MetricError set." -ForegroundColor Yellow
+    Write-Host ""
+}
+
 # Surface collector failures (#22). A Services/*/*.ps1 collector threw for a
 # specific subscription and was caught by ResourceInventory.ps1's circuit
 # breaker (CreateResourceJobs); that resource type is missing from the
