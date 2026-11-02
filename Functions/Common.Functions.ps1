@@ -1919,6 +1919,37 @@ function Write-ConsumptionDataCheckReport
     Write-Host $SkipConsumptionLine -ForegroundColor Yellow
 }
 
+# The consumption failure entries of a run whose billing download failed or
+# stopped part-way, unique by name and id. Leaves out the '(auth)' entry: a
+# consumption phase skipped because the sign-in could not be refreshed is
+# reported by the wrapper's FAILED (auth) banner instead.
+function Get-ConsumptionIncompleteEntries
+{
+    param([object[]]$Entries)
+    @(@($Entries) | Where-Object { $null -ne $_ -and [string]$_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique)
+}
+
+# The last lines of a run in which the billing download of one or more
+# subscriptions failed or stopped part-way: each subscription, then $Advice
+# (the command that collects them again). Shared by Run-AllSubscriptions.ps1
+# and direct runs of ResourceInventory.ps1, which then exit 3 (5 with a
+# collector failure). Prints nothing when there are none.
+function Write-ConsumptionFailedBanner
+{
+    param([object[]]$Entries, [string[]]$Advice)
+    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '================= FAILED (consumption) =================' -ForegroundColor Red
+    Write-Host ('Consumption (billing) data is missing or incomplete for {0} subscription(s):' -f $List.Count) -ForegroundColor Red
+    foreach ($Entry in $List)
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Red
+    }
+    foreach ($Line in @($Advice)) { Write-Host $Line -ForegroundColor Red }
+    Write-Host '========================================================' -ForegroundColor Red
+}
+
 # End of a direct ResourceInventory.ps1 run (Run-AllSubscriptions.ps1 prints its
 # own 'Consumption Failures' block): the subscriptions whose consumption could
 # not be collected or is incomplete, by name and id, and each distinct reason.

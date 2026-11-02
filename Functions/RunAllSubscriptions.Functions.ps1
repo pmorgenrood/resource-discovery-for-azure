@@ -2492,6 +2492,32 @@ function Get-RetryLimitedAttempts
     return @(@($FailedAttempts) | Where-Object { $null -ne $_ -and (Get-FailedAttemptCount -Entry $_) -ge $RetryLimit })
 }
 
+# The lines under the wrapper's FAILED (consumption) banner: the command that
+# collects each such subscription again. One that has now failed $RetryLimit
+# runs in a row is not collected by a run that continues this one, so it is
+# named apart with the -Fresh command, as Write-RetryLimitSummary names it.
+function Get-ConsumptionFailedAdvice
+{
+    param([object[]]$Entries, [object]$FailedAttempts, [string]$TenantID)
+    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    $LimitIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | ForEach-Object { [string]$_.Id })
+    $Retried = @($List | Where-Object { $LimitIds -notcontains [string]$_.Id })
+    $AtLimit = @($List | Where-Object { $LimitIds -contains [string]$_.Id })
+    $Lines = @()
+    if ($Retried.Count -gt 0)
+    {
+        $Lines += ('On the retry list, so the next run with the same settings collects {0} again; to collect only the retry list:' -f (@($Retried | ForEach-Object { $_.Name }) -join ', '))
+        $Lines += ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -ResumeFailedOnly' -f $TenantID)
+        $Lines += 'A subscription that fails 3 runs in a row is not collected again by a run that continues this one (Retry Limit Reached).'
+    }
+    if ($AtLimit.Count -gt 0)
+    {
+        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, start a new run with -Fresh:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
+        $Lines += ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh' -f $TenantID)
+    }
+    return $Lines
+}
+
 # Name the retry-list entries Get-RetryLimitedAttempts returned at the end of a
 # run, with their count and last reason, as incomplete. Prints nothing for an
 # empty list.
@@ -2746,6 +2772,10 @@ function Get-WrapperExitCode
     param(
         [bool]$AuthSkipped,
         [bool]$CollectorsFailed,
+        # A subscription's billing download failed or stopped part-way for a
+        # reason other than the sign-in: its cost data is incomplete, so 3, as
+        # for a data phase skipped for the sign-in.
+        [bool]$ConsumptionFailed = $false,
         # A -Resume run skipped a subscription whose earlier report zip could not
         # be carried into the consolidated zip, so that report is missing from it.
         # Same meaning as the verification gap (2) and takes precedence over 3-5:
@@ -2757,8 +2787,9 @@ function Get-WrapperExitCode
         [bool]$SubscriptionsFailed = $false
     )
     if ($ReportsMissing -or $SubscriptionsFailed) { return 2 }
-    if ($AuthSkipped -and $CollectorsFailed) { return 5 }
-    if ($AuthSkipped) { return 3 }
+    $DataIncomplete = $AuthSkipped -or $ConsumptionFailed
+    if ($DataIncomplete -and $CollectorsFailed) { return 5 }
+    if ($DataIncomplete) { return 3 }
     if ($CollectorsFailed) { return 4 }
     return 0
 }
