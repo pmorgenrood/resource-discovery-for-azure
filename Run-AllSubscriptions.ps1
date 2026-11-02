@@ -396,6 +396,29 @@ $Global:CollectorFailures = @()
 # the same PowerShell session lists the subscriptions again.
 Remove-Variable -Name RdaTenantSubscriptionCache -Scope Global -ErrorAction SilentlyContinue
 
+# The tenant key names this tenant's run lock and resume state files
+# (Get-TenantFileKey). Without a key of 12 hex characters every tenant would
+# share the same names, so the run stops here, before it creates or writes any
+# file (the inventory folder, the transcript, the lock or a state file). The key
+# is the SHA-256 of the text, so one that comes out right for -TenantID as given
+# comes out right for the tenant id a domain name resolves to below.
+$TenantKeyProblem = $null
+try
+{
+    $TenantKeyCheck = [string](Get-TenantFileKey -Tenant $TenantID)
+    if ([string]::IsNullOrEmpty($TenantKeyCheck)) { $TenantKeyProblem = 'it came out empty' }
+    elseif ($TenantKeyCheck -cnotmatch '^[0-9a-f]{12}$') { $TenantKeyProblem = 'it is not 12 hex characters' }
+}
+catch
+{
+    $TenantKeyProblem = $_.Exception.Message
+}
+if ($null -ne $TenantKeyProblem)
+{
+    Write-Host ("ERROR: Could not work out the tenant key that names this tenant's files in the inventory folder on PowerShell {0}: {1}. The run stopped before creating or writing any file." -f $PSVersionTable.PSVersion, $TenantKeyProblem) -ForegroundColor Red
+    Exit-Wrapper -Code 1
+}
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.

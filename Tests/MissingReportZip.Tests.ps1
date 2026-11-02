@@ -150,15 +150,16 @@ function Invoke-AzRestMethod
     # and its RunSummary.log), or $null when it wrote none.
     function script:Invoke-Wrapper
     {
-        param([int]$Streams = 1, [switch]$Obfuscate)
+        # -Tool: another copy of the tool to run (the default is the one above).
+        param([int]$Streams = 1, [switch]$Obfuscate, [string]$Tool = $script:ToolRoot)
         $Before = @(if (Test-Path -LiteralPath $script:Root) { Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File | ForEach-Object { $_.FullName } })
         $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
-        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams) + @(if ($Obfuscate) { '-Obfuscate' })) { $Info.ArgumentList.Add($Arg) }
+        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Tool 'Run-AllSubscriptions.ps1'), '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams) + @(if ($Obfuscate) { '-Obfuscate' })) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
         $Info.RedirectStandardInput = $true
         $Info.RedirectStandardOutput = $true
         $Info.RedirectStandardError = $true
-        $Info.WorkingDirectory = $script:ToolRoot
+        $Info.WorkingDirectory = $Tool
         $Info.Environment['HOME'] = $script:CaseHome
         $Info.Environment['PSModulePath'] = $script:Modules
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
@@ -375,5 +376,90 @@ Describe 'File names in the inventory folder hold no tenant id' -Skip:$IsWindows
             $R.ExitCode | Should -Be 0 -Because ($R.Text -join "`n")
             script:Get-TenantNamedFiles | Should -BeNullOrEmpty
         }
+    }
+}
+
+Describe 'The tenant key that names the files in the inventory folder' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+    }
+
+    It 'is <Key> for <Case>' -ForEach @(
+        @{ Case = 'the placeholder tenant id'; Id = '12345678-1234-1234-1234-123456789012'; Key = 'a3a8ee437933' }
+        @{ Case = 'the placeholder tenant id with spaces around it'; Id = '  12345678-1234-1234-1234-123456789012 '; Key = 'a3a8ee437933' }
+        @{ Case = 'a tenant in small letters'; Id = 'tenant-b'; Key = 'df6b6a5f230e' }
+        @{ Case = 'the same tenant in capitals with spaces around it'; Id = ' TENANT-B  '; Key = 'df6b6a5f230e' }
+    ) {
+        Get-TenantFileKey -Tenant $Id | Should -BeExactly $Key
+    }
+
+    It 'calls neither SHA256.HashData nor Convert.ToHexString, which need .NET 5 (PowerShell 7.1), while the scripts accept PowerShell 7.0' {
+        $Ast = (Get-Command -Name Get-TenantFileKey -CommandType Function).ScriptBlock.Ast
+        $Members = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.MemberExpressionAst] }, $true) | ForEach-Object { [string]$_.Member })
+        $Members | Should -Contain 'ComputeHash'
+        $Members | Should -Not -Contain 'HashData'
+        $Members | Should -Not -Contain 'ToHexString'
+    }
+}
+
+Describe 'A tenant key the run cannot work out' -Skip:$IsWindows {
+    BeforeAll {
+        # A copy of the tool whose Get-TenantFileKey is replaced by Body: the
+        # wrapper dot-sources the functions file, so the last definition wins.
+        function script:New-BadKeyTool
+        {
+            param([string]$Body)
+            $Dir = Join-Path $script:TestBase ('badkey-' + [guid]::NewGuid().ToString().Substring(0, 8))
+            Copy-Item -LiteralPath $script:ToolRoot -Destination $Dir -Recurse
+            Add-Content -LiteralPath (Join-Path $Dir 'Functions/RunAllSubscriptions.Functions.ps1') -Value ("`nfunction Get-TenantFileKey {{ param([string]`$Tenant) {0} }}" -f $Body) -Encoding utf8
+            return $Dir
+        }
+        # Every name, write time and content under Path, and the folder's own
+        # write time (a file created and removed again changes it).
+        function script:Get-FolderSnapshot
+        {
+            param([string]$Path)
+            if (-not (Test-Path -LiteralPath $Path)) { return @('absent') }
+            @(('folder|{0}' -f (Get-Item -LiteralPath $Path -Force).LastWriteTimeUtc.Ticks)) + @(Get-ChildItem -LiteralPath $Path -Recurse -Force | Sort-Object -Property FullName | ForEach-Object {
+                    $Hash = if ($_.PSIsContainer) { '' } else { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+                    '{0}|{1}|{2}' -f $_.FullName.Substring($Path.Length), $_.LastWriteTimeUtc.Ticks, $Hash
+                })
+        }
+        $script:KeyLine = "ERROR: Could not work out the tenant key that names this tenant's files in the inventory folder on PowerShell {0}: {1}. The run stopped before creating or writing any file."
+    }
+
+    It '<Case>: exit 1 with one line, and the inventory folder and every file in it are left exactly as they were' -ForEach @(
+        @{ Case = 'an empty key'; Body = "return ''"; Problem = 'it came out empty' }
+        @{ Case = 'no key at all'; Body = 'return'; Problem = 'it came out empty' }
+        @{ Case = 'a key that is not 12 hex characters'; Body = "return 'not-a-key'"; Problem = 'it is not 12 hex characters' }
+        @{ Case = 'a key that cannot be computed'; Body = "throw 'stand-in: no hash on this PowerShell'"; Problem = 'stand-in: no hash on this PowerShell' }
+    ) {
+        script:New-Case
+        script:Set-Scenario
+        $Tool = script:New-BadKeyTool -Body $Body
+        # What a run would read, move or remove: a resume state under the
+        # tenant key, one under the tenant id an earlier version used, and a
+        # run lock temporary file.
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-a3a8ee437933.json') -Value '{"CompletedSubscriptionIds":[]}' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)) -Value '{"CompletedSubscriptionIds":[]}' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root '.run-lock-a3a8ee437933.json.0a1b2c3d.tmp') -Value '{}' -Encoding utf8
+        (Get-Item -LiteralPath $script:Root).LastWriteTimeUtc = [datetime]::UtcNow.AddMinutes(-5)
+        $Before = script:Get-FolderSnapshot -Path $script:Root
+
+        $R = script:Invoke-Wrapper -Tool $Tool
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join "`n")
+        @($R.Text | Where-Object { $_ -like 'ERROR: Could not work out the tenant key*' }) | Should -Be @(($script:KeyLine -f $PSVersionTable.PSVersion, $Problem))
+        script:Get-FolderSnapshot -Path $script:Root | Should -Be $Before
+    }
+
+    It 'no inventory folder yet: exit 1 with the line, and no folder is created' {
+        script:New-Case
+        script:Set-Scenario
+        $Tool = script:New-BadKeyTool -Body "return ''"
+        $R = script:Invoke-Wrapper -Tool $Tool
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join "`n")
+        $R.Text | Should -Contain ($script:KeyLine -f $PSVersionTable.PSVersion, 'it came out empty')
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
     }
 }
