@@ -110,6 +110,8 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
             # Set-Variable: these are read only by the lifted block.
             Set-Variable -Name InventoryRoot -Value $Root
             Set-Variable -Name RunStartTime -Value ((Get-Date).AddMinutes(-5))
+            # This run's own report records: every report zip the test wrote.
+            Set-Variable -Name RunReports -Value @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter 'ResourcesReport_*.zip' | ForEach-Object { [pscustomobject]@{ Id = $_.BaseName; Name = $_.BaseName; Zip = [System.IO.Path]::GetRelativePath($Root, $_.FullName); Obfuscated = $false } })
             $OuterZipFile = $null
             $BundleBuildError = $null
             $Printed = @(. $script:BundleBlock 6>&1 | ConvertTo-Lines)

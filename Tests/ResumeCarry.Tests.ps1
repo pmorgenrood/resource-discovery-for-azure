@@ -153,6 +153,8 @@ $Global:ResourceCount = 1
         "param(`$RealScriptRoot, `$InventoryRoot, `$RunStartTime, `$SubResourceCounts, `$SkippedSubscriptions, `$CompletedReports, `$Resume, `$Obfuscate, `$ResumeStateFile, `$TenantID)`n" +
         "function Exit-Wrapper { param([int]`$Code) throw ('Exit-Wrapper ' + `$Code) }`n" +
         "`$WrapperTranscriptStarted = `$false; `$FailedSubscriptions = @(); `$Detailed = `$false`n" +
+        "# This run's own report records: the report zips the test wrote for this run.`n" +
+        "`$RunReports = @(Get-ChildItem -LiteralPath `$InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -LiteralPath `$_.FullName -Filter '*.zip' -File | Where-Object { `$_.LastWriteTime -ge `$RunStartTime } } | ForEach-Object { [pscustomobject]@{ Id = `$_.BaseName; Name = `$_.BaseName; Zip = [System.IO.Path]::GetRelativePath(`$InventoryRoot, `$_.FullName); Obfuscated = [bool]`$Obfuscate } })`n" +
         $PostText + "`n" +
         "[pscustomobject]@{ OuterZipFile = `$OuterZipFile; MainSummaryFile = `$MainSummaryFile; Uncarried = @(`$UncarriedSkipped) }")
 
