@@ -1739,6 +1739,11 @@ function ExecuteInventoryProcessing()
             $ConsumptionFailureMessage = $null
             $ConsumptionPageIndex = 0
 
+            # $UsageData is the last page read, and the next page's token comes
+            # from it. A subscription whose pull failed part-way leaves its token
+            # there, so each subscription starts with none.
+            $UsageData = $null
+
             try
             {
                 do
@@ -1751,7 +1756,7 @@ function ExecuteInventoryProcessing()
                         ShowDetails            = $true
                     }
 
-                    $Params.ContinuationToken = $UsageData.ContinuationToken
+                    $Params.ContinuationToken = if ($null -ne $UsageData) { $UsageData.ContinuationToken } else { $null }
 
                     $ConsumptionMaxRetries = 3
                     $ConsumptionAttempt = 0
