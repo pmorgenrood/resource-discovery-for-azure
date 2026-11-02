@@ -334,6 +334,32 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Global:ConsumptionRecordCount | Should -Be 2
     }
 
+    It 'logs the other subscriptions of a -SubscriptionID run once, as a count in the debug log only' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:SubscriptionID = 'sub-b'
+        $Global:Subscriptions = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' },
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' },
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Gamma' })
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'sub-b' } } }
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-b/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        GetResorceConsumption
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { -not $NoConsole -and $Message -match 'Alpha|Gamma|Skipping' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $NoConsole -and $ToDebugLog -and $Message -match '\b2 other subscription\(s\)' -and $Message -notmatch 'Alpha|Gamma' }
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'does not say a -ResourceGroup run cannot filter consumption by resource group, since it does' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' })
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        GetResorceConsumption
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'Cannot filter consumption' }
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
+    }
+
     # On an ICU host (Linux, macOS) the en-US time pattern has U+202F before
     # AM/PM, so the culture's default date text is not the same on every host.
     It 'writes UsageStartTime and UsageEndTime as M/d/yyyy h:mm:ss tt with a plain space, in ASCII' {
