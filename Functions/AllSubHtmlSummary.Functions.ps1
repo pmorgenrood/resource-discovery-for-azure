@@ -207,6 +207,16 @@ function New-RdaAllSubHtmlSummary
         # from the earlier run that completed those subscriptions.
         $IncludeFolders = @(),
 
+        # Optional: the report folder names whose report zip went into the
+        # consolidated zip. When given, only these folders are listed and
+        # counted, so a folder whose report zip is missing is not.
+        $ReportFolders = $null,
+
+        # Optional: lines from Get-RunReportCoverageLines (the subscriptions in
+        # the run, the reports in this zip, and each subscription without one
+        # with its reason), shown under the header.
+        [string[]]$CoverageLines = @(),
+
         # Optional run-health collections passed through from the wrapper. Each is an
         # array; when empty the corresponding banner is omitted. A consumption or
         # metrics entry whose ReportFolder names a report folder of this run also
@@ -253,6 +263,11 @@ function New-RdaAllSubHtmlSummary
     {
         $Included = @($IncludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
         $Folders = @($Folders | Where-Object { $_.LastWriteTime -ge $SinceTime -or $Included -contains $_.Name })
+    }
+    if ($null -ne $ReportFolders)
+    {
+        $InZipFolders = @(@($ReportFolders) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        $Folders = @($Folders | Where-Object { $InZipFolders -contains $_.Name })
     }
 
     $ObfPattern = '^(?:' + (Get-RdaObfuscationTokenPattern) + ')$'
@@ -347,6 +362,20 @@ function New-RdaAllSubHtmlSummary
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
 
     $Banners = New-Object System.Text.StringBuilder
+    # The subscriptions in the run against the reports in this zip, and why
+    # each subscription without a report has none (the caller already left
+    # out names under -Obfuscate).
+    $Coverage = @(@($CoverageLines) | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    if ($Coverage.Count -gt 0)
+    {
+        [void]$Banners.AppendFormat('<div class="coverage"><b>{0}</b></div>', (ConvertTo-HtmlSafe $Coverage[0]))
+    }
+    if ($Coverage.Count -gt 1)
+    {
+        [void]$Banners.AppendFormat('<div class="banner err"><b>{0}</b><ul>', (ConvertTo-HtmlSafe $Coverage[1]))
+        foreach ($CoverageLine in @($Coverage | Select-Object -Skip 2)) { [void]$Banners.AppendFormat('<li>{0}</li>', (ConvertTo-HtmlSafe ($CoverageLine -replace '^\s*-\s*', ''))) }
+        [void]$Banners.Append('</ul></div>')
+    }
     if ($FailedList.Count -gt 0)
     {
         if ($IsObfuscated)
@@ -444,7 +473,8 @@ h1{font-size:22px;margin:0 0 4px}h3{margin:0 0 8px;font-size:14px;color:var(--mu
 .privacy-banner.obfuscated{background:#ddf4e4;border:1px solid #52c41a}
 .privacy-banner.identifiable{background:#fff3cd;border:1px solid #e0b000}
 .banner{padding:10px 14px;border-radius:8px;margin:8px 0;font-size:13px}
-.banner.err{background:#ffebe9;border:1px solid #ff818a}.banner.warn{background:#fff8c5;border:1px solid #e0c000}
+.banner.err{background:#ffebe9;border:1px solid #ff818a}.banner ul{margin:4px 0 0;padding-left:20px}
+.coverage{margin:8px 0;font-size:13px}.banner.warn{background:#fff8c5;border:1px solid #e0c000}
 .cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;min-width:150px}
 .card .n{font-size:26px;font-weight:700}.card .l{color:var(--muted);font-size:12px}

@@ -106,9 +106,11 @@ function Invoke-AzRestMethod
     if ($Path -match '/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/roleAssignments\?')
     {
         $Id = $Matches[1]
+        if (@((Get-RdaStandInScenario).NoRole) -contains $Id) { return & $Answer 200 @{ value = @() } }
         return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/stand-in-reader" } }) }
     }
     if ($Path -match '/providers/Microsoft\.Authorization/roleDefinitions/[^/?]+\?') { return & $Answer 200 @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } } }
+    if ($Path -match '/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?' -and @((Get-RdaStandInScenario).NoRole) -contains $Matches[1]) { return & $Answer 200 @{ value = @() } }
     if ($Path -match '/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?') { return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) } }
     if ($Path -like '*Microsoft.ResourceGraph/resources*')
     {
@@ -138,8 +140,8 @@ function Invoke-AzRestMethod
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '')
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [string[]]$NoRole = @())
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; NoRole = @($NoRole) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -148,10 +150,10 @@ function Invoke-AzRestMethod
     # and its RunSummary.log), or $null when it wrote none.
     function script:Invoke-Wrapper
     {
-        param([int]$Streams = 1)
+        param([int]$Streams = 1, [switch]$Obfuscate)
         $Before = @(if (Test-Path -LiteralPath $script:Root) { Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File | ForEach-Object { $_.FullName } })
         $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
-        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams)) { $Info.ArgumentList.Add($Arg) }
+        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams) + @(if ($Obfuscate) { '-Obfuscate' })) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
         $Info.RedirectStandardInput = $true
         $Info.RedirectStandardOutput = $true
@@ -188,7 +190,15 @@ function Invoke-AzRestMethod
                     $Reader = [System.IO.StreamReader]::new($Log.Open())
                     try { $LogLines = @($Reader.ReadToEnd() -split "`r?`n") } finally { $Reader.Dispose() }
                 }
-                $Zip = [pscustomobject]@{ Ids = $Ids; RunSummary = $LogLines }
+                $Main = $Archive.Entries | Where-Object { $_.FullName -eq 'MainSummary.html' } | Select-Object -First 1
+                $MainText = ''
+                if ($null -ne $Main)
+                {
+                    $Reader = [System.IO.StreamReader]::new($Main.Open())
+                    try { $MainText = $Reader.ReadToEnd() } finally { $Reader.Dispose() }
+                }
+                $HtmlCopies = @($Archive.Entries | Where-Object { $_.FullName -like 'HTML*/*.html' } | ForEach-Object { ($_.FullName -split '/')[0] } | Sort-Object -Unique)
+                $Zip = [pscustomobject]@{ Ids = $Ids; RunSummary = $LogLines; MainSummary = $MainText; HtmlCopies = $HtmlCopies }
             }
             finally { $Archive.Dispose() }
         }
@@ -249,5 +259,61 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The summaries of a consolidated zip that lacks some reports' -Skip:$IsWindows {
+    It 'one report missing: both numbers, and the missing subscription named with its reason, in MainSummary.html and RunSummary.log' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R = script:Invoke-Wrapper
+        $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+        $R.Zip.Ids | Should -Be (script:Get-Ids 'A', 'C')
+        $Reason = 'report missing (collected, but its report zip was not written or is gone; the next run collects it)'
+        $R.Zip.MainSummary | Should -Match ([regex]::Escape('<b>3 subscription(s) in this run (3 visible to the tenant), 2 report(s) in this zip.</b>'))
+        $R.Zip.MainSummary | Should -Match ([regex]::Escape(('<b>1 subscription(s) without a report in this zip:</b><ul><li>Sub B ({0}): {1}</li></ul>' -f $B.Id, $Reason)))
+        # Only the reports in the zip are listed and copied.
+        ([regex]::Matches($R.Zip.MainSummary, '<tr><td>')).Count | Should -Be 2
+        $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape(('<tr><td>{0}</td>' -f $B.Id)))
+        $R.Zip.HtmlCopies.Count | Should -Be 2
+        $R.Zip.RunSummary | Should -Contain '  3 subscription(s) in this run (3 visible to the tenant), 2 report(s) in this zip.'
+        $R.Zip.RunSummary | Should -Contain '  1 subscription(s) without a report in this zip:'
+        $R.Zip.RunSummary | Should -Contain ('    - Sub B ({0}): {1}' -f $B.Id, $Reason)
+    }
+
+    It 'one report missing and one subscription skipped by the role check: each named with its own reason, the not-readable one without its id' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        script:Set-Scenario -NoZip @($B.Id) -NoRole @($C.Id)
+        $R = script:Invoke-Wrapper
+        $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+        $R.Zip.Ids | Should -Be (script:Get-Ids 'A')
+        $R.Zip.MainSummary | Should -Match ([regex]::Escape('<b>3 subscription(s) in this run (3 visible to the tenant), 1 report(s) in this zip.</b>'))
+        $R.Zip.MainSummary | Should -Match ([regex]::Escape(('<b>2 subscription(s) without a report in this zip:</b><ul><li>Sub B ({0}): report missing (collected, but its report zip was not written or is gone; the next run collects it)</li><li>Sub C: skipped by the up-front role check (not readable)</li></ul>' -f $B.Id)))
+        $R.Zip.HtmlCopies.Count | Should -Be 1
+        $R.Zip.RunSummary | Should -Contain '    - Sub C: skipped by the up-front role check (not readable)'
+        # No zip a run leaves holds the id of a not-readable subscription.
+        $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape($C.Id))
+        ($R.Zip.RunSummary -join "`n") | Should -Not -Match ([regex]::Escape($C.Id))
+    }
+
+    It 'under -Obfuscate: the numbers and a count for each reason, with no subscription name or id' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        script:Set-Scenario -NoZip @($B.Id) -NoRole @($C.Id)
+        $R = script:Invoke-Wrapper -Obfuscate
+        $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+        $R.Zip.MainSummary | Should -Match ([regex]::Escape('<b>2 subscription(s) without a report in this zip:</b><ul><li>1 report missing</li><li>1 skipped by the role check</li></ul>'))
+        $R.Zip.RunSummary | Should -Contain '    - 1 report missing'
+        $R.Zip.RunSummary | Should -Contain '    - 1 skipped by the role check'
+        foreach ($Sub in @($B, $C))
+        {
+            $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape($Sub.Id))
+            $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape($Sub.Name))
+            ($R.Zip.RunSummary -join "`n") | Should -Not -Match ([regex]::Escape($Sub.Id))
+        }
     }
 }
