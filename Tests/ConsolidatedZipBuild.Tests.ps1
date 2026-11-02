@@ -388,6 +388,7 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
             $ExpectedAssignment[0].Extent.Text
             '$MissingReports = @()'
             '$MissingReportCount = 0'
+            '$InventoryFolderGone = $false'
             (Find-WrapperIf -Condition '$ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container)' -Contains 'Per-subscription output verification').Extent.Text
             '$OuterZipFile = $null'
             '$BundleBuildError = $null'
@@ -467,6 +468,26 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         Invoke-Tail -BundleBuildError $null -Before (Get-EndOfRunText -Root $Gone -RunCount 1 -CarriedCount 0) | Should -Be 2
         # A run that expected no report zip keeps its exit code.
         Invoke-Tail -BundleBuildError $null -Before (Get-EndOfRunText -Root $Gone -RunCount 0 -CarriedCount 0) | Should -Be 0
+    }
+
+    It 'the inventory folder gone at the end: one line says the folder, its reports and the resume state are gone and the next run starts a new run, in place of the report-missing banner' {
+        $Gone = Join-Path $TestDrive 'folder-gone-text'
+        $BannerCall = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('Write-MissingReportBanner ') })
+        $BannerCall.Count | Should -Be 1
+        # Set-Variable: read only by the lifted call.
+        Set-Variable -Name RetryLimited -Value @()
+        Set-Variable -Name TenantID -Value '12345678-1234-1234-1234-123456789012'
+        Set-Variable -Name RunDataSettings -Value (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false)
+        $Lines = @(. ([scriptblock]::Create((Get-EndOfRunText -Root $Gone -RunCount 1 -CarriedCount 1) + "`n" + $BannerCall[0].Extent.Text)) 6>&1 | ConvertTo-Lines)
+        $Text = @($Lines | Where-Object { $_ -and $_ -ne ('Inventory root not found at {0}. Nothing to consolidate.' -f $Gone) })
+        $Text | Should -Be @(('FAILED (report missing): the inventory folder {0} is gone, with the report zips and the resume state that were in it, so no consolidated zip was built. The next run starts a new run and collects every subscription again.' -f $Gone))
+        ($Lines -join "`n") | Should -Not -Match 'resume state is kept|could not be named|=== FAILED'
+    }
+
+    It 'the report-missing banner is unchanged while the inventory folder is there' {
+        $Lines = @(Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Name = 'sub-a'; Id = 'sub-a' }) -MissingReportCount 1 -ZipBuilt $true -TenantID 't' 6>&1 | ConvertTo-Lines)
+        $Lines | Should -Contain '================== FAILED (report missing) =================='
+        $Lines | Should -Contain 'The resume state is kept. Run the same command again (without -Fresh), or with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
     }
 
     It 'the other exit codes are unchanged when the zip was built' {

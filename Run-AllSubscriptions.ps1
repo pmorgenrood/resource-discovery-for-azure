@@ -2450,6 +2450,9 @@ $ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
 # and the run exits 2, so the next run collects them and carries the others.
 $MissingReports = @()
 $MissingReportCount = 0
+# Set when the inventory folder is gone at the end of a run that expected
+# report zips (below the consolidation step).
+$InventoryFolderGone = $false
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
     $ActualSubZips = @(Get-RunReportZipItems -InventoryRoot $InventoryRoot -Reports $RunReports)
@@ -2597,7 +2600,7 @@ else
     Write-Host ("Inventory root not found at {0}. Nothing to consolidate." -f $InventoryRoot) -ForegroundColor Yellow
     # Every report zip the run expected went with the folder, so none of them is
     # in a consolidated zip (exit code 2 below).
-    if ($ExpectedZipCount -gt 0) { $MissingReportCount = $ExpectedZipCount }
+    if ($ExpectedZipCount -gt 0) { $MissingReportCount = $ExpectedZipCount; $InventoryFolderGone = $true }
 }
 
 # Aggregate "main" HTML summary across all per-subscription reports from
@@ -3298,7 +3301,8 @@ Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-C
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
 # the others, unless it has now failed 3 runs in a row; sets exit code 2 below.
-Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RunDataSettings
+# With the inventory folder gone, one line says so instead.
+Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RunDataSettings -GoneFolder $(if ($InventoryFolderGone) { $InventoryRoot } else { '' })
 
 # A per-stream state file the end-of-run merge could not move aside: the run
 # above is finished; the stop says what to do, and the exit code is set below
