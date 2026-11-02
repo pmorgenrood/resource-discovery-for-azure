@@ -426,6 +426,45 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @($Global:ConsumptionFailedSubs).Count | Should -Be 1
     }
 
+    It 'stops a subscription''s pull at the page limit and reports it incomplete, naming the limit' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            # Ends a loop with no limit, so the test fails instead of running on.
+            if ($script:Calls -gt 50) { throw 'stand-in: the pages did not stop' }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ('/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-{0}' -f $script:Calls)); ContinuationToken = ('page-{0}' -f ($script:Calls + 1)) }
+        }
+        GetResorceConsumption -MaxPages 3
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 3
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'the limit of 3 usage pages for one subscription'
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 4, after 3 record\(s\); this subscription''s consumption is INCOMPLETE'
+        $Global:ConsumptionFailedSubs[0].Complete | Should -BeFalse
+        $Global:ConsumptionFailedSubs[0].PageAtFailure | Should -Be 4
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 3
+    }
+
+    It 'collects a subscription whose last page is the page limit' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            $Next = if ($script:Calls -lt 3) { 'page-{0}' -f ($script:Calls + 1) } else { $null }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $Next }
+        }
+        GetResorceConsumption -MaxPages 3
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 3
+    }
+
+    It 'reads at most 10,000 usage pages for one subscription unless told otherwise' {
+        $Limit = @($script:CollectionAst.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'MaxPages' })
+        $Limit.Count | Should -Be 1
+        $Limit[0].DefaultValue.Extent.Text | Should -Be '10000'
+    }
+
     # The up-front check reads such a row as having no resource URI
     # (Get-ConsumptionRowResourceUri); the billing phase keeps its cost.
     It 'keeps a usage row whose InstanceData is <Case>, with blank resource fields, and collects the rest of the subscription' -ForEach @(

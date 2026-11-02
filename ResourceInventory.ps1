@@ -1644,7 +1644,12 @@ function ExecuteInventoryProcessing()
         Write-Log -Message ('Resource Reporting Phase Done.') -Severity 'Info'
     }
 
-    function GetResorceConsumption()
+    # $MaxPages: the most usage pages read for one subscription. A paging token
+    # that never runs out would otherwise keep the run reading without end; at
+    # the limit the subscription's consumption is reported INCOMPLETE. At the
+    # usage API's page size (up to 1,000 rows a page) 10,000 pages is about 10
+    # million rows for one subscription.
+    function GetResorceConsumption([int]$MaxPages = 10000)
     {
         $DebugPreference = "SilentlyContinue"
 
@@ -1909,7 +1914,13 @@ function ExecuteInventoryProcessing()
                     # other resource groups' rows, and a page that fails part-way writes none.
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
 
-                } while ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
+                    $MorePages = ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
+                    if ($MorePages -and $ConsumptionPageIndex -ge $MaxPages)
+                    {
+                        $ConsumptionPageIndex++
+                        throw ("Read the limit of {0:N0} usage pages for one subscription; the usage API offered more, which were not read" -f $MaxPages)
+                    }
+                } while ($MorePages)
             }
             catch
             {

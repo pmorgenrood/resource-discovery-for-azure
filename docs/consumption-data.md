@@ -74,6 +74,14 @@ retried. This is the rule the up-front consumption data check uses. Either way
 a page that still fails is handled by the per-subscription failure path (see
 [Recovering from a consumption crash](#recovering-from-a-consumption-crash)).
 
+### Page limit
+
+One subscription's pull reads at most 10,000 pages (about 10 million rows at the
+usage API's page size of up to 1,000 rows). If the API still offers more, the
+pull stops there, keeps the rows written so far, and reports that subscription's
+consumption INCOMPLETE with a message naming the limit, so a paging token that
+never runs out cannot keep a run going without end.
+
 ## The columns
 
 The CSV has 15 columns. Ten come straight from each usage-aggregation record;
