@@ -2559,12 +2559,14 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             # inventory folder is listed with.
             $PartialZip = Join-Path $InventoryRoot ('.rda-{0}.partial' -f [guid]::NewGuid().ToString('N'))
             Compress-Archive -Path $SubZips.FullName -DestinationPath $PartialZip -ErrorAction Stop
-            [System.IO.File]::Move($PartialZip, $OuterZipFile, $true)
-            $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
+            # Checked before it takes the reserved name, so a zip that fails the
+            # check never sits under the name a run ships.
+            $ZipProblem = Get-ConsolidatedZipProblem -Path $PartialZip -SubZipNames $SubZips.Name
             if ($ZipProblem)
             {
                 throw $ZipProblem
             }
+            [System.IO.File]::Move($PartialZip, $OuterZipFile, $true)
             # Its path is printed after the run summary is added to it, once
             # the zip passed the same check again (below the summary block).
         }
@@ -2572,8 +2574,9 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
         {
             $BundleBuildError = "Could not build {0}: {1}" -f $OuterZipFile, $_.Exception.Message
             Write-Host ("ERROR: {0}" -f $BundleBuildError) -ForegroundColor Red
-            # The name this run reserved, still empty: nothing of it is left.
-            if ($null -ne $Reserved) { $Left = Get-Item -LiteralPath $Reserved -ErrorAction SilentlyContinue; if ($null -ne $Left -and $Left.Length -eq 0) { Remove-Item -LiteralPath $Reserved -Force -ErrorAction SilentlyContinue } }
+            # The name this run reserved (New-RunOutputFile created it, so no
+            # other run writes it): nothing of it is left, whatever it holds.
+            if ($null -ne $Reserved) { Remove-Item -LiteralPath $Reserved -Force -ErrorAction SilentlyContinue }
             # The main summary, the fold and the final check below all key on
             # $OuterZipFile, so none of them may point at the missing zip.
             $OuterZipFile = $null
