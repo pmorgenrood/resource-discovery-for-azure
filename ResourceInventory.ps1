@@ -1998,3 +1998,18 @@ Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severi
 # up-front role check skipped.
 Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult
 Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
+
+# A direct run whose billing download failed or stopped part-way for a
+# subscription (other than for the sign-in) still writes the report and zip,
+# then ends with the FAILED (consumption) lines and exits 3, the code
+# Run-AllSubscriptions.ps1 uses. A direct run keeps no retry list: the command
+# printed collects the subscription again. Under -RunAllSubs the wrapper reports
+# this through its own exit code, so this is skipped there. The zip check keeps
+# the code to runs that produced their report.
+$ConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
+if (-not $RunAllSubs.IsPresent -and $ConsumptionIncomplete.Count -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile))
+{
+    $RetryTenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    exit 3
+}

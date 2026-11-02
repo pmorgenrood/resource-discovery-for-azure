@@ -180,6 +180,40 @@ Describe 'Get-WrapperExitCode' {
         # anything that only checks the exit code.
         Get-WrapperExitCode -AuthSkipped $true -CollectorsFailed $true | Should -Be 5 -Because 'neither failure signal may be silently dropped when both occur in the same run'
     }
+
+    It 'Returns 3 when a consumption download failed or stopped part-way, and 5 with a collector failure' {
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $false -ConsumptionFailed $true | Should -Be 3
+        Get-WrapperExitCode -AuthSkipped $false -CollectorsFailed $true -ConsumptionFailed $true | Should -Be 5
+    }
+}
+
+Describe 'FAILED (consumption) lines of the wrapper' {
+    BeforeAll {
+        $script:Failures = @(
+            [pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Message = 'stopped at consumption page 2' }
+            [pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a'; Message = 'stopped at consumption page 1' }
+            [pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a'; Message = 'stopped at consumption page 1' }
+            [pscustomobject]@{ Name = '(auth)'; Id = '(auth)'; Message = 'no usable sign-in' }
+        )
+    }
+
+    It 'names each failed subscription once, without the sign-in entry, with the command that collects it again' {
+        Get-ConsumptionFailedAdvice -Entries $script:Failures -TenantID 'tenant-1' | Should -Be @(
+            'To collect one again, run:'
+            '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-a'
+            '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-b'
+        )
+    }
+
+    It 'says nothing when only the sign-in entry is there' {
+        @(Get-ConsumptionFailedAdvice -Entries @($script:Failures[3]) -TenantID 'tenant-1').Count | Should -Be 0
+    }
+
+    It 'is printed by the wrapper and sets its exit code' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -TenantID $TenantID)'))
+        $Wrapper | Should -Match ([regex]::Escape('-ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0)'))
+    }
 }
 
 Describe 'Add-FailedAttempt / Remove-FailedAttempt single-element handling' {

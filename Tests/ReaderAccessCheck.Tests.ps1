@@ -1527,8 +1527,9 @@ Describe 'Write-SkippedSubscriptionSummary (end-of-run list)' {
         $Direct = (Get-Content -Path (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw).TrimEnd()
         # After the report and zip logging the direct script prints the no-usage and
         # skipped-subscription lists. The only code allowed after them is the direct-run
-        # exit 4 check: its comment lines, the failure count and one exit line.
-        $ExitFourCheck = '(\r?\n)+(#[^\r\n]*\r?\n)*\$CollectorFailureCount = [^\r\n]*\r?\nif \([^\r\n]*\) \{ exit 4 \}'
+        # exit-code check: its comment lines, the failure counts, and one exit line or one
+        # block that prints the FAILED (consumption) lines and exits.
+        $ExitFourCheck = '(\r?\n)+(#[^\r\n]*\r?\n)*(\$CollectorFailureCount = [^\r\n]*\r?\n)?(\$ConsumptionIncomplete = [^\r\n]*\r?\n)?if \([^\r\n]*\)(( \{ exit 4 \})|(\r?\n\{(\r?\n    [^\r\n]*)+\r?\n\}))'
         $Direct | Should -Match ([regex]::Escape('Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity ''Success''') + '\s*\r?\n(#[^\n]*\n)*' + [regex]::Escape('Write-NoUsageSummary -ConsumptionResult $script:ConsumptionCheckResult') + '\r?\n' + [regex]::Escape('Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped') + '(' + $ExitFourCheck + ')?$')
     }
 }
