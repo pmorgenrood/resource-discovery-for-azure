@@ -29,7 +29,7 @@ param ($TenantID,
     [string]$ConsumptionWindowEnd)
 
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
-if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
+if (-not (Test-Path -LiteralPath $FunctionsFile -PathType Leaf))
 {
     Write-Host "ERROR: Required functions file not found: $FunctionsFile" -ForegroundColor Red
     Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
@@ -38,7 +38,7 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
 . $FunctionsFile
 
 $CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
-if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
+if (-not (Test-Path -LiteralPath $CommonFunctionsFile -PathType Leaf))
 {
     Write-Host "ERROR: Required functions file not found: $CommonFunctionsFile" -ForegroundColor Red
     Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
@@ -437,7 +437,7 @@ Function RunInventorySetup()
         {
             try
             {
-                $OutputDirectory = (Resolve-Path $OutputDirectory -ErrorAction Stop).Path + [IO.Path]::DirectorySeparatorChar
+                $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory -ErrorAction Stop).Path + [IO.Path]::DirectorySeparatorChar
             }
             catch
             {
@@ -828,7 +828,7 @@ Function RunInventorySetup()
 
         Write-Log -Message ("Checking report folder: {0}" -f $DefaultPath) -Severity 'Info'
 
-        if ((Test-Path -Path $DefaultPath -PathType Container) -eq $false)
+        if ((Test-Path -LiteralPath $DefaultPath -PathType Container) -eq $false)
         {
             New-Item -Type Directory -Force -Path $DefaultPath | Out-Null
         }
@@ -1083,7 +1083,7 @@ Function RunInventorySetup()
 
         if (-not [string]::IsNullOrEmpty($ObfuscationDictionary))
         {
-            $SeedDictionary = Get-Content -Path $ObfuscationDictionary -Raw | ConvertFrom-Json
+            $SeedDictionary = Get-Content -LiteralPath $ObfuscationDictionary -Raw | ConvertFrom-Json
 
             if ($null -ne $SeedDictionary.ResourceIdMap)
             {
@@ -1355,11 +1355,11 @@ function ExecuteInventoryProcessing()
 
             if ($PSScriptRoot -like '*\*')
             {
-                $MetricPath = Get-ChildItem -Path ($PSScriptRoot + '\Extension\Metrics.ps1') -Recurse
+                $MetricPath = Get-ChildItem -LiteralPath ($PSScriptRoot + '\Extension\Metrics.ps1') -Recurse
             }
             else
             {
-                $MetricPath = Get-ChildItem -Path ($PSScriptRoot + '/Extension/Metrics.ps1') -Recurse
+                $MetricPath = Get-ChildItem -LiteralPath ($PSScriptRoot + '/Extension/Metrics.ps1') -Recurse
             }
 
             $MetricsFilePath = ($DefaultPath + "Metrics_" + $Global:ReportName + "_" + $CurrentDateTime + "_")
@@ -1433,11 +1433,11 @@ function ExecuteInventoryProcessing()
 
         if ($PSScriptRoot -like '*\*')
         {
-            $Modules = Get-ChildItem -Path ($PSScriptRoot + '\Services\*.ps1') -Recurse
+            $Modules = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse
         }
         else
         {
-            $Modules = Get-ChildItem -Path ($PSScriptRoot + '/Services/*.ps1') -Recurse
+            $Modules = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse
         }
 
         if ($Service -and @($Service).Count -gt 0)
@@ -1867,7 +1867,7 @@ function ExecuteInventoryProcessing()
                         $NewUsageDataExport.Add($UsageDataExport[$Item]) | Out-Null
                     }
 
-                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
+                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
 
                 } while ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
             }
@@ -1946,11 +1946,11 @@ function FinalizeOutputs
 
         if ($PSScriptRoot -like '*\*')
         {
-            $SummaryPath = Get-ChildItem -Path ($PSScriptRoot + '\Extension\Summary.ps1') -Recurse
+            $SummaryPath = Get-ChildItem -LiteralPath ($PSScriptRoot + '\Extension\Summary.ps1') -Recurse
         }
         else
         {
-            $SummaryPath = Get-ChildItem -Path ($PSScriptRoot + '/Extension/Summary.ps1') -Recurse
+            $SummaryPath = Get-ChildItem -LiteralPath ($PSScriptRoot + '/Extension/Summary.ps1') -Recurse
         }
 
         $ReportTenantId = if ($Obfuscate.IsPresent) { $null } else { $TenantID }
@@ -1993,7 +1993,7 @@ if (-not $RunAllSubs.IsPresent)
 
     $PreFlightInventoryRoot = if ($OutputDirectory)
     {
-        try { (Resolve-Path $OutputDirectory -ErrorAction Stop).Path }
+        try { (Resolve-Path -LiteralPath $OutputDirectory -ErrorAction Stop).Path }
         catch { $OutputDirectory }
     }
     elseif ($PSVersionTable.Platform -eq 'Unix')
@@ -2004,7 +2004,7 @@ if (-not $RunAllSubs.IsPresent)
     {
         "C:\InventoryReports"
     }
-    if (-not (Test-Path -Path $PreFlightInventoryRoot -PathType Container))
+    if (-not (Test-Path -LiteralPath $PreFlightInventoryRoot -PathType Container))
     {
         try { New-Item -Path $PreFlightInventoryRoot -ItemType Directory -Force | Out-Null }
         catch { Write-Verbose ("PreFlightInventoryRoot create failed at {0}: {1}" -f $PreFlightInventoryRoot, $_.Exception.Message) }
@@ -2014,7 +2014,7 @@ if (-not $RunAllSubs.IsPresent)
 
     if ($Service -and @($Service).Count -gt 0)
     {
-        $PreFlightAvailableServices = @(Get-ChildItem -Path (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse | ForEach-Object { $_.BaseName } | Sort-Object)
+        $PreFlightAvailableServices = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse | ForEach-Object { $_.BaseName } | Sort-Object)
         $PreFlightMatchedServices = @($Service | Where-Object { $_ -in $PreFlightAvailableServices })
         if (@($PreFlightMatchedServices).Count -eq 0)
         {
@@ -2032,14 +2032,14 @@ if (-not $RunAllSubs.IsPresent)
             Write-Host "ERROR: -ObfuscationDictionary requires -Obfuscate (there are no obfuscation dictionaries to seed without it)." -ForegroundColor Red
             exit 1
         }
-        if (-not (Test-Path -Path $ObfuscationDictionary -PathType Leaf))
+        if (-not (Test-Path -LiteralPath $ObfuscationDictionary -PathType Leaf))
         {
             Write-Host ("ERROR: -ObfuscationDictionary file not found: {0}" -f $ObfuscationDictionary) -ForegroundColor Red
             exit 1
         }
         try
         {
-            $null = Get-Content -Path $ObfuscationDictionary -Raw | ConvertFrom-Json
+            $null = Get-Content -LiteralPath $ObfuscationDictionary -Raw | ConvertFrom-Json
         }
         catch
         {
@@ -2070,7 +2070,7 @@ if (-not $RunAllSubs.IsPresent)
 
     try
     {
-        $RootItem = Get-Item -Path $PreFlightInventoryRoot -ErrorAction Stop
+        $RootItem = Get-Item -LiteralPath $PreFlightInventoryRoot -ErrorAction Stop
         $Drive = $RootItem.PSDrive
         if ($null -ne $Drive -and $null -ne $Drive.Free)
         {
@@ -2100,19 +2100,19 @@ if (-not $RunAllSubs.IsPresent)
     $ProbePath = Join-Path $PreFlightInventoryRoot (".write-probe-{0}.tmp" -f ([guid]::NewGuid()))
     try
     {
-        Set-Content -Path $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
-        $ProbeRead = Get-Content -Path $ProbePath -Raw -ErrorAction Stop
+        Set-Content -LiteralPath $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
+        $ProbeRead = Get-Content -LiteralPath $ProbePath -Raw -ErrorAction Stop
         if ($ProbeRead -notmatch 'preflight write probe')
         {
             throw "Write probe content mismatch (read back '$ProbeRead')"
         }
-        Remove-Item -Path $ProbePath -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $ProbePath -Force -ErrorAction Stop
         Write-Host ("Write probe: OK ({0})" -f $PreFlightInventoryRoot) -ForegroundColor Green
     }
     catch
     {
         $ProbeError = $_.Exception.Message
-        try { if (Test-Path $ProbePath) { Remove-Item -Path $ProbePath -Force -ErrorAction SilentlyContinue } }
+        try { if (Test-Path -LiteralPath $ProbePath) { Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue } }
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
         Write-Host ("ERROR: Pre-flight: cannot write to {0}: {1}. This usually means readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle. Verify the directory is writable and re-run." -f $PreFlightInventoryRoot, $ProbeError) -ForegroundColor Red
         exit 1
@@ -2127,7 +2127,7 @@ $Global:Runtime = Measure-Command -Expression {
     RunInventorySetup
 
     $Global:PowerShellTranscriptFile = ($Global:DefaultPath + "Transcript_Log_" + $Global:ReportName + "_" + $Global:CurrentDateTime + ".txt")
-    Start-Transcript -Path $Global:PowerShellTranscriptFile -UseMinimalHeader
+    Start-Transcript -LiteralPath $Global:PowerShellTranscriptFile -UseMinimalHeader
 }
 
 try
@@ -2209,7 +2209,7 @@ if ($Obfuscate.IsPresent)
         }
     }
 
-    $Dictionary | ConvertTo-Json -depth 5 | Out-File $Global:DictionaryFile -Encoding utf8
+    $Dictionary | ConvertTo-Json -depth 5 | Out-File -LiteralPath $Global:DictionaryFile -Encoding utf8
     Write-Log -Message ("Obfuscation dictionary saved locally: {0}" -f $Global:DictionaryFile) -Severity 'Success'
     Write-Log -Message ("") -Severity 'Info'
     Write-Log -Message ("=== OBFUSCATION NOTICE ===") -Severity 'Warning'
@@ -2232,26 +2232,26 @@ if ($Obfuscate.IsPresent)
 
 if ($SkipMetrics.IsPresent)
 {
-    @{ Metrics = @() } | ConvertTo-Json -depth 5 -compress | Out-File $Global:MetricsJsonFile -Encoding utf8
+    @{ Metrics = @() } | ConvertTo-Json -depth 5 -compress | Out-File -LiteralPath $Global:MetricsJsonFile -Encoding utf8
 }
 else
 {
     $MetricsPattern = ('Metrics_{0}_{1}*.json' -f $Global:ReportName, $CurrentDateTime)
-    $MetricsAny = @(Get-ChildItem -Path $DefaultPath -Filter $MetricsPattern -ErrorAction SilentlyContinue)
+    $MetricsAny = @(Get-ChildItem -LiteralPath $DefaultPath -Filter $MetricsPattern -ErrorAction SilentlyContinue)
     if ($MetricsAny.Count -eq 0)
     {
-        @{ Metrics = @() } | ConvertTo-Json -depth 5 -compress | Out-File $Global:MetricsJsonFile -Encoding utf8
+        @{ Metrics = @() } | ConvertTo-Json -depth 5 -compress | Out-File -LiteralPath $Global:MetricsJsonFile -Encoding utf8
     }
 }
 
-$ConsumptionCreated = Test-Path -Path $Global:ConsumptionFileCsv
+$ConsumptionCreated = Test-Path -LiteralPath $Global:ConsumptionFileCsv
 
 $ConsumptionEmpty = $false
 if ($ConsumptionCreated)
 {
     try
     {
-        $ConsumptionEmpty = ((Get-Item -Path $Global:ConsumptionFileCsv -ErrorAction Stop).Length -eq 0)
+        $ConsumptionEmpty = ((Get-Item -LiteralPath $Global:ConsumptionFileCsv -ErrorAction Stop).Length -eq 0)
     }
     catch
     {
@@ -2261,13 +2261,13 @@ if ($ConsumptionCreated)
 
 if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 {
-    "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File $Global:ConsumptionFileCsv -Encoding utf8
+    "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -LiteralPath $Global:ConsumptionFileCsv -Encoding utf8
 }
 
 # Only JSON files named with this run's stamp go into the zip. With -OutputDirectory
 # several runs can share one folder, and an earlier run's files there (its inventory,
 # or its local-only dictionary) must not ship in this run's zip.
-$JsonFiles = @(Get-ChildItem -Path $DefaultPath -Filter "*.json" | Where-Object { $_.Name -like "*_$($Global:CurrentDateTime)*" -and $_.Name -notlike "ObfuscationDictionary_*" -and $_.Name -notlike "Full_*" -and $_.Name -notlike "Heartbeat_*" -and $_.Name -notlike "DebugLog_*" -and $_.Name -notlike "ErrorLog_*" } | Select-Object -ExpandProperty FullName)
+$JsonFiles = @(Get-ChildItem -LiteralPath $DefaultPath -Filter "*.json" | Where-Object { $_.Name -like "*_$($Global:CurrentDateTime)*" -and $_.Name -notlike "ObfuscationDictionary_*" -and $_.Name -notlike "Full_*" -and $_.Name -notlike "Heartbeat_*" -and $_.Name -notlike "DebugLog_*" -and $_.Name -notlike "ErrorLog_*" } | Select-Object -ExpandProperty FullName)
 
 if ($Obfuscate.IsPresent)
 {
@@ -2275,8 +2275,10 @@ if ($Obfuscate.IsPresent)
 
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
+    # The archive expands wildcards in -Path, as Compress-Archive does; the escape
+    # keeps an output folder with [ or ] in its name as written.
     $CompressionOutput = @{
-        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles
+        Path = @(@($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles | ForEach-Object { [WildcardPattern]::Escape($_) })
         CompressionLevel = 'Fastest'
         DestinationPath = $Global:ZipOutputFile
     }
@@ -2288,8 +2290,10 @@ else
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
 
+    # The archive expands wildcards in -Path, as Compress-Archive does; the escape
+    # keeps an output folder with [ or ] in its name as written.
     $CompressionOutput = @{
-        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles
+        Path = @(@($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles | ForEach-Object { [WildcardPattern]::Escape($_) })
         CompressionLevel = 'Fastest'
         DestinationPath = $Global:ZipOutputFile
     }

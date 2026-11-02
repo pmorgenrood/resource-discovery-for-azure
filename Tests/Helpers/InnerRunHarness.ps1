@@ -5,6 +5,11 @@
 #
 #   -Culture         the culture the run uses (CurrentCulture and CurrentUICulture), e.g. tr-TR.
 #   -Out             -OutputDirectory for the run; left out when empty.
+#
+# -Tree and -Out default to $env:RDA_INNER_HARNESS_TREE and
+# $env:RDA_INNER_HARNESS_OUT. On Unix pwsh expands wildcards in the arguments
+# it passes to a program (out[1] becomes out1 when out1 exists), so a test
+# with [ or ] in a path hands it over in the environment instead.
 #   -SubIds          the subscriptions the sign-in lists (comma-separated).
 #   -AllSubs         a direct run without -SubscriptionID (every listed subscription).
 #   -ResourceGroup   -ResourceGroup for the run.
@@ -18,9 +23,9 @@
 # line') so a test can see whether debug output is on. The run's exit code is
 # this script's exit code. Placeholder ids and generic names only; no live Azure.
 param(
-    [string]$Tree,
+    [string]$Tree = $env:RDA_INNER_HARNESS_TREE,
     [string]$Culture = 'en-US',
-    [string]$Out = '',
+    [string]$Out = $env:RDA_INNER_HARNESS_OUT,
     [string]$SubIds = '12345678-1234-1234-1234-123456789012',
     [switch]$AllSubs,
     [string]$ResourceGroup = '',

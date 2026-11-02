@@ -82,7 +82,9 @@ function global:Import-Module
 function global:Get-Item
 {
     [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Path, [string[]]$LiteralPath)
-    if ($Global:SetupStopScenario -eq 'lowdisk' -and @($Path).Count -eq 1 -and $Path[0] -eq $Global:SetupStopOut)
+    # The script names the folder with -LiteralPath (a folder name may hold [ or ]).
+    $Asked = @(@($Path) + @($LiteralPath) | Where-Object { $_ })
+    if ($Global:SetupStopScenario -eq 'lowdisk' -and $Asked.Count -eq 1 -and $Asked[0] -eq $Global:SetupStopOut)
     {
         return [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 50MB } }
     }
@@ -93,7 +95,7 @@ function global:Set-Content
     [CmdletBinding()] param([string[]]$Path, [string[]]$LiteralPath, [Parameter(ValueFromPipeline = $true)][object[]]$Value, $Encoding, [switch]$Force)
     process
     {
-        if ($Global:SetupStopScenario -eq 'unwritable' -and "$Path" -like '*.write-probe-*') { throw 'Access to the path is denied.' }
+        if ($Global:SetupStopScenario -eq 'unwritable' -and "$Path$LiteralPath" -like '*.write-probe-*') { throw 'Access to the path is denied.' }
         Microsoft.PowerShell.Management\Set-Content @PSBoundParameters
     }
 }
