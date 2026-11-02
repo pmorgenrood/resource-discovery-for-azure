@@ -477,7 +477,7 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)'
         $At = [array]::IndexOf($Clear, 'Report missing (detail; not in this zip, the next run collects them):')
         $Clear[$At + 1] | Should -Be '  - Sub A (sub-a)'
-        $Clear | Should -Not -Contain '  - Sub B (sub-b)'
+        $Clear[$At + 2] | Should -Be '' -Because 'Sub B is not among those the next run collects'
         $Limit = [array]::IndexOf($Clear, 'Report missing, retry limit reached (detail; not in this zip; to try them again, start a new run with -Fresh):')
         $Clear[$Limit + 1] | Should -Be '  - Sub B (sub-b)'
         $Only = @(Get-RunSummaryLogContent -MissingReportCount 1 -MissingReports @($Missing[1]) -RetryLimited $Limited)
