@@ -2622,7 +2622,8 @@ if ($null -ne $OuterZipFile)
     $RoleSkippedIds = @(@($NotReadableIds) + @(if ($null -ne $AccessDecision) { $AccessDecision.InaccessibleIds }) | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $ReportCoverage = Get-RunReportCoverage -Visible $AllSubscriptions -RunIds @($AllSubscriptions | Where-Object { $ExcludedIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id }) `
         -InZipIds $InZipIds -ReportsInZip $SubZips.Count -MissingReports $MissingReports -MissingReportCount $MissingReportCount `
-        -NotReadableIds $RoleSkippedIds -RetryLimited @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts) -Uncarried $UncarriedSkipped -FailedAttempts $FailedAttempts
+        -NotReadableIds $RoleSkippedIds -RetryLimited @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts) -Uncarried $UncarriedSkipped -FailedAttempts $FailedAttempts `
+        -CompletedEarlierIds @(if ($ResumeFailedOnly) { Get-ZipOwedSubscriptionIds -CompletedIds $CompletedIds -InZipIds $InZipIds })
     $CoverageLines = @(Get-RunReportCoverageLines -Coverage $ReportCoverage -Obfuscated:$Obfuscate)
 }
 if ($null -ne $OuterZipFile)
@@ -2675,11 +2676,18 @@ if ($null -ne $OuterZipFile)
 # that is neither completed nor on the retry list (one an interrupted run never
 # reached) is still owed: the state is kept, so a later -Resume collects it and
 # still skips the completed ones. The summary below names them.
+# -ResumeFailedOnly puts only the reports it collected into its consolidated
+# zip, so the reports of the subscriptions completed earlier in the run are
+# not in it (Get-ZipOwedSubscriptionIds). While one is owed, the state is kept
+# and the run exits 2, and a run that continues this one carries them.
 $NotCollected = @()
+$ZipOwedIds = @()
 if ($ResumeFailedOnly)
 {
     $RetryListIds = @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
     $NotCollected = @(Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds $RetryListIds -NotReadableIds $NotReadableIds)
+    $MissingRunIds = @(@($MissingReports) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $ZipOwedIds = @(Get-ZipOwedSubscriptionIds -CompletedIds $CompletedIds -InZipIds @(@($SubResourceCounts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Where-Object { $MissingRunIds -notcontains $_ }))
 }
 # The retry-list entries past the retry limit, listed as incomplete in the
 # summary. They keep the state (see $RetryOwedCount), so the next -Resume or
@@ -2951,10 +2959,16 @@ if ($NotCollected.Count -gt 0)
     # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
     Write-NotCollectedSummary -NotCollected $NotCollected -ResumeStateFile $ResumeStateFile
 }
+if ($ZipOwedIds.Count -gt 0)
+{
+    # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
+    Write-Host ("Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of {0} subscription(s) completed earlier in this run are not in it, and the resume state is kept. To put every report of the run into a new consolidated zip, continue the run:" -f $ZipOwedIds.Count) -ForegroundColor Yellow
+    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $RunDataSettings)) -ForegroundColor Yellow
+}
 if ($RetryLimited.Count -gt 0)
 {
     # Set by the resume-state cleanup above.
-    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -NotListedIds $KeptNotListedIds -NotReadableIds @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } | ForEach-Object { [string]$_ } })
+    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -NotListedIds $KeptNotListedIds -NotReadableIds @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } | ForEach-Object { [string]$_ } }) -Settings $RunDataSettings
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($WrapperTranscriptStarted)
@@ -3105,7 +3119,7 @@ $CleanRun = $false
 # summary was added to it, keeps the state too: the next
 # -Resume then skips the completed subscriptions and carries their reports
 # into a new zip instead of collecting them all again (exit 2 says why).
-if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $null -eq $BundleBuildError -and -not ($MissingReportCount -gt 0) -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $ZipOwedIds.Count -eq 0 -and $null -eq $BundleBuildError -and -not ($MissingReportCount -gt 0) -and (Test-Path -Path $ResumeStateFile -PathType Leaf))
 {
     $ResumeStateClearTried = $true
     try
@@ -3247,11 +3261,13 @@ if (@($UncarriedSkipped).Count -gt 0)
     {
         Write-Host ("  - {0} ({1}): {2}" -f $U.Name, $U.Id, $U.Reason) -ForegroundColor Red
     }
-    Write-Host "Their reports are NOT in the consolidated zip. Re-run with -Fresh to collect every subscription again," -ForegroundColor Red
+    # Each command carries the run's settings.
+    Write-Host "Their reports are NOT in the consolidated zip. Start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
+    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RunDataSettings)) -ForegroundColor Red
     Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
     foreach ($U in @($UncarriedSkipped))
     {
-        Write-Host ("  ./ResourceInventory.ps1 -TenantID {0} -SubscriptionID {1}" -f $TenantID, $U.Id) -ForegroundColor Red
+        Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID $TenantID -SubscriptionID $U.Id -Settings $RunDataSettings)) -ForegroundColor Red
     }
     Write-Host "=================================================================" -ForegroundColor Red
 }
@@ -3262,33 +3278,18 @@ if (@($UncarriedSkipped).Count -gt 0)
 # retry list, so the next run collects it again; once it has failed 3 runs in a
 # row the retry limit leaves it out (Retry Limit Reached), and that run is not
 # exited 3 for it.
-Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID)
+Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
 
 # A subscription whose grouped Azure Monitor request still failed after its
 # retries (throttling, timeout, server error) has incomplete metrics: the same
 # retry list, retry limit and exit 3 (5) as a failed billing download above.
-Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID)
+Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
 
 # A subscription completed this run whose report zip is missing is not in the
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
-# the others; sets exit code 2 below.
-if ($MissingReportCount -gt 0)
-{
-    Write-Host ""
-    Write-Host "================== FAILED (report missing) ==================" -ForegroundColor Red
-    Write-Host ("{0} subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:" -f $MissingReportCount) -ForegroundColor Red
-    foreach ($M in @($MissingReports))
-    {
-        Write-Host ("  - {0} ({1})" -f $M.Name, $M.Id) -ForegroundColor Red
-    }
-    if (@($MissingReports).Count -lt $MissingReportCount)
-    {
-        Write-Host ("  ({0} more could not be named; see 'Per-subscription output verification failed' above.)" -f ($MissingReportCount - @($MissingReports).Count)) -ForegroundColor Red
-    }
-    Write-Host "The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip." -ForegroundColor Red
-    Write-Host "=============================================================" -ForegroundColor Red
-}
+# the others, unless it has now failed 3 runs in a row; sets exit code 2 below.
+Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RunDataSettings
 
 # A per-stream state file the end-of-run merge could not move aside: the run
 # above is finished; the stop says what to do, and the exit code is set below
@@ -3319,7 +3320,7 @@ if ($null -ne $BundleBuildError)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or ($MissingReportCount -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0) -ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0) -MetricsIncomplete (@(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count -gt 0)
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing ((@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or ($MissingReportCount -gt 0) -or ($ZipOwedIds.Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0) -ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0) -MetricsIncomplete (@(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count -gt 0)
 # A per-stream state file the merge could not move aside stops the next run at
 # its start: exit 1, in place of 0 and 3-5, so a caller acts on it. Exit 2
 # (reports missing or subscriptions failed) keeps its code; the stop above

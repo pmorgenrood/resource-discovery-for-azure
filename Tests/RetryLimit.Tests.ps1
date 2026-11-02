@@ -649,9 +649,9 @@ Describe 'Retry limit for a subscription whose billing download fails on every r
         $Listed | Should -Be @(1..3 | ForEach-Object { 'Consumption (billing) data is missing or incomplete for 1 subscription(s):|  - sub-x (sub-x)' })
         $Attempts | Should -Be @(1, 2, 3)
         # Runs 1 and 2 name the retry; run 3, at the limit, names -Fresh instead.
-        $Commands[0] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
-        $Commands[1] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
-        @($Commands[2] | Where-Object { $_ -like '*-ResumeFailedOnly' }).Count | Should -Be 0
+        $Commands[0] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -Resume')
+        $Commands[1] | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -Resume')
+        @($Commands[2] | Where-Object { $_ -like '*-Resume' }).Count | Should -Be 0
         @($Commands[2] | Where-Object { $_ -eq '  ./Run-AllSubscriptions.ps1 -TenantID t -Fresh' }).Count | Should -BeGreaterThan 0
         @($Run4.Calls) | Should -Not -Contain 'sub-x'
         @(script:Get-Lines -Run $Run4 -Like '*FAILED (consumption)*').Count | Should -Be 0
@@ -1168,7 +1168,7 @@ Describe 'A subscription whose grouped metric requests still fail after their re
         $At = [array]::IndexOf(@($Run1.Text), '=================== FAILED (metrics) ===================')
         $At | Should -BeGreaterOrEqual 0
         @($Run1.Text[($At + 1)..($At + 2)]) | Should -Be @('Metrics are incomplete for 1 subscription(s): Azure Monitor requests still failed after their retries (throttling, timeout or server error):', '  - sub-x (sub-x)')
-        @(script:Get-Lines -Run $Run1 -Like '  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly') | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -ResumeFailedOnly')
+        @(script:Get-Lines -Run $Run1 -Like '  ./Run-AllSubscriptions.ps1 -TenantID t -Resume') | Should -Be @('  ./Run-AllSubscriptions.ps1 -TenantID t -Resume')
         @(script:Get-Lines -Run $Run1 -Like 'Metrics Auth Failures*').Count | Should -Be 0 -Because 'a throttled subscription is not a sign-in problem'
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 1
         [string](script:Get-Entry -Id 'sub-x').Reason | Should -BeLike 'Metrics incomplete: Azure Monitor requests for 1 resource(s) still failed after their retries*'

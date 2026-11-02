@@ -1851,11 +1851,14 @@ Describe 'A run that stops before it starts collecting keeps the earlier run id'
         Test-Path -LiteralPath $Stream1 | Should -BeTrue
         script:Set-Scenario -Subs 'A', 'B', 'C'
         $R2 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
-        $R2.ExitCode | Should -Be 0
+        # Its consolidated zip holds Sub C only; the reports of Sub A and Sub B
+        # are owed, so it keeps the state and exits 2.
+        $R2.ExitCode | Should -Be 2
         $R2.Error | Should -BeNullOrEmpty
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 1 completed, 1 failed subscription record(s).')
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'C')
-        script:Test-CleanLine $R2 | Should -BeTrue
+        script:Test-CleanLine $R2 | Should -BeFalse
+        @($R2.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of 2 subscription(s) completed earlier in this run are not in it*' }).Count | Should -Be 1
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 }

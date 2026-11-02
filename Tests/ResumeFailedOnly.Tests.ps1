@@ -222,15 +222,20 @@ Describe '-ResumeFailedOnly after an interrupted run' {
         @($R.Text | Where-Object { $_ -eq 'Not Collected:           1 (Sub C) - no run has completed these and -ResumeFailedOnly retries only the retry list' }).Count | Should -Be 1
     }
 
-    It 'clears the state as before once every subscription is completed' {
+    It 'once every subscription is completed, keeps the state while its consolidated zip lacks the earlier reports, and the -Resume run after it clears it' {
         # Run 1 reached every subscription; only Sub B failed.
         $Global:RdaRfoFailIds = @('sub-b')
         $null = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Interrupted
         $Global:RdaRfoFailIds = @()
         $R = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -ResumeFailedOnly
 
-        @($R.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 0
         @($R.Text | Where-Object { $_ -like 'Not Collected:*' }).Count | Should -Be 0
+        @($R.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of 2 subscription(s) completed earlier in this run are not in it*' }).Count | Should -Be 1
+        Test-Path -LiteralPath $script:State | Should -BeTrue
+        $R2 = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Resume
+        @($R2.Result.SubResourceCounts) | Should -BeNullOrEmpty
+        @($R2.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 1
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 }
@@ -274,7 +279,7 @@ Describe '-ResumeFailedOnly with nothing on the retry list' {
 
 Describe '-ResumeFailedOnly and a subscription the access check skipped as not readable' {
     BeforeEach { script:New-Case }
-    It 'does not name it as not collected, and clears the state once the retries succeed' {
+    It 'does not name it as not collected once the retries succeed, and keeps the state for the earlier report its consolidated zip lacks' {
         # Run 1: Sub C is not readable and is skipped, Sub A completes, Sub B fails.
         $Global:RdaRfoFailIds = @('sub-b')
         $null = script:Invoke-Run -Subs @($script:A, $script:B, $script:C) -Unreadable 'sub-c' -Interrupted
@@ -285,8 +290,9 @@ Describe '-ResumeFailedOnly and a subscription the access check skipped as not r
 
         @($R.Result.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-b')
         @($R.Text | Where-Object { $_ -like 'Not Collected:*' }).Count | Should -Be 0
-        @($R.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 1
-        Test-Path -LiteralPath $script:State | Should -BeFalse
+        @($R.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of 1 subscription(s) completed earlier in this run are not in it*' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count | Should -Be 0
+        Test-Path -LiteralPath $script:State | Should -BeTrue
     }
 
     It 'after an interrupted run, names only the subscription the run never reached' {

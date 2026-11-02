@@ -188,7 +188,7 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
             'Consumption (billing) data is missing or incomplete for 1 subscription(s):'
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
             'To collect one again, run:'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -SkipMetrics'
             '========================================================'
         )
     }
@@ -225,8 +225,8 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
             '  - Sub B (placeholder-subscription-b)'
             'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.'
             'To collect one again, run:'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -SkipMetrics'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b -SkipMetrics'
             '========================================================'
         )
     }
