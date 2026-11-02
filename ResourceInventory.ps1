@@ -2418,12 +2418,13 @@ if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFil
 {
     $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
     $RetryTenant = if (-not [string]::IsNullOrEmpty($TenantID)) { $TenantID } else { $script:RdaRunTenant }
-    $RetryTenantArg = if (-not [string]::IsNullOrEmpty($RetryTenant)) { ' -TenantID {0}' -f $RetryTenant } else { '' }
+    # Each command carries this run's resource group and settings.
+    $RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
-    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ' + (Get-DirectRunRetryCommand -TenantID $RetryTenant -SubscriptionID $_.Id -ResourceGroup $ResourceGroup -Settings $RetrySettings) }))
     # Metrics left incomplete because Azure Monitor kept failing: the same lines and codes.
     $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
-    Write-MetricsIncompleteBanner -Entries $MetricsIncomplete -Advice (@('To collect one again, run:') + @($MetricsIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    Write-MetricsIncompleteBanner -Entries $MetricsIncomplete -Advice (@('To collect one again, run:') + @($MetricsIncomplete | ForEach-Object { '  ' + (Get-DirectRunRetryCommand -TenantID $RetryTenant -SubscriptionID $_.Id -ResourceGroup $ResourceGroup -Settings $RetrySettings) }))
     $DataIncomplete = $ConsumptionIncomplete.Count -gt 0 -or $MetricsIncomplete.Count -gt 0
     $DirectExitCode = if ($DataIncomplete -and $CollectorFailureCount -gt 0) { 5 } elseif ($DataIncomplete) { 3 } elseif ($CollectorFailureCount -gt 0) { 4 } else { 0 }
     if ($DirectExitCode -ne 0) { exit $DirectExitCode }

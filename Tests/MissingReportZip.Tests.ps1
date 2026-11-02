@@ -158,10 +158,10 @@ function Invoke-AzRestMethod
     function script:Invoke-Wrapper
     {
         # -Tool: another copy of the tool to run (the default is the one above).
-        param([int]$Streams = 1, [switch]$Obfuscate, [string]$Tool = $script:ToolRoot)
+        param([int]$Streams = 1, [switch]$Obfuscate, [switch]$Fresh, [switch]$ResumeFailedOnly, [switch]$Resume, [string]$Tool = $script:ToolRoot)
         $Before = @(if (Test-Path -LiteralPath $script:Root) { Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File | ForEach-Object { $_.FullName } })
         $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
-        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Tool 'Run-AllSubscriptions.ps1'), '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams) + @(if ($Obfuscate) { '-Obfuscate' })) { $Info.ArgumentList.Add($Arg) }
+        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Join-Path $Tool 'Run-AllSubscriptions.ps1'), '-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams) + @(if ($Obfuscate) { '-Obfuscate' }) + @(if ($Fresh) { '-Fresh' }) + @(if ($ResumeFailedOnly) { '-ResumeFailedOnly' }) + @(if ($Resume) { '-Resume' })) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
         $Info.RedirectStandardInput = $true
         $Info.RedirectStandardOutput = $true
@@ -214,6 +214,15 @@ function Invoke-AzRestMethod
         return [pscustomobject]@{ ExitCode = $Proc.ExitCode; Text = $Text; NewZips = $New.Count; Zip = $Zip; State = $State }
     }
 
+    # Every line of the FAILED (report missing) banner, up to its closing line.
+    function script:Get-FullBanner
+    {
+        param($Run)
+        $At = [array]::IndexOf($Run.Text, '================== FAILED (report missing) ==================')
+        if ($At -lt 0) { return @() }
+        $End = [array]::IndexOf($Run.Text, '=============================================================', $At + 1)
+        @($Run.Text[($At + 1)..($End - 1)])
+    }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $L = $_; ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $L) }).Id } | Sort-Object) }
     function script:Get-Banner
     {
@@ -248,7 +257,7 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         script:Get-Banner $R1 | Should -Be @(
             '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
             ('  - {0} ({1})' -f $MissingSub.Name, $MissingSub.Id)
-            'The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
+            'The resume state is kept. Run the same command again (without -Fresh), or with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
         )
         $R1.Zip.RunSummary | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
         $R1.Zip.RunSummary | Should -Contain ('  - {0} ({1})' -f $MissingSub.Name, $MissingSub.Id)
@@ -709,5 +718,88 @@ Describe 'Move-LegacyResumeStateFiles: files an earlier version named with the t
         $R.Lines.Count | Should -Be 5
         ($R.Lines -join "`n") | Should -Not -Match '12345678'
         @(script:Get-Names $Dir | Where-Object { $_ -match '12345678' }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
+    It 'after a -Fresh run, says to run the same command again without -Fresh, or with -Resume' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R = script:Invoke-Wrapper -Fresh
+        $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+        script:Get-FullBanner $R | Should -Contain 'The resume state is kept. Run the same command again (without -Fresh), or with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
+        (script:Get-FullBanner $R) -join "`n" | Should -Not -Match 'Run again with -Resume'
+    }
+
+    It 'when every report is missing, says that no consolidated zip was built, and none is' {
+        script:New-Case
+        script:Set-Scenario -NoZip @($script:Subs | ForEach-Object { $_.Id })
+        $R = script:Invoke-Wrapper
+        $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+        $R.NewZips | Should -Be 0
+        $Banner = script:Get-FullBanner $R
+        $Banner[0] | Should -Be '3 subscription(s) completed collection this run, but their report zip is missing, and no consolidated zip was built:'
+        $Banner | Should -Contain 'The resume state is kept. Run the same command again (without -Fresh), or with -Resume: it collects these subscriptions again and builds the consolidated zip.'
+        ($Banner -join "`n") | Should -Not -Match 'NOT in the consolidated zip'
+    }
+
+    It 'on the run whose missing report takes a subscription to the retry limit, names it apart with the -Fresh command, in the banner, MainSummary.html and RunSummary.log' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $null = script:Invoke-Wrapper
+        $null = script:Invoke-Wrapper
+        $R3 = script:Invoke-Wrapper
+        $R3.ExitCode | Should -Be 2 -Because ($R3.Text -join "`n")
+        @($R3.State.FailedAttempts | ForEach-Object { [int]$_.Attempts }) | Should -Be @(3)
+        $Fresh = '  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -SkipMetrics -SkipConsumption' -f $script:Tenant
+        script:Get-FullBanner $R3 | Should -Be @(
+            '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
+            ('  - {0} ({1})' -f $B.Name, $B.Id)
+            'Sub B failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect it again; to try again, start a new run with -Fresh:'
+            $Fresh
+        )
+        # The retry-limit summary of the same run gives the same command.
+        $R3.Text | Should -Contain ('  ' + $Fresh)
+        $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, start a new run with -Fresh)'
+        $R3.Zip.RunSummary | Should -Contain ('    - Sub B ({0}): {1}' -f $B.Id, $Reason)
+        $R3.Zip.MainSummary | Should -Match ([regex]::Escape(('<li>Sub B ({0}): {1}</li>' -f $B.Id, $Reason)))
+        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)'
+        ($R3.Zip.RunSummary -join "`n") | Should -Not -Match 'the next run collects'
+    }
+}
+
+Describe '-ResumeFailedOnly after a run with reports of other subscriptions' -Skip:$IsWindows {
+    It 'exits 2 and keeps the state while its consolidated zip lacks them, and names the run that carries them; that run ends clean with every report' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+
+        # The retry list only: Sub B writes its report now.
+        script:Set-Scenario
+        $R2 = script:Invoke-Wrapper -ResumeFailedOnly
+        $R2.ExitCode | Should -Be 2 -Because ($R2.Text -join "`n")
+        $R2.Zip.Ids | Should -Be (script:Get-Ids 'B')
+        $R2.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+        $R2.State | Should -Not -BeNullOrEmpty
+        $R2.Text | Should -Contain 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip, so the reports of 2 subscription(s) completed earlier in this run are not in it, and the resume state is kept. To put every report of the run into a new consolidated zip, continue the run:'
+        $R2.Text | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -SkipMetrics -SkipConsumption' -f $script:Tenant)
+        $Reason = 'completed earlier in the run; -ResumeFailedOnly does not carry its report, so a run that continues this one puts it into a new consolidated zip'
+        foreach ($L in 'A', 'C')
+        {
+            $Sub = $script:Subs | Where-Object { $_.Name -eq ('Sub ' + $L) }
+            $R2.Zip.RunSummary | Should -Contain ('    - {0} ({1}): {2}' -f $Sub.Name, $Sub.Id, $Reason)
+            $R2.Zip.MainSummary | Should -Match ([regex]::Escape(('<li>{0} ({1}): {2}</li>' -f $Sub.Name, $Sub.Id, $Reason)))
+        }
+
+        # The command it names: it collects nothing again and carries every report.
+        $R3 = script:Invoke-Wrapper -Resume
+        $R3.ExitCode | Should -Be 0 -Because ($R3.Text -join "`n")
+        $R3.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R3.Text | Should -Contain 'Resume state cleared (clean run).'
+        $R3.State | Should -BeNullOrEmpty
     }
 }

@@ -469,6 +469,33 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         (Get-RunSummaryLogContent) -join "`n" | Should -Not -Match 'Report missing'
     }
 
+    It 'names a missing report that took its subscription to the retry limit apart, with -Fresh, and not as collected by the next run' {
+        $Missing = @([pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a' }, [pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b' })
+        $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
+        $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing -RetryLimited $Limited)
+        $Clear | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
+        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)'
+        $At = [array]::IndexOf($Clear, 'Report missing (detail; not in this zip, the next run collects them):')
+        $Clear[$At + 1] | Should -Be '  - Sub A (sub-a)'
+        $Clear | Should -Not -Contain '  - Sub B (sub-b)'
+        $Limit = [array]::IndexOf($Clear, 'Report missing, retry limit reached (detail; not in this zip; to try them again, start a new run with -Fresh):')
+        $Clear[$Limit + 1] | Should -Be '  - Sub B (sub-b)'
+        $Only = @(Get-RunSummaryLogContent -MissingReportCount 1 -MissingReports @($Missing[1]) -RetryLimited $Limited)
+        ($Only -join "`n") | Should -Not -Match 'the next run collects them'
+    }
+
+    It 'gives a missing report that took its subscription to the retry limit the retry-limit reason in the zip coverage' {
+        $Visible = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; State = 'Enabled' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; State = 'Enabled' })
+        $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
+        $Missing = @([pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a' }, [pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b' })
+        $C = Get-RunReportCoverage -Visible $Visible -RunIds @('sub-a', 'sub-b') -MissingReports $Missing -MissingReportCount 2 -RetryLimited $Limited -FailedAttempts $Limited
+        @($C.WithoutReport | ForEach-Object { '{0}: {1}' -f $_.Id, $_.Reason }) | Should -Be @(
+            'sub-a: report missing (collected, but its report zip was not written or is gone; the next run collects it)'
+            'sub-b: retry limit reached (failed 3 runs in a row; to try it again, start a new run with -Fresh)'
+        )
+        $C.UnnamedMissing | Should -Be 0
+    }
+
     It 'still names a failed subscription given as an object with Name and Id' {
         $Lines = @(Get-RunSummaryLogContent -FailedSubscriptions $script:Failed)
         $Lines | Should -Contain '  - Contoso-Prod-Sub (11111111-1111-1111-1111-111111111111)'

@@ -1858,6 +1858,33 @@ function Get-RunGoOnCommand
     return ('re-run with {0}' -f $With)
 }
 
+# The settings a printed retry or new-run command carries, as command text:
+# ' -Obfuscate -SkipMetrics' for the switches in $Settings that are on, in the
+# order given, or '' when none is. Run-AllSubscriptions.ps1 passes its run
+# settings (Get-RunDataSettings, the names of Get-RunDataSettingNames), so the
+# command runs with the settings a continuing run must keep.
+function Format-RunDataSwitches
+{
+    param([System.Collections.IDictionary]$Settings)
+    if ($null -eq $Settings) { return '' }
+    return (-join @(foreach ($Name in @($Settings.Keys)) { if ($Settings[$Name]) { ' -' + $Name } }))
+}
+
+# The command that collects one subscription again with a direct
+# ResourceInventory.ps1 run: the tenant when known, the subscription, the
+# resource group when the run had one, and the settings of $Settings that
+# ResourceInventory.ps1 takes (it has no -IncludeDisabled). A resource group
+# is quoted, since its name may hold parentheses.
+function Get-DirectRunRetryCommand
+{
+    param([string]$TenantID, [string]$SubscriptionID, [string]$ResourceGroup, [System.Collections.IDictionary]$Settings)
+    $TenantArg = if ([string]::IsNullOrEmpty($TenantID)) { '' } else { ' -TenantID {0}' -f $TenantID }
+    $GroupArg = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " -ResourceGroup '{0}'" -f ($ResourceGroup -replace "'", "''") }
+    $Direct = [ordered]@{}
+    if ($null -ne $Settings) { foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'IncludeDisabled') { $Direct[$Name] = $Settings[$Name] } } }
+    return ('./ResourceInventory.ps1{0} -SubscriptionID {1}{2}{3}' -f $TenantArg, $SubscriptionID, $GroupArg, (Format-RunDataSwitches -Settings $Direct))
+}
+
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
 # every failing subscription with its outcome and the window queried, then the
 # fix. The caller exits with code 1 when $Result.ShouldBlock is $true. A

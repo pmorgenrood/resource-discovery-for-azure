@@ -2455,10 +2455,20 @@ exit 1
         & $AttemptsOf | Should -Be @(2)
 
         # The cause is gone: the same kind of run collects Sub X and clears the state.
+        # -ResumeFailedOnly puts only Sub X into its consolidated zip, so it keeps
+        # the state while Sub A's report is owed, exits 2 and names the -Resume
+        # run that carries it; that run clears the state.
         script:Set-WrapperScenario -Subs $Subs
         $R2 = script:Invoke-WrapperRun -Arguments $Route, '-Obfuscate'
-        $R2.ExitCode | Should -Be 0
         $R2.Text | Should -Contain 'Processing subscription: Sub X (sub-x-not-readable)'
+        if ($Route -eq '-ResumeFailedOnly')
+        {
+            $R2.ExitCode | Should -Be 2
+            $R2.Text | Should -Not -Contain 'Resume state cleared (clean run).'
+            @($R2.Text | Where-Object { $_ -like '  ./Run-AllSubscriptions.ps1 -TenantID * -Resume -Obfuscate' }).Count | Should -Be 1
+            $R2 = script:Invoke-WrapperRun -Arguments '-Resume', '-Obfuscate'
+        }
+        $R2.ExitCode | Should -Be 0
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         Test-Path -LiteralPath $script:CaseState | Should -BeFalse
         @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains('skipped by the up-front role check') -or $_.Name -like '*.resume-state*' } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
