@@ -74,7 +74,7 @@ param (
     # ~2 vCPUs (RAM-capped), never above 6. Passing -ParallelStreams explicitly
     # always overrides auto-tuning; pass 1 to force sequential. Each stream is a
     # separate `pwsh` background process with its own Az PowerShell context
-    # and its own resume-state file (.resume-state-<TenantID>-stream-<N>.json),
+    # and its own resume-state file (.resume-state-<tenant key>-stream-<N>.json),
     # so they cannot race on the shared Az static state or the resume file.
     # The wrapper splits the eligible subscriptions left to process (on -Resume,
     # those no earlier run completed) into N approximately equal chunks at the
@@ -791,7 +791,7 @@ if ($RunRecord.NewRun) { $CompletedIds = @(); $CompletedReports = @() }
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
-# .resume-state-<tenant>-stream-<N>.json and only merges them into the unified
+# .resume-state-<tenant key>-stream-<N>.json and only merges them into the unified
 # file at end-of-run. If that run was killed before the merge (Ctrl+C, SIGKILL,
 # Cloud Shell timeout), the failures live ONLY in the per-stream files while the
 # unified file is stale. Without this, -ResumeFailedOnly reads the unified file,
@@ -1645,7 +1645,7 @@ else
     # Each stream owns:
     #   - Its own slice of the eligible subscription list (round-robin split).
     #   - Its own resume-state file at
-    #     $InventoryRoot/.resume-state-<TenantID>-stream-<N>.json
+    #     $InventoryRoot/.resume-state-<tenant key>-stream-<N>.json
     #     so concurrent state writes cannot race.
     #   - Its own per-stream summary JSON (Stream_<N>_Summary.json) which the
     #     parent aggregates at the end.

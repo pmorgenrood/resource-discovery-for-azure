@@ -6,7 +6,7 @@
 # input. -OutputDirectory can be a folder that already holds other files, such
 # as an earlier reconstruction, an obfuscation dictionary, a plain inventory,
 # the wrapper's own per-subscription folders, or the wrapper's resume state
-# file (.resume-state-<tenant>.json, which lists subscription ids). None of
+# file (.resume-state-<tenant key>.json, which lists subscription ids). None of
 # those may end up in the bundle. On Windows a leading dot does not hide a
 # file, so a wildcard over the folder would pick up the resume state file too.
 #

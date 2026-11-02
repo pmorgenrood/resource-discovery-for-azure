@@ -2870,7 +2870,7 @@ function Get-WrapperExitCode
 # file and the per-stream state files and overwrite each other's progress, so
 # the wrapper holds a lock file for the tenant from before it reads any resume
 # state until it exits:
-#   <InventoryRoot>/.run-lock-<TenantID>.json
+#   <InventoryRoot>/.run-lock-<tenant key>.json
 # It is a dot-file named like the resume state file; no resume-state,
 # per-stream or zip step reads it or packs it. A run creates the lock only when
 # there is none (the file is created only if it is absent, and written to disk

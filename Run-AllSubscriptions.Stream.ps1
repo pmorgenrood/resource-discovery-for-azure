@@ -6,7 +6,7 @@
 # Each instance of this worker:
 #   - Runs as a separate `pwsh` background job (fresh process, fresh AppDomain).
 #   - Owns its own slice of the subscription list.
-#   - Owns its own resume-state file (.resume-state-<TenantID>-stream-<N>.json),
+#   - Owns its own resume-state file (.resume-state-<tenant key>-stream-<N>.json),
 #     so the streams cannot race on a shared file.
 #   - Imports an Az PowerShell context from its own snapshot file written by
 #     the parent wrapper, so authentication is not re-prompted per stream,
