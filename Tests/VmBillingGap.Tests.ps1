@@ -165,6 +165,66 @@ Describe 'VM billing-coverage banner' {
         $Html | Should -Not -Match 'VM billing-coverage check'
     }
 
+    It 'counts a VM whose ResourceId repeats in another letter case once' {
+        $Inv = New-TestInventory -RunningVms 3 -DeallocatedVms 0
+        $Csv = Join-Path $script:WorkDir 'con_case.csv'
+        @(
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-one/providers/Microsoft.Compute/virtualMachines/vm-1' }
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-one/providers/microsoft.compute/virtualmachines/vm-1' }
+        ) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv
+        $Html | Should -Match 'only 1 VMs'
+    }
+
+    It 'counts rows with an empty ResourceId, and a file without the column, as before' {
+        $Inv = New-TestInventory -RunningVms 3 -DeallocatedVms 0
+        $Csv = Join-Path $script:WorkDir 'con_blank.csv'
+        @(
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '' }
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '' }
+            [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = 'vm-a' }
+        ) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv | Should -Match 'only 2 VMs'
+
+        $NoColumn = Join-Path $script:WorkDir 'con_nocol.csv'
+        @('"MeterCategory","Quantity"', '"Virtual Machines","1"') | Set-Content -Path $NoColumn -Encoding utf8
+        Invoke-Summary -Inventory $Inv -ConsumptionFile $NoColumn | Should -Match 'only 0 VMs'
+    }
+
+    # The check runs at the very end of a run, inside the inventory process; a
+    # large subscription's billing file loaded whole as objects took several
+    # times its size on disk (several hundred MB more at 100,000 rows).
+    It 'reads a 100,000-row consumption file without holding it in memory' -Skip:(-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
+        $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
+        $JsonPath = Join-Path $script:WorkDir 'inv_large.json'
+        $Inv | ConvertTo-Json -Depth 8 | Out-File -FilePath $JsonPath -Encoding utf8
+        $Csv = Join-Path $script:WorkDir 'con_large.csv'
+        $Writer = [System.IO.StreamWriter]::new($Csv, $false, [System.Text.UTF8Encoding]::new($false))
+        try
+        {
+            $Writer.WriteLine('"InstanceData","MeterCategory","MeterId","MeterName","MeterRegion","MeterSubCategory","Quantity","Unit","UsageStartTime","UsageEndTime","ResourceId","ResourceLocation","ConsumptionMeter","ReservationId","ReservationOrderId"')
+            for ($i = 0; $i -lt 100000; $i++)
+            {
+                $Rid = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-{0:d2}/providers/Microsoft.Compute/disks/disk-{1:d5}' -f ($i % 50), ($i % 40000)
+                $Instance = '{""Microsoft.Resources"":{""resourceUri"":""' + $Rid + '"",""location"":""eastus"",""additionalInfo"":{""ServiceType"":""Standard_D2s_v5"",""ImageType"":""Canonical"",""UsageType"":""ComputeHR""}}}'
+                $Writer.WriteLine(('"{0}","Storage","00000000-0000-0000-0000-000000000000","P10 LRS Disk","US East","Premium SSD Managed Disks","{1}","1 Hour","9/1/2026 12:00:00 AM","9/2/2026 12:00:00 AM","{2}","eastus","","",""' -f $Instance, ($i % 24), $Rid))
+            }
+        }
+        finally
+        {
+            $Writer.Dispose()
+        }
+        $HtmlPath = Join-Path $script:WorkDir 'rpt_large.html'
+        $Probe = '$MaximumErrorCount = 32768; $P = [System.Diagnostics.Process]::GetCurrentProcess(); [GC]::Collect(); $P.Refresh(); $Before = $P.WorkingSet64; ' +
+        ('& ''{0}'' -JsonFile ''{1}'' -HtmlFile ''{2}'' -ConsumptionFile ''{3}'' | Out-Null; ' -f $script:SummaryScript, $JsonPath, $HtmlPath, $Csv) +
+        '$P.Refresh(); ''GROWTH_MB='' + [math]::Round(($P.PeakWorkingSet64 - $Before) / 1MB)'
+        $Out = @(pwsh -NoProfile -NonInteractive -Command $Probe 2>&1 | ForEach-Object { [string]$_ })
+        $Line = @($Out | Where-Object { $_ -like 'GROWTH_MB=*' }) | Select-Object -First 1
+        $Line | Should -Not -BeNullOrEmpty -Because ($Out -join "`n")
+        [int]($Line -replace '^GROWTH_MB=') | Should -BeLessThan 250
+        Get-Content -Path $HtmlPath -Raw | Should -Match 'only 0 VMs'
+    }
+
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_thresh.csv'
