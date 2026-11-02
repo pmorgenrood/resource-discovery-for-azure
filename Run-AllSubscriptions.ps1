@@ -1906,7 +1906,8 @@ else
                     Write-Host ("WARNING: could not make the Az context snapshots in {0} readable by this user only. Each holds an Azure token cache until its stream has read it." -f $InventoryRoot) -ForegroundColor Yellow
                 }
 
-                $Jobs += Start-Job -ScriptBlock {
+                # Named after its stream: the job's Id is not the stream number.
+                $Jobs += Start-Job -Name ('stream-{0}' -f $S) -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)
                     & $WorkerScript @WorkerArgs
                 } -ArgumentList @($WorkerScript, $WorkerArgs)
@@ -1956,7 +1957,7 @@ else
             {
                 if ($j.State -ne 'Completed')
                 {
-                    Write-Host ("[stream-{0}] job ended in state {1}" -f $j.Id, $j.State) -ForegroundColor Yellow
+                    Write-Host ("[{0}] job ended in state {1}" -f $j.Name, $j.State) -ForegroundColor Yellow
                 }
             }
             # Job cleanup is in the `finally` block below so it runs even if any

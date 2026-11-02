@@ -112,7 +112,7 @@ $Global:ResourceCount = 1
     # commands and Save-AzContext are stand-ins.
     $ParText = script:Set-TestPaths -Text $SeqIf[0].ElseClause.Extent.Text
     $JobShims = "function Save-AzContext { [CmdletBinding()] param([string]`$Path, [switch]`$Force) }`n" +
-    "function Start-Job { [CmdletBinding()] param([scriptblock]`$ScriptBlock, [object[]]`$ArgumentList) `$null = & `$ScriptBlock @ArgumentList; [pscustomobject]@{ State = 'Completed'; Id = 0 } }`n" +
+    "function Start-Job { [CmdletBinding()] param([string]`$Name, [scriptblock]`$ScriptBlock, [object[]]`$ArgumentList) `$null = & `$ScriptBlock @ArgumentList; [pscustomobject]@{ State = 'Completed'; Id = 0; Name = `$Name } }`n" +
     "function Receive-Job { [CmdletBinding()] param([Parameter(ValueFromPipeline = `$true)]`$InputObject) process { } }`n" +
     "function Stop-Job { [CmdletBinding()] param(`$Job) }`n" +
     "function Remove-Job { [CmdletBinding()] param([Parameter(ValueFromPipeline = `$true)]`$InputObject, [switch]`$Force) process { } }`n"
