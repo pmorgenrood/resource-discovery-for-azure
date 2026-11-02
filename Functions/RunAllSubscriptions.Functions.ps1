@@ -4537,7 +4537,14 @@ function Get-RunSummaryLogContent
         {
             $Lines.Add('')
             $Lines.Add('Failed subscriptions (detail):')
-            foreach ($FailedSub in $Failed) { $Lines.Add(('  - {0} ({1})' -f [string]$FailedSub.Name, [string]$FailedSub.Id)) }
+            # Run-AllSubscriptions.ps1 collects each failure as a line of text (the
+            # subscription name, '<name> (stream-N: <reason>)', or 'stream-N (no
+            # summary)'), which has no Name or Id; an object carries both.
+            foreach ($FailedSub in $Failed)
+            {
+                if ($FailedSub -is [string]) { $Lines.Add(('  - {0}' -f $FailedSub)) }
+                else { $Lines.Add(('  - {0} ({1})' -f [string]$FailedSub.Name, [string]$FailedSub.Id)) }
+            }
         }
         if ($Limited.Count -gt 0)
         {

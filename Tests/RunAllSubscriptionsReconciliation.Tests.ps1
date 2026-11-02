@@ -446,6 +446,22 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Text | Should -Match 'no usable token'
     }
 
+    It 'names each failed subscription from the lines of text the wrapper collects' {
+        # Run-AllSubscriptions.ps1 collects each failure as text: the subscription
+        # name, '<name> (stream-N: <reason>)' from a stream, or 'stream-N (no summary)'.
+        $Failed = @('Contoso-Prod-Sub', 'Fabrikam-Dev (stream-1: Script exited with code 1)', 'stream-0 (no summary)')
+        $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -FailedSubscriptions $Failed)
+        $Start = [array]::IndexOf($Lines, 'Failed subscriptions (detail):')
+        $Start | Should -BeGreaterOrEqual 0
+        $Lines[($Start + 1)..($Start + 3)] | Should -Be @('  - Contoso-Prod-Sub', '  - Fabrikam-Dev (stream-1: Script exited with code 1)', '  - stream-0 (no summary)')
+        $Lines | Should -Not -Contain '  -  ()'
+    }
+
+    It 'still names a failed subscription given as an object with Name and Id' {
+        $Lines = @(Get-RunSummaryLogContent -FailedSubscriptions $script:Failed)
+        $Lines | Should -Contain '  - Contoso-Prod-Sub (11111111-1111-1111-1111-111111111111)'
+    }
+
     It 'drops TenantID / SubscriptionID / InventoryRoot from the parameter list' {
         $Params = @{
             TenantID        = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
