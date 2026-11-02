@@ -2478,27 +2478,29 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host "  - Out-of-disk-space write that the inner script swallowed silently." -ForegroundColor Yellow
         Write-Host ""
         # The subscriptions whose report is missing, by name: those whose run wrote
-        # no zip (on the retry list already), and those completed this run whose
-        # recorded zip is gone since. A gone one is taken off the completed list and
-        # put on the retry list the same way, so the next run collects it again
-        # instead of failing to carry its report. The latest record of a subscription
-        # completed this run is the one this run wrote.
-        $LatestReports = Get-LatestCompletedReports -Reports $CompletedReports
+        # no zip (on the retry list already), and those whose zip this run wrote
+        # (its own report records, complete or not) and is gone since. A gone one
+        # completed this run is taken off the completed list and put on the retry
+        # list the same way, so the next run collects it again instead of failing
+        # to carry its report; one left incomplete (metrics or consumption) is on
+        # the retry list already.
+        $LatestReports = Get-LatestCompletedReports -Reports $RunReports
         $GoneRecords = @(foreach ($S in @($SubResourceCounts))
             {
                 $Id = [string]$S.Id
-                if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
+                if (-not $LatestReports.ContainsKey($Id)) { continue }
                 $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
                 if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
                 if (-not (Test-Path -LiteralPath (Join-Path $InventoryRoot ([string]$ZipProp.Value)) -PathType Leaf)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
             })
-        foreach ($Gone in $GoneRecords)
+        $GoneCompleted = @($GoneRecords | Where-Object { $CompletedIds -contains [string]$_.Id })
+        foreach ($Gone in $GoneCompleted)
         {
             $CompletedIds = @($CompletedIds | Where-Object { $_ -ne [string]$Gone.Id })
             $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne [string]$Gone.Id })
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$Gone.Id) -Name ([string]$Gone.Name) -Reason 'its report zip was written and was gone before the consolidated zip was built'
         }
-        if ($GoneRecords.Count -gt 0)
+        if ($GoneCompleted.Count -gt 0)
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         }

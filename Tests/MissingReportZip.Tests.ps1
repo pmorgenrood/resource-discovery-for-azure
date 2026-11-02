@@ -14,7 +14,8 @@
 # started as its own pwsh process with -File (stdin closed) from a copy of the
 # tool whose ResourceInventory.ps1 is a stand-in that writes one report folder
 # and zip per call, writes the folder but no zip for a subscription the scenario
-# names, and can remove another subscription's zip. Azure is a set of stand-in
+# names, can record a subscription's metrics as incomplete, and can remove
+# another subscription's zip. Azure is a set of stand-in
 # Az modules first on the module path. The process's home is a scratch folder,
 # so the run writes its inventory root under it. On Windows the wrapper writes
 # to C:\InventoryReports instead, so these tests do not run there. Placeholder
@@ -50,6 +51,12 @@ Set-Content -LiteralPath (Join-Path $Folder ('Inventory_ResourcesReport_{0}.json
 Set-Content -LiteralPath (Join-Path $Folder ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
+# Metrics left incomplete, recorded the way Extension/Metrics.ps1 records them.
+if (@($Scenario.Incomplete) -contains $SubscriptionID)
+{
+    if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
+    $Global:MetricsFailedSubs += [pscustomobject]@{ Name = [string](@($Scenario.Subscriptions | Where-Object { $_.Id -eq $SubscriptionID })[0].Name); Id = $SubscriptionID; Message = 'stand-in: a grouped Azure Monitor request still failed after its retries.'; ReportFolder = $Folder; Complete = $false }
+}
 # A zip written earlier in this run, removed now (as by an antivirus quarantine).
 if ([string]$Scenario.GoneBy -eq $SubscriptionID)
 {
@@ -140,8 +147,8 @@ function Invoke-AzRestMethod
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [string[]]$NoRole = @())
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; NoRole = @($NoRole) } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [string[]]$NoRole = @(), [string[]]$Incomplete = @())
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; NoRole = @($NoRole); Incomplete = @($Incomplete) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -257,6 +264,34 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.ExitCode | Should -Be 0 -Because ($R2.Text -join "`n")
         $R2.Text | Should -Contain 'Resume: carrying 2 report(s) of subscription(s) completed by an earlier run into the consolidated zip.'
         $R2.NewZips | Should -Be 1
+        $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R2.Text | Should -Contain 'Resume state cleared (clean run).'
+        $R2.State | Should -BeNullOrEmpty
+    }
+
+    It 'a written zip gone before the consolidated zip, of a subscription whose metrics were left incomplete: it is named, its retry-list entry stays as it was, and the next run completes it' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        script:Set-Scenario -Incomplete @($B.Id) -GoneSub $B.Id -GoneBy $C.Id
+
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+        $R1.Zip.Ids | Should -Be (script:Get-Ids 'A', 'C')
+        script:Get-Banner $R1 | Should -Be @(
+            '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
+            ('  - {0} ({1})' -f $B.Name, $B.Id)
+            'The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip.'
+        )
+        @($R1.State.CompletedSubscriptionIds | Sort-Object) | Should -Be (script:Get-Ids 'A', 'C')
+        $Entries = @($R1.State.FailedAttempts)
+        @($Entries | ForEach-Object { [string]$_.Id }) | Should -Be @($B.Id)
+        $Entries[0].Reason | Should -Be 'Metrics incomplete: stand-in: a grouped Azure Monitor request still failed after its retries.'
+        $Entries[0].Attempts | Should -Be 1
+
+        script:Set-Scenario
+        $R2 = script:Invoke-Wrapper
+        $R2.ExitCode | Should -Be 0 -Because ($R2.Text -join "`n")
         $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
