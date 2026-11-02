@@ -138,7 +138,23 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         (Get-Card $Html 'Empty (0 resources)') | Should -Be '1'
         (Get-Card $Html 'Failed') | Should -Be '2'
         $Html | Should -Match 'failed to process'
-        $Html | Should -Match 'returned 0 resources'
+        $Html | Should -Match '1 subscription\(s\) have 0 resources in their report'
+    }
+
+    It 'says what a report with 0 resources means, without naming read access as a cause' {
+        # Every subscription a run collects passed the up-front role check, and a
+        # report lists only the types a collector covers, so a subscription with
+        # only virtual networks has 0 resources in its report.
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{ VirtualMachines = 3 } -SubName 'Sub A' | Out-Null
+        New-SubFolder -Root $Run -Services @{} -SubName 'Network Only Sub' | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'hold no resources of the types this tool reports'
+        $Html | Should -Not -Match 'Reader'
+        $Html | Should -Not -Match 'permission'
     }
 
     It 'detects obfuscated posture from prod_/nonprod_ tokens' {
