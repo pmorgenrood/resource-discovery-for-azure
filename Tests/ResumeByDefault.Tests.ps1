@@ -1287,13 +1287,14 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
     BeforeEach { script:New-Case }
     AfterEach { script:Write-FailedCaseRuns }
 
-    It 'a role check that could not finish: runs 1 to 3 keep the state and end with exit 0, then each continued run skips it with exit 2 and names -Fresh' {
+    It 'a role check that could not finish: runs 1 to 3 keep the state, runs 1 and 2 end with exit 0 and run 3, which reaches the retry limit, with exit 2, then each continued run skips it with exit 2 and names -Fresh' {
         script:Set-Scenario -Subs 'A', 'B' -RoleUnknown 'B'
         $Started = $null
         foreach ($N in 1, 2, 3)
         {
             $R = script:Invoke-Wrapper -Streams 1
-            $R.ExitCode | Should -Be 0 -Because 'skipping a subscription the role check could not finish does not change the exit code'
+            if ($N -lt 3) { $R.ExitCode | Should -Be 0 -Because 'skipping a subscription the role check could not finish does not change the exit code' }
+            else { $R.ExitCode | Should -Be 2 -Because 'the run in which its role check fails a third time reaches the retry limit' }
             if ($N -eq 1) { script:Get-Collected $R | Should -Be (script:Get-Ids 'A'); $Started = script:Get-StateStartText }
             else
             {
@@ -1725,7 +1726,9 @@ Describe 'One run record in every write, and advice that runs as stated' -Skip:$
         $OldId = [string](script:Read-StateFile).RunId
         script:Set-StateKeys @{ RunStartedAt = [datetime]::UtcNow.AddDays(-8).ToString('o', [cultureinfo]::InvariantCulture) }
         $R3 = script:Invoke-Wrapper -Streams 1
-        $R3.ExitCode | Should -Be 0
+        # Its role check could not finish a third run in a row: the retry limit
+        # is reached in this run, which ends with exit 2.
+        $R3.ExitCode | Should -Be 2
         @(script:Get-StartLines $R3)[0] | Should -BeLike 'The unfinished run started *, more than 7 days ago; starting a new run.*'
         [string](script:Read-StateFile).RunId | Should -Not -Be $OldId
         @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @(3)
