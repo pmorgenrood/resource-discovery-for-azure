@@ -543,6 +543,31 @@ Describe 'A run stopped by Ctrl+C before every subscription was processed' -Skip
         $Result.ExitCode | Should -Be 0
     }
 
+    It 'inside a PowerShell session: after the interrupted run, a clean -Fresh run with 2 streams reads $LASTEXITCODE 0' {
+        # -Fresh collects both subscriptions through the streams, so no
+        # inventory runs in the session and only the wrapper's own exit sets
+        # the code the interrupt left at 130.
+        $Run = script:Start-Run -Hold 'sub-b' -Session -Command @($script:Pwsh, '-NoLogo', '-NoProfile', '-Command', '-')
+        $Line = "& '{0}' -TenantID '{1}' -ParallelStreams 2 -SkipMetrics -SkipConsumption" -f ($script:Wrapper -replace "'", "''"), $script:Tenant
+        foreach ($Typed in @($Line, '"after1: $LASTEXITCODE"', '$env:RDA_STANDIN_HOLD = ""', ($Line + ' -Fresh'), '"after2: $LASTEXITCODE"', '"session still open"', 'exit 0'))
+        {
+            $Run.Process.StandardInput.WriteLine($Typed)
+        }
+        $Run.Process.StandardInput.Flush()
+        script:Wait-Held -Started $Run
+        & kill -s INT $Run.Process.Id
+        $Ended = $Run.Process.WaitForExit(300000)
+        $Run.Process.StandardInput.Close()
+        $Result = script:Wait-Run -Started $Run -TimeoutSeconds 30
+        $After = @($Result.Text | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^after\d: ' })
+        Write-Host ('RESULT in-session -Fresh, 2 streams: {0}; collected {1}; process exit {2}' -f ($After -join ', '), ((script:Get-Called -Prefix 'collected') -join ','), $Result.ExitCode)
+        $Ended | Should -BeTrue
+        $After | Should -Be @('after1: 130', 'after2: 0') -Because ('Output: {0}' -f ($Result.Text -join ' | '))
+        script:Get-Called -Prefix 'collected' | Should -Be @('sub-a', 'sub-a', 'sub-b') -Because 'the -Fresh run collects both'
+        @($Result.Text | Where-Object { $_.Trim() -eq 'session still open' }).Count | Should -Be 1
+        $Result.ExitCode | Should -Be 0
+    }
+
     It 'pwsh -Command: exits 1, PowerShell''s own code for a stopped command, not 0, with the line, <Label>' -TestCases @(
         @{ Label = 'sequential (-ParallelStreams 1)'; Streams = 1 },
         @{ Label = 'with 2 streams'; Streams = 2 }
