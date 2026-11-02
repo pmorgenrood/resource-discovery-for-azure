@@ -4335,6 +4335,116 @@ function Get-AzContextAutosaveCheck
     return [pscustomobject]@{ Disabled = $false; Detail = ('Get-AzContextAutosaveSetting reports Mode={0}, ContextFile={1}, CacheFile={2}' -f $Setting.Mode, $Setting.ContextFile, $Setting.CacheFile) }
 }
 
+# The subscriptions visible to the tenant that have no report in this run's
+# consolidated zip, each with the reason the run recorded, and the numbers the
+# main summary and RunSummary.log give: the subscriptions in the run (those
+# visible and not left out as not enabled), those visible to the tenant, and
+# the reports in the zip. The first reason that applies is used, in this
+# order: report missing, skipped by the up-front role check, retry limit
+# reached, earlier report not carried, not enabled or excluded, collection
+# failed (on the retry list after this run), not collected. Kind is a fixed
+# word for each reason; Reason is the text, which for a failed collection
+# ends with the reason the retry list records (raw error text, so a summary of
+# an obfuscated run shows Kind counts only).
+function Get-RunReportCoverage
+{
+    param(
+        # Get-AzSubscription answers ({ Id; Name; State }).
+        $Visible = @(),
+        # Ids of the subscriptions the run covers.
+        $RunIds = @(),
+        # Ids of the subscriptions whose report is in the consolidated zip.
+        $InZipIds = @(),
+        [int]$ReportsInZip = 0,
+        # { Name; Id } of the subscriptions completed this run whose report zip
+        # is missing, and how many there are (some may not be nameable).
+        $MissingReports = @(),
+        [int]$MissingReportCount = 0,
+        $NotReadableIds = @(),
+        # Retry-list entries past the retry limit (Get-RetryLimitedAttempts).
+        $RetryLimited = @(),
+        # { Id; Name; Reason } of the subscriptions a run that continued the
+        # unfinished run skipped as completed but could not carry.
+        $Uncarried = @(),
+        # The retry list after this run ({ Id; Name; Attempts; Reason }).
+        $FailedAttempts = @()
+    )
+    $Ids = { param($Items) @(@($Items) | Where-Object { $null -ne $_ } | ForEach-Object { if ($_ -is [string]) { $_ } else { [string]$_.Id } } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) }
+    $VisibleSubs = @(@($Visible) | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
+    $Run = @(& $Ids $RunIds)
+    $InZip = @(& $Ids $InZipIds)
+    $Missing = @(& $Ids $MissingReports)
+    $NotReadable = @(& $Ids $NotReadableIds)
+    $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
+    $LimitedIds = @(& $Ids $Limited)
+    $UncarriedIds = @(& $Ids $Uncarried)
+    $Retry = @(@($FailedAttempts) | Where-Object { $null -ne $_ })
+    $RetryIds = @(& $Ids $Retry)
+    $Without = @(foreach ($Sub in $VisibleSubs)
+        {
+            $Id = [string]$Sub.Id
+            if ($InZip -contains $Id) { continue }
+            $Kind, $Reason = if ($Missing -contains $Id) { 'report missing', 'report missing (collected, but its report zip was not written or is gone; the next run collects it)' }
+            elseif ($NotReadable -contains $Id) { 'skipped by the role check', 'skipped by the up-front role check (not readable)' }
+            elseif ($LimitedIds -contains $Id)
+            {
+                $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]
+                'retry limit reached', ('retry limit reached (failed {0} runs in a row; to try it again, start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry))
+            }
+            elseif ($UncarriedIds -contains $Id) { 'earlier report not carried', 'earlier report not carried (completed by an earlier run, but its report could not be carried into this zip)' }
+            elseif ($Run -notcontains $Id) { 'not enabled or excluded', ('not enabled or excluded (state: {0})' -f [string]$Sub.State) }
+            elseif ($RetryIds -contains $Id)
+            {
+                $Entry = @($Retry | Where-Object { [string]$_.Id -eq $Id })[0]
+                'collection failed', ('collection failed: {0}' -f [string]$Entry.Reason)
+            }
+            else { 'not collected', 'not collected by this run (for example an interrupted run; the next run collects it)' }
+            [pscustomobject]@{ Name = [string]$Sub.Name; Id = $Id; Kind = $Kind; Reason = $Reason }
+        })
+    # A subscription completed this run whose report is missing but which could
+    # not be named still counts.
+    $Unnamed = [math]::Max(0, $MissingReportCount - @($Without | Where-Object { $_.Kind -eq 'report missing' }).Count)
+    return [pscustomobject]@{
+        InRun          = @($VisibleSubs | Where-Object { $Run -contains [string]$_.Id }).Count
+        Visible        = $VisibleSubs.Count
+        ReportsInZip   = $ReportsInZip
+        WithoutReport  = $Without
+        UnnamedMissing = [int]$Unnamed
+    }
+}
+
+# The lines MainSummary.html and RunSummary.log give for Get-RunReportCoverage:
+# the two numbers, then each subscription without a report in this zip with its
+# reason. Under -Obfuscated, the number of subscriptions for each kind of
+# reason only, as the summaries give counts only there.
+function Get-RunReportCoverageLines
+{
+    param($Coverage, [switch]$Obfuscated)
+    if ($null -eq $Coverage) { return @() }
+    $Without = @(@($Coverage.WithoutReport) | Where-Object { $null -ne $_ })
+    $Lines = [System.Collections.Generic.List[string]]::new()
+    $Lines.Add(('{0} subscription(s) in this run ({1} visible to the tenant), {2} report(s) in this zip.' -f [int]$Coverage.InRun, [int]$Coverage.Visible, [int]$Coverage.ReportsInZip))
+    $Unnamed = [int]$Coverage.UnnamedMissing
+    if ($Without.Count + $Unnamed -eq 0) { return $Lines.ToArray() }
+    $Lines.Add(('{0} subscription(s) without a report in this zip:' -f ($Without.Count + $Unnamed)))
+    if ($Obfuscated)
+    {
+        foreach ($Group in @($Without | Group-Object -Property Kind | Sort-Object -Property Name)) { $Lines.Add(('  - {0} {1}' -f $Group.Count, $Group.Name)) }
+    }
+    else
+    {
+        # A subscription the role check found not readable is named without its
+        # id: no zip a run leaves holds the id of a not-readable subscription.
+        foreach ($Sub in @($Without | Sort-Object -Property Name, Id))
+        {
+            if ($Sub.Kind -eq 'skipped by the role check') { $Lines.Add(('  - {0}: {1}' -f $Sub.Name, $Sub.Reason)) }
+            else { $Lines.Add(('  - {0} ({1}): {2}' -f $Sub.Name, $Sub.Id, $Sub.Reason)) }
+        }
+    }
+    if ($Unnamed -gt 0) { $Lines.Add(('  - {0} report missing that could not be named (see Per-subscription output verification on the console)' -f $Unnamed)) }
+    return $Lines.ToArray()
+}
+
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation
 # timestamp (no file I/O, no Azure calls) so it is unit-testable offline: the
@@ -4380,6 +4490,9 @@ function Get-RunSummaryLogContent
         # nameable) and the ones named ({ Name; Id }).
         [int]$MissingReportCount = 0,
         $MissingReports = @(),
+        # Get-RunReportCoverageLines: the subscriptions in the run, the reports in
+        # this zip, and each subscription without one with its reason.
+        [string[]]$CoverageLines = @(),
         [int]$ConsumptionRecordCount = 0,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
@@ -4529,6 +4642,13 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
+    $Coverage = @(@($CoverageLines) | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    if ($Coverage.Count -gt 0)
+    {
+        $Lines.Add('')
+        $Lines.Add('Reports in this zip:')
+        foreach ($CoverageLine in $Coverage) { $Lines.Add(('  {0}' -f $CoverageLine)) }
+    }
 
     # --- Health --------------------------------------------------------------
     $Lines.Add('')

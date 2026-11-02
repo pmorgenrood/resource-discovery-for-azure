@@ -2523,6 +2523,24 @@ else
 # the per-sub reports and the consolidated zip are already written, so any
 # error is downgraded to a warning and $MainSummaryFile is left $null.
 $MainSummaryFile = $null
+# What the consolidated zip holds against the run: the report folders whose
+# zip went into it, and each subscription visible to the tenant without a
+# report in it, with the reason the run recorded (MainSummary.html, its HTML
+# copies and RunSummary.log are built from these).
+$ZipReportFolders = @()
+$CoverageLines = @()
+if ($null -ne $OuterZipFile)
+{
+    $ZipReportFolders = @($SubZips | ForEach-Object { $_.Directory.Name } | Sort-Object -Unique)
+    $MissingIds = @($MissingReports | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $InZipIds = @(@($SubResourceCounts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Where-Object { $MissingIds -notcontains $_ }) + @($CarriedReports | ForEach-Object { [string]$_.Id }))
+    $ExcludedIds = @($Excluded | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $RoleSkippedIds = @(@($NotReadableIds) + @(if ($null -ne $AccessDecision) { $AccessDecision.InaccessibleIds }) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $ReportCoverage = Get-RunReportCoverage -Visible $AllSubscriptions -RunIds @($AllSubscriptions | Where-Object { $ExcludedIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id }) `
+        -InZipIds $InZipIds -ReportsInZip $SubZips.Count -MissingReports $MissingReports -MissingReportCount $MissingReportCount `
+        -NotReadableIds $RoleSkippedIds -RetryLimited @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts) -Uncarried $UncarriedSkipped -FailedAttempts $FailedAttempts
+    $CoverageLines = @(Get-RunReportCoverageLines -Coverage $ReportCoverage -Obfuscated:$Obfuscate)
+}
 if ($null -ne $OuterZipFile)
 {
     try
@@ -2551,6 +2569,7 @@ if ($null -ne $OuterZipFile)
         }
         catch { Write-Verbose ("MainSummary: could not read Version.json: {0}" -f $_.Exception.Message) }
         New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime -IncludeFolders $CarriedFolderNames `
+            -ReportFolders $ZipReportFolders -CoverageLines $CoverageLines `
             -FailedSubscriptions $FailedSubscriptions `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
@@ -2887,6 +2906,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -RetryLimited $RetryLimited `
             -MissingReportCount $MissingReportCount -MissingReports $MissingReports `
+            -CoverageLines $CoverageLines `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
@@ -2918,9 +2938,11 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
         #    summary links. HTML only - no *.json/csv - so nothing is
         #    double-ingested and the folder name signals "report HTML, not
         #    data". Scoped to THIS run by timestamp, plus the report folders
-        #    carried from an earlier run on -Resume; a de-obfuscated
+        #    carried from an earlier run on -Resume, and only the folders whose
+        #    report zip is in the consolidated zip; a de-obfuscated
         #    *_revealed* report is never copied across.
-        foreach ($SubDir in @(Get-ChildItem -Path $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime -or $CarriedFolderNames -contains $_.Name }))
+        $InZipFolders = @($SubZips | ForEach-Object { $_.Directory.Name })
+        foreach ($SubDir in @(Get-ChildItem -Path $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { ($_.LastWriteTime -ge $RunStartTime -or $CarriedFolderNames -contains $_.Name) -and $InZipFolders -contains $_.Name }))
         {
             $SubHtml = Get-ChildItem -Path $SubDir.FullName -Filter '*.html' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*_revealed*' } | Select-Object -First 1
             if ($null -eq $SubHtml) { continue }
