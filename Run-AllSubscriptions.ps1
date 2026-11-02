@@ -3208,7 +3208,7 @@ if ($null -ne $BundleBuildError)
     # the reports into a new zip; without a state file it would collect them.
     if ($ResumeStateFile -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
     {
-        Write-Host "Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again." -ForegroundColor Red
+        Write-Host "Fix the cause (for example, free up disk space), then run the same command again (without -Fresh), or with -Resume: it puts these reports into a new consolidated zip without collecting them again." -ForegroundColor Red
     }
     else
     {

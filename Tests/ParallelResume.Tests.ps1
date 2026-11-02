@@ -1175,7 +1175,7 @@ Describe 'A consolidated zip lost while the run summary is added to it keeps the
         @(Get-ChildItem -LiteralPath $script:Root -File -Filter 'AllSubscriptions_*.zip') | Should -BeNullOrEmpty
         (script:Read-State).Completed | Should -Be (script:Get-Ids 'A', 'B', 'C')
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
-        $R1.Text | Should -Contain 'Fix the cause (for example, free up disk space), then run again with -Resume: it puts these reports into a new consolidated zip without collecting them again.'
+        $R1.Text | Should -Contain 'Fix the cause (for example, free up disk space), then run the same command again (without -Fresh), or with -Resume: it puts these reports into a new consolidated zip without collecting them again.'
 
         script:Set-Scenario -Subs 'A', 'B', 'C'
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams -Environment $script:LoseZipEnv

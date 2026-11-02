@@ -119,7 +119,7 @@ function Exit-WrapperInterrupted
 {
     param([string]$InventoryRoot, [bool]$OwnsProcessExit)
     if (Get-Variable -Name 'WrapperExiting' -Scope Script -ValueOnly -ErrorAction SilentlyContinue) { return }
-    Write-Host ("Interrupted (Ctrl+C) before all subscriptions were processed. The resume state is kept in {0}; to continue, run the same command again with -Resume." -f $InventoryRoot) -ForegroundColor Yellow
+    Write-Host ("Interrupted (Ctrl+C) before all subscriptions were processed. The resume state is kept in {0}; to continue, run the same command again (without -Fresh), or with -Resume." -f $InventoryRoot) -ForegroundColor Yellow
     # Only marks the code: the process ends once the script has returned, so
     # Exit-Wrapper's clean-up still runs.
     if ($OwnsProcessExit) { $Host.SetShouldExit(130) }
