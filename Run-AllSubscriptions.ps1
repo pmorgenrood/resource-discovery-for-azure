@@ -2542,6 +2542,7 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $OuterZipFile = Join-Path $InventoryRoot "AllSubscriptions_ResourcesReport_$Timestamp.zip"
         $Reserved = $null
+        $PartialZip = $null
         try
         {
             # Today's name, or the next free one (-2, -3, ...): never another
@@ -2549,7 +2550,14 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             $OuterZipFile = New-RunOutputFile -Directory $InventoryRoot -Stem "AllSubscriptions_ResourcesReport_$Timestamp" -Extension '.zip'
             $Reserved = $OuterZipFile
             Write-Host ("Compressing {0} per-subscription report(s) into: {1}" -f $SubZips.Count, $OuterZipFile) -ForegroundColor Cyan
-            Compress-Archive -Path $SubZips.FullName -DestinationPath $OuterZipFile -Force -ErrorAction Stop
+            # Built under a name of its own in the same folder, then moved over
+            # the reserved name, so the reserved name is never free: -Force
+            # would delete it before writing. Like the temporary name of
+            # Compress-RdaReportArchive, it matches none of the patterns the
+            # inventory folder is listed with.
+            $PartialZip = Join-Path $InventoryRoot ('.rda-{0}.partial' -f [guid]::NewGuid().ToString('N'))
+            Compress-Archive -Path $SubZips.FullName -DestinationPath $PartialZip -ErrorAction Stop
+            [System.IO.File]::Move($PartialZip, $OuterZipFile, $true)
             $ZipProblem = Get-ConsolidatedZipProblem -Path $OuterZipFile -SubZipNames $SubZips.Name
             if ($ZipProblem)
             {
@@ -2567,6 +2575,11 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             # The main summary, the fold and the final check below all key on
             # $OuterZipFile, so none of them may point at the missing zip.
             $OuterZipFile = $null
+        }
+        finally
+        {
+            # Moved into place on success; whatever a failure left of it goes.
+            if ($null -ne $PartialZip -and (Test-Path -LiteralPath $PartialZip)) { Remove-Item -LiteralPath $PartialZip -Force -ErrorAction SilentlyContinue }
         }
     }
     else
