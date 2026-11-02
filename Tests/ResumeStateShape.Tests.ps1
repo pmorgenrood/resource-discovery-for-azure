@@ -245,6 +245,16 @@ function Get-UsageAggregates
     }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $script:Subs[$_].Id } | Sort-Object) }
     function script:Test-CleanLine { param($Run) @($Run.Text | Where-Object { $_ -eq 'Resume state cleared (clean run).' }).Count -eq 1 }
+    # A run that skipped Sub A as completed but found no earlier report of it to
+    # carry, and nothing else missing: Sub A alone under FAILED (earlier report
+    # not carried).
+    function script:Test-UncarriedOnlyA
+    {
+        param($Run)
+        @($Run.Text | Where-Object { $_ -like '*= FAILED (earlier report not carried) =*' }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like '  - Sub A (sub-a): *' }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like '*FAILED (report missing)*' -or $_ -like '*FAILED (consolidated zip)*' }) | Should -BeNullOrEmpty
+    }
     function script:Get-ShapeWarnings { param($Run) @($Run.Text | Where-Object { $_ -like 'WARNING: The * is not the right shape (*' }) }
 
     # The state files in the inventory root: the live ones, and the ones moved
@@ -1090,13 +1100,25 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         $Raw.CompletedSubscriptionIds = @($null, $script:Subs['A'].Id)
         $Raw | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly'
-        $R1.ExitCode | Should -Be 0
+        # Its consolidated zip holds Sub B only; Sub A's report, completed earlier
+        # in the run, is owed, so it keeps the state and exits 2.
+        $R1.ExitCode | Should -Be 2
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
         script:Get-MovedAside | Should -BeNullOrEmpty
         $R1.Text | Should -Contain 'ResumeFailedOnly: filtered to 1 previously-failed subscription(s) (was 2).'
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B')
-        script:Test-CleanLine $R1 | Should -BeTrue
-        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        script:Test-CleanLine $R1 | Should -BeFalse
+        @($R1.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip*' }).Count | Should -Be 1
+        # The -Resume it names collects nothing and uses the state as it is. This
+        # hand-written state records no report for Sub A, so that run cannot
+        # carry it and ends with exit 2 under FAILED (earlier report not
+        # carried), as for any state without report records.
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.ExitCode | Should -Be 2
+        @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
+        script:Get-MovedAside | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -BeNullOrEmpty
+        script:Test-UncarriedOnlyA $R2
     }
 }
 
@@ -1155,13 +1177,26 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         # Not the wrong shape and no new stop. Whether the empty file itself is
         # kept or moved aside as unreadable belongs to the handling of
         # per-stream files that cannot be read, so it is not checked here.
+        # Its consolidated zip holds Sub B only; Sub A's report, completed
+        # earlier in the run, is owed, so it keeps the state and exits 2.
         $R1.ExitCode | Should -Not -Be 1
-        $R1.ExitCode | Should -Be 0
+        $R1.ExitCode | Should -Be 2
         $R1.Error | Should -BeNullOrEmpty
         @(script:Get-ShapeWarnings $R1) | Should -BeNullOrEmpty
         @($R1.Text | Where-Object { $_ -like 'ResumeFailedOnly: stopped*' }) | Should -BeNullOrEmpty
         $R1.Text | Should -Contain 'ResumeFailedOnly: filtered to 1 previously-failed subscription(s) (was 2).'
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B')
+        @($R1.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip*' }).Count | Should -Be 1
+        # The -Resume it names collects nothing and reads the files the same
+        # way. This hand-written state records no report for Sub A, so that run
+        # cannot carry it and ends with exit 2 under FAILED (earlier report not
+        # carried), as for any state without report records.
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R2.ExitCode | Should -Be 2
+        $R2.Error | Should -BeNullOrEmpty
+        @(script:Get-ShapeWarnings $R2) | Should -BeNullOrEmpty
+        script:Get-Collected $R2 | Should -BeNullOrEmpty
+        script:Test-UncarriedOnlyA $R2
     }
 
     It 'a wrong-shaped per-stream file that cannot be moved aside stops <Switch> with exit 1 before any work, the same on the next run; after the printed command the run ends clean' -ForEach @(
