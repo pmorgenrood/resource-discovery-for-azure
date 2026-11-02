@@ -613,13 +613,13 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 | `0` | Clean run — no failures of any kind. |
 | `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). This includes the consumption data check stopping the run because a subscription returned no usage values (see [Consumption data check](#consumption-data-check-up-front)). |
 | `2` | Per-subscription output verification gap (a subscription reported success but its output zip is missing). |
-| `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner. |
+| `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner — or the consumption (billing) download of one or more subscriptions failed or stopped part-way for another reason — see the "FAILED (consumption)" banner, which names each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. |
 | `4` | Completed, but one or more `Services/*/*.ps1` collectors failed for one or more subscriptions — see the "FAILED (collectors)" banner and "Collector Failures" summary. Affected resource types are missing (not empty) from those subscriptions' reports. |
 | `5` | Both `3` and `4` occurred in the same run. |
 
 Codes `3`–`5` still mean the report was produced — they flag that it is **incomplete** in a specific, diagnosable way, rather than silently looking like a clean/empty result.
 
-A direct run of `ResourceInventory.ps1` also ends with exit code `1` when the consumption data check stops it.
+A direct run of `ResourceInventory.ps1` also ends with exit code `1` when the consumption data check stops it, and with exit code `3` when it wrote its report and zip but the consumption (billing) download of one or more subscriptions failed or stopped part-way; it then ends with the "FAILED (consumption)" lines, which name each one and the `ResourceInventory.ps1 -SubscriptionID` command that collects it again. Under `-RunAllSubs`, which is how `Run-AllSubscriptions.ps1` calls it, the script does not exit `3`; the wrapper's codes above apply.
 
 ### Important Notes
 
