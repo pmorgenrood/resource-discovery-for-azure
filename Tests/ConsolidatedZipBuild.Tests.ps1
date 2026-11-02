@@ -122,7 +122,8 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
     It 'a consolidated zip of another run with the same second''s name is never written over: this run takes the next free name' {
         $Root = Join-Path $TestDrive 'same-second'
         $null = New-SubReport -Root $Root -Stamp 'X1'
-        Mock Get-Date { [datetime]'2026-11-02T15:04:05' } -ParameterFilter { $Format -eq 'yyyy-MM-dd_HH-mm-ss' }
+        # What Get-Date -Format returns: the formatted text.
+        Mock Get-Date { '2026-11-02_15-04-05' } -ParameterFilter { $Format -eq 'yyyy-MM-dd_HH-mm-ss' }
         $Other = Join-Path $Root 'AllSubscriptions_ResourcesReport_2026-11-02_15-04-05.zip'
         Set-Content -LiteralPath $Other -Value 'another run' -NoNewline
         $R = Invoke-BundleBlock -Root $Root
