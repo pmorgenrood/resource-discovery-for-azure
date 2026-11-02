@@ -1683,20 +1683,22 @@ function ExecuteInventoryProcessing()
             return
         }
 
+        # A -SubscriptionID run passes over every other subscription in the list:
+        # one line in the local debug log, never one console line for each.
+        if (![string]::IsNullOrEmpty($SubscriptionID))
+        {
+            $PassedOverCount = @($Global:Subscriptions | Where-Object { $_.Id -ne $SubscriptionID }).Count
+            if ($PassedOverCount -gt 0)
+            {
+                Write-Log -Message ("Consumption: {0} other subscription(s) in this run's subscription list not collected; the run is limited to -SubscriptionID." -f $PassedOverCount) -Severity 'Info' -NoConsole -ToDebugLog
+            }
+        }
+
         foreach ($sub in $Global:Subscriptions)
         {
-            if (![string]::IsNullOrEmpty($SubscriptionID))
+            if (![string]::IsNullOrEmpty($SubscriptionID) -and $SubscriptionID -ne $sub.Id)
             {
-                if (![string]::IsNullOrEmpty($ResourceGroup))
-                {
-                    Write-Log -Message ("Cannot filter consumption by resource group." -f $sub.Name) -Severity 'Info'
-                }
-
-                if ($SubscriptionID -ne $sub.Id)
-                {
-                    Write-Log -Message ("Skipping: {0}" -f $sub.Name) -Severity 'Info'
-                    continue
-                }
+                continue
             }
 
             $ContextOk = $false
