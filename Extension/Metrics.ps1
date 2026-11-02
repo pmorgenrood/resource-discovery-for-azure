@@ -526,9 +526,10 @@ if ($Task -eq 'Processing')
     # lock (Monitor) on the array itself.
     $MetricRequestCounts = [long[]]::new(2)
 
-    # The resource id of every grouped request that still failed after its retries
-    # for a reason other than BadRequest (throttling, timeout, server error). Their
-    # subscriptions are recorded as metrics incomplete at the end of the phase.
+    # The resource id of every request, grouped or for one metric, that still failed
+    # after its retries for a reason other than BadRequest (throttling, timeout,
+    # server error). Their subscriptions are recorded as metrics incomplete at the
+    # end of the phase.
     $MetricFailedGroupIds = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
     # $MetricCount is the number of definitions to send, as it was when the batch
@@ -629,7 +630,8 @@ if ($Task -eq 'Processing')
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
-                # failure is recorded for each definition. With -StopOnBadRequest a
+                # failure is recorded for each definition. BadRequest is true when the
+                # last attempt failed with BadRequest. With -StopOnBadRequest a
                 # BadRequest answer ends the request at once: the same name set is
                 # rejected the same way on every retry.
                 function Invoke-MetricRequest
@@ -699,7 +701,7 @@ if ($Task -eq 'Processing')
                                     {
                                         $Throttled = $true
                                     }
-                                    elseif ($StopOnBadRequest)
+                                    else
                                     {
                                         $BadRequest = Test-MetricBadRequest -Exception $_.Exception
                                     }
@@ -725,10 +727,9 @@ if ($Task -eq 'Processing')
                                 break
                             }
 
-                            if ($BadRequest)
+                            if ($BadRequest -and $StopOnBadRequest)
                             {
                                 $CallOutcome = 'Error'
-                                $Request.BadRequest = $true
                                 break
                             }
 
@@ -750,6 +751,7 @@ if ($Task -eq 'Processing')
 
                         if (-not $Succeeded)
                         {
+                            $Request.BadRequest = $BadRequest
                             throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
                         }
 
@@ -909,6 +911,10 @@ if ($Task -eq 'Processing')
                 if ($GroupDefs.Count -eq 1)
                 {
                     $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $GroupDefs[0].MetricName -Kind 'Request'
+                    if (-not $Request.Succeeded -and -not $Request.BadRequest)
+                    {
+                        $FailedGroupIds.Add([string]$GroupDefs[0].Id)
+                    }
                     Add-MetricRecord -Def $GroupDefs[0] -Request $Request -MetricQuery $Request.Query -CallStopwatch $CallStopwatch
                 }
                 else
@@ -961,6 +967,10 @@ if ($Task -eq 'Processing')
                             # requested on its own too. Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
+                            if (-not $SingleRequest.Succeeded -and -not $SingleRequest.BadRequest)
+                            {
+                                $FailedGroupIds.Add([string]$Def.Id)
+                            }
                             Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds
                         }
                     }
@@ -1059,8 +1069,8 @@ if ($Task -eq 'Processing')
         }
     }
 
-    # A subscription with a grouped request that still failed after its retries
-    # (not BadRequest) is metrics incomplete: one entry in $Global:MetricsFailedSubs,
+    # A subscription with a request that still failed after its retries (not
+    # BadRequest) is metrics incomplete: one entry in $Global:MetricsFailedSubs,
     # as for metrics skipped for the sign-in, with Complete = $false so the wrapper
     # tells the two apart. The wrapper lists it at the end of the run and keeps it
     # on the retry list; the failed records stay in the report with MetricError true.
