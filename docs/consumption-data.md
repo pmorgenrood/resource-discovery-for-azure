@@ -64,13 +64,14 @@ consumption phase (the rest of the inventory continues). In a
 ### Transient-failure retry
 
 Each page request is retried up to **3 times, with exponential backoff (2, 4
-and 8 seconds)**, when the failure is transient: 429 throttling, a timeout, a
-server error (5xx), or a transfer cut off part-way (`Error while copying content
-to a stream`). The **same** page is retried (the previous page's
-`ContinuationToken` is preserved), so no rows are duplicated or skipped. A
-failure a retry cannot change — access refused (401 or 403), a bad request
-(400), not found (404), or an error not recognised as transient — is not
-retried. This is the rule the up-front consumption data check uses. Either way
+and 8 seconds)**, unless the failure is one a retry cannot change: access
+refused (401, 403, or an error that says access was denied), a bad request
+(400) or not found (404). Every other failure is retried, for example 429
+throttling, a timeout, a server error (5xx), a transfer cut off part-way
+(`Error while copying content to a stream`) or an error that is not
+recognised. The **same** page is retried (the previous page's
+`ContinuationToken` is preserved), so no rows are duplicated or skipped. This
+is the rule the up-front consumption data check uses. Either way
 a page that still fails is handled by the per-subscription failure path (see
 [Recovering from a consumption crash](#recovering-from-a-consumption-crash)).
 

@@ -426,6 +426,45 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @($Global:ConsumptionFailedSubs).Count | Should -Be 1
     }
 
+    It 'retries a billing call that fails with an error it does not recognise (<Case>), and collects the subscription' -ForEach @(
+        @{ Case = 'a request that could not be sent'; Shape = 'http' }
+        @{ Case = 'a message only'; Shape = 'text' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailShape = $Shape
+        $script:Calls = 0
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -eq 1 -and $script:FailShape -eq 'http') { throw ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) }
+            if ($script:Calls -eq 1) { throw 'stand-in: the usage service returned an error for this page' }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'does not retry a billing call whose error has no status code and says <Case>' -ForEach @(
+        @{ Case = 'access denied'; Message = 'Access denied.' }
+        @{ Case = 'AuthorizationFailed'; Message = "AuthorizationFailed: The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'." }
+        @{ Case = 'Forbidden'; Message = "Operation returned an invalid status code 'Forbidden'" }
+        @{ Case = 'Unauthorized'; Message = 'Unauthorized' }
+        @{ Case = 'BadRequest'; Message = 'BadRequest: the request is not valid.' }
+        @{ Case = '404 (Not Found)'; Message = 'Response status code does not indicate success: 404 (Not Found).' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailMessage = $Message
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates { throw ([System.Net.Http.HttpRequestException]::new($script:FailMessage)) }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+    }
+
     It 'stops a subscription''s pull at the page limit and reports it incomplete, naming the limit' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         $script:Calls = 0
@@ -630,6 +669,29 @@ Describe 'Invoke-ConsumptionValueProbe and Get-ConsumptionCheckVerdict' {
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
+    It 'passes when an error it does not recognise is followed by success' {
+        $script:Calls = 0
+        Mock Get-UsageAggregatesPage {
+            $script:Calls++
+            if ($script:Calls -eq 1) { throw ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) }
+            New-UsagePage -Quantities @(1)
+        }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Outcome | Should -Be 'Pass'
+        $Probe.Attempts | Should -Be 2
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+    }
+
+    It 'refuses an access-denied error that has no status code without retrying it' {
+        Mock Get-UsageAggregatesPage { throw ([System.Net.Http.HttpRequestException]::new('Access denied.')) }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Passed | Should -BeFalse
+        $Probe.Attempts | Should -Be 1
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
     It 'refuses a transient failure that persists after the bounded retries' {
         Mock Get-UsageAggregatesPage { throw (New-StatusException -Message 'Service unavailable' -Status ServiceUnavailable) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxRetries 3
@@ -716,19 +778,21 @@ Describe 'Get-UsageAggregatesPage (the usage API Get-UsageAggregates wraps)' {
         $Verdict.Detail | Should -Be 'query failed (HTTP 403, 1 attempt(s)): the usage API answered HTTP 403'
     }
 
-    It 'stops the subscription (Error), without retrying, on a malformed answer: <Case>' -TestCases @(
+    It 'stops the subscription (Error) after the bounded retries on a malformed answer: <Case>' -TestCases @(
         @{ Case = 'a 200 that is not JSON'; Raw = '{"value": [' ; NextLink = $null }
         @{ Case = 'a nextLink that is not a URL'; Raw = $null; NextLink = 'not a url' }
         @{ Case = 'a nextLink without a continuationToken'; Raw = $null; NextLink = 'https://management.azure.com/subscriptions/sub-a/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview' }
     ) {
         param($Case, $Raw, $NextLink)
-        $Answer = if ($Raw) { New-RestAnswer -Raw $Raw } else { New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $NextLink } }
-        $script:Answers.Enqueue($Answer)
+        1..4 | ForEach-Object {
+            $Answer = if ($Raw) { New-RestAnswer -Raw $Raw } else { New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $NextLink } }
+            $script:Answers.Enqueue($Answer)
+        }
         $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
         $Verdict.Outcome | Should -Be 'Error'
         $Verdict.Passed | Should -BeFalse
-        $script:Paths.Count | Should -Be 1
-        Should -Invoke Start-Sleep -Times 0 -Exactly
+        $script:Paths.Count | Should -Be 4
+        Should -Invoke Start-Sleep -Times 3 -Exactly
     }
 }
 
@@ -1149,11 +1213,22 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('Error while copying content to a stream.', [System.IO.IOException]::new('Unable to read data from the transport connection.'))) | Should -Be 'Transient'
     }
 
-    It 'treats 400, 401, 403 and unclassified errors as permanent' {
+    It 'treats 400, 401, 403, 404, and a message without a status code that names one of them or access denied, as permanent' {
         Get-ConsumptionErrorKind -Exception (New-CloudShapedException -Message 'InvalidInput' -Status BadRequest) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Unauthorized) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Forbidden) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status NotFound) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Subscription not found')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Access denied.')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('AuthorizationFailed')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new("The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'")) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status code does not indicate success: 401.')) | Should -Be 'Permanent'
+    }
+
+    It 'treats an error it does not recognise, and any other status code, as transient' {
+        Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Conflict) | Should -Be 'Transient'
     }
 }
 

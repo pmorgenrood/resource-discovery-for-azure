@@ -1335,29 +1335,32 @@ function Get-ConsumptionErrorStatusCode
     return $null
 }
 
-# Pure: 'Transient' for throttling, timeouts and server-side errors (worth a
-# bounded retry); 'Permanent' for everything else, including 400 (malformed
-# request) and 401/403 (no permission), which a retry cannot change.
+# Pure: 'Permanent' for the failures a retry cannot change: 400 (malformed
+# request), 401/403 (no permission) and 404 (not found). Without a status code
+# the message decides: it is permanent only when it names one of those (by
+# name or number) or says access was denied. Everything else is 'Transient'
+# (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
+# off part-way, and any error not recognised here.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
     $Status = Get-ConsumptionErrorStatusCode -Exception $Exception
     if ($null -ne $Status)
     {
-        if ($Status -eq 408 -or $Status -eq 429 -or $Status -ge 500) { return 'Transient' }
-        return 'Permanent'
-    }
-    $Message = [string]$Exception.Message
-    # 'Error while copying content to a stream': a transfer cut off part-way.
-    if ($Message -match '(?i)timed? ?out|timeout|throttl|too many requests|\b429\b|\b50[0-4]\b|temporar|service unavailable|task was cancel|connection (was )?(reset|closed|refused)|name could not be resolved|name or service not known|error while copying content to a stream')
-    {
+        if ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404) { return 'Permanent' }
         return 'Transient'
     }
-    return 'Permanent'
+    $Message = [string]$Exception.Message
+    if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization')
+    {
+        return 'Permanent'
+    }
+    return 'Transient'
 }
 
 # Runs $Operation (a scriptblock taking one argument) and retries it with
-# exponential backoff (2, 4, 8 s) while the failure is transient. Returns
+# exponential backoff (2, 4, 8 s) unless the failure is one a retry cannot
+# change (Get-ConsumptionErrorKind: 400, 401, 403, 404, access denied). Returns
 # { Value; Error; Attempts }; Error is the last exception, or $null on success.
 function Invoke-ConsumptionCallWithRetry
 {
