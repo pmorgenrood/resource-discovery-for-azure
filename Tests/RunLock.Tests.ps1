@@ -127,10 +127,10 @@ function Get-AzSubscription
     # error that ends the wrapper after it took the lock.
     # Whether this run held its lock when it read the subscription list.
     $Run = if ($global:RdaStandInRun) { $global:RdaStandInRun } elseif ($env:RDA_STANDIN_RUN) { $env:RDA_STANDIN_RUN } else { 'run' }
-    Set-Content -LiteralPath (Join-Path $HOME ('lock-at-list-' + $Run)) -Value ([string](Test-Path -LiteralPath (Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f $TenantId.ToLowerInvariant()))))
+    Set-Content -LiteralPath (Join-Path $HOME ('lock-at-list-' + $Run)) -Value ([string](Test-Path -LiteralPath (Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantId.ToLowerInvariant()).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))))
     if ($Scenario.ThrowAtList)
     {
-        Set-Content -LiteralPath (Join-Path $HOME 'lock-at-list') -Value ([string](Test-Path -LiteralPath (Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f $TenantId))))
+        Set-Content -LiteralPath (Join-Path $HOME 'lock-at-list') -Value ([string](Test-Path -LiteralPath (Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantId).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))))
         throw 'stand-in: the subscription list failed'
     }
     @($Scenario.Subscriptions | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = 'Enabled'; TenantId = $Scenario.Tenant } })
@@ -217,7 +217,7 @@ function Wait-Marker([string]$Name)
     $Deadline = (Get-Date).AddSeconds(150)
     while (-not (Test-Path -LiteralPath (Join-Path $HOME $Name))) { if ((Get-Date) -gt $Deadline) { throw ('no ' + $Name) }; Start-Sleep -Milliseconds 100 }
 }
-function Get-LockPathOf([string]$Tenant) { Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f $Tenant) }
+function Get-LockPathOf([string]$Tenant) { Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())) }
 function Read-LockValues([string]$Tenant)
 {
     $Path = Get-LockPathOf $Tenant
@@ -301,7 +301,7 @@ function Start-RunLockHeartbeat
 param([string]$Wrapper, [string]$Tenant, [string]$Out, [string]$CaseHome)
 $Runspace = [runspacefactory]::CreateRunspace($Host)
 $Runspace.Open()
-$LockPath = Join-Path $CaseHome ('InventoryReports/.run-lock-{0}.json' -f $Tenant)
+$LockPath = Join-Path $CaseHome ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
 $PowerShell = [powershell]::Create()
 $PowerShell.Runspace = $Runspace
 $null = $PowerShell.AddScript(("& '{0}' -TenantID {1} -ParallelStreams 1" -f $Wrapper, $Tenant))
@@ -333,10 +333,10 @@ $Runs = @(foreach ($Number in 2, 3)
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
-        $script:LockPath = Join-Path $script:Root ('.run-lock-{0}.json' -f $script:Tenant)
+        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
+        $script:LockPath = Join-Path $script:Root ('.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $script:ScenarioB = Join-Path $script:CaseHome 'scenario-b.json'
-        $script:LockPathB = Join-Path $script:Root ('.run-lock-{0}.json' -f $script:TenantB)
+        $script:LockPathB = Join-Path $script:Root ('.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:TenantB).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
     }
 
     # Starts a pwsh process of this case that runs the script Source with
@@ -713,11 +713,11 @@ Describe 'The run lock file' {
 
     It 'is a dot-file per tenant that neither the resume state nor the per-stream state picks up' {
         $Path = Get-RunLockPath -InventoryRoot $script:Root -Tenant $script:Tenant
-        Split-Path -Path $Path -Leaf | Should -Be ('.run-lock-{0}.json' -f $script:Tenant)
-        $Stream = Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)
+        Split-Path -Path $Path -Leaf | Should -Be ('.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
+        $Stream = Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         Set-Content -LiteralPath $Path -Value '{}'
         Set-Content -LiteralPath $Stream -Value '{}'
-        @(Get-StreamResumeStateFiles -InventoryRoot $script:Root -Tenant $script:Tenant).Name | Should -Be @('.resume-state-{0}-stream-0.json' -f $script:Tenant)
+        @(Get-StreamResumeStateFiles -InventoryRoot $script:Root -Tenant $script:Tenant).Name | Should -Be @('.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $Path | Should -Not -Be $script:State
         # The zip steps pack only files inside the per-subscription report folders.
         @(Get-ChildItem -Path $script:Root -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.zip' -File }).Count | Should -Be 0
@@ -2115,8 +2115,8 @@ Describe 'Runs of the wrapper in one process' -Skip:$IsWindows {
         $Out = Join-Path $script:CaseHome 'tenants.json'
         $Loop = script:Start-CaseScript -Name 'tenants.ps1' -Source @'
 param([string]$Wrapper, [string]$TenantA, [string]$ScenarioA, [string]$TenantB, [string]$ScenarioB, [string]$Out)
-$LockA = Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f $TenantA.ToLowerInvariant())
-$LockB = Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f $TenantB.ToLowerInvariant())
+$LockA = Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantA.ToLowerInvariant()).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
+$LockB = Join-Path $HOME ('InventoryReports/.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantB.ToLowerInvariant()).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
 $Result = [ordered]@{}
 $global:RdaStandInScenario = $ScenarioA
 $global:RdaStandInRun = 'ta'

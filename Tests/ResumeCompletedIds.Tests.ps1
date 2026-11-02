@@ -134,7 +134,7 @@ $Global:LASTEXITCODE = 0
         param([scriptblock]$Block, [string]$Root, [object[]]$Subs, [bool]$Resume = $false)
         $Global:RdaIdsTestProcessed = @()
         $Global:RdaIdsTestRoot = $Root
-        $Out = @(& $Block $script:FakeRoot $Root (Join-Path $Root '.resume-state-t.json') 't' $Subs $Resume 6>&1)
+        $Out = @(& $Block $script:FakeRoot $Root (Join-Path $Root '.resume-state-e3b98a4da31a.json') 't' $Subs $Resume 6>&1)
         $Text = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Names = @($Global:RdaIdsTestProcessed | ForEach-Object { $Id = $_; ($script:All | Where-Object { $_.Id -eq $Id }).Name })
         return [pscustomobject]@{ Text = $Text; Processed = ($Names -join ', ') }
@@ -145,7 +145,7 @@ $Global:LASTEXITCODE = 0
     function script:Get-StateIds
     {
         param([string]$Root)
-        $Ids = @((Get-Content -LiteralPath (Join-Path $Root '.resume-state-t.json') -Raw | ConvertFrom-Json).CompletedSubscriptionIds)
+        $Ids = @((Get-Content -LiteralPath (Join-Path $Root '.resume-state-e3b98a4da31a.json') -Raw | ConvertFrom-Json).CompletedSubscriptionIds)
         $Labels = @($Ids | ForEach-Object {
                 $Id = $_
                 $Sub = $script:All | Where-Object { $_.Id -eq $Id }
@@ -165,7 +165,7 @@ $Global:LASTEXITCODE = 0
     function script:Save-TestState
     {
         param([string]$Root, [object[]]$Subs)
-        Save-CompletedSubscriptionIds -Path (Join-Path $Root '.resume-state-t.json') -Tenant 't' -Ids @($Subs | ForEach-Object { $_.Id })
+        Save-CompletedSubscriptionIds -Path (Join-Path $Root '.resume-state-e3b98a4da31a.json') -Tenant 't' -Ids @($Subs | ForEach-Object { $_.Id })
     }
 
     # A per-stream state file as Run-AllSubscriptions.Stream.ps1 writes it.
@@ -173,7 +173,7 @@ $Global:LASTEXITCODE = 0
     {
         param([string]$Root, [int]$StreamId, [object[]]$Subs)
         @{ Tenant = 't'; StreamId = [string]$StreamId; Completed = @($Subs | ForEach-Object { $_.Id }); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Root (".resume-state-t-stream-{0}.json" -f $StreamId)) -Encoding utf8
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Root (".resume-state-e3b98a4da31a-stream-{0}.json" -f $StreamId)) -Encoding utf8
     }
 
     function script:New-CaseRoot
@@ -231,7 +231,7 @@ Describe 'Sequential run: the resume state keeps one id per completed subscripti
     It 'a state file holding a null id, as saved after a failed first subscription, reads as no completed subscriptions' {
         $Failed = @{ Id = $script:A.Id; Name = $script:A.Name; LastFailedAt = (Get-Date).ToString('o'); Reason = 'stand-in failure'; Attempts = 1 }
         @{ TenantID = 't'; CompletedSubscriptionIds = @($null); FailedAttempts = @($Failed); LastUpdated = (Get-Date).ToString('o') } |
-            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t.json') -Encoding utf8
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-e3b98a4da31a.json') -Encoding utf8
         $R = script:Invoke-Wrapper -Block $script:SequentialRun -Root $script:Root -Subs @($script:A) -Resume $true
         # A state file is there, so 'no previous state found' is not printed; the
         # wrapper's start line (outside this block) says 0 subscriptions are done.
@@ -269,6 +269,6 @@ Describe 'Other places that add to the completed list, starting from one earlier
         script:Get-StateIds -Root $script:Root | Should -Be '3 id(s): Sub A, Sub B, Sub C'
         # The merge deletes the per-stream files it merged once the resume state
         # holds their records (Invoke-FoldedStreamStateCleanup).
-        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-t-stream-*.json' -Force).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-e3b98a4da31a-stream-*.json' -Force).Count | Should -Be 0
     }
 }

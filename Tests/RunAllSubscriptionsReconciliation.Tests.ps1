@@ -85,7 +85,7 @@ Describe 'Get-StreamResumeStateFiles' {
         # then a later run using -ParallelStreams 2. All four files must still
         # be discovered so their data is not silently dropped/orphaned.
         0..3 | ForEach-Object {
-            Set-Content -Path (Join-Path $script:CaseDir (".resume-state-$Tenant-stream-$_.json")) -Value '{}'
+            Set-Content -Path (Join-Path $script:CaseDir (".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-$_.json")) -Value '{}'
         }
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 4 -Because 'all four per-stream files (0-3) must be discovered regardless of the current run''s -ParallelStreams value'
@@ -93,20 +93,20 @@ Describe 'Get-StreamResumeStateFiles' {
 
     It 'Does not return resume files belonging to a different tenant' {
         $Tenant = 'tenant-abc'
-        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant-stream-0.json") -Value '{}'
+        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json") -Value '{}'
         Set-Content -Path (Join-Path $script:CaseDir ".resume-state-other-tenant-stream-0.json") -Value '{}'
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 1
-        $Files[0].Name | Should -Be ".resume-state-$Tenant-stream-0.json"
+        $Files[0].Name | Should -Be ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json"
     }
 
     It 'Does not return the unified (non-stream) resume-state file' {
         $Tenant = 'tenant-abc'
         Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant.json") -Value '{}'
-        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant-stream-0.json") -Value '{}'
+        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json") -Value '{}'
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 1
-        $Files[0].Name | Should -Be ".resume-state-$Tenant-stream-0.json"
+        $Files[0].Name | Should -Be ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json"
     }
 
     It 'Returns an empty array (not $null / an error) when no per-stream files exist' {
@@ -290,11 +290,11 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
     It 'recovers a failure that lives only in an unmerged per-stream file' {
         $Tenant = 'tenant-f2a'
         @{ Tenant = $Tenant; StreamId = 0; Completed = @('sub-ok'); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-0.json")
+            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json")
         @{ Tenant = $Tenant; StreamId = 1; Completed = @(); FailedAttempts = @(
                 [pscustomobject]@{ Id = 'sub-fail'; Name = 'Sub Fail'; LastFailedAt = '2026-06-01T00:00:00Z'; Reason = 'throttled'; Attempts = 1 }
             )
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-1.json")
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-1.json")
 
         $StrandedCompleted = @()
         $StrandedFailed = @()
@@ -315,11 +315,11 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
     It 'prunes a stranded failure when the same sub completed in another stream' {
         $Tenant = 'tenant-f2b'
         @{ Tenant = $Tenant; StreamId = 0; Completed = @('sub-x'); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-0.json")
+            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json")
         @{ Tenant = $Tenant; StreamId = 1; Completed = @(); FailedAttempts = @(
                 [pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-05-01T00:00:00Z'; Reason = 'transient'; Attempts = 1 }
             )
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-1.json")
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-1.json")
 
         $StrandedCompleted = @()
         $StrandedFailed = @()

@@ -166,7 +166,7 @@ exit 1
         New-Item -ItemType Directory -Path $script:CaseHome -Force | Out-Null
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
     }
 
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.

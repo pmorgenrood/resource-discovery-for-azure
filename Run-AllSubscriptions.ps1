@@ -494,6 +494,16 @@ catch
 # whoever wrote it; the message says who holds it and what to do
 # (Write-RunLockHeldMessage).
 $RunLockPath = Get-RunLockPath -InventoryRoot $InventoryRoot -Tenant $TenantID
+# The lock of an earlier version of this tool, named with the tenant id, is
+# honoured as a lock: never moved or taken over (Get-RunLockLegacyPath).
+$LegacyLockPath = Get-RunLockLegacyPath -InventoryRoot $InventoryRoot -Tenant $TenantID
+$LegacyLock = if (Test-Path -LiteralPath $LegacyLockPath) { Read-RunLock -Path $LegacyLockPath } else { $null }
+if ($null -ne $LegacyLock -and $LegacyLock.Exists)
+{
+    Write-RunLockHeldMessage -Request ([pscustomobject]@{ Acquired = $false; Path = $LegacyLockPath; Held = $LegacyLock; Holder = (Get-RunLockHolder -Lock $LegacyLock); Problem = $null }) -Tenant $TenantID
+    $RunLock = $null
+    Exit-Wrapper -Code 1
+}
 $RunLock = Request-RunLock -Path $RunLockPath -RunStartTime $RunStartTime
 if (-not $RunLock.Acquired)
 {
@@ -507,8 +517,11 @@ if (-not (Start-RunLockHeartbeat -Lock $RunLock)) { Exit-Wrapper -Code 1 }
 $RunKey = Get-RunLockRunKey -Record $RunLock.Record
 if ([string]::IsNullOrEmpty($RunKey)) { $RunKey = [guid]::NewGuid().ToString('N').Substring(0, 8) }
 
-# Resume state helpers
-$ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $TenantID)
+# Resume state helpers. The file names hold the tenant key, not the tenant id
+# (Get-TenantFileKey); files an earlier version named with the tenant id are
+# moved to these names once, now that this run holds the lock.
+$ResumeStateFile = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $TenantID
+$null = Move-LegacyResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID
 
 # How this run starts (Resolve-RunStart): it continues the unfinished run the
 # resume state file holds, as -Resume does, or starts a new one when there is
@@ -1345,7 +1358,7 @@ if (-not ($Resume -or $ResumeFailedOnly))
     {
         for ($S = 0; $S -lt $PlannedStreamCount; $S++)
         {
-            $OwnStreamFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json" -f $TenantID, $S)
+            $OwnStreamFile = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $TenantID -Stream $S
             $Moved = Move-WrongShapeResumeStateFile -Path $OwnStreamFile -Kind Stream
             if ($Moved) { $WrongShapeStateFiles += $Moved }
         }

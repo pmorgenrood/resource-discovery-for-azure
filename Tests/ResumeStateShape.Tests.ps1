@@ -185,9 +185,9 @@ function Get-UsageAggregates
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:StateName = '.resume-state-{0}.json' -f $script:Tenant
+        $script:StateName = '.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         $script:State = Join-Path $script:Root $script:StateName
-        $script:Stream0Name = '.resume-state-{0}-stream-0.json' -f $script:Tenant
+        $script:Stream0Name = '.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
     }
 
     function script:Set-Scenario
@@ -277,7 +277,7 @@ function Get-UsageAggregates
     function script:Write-StreamText
     {
         param([string]$Text, [int]$StreamId = 0)
-        $Path = Join-Path $script:Root ('.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $StreamId)
+        $Path = Join-Path $script:Root ('.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $StreamId)
         Set-Content -LiteralPath $Path -Value $Text -Encoding utf8
         return (Get-Content -LiteralPath $Path -Raw)
     }
@@ -588,7 +588,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 
     It 'renames a wrong-shaped file to its name plus .unreadable- and the UTC time, warns with the file and the field, and keeps its content' {
-        $Path = Join-Path $script:Dir '.resume-state-t.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
         $Text = '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":"' + $script:Marker + '"}'
         Set-Content -LiteralPath $Path -Value $Text -NoNewline
         $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
@@ -596,9 +596,9 @@ Describe 'Move-WrongShapeResumeStateFile' {
         $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Result.Count | Should -Be 1
         $Result[0].Kind | Should -Be 'Main'
-        $Result[0].Name | Should -Be '.resume-state-t.json'
-        $Result[0].MovedTo | Should -Be '.resume-state-t.json.unreadable-20260102-030405'
-        $Lines | Should -Be @('WARNING: The resume state file .resume-state-t.json is not the right shape (FailedAttempts is not a list), so its records are not used. It was moved aside to .resume-state-t.json.unreadable-20260102-030405, kept for inspection; no run reads it again.')
+        $Result[0].Name | Should -Be '.resume-state-e3b98a4da31a.json'
+        $Result[0].MovedTo | Should -Be '.resume-state-e3b98a4da31a.json.unreadable-20260102-030405'
+        $Lines | Should -Be @('WARNING: The resume state file .resume-state-e3b98a4da31a.json is not the right shape (FailedAttempts is not a list), so its records are not used. It was moved aside to .resume-state-e3b98a4da31a.json.unreadable-20260102-030405, kept for inspection; no run reads it again.')
         Test-Path -LiteralPath $Path | Should -BeFalse
         Get-Content -LiteralPath (Join-Path $script:Dir $Result[0].MovedTo) -Raw | Should -Be $Text
         # No later run finds it as a state file.
@@ -607,8 +607,8 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 
     It 'with -Resume, a per-stream file also says what this run does; the resume state file line comes from the wrapper later' -TestCases @(
-        @{ Kind = 'Main'; Name = '.resume-state-t.json'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"x"}'; Then = @() },
-        @{ Kind = 'Stream'; Name = '.resume-state-t-stream-1.json'; Json = '{"Completed":5}'; Then = @('  This run does not count the subscriptions it lists as completed.') }
+        @{ Kind = 'Main'; Name = '.resume-state-e3b98a4da31a.json'; Json = '{"TenantID":"t","CompletedSubscriptionIds":"x"}'; Then = @() },
+        @{ Kind = 'Stream'; Name = '.resume-state-e3b98a4da31a-stream-1.json'; Json = '{"Completed":5}'; Then = @('  This run does not count the subscriptions it lists as completed.') }
     ) {
         $Path = Join-Path $script:Dir $Name
         Set-Content -LiteralPath $Path -Value $Json
@@ -624,10 +624,10 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 
     It 'uses the record it is given instead of reading the file' {
-        $Path = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json'
         Set-Content -LiteralPath $Path -Value '{"Completed":[],"FailedAttempts":[]}'
         $Result = Move-WrongShapeResumeStateFile -Path $Path -Kind Stream -Record (script:ConvertTo-Record '{"Completed":5}') -Now $script:Now 6>$null
-        $Result.MovedTo | Should -Be '.resume-state-t-stream-0.json.unreadable-20260102-030405'
+        $Result.MovedTo | Should -Be '.resume-state-e3b98a4da31a-stream-0.json.unreadable-20260102-030405'
     }
 
     It 'leaves a <Label> file alone and returns nothing' -TestCases @(
@@ -636,7 +636,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
         @{ Label = '0-byte'; Text = '' },
         @{ Label = 'whitespace-only'; Text = "  `r`n `t" }
     ) {
-        $Path = Join-Path $script:Dir '.resume-state-t.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
         script:Write-RawText -Path $Path -Text $Text
         $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
         $Out | Should -BeNullOrEmpty
@@ -649,19 +649,19 @@ Describe 'Move-WrongShapeResumeStateFile' {
     }
 
     It 'returns nothing when there is no file' {
-        @(Move-WrongShapeResumeStateFile -Path (Join-Path $script:Dir '.resume-state-t.json') -Kind Main 6>&1) | Should -BeNullOrEmpty
+        @(Move-WrongShapeResumeStateFile -Path (Join-Path $script:Dir '.resume-state-e3b98a4da31a.json') -Kind Main 6>&1) | Should -BeNullOrEmpty
     }
 
     It 'adds -2 when the name is taken, and -3 when that is taken too; the files already there are kept' {
-        $Path = Join-Path $script:Dir '.resume-state-t.json'
-        $Base = '.resume-state-t.json.unreadable-20260102-030405'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
+        $Base = '.resume-state-e3b98a4da31a.json.unreadable-20260102-030405'
         Set-Content -LiteralPath (Join-Path $script:Dir $Base) -Value 'an earlier one'
         Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":5}'
         $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1)
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
         $Lines = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Result[0].MovedTo | Should -Be ($Base + '-2')
-        $Lines[0] | Should -Be ('WARNING: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), so its records are not used. It was moved aside to {0}-2, kept for inspection; no run reads it again.' -f $Base)
+        $Lines[0] | Should -Be ('WARNING: The resume state file .resume-state-e3b98a4da31a.json is not the right shape (CompletedSubscriptionIds is not a list), so its records are not used. It was moved aside to {0}-2, kept for inspection; no run reads it again.' -f $Base)
         # A second wrong-shaped file in the same second.
         Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":6}'
         (Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>$null).MovedTo | Should -Be ($Base + '-3')
@@ -673,8 +673,8 @@ Describe 'Move-WrongShapeResumeStateFile' {
 
     It 'when the name and -2 to -100 are all taken, stops the run with exit 1, names the file and the reason, prints the remove command and leaves the file' {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
-        $Path = Join-Path $script:Dir '.resume-state-t.json'
-        $Base = '.resume-state-t.json.unreadable-20260102-030405'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
+        $Base = '.resume-state-e3b98a4da31a.json.unreadable-20260102-030405'
         New-Item -ItemType File -Path (Join-Path $script:Dir $Base) | Out-Null
         foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:Dir ('{0}-{1}' -f $Base, $N)) | Out-Null }
         Set-Content -LiteralPath $Path -Value '{"TenantID":"t","CompletedSubscriptionIds":5}'
@@ -682,7 +682,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
         { Move-WrongShapeResumeStateFile -Path $Path -Kind Main -Now $script:Now 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
         Should -Invoke Exit-Wrapper -Times 1 -Exactly -ParameterFilter { $Code -eq 1 }
         $Lines | Should -Be @(
-            ('ERROR: The resume state file .resume-state-t.json is not the right shape (CompletedSubscriptionIds is not a list), and it could not be moved aside: every name from {0} to {0}-100 is taken' -f $Base),
+            ('ERROR: The resume state file .resume-state-e3b98a4da31a.json is not the right shape (CompletedSubscriptionIds is not a list), and it could not be moved aside: every name from {0} to {0}-100 is taken' -f $Base),
             $script:StopStart,
             $script:LaterMain,
             $script:RemoveLead,
@@ -702,18 +702,18 @@ Describe 'Move-WrongShapeResumeStateFile' {
         @{ Kind = 'Stream'; After = $true; Rfo = ' under -ResumeFailedOnly'; When = ' found after the collection'; Expect = 'StopAfter,LaterStream,RemoveLead,Cmd,ThenResume' }
     ) {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
-        $Path = Join-Path $script:Dir '.resume-state-t-stream-3.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-3.json'
         $Lines = [System.Collections.Generic.List[string]]::new()
-        $File = [pscustomobject]@{ Kind = $Kind; Name = '.resume-state-t-stream-3.json'; MovedTo = $null; Path = $Path; Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true }
+        $File = [pscustomobject]@{ Kind = $Kind; Name = '.resume-state-e3b98a4da31a-stream-3.json'; MovedTo = $null; Path = $Path; Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true }
         { Stop-WrongShapeStateNotMoved -Files @($File) -AfterCollection:$After -ResumeFailedOnly:($Rfo -ne '') 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
         $What = if ($Kind -eq 'Main') { 'resume state file' } else { 'per-stream state file' }
-        $Want = @(('ERROR: The {0} .resume-state-t-stream-3.json is not the right shape (Completed is not a list), and it could not be moved aside: stand-in reason' -f $What)) + @($Expect -split ',' | ForEach-Object { if ($_ -eq 'Cmd') { "  Remove-Item -LiteralPath '{0}' -Force" -f $Path } else { (Get-Variable -Scope Script -Name $_).Value } })
+        $Want = @(('ERROR: The {0} .resume-state-e3b98a4da31a-stream-3.json is not the right shape (Completed is not a list), and it could not be moved aside: stand-in reason' -f $What)) + @($Expect -split ',' | ForEach-Object { if ($_ -eq 'Cmd') { "  Remove-Item -LiteralPath '{0}' -Force" -f $Path } else { (Get-Variable -Scope Script -Name $_).Value } })
         @($Lines) | Should -Be $Want
     }
 
     It 'two files after the collection: an ERROR line and a remove command for each, then one exit 1' {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
-        $Files = @(5, 6 | ForEach-Object { [pscustomobject]@{ Kind = 'Stream'; Name = ('.resume-state-t-stream-{0}.json' -f $_); MovedTo = $null; Path = (Join-Path $script:Dir ('.resume-state-t-stream-{0}.json' -f $_)); Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true } })
+        $Files = @(5, 6 | ForEach-Object { [pscustomobject]@{ Kind = 'Stream'; Name = ('.resume-state-e3b98a4da31a-stream-{0}.json' -f $_); MovedTo = $null; Path = (Join-Path $script:Dir ('.resume-state-e3b98a4da31a-stream-{0}.json' -f $_)); Problem = 'Completed is not a list'; Reason = 'stand-in reason'; NotMoved = $true } })
         $Lines = [System.Collections.Generic.List[string]]::new()
         { Stop-WrongShapeStateNotMoved -Files $Files -AfterCollection 6>&1 | ForEach-Object { $Lines.Add([string]$_.MessageData) } } | Should -Throw 'Exit-Wrapper 1'
         Should -Invoke Exit-Wrapper -Times 1 -Exactly
@@ -725,7 +725,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
     # chmod makes the folder read-only here; Windows has no chmod.
     It 'after the collection, a file that cannot be moved aside is left as it is and returned, with a notice, and the run is not stopped yet' -Skip:$IsWindows {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
-        $Path = Join-Path $script:Dir '.resume-state-t-stream-5.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-5.json'
         Set-Content -LiteralPath $Path -Value '{"Completed":5}'
         & chmod 555 $script:Dir
         try { $Out = @(Move-WrongShapeResumeStateFile -Path $Path -Kind Stream -AfterCollection -Now $script:Now 6>&1) }
@@ -737,7 +737,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
         $Result.Count | Should -Be 1
         $Result[0].NotMoved | Should -BeTrue
         $Result[0].Path | Should -Be $Path
-        $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-5.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
+        $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-e3b98a4da31a-stream-5.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
         $Lines[1] | Should -Be $script:MergeNotice
         Get-Content -LiteralPath $Path -Raw | Should -BeLike '*"Completed":5*'
     }
@@ -747,7 +747,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
         Mock Exit-Wrapper { throw ('Exit-Wrapper {0}' -f $Code) }
         $Odd = Join-Path $script:Dir "it's here"
         New-Item -ItemType Directory -Path $Odd | Out-Null
-        $Path = Join-Path $Odd '.resume-state-t-stream-0.json'
+        $Path = Join-Path $Odd '.resume-state-e3b98a4da31a-stream-0.json'
         Set-Content -LiteralPath $Path -Value '{"Completed":5}'
         & chmod 555 $Odd
         try
@@ -757,7 +757,7 @@ Describe 'Move-WrongShapeResumeStateFile' {
         }
         finally { & chmod 755 $Odd }
         if (-not (Test-Path -LiteralPath $Path)) { Set-ItResult -Skipped -Because 'a read-only folder can still be written here'; return }
-        $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-0.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
+        $Lines[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-e3b98a4da31a-stream-0.json is not the right shape (Completed is not a list), and it could not be moved aside: *'
         $Lines[1] | Should -Be $script:StopStart
         $Command = @($Lines | Where-Object { $_ -like "  Remove-Item -LiteralPath '*" })[0].Trim()
         $Command | Should -Be ("Remove-Item -LiteralPath '{0}' -Force" -f $Path.Replace("'", "''"))
@@ -767,13 +767,13 @@ Describe 'Move-WrongShapeResumeStateFile' {
 
     It 'Write-WrongShapeStateSummary names each file and never says clean run' {
         $Files = @(
-            [pscustomobject]@{ Kind = 'Main'; Name = '.resume-state-t.json'; MovedTo = '.resume-state-t.json.unreadable-20260102-030405' },
-            [pscustomobject]@{ Kind = 'Stream'; Name = '.resume-state-t-stream-1.json'; MovedTo = '.resume-state-t-stream-1.json.unreadable-20260102-030405-2' }
+            [pscustomobject]@{ Kind = 'Main'; Name = '.resume-state-e3b98a4da31a.json'; MovedTo = '.resume-state-e3b98a4da31a.json.unreadable-20260102-030405' },
+            [pscustomobject]@{ Kind = 'Stream'; Name = '.resume-state-e3b98a4da31a-stream-1.json'; MovedTo = '.resume-state-e3b98a4da31a-stream-1.json.unreadable-20260102-030405-2' }
         )
         $Lines = @(Write-WrongShapeStateSummary -Files $Files -StateKept $false 6>&1 | ForEach-Object { [string]$_.MessageData })
         $Lines | Should -Be @(
-            'Resume state cleared, but not a clean run: the resume state file .resume-state-t.json was not the right shape and was moved aside to .resume-state-t.json.unreadable-20260102-030405; its records were not used.',
-            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-t-stream-1.json was not the right shape and was moved aside to .resume-state-t-stream-1.json.unreadable-20260102-030405-2; its records were not used.'
+            'Resume state cleared, but not a clean run: the resume state file .resume-state-e3b98a4da31a.json was not the right shape and was moved aside to .resume-state-e3b98a4da31a.json.unreadable-20260102-030405; its records were not used.',
+            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-e3b98a4da31a-stream-1.json was not the right shape and was moved aside to .resume-state-e3b98a4da31a-stream-1.json.unreadable-20260102-030405-2; its records were not used.'
         )
         @(Write-WrongShapeStateSummary -Files @() -StateKept $true 6>&1) | Should -BeNullOrEmpty
     }
@@ -783,7 +783,7 @@ Describe 'Readers' {
     BeforeEach {
         $script:Dir = Join-Path $script:UnitDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $script:Dir -Force | Out-Null
-        $script:Path = Join-Path $script:Dir '.resume-state-t.json'
+        $script:Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
     }
 
     It 'Get-FailedAttempts skips the null entry the wrapper saves when a retry list becomes empty' {
@@ -796,7 +796,7 @@ Describe 'Readers' {
 
     It 'the stream worker reads a wrong-shaped per-stream state file as no records, with a warning' {
         Set-Variable -Name Tag -Value '[stream-0]'
-        $Path = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json'
         Set-Content -LiteralPath $Path -Value '{"Completed":5,"FailedAttempts":"garbage"}'
         $Out = @(Read-StreamState -Path $Path 6>&1)
         $State = @($Out | Where-Object { $_ -is [hashtable] })[0]
@@ -811,7 +811,7 @@ Describe 'Readers' {
         @{ Label = 'whitespace-only'; Text = "`n  `n" }
     ) {
         Set-Variable -Name Tag -Value '[stream-0]'
-        $Path = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        $Path = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json'
         script:Write-RawText -Path $Path -Text $Text
         $Out = @(Read-StreamState -Path $Path 6>&1)
         $State = @($Out | Where-Object { $_ -is [hashtable] })[0]
@@ -1275,7 +1275,7 @@ Describe 'Wrapper end to end: a wrong-shaped per-stream state file' -Skip:$IsWin
         $Seeded = script:Write-StreamText -Text ('{"Completed": ["sub-a"], "FailedAttempts": "' + $script:Marker + '"}') -StreamId 5
         $R1 = script:Invoke-Wrapper -Streams 2
         $R1.ExitCode | Should -Be 0
-        $Moved = script:Assert-MovedAside -Run $R1 -FileName ('.resume-state-{0}-stream-5.json' -f $script:Tenant) -Field 'FailedAttempts is not a list' -Content $Seeded
+        $Moved = script:Assert-MovedAside -Run $R1 -FileName ('.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())) -Field 'FailedAttempts is not a list' -Content $Seeded
         # The merge's clean-up does not try to remove the path it moved.
         $R1.Error | Should -BeNullOrEmpty
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B', 'C')
@@ -1290,7 +1290,7 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
     # another program holds open; the run can read and write everything else.
     BeforeEach {
         script:New-Case
-        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
     }
 
     It 'the resume state file, under -ResumeFailedOnly: the stop names -Resume as the next command, which collects Sub B from the retry list; the run after it ends clean' {
@@ -1436,7 +1436,7 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
 
     It 'a right-shaped per-stream file read before one that cannot be moved aside: -Resume stops with exit 1 and prints no other warning; the right-shaped file is kept and the -Resume after the printed command uses it' {
         # Stream 0 lists Sub A as completed; stream 1 cannot be moved aside.
-        $Stream1Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+        $Stream1Name = '.resume-state-{0}-stream-1.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         script:Set-Scenario -RenameRefused $Stream1Name
         $Good = script:Write-StreamText -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "0", "Completed": ["sub-a"], "FailedAttempts": []}')
         $null = script:Write-StreamText -Text '{"Completed": 5, "FailedAttempts": []}' -StreamId 1
@@ -1524,7 +1524,7 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
         $Control = script:Invoke-Wrapper -Streams 2
         $Control.ExitCode | Should -Be 2
         script:New-Case
-        $StaleName = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+        $StaleName = '.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         script:Set-Scenario -NoZip 'B' -RenameRefused $StaleName
         $null = script:Write-StreamText -Text '{"Completed": ["sub-a"], "FailedAttempts": "garbage"}' -StreamId 5
         $Stale = Join-Path $script:Root $StaleName
@@ -1562,7 +1562,7 @@ Describe 'Wrapper end to end: a wrong-shaped state file another program holds op
 Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindows {
     BeforeEach {
         script:New-Case
-        $script:Stream1Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+        $script:Stream1Name = '.resume-state-{0}-stream-1.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
     }
 
     # A RunId is compared as text: the number 5 in a per-stream file must not
@@ -1685,8 +1685,8 @@ Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindo
         @{ Label = 'a two-stream run without either switch stopped before its streams start'; Arguments = @(); Streams = 2; Stuck = 0; MainRunId = 'run-earlier' },
         @{ Label = 'a two-stream run without either switch stopped at its end'; Arguments = @(); Streams = 2; Stuck = 5; MainRunId = '' }
     ) {
-        $StuckName = '.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stuck
-        $OtherName = '.resume-state-{0}-stream-6.json' -f $script:Tenant
+        $StuckName = '.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Stuck
+        $OtherName = '.resume-state-{0}-stream-6.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         script:Set-Scenario -RenameRefused $StuckName
         if ($MainRunId)
         {
@@ -1714,7 +1714,7 @@ Describe 'Wrapper end to end: per-stream state files and run ids' -Skip:$IsWindo
         script:Write-RawText -Path $script:State -Text ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": 5, "FailedAttempts": [], "RunId": "run-earlier"}')
         $MainBytes = [System.IO.File]::ReadAllBytes($script:State)
         $Own = script:Write-StreamText -StreamId 1 -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "1", "RunId": "run-earlier", "Completed": ["sub-b"], "FailedAttempts": []}')
-        $OtherName = '.resume-state-{0}-stream-6.json' -f $script:Tenant
+        $OtherName = '.resume-state-{0}-stream-6.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         $Other = script:Write-StreamText -StreamId 6 -Text ('{"Tenant": "' + $script:Tenant + '", "StreamId": "6", "RunId": "run-other", "Completed": [], "FailedAttempts": []}')
         $R = script:Invoke-Wrapper -Arguments $Arguments
         $R.ExitCode | Should -Be 1
@@ -1735,7 +1735,7 @@ Describe 'Wrapper end to end: a per-stream state file that cannot be read and ca
     # another program holds open; the run can read and write everything else.
     BeforeEach {
         script:New-Case
-        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f $script:Tenant
+        $script:Stream5Name = '.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         $script:LaterUnreadable = '  While the file cannot be moved aside, every later run that continues the unfinished run (with or without -Resume, and -ResumeFailedOnly) reads it at its start and stops the same way. A later run that starts a new run (-Fresh) does not read it at its start; one that runs more than one stream reads it at its end and stops the same way there, unless one of its streams writes that file first.'
     }
     BeforeAll {

@@ -1659,15 +1659,15 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
     }
 
     It 'Move-UnreadableStreamStateFile renames the file to a name no recovery or *.json pattern finds, with a warning that names it' {
-        $File = Join-Path $script:Dir '.resume-state-t-stream-1.json'
+        $File = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-1.json'
         Set-Content -LiteralPath $File -Value '{ "Completed": [ "sub-b" ]'
         $R = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now ([datetime]'2026-10-29T14:02:55')
-        $R.Name | Should -Be '.resume-state-t-stream-1.json'
-        $R.MovedTo | Should -Be '.resume-state-t-stream-1.json.unreadable-20261029-140255'
+        $R.Name | Should -Be '.resume-state-e3b98a4da31a-stream-1.json'
+        $R.MovedTo | Should -Be '.resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255'
         Test-Path -LiteralPath $File | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:Dir $R.MovedTo) | Should -BeTrue
         @($script:Lines) | Should -Be @(
-            'WARNING: The per-stream state file .resume-state-t-stream-1.json from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again. It was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255.'
+            'WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-1.json from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and this run collects them again. It was moved aside to .resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255.'
         )
         ($script:Lines -join "`n") | Should -Not -Match 'sub-b'
         @(Get-StreamResumeStateFiles -InventoryRoot $script:Dir -Tenant 't') | Should -BeNullOrEmpty
@@ -1675,16 +1675,16 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
     }
 
     It 'Move-UnreadableStreamStateFile returns the file for the stop when it cannot be moved, and keeps the file in place' {
-        $File = Join-Path $script:Dir '.resume-state-t-stream-0.json'
+        $File = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json'
         Set-Content -LiteralPath $File -Value 'cut'
         $Now = [datetime]'2026-10-29T14:02:55'
         # The new name and -2 to -100 are all taken, so the rename fails.
-        Set-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Value 'an earlier one'
-        foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:Dir ('.resume-state-t-stream-0.json.unreadable-20261029-140255-{0}' -f $N)) -Force | Out-Null }
+        Set-Content -LiteralPath (Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json.unreadable-20261029-140255') -Value 'an earlier one'
+        foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:Dir ('.resume-state-e3b98a4da31a-stream-0.json.unreadable-20261029-140255-{0}' -f $N)) -Force | Out-Null }
         $R = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now $Now
         $R.MovedTo | Should -BeNullOrEmpty
         Test-Path -LiteralPath $File | Should -BeTrue
-        Get-Content -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-0.json.unreadable-20261029-140255') -Raw | Should -Match 'an earlier one'
+        Get-Content -LiteralPath (Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-0.json.unreadable-20261029-140255') -Raw | Should -Match 'an earlier one'
         $R.NotMoved | Should -BeTrue
         # At startup the wrapper stops with exit 1 and names the file; nothing is printed here.
         @($script:Lines) | Should -BeNullOrEmpty
@@ -1692,31 +1692,31 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
 
     It 'Write-UnreadableStreamStateSummary says whether the state was cleared or kept, and where the file went' {
         $Files = @(
-            [pscustomobject]@{ Name = '.resume-state-t-stream-1.json'; MovedTo = '.resume-state-t-stream-1.json.unreadable-20261029-140255' }
-            [pscustomobject]@{ Name = '.resume-state-t-stream-2.json'; MovedTo = $null }
+            [pscustomobject]@{ Name = '.resume-state-e3b98a4da31a-stream-1.json'; MovedTo = '.resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255' }
+            [pscustomobject]@{ Name = '.resume-state-e3b98a4da31a-stream-2.json'; MovedTo = $null }
         )
         Write-UnreadableStreamStateSummary -Unreadable $Files -StateKept $false
         Write-UnreadableStreamStateSummary -Unreadable $Files[0] -StateKept $true
         Write-UnreadableStreamStateSummary -Unreadable @() -StateKept $false
         @($script:Lines) | Should -Be @(
-            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-t-stream-1.json could not be read and was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255; its records were not used.'
-            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-t-stream-2.json could not be read and was left in place (it could not be moved aside); its records were not used.'
-            'Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-1.json could not be read and was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255; its records were not used.'
+            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-e3b98a4da31a-stream-1.json could not be read and was moved aside to .resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255; its records were not used.'
+            'Resume state cleared, but not a clean run: the per-stream state file .resume-state-e3b98a4da31a-stream-2.json could not be read and was left in place (it could not be moved aside); its records were not used.'
+            'Resume state kept, but not a clean run: the per-stream state file .resume-state-e3b98a4da31a-stream-1.json could not be read and was moved aside to .resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255; its records were not used.'
         )
     }
 
     It 'Move-UnreadableStreamStateFile under -ResumeFailedOnly says a later -Resume collects the subscriptions' {
-        $File = Join-Path $script:Dir '.resume-state-t-stream-1.json'
+        $File = Join-Path $script:Dir '.resume-state-e3b98a4da31a-stream-1.json'
         Set-Content -LiteralPath $File -Value '{ "Completed": [ "sub-b" ]'
         $null = Move-UnreadableStreamStateFile -File (Get-Item -LiteralPath $File -Force) -Now ([datetime]'2026-10-29T14:02:55') -ResumeFailedOnly
         @($script:Lines) | Should -Be @(
-            'WARNING: The per-stream state file .resume-state-t-stream-1.json from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and a later -Resume collects them (-ResumeFailedOnly retries only the retry list). It was moved aside to .resume-state-t-stream-1.json.unreadable-20261029-140255.'
+            'WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-1.json from an interrupted parallel run could not be read, so its records are not used: the subscriptions it lists are not counted as completed and a later -Resume collects them (-ResumeFailedOnly retries only the retry list). It was moved aside to .resume-state-e3b98a4da31a-stream-1.json.unreadable-20261029-140255.'
         )
     }
 
     It 'Remove-ResumeStateFiles removes the per-stream files and the resume state file, and prints nothing' {
-        $Stream = @('0', '1') | ForEach-Object { Join-Path $script:Dir ('.resume-state-t-stream-{0}.json' -f $_) }
-        $State = Join-Path $script:Dir '.resume-state-t.json'
+        $Stream = @('0', '1') | ForEach-Object { Join-Path $script:Dir ('.resume-state-e3b98a4da31a-stream-{0}.json' -f $_) }
+        $State = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
         foreach ($Path in @($Stream) + $State) { Set-Content -LiteralPath $Path -Value '{}' }
         @(Remove-ResumeStateFiles -StreamFiles $Stream -StateFile $State) | Should -BeNullOrEmpty
         @(Get-ChildItem -LiteralPath $script:Dir -Force) | Should -BeNullOrEmpty
@@ -1727,8 +1727,8 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
     }
 
     It 'Remove-ResumeStateFiles keeps the resume state file while a per-stream file cannot be removed' {
-        $Stream = @('0', '1') | ForEach-Object { Join-Path $script:Dir ('.resume-state-t-stream-{0}.json' -f $_) }
-        $State = Join-Path $script:Dir '.resume-state-t.json'
+        $Stream = @('0', '1') | ForEach-Object { Join-Path $script:Dir ('.resume-state-e3b98a4da31a-stream-{0}.json' -f $_) }
+        $State = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
         foreach ($Path in @($Stream) + $State) { Set-Content -LiteralPath $Path -Value '{}' }
         Mock Remove-Item { throw 'denied' } -ParameterFilter { $LiteralPath -like '*-stream-0.json' }
         $Left = @(Remove-ResumeStateFiles -StreamFiles $Stream -StateFile $State)
@@ -1736,22 +1736,22 @@ Describe 'Resume-state helpers: the retry list and an unreadable per-stream file
         Test-Path -LiteralPath $Stream[1] | Should -BeFalse
         Test-Path -LiteralPath $State | Should -BeTrue
         @($script:Lines) | Should -Be @(
-            'WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: denied'
-            '  The resume state file .resume-state-t.json is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.'
+            'WARNING: Could not remove the per-stream state file .resume-state-e3b98a4da31a-stream-0.json: denied'
+            '  The resume state file .resume-state-e3b98a4da31a.json is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.'
         )
     }
 
     It 'Remove-ResumeStateFiles names a resume state file that cannot be removed, or that is still there after the removal' {
-        $State = Join-Path $script:Dir '.resume-state-t.json'
+        $State = Join-Path $script:Dir '.resume-state-e3b98a4da31a.json'
         Set-Content -LiteralPath $State -Value '{}'
         Mock Remove-Item { throw 'denied' }
         @(Remove-ResumeStateFiles -StateFile $State) | Should -Be @($State)
         Mock Remove-Item { }
         @(Remove-ResumeStateFiles -StateFile $State) | Should -Be @($State)
         @($script:Lines) | Should -Be @(
-            'WARNING: Could not remove the resume state file .resume-state-t.json: denied'
+            'WARNING: Could not remove the resume state file .resume-state-e3b98a4da31a.json: denied'
             '  The next run reads it again and retries the removal.'
-            'WARNING: Could not remove the resume state file .resume-state-t.json: it is still there after the removal'
+            'WARNING: Could not remove the resume state file .resume-state-e3b98a4da31a.json: it is still there after the removal'
             '  The next run reads it again and retries the removal.'
         )
     }
@@ -1931,7 +1931,7 @@ exit 1
             $script:CaseHome = $CaseHome
             $script:CaseRoot = Join-Path $CaseHome 'InventoryReports'
             $script:CaseScenario = Join-Path $CaseHome 'scenario.json'
-            $script:CaseState = Join-Path $script:CaseRoot ('.resume-state-{0}.json' -f $script:WrapperTenant)
+            $script:CaseState = Join-Path $script:CaseRoot ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:WrapperTenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         }
 
         function script:Set-WrapperScenario
@@ -2014,7 +2014,7 @@ exit 1
     function script:Get-StreamStateFiles
         {
             if (-not (Test-Path -LiteralPath $script:CaseRoot)) { return @() }
-            @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:WrapperTenant))
+            @(Get-ChildItem -LiteralPath $script:CaseRoot -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:WrapperTenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
         }
         function script:Get-StreamCompletedIds
         {

@@ -104,7 +104,7 @@ if ($Scenario.CutStreamFile -and $Scenario.CutStreamFile.AfterId -eq $Subscripti
     $Done = '.rda-stream-*-{0}-summary.json' -f $Cut.Stream
     $Deadline = (Get-Date).AddSeconds(240)
     while (@(Get-ChildItem -LiteralPath $Root -Force -File -Filter $Done -ErrorAction SilentlyContinue).Count -eq 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
-    $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f $TenantID, $Cut.Stream)
+    $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantID).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Cut.Stream)
     if ($Cut.Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Target, [byte[]]@()) }
     else { $Raw = Get-Content -LiteralPath $Target -Raw; Set-Content -LiteralPath $Target -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
 }
@@ -264,7 +264,7 @@ function global:Compress-Archive
         New-Item -ItemType Directory -Path $script:CaseHome -Force | Out-Null
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         # Every wrapper run of the test, kept whole for Write-FailedCaseRuns.
         $script:CaseRuns = [System.Collections.Generic.List[object]]::new()
         $script:ErrorMark = $Error.Count
@@ -397,12 +397,12 @@ function global:Compress-Archive
     function script:Get-StreamFiles
     {
         if (-not (Test-Path -LiteralPath $script:Root)) { return @() }
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant))
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
     }
     function script:Get-StreamLikeFiles
     {
         if (-not (Test-Path -LiteralPath $script:Root)) { return @() }
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -like ('.resume-state-{0}-stream-*' -f $script:Tenant) })
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -like ('.resume-state-{0}-stream-*' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())) })
     }
     # The ids the per-stream state files record as completed, and as failed.
     function script:Get-StreamCompletedIds
@@ -500,7 +500,7 @@ function global:Compress-Archive
                 $Completed += $Id
                 $Reports += [pscustomobject]@{ Id = $Id; Name = $script:Subs[$Letter].Name; Zip = [System.IO.Path]::GetRelativePath($script:Root, $Zip); Obfuscated = $false }
             }
-            $Name = if ($Names.ContainsKey($Stream)) { $Names[$Stream] } else { '.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stream }
+            $Name = if ($Names.ContainsKey($Stream)) { $Names[$Stream] } else { '.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Stream }
             [pscustomobject]@{ Tenant = $script:Tenant; StreamId = [string]$Stream; Completed = @($Completed); FailedAttempts = @(); Reports = @($Reports) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root $Name) -Encoding utf8
         }
     }
@@ -1156,7 +1156,7 @@ Describe 'Resolve-RunStart and its readers' {
     It 'Write-StreamState writes through a temporary file: a write cut short leaves the earlier per-stream file whole' {
         $Dir = Join-Path $script:TestBase ('unit-' + [guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        $File = Join-Path $Dir '.resume-state-t-stream-0.json'
+        $File = Join-Path $Dir '.resume-state-e3b98a4da31a-stream-0.json'
         $TenantID = 't'; $StreamId = '0'; $RunId = 'run-1'
         $StreamRunRecord = [pscustomobject]@{ RunStartedAt = '2026-10-30T12:00:00.0000000Z'; RunSettings = [pscustomobject]@{ Obfuscate = $false; SkipMetrics = $true; SkipConsumption = $false; IncludeDisabled = $false }; ConsumptionWindowStart = '2026-09-29'; ConsumptionWindowEnd = '2026-10-29' }
         Write-StreamState -Path $File -Completed @('sub-a') -FailedAttempts @() -Reports @()
@@ -1660,7 +1660,7 @@ Describe 'One run record in every write, and advice that runs as stated' -Skip:$
         $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         $R2.ExitCode | Should -Be 1
         (script:Read-StateFile).RunSettings.Obfuscate | Should -BeFalse -Because 'the -Fresh run wrote its own record with the retry list'
-        $R2.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f $script:Tenant)
+        $R2.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $R2.Text | Should -Contain 'Excluded 1 non-Enabled subscription(s) [Disabled: 1]. To inventory them anyway, start a new run with -Fresh -IncludeDisabled.'
         @($R2.Text | Where-Object { $_ -like '*re-run with -SkipConsumption*' -or $_ -like '*Use -IncludeDisabled*' }) | Should -BeNullOrEmpty
         # Run 3, the advised -Fresh -SkipConsumption (role checks pass now): a new run, exit 0, clean.
@@ -1760,7 +1760,7 @@ Describe 'One run record in every write, and advice that runs as stated' -Skip:$
     It '-ResumeFailedOnly with only a per-stream file that is not the right shape says it stops, not that it continues (exit 1); then no run to retry (exit 1); then a new run' {
         script:Set-Scenario -Subs 'A', 'B'
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
-        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Value '{"Completed": 5, "FailedAttempts": "x"}' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))) -Value '{"Completed": 5, "FailedAttempts": "x"}' -Encoding utf8
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         $R1.ExitCode | Should -Be 1
         @($R1.Text | Where-Object { $_ -like '*It continues that run*' -or $_ -like 'Continuing *' }) | Should -BeNullOrEmpty
@@ -1835,7 +1835,7 @@ Describe 'Resume by default: the state each run records, and the advice it print
     It '-ResumeFailedOnly with no resume state file and only a per-stream file that cannot be parsed has no run to retry: exit 1, twice; then a new run' {
         script:Set-Scenario -Subs 'A', 'B'
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
-        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Value '{ cut' -NoNewline
+        Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))) -Value '{ cut' -NoNewline
         foreach ($N in 1, 2)
         {
             $R = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
@@ -1857,7 +1857,7 @@ Describe 'Resume by default: the state each run records, and the advice it print
         {
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 1
-            $R.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f $script:Tenant)
+            $R.Text | Should -Contain ('  3. Or start a new run with -Fresh -SkipConsumption to inventory without consumption data: the resume state file .resume-state-{0}.json is kept, and a run that continues it keeps its settings.' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
             $R.Text | Should -Not -Contain '  3. Or re-run with -SkipConsumption to inventory without consumption data.'
             $R.Text | Should -Contain 'Excluded 1 non-Enabled subscription(s) [Disabled: 1]. To inventory them anyway, start a new run with -Fresh -IncludeDisabled.'
         }

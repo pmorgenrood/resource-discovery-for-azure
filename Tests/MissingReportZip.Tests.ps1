@@ -136,7 +136,7 @@ function Invoke-AzRestMethod
         New-Item -ItemType Directory -Path $script:CaseHome -Force | Out-Null
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:StateFile = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $script:StateFile = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
     }
     function script:Set-Scenario
     {
@@ -248,7 +248,7 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R1.State | Should -Not -BeNullOrEmpty
         @($R1.State.CompletedSubscriptionIds | Sort-Object) | Should -Be (script:Get-Ids $Kept)
         @($R1.State.FailedAttempts | ForEach-Object { [string]$_.Id }) | Should -Be @($MissingSub.Id)
-        Test-Path -LiteralPath (Join-Path $script:Root ('.run-lock-{0}.json' -f $script:Tenant)) | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:Root ('.run-lock-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))) | Should -BeFalse
 
         # The next run, the same command: it continues the unfinished run.
         script:Set-Scenario
@@ -314,6 +314,66 @@ Describe 'The summaries of a consolidated zip that lacks some reports' -Skip:$Is
             $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape($Sub.Id))
             $R.Zip.MainSummary | Should -Not -Match ([regex]::Escape($Sub.Name))
             ($R.Zip.RunSummary -join "`n") | Should -Not -Match ([regex]::Escape($Sub.Id))
+        }
+    }
+}
+
+Describe 'File names in the inventory folder hold no tenant id' -Skip:$IsWindows {
+    BeforeAll {
+        $script:Key = 'a3a8ee437933'
+        function script:Get-TenantNamedFiles
+        {
+            @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '12345678-1234-1234-1234-12345678901[0-9]' -or $_.Name -match '12345678' } | ForEach-Object { $_.Name })
+        }
+    }
+
+    It 'a run interrupted with its resume state under the old name (the tenant id) is continued by the next run, which moves it once; the run after that ends clean and leaves no old-name file' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+        $New = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Key)
+        Test-Path -LiteralPath $New | Should -BeTrue
+        # The state as an earlier version of this tool names it.
+        $Old = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        Move-Item -LiteralPath $New -Destination $Old
+
+        script:Set-Scenario
+        $R2 = script:Invoke-Wrapper
+        $R2.ExitCode | Should -Be 0 -Because ($R2.Text -join "`n")
+        @($R2.Text | Where-Object { $_ -like 'Renamed a resume state file*' }) | Should -Be @(('Renamed a resume state file of an earlier version of this tool to .resume-state-{0}.json: file names no longer hold the tenant id.' -f $script:Key))
+        $R2.Text | Should -Contain 'Resume: carrying 2 report(s) of subscription(s) completed by an earlier run into the consolidated zip.'
+        $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R2.Text | Should -Contain 'Resume state cleared (clean run).'
+        script:Get-TenantNamedFiles | Should -BeNullOrEmpty
+
+        $R3 = script:Invoke-Wrapper
+        $R3.ExitCode | Should -Be 0 -Because ($R3.Text -join "`n")
+        @($R3.Text | Where-Object { $_ -like 'Renamed a resume state file*' }) | Should -BeNullOrEmpty
+        $R3.Text | Should -Contain 'Starting a new run.'
+        script:Get-TenantNamedFiles | Should -BeNullOrEmpty
+    }
+
+    It 'a run lock under the old name is never moved or taken over: the run stops with exit 1 and its remove command; after it the next two runs proceed and name no file with the tenant id' {
+        script:New-Case
+        script:Set-Scenario
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $OldLock = Join-Path $script:Root ('.run-lock-{0}.json' -f $script:Tenant)
+        $Stamp = [datetime]::UtcNow.AddHours(-3).ToString('o')
+        Set-Content -LiteralPath $OldLock -Value ('{{"MachineName":"build.other.example","ProcessId":4242,"ProcessStartTimeUtc":"{0}","RunStartTimeUtc":"{0}","HeartbeatUtc":"{0}"}}' -f $Stamp) -Encoding utf8
+        $R1 = script:Invoke-Wrapper
+        $R1.ExitCode | Should -Be 1
+        $R1.Text | Should -Contain ('  Lock file:    {0}' -f $OldLock)
+        $Remove = @($R1.Text | Where-Object { $_ -match '^    Remove-Item -LiteralPath ' })
+        $Remove | Should -Be @(("    Remove-Item -LiteralPath '{0}' -Force" -f $OldLock))
+        Test-Path -LiteralPath $OldLock | Should -BeTrue
+        & ([scriptblock]::Create($Remove[0].Trim()))
+        foreach ($N in 1, 2)
+        {
+            $R = script:Invoke-Wrapper
+            $R.ExitCode | Should -Be 0 -Because ($R.Text -join "`n")
+            script:Get-TenantNamedFiles | Should -BeNullOrEmpty
         }
     }
 }

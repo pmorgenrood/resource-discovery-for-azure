@@ -129,7 +129,7 @@ if ($Scenario.CutStreamFile -and $Scenario.CutStreamFile.AfterId -eq $Subscripti
     $Done = '.rda-stream-*-{0}-summary.json' -f $Cut.Stream
     $Deadline = (Get-Date).AddSeconds(240)
     while (@(Get-ChildItem -LiteralPath $Root -Force -File -Filter $Done -ErrorAction SilentlyContinue).Count -eq 0 -and (Get-Date) -lt $Deadline) { Start-Sleep -Milliseconds 100 }
-    $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f $TenantID, $Cut.Stream)
+    $Target = Join-Path $Root ('.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantID).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Cut.Stream)
     if ($Cut.Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Target, [byte[]]@()) }
     else { $Raw = Get-Content -LiteralPath $Target -Raw; Set-Content -LiteralPath $Target -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
 }
@@ -284,7 +284,7 @@ function global:Compress-Archive
         New-Item -ItemType Directory -Path $script:CaseHome -Force | Out-Null
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         # Every wrapper run of the test, kept whole for Write-FailedCaseRuns.
         $script:CaseRuns = [System.Collections.Generic.List[object]]::new()
         $script:ErrorMark = $Error.Count
@@ -415,12 +415,12 @@ function global:Compress-Archive
     function script:Get-StreamFiles
     {
         if (-not (Test-Path -LiteralPath $script:Root)) { return @() }
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant))
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
     }
     function script:Get-StreamLikeFiles
     {
         if (-not (Test-Path -LiteralPath $script:Root)) { return @() }
-        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -like ('.resume-state-{0}-stream-*' -f $script:Tenant) })
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File | Where-Object { $_.Name -like ('.resume-state-{0}-stream-*' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())) })
     }
     # The ids the per-stream state files record as completed, and as failed.
     function script:Get-StreamCompletedIds
@@ -518,7 +518,7 @@ function global:Compress-Archive
                 $Completed += $Id
                 $Reports += [pscustomobject]@{ Id = $Id; Name = $script:Subs[$Letter].Name; Zip = [System.IO.Path]::GetRelativePath($script:Root, $Zip); Obfuscated = $false }
             }
-            $Name = if ($Names.ContainsKey($Stream)) { $Names[$Stream] } else { '.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stream }
+            $Name = if ($Names.ContainsKey($Stream)) { $Names[$Stream] } else { '.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Stream }
             [pscustomobject]@{ Tenant = $script:Tenant; StreamId = [string]$Stream; Completed = @($Completed); FailedAttempts = @(); Reports = @($Reports) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root $Name) -Encoding utf8
         }
     }
@@ -879,7 +879,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         @($R2.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
         script:Get-RecoveryLines $R2 | Should -Be @('Recovered per-stream state from an interrupted parallel run: 0 completed, 1 failed subscription record(s).')
         Get-Content -LiteralPath $script:State -Raw | Should -Be $Before -Because 'no write of the resume state went through'
-        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), ($Names -join ', ')))
         script:Test-CleanLine $R2 | Should -BeFalse
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only they hold the newer record'
 
@@ -908,7 +908,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         script:Set-Scenario -Subs 'A', 'D', 'B', 'C' -Fail 'B' -Hang 'D'
         $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'D') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' -and ((script:Get-StreamFailedIds) -join ',') -eq 'sub-b' }
         # The stream 0 file also holds a list of per-id records of a kind this version does not keep.
-        $Name = '.resume-state-{0}-stream-0.json' -f $script:Tenant
+        $Name = '.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         $File = Join-Path $script:Root $Name
         $Obj = Get-Content -LiteralPath $File -Raw | ConvertFrom-Json
         @($Obj.Completed) | Should -Be @('sub-a')
@@ -989,7 +989,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C', 'D')
         script:Get-ErrorLines $R2 | Should -Be @('ERROR processing subscription Sub B: stand-in failure for this subscription')
         $R2.Error | Should -BeNullOrEmpty
-        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), ($Names -join ', ')))
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only it holds the newer report'
 
         # Run 3, writes work again and B succeeds: the bundle carries A's newer report.
@@ -1040,7 +1040,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C', 'D')
         script:Get-ErrorLines $R2 | Should -Be @('ERROR processing subscription Sub B: stand-in failure for this subscription')
-        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', ')))
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*' }) | Should -Be @(('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), ($Names -join ', ')))
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names -Because 'only it holds the newer report'
         $null -eq (script:Read-StateFile).PSObject.Properties['CompletedReports'] | Should -BeTrue
 
@@ -1106,7 +1106,7 @@ Describe 'A run that keeps the resume state deletes the per-stream files it fold
         @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
         $Warning = @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*' })
         $Warning.Count | Should -Be 1
-        $Warning[0] | Should -Be ('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f $script:Tenant, ($Names -join ', '))
+        $Warning[0] | Should -Be ('WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run read at startup, so they are kept and a later -Resume reads them again: {1}' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), ($Names -join ', '))
         script:Test-CleanLine $R1 | Should -BeFalse
         @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object) | Should -Be $Names
 
@@ -1347,12 +1347,12 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
         . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
         $Dir = Join-Path $script:TestBase ('ro-' + [guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        $Stream = Join-Path $Dir '.resume-state-t-stream-0.json'
-        $State = Join-Path $Dir '.resume-state-t.json'
+        $Stream = Join-Path $Dir '.resume-state-e3b98a4da31a-stream-0.json'
+        $State = Join-Path $Dir '.resume-state-e3b98a4da31a.json'
         Set-Content -LiteralPath $Stream -Value '{}'
         Set-Content -LiteralPath $State -Value '{}'
-        $Denied = 'WARNING: Could not remove the per-stream state file .resume-state-t-stream-0.json: Access to the path ''{0}'' is denied.' -f $Stream
-        $Kept = '  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f '.resume-state-t.json'
+        $Denied = 'WARNING: Could not remove the per-stream state file .resume-state-e3b98a4da31a-stream-0.json: Access to the path ''{0}'' is denied.' -f $Stream
+        $Kept = '  The resume state file {0} is kept, so the next -Resume reads the same state and the per-stream state file(s) above again. Once the folder can be written, remove the file(s) named above.' -f '.resume-state-e3b98a4da31a.json'
         & chmod 555 $Dir
         try
         {
@@ -1364,7 +1364,7 @@ Describe 'A per-stream or resume state file that cannot be removed' -Skip:(-not 
             @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @($Denied, $Kept) -Because 'the stream-only removal prints the same lines'
             $Out = @(Remove-ResumeStateFiles -StateFile $State 6>&1)
             @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(
-                ('WARNING: Could not remove the resume state file .resume-state-t.json: Access to the path ''{0}'' is denied.' -f $State)
+                ('WARNING: Could not remove the resume state file .resume-state-e3b98a4da31a.json: Access to the path ''{0}'' is denied.' -f $State)
                 '  The next run reads it again and retries the removal.'
             )
         }
@@ -1394,11 +1394,11 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
             # An interrupted 3-stream run over A to F: A, B and C completed, D, E
             # and F were never reached. The write of the stream 2 file was cut short.
             script:New-InterruptedStreamState -Streams @{ 0 = @('A'); 1 = @('B'); 2 = @('C') }
-            $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f $script:Tenant)
+            $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
             if ($Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Bad, [byte[]]@()) }
             else { $Raw = Get-Content -LiteralPath $Bad -Raw; Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
             script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F'
-            $Name = '.resume-state-{0}-stream-2.json' -f $script:Tenant
+            $Name = '.resume-state-{0}-stream-2.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         }
         else
         {
@@ -1406,7 +1406,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
             # Once B's stream has finished, C's run cuts its state file short, so
             # the run reads it only in its end-of-run merge.
             script:Set-Scenario -Subs 'A', 'B', 'C' -CutAfter 'C' -CutStream 1 -CutKind $Kind
-            $Name = '.resume-state-{0}-stream-1.json' -f $script:Tenant
+            $Name = '.resume-state-{0}-stream-1.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         }
 
         $R1 = script:Invoke-Wrapper -Arguments @(if ($Resuming) { '-Resume' }) -Streams 2
@@ -1450,7 +1450,7 @@ Describe 'A per-stream state file the end-of-run merge cannot read' -Skip:$IsWin
         # and F. C completes, A, B and E fail, then D and F hang.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'A', 'B', 'E' -Hang 'D', 'F'
         $null = script:Invoke-Wrapper -Streams 3 -EndWhen { (script:Test-Hanging 'D', 'F') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-c' -and ((script:Get-StreamFailedIds) -join ',') -eq 'sub-a,sub-b,sub-e' }
-        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f $script:Tenant)
+        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-2.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $Raw = Get-Content -LiteralPath $Bad -Raw
         Set-Content -LiteralPath $Bad -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8
 
@@ -1598,7 +1598,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, two streams, interrupted after A, while every write of the resume state fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B', 'C' -BlockStateWrite
         $R1 = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'B', 'C') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
-        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
         script:Read-StateFile | Should -BeNullOrEmpty
         $Names = @(script:Get-StreamFiles | ForEach-Object { $_.Name } | Sort-Object)
 
@@ -1658,7 +1658,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B')
         script:Get-ErrorLines $R1 | Should -BeNullOrEmpty
         $R1.Error | Should -BeNullOrEmpty
-        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
         @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' }).Count | Should -BeGreaterThan 0
         # Each failed write names the folder and the command that removes it.
         $Folder = @($R1.Text | Where-Object { $_ -like 'WARNING: * is a folder with content*' } | Sort-Object -Unique)
@@ -1691,7 +1691,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R1.Error | Should -BeNullOrEmpty
         script:Get-ErrorLines $R1 | Should -Be @('ERROR processing subscription Sub C: stand-in failure for this subscription')
         # The start-of-run write fails on the folder and removes it; every later write succeeds.
-        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
+        @($R1.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
         @($R1.Text | Where-Object { $_ -like 'WARNING: Failed to persist resume state to*' -or $_ -like 'WARNING: * is a folder with content*' }) | Should -BeNullOrEmpty
         Test-Path -LiteralPath ($script:State + '.tmp') | Should -BeFalse
         [string](script:Read-StateFile).RunId | Should -Not -BeNullOrEmpty
@@ -1739,8 +1739,8 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D', 'E', 'F' -Fail 'C' -BlockStateWrite
         $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 2
         $R2.Error | Should -BeNullOrEmpty
-        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f $script:Tenant))
-        $Lead = 'WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept: ' -f $script:Tenant
+        @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written at the start*' }) | Should -Be @(($script:StartWriteWarning -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())))
+        $Lead = 'WARNING: The resume state file .resume-state-{0}.json could not be written or read back with every record of the per-stream state files this run''s streams wrote, so they are kept: ' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
         $Tail = '. The resume state file does not hold this run''s id, so a later run does not read them and may not see what this run completed or failed. Once the file can be written, start the next run with -Fresh.'
         $Lines = @($R2.Text | Where-Object { $_ -like 'WARNING: The resume state file*could not be written or read back*' })
         $Lines.Count | Should -Be 1
@@ -1771,7 +1771,7 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         # Run 1, two streams, interrupted: stream 0 completes A with a report, then hangs on C; stream 1 hangs on B.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B', 'C'
         $null = script:Invoke-Wrapper -Streams 2 -EndWhen { (script:Test-Hanging 'B', 'C') -and ((script:Get-StreamCompletedIds) -join ',') -eq 'sub-a' }
-        $Old = [string]@((Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Raw | ConvertFrom-Json).Reports)[0].Zip
+        $Old = [string]@((Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))) -Raw | ConvertFrom-Json).Reports)[0].Zip
         # Run 2, -Fresh, one stream: A completes with a new report, B fails.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B'
         $null = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
@@ -1824,7 +1824,7 @@ Describe 'A run that stops before it starts collecting keeps the earlier run id'
         $Now = (Get-Date).ToUniversalTime().ToString('o')
         Set-Content -LiteralPath $script:State -Value ('{"TenantID": "' + $script:Tenant + '", "CompletedSubscriptionIds": ["sub-a"], "FailedAttempts": [], "RunId": "run-earlier", "LastUpdated": "' + $Now + '"}') -Encoding utf8
         $Before = [System.IO.File]::ReadAllBytes($script:State)
-        $Stream1 = Join-Path $script:Root ('.resume-state-{0}-stream-1.json' -f $script:Tenant)
+        $Stream1 = Join-Path $script:Root ('.resume-state-{0}-stream-1.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         Set-Content -LiteralPath $Stream1 -Value ('{"Tenant": "' + $script:Tenant + '", "StreamId": "1", "RunId": "run-earlier", "Completed": ["sub-b"], "FailedAttempts": [{"Id": "sub-c", "Name": "Sub C", "LastFailedAt": "' + $Now + '", "Reason": "stand-in failure", "Attempts": 1}]}') -Encoding utf8
         $Worker = Join-Path (Split-Path -Path $script:Wrapper -Parent) 'Run-AllSubscriptions.Stream.ps1'
         switch ($Stop)
@@ -1883,21 +1883,21 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'renames the file with the UTC time and names it in the warning' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t-stream-3.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-e3b98a4da31a-stream-3.json'
         Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
         $Out = Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime() 6>&1
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
-        $Result.Name | Should -Be '.resume-state-t-stream-3.json'
-        $Result.MovedTo | Should -Be '.resume-state-t-stream-3.json.unreadable-20260102-030405'
+        $Result.Name | Should -Be '.resume-state-e3b98a4da31a-stream-3.json'
+        $Result.MovedTo | Should -Be '.resume-state-e3b98a4da31a-stream-3.json.unreadable-20260102-030405'
         Test-Path -LiteralPath $Path | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:UnitDir $Result.MovedTo) | Should -BeTrue
         $Warning = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
         $Warning.Count | Should -Be 1
-        $Warning[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-t-stream-3.json*could not be read, so its records are not used: * It was moved aside to .resume-state-t-stream-3.json.unreadable-20260102-030405.'
+        $Warning[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-3.json*could not be read, so its records are not used: * It was moved aside to .resume-state-e3b98a4da31a-stream-3.json.unreadable-20260102-030405.'
     }
 
     It 'Get-ResumeStateRecordMismatch names the ids whose record on disk is not the run''s' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-e3b98a4da31a.json'
         $Run = @{ CompletedIds = @('sub-a', 'sub-c'); FailedAttempts = @([pscustomobject]@{ Id = 'sub-b'; Attempts = 2 }) }
         $Ids = @('sub-a', 'sub-b')
         # No file, or one that cannot be read or is for another tenant: every id.
@@ -1919,7 +1919,7 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'Get-ResumeStateRecordMismatch compares whole records: a retry entry with the same run count' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t2.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-c44474038d45.json'
         $Earlier = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = '2026-01-01T00:00:00.0000000+00:00'; Reason = 'earlier reason'; Attempts = 1 }
         $Newer = [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = (Get-Date).ToString('o'); Reason = 'newer reason'; Attempts = 1 }
         [pscustomobject]@{
@@ -1938,7 +1938,7 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'Get-ResumeStateRecordMismatch compares every list of per-id records either side holds' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t3.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-cece8a9cecfb.json'
         $Write = { param($State) $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding utf8 }
         $Report = { param($Zip) [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Zip = $Zip; Obfuscated = $false } }
         $Run = @{ Path = $Path; Tenant = 't'; Ids = @('sub-a'); CompletedIds = @('sub-a'); FailedAttempts = @() }
@@ -2020,7 +2020,7 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'Get-ResumeStateRunId, Set-ResumeStateRunId, Test-StreamStateRunId and Save-CompletedSubscriptionIds carry the run id' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t4.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-a2f1a68a3cf7.json'
         Get-ResumeStateRunId -Path $Path -Tenant 't' | Should -BeNullOrEmpty
         try
         {
@@ -2071,7 +2071,7 @@ Describe 'The per-stream and resume state helpers' {
         @($Bare.CompletedSubscriptionIds) | Should -BeNullOrEmpty
         $Bare.RunId | Should -Be 'run-four'
         # The worker's own read takes only its run's file.
-        $Stream = Join-Path $script:UnitDir '.resume-state-t-stream-6.json'
+        $Stream = Join-Path $script:UnitDir '.resume-state-e3b98a4da31a-stream-6.json'
         Set-Content -LiteralPath $Stream -Value '{"Tenant":"t","StreamId":"6","RunId":"x","Completed":["sub-a"],"FailedAttempts":[]}' -Encoding utf8
         @((Read-StreamState -Path $Stream -RunId 'x').Completed) | Should -Be @('sub-a')
         @((Read-StreamState -Path $Stream -RunId 'y').Completed) | Should -BeNullOrEmpty
@@ -2080,14 +2080,14 @@ Describe 'The per-stream and resume state helpers' {
     It 'Remove-OtherRunStreamStateFiles removes only other runs'' readable files, and names one it cannot remove' {
         $Dir = Join-Path $script:UnitDir ('other-' + [guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        $Write = { param($N, $Body) Set-Content -LiteralPath (Join-Path $Dir ('.resume-state-t-stream-{0}.json' -f $N)) -Value $Body -Encoding utf8 }
+        $Write = { param($N, $Body) Set-Content -LiteralPath (Join-Path $Dir ('.resume-state-e3b98a4da31a-stream-{0}.json' -f $N)) -Value $Body -Encoding utf8 }
         & $Write 0 '{"Tenant":"t","StreamId":"0","RunId":"run-one","Completed":["sub-a"],"FailedAttempts":[]}'
         & $Write 1 '{"Tenant":"t","StreamId":"1","RunId":"run-two","Completed":["sub-b"],"FailedAttempts":[]}'
         & $Write 2 '{"Tenant":"t","StreamId":"2","Completed":["sub-c"],"FailedAttempts":[]}'
         & $Write 3 '{"Tenant":"t","Stre'
         $Out = @(Remove-OtherRunStreamStateFiles -InventoryRoot $Dir -Tenant 't' -RunId 'run-two' 6>&1)
-        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @('Removed the per-stream state files .resume-state-t-stream-0.json, .resume-state-t-stream-2.json, which another run wrote and no run can resume.')
-        @(Get-ChildItem -LiteralPath $Dir -Force -File | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('.resume-state-t-stream-1.json', '.resume-state-t-stream-3.json')
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @('Removed the per-stream state files .resume-state-e3b98a4da31a-stream-0.json, .resume-state-e3b98a4da31a-stream-2.json, which another run wrote and no run can resume.')
+        @(Get-ChildItem -LiteralPath $Dir -Force -File | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @('.resume-state-e3b98a4da31a-stream-1.json', '.resume-state-e3b98a4da31a-stream-3.json')
         if ($IsLinux -or $IsMacOS)
         {
             & $Write 4 '{"Tenant":"t","StreamId":"4","RunId":"run-one","Completed":[],"FailedAttempts":[]}'
@@ -2095,10 +2095,10 @@ Describe 'The per-stream and resume state helpers' {
             try
             {
                 $Out = @(Remove-OtherRunStreamStateFiles -InventoryRoot $Dir -Tenant 't' -RunId 'run-two' 6>&1)
-                if (Test-Path -LiteralPath (Join-Path $Dir '.resume-state-t-stream-4.json'))
+                if (Test-Path -LiteralPath (Join-Path $Dir '.resume-state-e3b98a4da31a-stream-4.json'))
                 {
-                    @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(('WARNING: Could not remove the per-stream state file .resume-state-t-stream-4.json, which another run wrote: Access to the path ''{0}'' is denied.' -f (Join-Path $Dir '.resume-state-t-stream-4.json')))
-                    @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0].Left | Should -Be @('.resume-state-t-stream-4.json')
+                    @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(('WARNING: Could not remove the per-stream state file .resume-state-e3b98a4da31a-stream-4.json, which another run wrote: Access to the path ''{0}'' is denied.' -f (Join-Path $Dir '.resume-state-e3b98a4da31a-stream-4.json')))
+                    @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0].Left | Should -Be @('.resume-state-e3b98a4da31a-stream-4.json')
                 }
             }
             finally { & chmod 755 $Dir }
@@ -2108,16 +2108,16 @@ Describe 'The per-stream and resume state helpers' {
     It 'Move-UntrackedStreamStateFiles renames a file holding a list this version does not keep, and says so when it cannot' {
         $Dir = Join-Path $script:UnitDir ('unused-' + [guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        $With = Join-Path $Dir '.resume-state-t-stream-0.json'
-        $Without = Join-Path $Dir '.resume-state-t-stream-1.json'
+        $With = Join-Path $Dir '.resume-state-e3b98a4da31a-stream-0.json'
+        $Without = Join-Path $Dir '.resume-state-e3b98a4da31a-stream-1.json'
         Set-Content -LiteralPath $With -Value '{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[],"Notes":[{"Id":"sub-a"}]}' -Encoding utf8
         Set-Content -LiteralPath $Without -Value '{"Tenant":"t","StreamId":"1","Completed":["sub-b"],"FailedAttempts":[]}' -Encoding utf8
         $Now = [datetime]::new(2026, 1, 2, 3, 4, 5, [DateTimeKind]::Utc)
         $Out = @(Move-UntrackedStreamStateFiles -Files @($With, $Without) -Now $Now 6>&1)
-        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @('WARNING: The per-stream state file .resume-state-t-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It was moved aside to .resume-state-t-stream-0.json.unused-20260102-030405.')
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @('WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It was moved aside to .resume-state-e3b98a4da31a-stream-0.json.unused-20260102-030405.')
         $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
         $Result.Left | Should -Be @($Without)
-        $Result.Moved[0].MovedTo | Should -Be '.resume-state-t-stream-0.json.unused-20260102-030405'
+        $Result.Moved[0].MovedTo | Should -Be '.resume-state-e3b98a4da31a-stream-0.json.unused-20260102-030405'
         Test-Path -LiteralPath ($With + '.unused-20260102-030405') | Should -BeTrue
         # A rename that fails leaves the file and says so.
         Set-Content -LiteralPath $With -Value '{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[],"Notes":[{"Id":"sub-a"}]}' -Encoding utf8
@@ -2125,7 +2125,7 @@ Describe 'The per-stream and resume state helpers' {
         New-Item -ItemType Directory -Path ($With + '.unused-20260102-030405') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path ($With + '.unused-20260102-030405') 'keep') -Value 'x'
         $Out = @(Move-UntrackedStreamStateFiles -Files @($With) -Now $Now 6>&1)
-        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-t-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It could not be moved aside (*), so a later -Resume reads it again.'
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It could not be moved aside (*), so a later -Resume reads it again.'
         @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0].NotMoved | Should -Be @($With)
         Test-Path -LiteralPath $With | Should -BeTrue
     }
@@ -2137,8 +2137,8 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'adds -2 to the name when it is taken, and -3 when that is taken too; the files already there are kept' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t-stream-7.json'
-        $Base = '.resume-state-t-stream-7.json.unreadable-20260102-030405'
+        $Path = Join-Path $script:UnitDir '.resume-state-e3b98a4da31a-stream-7.json'
+        $Base = '.resume-state-e3b98a4da31a-stream-7.json.unreadable-20260102-030405'
         Set-Content -LiteralPath (Join-Path $script:UnitDir $Base) -Value 'an earlier one' -Encoding utf8
         Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
         $Now = ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime()
@@ -2157,10 +2157,10 @@ Describe 'The per-stream and resume state helpers' {
     }
 
     It 'leaves the file in place and returns it for the stop when it cannot be renamed' {
-        $Path = Join-Path $script:UnitDir '.resume-state-t-stream-4.json'
+        $Path = Join-Path $script:UnitDir '.resume-state-e3b98a4da31a-stream-4.json'
         Set-Content -LiteralPath $Path -Value '{' -Encoding utf8
         # The new name and -2 to -100 are all taken, so the rename fails.
-        $Base = '.resume-state-t-stream-4.json.unreadable-20260102-030405'
+        $Base = '.resume-state-e3b98a4da31a-stream-4.json.unreadable-20260102-030405'
         New-Item -ItemType Directory -Path (Join-Path $script:UnitDir $Base) -Force | Out-Null
         foreach ($N in 2..100) { New-Item -ItemType File -Path (Join-Path $script:UnitDir ('{0}-{1}' -f $Base, $N)) -Force | Out-Null }
         # At startup it prints nothing: the wrapper stops with exit 1 and names it.
@@ -2174,14 +2174,14 @@ Describe 'The per-stream and resume state helpers' {
         @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) | Should -BeNullOrEmpty
         # At the end of a run it names the file and says the run ends with the stop.
         $End = @(Move-UnreadableStreamStateFile -File (Get-Item -Force -LiteralPath $Path) -Now ([datetime]'2026-01-02T03:04:05Z').ToUniversalTime() -AtRunEnd 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
-        $End[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-t-stream-4.json could not be read, and it could not be moved aside: *'
+        $End[0] | Should -BeLike 'ERROR: The per-stream state file .resume-state-e3b98a4da31a-stream-4.json could not be read, and it could not be moved aside: *'
         $End[1] | Should -BeLike '*ends with exit 1 (exit 2 when a report is missing or a subscription failed), with what to do next at its end.'
         $Summary = @(Write-UnreadableStreamStateSummary -Unreadable @($Result) -StateKept $true 6>&1 | ForEach-Object { [string]$_ })
-        $Summary | Should -Be @('Resume state kept, but not a clean run: the per-stream state file .resume-state-t-stream-4.json could not be read and was left in place (it could not be moved aside); its records were not used.')
+        $Summary | Should -Be @('Resume state kept, but not a clean run: the per-stream state file .resume-state-e3b98a4da31a-stream-4.json could not be read and was left in place (it could not be moved aside); its records were not used.')
     }
 
     It 'Remove-ResumeStateTempPath leaves a folder with content, and the PowerShell command it prints removes it from a path holding a single quote' {
-        $Folder = Join-Path (Join-Path $script:UnitDir "it's here") '.resume-state-t.json.tmp'
+        $Folder = Join-Path (Join-Path $script:UnitDir "it's here") '.resume-state-e3b98a4da31a.json.tmp'
         New-Item -ItemType Directory -Path $Folder -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Folder 'kept') -Value 'x' -Encoding utf8
         $Lines = @(Remove-ResumeStateTempPath -Path $Folder 6>&1 | ForEach-Object { [string]$_ })
@@ -2206,7 +2206,7 @@ Describe 'The recovery line after an interrupted parallel run' -Skip:$IsWindows 
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
         foreach ($Stream in @(@{ N = '0'; Id = 'sub-a' }, @{ N = '1'; Id = 'sub-b' }))
         {
-            Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-{1}.json' -f $script:Tenant, $Stream.N)) -Encoding utf8 -Value (@{ Tenant = $script:Tenant; StreamId = $Stream.N; Completed = @($Stream.Id); FailedAttempts = @($null) } | ConvertTo-Json -Depth 4)
+            Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-{1}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()), $Stream.N)) -Encoding utf8 -Value (@{ Tenant = $script:Tenant; StreamId = $Stream.N; Completed = @($Stream.Id); FailedAttempts = @($null) } | ConvertTo-Json -Depth 4)
         }
         script:Set-Scenario -Subs 'A', 'B', 'C'
         $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1

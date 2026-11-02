@@ -204,7 +204,7 @@ finally
 # ---- Per-stream resume state -------------------------------------------------
 #
 # Each stream owns a separate file. No races, no locking, simple semantics.
-$StreamStateFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json" -f $TenantID, $StreamId)
+$StreamStateFile = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $TenantID -Stream $StreamId
 
 
 
