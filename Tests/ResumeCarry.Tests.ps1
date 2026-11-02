@@ -766,7 +766,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
         $After2.Reports | Should -BeNullOrEmpty
         $After2.Failed | Should -Be @('sub-a') -Because 'a run that left no zip is a failed run, so the retry limit ends a cause that does not go away'
-        $Post2.ExitCode | Should -Be 2 -Because 'the run that left no zip still ends at the output verification, as before'
+        $Post2.ExitCode | Should -BeNullOrEmpty -Because 'the output verification names the gap and the run goes on; it exits 2 at its end (Tests/MissingReportZip.Tests.ps1)'
         ($Post2.Text -join "`n") | Should -Match 'ERROR: Per-subscription output verification failed'
         @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
         ($R.Post.Text -join "`n") | Should -Not -Match 'Resume: carrying'
