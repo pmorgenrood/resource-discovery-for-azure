@@ -132,6 +132,48 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         (Get-ZipEntryNames -Path $R.OuterZipFile) | Should -Be @('ResourcesReport_X1.zip')
     }
 
+    It 'the name it took stays on disk while the zip is built: the zip is written under a name of its own in the folder, then moved over it, and that file is not left' {
+        $Root = Join-Path $TestDrive 'reserved-kept'
+        $null = New-SubReport -Root $Root -Stamp 'R1'
+        $null = New-SubReport -Root $Root -Stamp 'R2'
+        # What Get-Date -Format returns: the formatted text.
+        Mock Get-Date { '2026-11-02_15-04-05' } -ParameterFilter { $Format -eq 'yyyy-MM-dd_HH-mm-ss' }
+        $script:ReservedName = Join-Path $Root 'AllSubscriptions_ResourcesReport_2026-11-02_15-04-05.zip'
+        $script:Builds = @()
+        # Notes where it writes and whether the name taken is still there, then
+        # writes a zip of every report given to a new file there.
+        Mock Compress-Archive -ParameterFilter { -not $Update } {
+            $script:Builds += [pscustomobject]@{ Destination = $DestinationPath; ReservedThere = (Test-Path -LiteralPath $script:ReservedName -PathType Leaf) }
+            $Zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, 'Create')
+            try { foreach ($Report in @($Path)) { $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Report, (Split-Path $Report -Leaf)) } } finally { $Zip.Dispose() }
+        }
+        $R = Invoke-BundleBlock -Root $Root
+
+        $script:Builds.Count | Should -Be 1
+        $script:Builds[0].ReservedThere | Should -BeTrue
+        $script:Builds[0].Destination | Should -Not -Be $script:ReservedName
+        Split-Path $script:Builds[0].Destination -Parent | Should -Be $Root
+        Split-Path $script:Builds[0].Destination -Leaf | Should -Not -BeLike '*.zip'
+        $R.BundleBuildError | Should -BeNullOrEmpty
+        $R.OuterZipFile | Should -Be $script:ReservedName
+        (Get-ZipEntryNames -Path $R.OuterZipFile | Sort-Object) | Should -Be @('ResourcesReport_R1.zip', 'ResourcesReport_R2.zip')
+        @(Get-ChildItem -LiteralPath $Root -File -Force | ForEach-Object { $_.Name }) | Should -Be @('AllSubscriptions_ResourcesReport_2026-11-02_15-04-05.zip')
+    }
+
+    It 'a build that fails part-way leaves no file in the folder: neither the part written nor the name it took' {
+        $Root = Join-Path $TestDrive 'part-written'
+        $null = New-SubReport -Root $Root -Stamp 'P1'
+        Mock Compress-Archive -ParameterFilter { -not $Update } {
+            Set-Content -LiteralPath $DestinationPath -Value 'PK part' -NoNewline
+            throw [System.IO.IOException]::new('No space left on device')
+        }
+        $R = Invoke-BundleBlock -Root $Root
+
+        $R.BundleBuildError | Should -BeLike '*: No space left on device'
+        $R.OuterZipFile | Should -BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath $Root -File -Force | ForEach-Object { $_.Name }) | Should -BeNullOrEmpty
+    }
+
     It 'a consolidated zip that cannot be built leaves no empty file under the name it took' {
         $Root = Join-Path $TestDrive 'reserved-failed'
         $null = New-SubReport -Root $Root -Stamp 'F9'
