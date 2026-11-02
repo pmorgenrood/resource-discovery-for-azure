@@ -1451,7 +1451,6 @@ function ExecuteInventoryProcessing()
                     $UsageDataExport = $UsageData.UsageAggregations.Properties | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime
 
                     Write-Log -Message ("Records found: $($UsageDataExport.Count)...") -Severity 'Info'
-                    $ConsumptionRecordsThisSub += $UsageDataExport.Count
 
                     $NewUsageDataExport = [System.Collections.ArrayList]::new()
 
@@ -1561,6 +1560,9 @@ function ExecuteInventoryProcessing()
                     }
 
                     $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
+                    # Rows written to the consumption file: a -ResourceGroup run leaves out the
+                    # other resource groups' rows, and a page that fails part-way writes none.
+                    $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
 
                 } while ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
             }

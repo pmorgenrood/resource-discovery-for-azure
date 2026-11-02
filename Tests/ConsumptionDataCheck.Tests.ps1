@@ -350,6 +350,37 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Global:ConsumptionRecordCount | Should -Be 1
     }
 
+    It 'counts the rows written to the consumption file, not the rows read' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        Mock Get-UsageAggregates {
+            $Rows = @(
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-3')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'says how many rows were written when a page fails part-way' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $Bad = New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-2'
+            $Bad.Properties.InstanceData = $null
+            [pscustomobject]@{ UsageAggregations = @((New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'), $Bad); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 0
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'after 0 record\(s\)'
+        $Global:ConsumptionRecordCount | Should -Be 0
+    }
+
     It 'does not say a -ResourceGroup run cannot filter consumption by resource group, since it does' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         $script:ResourceGroup = 'rg-one'
