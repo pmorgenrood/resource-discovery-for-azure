@@ -510,6 +510,7 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @{ Case = 'missing'; Value = $null }
         @{ Case = 'empty'; Value = '' }
         @{ Case = 'not JSON'; Value = '{"Microsoft.Resources": {' }
+        @{ Case = 'JSON without Microsoft.Resources'; Value = '{}' }
     ) {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         $script:BadInstance = $Value
