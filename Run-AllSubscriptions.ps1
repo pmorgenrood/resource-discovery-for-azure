@@ -3292,9 +3292,10 @@ if (@($UncarriedSkipped).Count -gt 0)
 # exited 3 for it.
 Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
 
-# A subscription whose grouped Azure Monitor request still failed after its
-# retries (throttling, timeout, server error) has incomplete metrics: the same
-# retry list, retry limit and exit 3 (5) as a failed billing download above.
+# A subscription whose Azure Monitor metric request (grouped or for one
+# metric) still failed after its retries (throttling, timeout, server error)
+# has incomplete metrics: the same retry list, retry limit and exit 3 (5) as a
+# failed billing download above.
 Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs) -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RunDataSettings)
 
 # A subscription completed this run whose report zip is missing is not in the

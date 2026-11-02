@@ -2920,9 +2920,10 @@ function Get-WrapperExitCode
         # reason other than the sign-in: its cost data is incomplete, so 3, as
         # for a data phase skipped for the sign-in.
         [bool]$ConsumptionFailed = $false,
-        # A subscription's grouped Azure Monitor request still failed after its
-        # retries (throttling, timeout, server error): its metrics are
-        # incomplete, so 3, as for a failed billing download.
+        # A subscription's Azure Monitor metric request (grouped or for one
+        # metric) still failed after its retries (throttling, timeout, server
+        # error): its metrics are incomplete, so 3, as for a failed billing
+        # download.
         [bool]$MetricsIncomplete = $false,
         # A -Resume run skipped a subscription whose earlier report zip could not
         # be carried into the consolidated zip, so that report is missing from it.
