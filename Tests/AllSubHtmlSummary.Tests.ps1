@@ -203,6 +203,20 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         $Html | Should -Not -Match 'privacy-banner obfuscated'
     }
 
+    It 'says Privacy: <Expected> on the console line when the reports hold no records to sample (-Obfuscated: <Obf>)' -ForEach @(
+        @{ Obf = $true; Expected = 'obfuscated' }
+        @{ Obf = $false; Expected = 'identifiable' }
+    ) {
+        $Run = New-Run
+        if ($Obf) { New-SubFolder -Root $Run -Services @{} -Obfuscated | Out-Null } else { New-SubFolder -Root $Run -Services @{} -SubName 'sub-a' | Out-Null }
+        $Out = Join-Path $Run 'main.html'
+
+        $Printed = @(New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated:$Obf 6>&1 | ForEach-Object { [string]$_ })
+        $Line = @($Printed | Where-Object { $_ -like '*Privacy:*' })
+        $Line.Count | Should -Be 1
+        $Line[0] | Should -BeLike ('* failed. Privacy: {0}.' -f $Expected)
+    }
+
     It 'renders run-wide charts only when -Detailed is passed' {
         $Run = New-Run
         New-SubFolder -Root $Run -Services @{ VirtualMachines = 2; StorageAcc = 1; AppServices = 1 } -SubName 'Sub A' | Out-Null
