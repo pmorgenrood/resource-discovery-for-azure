@@ -10,8 +10,11 @@
 # the parallel branch (its streams run the real Run-AllSubscriptions.Stream.ps1 in
 # this process one after the other, with the Az context import, Save-AzContext and
 # the job commands stood in), the resume-state cleanup, the summary, the
-# RunSummary.log content and the exit code. The access check is a stand-in that
-# finds every subscription readable. A stand-in ResourceInventory.ps1 writes one
+# RunSummary.log content and the exit code. The role check runs as written with
+# a stand-in check that could not finish for the ids in $Global:RdaRlUnreadableIds
+# and finds every other subscription readable; the consumption data check is a
+# stand-in that passes.
+# A stand-in ResourceInventory.ps1 writes one
 # report folder and zip per call, throws for the ids in $Global:RdaRlFailIds, and
 # records a metrics gap for the ids in $Global:RdaRlIncompleteIds.
 #
@@ -78,23 +81,13 @@ $Global:ResourceCount = 1
         (($Text -replace '\$PSScriptRoot', '$FakeScriptRoot') -replace '\$HOME\b', '$Global:RdaRlHome') -replace '"C:\\InventoryReports"', '"$Global:RdaRlHome/InventoryReports"'
     }
 
-    # Startup: from the first read of the resume state to the up-front access check.
-    # This holds the stranded-stream fold, the -Resume block, the -ResumeFailedOnly
-    # filter and everything else the wrapper does before the check.
+    # Startup, as written: from the first read of the resume state to the record of
+    # what the up-front access check skipped. This holds the stranded-stream fold,
+    # the -Resume block, the -ResumeFailedOnly filter, the access check and the
+    # consumption check. Only their probes are stand-ins (see the prologue).
     $SeedAt = script:Find-TopIndex -What 'the startup read of the completed ids' -Match { param($s) $s.Extent.Text -match '^\$CompletedIds = (@\()?Get-CompletedSubscriptionIds ' }
-    $ScopeAt = script:Find-TopIndex -After $SeedAt -What 'the access-check scope' -Match { param($s) $s.Extent.Text.StartsWith('$ScopeForProbe = ') }
-    # The completed ids are read as an array: an empty or one-id list comes back
-    # from Get-CompletedSubscriptionIds as $null or a bare string, and `+=` would
-    # then join the next id onto it. A wrapper that already reads it this way is
-    # left as written.
-    $StartText = (script:Join-Top -From $SeedAt -To ($ScopeAt - 1)).Replace(
-        '$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID' + "`n",
-        '$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ })' + "`n")
-
-    # The access check: its scope as written, then a stand-in that finds every
-    # subscription readable; then the record of what it skipped, as written.
-    $GateText = $Top[$ScopeAt].Extent.Text + "`n`$AccessDecision = [pscustomobject]@{ InaccessibleIds = @() }`n"
-    $RecordText = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$ScopeForProbe.Count -gt 0' -and $_.Extent.Text.Contains('-NotReadable $NotReadableIds') } | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $RecordAt = script:Find-TopIndex -After $SeedAt -What 'the record of what the access check skipped' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Clauses[0].Item1.Extent.Text -eq '$ScopeForProbe.Count -gt 0' -and $s.Extent.Text.Contains('-NotReadable $NotReadableIds') }
+    $StartText = script:Join-Top -From $SeedAt -To $RecordAt
 
     # The sequential loop: the body of `if ($ParallelStreams -le 1)`.
     $SeqIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' -and $args[0].Parent -is [System.Management.Automation.Language.NamedBlockAst] }, $true))
@@ -164,16 +157,18 @@ $Global:ResourceCount = 1
     "`$Global:MetricsFailedSubs = @(); `$Global:ConsumptionFailedSubs = @(); `$Global:CollectorFailures = @(); `$Global:ConsumptionRecordCount = 0`n" +
     "`$Obfuscate = [bool]`$ObfuscateRun; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null`n" +
     "`$InventoryPassthrough = @{ ConcurrencyLimit = 6 }; `$WrapperTranscriptStarted = `$false; `$Elapsed = [timespan]::Zero`n" +
-    "`$ConcurrencyLimit = 6; `$DeviceLogin = `$false; `$SkipMetrics = `$false; `$SkipConsumption = `$false; `$AllowPartialAccess = `$false`n" +
+    "`$ConcurrencyLimit = 6; `$DeviceLogin = `$false; `$SkipMetrics = `$false; `$SkipConsumption = `$false; `$AllowPartialAccess = [bool]`$Global:RdaRlAllowPartialAccess`n" +
+    "function Test-SubscriptionRoleAccessAll { param(`$Subscriptions, [string]`$ResourceGroup, [switch]`$IncludeUsage) @(`$Subscriptions) | ForEach-Object { `$Unknown = @(`$Global:RdaRlUnreadableIds) -contains `$_.Id; [pscustomobject]@{ Id = `$_.Id; Name = `$_.Name; State = `$(if (`$Unknown) { 'Unknown' } else { 'Readable' }); Verdict = `$(if (`$Unknown) { 'Unknown' } else { 'Yes' }); Reason = `$(if (`$Unknown) { 'role check inconclusive (stand-in)' } else { 'Reader (stand-in)' }); UsageVerdict = 'Yes'; UsageText = 'yes (stand-in)'; Assignments = `$null; Permissions = `$null; Seconds = 0 } } }`n" +
+    "function Invoke-ConsumptionDataCheck { param(`$Subscriptions, `$Window, `$RoleCheck, [string]`$ResourceGroup) Resolve-ConsumptionDataCheck -Window `$Window -Results @(@(`$Subscriptions) | ForEach-Object { [pscustomobject]@{ Id = `$_.Id; Name = `$_.Name; ResourceCount = 1; Outcome = 'Ok'; Passed = `$true; Detail = `$null; PageCapReached = `$false; PagesRead = 1; Seconds = 0 } }) }`n" +
     "`$AllSubscriptions = @(@(`$Subscriptions) + @(`$Global:RdaRlAlsoVisible | Where-Object { `$_ })); `$Excluded = @(`$Global:RdaRlAlsoVisible | Where-Object { `$_ }); `$RunStartTime = Get-Date; `$BundleVer = 'test'`n" +
     "`$SubWarnings = @(`$Global:RdaRlListWarnings | Where-Object { `$_ }); `$SubErrors = @(`$Global:RdaRlListErrors | Where-Object { `$_ })`n" +
-    "`$NoAccessSubs = @(); `$GenuinelyEmptySubs = @(); `$UnknownSubs = @(); `$ConsumptionRecordTotal = 0`n" +
+    "`$NoAccessSubs = @(); `$GenuinelyEmptySubs = @(); `$UnknownSubs = @(); `$ConsumptionRecordTotal = 0; `$ConsumptionWindow = Get-ConsumptionWindow`n" +
     "`$AutoTune = [pscustomobject]@{ VCpu = 2; RamGB = 4 }; `$StreamsSrc = 'explicit'; `$ConcurrencySrc = 'auto'; `$AuthSkippedPhases = @(); `$UncarriedSkipped = @()`n"
     $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$ParallelStreams, `$ObfuscateRun)`n"
     $Result = "`n[pscustomobject]@{ Kind = 'run-result'; SubResourceCounts = @(`$SubResourceCounts); FailedSubscriptions = @(`$FailedSubscriptions); RunSummary = @(`$RunSummaryLines); WrapperExitCode = `$WrapperExitCode }"
     $Tail = "`n" + $CleanupText + "`n" + $AdviceText + "`n" + $RunSummaryText + "`n" + $ExitText + $Result
 
-    $Start = $Params + $Prologue + $StartText + "`n" + $GateText + $RecordText + "`n"
+    $Start = $Params + $Prologue + $StartText + "`n"
     $script:SequentialBlock = [scriptblock]::Create($Start + ". " + $SeqText + $Tail)
     # The same run, with a consolidated zip that could not be built.
     $script:SequentialZipFailBlock = [scriptblock]::Create($Start + ". " + $SeqText + "`n`$BundleBuildError = 'stand-in: the consolidated zip could not be built'" + $Tail)
@@ -244,12 +239,16 @@ $Global:ResourceCount = 1
         # Warnings and errors the subscription listing came back with.
         $Global:RdaRlListWarnings = @()
         $Global:RdaRlListErrors = @()
+        # Subscriptions the access check's stand-in probe finds not readable, and
+        # whether the run has -AllowPartialAccess.
+        $Global:RdaRlUnreadableIds = @()
+        $Global:RdaRlAllowPartialAccess = $false
         $script:State = Join-Path $script:Root '.resume-state-t.json'
     }
 }
 
 AfterAll {
-    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaRlRoot, RdaRlFailIds, RdaRlIncompleteIds, RdaRlNoZipIds, RdaRlHome, RdaRlCalls, RdaRlAlsoVisible, RdaRlListWarnings, RdaRlListErrors, RdaRlUnreadableIds, RdaRlAllowPartialAccess -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -931,5 +930,41 @@ Describe 'A stream that did not start on the parallel path' {
         $Next = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2 -Resume
         [int](script:Get-Entry -Id 'sub-a').Attempts | Should -Be 1
         @(script:Get-Lines -Run $Next -Like 'Not counted toward the retry limit:*') | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A resume state that lists exactly one completed subscription' {
+    BeforeAll {
+        Mock Import-Module -ParameterFilter { $Name -eq 'Az.Accounts' } -MockWith { }
+        Mock Get-AzContextAutosaveSetting -MockWith { [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+        Mock Disable-AzContextAutosave -MockWith { }
+        Mock Import-AzContext -MockWith { }
+    }
+    BeforeEach { script:New-Case }
+
+    # Get-CompletedSubscriptionIds returns one id as a bare string. Joined with
+    # the streams' ids, it became one text that matches no id, so the retry entry
+    # of a subscription the run completed was never removed.
+    It 'a run without -Resume that collects the subscription past the limit takes it off the retry list, and the next -Resume ends 0 (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlFailIds = @('sub-x')
+        $Subs = @($script:A, $script:X)
+        $null = script:Invoke-Run -Subs $Subs
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
+        @((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).CompletedSubscriptionIds) | Should -Be @('sub-a')
+
+        $Global:RdaRlFailIds = @()
+        $Run = script:Invoke-Run -Subs $Subs -Streams $Streams
+        @($Run.Calls) | Should -Contain 'sub-x'
+        script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty -Because 'the run completed it'
+        @(script:Get-Lines -Run $Run -Like 'Retry Limit Reached:*') | Should -BeNullOrEmpty
+        $Run.Result.WrapperExitCode | Should -Be 0
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+
+        $Next = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+        @(script:Get-Lines -Run $Next -Like 'Not retried:*') | Should -BeNullOrEmpty
+        @($Next.Calls | Sort-Object -Unique) | Should -Be @('sub-a', 'sub-x')
+        $Next.Result.WrapperExitCode | Should -Be 0
     }
 }
