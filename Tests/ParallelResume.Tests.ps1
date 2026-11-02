@@ -1521,6 +1521,18 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         script:Get-Collected $R3 | Should -Be (script:Get-Ids 'C')
         $R3.Text | Should -Not -Contain 'Skipping (already completed): Sub C (sub-c)'
         script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        if ($Next -eq '-ResumeFailedOnly')
+        {
+            # Its consolidated zip holds Sub C only; the reports of the others are
+            # owed, so it keeps the state and exits 2. The -Resume run it names
+            # collects nothing, carries them and ends clean.
+            $R3.ExitCode | Should -Be 2
+            script:Test-CleanLine $R3 | Should -BeFalse
+            @($R3.Text | Where-Object { $_ -like 'Not finished: -ResumeFailedOnly puts only the reports it collected into its consolidated zip*' }).Count | Should -Be 1
+            $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+            script:Get-Collected $R3 | Should -BeNullOrEmpty
+            script:Get-RecoveryLines $R3 | Should -BeNullOrEmpty
+        }
         script:Test-CleanLine $R3 | Should -BeTrue
         @($R3.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -BeNullOrEmpty
         @($R3.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f ($Others -join ', ')))
@@ -1586,11 +1598,18 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         $R4 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         script:Get-Collected $R4 | Should -Be (script:Get-Ids 'D')
         [string](script:Read-StateFile).RunId | Should -Be $Id
-        # Run 5, -ResumeFailedOnly: D succeeds and the state clears.
+        # Run 5, -ResumeFailedOnly: D succeeds. Its consolidated zip holds Sub D
+        # only, so the state is kept, still with the id, for the reports of the
+        # others; run 6, the -Resume it names, carries them and clears the state.
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R5 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         script:Get-Collected $R5 | Should -Be (script:Get-Ids 'D')
-        script:Test-CleanLine $R5 | Should -BeTrue
+        $R5.ExitCode | Should -Be 2
+        script:Test-CleanLine $R5 | Should -BeFalse
+        [string](script:Read-StateFile).RunId | Should -Be $Id
+        $R6 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R6 | Should -BeNullOrEmpty
+        script:Test-CleanLine $R6 | Should -BeTrue
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 
