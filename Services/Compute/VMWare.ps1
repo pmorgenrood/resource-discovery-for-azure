@@ -18,7 +18,8 @@ if ($Task -eq 'Processing')
                 'ResourceGroup'            = $1.RESOURCEGROUP;
                 'Name'                     = $1.NAME;
                 'Location'                 = $1.LOCATION;
-                'SKU'                      = $Data.sku.name;
+                # The SKU is on the resource itself, not in its properties.
+                'SKU'                      = $1.sku.name;
                 'AvailabilityStrategy'     = $Data.availability.strategy;
                 'Encryption'               = $Data.encryption.status;
                 'ClusterSize'              = $Data.managementCluster.clusterSize;
