@@ -12,6 +12,9 @@
 #     one call per metric, so only the invalid metric is marked as an error;
 #   - a group that fails for another reason (throttling, server error) is retried
 #     and does not fall back to one call per metric;
+#   - a request, grouped or for one metric, that still fails after its retries
+#     for a reason other than BadRequest makes its subscription metrics
+#     incomplete;
 #   - one call never asks for more than 20 metric names;
 #   - the diagnostics summary counts metric definitions, not calls;
 #   - each metric's diagnostics time is the time of the request that answered it;
@@ -99,6 +102,13 @@ function Get-AzMetric
         'Status500Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::InternalServerError) }
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
+        'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+    }
+    # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
+    switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
+    {
+        'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
+        'ServiceUnavailable' { throw "Operation returned an invalid status code 'ServiceUnavailable'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
     }
 
@@ -190,7 +200,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -206,6 +216,7 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_INVALID = $Invalid
         $env:RDA_TEST_METRIC_OMIT = $Omit
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
+        $env:RDA_TEST_METRIC_SINGLE_ERROR = $SingleError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $env:RDA_TEST_METRIC_POINTS = $PointsFile
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
@@ -250,7 +261,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_METRIC_SINGLE_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -661,5 +672,75 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $null = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-clean'
 
         @($Global:MetricsFailedSubs).Count | Should -Be 0
+    }
+}
+
+Describe 'Metrics.ps1 subscriptions whose single-metric request still fails after its retries' {
+    BeforeAll {
+        $script:IncompleteVm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-incomplete'
+        $script:IncompleteDisk = New-TestDisk -Name 'disk-incomplete'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_single') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'records the subscription as metrics incomplete when a single-metric request fails with <SingleError> on every attempt' -ForEach @(@{ SingleError = 'Throttled' }, @{ SingleError = 'ServiceUnavailable' }) {
+        # The VM's two metrics are requested one at a time, each with its own request.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-' + $SingleError) -SingleError $SingleError
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Name | Should -Be 'test-subscription'
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeOfType [bool]
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].ReportFolder | Should -Be 'ResourcesReport_single'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
+
+        # Each request keeps its retries: 4 attempts for each of the 2 metrics.
+        $Run.Calls.Count | Should -Be 8
+        $Run.Records.Count | Should -Be 2
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'records it when a request for one metric, after Azure rejected the grouped request, fails with ServiceUnavailable on every attempt' {
+        # The four requests of the group run one after another, each with its retries.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'fallback-single-unavailable' -MultiError 'BadRequest' -SingleError 'ServiceUnavailable'
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+
+        # One rejected grouped request, then 4 attempts for each of the 4 metrics.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 16
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+    }
+
+    It 'does not record it when a single-metric request fails with BadRequest on every attempt' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName 'single-badrequest' -SingleError 'BadRequest'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        # The retries are unchanged: 4 attempts for each of the 2 metrics.
+        $Run.Calls.Count | Should -Be 8
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
+    }
+
+    It 'does not record it when the request for a metric Azure rejects fails with BadRequest' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'fallback-single-badrequest' -Invalid 'disk-incomplete|Composite Disk Write Bytes/sec'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        $Errors = @($Run.Records | Where-Object { $_.MetricError })
+        $Errors.Count | Should -Be 1
+        $Errors[0].Metric | Should -Be 'Composite Disk Write Bytes/sec'
     }
 }
