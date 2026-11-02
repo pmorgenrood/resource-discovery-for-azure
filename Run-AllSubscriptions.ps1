@@ -472,6 +472,9 @@ $RunStartTime = Get-Date
 $FailedSubscriptions = @()
 # Set by Save-CompletedSubscriptionIds when a save of the resume state fails.
 $ResumeStateSaveFailed = $false
+# The subscriptions collected this run without a report zip being written
+# ({ Id; Name }), named when the per-subscription output check finds the gap.
+$NoReportSubs = @()
 
 # Per-subscription metrics-phase auth health, aggregated across the whole run.
 # This is the metrics counterpart to $Global:ConsumptionFailedSubs and works the
@@ -1428,6 +1431,7 @@ if ($ParallelStreams -le 1)
                 # carry: the sub is not completed. As after a failed attempt, an
                 # earlier run's completion of it ends here, so the next -Resume
                 # collects it again instead of carrying the older report.
+                $NoReportSubs += [pscustomobject]@{ Id = [string]$Sub.Id; Name = [string]$Sub.Name }
                 if ($CompletedIds -contains $Sub.Id)
                 {
                     $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
@@ -1651,6 +1655,7 @@ else
                 {
                     # Same as the sequential branch: a run that left no zip does not
                     # complete the sub, and ends an earlier run's completion of it.
+                    $NoReportSubs += [pscustomobject]@{ Id = [string]$Sub.Id; Name = [string]$Sub.Name }
                     if ($CompletedIds -contains $Sub.Id)
                     {
                         $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
@@ -1959,6 +1964,7 @@ else
                 if ($StreamSummary.NoReport)
                 {
                     $StreamNoReportIds += @($StreamSummary.NoReport | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [string]$_.Id })
+                    $NoReportSubs += @($StreamSummary.NoReport | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } | ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; Name = [string]$_.Name } })
                 }
 
                 # Each stream skips (on -Resume) the subs its own state file lists
@@ -2271,9 +2277,9 @@ if ($Resume -and @($SkippedSubscriptions).Count -gt 0)
 }
 $CarriedFolderNames = @($CarriedReports | ForEach-Object { $_.Folder })
 
-# === Per-subscription output verification (hard-stop) ========================
+# === Per-subscription output verification =====================================
 #
-# Hard-fail with exit code 2 (distinct from auth/runtime exit code 1) if the
+# The run ends with exit code 2 (distinct from auth/runtime exit code 1) if the
 # number of per-subscription zip files written by this invocation is lower
 # than the number of subscriptions that ran to completion this invocation.
 #
@@ -2282,9 +2288,9 @@ $CarriedFolderNames = @($CarriedReports | ForEach-Object { $_.Folder })
 # quarantine, Cloud Shell ephemeral-storage eviction between worker exit and
 # wrapper consolidation, a worker that crashed after the inner script logged
 # completion but before its zip flushed, an out-of-disk-space write that the
-# inner script silently swallowed - the wrapper would silently consolidate
-# the smaller set and tell the operator everything succeeded. The downstream
-# consumer then discovers an incomplete archive days later.
+# inner script silently swallowed - the consolidated zip holds the smaller set,
+# so the run names what is missing (console and RunSummary.log), keeps the
+# resume state and exits 2 instead of reporting success.
 #
 # Invariant. ResourceInventory.ps1 always writes a per-sub zip on a
 # successful return, even when the sub holds zero resources (it still emits
@@ -2298,6 +2304,11 @@ $CarriedFolderNames = @($CarriedReports | ForEach-Object { $_.Folder })
 # On -Resume, the zips carried from an earlier run count on both sides: they
 # were checked when carried and are added to the found set below.
 $ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
+# A gap does not stop the run: the consolidated zip is built from the reports
+# that exist, the missing ones are named at the end, the resume state is kept
+# and the run exits 2, so the next -Resume collects them and carries the others.
+$MissingReports = @()
+$MissingReportCount = 0
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
     $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
@@ -2325,17 +2336,40 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host "  - A parallel worker crashed after the inner script logged completion but before flushing the zip to disk." -ForegroundColor Yellow
         Write-Host "  - Out-of-disk-space write that the inner script swallowed silently." -ForegroundColor Yellow
         Write-Host ""
+        # The subscriptions whose report is missing, by name: those whose run wrote
+        # no zip (not completed already), and those completed this run whose
+        # recorded zip is gone since. A gone one is taken off the completed list
+        # the same way, so the next -Resume collects it again instead of failing
+        # to carry its report. The latest record of a subscription completed this
+        # run is the one this run wrote.
+        $LatestReports = Get-LatestCompletedReports -Reports $CompletedReports
+        $GoneRecords = @(foreach ($S in @($SubResourceCounts))
+            {
+                $Id = [string]$S.Id
+                if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
+                $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
+                if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
+                if (-not (Test-Path -LiteralPath (Join-Path $InventoryRoot ([string]$ZipProp.Value)) -PathType Leaf)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
+            })
+        foreach ($Gone in $GoneRecords)
+        {
+            $CompletedIds = @($CompletedIds | Where-Object { $_ -ne [string]$Gone.Id })
+            $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne [string]$Gone.Id })
+        }
+        if ($GoneRecords.Count -gt 0)
+        {
+            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+        }
+        $MissingReports = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
+        $MissingReportCount = [math]::Max($MissingCount, $MissingReports.Count)
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
-        Write-Host "Recover by either:" -ForegroundColor Yellow
-        Write-Host "  - Locating the missing per-sub directory under the inventory root and inspecting why its zip is absent, OR" -ForegroundColor Yellow
-        Write-Host "  - Re-running with -Resume to re-collect any unprocessed/missing subscription." -ForegroundColor Yellow
+        Write-Host "The consolidated zip is built from the reports that exist; the missing ones are named under FAILED (report missing) at the end." -ForegroundColor Yellow
         if ($WrapperTranscriptStarted)
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
-        Exit-Wrapper -Code 2
     }
-    if ($UncarriedSkipped.Count -gt 0)
+    elseif ($UncarriedSkipped.Count -gt 0)
     {
         Write-Host ("Per-subscription output verification: INCOMPLETE ({0} zip(s) found, but {1} subscription(s) skipped by -Resume have no earlier report to carry - see FAILED (earlier report not carried) below)" -f $ActualZipCount, $UncarriedSkipped.Count) -ForegroundColor Red
     }
@@ -2543,7 +2577,7 @@ $RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $Retry
 # or when they are no longer visible. ResourceInventory.ps1 run on its own does
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
-if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and -not ($MissingReportCount -gt 0) -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
 {
     try
     {
@@ -2880,6 +2914,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -RetryLimited $RetryLimited `
             -NotInRun $RetryOwedNotInRun `
             -ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `
+            -MissingReportCount $MissingReportCount -MissingReports $MissingReports `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
@@ -3099,6 +3134,27 @@ if (@($UncarriedSkipped).Count -gt 0)
     Write-Host "=================================================================" -ForegroundColor Red
 }
 
+# A subscription collected this run whose report zip is missing is not in the
+# consolidated zip, which holds the reports that exist. It is not completed and
+# the resume state is kept, so the next -Resume collects it again and carries
+# the others; sets exit code 2 below.
+if ($MissingReportCount -gt 0)
+{
+    Write-Host ""
+    Write-Host "================== FAILED (report missing) ==================" -ForegroundColor Red
+    Write-Host ("{0} subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:" -f $MissingReportCount) -ForegroundColor Red
+    foreach ($M in @($MissingReports))
+    {
+        Write-Host ("  - {0} ({1})" -f $M.Name, $M.Id) -ForegroundColor Red
+    }
+    if (@($MissingReports).Count -lt $MissingReportCount)
+    {
+        Write-Host ("  ({0} more could not be named; see 'Per-subscription output verification failed' above.)" -f ($MissingReportCount - @($MissingReports).Count)) -ForegroundColor Red
+    }
+    Write-Host "The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip." -ForegroundColor Red
+    Write-Host "=============================================================" -ForegroundColor Red
+}
+
 # A save of the resume state that failed this run (Save-CompletedSubscriptionIds
 # warned), with no later save that reached the disk, can leave the file listing
 # a subscription this run failed as completed, so a -Resume run would skip it
@@ -3130,7 +3186,7 @@ if ($null -ne $BundleBuildError -or $InventoryFolderGone)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing (($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) -or (@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or (@($UnreadableStreamFiles).Count -gt 0) -or (@($LeftStreamFiles).Count -gt 0) -or (@($RetryOwedNotInRun).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing (($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) -or (@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or (@($UnreadableStreamFiles).Count -gt 0) -or (@($LeftStreamFiles).Count -gt 0) -or (@($RetryOwedNotInRun).Count -gt 0) -or ($MissingReportCount -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode

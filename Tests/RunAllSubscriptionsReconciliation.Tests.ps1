@@ -449,6 +449,18 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Lines | Should -Not -Contain '  - (all) ((auth)): stand-in'
     }
 
+    It 'counts the subscriptions whose report is missing, and names them only in a non-obfuscated run' {
+        $Missing = @([pscustomobject]@{ Name = 'Contoso-Prod-Sub'; Id = '12345678-1234-1234-1234-123456789012' })
+        $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing)
+        $Clear | Should -Contain '  Report missing      : 2 (completed, but their report zip is not in this zip; a -Resume collects them)'
+        $Clear | Should -Contain '  - Contoso-Prod-Sub (12345678-1234-1234-1234-123456789012)'
+        $Obf = (Get-RunSummaryLogContent -Obfuscated -MissingReportCount 2 -MissingReports $Missing) -join "`n"
+        $Obf | Should -Match 'Report missing\s+: 2'
+        $Obf | Should -Not -Match 'Contoso'
+        $Obf | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+        (Get-RunSummaryLogContent) -join "`n" | Should -Not -Match 'Report missing'
+    }
+
     It 'still names a failed subscription given as an object with Name and Id' {
         $Lines = @(Get-RunSummaryLogContent -FailedSubscriptions $script:Failed)
         $Lines | Should -Contain '  - Contoso-Prod-Sub (11111111-1111-1111-1111-111111111111)'

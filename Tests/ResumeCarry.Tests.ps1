@@ -382,7 +382,7 @@ Describe 'Exit code when an earlier report is missing from the consolidated zip'
 
     It 'the wrapper passes the uncarried list to the exit code and prints the FAILED banner before its transcript stops' {
         $Src = Get-Content -LiteralPath $script:WrapperPath -Raw
-        $Src | Should -Match ([regex]::Escape('Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing (($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) -or (@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or (@($UnreadableStreamFiles).Count -gt 0) -or (@($LeftStreamFiles).Count -gt 0) -or (@($RetryOwedNotInRun).Count -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)'))
+        $Src | Should -Match ([regex]::Escape('Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -ReportsMissing (($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) -or (@($UncarriedSkipped).Count -gt 0) -or (@($RetryLimitedOwed).Count -gt 0) -or (@($UnreadableStreamFiles).Count -gt 0) -or (@($LeftStreamFiles).Count -gt 0) -or (@($RetryOwedNotInRun).Count -gt 0) -or ($MissingReportCount -gt 0)) -SubscriptionsFailed (@($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0)'))
         $Lines = Get-Content -LiteralPath $script:WrapperPath
         $Banner = ($Lines | Select-String -SimpleMatch 'FAILED (earlier report not carried) =' | Select-Object -First 1).LineNumber
         $Stop = ($Lines | Select-String -SimpleMatch 'Stop-Transcript on normal completion failed' | Select-Object -First 1).LineNumber
@@ -731,7 +731,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $After2.Completed | Should -BeNullOrEmpty -Because 'the latest run of sub-a left no report'
         $After2.Reports | Should -BeNullOrEmpty
         $After2.Failed | Should -BeNullOrEmpty -Because 'a run that left no zip is not recorded as a failed attempt'
-        $Post2.ExitCode | Should -Be 2 -Because 'the run that left no zip still ends at the output verification, as before'
+        $Post2.ExitCode | Should -BeNullOrEmpty -Because 'the output verification names the gap and the run goes on; it exits 2 at its end (Tests/MissingReportZip.Tests.ps1)'
         ($Post2.Text -join "`n") | Should -Match 'ERROR: Per-subscription output verification failed'
         @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -BeNullOrEmpty -Because 'the -Resume run must not skip a subscription whose latest run left no report'
         ($R.Post.Text -join "`n") | Should -Not -Match 'Resume: carrying'

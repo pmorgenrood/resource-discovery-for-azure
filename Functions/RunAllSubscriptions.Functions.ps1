@@ -1463,6 +1463,11 @@ function Get-RunSummaryLogContent
         # How many subscriptions failed, from Get-FailedSubscriptionCount; when
         # not given, one per entry of -FailedSubscriptions.
         [int]$FailedSubscriptionCount = -1,
+        # Subscriptions completed this run whose report zip is missing, so the
+        # consolidated zip does not hold them: the count (some may not be
+        # nameable) and the ones named ({ Name; Id }).
+        [int]$MissingReportCount = 0,
+        $MissingReports = @(),
         [int]$ConsumptionRecordCount = 0,
         # A save of the resume state failed this run (and no later one reached
         # the disk): the log says a -Resume could skip a failed subscription.
@@ -1504,6 +1509,8 @@ function Get-RunSummaryLogContent
     $ConsumptionPhaseSkipped = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
     $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     $LeftOut = @(@($NotInRun) | Where-Object { $null -ne $_ })
+    $Missing = @(@($MissingReports) | Where-Object { $null -ne $_ })
+    $MissingTotal = [math]::Max($MissingReportCount, $Missing.Count)
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -1613,6 +1620,10 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  Not in this run     : {0} (on the retry list, but not in this run''s subscription set; incomplete)' -f $LeftOut.Count))
     if ($ResumeStateNotSaved) { $Lines.Add('  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)') }
+    if ($MissingTotal -gt 0)
+    {
+        $Lines.Add(('  Report missing      : {0} (completed, but their report zip is not in this zip; a -Resume collects them)' -f $MissingTotal))
+    }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
@@ -1657,6 +1668,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Not in this run (detail; disabled without -IncludeDisabled, not listed, or not readable):')
             foreach ($LeftOutSub in $LeftOut) { $Lines.Add(('  - {0} ({1}): failed {2} run(s); last reason: {3}' -f [string]$LeftOutSub.Name, [string]$LeftOutSub.Id, (Get-FailedAttemptCount -Entry $LeftOutSub), [string]$LeftOutSub.Reason)) }
+        }
+        if ($Missing.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Report missing (detail; not in this zip, a -Resume collects them):')
+            foreach ($MissingSub in $Missing) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
         {
