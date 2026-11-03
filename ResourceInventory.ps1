@@ -14,6 +14,10 @@ param ($TenantID,
     [switch]$UseManagedIdentity,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
+    # Pull the network types that no collector reads too (see
+    # Get-RdaNetworkSkipList). Off by default: they cost time and
+    # memory, and network costs come from the consumption data either way.
+    [switch]$IncludeNetworkResources,
     $ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
@@ -56,6 +60,10 @@ function Variables
 {
     $Global:ResourceContainers = @()
     $Global:Resources = @()
+    # Network rows left out of the pull, in total and by type. Cleared on every
+    # run so a wrapper never reads the last subscription's count.
+    $Global:SkippedResourceCount = 0
+    $Global:SkippedResourceTypes = [ordered]@{}
     $Global:Subscriptions = ''
     $Global:ReportName = $ReportName
     $Global:Version = GetLocalVersion
@@ -787,21 +795,27 @@ Function RunInventorySetup()
             $ResourceGroup = $ResourceGroup.ToLower()
         }
 
+        # The same type filter on the count and the page query, so the paging
+        # matches the count. Empty with -IncludeNetworkResources.
+        $SkipFilter = Get-RdaNetworkSkipFilter -IncludeNetworkResources:$IncludeNetworkResources.IsPresent
+
         if (![string]::IsNullOrEmpty($ResourceGroup) -and ![string]::IsNullOrEmpty($SubscriptionID))
         {
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID + '. And from Resource Group: ' + $ResourceGroup) -Severity 'Success'
 
             $Subscri = $SubscriptionID
+            $ScopeIds = @($Subscri)
+            $Where = "resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
-            $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -HideRawOutput:$Obfuscate.IsPresent
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -809,16 +823,18 @@ Function RunInventorySetup()
         elseif ([string]::IsNullOrEmpty($ResourceGroup) -and ![string]::IsNullOrEmpty($SubscriptionID))
         {
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID) -Severity 'Success'
+            $ScopeIds = @($SubscriptionID)
+            $Where = "(isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
-            $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -HideRawOutput:$Obfuscate.IsPresent
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -828,8 +844,10 @@ Function RunInventorySetup()
             # Every subscription of the run, named explicitly (in batches of
             # 1000), rather than whatever scope Resource Graph defaults to.
             $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
-            $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -HideRawOutput:$Obfuscate.IsPresent
+            $ScopeIds = $RunSubscriptionIds
+            $Where = "(isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeCount = Get-AzGraphCount -Result $EnvSize
 
             Write-Log -Message ("Resources Output: {0} Resources Identified" -f $EnvSizeCount) -Severity 'Success'
@@ -837,11 +855,27 @@ Function RunInventorySetup()
             if ($EnvSizeCount -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-AzGraphQuerySafe -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.Data
             }
+        }
+
+        # How many network rows the filter left out, for the log only. Same
+        # scope and same where as the pull. Nothing is skipped, and nothing is
+        # counted, with -IncludeNetworkResources.
+        if ($IncludeNetworkResources.IsPresent)
+        {
+            $Global:SkippedResourceCount = 0
+            $Global:SkippedResourceTypes = [ordered]@{}
+        }
+        else
+        {
+            $Skipped = Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
+            # $null means unknown: the log then reads as if nothing was skipped.
+            $Global:SkippedResourceCount = if ($null -ne $Skipped) { $Skipped.Total } else { $null }
+            $Global:SkippedResourceTypes = if ($null -ne $Skipped) { $Skipped.ByType } else { [ordered]@{} }
         }
     }
 
@@ -881,6 +915,10 @@ Function RunInventorySetup()
     GetSubscriptionsData
     ResourceInventoryLoop
     ResourceInventoryAvd
+
+    $CountMessage = Get-RdaResourceCountMessage -Collected @($Global:Resources).Count -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+    if ($CountMessage.Kind -eq 'Empty') { Write-Log -Message 'Resources collected: 0' -Severity 'Info' }
+    else { Write-Log -Message $CountMessage.Text -Severity 'Success' }
 
     if ($Obfuscate.IsPresent)
     {

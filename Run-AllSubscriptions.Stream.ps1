@@ -50,6 +50,7 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
+    [switch] $IncludeNetworkResources,
     [int]    $ConcurrencyLimit = 6
 )
 
@@ -66,6 +67,17 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
     exit 1
 }
 . $FunctionsFile
+
+# The per-subscription count line (Get-RdaResourceCountMessage) is shared with
+# the wrapper and the inner script.
+$CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
+if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
+{
+    Write-Host "ERROR: Required functions file not found: $CommonFunctionsFile" -ForegroundColor Red
+    Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
+    exit 1
+}
+. $CommonFunctionsFile
 
 # The supported Az.Accounts version (Get-RdaAzAccountsMinimumVersion). The
 # wrapper stops when this file is missing, but the worker checks too: without
@@ -180,6 +192,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 
 # ---- Per-sub iteration -------------------------------------------------------
@@ -250,15 +263,19 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # in this stream worker's scope. The inner script resets $Global:Resources
         # to @() at the start of every invocation.
         $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
-        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount }
+        # Network rows the inner script left out of the pull (reset by it on
+        # every run; $null when its count query failed).
+        $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
+        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount }
 
-        if ($ResCount -eq 0)
+        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+        if ($CountMessage.Kind -eq 'Empty')
         {
             Write-Stream ("WARNING: '{0}' returned 0 resources (likely permission gap or empty sub)" -f $SubName) 'Yellow'
         }
         else
         {
-            Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
+            Write-Stream ("done: {0} - {1}" -f $SubName, $CountMessage.Text) 'Green'
         }
 
         if (-not ($Completed -contains $SubId))

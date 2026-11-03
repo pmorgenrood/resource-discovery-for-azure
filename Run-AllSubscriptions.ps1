@@ -5,6 +5,10 @@ param (
     [switch]$Obfuscate,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
+    # Forwarded. Also pull the network types no collector reads (virtual
+    # networks, NSGs, NICs and the like). Off by default to save time and
+    # memory; network costs come from the consumption data either way.
+    [switch]$IncludeNetworkResources,
     [switch]$Resume,
     # Retry only the subscriptions that failed on a previous run: the script
     # processes exactly the failures recorded in the resume-state file and
@@ -820,6 +824,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
 # Always forward ConcurrencyLimit so the operator can tune metrics-phase
 # throttling end-to-end from a single param instead of editing the inner
 # script's default. Defaults to 6 (the inner script's existing default), so
@@ -878,13 +883,18 @@ if ($ParallelStreams -le 1)
             # to @() at the start of every invocation, so the count after return
             # accurately reflects the subscription that just finished.
             $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
+            # Network rows the inner script left out of the pull (reset by it
+            # on every run; $null when its count query failed).
+            $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
             $SubResourceCounts += [pscustomobject]@{
-                Name  = $Sub.Name
-                Id    = $Sub.Id
-                Count = $ResCount
+                Name    = $Sub.Name
+                Id      = $Sub.Id
+                Count   = $ResCount
+                Skipped = $SkipCount
             }
 
-            if ($ResCount -eq 0)
+            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+            if ($CountMessage.Kind -eq 'Empty')
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
                 # and in the wrapper transcript. The most common cause is the signed-in
@@ -896,7 +906,8 @@ if ($ParallelStreams -le 1)
             }
             else
             {
-                Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
+                # 'NetworkOnly' (only skipped network types) is not a warning.
+                Write-Host $CountMessage.Text -ForegroundColor DarkGreen
             }
 
             Write-Host "Completed subscription: $($Sub.Name)" -ForegroundColor Green
@@ -1074,14 +1085,16 @@ else
                 # Same null-guard as the sequential branch above.
                 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Script exited with code $LASTEXITCODE" }
                 $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
-                $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount }
-                if ($ResCount -eq 0)
+                $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
+                $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount; Skipped = $SkipCount }
+                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+                if ($CountMessage.Kind -eq 'Empty')
                 {
                     Write-Host ("WARNING: '{0}' returned 0 resources." -f $Sub.Name) -ForegroundColor Yellow
                 }
                 else
                 {
-                    Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
+                    Write-Host $CountMessage.Text -ForegroundColor DarkGreen
                 }
                 if (-not ($CompletedIds -contains $Sub.Id))
                 {
@@ -1229,6 +1242,7 @@ else
                 if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
+                if ($IncludeNetworkResources) { $WorkerArgs.IncludeNetworkResources = $true }
 
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)
@@ -1317,9 +1331,11 @@ else
                     {
                         if ($null -eq $rc) { continue }
                         $SubResourceCounts += [pscustomobject]@{
-                            Name  = $rc.Name
-                            Id    = $rc.Id
-                            Count = [int]$rc.Count
+                            Name    = $rc.Name
+                            Id      = $rc.Id
+                            Count   = [int]$rc.Count
+                            # Missing in a summary from an older worker: 0.
+                            Skipped = if ($null -ne $rc.Skipped) { [long]$rc.Skipped } else { [long]0 }
                         }
                     }
                 }
@@ -1713,7 +1729,10 @@ Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCo
 # to scan individual transcripts to find subs that came back empty. Empty subs
 # are shown distinctly because they almost always indicate a permission gap;
 # treating them as "successful" in the summary is misleading.
-$EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 })
+# A sub whose only resources are skipped network types (Skipped > 0) is not
+# empty and has access, so it is listed apart and not probed as empty.
+$EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and -not ([long]$_.Skipped -gt 0) })
+$NetworkOnlySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and [long]$_.Skipped -gt 0 })
 $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
 # Initialised here (not only inside the 0-resource branch below) so the
 # run-summary finalization can read them unconditionally even when there
@@ -1725,6 +1744,16 @@ if ($SubResourceCounts.Count -gt 0)
 {
     $TotalRes = ($SubResourceCounts | Measure-Object -Property Count -Sum).Sum
     Write-Host ("Total Resources:         {0:N0} across {1} subscription(s)" -f $TotalRes, $NonEmptySubs.Count) -ForegroundColor Green
+    $TotalSkipped = [long](($SubResourceCounts | ForEach-Object { [long]$_.Skipped } | Measure-Object -Sum).Sum)
+    if ($TotalSkipped -gt 0)
+    {
+        Write-Host ("Network resources skipped: {0:N0} (network costs still come from the consumption data; -IncludeNetworkResources keeps them)" -f $TotalSkipped) -ForegroundColor DarkGreen
+    }
+    if ($NetworkOnlySubs.Count -gt 0)
+    {
+        Write-Host ("Subscriptions with only skipped network resources: {0}" -f $NetworkOnlySubs.Count) -ForegroundColor DarkGreen
+        foreach ($e in $NetworkOnlySubs) { Write-Host ("    - {0} ({1}) - {2:N0} network resources skipped" -f $e.Name, $e.Id, [long]$e.Skipped) -ForegroundColor DarkGreen }
+    }
 }
 if ($EmptySubs.Count -gt 0)
 {
