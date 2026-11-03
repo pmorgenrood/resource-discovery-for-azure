@@ -497,6 +497,91 @@ function Get-AzGraphCount
     return $Total
 }
 
+# The network resource types the Resource Graph pull leaves out. No collector
+# reads them (Tests/SkipNetworkResources.Tests.ps1 fails if one ever does),
+# they have no Inventory section, and network costs come from the consumption
+# data, which is fetched apart from this pull. They are the bulk of the rows
+# and of the memory on a large tenant: a virtual network carries every subnet
+# with the ip configuration of every network interface in it.
+# This is the one copy of the list. -IncludeNetworkResources turns the skip off.
+function Get-RdaNetworkSkipList
+{
+    return @(
+        'microsoft.network/virtualnetworks'
+        'microsoft.network/networksecuritygroups'
+        'microsoft.network/networkinterfaces'
+        'microsoft.network/privateendpoints'
+        'microsoft.network/privatednszones'
+        'microsoft.network/privatednszones/virtualnetworklinks'
+        'microsoft.network/routetables'
+        'microsoft.network/networkwatchers'
+        'microsoft.network/networkwatchers/flowlogs'
+        'microsoft.network/applicationsecuritygroups'
+        'microsoft.network/ddosprotectionplans'
+        'microsoft.network/ipgroups'
+        'microsoft.network/connections'
+        'microsoft.network/localnetworkgateways'
+        'microsoft.network/firewallpolicies'
+        'microsoft.network/networkintentpolicies'
+        'microsoft.network/privatelinkservices'
+    )
+}
+
+# The skipped types as a KQL list: ('a', 'b', ...).
+function Get-RdaSkippedNetworkTypeList
+{
+    return '(' + ((Get-RdaNetworkSkipList | ForEach-Object { "'$_'" }) -join ', ') + ')'
+}
+
+# The filter the count query and the page query both carry, so the paging
+# stays in step with the count. Empty with -IncludeNetworkResources.
+function Get-RdaNetworkSkipFilter
+{
+    param([switch]$IncludeNetworkResources)
+    if ($IncludeNetworkResources) { return '' }
+    return ' | where type !in~ ' + (Get-RdaSkippedNetworkTypeList)
+}
+
+# One cheap query: how many rows of each skipped type the scope holds. It only
+# feeds the log, so a failure warns once and returns $null; it never fails the
+# run and is never retried here (Invoke-AzGraphQuerySafe has its own capped
+# retries). $Where is the scope's own where clause, without 'resources |'.
+# Returns { Total; ByType } with the types lowercase and summed across
+# subscription batches.
+function Get-RdaSkippedNetworkCount
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Where,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SubscriptionId,
+        [switch]$HideRawOutput
+    )
+
+    $Query = 'resources | where {0} | where type in~ {1} | summarize count() by type' -f $Where, (Get-RdaSkippedNetworkTypeList)
+    try
+    {
+        $Result = Invoke-AzGraphQuerySafe -Query $Query -SubscriptionId $SubscriptionId -HideRawOutput:$HideRawOutput
+    }
+    catch
+    {
+        # The first line only: the rest repeats the query.
+        $Reason = ([string]$_.Exception.Message -split "`r?`n")[0]
+        Write-Log -Message ("Could not count the skipped network resources ({0}). The run carries on; the log just leaves the skipped count out." -f $Reason) -Severity 'Warning'
+        return $null
+    }
+
+    $ByType = [ordered]@{}
+    $Total = [long]0
+    foreach ($Row in @($Result.data))
+    {
+        if ($null -eq $Row -or $null -eq $Row.count_ -or [string]::IsNullOrEmpty([string]$Row.type)) { continue }
+        $Type = ([string]$Row.type).ToLowerInvariant()
+        if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
+        $ByType[$Type] += [long]$Row.count_
+        $Total += [long]$Row.count_
+    }
+    return [pscustomobject]@{ Total = $Total; ByType = $ByType }
+}
+
 
 
 # Build + write the shareable Diagnostics_*.log that ships INSIDE the per-sub

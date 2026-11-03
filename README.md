@@ -461,6 +461,7 @@ Compress-Archive -Path ./* -DestinationPath "CompanyName_ResourcesReport_$(Get-D
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
 | `SkipConsumption` | Switch | Skip cost/billing data collection | False | `-SkipConsumption` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
+| `IncludeNetworkResources` | Switch | Also pull the network types that no collector reads (virtual networks, NSGs, NICs, private endpoints, route tables and the like). They are left out by default because they can be most of the rows, time and memory of a run. Network costs still come from the consumption data either way. | False | `-IncludeNetworkResources` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
 
 ### Metrics Lookback Window
@@ -530,6 +531,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `Obfuscate` | Switch | Forwarded. Replace resource IDs, names, subscriptions, resource groups, and tags with masked values. | False | `-Obfuscate` |
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
 | `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection. | False | `-SkipConsumption` |
+| `IncludeNetworkResources` | Switch | Forwarded. Also pull the network types no collector reads; left out by default to save time and memory. Network costs still come from the consumption data. | False | `-IncludeNetworkResources` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
 
 ## Troubleshooting
