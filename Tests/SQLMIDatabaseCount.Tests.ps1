@@ -17,11 +17,23 @@
 #   - odd ids give exactly what the old '-like' match gave: an id that holds
 #     '/databases/' twice, a database id with nothing after '/databases/', null
 #     ids, wildcard characters ([ ] * ?) in an instance id, and non-ASCII
-#     letters that '-like' folds to ASCII.
+#     letters that '-like' folds to ASCII;
+#   - on a tr-TR host, ids that differ only in I and i still count, which the
+#     old scan got wrong, so this test fails if the old scan comes back.
+#
+# '-like' follows the host culture, so the tests pin the invariant culture and
+# put the host's culture back at the end.
 #
 # No live Azure. All GUIDs are the Azure documentation placeholder.
 
 BeforeAll {
+    # '-like' follows the host culture, so pin it for the '-like' oracle below.
+    # Tests that need another culture set it themselves and put this one back.
+    $script:SavedCulture = [System.Globalization.CultureInfo]::CurrentCulture
+    $script:SavedUICulture = [System.Globalization.CultureInfo]::CurrentUICulture
+    [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+    [System.Globalization.CultureInfo]::CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
+
     $script:Collector = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Services', 'Data', 'SQLMI.ps1' | Resolve-Path | Select-Object -ExpandProperty Path
 
     $script:DocGuid = '12345678-1234-1234-1234-123456789012'
@@ -42,7 +54,8 @@ BeforeAll {
 
     function New-TestInstance
     {
-        param([AllowNull()][string]$Id, [string]$Name = 'mi')
+        # No [string] on $Id: it would turn $null into ''.
+        param([AllowNull()]$Id, [string]$Name = 'mi')
         [pscustomobject]@{
             TYPE           = 'microsoft.sql/managedInstances'
             id             = if ($null -eq $Id) { $null } else { $Id }
@@ -60,7 +73,7 @@ BeforeAll {
 
     function New-TestDatabase
     {
-        param([AllowNull()][string]$Id)
+        param([AllowNull()]$Id)
         [pscustomobject]@{
             TYPE           = 'microsoft.sql/managedinstances/databases'
             id             = if ($null -eq $Id) { $null } else { $Id }
@@ -195,7 +208,11 @@ Describe 'SQLMI database count' {
     It 'skips database rows with no id, and gives a null-id instance what -like gives' {
         $Mi = New-TestInstance -Id (Get-MiId 'mi-null')
         $NullMi = New-TestInstance -Id $null
-        $Rows = @($Mi, $NullMi, (New-TestDatabase -Id $null), (New-TestDatabase -Id "$($Mi.id)/databases/db1"), (New-TestDatabase -Id '/databases/odd'))
+        $NullDb = New-TestDatabase -Id $null
+        $Rows = @($Mi, $NullMi, $NullDb, (New-TestDatabase -Id "$($Mi.id)/databases/db1"), (New-TestDatabase -Id '/databases/odd'))
+        # The rows must hold a real $null, not '', or the null-id branch never runs.
+        $null -eq $NullDb.id | Should -BeTrue
+        $null -eq $NullMi.id | Should -BeTrue
 
         $Recs = @(Assert-SameAsLike -Resources $Rows)
 
@@ -258,4 +275,31 @@ Describe 'SQLMI database count' {
         $Recs = @(Assert-SameAsLike -Resources $Shuffled)
         $Recs.Count | Should -Be 20
     }
+
+    It 'gives the true count on a tr-TR host when ids differ only in I and i' {
+        # Under tr-TR, 'I' lower-cases to a dotless i, so a culture-aware match
+        # misses 'managedInstances' against 'managedinstances'. The per-instance
+        # '-like' scan wrote '0' here.
+        $Mi = New-TestInstance -Id (Get-MiId 'mi-tr')
+        $Db1 = New-TestDatabase -Id ("$($Mi.id)/databases/db1".ToLowerInvariant())
+        $Db2 = New-TestDatabase -Id ("$($Mi.id)/DATABASES/DB2".ToUpperInvariant())
+        $Saved = [System.Globalization.CultureInfo]::CurrentCulture
+        try
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::new('tr-TR')
+            $Rec = Invoke-TestCollector -Resources @($Mi, $Db1, $Db2)
+        }
+        finally
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = $Saved
+        }
+
+        $Rec['Databases'] | Should -Be 2
+        $Rec['Databases'] | Should -BeOfType ([int])
+    }
+}
+
+AfterAll {
+    [System.Globalization.CultureInfo]::CurrentCulture = $script:SavedCulture
+    [System.Globalization.CultureInfo]::CurrentUICulture = $script:SavedUICulture
 }
