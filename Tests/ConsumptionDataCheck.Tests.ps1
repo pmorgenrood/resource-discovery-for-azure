@@ -1289,6 +1289,19 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [RdaTestFakes.MsalCachePersistenceException]::new('stand-in: other text'))) | Should -Be 'Transient'
     }
 
+    It 'does not retry a failed token cache check when the same error also names a refusal, a bad request or not found: <Text>' -ForEach @(
+        @{ Text = "The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'" }
+        @{ Text = 'Access denied.' }
+        @{ Text = 'Response status code does not indicate success: 403 (Forbidden).' }
+        @{ Text = 'BadRequest: the request is not valid.' }
+        @{ Text = "The subscription 'sub-a' could not be found." }
+    ) {
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        $Cache = [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.', [System.Exception]::new('Persistence check failed. Data was written but it could not be read.'))
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text, [System.ArgumentException]::new($SignIn, $Cache))) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [System.Exception]::new($Text, $Cache))) | Should -Be 'Permanent'
+    }
+
     It 'still does not retry the same sign-in text without a failed token cache check' {
         $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
         Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn)) | Should -Be 'Permanent'
