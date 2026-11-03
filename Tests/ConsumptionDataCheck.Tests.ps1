@@ -1241,6 +1241,33 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception $Near | Should -Be 'Permanent'
     }
 
+    It 'retries a failed token cache check, although Az reports it as a sign-in to set up' {
+        # The shape Az gives when two token requests delete each other's
+        # token cache test file: its sign-in text, with the cache library's
+        # error inside, by message and by type.
+        if (-not ('RdaTestFakes.MsalCachePersistenceException' -as [type]))
+        {
+            Add-Type -TypeDefinition 'namespace RdaTestFakes { public class MsalCachePersistenceException : System.Exception { public MsalCachePersistenceException(string m) : base(m) { } } }'
+        }
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        $Check = 'Persistence check failed. Data was written but it could not be read. Possible cause: on Linux, LibSecret is installed but D-Bus isn''t running because it cannot be started over SSH.'
+        $Library = [RdaTestFakes.MsalCachePersistenceException]::new($Check)
+        $Credential = [System.Exception]::new('SharedTokenCacheCredential authentication failed: ' + $Check, $Library)
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Credential)) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn + [Environment]::NewLine + 'SharedTokenCacheCredential authentication failed: ' + $Check)) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [RdaTestFakes.MsalCachePersistenceException]::new('stand-in: other text'))) | Should -Be 'Transient'
+    }
+
+    It 'still does not retry the same sign-in text without a failed token cache check' {
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn)) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [System.Exception]::new('AADSTS700082: The refresh token has expired due to inactivity.'))) | Should -Be 'Permanent'
+        # A failed token cache check further down than the 10 errors read is not seen.
+        $Deep = [System.Exception]::new('Persistence check failed.')
+        foreach ($Level in 1..9) { $Deep = [System.Exception]::new('wrapped', $Deep) }
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Deep)) | Should -Be 'Permanent'
+    }
+
     It 'treats an error it does not recognise, and any other status code, as transient' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
@@ -1302,6 +1329,24 @@ Describe 'Invoke-ConsumptionDataCheck across subscriptions' {
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.Exempt.Count | Should -Be 0
         Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
+    }
+
+    It 'retries a usage query that fails with a failed token cache check, and passes on the answer' {
+        Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1; 'sub-b' = 1; 'sub-c' = 1 } }
+        $script:CacheCheckFailed = $false
+        Mock Get-UsageAggregatesPage {
+            if ($SubscriptionId -eq 'sub-b' -and -not $script:CacheCheckFailed)
+            {
+                $script:CacheCheckFailed = $true
+                throw [System.ArgumentException]::new('Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.', [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.'))
+            }
+            New-UsagePage -Quantities @(1)
+        }
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
+        $Result.ShouldBlock | Should -BeFalse
+        @($Result.Results | ForEach-Object { $_.Outcome }) | Should -Be @('Pass', 'Pass', 'Pass')
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-b' }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
     }
 
     It 'passes when every subscription returns a positive quantity, and leaves the Azure context alone' {
