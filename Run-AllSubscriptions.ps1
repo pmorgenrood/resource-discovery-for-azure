@@ -5,6 +5,10 @@ param (
     [switch]$Obfuscate,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
+    # Forwarded. Also pull the network types no collector reads (virtual
+    # networks, NSGs, NICs and the like). Off by default to save time and
+    # memory; network costs come from the consumption data either way.
+    [switch]$IncludeNetworkResources,
     [switch]$Resume,
     # Retry only the subscriptions that failed on a previous run: the script
     # processes exactly the failures recorded in the resume-state file and
@@ -1394,6 +1398,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
 # Always forward ConcurrencyLimit so the operator can tune metrics-phase
 # throttling end-to-end from a single param instead of editing the inner
 # script's default. Defaults to 6 (the inner script's existing default), so
@@ -1502,12 +1507,14 @@ if ($ParallelStreams -le 1)
             # accurately reflects the subscription that just finished.
             $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
             $SubResourceCounts += [pscustomobject]@{
-                Name  = $Sub.Name
-                Id    = $Sub.Id
-                Count = $ResCount
+                Name    = $Sub.Name
+                Id      = $Sub.Id
+                Count   = $ResCount
+                Skipped = $SkipCount
             }
 
-            if ($ResCount -eq 0)
+            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+            if ($CountMessage.Kind -eq 'Empty')
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
                 # and in the wrapper transcript. Read access is not the cause: a
@@ -1518,7 +1525,8 @@ if ($ParallelStreams -le 1)
             }
             else
             {
-                Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
+                # 'NetworkOnly' (only skipped network types) is not a warning.
+                Write-Host $CountMessage.Text -ForegroundColor DarkGreen
             }
 
             Write-Host "Completed subscription: $($Sub.Name)" -ForegroundColor Green
@@ -1789,7 +1797,7 @@ else
                 }
                 else
                 {
-                    Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
+                    Write-Host $CountMessage.Text -ForegroundColor DarkGreen
                 }
                 $NewReport = New-CompletedReportRecord -InventoryRoot $InventoryRoot -Id $Sub.Id -Name $Sub.Name -ZipPath $Global:ZipOutputFile -Obfuscated ([bool]$Obfuscate)
                 $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
@@ -1997,6 +2005,7 @@ else
                 if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
+                if ($IncludeNetworkResources) { $WorkerArgs.IncludeNetworkResources = $true }
 
                 # Write the snapshot. The first is written by Save-AzContext;
                 # the others get the same bytes.
@@ -2122,9 +2131,11 @@ else
                     {
                         if ($null -eq $rc) { continue }
                         $SubResourceCounts += [pscustomobject]@{
-                            Name  = $rc.Name
-                            Id    = $rc.Id
-                            Count = [int]$rc.Count
+                            Name    = $rc.Name
+                            Id      = $rc.Id
+                            Count   = [int]$rc.Count
+                            # Missing in a summary from an older worker: 0.
+                            Skipped = if ($null -ne $rc.Skipped) { [long]$rc.Skipped } else { [long]0 }
                         }
                     }
                 }
@@ -2799,6 +2810,16 @@ if ($SubResourceCounts.Count -gt 0)
 {
     $TotalRes = ($SubResourceCounts | Measure-Object -Property Count -Sum).Sum
     Write-Host ("Total Resources:         {0:N0} across {1} subscription(s)" -f $TotalRes, $NonEmptySubs.Count) -ForegroundColor Green
+    $TotalSkipped = [long](($SubResourceCounts | ForEach-Object { [long]$_.Skipped } | Measure-Object -Sum).Sum)
+    if ($TotalSkipped -gt 0)
+    {
+        Write-Host ("Network resources skipped: {0:N0} (network costs still come from the consumption data; -IncludeNetworkResources keeps them)" -f $TotalSkipped) -ForegroundColor DarkGreen
+    }
+    if ($NetworkOnlySubs.Count -gt 0)
+    {
+        Write-Host ("Subscriptions with only skipped network resources: {0}" -f $NetworkOnlySubs.Count) -ForegroundColor DarkGreen
+        foreach ($e in $NetworkOnlySubs) { Write-Host ("    - {0} ({1}) - {2:N0} network resources skipped" -f $e.Name, $e.Id, [long]$e.Skipped) -ForegroundColor DarkGreen }
+    }
 }
 if ($EmptySubs.Count -gt 0)
 {

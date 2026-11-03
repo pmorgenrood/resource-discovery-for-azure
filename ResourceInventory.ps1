@@ -17,6 +17,10 @@ param ($TenantID,
     [switch]$UseManagedIdentity,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
+    # Pull the network types that no collector reads too (see
+    # Get-RdaNetworkSkipList). Off by default: they cost time and
+    # memory, and network costs come from the consumption data either way.
+    [switch]$IncludeNetworkResources,
     $ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
@@ -924,11 +928,17 @@ Function RunInventorySetup()
             $ResourceGroup = $ResourceGroup.ToLowerInvariant()
         }
 
+        # The same type filter on the count and the page query, so the paging
+        # matches the count. Empty with -IncludeNetworkResources.
+        $SkipFilter = Get-RdaNetworkSkipFilter -IncludeNetworkResources:$IncludeNetworkResources.IsPresent
+
         if (![string]::IsNullOrEmpty($ResourceGroup) -and ![string]::IsNullOrEmpty($SubscriptionID))
         {
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID + '. And from Resource Group: ' + $ResourceGroup) -Severity 'Success'
 
             $Subscri = $SubscriptionID
+            $ScopeIds = @($Subscri)
+            $Where = "resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
             $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
             $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($Subscri) -HideRawOutput:$Obfuscate.IsPresent
@@ -946,6 +956,8 @@ Function RunInventorySetup()
         elseif ([string]::IsNullOrEmpty($ResourceGroup) -and ![string]::IsNullOrEmpty($SubscriptionID))
         {
             Write-Log -Message ('Extracting Resources from Subscription: ' + $SubscriptionID) -Severity 'Success'
+            $ScopeIds = @($SubscriptionID)
+            $Where = "(isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
             $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
             $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($SubscriptionID) -HideRawOutput:$Obfuscate.IsPresent
@@ -979,6 +991,22 @@ Function RunInventorySetup()
 
                 $Global:Resources += $Resource.Data
             }
+        }
+
+        # How many network rows the filter left out, for the log only. Same
+        # scope and same where as the pull. Nothing is skipped, and nothing is
+        # counted, with -IncludeNetworkResources.
+        if ($IncludeNetworkResources.IsPresent)
+        {
+            $Global:SkippedResourceCount = 0
+            $Global:SkippedResourceTypes = [ordered]@{}
+        }
+        else
+        {
+            $Skipped = Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
+            # $null means unknown: the log then reads as if nothing was skipped.
+            $Global:SkippedResourceCount = if ($null -ne $Skipped) { $Skipped.Total } else { $null }
+            $Global:SkippedResourceTypes = if ($null -ne $Skipped) { $Skipped.ByType } else { [ordered]@{} }
         }
     }
 

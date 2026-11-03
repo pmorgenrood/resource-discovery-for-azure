@@ -248,6 +248,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart)) { $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowStart }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowEnd)) { $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowEnd }
@@ -341,13 +342,14 @@ for ($i = 0; $i -lt $PairCount; $i++)
         $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
         $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount }
 
-        if ($ResCount -eq 0)
+        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+        if ($CountMessage.Kind -eq 'Empty')
         {
             Write-Stream ("WARNING: '{0}' returned 0 resources (it passed the up-front role check, so it is an empty subscription)" -f $SubName) 'Yellow'
         }
         else
         {
-            Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
+            Write-Stream ("done: {0} - {1}" -f $SubName, $CountMessage.Text) 'Green'
         }
 
         # Record the zip this run wrote, replacing any earlier record for the sub.

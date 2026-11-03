@@ -564,6 +564,7 @@ Get-ChildItem -File -Path ./* -Include *.html, Consumption_*.csv, Inventory_*.js
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
 | `SkipConsumption` | Switch | Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front) | False | `-SkipConsumption` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
+| `IncludeNetworkResources` | Switch | Also pull the network types that no collector reads (virtual networks, NSGs, NICs, private endpoints, route tables and the like). They are left out by default because they can be most of the rows, time and memory of a run. Network costs still come from the consumption data either way. | False | `-IncludeNetworkResources` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
 
 ### Metrics Lookback Window
