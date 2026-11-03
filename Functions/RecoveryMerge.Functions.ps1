@@ -293,6 +293,9 @@ function Merge-RecoveryData
     # otherwise looks complete. We cannot repair that here, but we CAN detect the
     # tell-tale: a seeded recovery's ResourceIdMap shares (almost) all of the gap's
     # tokens, whereas an unseeded one shares none. Warn loudly on zero overlap.
+    # A bundle pair where only one side has a dictionary STOPS the merge before
+    # the output folder is created, so nothing is written, zipped or left behind;
+    # the way out is to fix the named bundle and run the same merge again.
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
         try
@@ -315,9 +318,17 @@ function Merge-RecoveryData
             Add-MergeWarning ('could not compare the gap/recovery obfuscation dictionaries for compatibility (seed check skipped): {0}' -f $_.Exception.Message)
         }
     }
-    elseif (($null -ne $GapDictionaryFile) -ne ($null -ne $RecoveryDictionaryFile))
+    elseif ($GapDictionaryFile)
     {
-        Add-MergeWarning ('only one of the gap/recovery bundles has an ObfuscationDictionary. Mixed obfuscation state suggests the two bundles were produced with different -Obfuscate settings; confirm they belong together before shipping the merged bundle.')
+        # Masked gap, recovery without a dictionary: the recovery inventory may
+        # hold real names and ids, which would ship inside a masked zip.
+        throw ("Merge-RecoveryData: the recovery bundle '{0}' has no ObfuscationDictionary_*.json, but the gap bundle has '{1}'. The recovery run was probably not masked, so its real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}', then run this merge again. If the recovery run was masked and its dictionary was moved, put it back in that folder." -f $RecoveryBundlePath, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
+    }
+    elseif ($RecoveryDictionaryFile)
+    {
+        # Masked recovery, gap without a dictionary: the gap inventory may hold
+        # real names and ids next to masked recovered rows.
+        throw ("Merge-RecoveryData: the gap bundle '{0}' has no ObfuscationDictionary_*.json, but the recovery bundle has '{1}'. The gap run was probably not masked, so real names and ids would sit next to masked rows in one bundle. Nothing was written to '{2}'. If the gap run was masked and its dictionary was moved, put it back in that folder. Otherwise re-run the gap bundle with -Obfuscate (or re-run the recovery without -Obfuscate to match it), then run this merge again." -f $GapBundlePath, $RecoveryDictionaryFile.Name, $OutputPath)
     }
 
     # -- Guard: dictionary-belongs-to-its-inventory (HARD FAIL) ---------------

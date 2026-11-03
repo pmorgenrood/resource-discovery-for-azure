@@ -446,6 +446,59 @@ Describe 'Merge-RecoveryData metrics handling' {
     }
 }
 
+Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
+
+    It 'stops when only the gap bundle has a dictionary, naming the recovery bundle' {
+        $C = New-Case
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage ('*recovery bundle ''{0}'' has no ObfuscationDictionary*-Obfuscate -ObfuscationDictionary*' -f $C.Recovery)
+        Test-Path -Path $C.Output | Should -BeFalse -Because 'no file may be written or zipped when real values could ship in a masked bundle'
+    }
+
+    It 'stops when only the recovery bundle has a dictionary, naming the gap bundle' {
+        $C = New-Case
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage ('*gap bundle ''{0}'' has no ObfuscationDictionary*-Obfuscate*' -f $C.Gap)
+        Test-Path -Path $C.Output | Should -BeFalse
+    }
+
+    It 'leaves an existing output folder untouched when it stops' {
+        $C = New-Case
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        New-Item -ItemType Directory -Path $C.Output -Force | Out-Null
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*has no ObfuscationDictionary*'
+        @(Get-ChildItem -Path $C.Output -Force).Count | Should -Be 0 -Because 'no inventory, csv, metrics, html, dictionary or zip is written before the stop'
+    }
+
+    It 'merges cleanly on the next run once the recovery is re-run seeded with the gap dictionary' {
+        $C = New-Case
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } | Should -Throw
+
+        # The way out: the seeded recovery re-run writes its dictionary, and the same merge command now passes.
+        $SeededDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap'; 'prod_recNew' = '/id/new' } }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $SeededDict
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        @($Result.Warnings).Count | Should -Be 0
+        Test-Path -Path $Result.OutputZip | Should -BeTrue
+    }
+}
+
 Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
     It 'warns when the recovery dictionary shares no ResourceIdMap tokens with the gap (likely unseeded recovery)' {
@@ -470,17 +523,6 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
 
         ($Result.Warnings -join "`n") | Should -Not -Match 'share NO ResourceIdMap tokens'
-    }
-
-    It 'warns about mixed obfuscation state when only one bundle has a dictionary' {
-        $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
-
-        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
-
-        ($Result.Warnings -join "`n") | Should -Match 'only one of the gap/recovery bundles has an ObfuscationDictionary'
     }
 
     It 'warns when a replaced inventory key has fewer records than the gap held' {
@@ -540,7 +582,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
         # Dictionary from a DIFFERENT run: none of the gap inventory's tokens appear.
         $WrongDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_99999999-9999-9999-9999-999999999999' = '/id/x' } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory $GapInv -Dictionary $WrongDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        # The recovery carries the same dictionary (seeded from it), so only the gap's wrong dictionary is at fault.
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $WrongDict
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
             Should -Throw -ExpectedMessage '*does NOT match its inventory*'
@@ -557,7 +600,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
             )
         }
         $WrongDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_dddddddd-dddd-dddd-dddd-dddddddddddd' = '/id/y' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        # The gap carries the same dictionary, so only the recovery's wrong dictionary is at fault.
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $WrongDict
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory $RecInv -Dictionary $WrongDict
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
@@ -655,7 +699,7 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_tokA' = '/id/a' } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $GapDict
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
 
