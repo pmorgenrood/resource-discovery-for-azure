@@ -1347,19 +1347,38 @@ function Get-ConsumptionErrorStatusCode
 # does not count: some of those are transient. Everything else is 'Transient'
 # (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
 # off part-way, and any error not recognised here.
+# Before any of that, a failed token cache check is 'Transient', although Az
+# reports it as a sign-in to set up ('run Connect-AzAccount'): on every token
+# request the token cache library (MSAL, in Az.Accounts) writes a test file
+# next to the cache, reads it back and deletes it, so two token requests at the
+# same moment, in this process or in another one that uses the same token
+# cache, can delete each other's test file ('Persistence check failed. Data was
+# written but it could not be read'). The next attempt checks again and passes.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
     $Status = Get-ConsumptionErrorStatusCode -Exception $Exception
     if ($null -ne $Status -and ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404)) { return 'Permanent' }
+    $Chain = [System.Collections.Generic.List[object]]::new()
     $Pending = [System.Collections.Generic.Queue[object]]::new()
     $Pending.Enqueue($Exception)
-    $Checked = 0
-    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
     {
         $Ex = $Pending.Dequeue()
         if ($null -eq $Ex) { continue }
-        $Checked++
+        $Chain.Add($Ex)
+        if ($null -ne $Ex.PSObject.Properties['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
+        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+        {
+            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+        }
+    }
+    foreach ($Ex in $Chain)
+    {
+        if ($Ex.GetType().Name -eq 'MsalCachePersistenceException' -or [string]$Ex.Message -match '(?i)persistence check failed') { return 'Transient' }
+    }
+    foreach ($Ex in $Chain)
+    {
         $Message = [string]$Ex.Message
         if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
         {
@@ -1369,11 +1388,6 @@ function Get-ConsumptionErrorKind
         {
             return 'Permanent'
         }
-        if ($null -ne $Ex.PSObject.Properties['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
-        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-        {
-            $Pending.Enqueue($Ex.ErrorRecord.Exception)
-        }
     }
     return 'Transient'
 }
@@ -1381,7 +1395,8 @@ function Get-ConsumptionErrorKind
 # Runs $Operation (a scriptblock taking one argument) and retries it with
 # exponential backoff (2, 4, 8 s) unless the failure is one a retry cannot
 # change (Get-ConsumptionErrorKind: 400, 401, 403, 404, access denied, not
-# found, a sign-in that cannot be used). Returns
+# found, a sign-in that cannot be used; a failed token cache check is
+# retried). Returns
 # { Value; Error; Attempts }; Error is the last exception, or $null on success.
 function Invoke-ConsumptionCallWithRetry
 {
