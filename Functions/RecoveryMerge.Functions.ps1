@@ -305,8 +305,12 @@ function Merge-RecoveryData
         {
             $GapDictCheck = Get-Content -Path $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
             $RecoveryDictCheck = Get-Content -Path $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
-            $GapIdKeys = @($GapDictCheck.ResourceIdMap.PSObject.Properties.Name)
-            $RecoveryIdKeys = @($RecoveryDictCheck.ResourceIdMap.PSObject.Properties.Name)
+            # Drop the $null that an empty or missing map yields, so an empty
+            # ResourceIdMap (a run that found no resources) counts as 0 keys and
+            # the check below is skipped instead of stopping a merge that no
+            # re-run could ever get past.
+            $GapIdKeys = @($GapDictCheck.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
+            $RecoveryIdKeys = @($RecoveryDictCheck.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
             if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
             {
                 $SharedIdKeyCount = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys }).Count

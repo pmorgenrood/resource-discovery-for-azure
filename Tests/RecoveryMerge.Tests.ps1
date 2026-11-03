@@ -494,6 +494,25 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $C.Output | Should -BeFalse
     }
 
+    It 'does not stop or warn on token overlap when the gap ResourceIdMap is empty (<Case>)' -ForEach @(
+        @{ Case = 'empty map'; GapIdMap = [ordered]@{} },
+        @{ Case = 'no map'; GapIdMap = $null }
+    ) {
+        $C = New-Case
+        # A masked run over a subscription with no resources writes an empty ResourceIdMap;
+        # a seeded recovery that then finds resources shares no token with it, and no re-run can change that.
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; SubscriptionMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' } }
+        if ($null -ne $GapIdMap) { $GapDict['ResourceIdMap'] = $GapIdMap }
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recNew' = '/id/new' }; SubscriptionMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @() }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        ($Result.Warnings -join "`n") | Should -Not -Match 'share no ResourceIdMap token'
+        Test-Path -Path $Result.OutputZip | Should -BeTrue
+    }
+
     It 'leaves an existing output folder untouched when it stops' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
