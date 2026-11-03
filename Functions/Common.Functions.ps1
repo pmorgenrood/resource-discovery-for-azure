@@ -252,3 +252,393 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
         }
     }
 }
+
+# =============================================================================
+# Memory and timing readings (observe only)
+#
+# Five readings per subscription (start, discovery, collectors, released, end)
+# record how much memory the process holds and how long the subscription has
+# been running. A reading never changes what it measures: no collection is
+# forced, so the managed heap figure includes garbage the runtime has not
+# collected yet. The records land in $Global:MemoryReadings, which the wrapper
+# keeps for the whole run and a stream worker hands back in its summary JSON.
+# They are rendered into each subscription's Diagnostics log, RunSummary.log and
+# the local debug log, and carry counts, seconds and megabytes only. A
+# subscription is named by its id, or by its position when the run is
+# obfuscated.
+# =============================================================================
+
+function Get-RdaPeakWorkingSetMB
+{
+    [CmdletBinding()]
+    param()
+
+    # The highest working set this process has had so far, in MB, or $null when the OS does not
+    # report it: .NET returns 0 where the platform has no peak counter, and the renderers write
+    # $null as n/a so a missing figure is never read as 0.
+    try
+    {
+        $PeakBytes = [System.Diagnostics.Process]::GetCurrentProcess().PeakWorkingSet64
+        if ($PeakBytes -gt 0)
+        {
+            return [math]::Round($PeakBytes / 1MB, 1)
+        }
+    }
+    catch
+    {
+        Write-Verbose ('Peak working set unavailable: {0}' -f $_.Exception.Message)
+    }
+    return $null
+}
+
+function Write-RdaMemorySnapshot
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [System.Diagnostics.Stopwatch]$Clock,
+        [switch]$Record
+    )
+
+    # Takes one reading: the managed heap ([GC]::GetTotalMemory($false), so no collection is
+    # forced), the process working set and its peak so far, the memory available to the runtime,
+    # and the seconds since the subscription started ($Clock). -Record appends it to
+    # $Global:MemoryReadings, keyed by the subscription being processed and the run stamp. A
+    # recorded phase must be one of the five the renderers lay out; a misspelled phase would
+    # otherwise render as a silent gap.
+    # The reading also goes to the local debug log, but only once that log belongs to this run
+    # (its name carries the run stamp): under the wrapper the path still names the previous
+    # subscription's log until this run sets its own. The block written at the end of the run
+    # carries every reading, the earlier ones included.
+    if ($Record)
+    {
+        $RecordedPhases = @('start', 'discovery', 'collectors', 'released', 'end')
+        if ($Phase -notin $RecordedPhases)
+        {
+            throw [System.ArgumentException]::new(("A recorded memory reading must use one of the phases the summary renders ({0}); got '{1}'." -f ($RecordedPhases -join ', '), $Phase), 'Phase')
+        }
+    }
+
+    $Stamp = [string]$Global:CurrentDateTime
+    $DebugLogName = if ([string]::IsNullOrEmpty([string]$Global:DebugLogFile)) { '' } else { [System.IO.Path]::GetFileName([string]$Global:DebugLogFile) }
+    $DebugLogIsThisRun = (-not [string]::IsNullOrEmpty($Stamp)) -and $DebugLogName.Contains($Stamp)
+    try
+    {
+        $Inv = [cultureinfo]::InvariantCulture
+        $HeapMB = [math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 1)
+        $WorkingSetMB = [math]::Round([System.Diagnostics.Process]::GetCurrentProcess().WorkingSet64 / 1MB, 1)
+        $PeakMB = Get-RdaPeakWorkingSetMB
+        $LimitMB = [math]::Round([System.GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes / 1MB, 0)
+        $Seconds = if ($null -ne $Clock) { [math]::Round($Clock.Elapsed.TotalSeconds, 1) } else { $null }
+        if ($Record)
+        {
+            $SubId = Get-Variable -Name 'SubscriptionID' -ValueOnly -ErrorAction SilentlyContinue
+            # .Count on the array itself: wrapping it in @() would copy every row to count them.
+            $ResourceCount = if ($null -ne $Global:Resources) { [int]$Global:Resources.Count } else { 0 }
+            if ($null -eq $Global:MemoryReadings) { $Global:MemoryReadings = @() }
+            $Global:MemoryReadings += [pscustomobject]@{
+                Id               = [string]$SubId
+                Stamp            = $Stamp
+                Phase            = $Phase
+                Resources        = $ResourceCount
+                HeapMB           = $HeapMB
+                WorkingSetMB     = $WorkingSetMB
+                PeakWorkingSetMB = $PeakMB
+                LimitMB          = $LimitMB
+                Seconds          = $Seconds
+            }
+        }
+        if ($DebugLogIsThisRun)
+        {
+            $PeakText = if ($null -ne $PeakMB) { '{0} MB' -f $PeakMB.ToString($Inv) } else { 'n/a' }
+            $SecondsText = if ($null -ne $Seconds) { '{0} s' -f $Seconds.ToString('0.0', $Inv) } else { 'n/a' }
+            Write-Log -Message ('[Memory] {0}: managed heap {1} MB, process working set {2} MB, peak working set {3}, memory available to the runtime {4} MB, {5} since the subscription started (no collection forced).' -f $Phase, $HeapMB.ToString($Inv), $WorkingSetMB.ToString($Inv), $PeakText, $LimitMB.ToString($Inv), $SecondsText) -Severity 'Info' -NoConsole -ToDebugLog
+        }
+    }
+    catch
+    {
+        if ($DebugLogIsThisRun)
+        {
+            Write-Log -Message ('[Memory] {0}: reading unavailable: {1}' -f $Phase, $_.Exception.Message) -Severity 'Info' -NoConsole -ToDebugLog
+        }
+    }
+}
+
+function Add-RdaSubscriptionTimings
+{
+    [CmdletBinding()]
+    param(
+        [System.Diagnostics.Stopwatch]$Clock,
+        [System.Diagnostics.Stopwatch]$ReportClock,
+        $PhaseTimings
+    )
+
+    # Adds the phase durations of the subscription being processed to its 'end' reading, so they
+    # travel with the readings to the wrapper and through a stream worker's summary JSON. In
+    # seconds, one decimal: MetricsSeconds, CollectorsSeconds and BillingSeconds are read from
+    # the phase-timing table the HTML report and the Diagnostics log already show ($null when the
+    # phase did not run); ReportSeconds is the report and packaging, timed by $ReportClock from
+    # the start of the HTML report; TotalSeconds is the time since the subscription started.
+    # Called before the Diagnostics log is written and again after the zip, so the log holds the
+    # values at the time it was written and RunSummary.log and the debug log include the zip.
+    # Does nothing when this run took no 'end' reading.
+    try
+    {
+        $SubId = [string](Get-Variable -Name 'SubscriptionID' -ValueOnly -ErrorAction SilentlyContinue)
+        $Stamp = [string]$Global:CurrentDateTime
+        $EndReading = @(@($Global:MemoryReadings) | Where-Object { $null -ne $_ -and [string]$_.Phase -eq 'end' -and [string]$_.Stamp -eq $Stamp -and [string]$_.Id -eq $SubId } | Select-Object -Last 1)
+        if ($EndReading.Count -eq 0) { return }
+
+        $Values = [ordered]@{
+            MetricsSeconds    = $null
+            CollectorsSeconds = $null
+            BillingSeconds    = $null
+            ReportSeconds     = if ($null -ne $ReportClock) { [math]::Round($ReportClock.Elapsed.TotalSeconds, 1) } else { $null }
+            TotalSeconds      = if ($null -ne $Clock) { [math]::Round($Clock.Elapsed.TotalSeconds, 1) } else { $null }
+        }
+        if ($null -ne $PhaseTimings)
+        {
+            $BillingTotal = $null
+            foreach ($PhaseName in @($PhaseTimings.Keys))
+            {
+                $PhaseSeconds = ([TimeSpan]$PhaseTimings[$PhaseName]).TotalSeconds
+                if ($PhaseName -eq 'Metrics collection (Azure Monitor)') { $Values['MetricsSeconds'] = [math]::Round($PhaseSeconds, 1) }
+                elseif ($PhaseName -eq 'Resource detail collection (service collectors)') { $Values['CollectorsSeconds'] = [math]::Round($PhaseSeconds, 1) }
+                elseif ([string]$PhaseName -like '* (billing)') { $BillingTotal = [double]$BillingTotal + $PhaseSeconds }
+            }
+            if ($null -ne $BillingTotal) { $Values['BillingSeconds'] = [math]::Round($BillingTotal, 1) }
+        }
+        foreach ($Field in $Values.Keys)
+        {
+            $EndReading[0] | Add-Member -NotePropertyName $Field -NotePropertyValue $Values[$Field] -Force
+        }
+    }
+    catch
+    {
+        Write-Verbose ('Subscription timings not recorded: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Get-RdaReadingGroups
+{
+    [CmdletBinding()]
+    param(
+        $Readings = @(),
+        [string]$Stamp,
+        [switch]$Obfuscated
+    )
+
+    # Groups the readings by subscription, in the order they were first seen, and labels each
+    # group: 'sub <id>', or 'sub <position>' when obfuscated or when a reading carries no id.
+    # -Stamp keeps a standalone run's log to its own readings when the same prompt has run the
+    # script before.
+    $Rows = @(@($Readings) | Where-Object { $null -ne $_ -and -not [string]::IsNullOrEmpty([string]$_.Phase) })
+    if (-not [string]::IsNullOrEmpty($Stamp))
+    {
+        $Rows = @($Rows | Where-Object { [string]$_.Stamp -eq $Stamp })
+    }
+    $Groups = [ordered]@{}
+    foreach ($Row in $Rows)
+    {
+        $Key = [string]$Row.Id
+        if ([string]::IsNullOrEmpty($Key)) { $Key = [string]$Row.Stamp }
+        if (-not $Groups.Contains($Key)) { $Groups[$Key] = [System.Collections.Generic.List[object]]::new() }
+        $Groups[$Key].Add($Row)
+    }
+    $Result = [System.Collections.Generic.List[object]]::new()
+    $Position = 0
+    foreach ($Key in $Groups.Keys)
+    {
+        $Position++
+        $Group = @($Groups[$Key])
+        $Label = if ($Obfuscated -or [string]::IsNullOrEmpty([string]$Group[0].Id)) { 'sub {0}' -f $Position } else { 'sub {0}' -f [string]$Group[0].Id }
+        $Result.Add([pscustomobject]@{ Label = $Label; Rows = $Group })
+    }
+    return $Result.ToArray()
+}
+
+function ConvertTo-RdaReadingNumber
+{
+    [CmdletBinding()]
+    [OutputType([double])]
+    param($Value)
+
+    # A reading field as a double, or $null when it is missing or not a number. Parsed with the
+    # invariant culture, so a value that came back through JSON reads the same under a
+    # comma-decimal culture.
+    if ($null -eq $Value -or [string]::IsNullOrEmpty([string]$Value)) { return $null }
+    $Number = 0.0
+    if ([double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Float, [cultureinfo]::InvariantCulture, [ref]$Number)) { return $Number }
+    return $null
+}
+
+function Get-RdaMemoryReadingLines
+{
+    [CmdletBinding()]
+    param(
+        $Readings = @(),
+        [string]$Stamp,
+        [switch]$Obfuscated
+    )
+
+    # Renders the readings Write-RdaMemorySnapshot -Record collected, as three tables with one
+    # row per subscription and one cell per phase: managed heap / working set, the peak working
+    # set so far, and the seconds since the subscription started. '-' marks a phase that was
+    # never reached and 'n/a' a figure the OS did not report. Under the first two tables come the
+    # highest working set, the memory available to the runtime and the highest peak. Megabytes
+    # are whole numbers, seconds have one decimal.
+    $Lines = [System.Collections.Generic.List[string]]::new()
+    $Groups = @(Get-RdaReadingGroups -Readings $Readings -Stamp $Stamp -Obfuscated:$Obfuscated)
+    if ($Groups.Count -eq 0) { return $Lines.ToArray() }
+
+    $Inv = [cultureinfo]::InvariantCulture
+    $Phases = @('start', 'discovery', 'collectors', 'released', 'end')
+    $HighestWorkingSet = 0.0
+    $HighestPeak = $null
+    $Limit = 0.0
+    $MemoryRows = [System.Collections.Generic.List[string]]::new()
+    $PeakRows = [System.Collections.Generic.List[string]]::new()
+    $SecondsRows = [System.Collections.Generic.List[string]]::new()
+    foreach ($Group in $Groups)
+    {
+        $Resources = 0
+        foreach ($Row in $Group.Rows)
+        {
+            $RowResources = 0
+            if ([int]::TryParse([string]$Row.Resources, [ref]$RowResources) -and $RowResources -gt $Resources) { $Resources = $RowResources }
+            $RowWs = ConvertTo-RdaReadingNumber $Row.WorkingSetMB
+            if ($null -ne $RowWs -and $RowWs -gt $HighestWorkingSet) { $HighestWorkingSet = $RowWs }
+            $RowPeak = ConvertTo-RdaReadingNumber $Row.PeakWorkingSetMB
+            if ($null -ne $RowPeak -and ($null -eq $HighestPeak -or $RowPeak -gt $HighestPeak)) { $HighestPeak = $RowPeak }
+            $RowLimit = ConvertTo-RdaReadingNumber $Row.LimitMB
+            if ($null -ne $RowLimit -and $RowLimit -gt $Limit) { $Limit = $RowLimit }
+        }
+        $MemoryCells = [System.Collections.Generic.List[string]]::new()
+        $MemoryCells.Add(('resources {0}' -f $Resources.ToString('N0', $Inv)))
+        $PeakCells = [System.Collections.Generic.List[string]]::new()
+        $SecondsCells = [System.Collections.Generic.List[string]]::new()
+        foreach ($Phase in $Phases)
+        {
+            $Reading = @($Group.Rows | Where-Object { [string]$_.Phase -eq $Phase } | Select-Object -Last 1)
+            if ($Reading.Count -eq 0)
+            {
+                $MemoryCells.Add(('{0} -' -f $Phase))
+                $PeakCells.Add(('{0} -' -f $Phase))
+                $SecondsCells.Add(('{0} -' -f $Phase))
+                continue
+            }
+            $Heap = ConvertTo-RdaReadingNumber $Reading[0].HeapMB
+            $Ws = ConvertTo-RdaReadingNumber $Reading[0].WorkingSetMB
+            $HeapText = if ($null -ne $Heap) { [math]::Round($Heap).ToString($Inv) } else { 'n/a' }
+            $WsText = if ($null -ne $Ws) { [math]::Round($Ws).ToString($Inv) } else { 'n/a' }
+            $MemoryCells.Add(('{0} {1}/{2}' -f $Phase, $HeapText, $WsText))
+            $Peak = ConvertTo-RdaReadingNumber $Reading[0].PeakWorkingSetMB
+            $PeakCells.Add(('{0} {1}' -f $Phase, $(if ($null -ne $Peak) { [math]::Round($Peak).ToString($Inv) } else { 'n/a' })))
+            $Seconds = ConvertTo-RdaReadingNumber $Reading[0].Seconds
+            $SecondsCells.Add(('{0} {1}' -f $Phase, $(if ($null -ne $Seconds) { $Seconds.ToString('0.0', $Inv) } else { 'n/a' })))
+        }
+        $MemoryRows.Add(('  [{0}]  {1}' -f $Group.Label, ($MemoryCells -join '  ')))
+        $PeakRows.Add(('  [{0}]  {1}' -f $Group.Label, ($PeakCells -join '  ')))
+        $SecondsRows.Add(('  [{0}]  {1}' -f $Group.Label, ($SecondsCells -join '  ')))
+    }
+
+    $Lines.Add('Memory (MB, read without forcing a collection; managed heap / process working set):')
+    foreach ($Row in $MemoryRows) { $Lines.Add($Row) }
+    $Lines.Add(('  Highest working set sampled : {0} MB' -f [math]::Round($HighestWorkingSet).ToString($Inv)))
+    if ($Limit -gt 0)
+    {
+        $Lines.Add(('  Memory available to runtime : {0} MB' -f [math]::Round($Limit).ToString($Inv)))
+    }
+    $Lines.Add('Peak working set so far (MB, n/a where the OS does not report it):')
+    foreach ($Row in $PeakRows) { $Lines.Add($Row) }
+    $Lines.Add(('  Highest peak working set    : {0}' -f $(if ($null -ne $HighestPeak) { '{0} MB' -f [math]::Round($HighestPeak).ToString($Inv) } else { 'n/a' })))
+    $Lines.Add('Seconds since the subscription started, at each reading:')
+    foreach ($Row in $SecondsRows) { $Lines.Add($Row) }
+
+    return $Lines.ToArray()
+}
+
+function Get-RdaTimingLines
+{
+    [CmdletBinding()]
+    param(
+        $Readings = @(),
+        [string]$Stamp,
+        [switch]$Obfuscated,
+        [switch]$BeforeZip
+    )
+
+    # Renders one row of phase durations per subscription, in seconds with one decimal:
+    # discovery (the Resource Graph pages, from the 'start' to the 'discovery' reading), then
+    # metrics, collectors, billing, report and total as Add-RdaSubscriptionTimings put them on
+    # the 'end' reading. '-' marks a phase that did not run or a subscription that never reached
+    # its 'end' reading. -BeforeZip states in the header that report and total stop where the
+    # log is written, which is the case for the log that ships inside the subscription's zip.
+    $Lines = [System.Collections.Generic.List[string]]::new()
+    $Groups = @(Get-RdaReadingGroups -Readings $Readings -Stamp $Stamp -Obfuscated:$Obfuscated)
+    if ($Groups.Count -eq 0) { return $Lines.ToArray() }
+
+    $Inv = [cultureinfo]::InvariantCulture
+    $Format = {
+        param($Value)
+        $Number = ConvertTo-RdaReadingNumber $Value
+        if ($null -ne $Number) { $Number.ToString('0.0', $Inv) } else { '-' }
+    }
+    if ($BeforeZip)
+    {
+        $Lines.Add('Timings (seconds; report is report and packaging; report and total stop where this log is written, before the zip):')
+    }
+    else
+    {
+        $Lines.Add('Timings (seconds; report is report and packaging; report and total include the zip):')
+    }
+    foreach ($Group in $Groups)
+    {
+        $Start = @($Group.Rows | Where-Object { [string]$_.Phase -eq 'start' } | Select-Object -Last 1)
+        $Discovery = @($Group.Rows | Where-Object { [string]$_.Phase -eq 'discovery' } | Select-Object -Last 1)
+        $End = @($Group.Rows | Where-Object { [string]$_.Phase -eq 'end' } | Select-Object -Last 1)
+        $DiscoverySeconds = $null
+        if ($Start.Count -gt 0 -and $Discovery.Count -gt 0)
+        {
+            $From = ConvertTo-RdaReadingNumber $Start[0].Seconds
+            $To = ConvertTo-RdaReadingNumber $Discovery[0].Seconds
+            if ($null -ne $From -and $null -ne $To) { $DiscoverySeconds = [math]::Max(0, [math]::Round($To - $From, 1)) }
+        }
+        $EndRow = if ($End.Count -gt 0) { $End[0] } else { [pscustomobject]@{} }
+        $Cells = @(
+            ('discovery {0}' -f (& $Format $DiscoverySeconds))
+            ('metrics {0}' -f (& $Format $EndRow.MetricsSeconds))
+            ('collectors {0}' -f (& $Format $EndRow.CollectorsSeconds))
+            ('billing {0}' -f (& $Format $EndRow.BillingSeconds))
+            ('report {0}' -f (& $Format $EndRow.ReportSeconds))
+            ('total {0}' -f (& $Format $EndRow.TotalSeconds))
+        )
+        $Lines.Add(('  [{0}]  {1}' -f $Group.Label, ($Cells -join '  ')))
+    }
+
+    return $Lines.ToArray()
+}
+
+function Write-RdaPerformanceDebugLog
+{
+    [CmdletBinding()]
+    param(
+        [switch]$Obfuscated
+    )
+
+    # Writes this run's memory and timing block to the local debug log, one line per row, after
+    # the zip, so the debug log holds the same figures as RunSummary.log. Never breaks a run.
+    try
+    {
+        $Stamp = [string]$Global:CurrentDateTime
+        $BlockLines = @(Get-RdaMemoryReadingLines -Readings $Global:MemoryReadings -Stamp $Stamp -Obfuscated:$Obfuscated) + @(Get-RdaTimingLines -Readings $Global:MemoryReadings -Stamp $Stamp -Obfuscated:$Obfuscated)
+        foreach ($BlockLine in $BlockLines)
+        {
+            Write-Log -Message ('[Performance] {0}' -f $BlockLine) -Severity 'Info' -NoConsole -ToDebugLog
+        }
+    }
+    catch
+    {
+        Write-Log -Message ('[Performance] block unavailable: {0}' -f $_.Exception.Message) -Severity 'Info' -NoConsole -ToDebugLog
+    }
+}

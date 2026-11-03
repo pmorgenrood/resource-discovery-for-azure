@@ -933,6 +933,10 @@ function Get-RunSummaryLogContent
         [string]$StreamsSource,
         [int]$Concurrency = 0,
         [string]$ConcurrencySource,
+        # Memory readings and timings recorded per subscription (Write-RdaMemorySnapshot -Record),
+        # and the wrapper process's own peak working set in MB ($null when the OS does not report it).
+        $MemoryReadings = @(),
+        $PeakWorkingSetMB = $null,
         # When set, emit counts only (no names / ids / raw messages).
         [switch]$Obfuscated
     )
@@ -1073,6 +1077,46 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
+
+    # --- Memory and timings --------------------------------------------------
+    # Counts, seconds and megabytes per subscription, labelled by subscription id, or by position
+    # when obfuscated, then the run total and the highest peak working set of any one process
+    # (parallel streams run in separate processes, so their peaks are not added together). A
+    # summary with no readings says so, so it is not mistaken for one from a build without them.
+    $Inv = [cultureinfo]::InvariantCulture
+    $Readings = @(@($MemoryReadings) | Where-Object { $null -ne $_ })
+    $Lines.Add('')
+    try
+    {
+        if ($Readings.Count -gt 0)
+        {
+            foreach ($MemoryLine in @(Get-RdaMemoryReadingLines -Readings $Readings -Obfuscated:$Obfuscated)) { $Lines.Add($MemoryLine) }
+            foreach ($TimingLine in @(Get-RdaTimingLines -Readings $Readings -Obfuscated:$Obfuscated)) { $Lines.Add($TimingLine) }
+        }
+        else
+        {
+            $Lines.Add('Memory: no readings recorded (no subscription reached its first reading)')
+        }
+    }
+    catch
+    {
+        $Lines.Add(('Memory and timing readings unavailable: {0}' -f $_.Exception.Message))
+    }
+    if (($StartTime -is [datetime]) -and ($EndTime -is [datetime]) -and ($EndTime -ge $StartTime) -and ($StartTime -ne [datetime]::MinValue))
+    {
+        $Lines.Add(('  Run total                   : {0} s' -f ([math]::Round(($EndTime - $StartTime).TotalSeconds, 1)).ToString('0.0', $Inv)))
+    }
+    $RunPeak = $null
+    foreach ($PeakValue in @(@($Readings | ForEach-Object { $_.PeakWorkingSetMB }) + @($PeakWorkingSetMB)))
+    {
+        $PeakNumber = 0.0
+        if ($null -ne $PeakValue -and [double]::TryParse([string]$PeakValue, [System.Globalization.NumberStyles]::Float, $Inv, [ref]$PeakNumber) -and $PeakNumber -gt 0 -and ($null -eq $RunPeak -or $PeakNumber -gt $RunPeak))
+        {
+            $RunPeak = $PeakNumber
+        }
+    }
+    $RunPeakText = if ($null -ne $RunPeak) { '{0} MB (highest single process)' -f [math]::Round($RunPeak).ToString($Inv) } else { 'n/a' }
+    $Lines.Add(('  Run peak working set        : {0}' -f $RunPeakText))
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where
     # real names already appear throughout the report. An obfuscated bundle stops

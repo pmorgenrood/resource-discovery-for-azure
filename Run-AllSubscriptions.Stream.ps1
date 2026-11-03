@@ -204,6 +204,9 @@ $Global:MetricsFailedSubs = @()
 # Same reset/aggregate/report lifecycle as $Global:MetricsFailedSubs above.
 $Global:CollectorFailures = @()
 
+# Per-subscription memory readings and timings (Write-RdaMemorySnapshot -Record), same lifecycle.
+$Global:MemoryReadings = @()
+
 $PairCount = [Math]::Min($SubscriptionIds.Count, $SubscriptionNames.Count)
 for ($i = 0; $i -lt $PairCount; $i++)
 {
@@ -318,6 +321,7 @@ $ConsumptionTotal = if ($null -ne $Global:ConsumptionRecordCount) { [int]$Global
 $ConsumptionFailedSubs = if ($null -ne $Global:ConsumptionFailedSubs) { @($Global:ConsumptionFailedSubs) } else { @() }
 $MetricsFailedSubs = if ($null -ne $Global:MetricsFailedSubs) { @($Global:MetricsFailedSubs) } else { @() }
 $CollectorFailures = if ($null -ne $Global:CollectorFailures) { @($Global:CollectorFailures) } else { @() }
+$MemoryReadings = if ($null -ne $Global:MemoryReadings) { @($Global:MemoryReadings) } else { @() }
 
 $Summary = [pscustomobject]@{
     StreamId               = $StreamId
@@ -331,6 +335,7 @@ $Summary = [pscustomobject]@{
     ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
+    MemoryReadings         = @($MemoryReadings)
 }
 try
 {

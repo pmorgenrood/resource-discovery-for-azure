@@ -242,6 +242,7 @@ function Write-RdaShareableDiagnosticsLog
         [string]$RunDateTime,
         [string]$Version,
         $PhaseTimings,
+        $MemoryReadings = @(),
         [switch]$Obfuscated
     )
 
@@ -361,6 +362,26 @@ function Write-RdaShareableDiagnosticsLog
         foreach ($csItem in $ConsumpSkips)
         {
             $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$csItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$csItem.Message) $DiagScrubMap)))
+        }
+
+        # This run's memory readings and timings: counts, seconds and megabytes, labelled by
+        # subscription. The label passes through the same scrub as every other '[sub ...]' line
+        # here, so the default log masks the id as its header says. Filtered to this run's stamp,
+        # because a prompt that has run the script before still holds the earlier run's readings.
+        # Rendered in its own try/catch so a rendering fault costs this block, not the whole log.
+        $PerformanceLines = @()
+        try
+        {
+            $PerformanceLines = @(Get-RdaMemoryReadingLines -Readings $MemoryReadings -Stamp $RunDateTime -Obfuscated:$Obfuscated) + @(Get-RdaTimingLines -Readings $MemoryReadings -Stamp $RunDateTime -Obfuscated:$Obfuscated -BeforeZip)
+        }
+        catch
+        {
+            $PerformanceLines = @(('Memory and timing readings unavailable: {0}' -f $_.Exception.Message))
+        }
+        if ($PerformanceLines.Count -gt 0)
+        {
+            $DiagLines.Add('')
+            foreach ($PerformanceLine in $PerformanceLines) { $DiagLines.Add((Protect-DiagnosticText $PerformanceLine $DiagScrubMap)) }
         }
 
         $DiagnosticsFile = ($DefaultPath + "Diagnostics_" + $ReportName + "_" + $RunDateTime + ".log")

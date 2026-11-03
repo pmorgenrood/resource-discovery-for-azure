@@ -484,6 +484,11 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# Per-subscription memory readings and timings (Write-RdaMemorySnapshot -Record), same lifecycle:
+# appended directly in a sequential run, folded in from each stream's summary JSON in a parallel
+# run, and rendered into RunSummary.log.
+$Global:MemoryReadings = @()
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
@@ -1473,6 +1478,12 @@ else
                     $Global:CollectorFailures += @($StreamSummary.CollectorFailures)
                 }
 
+                if ($StreamSummary.MemoryReadings -and $StreamSummary.MemoryReadings.Count -gt 0)
+                {
+                    if ($null -eq $Global:MemoryReadings) { $Global:MemoryReadings = @() }
+                    $Global:MemoryReadings += @($StreamSummary.MemoryReadings)
+                }
+
                 # If a stream wrote a failures log, add it to the wrapper's diag-file
                 # accumulator so the final summary surfaces the path. The wrapper's
                 # existing $DiagFile was nullable; using a single concatenated log
@@ -2069,6 +2080,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
             -Concurrency $ConcurrencyLimit -ConcurrencySource $ConcurrencySrc `
+            -MemoryReadings $Global:MemoryReadings -PeakWorkingSetMB (Get-RdaPeakWorkingSetMB) `
             -Obfuscated:$Obfuscate
         $RunSummaryLines | Out-File -FilePath (Join-Path $BundleStage 'RunSummary.log') -Encoding utf8
 

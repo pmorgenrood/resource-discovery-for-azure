@@ -18,6 +18,10 @@ param ($TenantID,
     $ReportName = 'ResourcesReport',
     $OutputDirectory)
 
+# Times this subscription from the moment the script starts; the memory readings and the
+# per-subscription timings count their seconds from here.
+$SubscriptionClock = [System.Diagnostics.Stopwatch]::StartNew()
+
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
 if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
 {
@@ -681,8 +685,14 @@ Function RunInventorySetup()
     CheckCliRequirements
     CheckPowerShell
     GetSubscriptionsData
+
+    # Taken after sign-in and the subscription list, so the difference to the 'discovery' reading is
+    # the Resource Graph pages alone and not the modules and tokens the setup loaded.
+    Write-RdaMemorySnapshot -Phase 'start' -Clock $SubscriptionClock -Record
+
     ResourceInventoryLoop
     ResourceInventoryAvd
+    Write-RdaMemorySnapshot -Phase 'discovery' -Clock $SubscriptionClock -Record
 
     if ($Obfuscate.IsPresent)
     {
@@ -1466,6 +1476,11 @@ function ExecuteInventoryProcessing()
 
     ProcessMetricsResult
     ProcessResourceResult
+    Write-RdaMemorySnapshot -Phase 'collectors' -Clock $SubscriptionClock -Record
+
+    # Nothing is released at this point; the reading keeps the same five phases as a build that
+    # frees the collector input here, so the two can be compared row by row.
+    Write-RdaMemorySnapshot -Phase 'released' -Clock $SubscriptionClock -Record
 
     if (!$SkipMetrics.IsPresent)
     {
@@ -1666,6 +1681,9 @@ finally
     catch { }
 }
 
+# Report and packaging: from the start of the HTML report to the end of the zip.
+$ReportPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
 FinalizeOutputs
 
 Write-Log -Message ("Compressing Resources Output: {0}" -f $Global:ZipOutputFile) -Severity 'Info'
@@ -1790,9 +1808,12 @@ if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 
 $JsonWildCard = $DefaultPath + "*.json"
 
+Write-RdaMemorySnapshot -Phase 'end' -Clock $SubscriptionClock -Record
+Add-RdaSubscriptionTimings -Clock $SubscriptionClock -ReportClock $ReportPhaseTimer -PhaseTimings $script:PhaseTimings
+
 if ($Obfuscate.IsPresent)
 {
-    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -Obfuscated:$Obfuscate.IsPresent
+    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -MemoryReadings $Global:MemoryReadings -Obfuscated:$Obfuscate.IsPresent
 
     $JsonFiles = Get-ChildItem -Path $DefaultPath -Filter "*.json" | Where-Object { $_.Name -notlike "ObfuscationDictionary_*" -and $_.Name -notlike "Full_*" -and $_.Name -notlike "Heartbeat_*" -and $_.Name -notlike "DebugLog_*" -and $_.Name -notlike "ErrorLog_*" } | Select-Object -ExpandProperty FullName
     $ShareableExtras = @()
@@ -1806,7 +1827,7 @@ if ($Obfuscate.IsPresent)
 }
 else
 {
-    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings
+    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -MemoryReadings $Global:MemoryReadings
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
 
@@ -1828,6 +1849,11 @@ catch
     Write-Error ("Error Compressing Output File: {0}." -f $Global:ZipOutputFile)
     Write-Error ("Please zip the output files manually.")
 }
+
+# The zip is written, so report and packaging and the total are complete; RunSummary.log and the
+# debug log carry these values, the Diagnostics log inside the zip the ones from before it.
+Add-RdaSubscriptionTimings -Clock $SubscriptionClock -ReportClock $ReportPhaseTimer -PhaseTimings $script:PhaseTimings
+Write-RdaPerformanceDebugLog -Obfuscated:$Obfuscate.IsPresent
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
