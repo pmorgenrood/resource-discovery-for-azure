@@ -2316,3 +2316,48 @@ function Connect-RdaWrapperSession
         throw ("Az PowerShell sign-in to tenant {0} did not give a usable token; stopping instead of prompting again. Run 'Connect-AzAccount -Tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin)." -f $TenantID)
     }
 }
+
+# The per-subscription count line, shared by the wrapper, the stream worker and
+# a direct run. $Collected is the rows kept (@($Global:Resources).Count);
+# $Skipped is the network rows left out of the pull ($null when the count
+# query failed, 0 with -IncludeNetworkResources). Kind:
+#   Empty       - nothing collected and nothing known to be skipped. The
+#                 caller keeps its own empty-subscription warning (a
+#                 permission gap or a really empty subscription).
+#   NetworkOnly - nothing collected, but network rows were skipped. Not a
+#                 warning: the subscription only holds skipped types.
+#   Collected   - rows were collected.
+function Get-RdaResourceCountMessage
+{
+    param(
+        [Parameter(Mandatory = $true)][long]$Collected,
+        [AllowNull()]$Skipped,
+        [System.Collections.IDictionary]$SkippedByType
+    )
+
+    $SkippedCount = if ($null -eq $Skipped) { [long]0 } else { [long]$Skipped }
+    $Noun = if ($SkippedCount -eq 1) { 'network resource' } else { 'network resources' }
+
+    if ($Collected -le 0 -and $SkippedCount -le 0)
+    {
+        return [pscustomobject]@{ Kind = 'Empty'; Text = $null }
+    }
+
+    if ($Collected -le 0)
+    {
+        $Parts = @()
+        if ($null -ne $SkippedByType -and $SkippedByType.Count -gt 0)
+        {
+            $Parts = @($SkippedByType.GetEnumerator() |
+                    Sort-Object -Property @{ Expression = { [long]$_.Value }; Descending = $true }, @{ Expression = { [string]$_.Key }; Descending = $false } |
+                    ForEach-Object { '{0:N0} {1}' -f [long]$_.Value, ([string]$_.Key -replace '^(?i)microsoft\.network/', '') })
+        }
+        $Split = if ($Parts.Count -gt 0) { ' (' + ($Parts -join ', ') + ')' } else { '' }
+        $Text = '0 resources collected. {0:N0} {1} skipped{2}. Network costs still come from the consumption data.' -f $SkippedCount, $Noun, $Split
+        return [pscustomobject]@{ Kind = 'NetworkOnly'; Text = $Text }
+    }
+
+    $Text = 'Resources collected: {0:N0}' -f $Collected
+    if ($SkippedCount -gt 0) { $Text += ' ({0:N0} {1} skipped)' -f $SkippedCount, $Noun }
+    return [pscustomobject]@{ Kind = 'Collected'; Text = $Text }
+}
