@@ -425,9 +425,13 @@ function Get-RoleCheckCountedScopeKinds
 }
 
 # The signed-in identity's object id, from the 'oid' claim of its own Resource
-# Manager token (no directory call). $null when it cannot be read.
+# Manager token (no directory call). The token request has the role check's
+# retry policy (Invoke-ConsumptionCallWithRetry), so a failed token cache check
+# is retried; a sign-in that cannot be used is not. $null when it cannot be
+# read.
 function Get-RoleCheckCallerObjectId
 {
+    param([int]$MaxRetries = 3)
     try
     {
         $ResourceUrl = 'https://management.azure.com/'
@@ -436,7 +440,12 @@ function Get-RoleCheckCallerObjectId
         {
             $ResourceUrl = [string]$Context.Environment.ResourceManagerUrl
         }
-        $Token = Get-AzAccessToken -ResourceUrl $ResourceUrl -WarningAction SilentlyContinue -ErrorAction Stop
+        $Call = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $ResourceUrl -Operation {
+            param($Url)
+            Get-AzAccessToken -ResourceUrl $Url -WarningAction SilentlyContinue -ErrorAction Stop
+        }
+        if ($null -ne $Call.Error) { throw $Call.Error }
+        $Token = $Call.Value
         $Raw = if ($Token.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $Token.Token).Password } else { [string]$Token.Token }
         $Parts = $Raw.Split('.')
         if ($Parts.Count -lt 2) { return $null }
@@ -928,7 +937,7 @@ function Test-SubscriptionRoleAccessAll
         [int]$MaxRetries = 3,
         [int]$ThrottleLimit = 8
     )
-    $CallerObjectId = Get-RoleCheckCallerObjectId
+    $CallerObjectId = Get-RoleCheckCallerObjectId -MaxRetries $MaxRetries
     $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
     $Arguments = @{
         ResourceGroup   = $ResourceGroup
@@ -1358,13 +1367,17 @@ function Get-ConsumptionErrorStatusCode
 # does not count: some of those are transient. Everything else is 'Transient'
 # (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
 # off part-way, and any error not recognised here.
-# Before any of that, a failed token cache check is 'Transient', although Az
-# reports it as a sign-in to set up ('run Connect-AzAccount'): on every token
-# request the token cache library (MSAL, in Az.Accounts) writes a test file
-# next to the cache, reads it back and deletes it, so two token requests at the
-# same moment, in this process or in another one that uses the same token
-# cache, can delete each other's test file ('Persistence check failed. Data was
-# written but it could not be read'). The next attempt checks again and passes.
+# A failed token cache check is 'Transient', although Az reports it as a
+# sign-in to set up ('run Connect-AzAccount'); a status, permission or
+# not-found text elsewhere in the chain still makes it 'Permanent'. On every
+# token request the token cache library (MSAL, in Az.Accounts) writes a test
+# file next to the cache, reads it back and deletes it, so two token requests
+# at the same moment, in this process or in another one that uses the same
+# token cache, can delete each other's test file ('Persistence check failed.
+# Data was written but it could not be read'). A retry usually passes; if every
+# attempt fails (a token cache that cannot be used at all, for example D-Bus
+# not running over SSH, as the error text names), the call gives up after the
+# same 3 retries.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
@@ -1386,16 +1399,18 @@ function Get-ConsumptionErrorKind
     }
     foreach ($Ex in $Chain)
     {
+        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
+        {
+            return 'Permanent'
+        }
+    }
+    foreach ($Ex in $Chain)
+    {
         if ($Ex.GetType().Name -eq 'MsalCachePersistenceException' -or [string]$Ex.Message -match '(?i)persistence check failed') { return 'Transient' }
     }
     foreach ($Ex in $Chain)
     {
-        $Message = [string]$Ex.Message
-        if ($Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
-        {
-            return 'Permanent'
-        }
-        if ($Message -match '(?i)connect-azaccount|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
+        if ([string]$Ex.Message -match '(?i)connect-azaccount|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
         {
             return 'Permanent'
         }

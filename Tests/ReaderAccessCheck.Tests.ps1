@@ -672,9 +672,41 @@ Describe 'Get-RoleCheckCallerObjectId' {
     }
 
     It 'returns $null when no token can be had' {
+        Mock Start-Sleep { }
         Mock Get-AzContext { $null }
         Mock Get-AzAccessToken { throw 'no context' }
         Get-RoleCheckCallerObjectId | Should -BeNullOrEmpty
+        # An error it does not recognise gets the role check's 3 retries.
+        Should -Invoke Get-AzAccessToken -Times 4 -Exactly
+    }
+
+    It 'retries the token request when the token cache check fails, and reads the oid' {
+        Mock Start-Sleep { }
+        $Payload = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"oid":"caller-oid","tid":"t"}')).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        Mock Get-AzContext { $null }
+        $script:TokenCacheCheckFailed = $false
+        Mock Get-AzAccessToken {
+            if (-not $script:TokenCacheCheckFailed)
+            {
+                # The shape the token request fails with when two token
+                # requests delete each other's token cache test file.
+                $script:TokenCacheCheckFailed = $true
+                throw [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.', [System.Exception]::new('Persistence check failed. Data was written but it could not be read.'))
+            }
+            [pscustomobject]@{ Token = (ConvertTo-SecureString ('e30.' + $Payload + '.sig') -AsPlainText -Force) }
+        }
+        Get-RoleCheckCallerObjectId | Should -Be 'caller-oid'
+        Should -Invoke Get-AzAccessToken -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+    }
+
+    It 'asks once, and returns $null, when the sign-in cannot be used' {
+        Mock Start-Sleep { }
+        Mock Get-AzContext { $null }
+        Mock Get-AzAccessToken { throw 'Run Connect-AzAccount to login.' }
+        Get-RoleCheckCallerObjectId | Should -BeNullOrEmpty
+        Should -Invoke Get-AzAccessToken -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 }
 
