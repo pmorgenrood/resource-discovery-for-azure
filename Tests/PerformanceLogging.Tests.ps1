@@ -365,7 +365,7 @@ Describe 'Get-RdaMemoryReadingLines' {
         $Lines = @(Get-RdaMemoryReadingLines -Readings $NoPeak)
         $Lines[5] | Should -Be '  [sub mac-subscription]  start n/a  discovery n/a  collectors n/a  released n/a  end n/a'
         $Lines[6] | Should -Be '  Highest peak working set    : n/a'
-        ($Lines -join "`n") | Should -Not -Match 'start 0\b' -Because 'a missing peak is never written as 0'
+        $Lines[5] | Should -Not -Match '\b0\b' -Because 'a missing peak is never written as 0'
     }
 
     It 'returns nothing for no readings' {

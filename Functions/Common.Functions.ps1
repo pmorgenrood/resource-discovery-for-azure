@@ -602,7 +602,8 @@ function Get-RdaTimingLines
         {
             $From = ConvertTo-RdaReadingNumber $Start[0].Seconds
             $To = ConvertTo-RdaReadingNumber $Discovery[0].Seconds
-            if ($null -ne $From -and $null -ne $To) { $DiscoverySeconds = [math]::Max(0, [math]::Round($To - $From, 1)) }
+            # [double] 0: with an int first argument [math]::Max picks its integer overload and drops the decimal.
+            if ($null -ne $From -and $null -ne $To) { $DiscoverySeconds = [math]::Max([double]0, [math]::Round($To - $From, 1)) }
         }
         $EndRow = if ($End.Count -gt 0) { $End[0] } else { [pscustomobject]@{} }
         $Cells = @(
