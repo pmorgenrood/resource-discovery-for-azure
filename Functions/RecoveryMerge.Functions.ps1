@@ -292,12 +292,15 @@ function Merge-RecoveryData
     # resources will not join - silent referential corruption in a bundle that
     # otherwise looks complete. We cannot repair that here, but we CAN detect the
     # tell-tale: a seeded recovery's ResourceIdMap shares (almost) all of the gap's
-    # tokens, whereas an unseeded one shares none. Warn loudly on zero overlap.
-    # A bundle pair where only one side has a dictionary STOPS the merge before
-    # the output folder is created, so nothing is written, zipped or left behind;
-    # the way out is to fix the named bundle and run the same merge again.
+    # tokens, whereas an unseeded one shares none. Zero overlap STOPS the merge.
+    # Both guards in this block run before the output folder is created, so a
+    # stopped merge writes, zips and leaves nothing; the way out is to fix the
+    # named bundle and run the same merge again.
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
+        # Counted inside the try, thrown after it, so the stop is never turned
+        # into the "could not compare" warning below.
+        $SharedIdKeyCount = $null
         try
         {
             $GapDictCheck = Get-Content -Path $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
@@ -306,16 +309,16 @@ function Merge-RecoveryData
             $RecoveryIdKeys = @($RecoveryDictCheck.ResourceIdMap.PSObject.Properties.Name)
             if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
             {
-                $SharedIdKeys = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys })
-                if (@($SharedIdKeys).Count -eq 0)
-                {
-                    Add-MergeWarning ('the recovery and gap obfuscation dictionaries share NO ResourceIdMap tokens. This almost always means the recovery run was NOT seeded with the gap bundle''s dictionary (-ObfuscationDictionary <gap dict>). Cross-references in the recovered service(s) will carry mismatched tokens and will not join, so the merged bundle''s referential integrity is likely broken. Re-run the recovery seeded with the gap dictionary, or confirm the two bundles belong together.')
-                }
+                $SharedIdKeyCount = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys }).Count
             }
         }
         catch
         {
             Add-MergeWarning ('could not compare the gap/recovery obfuscation dictionaries for compatibility (seed check skipped): {0}' -f $_.Exception.Message)
+        }
+        if ($SharedIdKeyCount -eq 0)
+        {
+            throw ("Merge-RecoveryData: the recovery bundle's dictionary '{0}' and the gap bundle's dictionary '{1}' share no ResourceIdMap token. The recovery run was almost certainly not seeded with the gap dictionary, so the same resource would carry different tokens in different files of the merged bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}', then run this merge again." -f $RecoveryDictionaryFile.Name, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
         }
     }
     elseif ($GapDictionaryFile)

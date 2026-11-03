@@ -448,6 +448,30 @@ Describe 'Merge-RecoveryData metrics handling' {
 
 Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
+    It 'stops when the recovery dictionary shares no ResourceIdMap token with the gap (unseeded recovery)' {
+        $C = New-Case
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*share no ResourceIdMap token*-ObfuscationDictionary*'
+        Test-Path -Path $C.Output | Should -BeFalse -Because 'the stop comes before the output folder is made, so nothing is left for the next run to trip on'
+    }
+
+    It 'stops even under -ErrorAction SilentlyContinue when no ResourceIdMap token is shared' {
+        $C = New-Case
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*share no ResourceIdMap token*'
+        Test-Path -Path $C.Output | Should -BeFalse
+    }
+
     It 'stops when only the gap bundle has a dictionary, naming the recovery bundle' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
@@ -500,18 +524,6 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 }
 
 Describe 'Merge-RecoveryData guards (advisory warnings)' {
-
-    It 'warns when the recovery dictionary shares no ResourceIdMap tokens with the gap (likely unseeded recovery)' {
-        $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
-        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
-
-        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
-
-        ($Result.Warnings -join "`n") | Should -Match 'share NO ResourceIdMap tokens'
-    }
 
     It 'does NOT warn about token overlap when the dictionaries share ResourceIdMap tokens (seeded recovery)' {
         $C = New-Case
@@ -677,9 +689,10 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
             ResourceIdMap       = [ordered]@{ 'prod_tokA' = '/id/a' }
             SubscriptionNameMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' }
         }
+        # Seeded recovery: it shares the gap's token and adds one of its own.
         $RecDict = [ordered]@{
             GeneratedAt   = '2026-01-02 00:00:00'
-            ResourceIdMap = [ordered]@{ 'prod_tokB' = '/id/b' }
+            ResourceIdMap = [ordered]@{ 'prod_tokA' = '/id/a'; 'prod_tokB' = '/id/b' }
             TagMap        = [ordered]@{ 'prod_tagtok' = 'payments' }
         }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict

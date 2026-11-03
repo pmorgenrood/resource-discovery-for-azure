@@ -105,6 +105,13 @@ Behaviour:
 - The return object reports `MergedServiceKeys`, `ConsumptionSource`
   (`gap`/`recovery`), and `MetricsSource` (`gap`/`recovery`) for confirmation.
 - The obfuscation dictionaries are merged (local-only, never zipped).
+- **Masking must match.** The merge stops, before it writes or zips anything,
+  when only one of the two bundles has an `ObfuscationDictionary_*.json`
+  (one run was masked and the other was not), or when the two dictionaries
+  share no `ResourceIdMap` token (the recovery run was not seeded with the gap
+  dictionary). The error names the bundle to fix. Re-run that bundle with
+  `-Obfuscate` (for the recovery run, also `-ObfuscationDictionary <gap dict>`),
+  or put a moved dictionary back in its folder, then run the same merge again.
 
 ## Recovery recipes
 
