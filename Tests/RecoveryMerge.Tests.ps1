@@ -490,8 +490,25 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
-            Should -Throw -ExpectedMessage ('*gap bundle ''{0}'' has no ObfuscationDictionary*-Obfuscate*' -f $C.Gap)
+            Should -Throw -ExpectedMessage ('*gap bundle ''{0}'' has no ObfuscationDictionary*-Obfuscate*into a new folder*' -f $C.Gap)
         Test-Path -Path $C.Output | Should -BeFalse
+    }
+
+    It 'merges on the next run once the recovery is re-run without -Obfuscate into a new folder' {
+        $C = New-Case
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } | Should -Throw
+
+        # A re-run into the same folder would leave the old dictionary there and stop again; a new folder is the way out.
+        $NewRecovery = $C.Recovery + '_rerun'
+        New-Bundle -Dir $NewRecovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $NewRecovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        @($Result.Warnings).Count | Should -Be 0
+        $Result.OutputDictionary | Should -BeNullOrEmpty
+        Test-Path -Path $Result.OutputZip | Should -BeTrue
     }
 
     It 'does not stop or warn on token overlap when the gap ResourceIdMap is empty (<Case>)' -ForEach @(

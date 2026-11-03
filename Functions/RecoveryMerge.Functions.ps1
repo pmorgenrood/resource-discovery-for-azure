@@ -322,20 +322,20 @@ function Merge-RecoveryData
         }
         if ($SharedIdKeyCount -eq 0)
         {
-            throw ("Merge-RecoveryData: the recovery bundle's dictionary '{0}' and the gap bundle's dictionary '{1}' share no ResourceIdMap token. The recovery run was almost certainly not seeded with the gap dictionary, so the same resource would carry different tokens in different files of the merged bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}', then run this merge again." -f $RecoveryDictionaryFile.Name, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
+            throw ("Merge-RecoveryData: the recovery bundle's dictionary '{0}' and the gap bundle's dictionary '{1}' share no ResourceIdMap token. The recovery run was almost certainly not seeded with the gap dictionary, so the same resource would carry different tokens in different files of the merged bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}' into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it." -f $RecoveryDictionaryFile.Name, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
         }
     }
     elseif ($GapDictionaryFile)
     {
         # Masked gap, recovery without a dictionary: the recovery inventory may
         # hold real names and ids, which would ship inside a masked zip.
-        throw ("Merge-RecoveryData: the recovery bundle '{0}' has no ObfuscationDictionary_*.json, but the gap bundle has '{1}'. The recovery run was probably not masked, so its real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}', then run this merge again. If the recovery run was masked and its dictionary was moved, put it back in that folder." -f $RecoveryBundlePath, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
+        throw ("Merge-RecoveryData: the recovery bundle '{0}' has no ObfuscationDictionary_*.json, but the gap bundle has '{1}'. The recovery run was probably not masked, so its real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}' into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it. If the recovery run was masked and its dictionary was moved, put it back in that folder." -f $RecoveryBundlePath, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
     }
     elseif ($RecoveryDictionaryFile)
     {
         # Masked recovery, gap without a dictionary: the gap inventory may hold
         # real names and ids next to masked recovered rows.
-        throw ("Merge-RecoveryData: the gap bundle '{0}' has no ObfuscationDictionary_*.json, but the recovery bundle has '{1}'. The gap run was probably not masked, so real names and ids would sit next to masked rows in one bundle. Nothing was written to '{2}'. If the gap run was masked and its dictionary was moved, put it back in that folder. Otherwise re-run the gap bundle with -Obfuscate (or re-run the recovery without -Obfuscate to match it), then run this merge again." -f $GapBundlePath, $RecoveryDictionaryFile.Name, $OutputPath)
+        throw ("Merge-RecoveryData: the gap bundle '{0}' has no ObfuscationDictionary_*.json, but the recovery bundle has '{1}'. The gap run was probably not masked, so real names and ids would sit next to masked rows in one bundle. Nothing was written to '{2}'. If the gap run was masked and its dictionary was moved, put it back in that folder. Otherwise re-run the gap bundle with -Obfuscate, or re-run the recovery without -Obfuscate to match it, into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at the new folder." -f $GapBundlePath, $RecoveryDictionaryFile.Name, $OutputPath)
     }
 
     # -- Guard: dictionary-belongs-to-its-inventory (HARD FAIL) ---------------

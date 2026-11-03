@@ -110,8 +110,10 @@ Behaviour:
   (one run was masked and the other was not), or when the two dictionaries
   share no `ResourceIdMap` token (the recovery run was not seeded with the gap
   dictionary). The error names the bundle to fix. Re-run that bundle with
-  `-Obfuscate` (for the recovery run, also `-ObfuscationDictionary <gap dict>`),
-  or put a moved dictionary back in its folder, then run the same merge again.
+  `-Obfuscate` (for the recovery run, also `-ObfuscationDictionary <gap dict>`)
+  into a new folder, or put a moved dictionary back in its folder, then run the
+  merge again pointed at it. A reused `-OutputDirectory` still holds the old
+  run's files, including its dictionary, so the merge would stop again.
 
 ## Recovery recipes
 
