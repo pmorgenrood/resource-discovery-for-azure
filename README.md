@@ -268,7 +268,7 @@ Read access means one role that can read **every** resource type. Azure Resource
 
 The list says what to do for each cause: grant Reader (no read access, or a resource group that is not found), re-run (the check could not finish, for example persistent throttling or a role assignment list longer than 1000 pages), or wait 5 minutes and re-run (the two answers disagree, usually right after a role change).
 
-Each Azure call of the check that fails with an error the tool does not recognise (not a permission error, a sign-in that cannot be used, a bad request or not found) is retried up to 3 times, with waits of 2, 4 and 8 seconds, so at most 14 seconds per call, before the check gives up on that subscription as before (`role check inconclusive after retries`).
+Each Azure call of the check that fails with an error the tool does not recognise (not a permission error, a sign-in that cannot be used, a bad request or not found) is retried up to 3 times, with waits of 2, 4 and 8 seconds, so at most 14 seconds per call, before the check gives up on that subscription as before (`role check inconclusive after retries`). A failed token cache check is retried too, although Az reports it as a sign-in to set up (`Connect-AzAccount`): it happens when two token requests overlap, in one run or in two Az PowerShell processes that share the token cache, and passes on the next attempt. The same retry applies to the consumption data check and to the consumption download.
 
 #### Consumption data check (up-front)
 
