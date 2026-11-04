@@ -157,6 +157,16 @@ Describe 'The skip list' {
             {
                 [void]$Literals.Add($M.Groups[1].Value)
             }
+            # A provider type literal with a wildcard (a switch -Wildcard
+            # case, a pattern kept in a variable): read as -like.
+            foreach ($M in [regex]::Matches($Text, '(?i)[''"](microsoft\.[a-z0-9]*[*?][a-z0-9./*?]*|microsoft\.[a-z0-9]+/[a-z0-9./]*[*?][a-z0-9./*?]*)[''"]'))
+            {
+                foreach ($T in $SkipList) { if ($T -like $M.Groups[1].Value) { $Hits.Add("$T (by wildcard literal '$($M.Groups[1].Value)')") } }
+            }
+            # A switch on the type, and a method call on it (.StartsWith and
+            # the like), cannot be checked as a comparison.
+            foreach ($M in [regex]::Matches($Text, '(?i)\bswitch\b(\s+-\w+)*\s*\([^)]*\btype\b[^)]*\)')) { $Unchecked.Add($M.Value) }
+            foreach ($M in [regex]::Matches($Text, '(?i)\.type\.(?!ToLower(Invariant)?\(\)\s*-)[a-z]+\s*\(')) { $Unchecked.Add($M.Value) }
             foreach ($T in $SkipList) { if ($Literals.Contains($T)) { $Hits.Add($T) } }
             [pscustomobject]@{ Literals = $Literals; Hits = @($Hits); Unchecked = @($Unchecked) }
         }
@@ -189,6 +199,10 @@ Describe 'The skip list' {
         @{ Label = 'by a -match pattern'; Text = '$Resources | Where-Object { $_.type -imatch ''^microsoft\.network/route'' }'; Expect = 'hit' }
         @{ Label = 'by a variable'; Text = '$T = ''microsoft.net'' + ''work/routetables''; $Resources | Where-Object { $_.TYPE -eq $T }'; Expect = 'unchecked' }
         @{ Label = 'in a -in list held in a variable'; Text = '$Resources | Where-Object { $_.type -in $NetTypes }'; Expect = 'unchecked' }
+        @{ Label = 'by a switch -Wildcard on the type'; Text = 'switch -Wildcard ($_.type) { ''microsoft.network/*'' { $N++ } }'; Expect = 'hit' }
+        @{ Label = 'by a switch -Regex on the type'; Text = 'switch -Regex ($_.TYPE) { ''^microsoft\.network/'' { $N++ } }'; Expect = 'unchecked' }
+        @{ Label = 'by a .type method call'; Text = '$Resources | Where-Object { $_.type.StartsWith(''microsoft.network/route'') }'; Expect = 'unchecked' }
+        @{ Label = 'by Where-Object -Property type'; Text = '$Resources | Where-Object -Property type -EQ ''microsoft.network/routetables'''; Expect = 'hit' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
