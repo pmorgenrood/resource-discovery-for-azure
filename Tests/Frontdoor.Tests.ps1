@@ -27,7 +27,7 @@ BeforeAll {
     $script:ObfuscatedIdPattern = Get-RdaObfuscatedIdPattern
     # A Front Door ID is always an ARM id, so under -Obfuscate it must be the
     # full masked ARM path, never a flat token.
-    $script:MaskedIdPattern = Get-RdaMaskedIdPattern
+    $script:MaskedIdPattern = Get-RdaContractIdPattern
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 
     # Detect whether this zip is from an obfuscated run: the ID starts like a
