@@ -449,3 +449,44 @@ Describe 'PreflightOnly, run from inside a clone' {
     }
 }
 
+Describe 'Sign-in stays in this process' {
+    BeforeAll {
+        $script:Other = '44444444-4444-4444-4444-444444444444'
+        $script:Acct = [pscustomobject]@{ Id = 'user' }
+    }
+
+    It 'switches tenant and subscription for this process only, never the saved default' {
+        Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:Other }; Subscription = [pscustomobject]@{ Id = $script:Other } } }
+        Mock Set-AzContext { }
+        Mock Get-AzAccessToken { 'token' }
+        Mock Get-AzSubscription { [pscustomobject]@{ Id = $script:S; State = 'Enabled' } }
+        Test-RdaAzSignIn -Tenant $script:T -Subscription $script:S | Should -BeTrue
+        Should -Invoke Set-AzContext -Times 1 -Exactly -ParameterFilter { $Scope -eq 'Process' -and $Tenant -eq $script:T -and $Subscription -eq $script:S }
+        Should -Invoke Set-AzContext -Times 0 -Exactly -ParameterFilter { $Scope -ne 'Process' }
+    }
+
+    It 'lets a new process use a saved sign-in whose default tenant is another one' {
+        Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:Other } } }
+        Mock Get-AzAccessToken { 'token' }
+        $Check = [scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T))
+        & $Check | Should -BeTrue
+        Should -Invoke Get-AzAccessToken -Times 1 -Exactly -ParameterFilter { $TenantId -eq $script:T }
+    }
+
+    It 'says no when the saved sign-in cannot get a token for the tenant' {
+        Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:Other } } }
+        Mock Get-AzAccessToken { throw 'no token' }
+        & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T))) | Should -BeFalse
+    }
+
+    It 'says no when there is no saved sign-in' {
+        Mock Get-AzContext { $null }
+        Mock Get-AzAccessToken { 'token' }
+        & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T))) | Should -BeFalse
+        Should -Invoke Get-AzAccessToken -Times 0 -Exactly
+    }
+
+    It 'takes only a GUID as the tenant, so nothing else lands in the command' {
+        { Get-RdaChildSignInCheck -Tenant "x'; Remove-Item ~ -Recurse; '" } | Should -Throw '*GUID*'
+    }
+}
