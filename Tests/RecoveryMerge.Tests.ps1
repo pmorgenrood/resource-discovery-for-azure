@@ -299,6 +299,21 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
+    It 'refuses an -OutputPath that already holds the <Which> inventory, however the folder is reached' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        # A bind mount, a mapped or substituted drive or a short name shows a
+        # source folder under another path. Seen from the path, that is an
+        # output folder holding the source's own inventory file.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Source = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        $null = New-Item -ItemType Directory -Path $C.Output
+        Get-ChildItem -LiteralPath $Source -File | Copy-Item -Destination $C.Output
+        $Before = @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw -ExpectedMessage '*already holds the source inventory*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
