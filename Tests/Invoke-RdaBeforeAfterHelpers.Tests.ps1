@@ -43,7 +43,7 @@ BeforeAll {
             $Vals = @{ InstanceData = '{"a":1,"b":"x, y"}'; MeterCategory = $(if ($i % 2) { 'Storage' } else { 'Virtual Machines' }); MeterId = "m$i"; Quantity = ([string]$Q); UsageStartTime = '2026-10-01T00:00:00Z'; UsageEndTime = '2026-10-31T00:00:00Z'; ResourceId = $Rid; Cost = '0.5' }
             $Lines.Add(($Hdr | ForEach-Object { '"' + ([string]$Vals[$_]).Replace('"', '""') + '"' }) -join ',')
         }
-        $Met = @{ Metrics = @(for ($i = 0; $i -lt $Metrics; $i++) { [ordered]@{ ID = $VmIds[$i % $VmIds.Count]; Name = ($VmIds[$i % $VmIds.Count] -split '/')[-1]; Subscription = $Sub; ResourceGroup = $Rg; Service = 'VM'; Metric = 'Percentage CPU'; MetricAggregate = 'Average'; MetricValue = 1.5; MetricCount = 10; MetricPercentile = 2.0; MetricError = $false } }) }
+        $Met = @{ Metrics = @(for ($i = 0; $i -lt $Metrics; $i++) { [ordered]@{ ID = $VmIds[$i % $VmIds.Count]; Name = ($VmIds[$i % $VmIds.Count] -split '/')[-1]; Subscription = $Sub; ResourceGroup = $Rg; Service = 'VM'; Metric = 'Percentage CPU'; MetricAggregate = 'Average'; MetricValue = 1.5; MetricCount = 10; MetricPercentile = 2.0; MetricError = $false; MetricSeries = @(1.5, 2.0) } }) }
         $Diag = @('Resource Discovery for Azure - diagnostics', '', ('Collector failures: {0}' -f $FailedCollector.Count)) + @($FailedCollector | ForEach-Object { '  [sub <guid>] {0}: Cannot convert null to type "System.DateTime".' -f $_ }) + @('', 'Metrics auth-skipped subscriptions: 0', '', 'Consumption failed/incomplete subscriptions: 0')
         if ($FailedCollector -contains 'VMDisk') { $Inv.VMDisk = @() }
         return [pscustomobject]@{ Inventory = ($Inv | ConvertTo-Json -Depth 10); Consumption = ($Lines -join "`n"); Metrics = ($Met | ConvertTo-Json -Depth 10); Diagnostics = ($Diag -join "`n") }
@@ -150,12 +150,13 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
 
     It 'counts metrics rows with MetricError true, and leaves nulls out' {
         $Run = Get-FakeRun -Metrics 3
-        $V = '"MetricCount":1,"MetricValue":1.5,"MetricPercentile":2'
+        $V = '"MetricCount":1,"MetricValue":1.5,"MetricPercentile":2,"MetricSeries":[1]'
         $Run.Metrics = '{"Metrics":[{"ID":"a","MetricError":true,' + $V + '},null,{"ID":"b","MetricError":false,' + $V + '},{"ID":"c","MetricError":"true",' + $V + '}],"Other":{"x":[1,2]}}'
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'met.zip') $Run -Wrap)
         $C.metricsRows | Should -Be 3
         $C.metricsErrorRows | Should -Be 1 -Because 'only a JSON true counts, not the text "true"'
-        @($C.problems) | Should -Be @('metrics value not a number, or MetricError not true or false') -Because 'the text "true" is not true or false'
+        @($C.problems) | Should -Contain 'metrics value or series not a number, or MetricError not true or false'
+        @($C.problems) | Should -Contain 'metrics record not an object'
     }
 
     It 'counts inventory sections without reading other values as rows' {
@@ -168,16 +169,16 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
         $C.inventoryBySection.PublicIP | Should -Be 1
     }
 
-    It 'notes a cut-off inventory or metrics file and a consumption file with an open quote, and goes on' {
+    It 'notes a cut-off inventory or metrics file and a missing consumption header, and goes on' {
         $Run = Get-FakeRun
         $Run.Inventory = '{"VirtualMachines":[{"ID":"a"},'
         $Run.Metrics = '{"Metrics":[{"ID":"a"'
-        $Run.Consumption = "a,b`n1,""x`n2,3"
+        $Run.Consumption = "WrongHeader`n1"
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'bad.zip') $Run -Wrap)
         $C.reports | Should -Be 1
         @($C.problems) | Should -Contain 'inventory file could not be read'
         @($C.problems) | Should -Contain 'a metrics file could not be read'
-        @($C.problems) | Should -Contain 'consumption file could not be read'
+        @($C.problems) | Should -Contain 'consumption header missing'
     }
 
     It 'gives a fixed problem for a zip that cannot be opened, never a stop' {
@@ -222,7 +223,7 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
 
     It 'does not count a report with a file that could not be read' {
         $Run = Get-FakeRun
-        $Run.Consumption = "a,b`n1,""x`n2,3"
+        $Run.Consumption = "WrongHeader`n1"
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'badcsv.zip') $Run -Wrap)
         $Ok = @{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }
         Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
@@ -230,10 +231,19 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
 
     It 'notes files the reader would drop or refuse: <Case>' -TestCases @(
         @{ Case = 'metrics with no Metrics list'; Set = { param($R) $R.Metrics = '{"Wrong":[]}' }; Want = 'metrics file has no Metrics list' }
-        @{ Case = 'metrics value null'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":null,"MetricValue":1,"MetricPercentile":1,"MetricError":false}]}' }; Want = 'metrics value not a number, or MetricError not true or false' }
-        @{ Case = 'MetricError as text'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":"false"}]}' }; Want = 'metrics value not a number, or MetricError not true or false' }
+        @{ Case = 'metrics value null'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":null,"MetricValue":1,"MetricPercentile":1,"MetricError":false,"MetricSeries":[1]}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'MetricError as text'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":"false","MetricSeries":[1]}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'MetricSeries null'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":false,"MetricSeries":null}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'MetricSeries missing'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":false}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'MetricSeries text'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":false,"MetricSeries":"3"}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'MetricSeries list with null'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":false,"MetricSeries":[1,null]}]}' }; Want = 'metrics value or series not a number, or MetricError not true or false' }
+        @{ Case = 'a null entry in the Metrics list'; Set = { param($R) $R.Metrics = '{"Metrics":[null]}' }; Want = 'metrics record not an object' }
+        @{ Case = 'a scalar entry in the Metrics list'; Set = { param($R) $R.Metrics = '{"Metrics":[42]}' }; Want = 'metrics record not an object' }
+        @{ Case = 'inventory record not an object'; Set = { param($R) $R.Inventory = '{"VirtualMachines":[42,{"ID":"a","Name":"b"}]}' }; Want = 'inventory record not an object' }
         @{ Case = 'consumption with a renamed header'; Set = { param($R) $R.Consumption = "WrongHeader`n1" }; Want = 'consumption header missing' }
         @{ Case = 'consumption Quantity with a comma'; Set = { param($R) $R.Consumption = "ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime`n/x,a,b,c,m,""1,5"",2026-10-01T00:00:00Z,2026-10-02T00:00:00Z" }; Want = 'consumption number or date that does not parse' }
+        @{ Case = 'consumption missing Quantity header'; Set = { param($R) $R.Consumption = "ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,UsageStartTime,UsageEndTime`n/x,a,b,c,m,2026-10-01T00:00:00Z,2026-10-02T00:00:00Z" }; Want = 'consumption header missing' }
+        @{ Case = 'consumption short row'; Set = { param($R) $R.Consumption = "ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime`nm" }; Want = 'consumption number or date that does not parse' }
         @{ Case = 'inventory ID as a number'; Set = { param($R) $R.Inventory = '{"VirtualMachines":[{"ID":5,"Name":"a"}]}' }; Want = 'inventory ID, Name or SKU not a string' }
         @{ Case = 'inventory section as an object'; Set = { param($R) $R.Inventory = '{"VirtualMachines":{"ID":"a"}}' }; Want = 'inventory section not a list' }
     ) {
@@ -244,6 +254,14 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive ('c-' + [guid]::NewGuid() + '.zip')) $Run -Wrap)
         @($C.problems) | Should -Contain $Want
         Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = $C }, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
+    }
+
+    It 'lets a failed-call record (MetricError true) keep a null series, as both releases write it' {
+        $Run = Get-FakeRun
+        $Run.Metrics = '{"Metrics":[{"ID":"a","MetricCount":0,"MetricValue":0,"MetricPercentile":0,"MetricError":true,"MetricSeries":null}]}'
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'errnull.zip') $Run -Wrap)
+        @($C.problems).Count | Should -Be 0
+        $C.metricsErrorRows | Should -Be 1
     }
 
     It 'counts rows the reader drops one by one, without calling the file bad' {

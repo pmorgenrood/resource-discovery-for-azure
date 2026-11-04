@@ -692,21 +692,23 @@ Describe 'Round 3: resource-group Reader, paged replies, a subscription of anoth
         Should -Invoke Invoke-AzRestMethod -Times 10 -Exactly
     }
 
-    It 'warns, not stops, when only a resource group can be read, and reads pages (Azure CLI)' {
-        $script:Replies = @{
-            perm1 = '{"value":[],"nextLink":"https://example.invalid/p2"}'
-            perm2 = '{"value":[]}'
-            rg = '{"value":[{"name":"rg1"}]}'
-        }
+    It 'warns, not stops, when only a resource group or a resource can be read (Azure CLI)' {
+        $script:Replies = @{ perm = '{"value":[]}'; rg = '{"value":[]}'; res = '{"value":[{"id":"x"}]}' }
+        $script:FakeAzCalls = [System.Collections.Generic.List[object]]::new()
         function global:az
         {
+            $script:FakeAzCalls.Add(@($args))
             $global:LASTEXITCODE = 0
             $U = $args[$args.IndexOf('--url') + 1]
-            if ($U -like '*/resourcegroups?*') { $script:Replies.rg } elseif ($U -eq 'https://example.invalid/p2') { $script:Replies.perm2 } else { $script:Replies.perm1 }
+            if ($U -like '*/resourcegroups') { $script:Replies.rg } elseif ($U -like '*/resources') { $script:Replies.res } else { $script:Replies.perm }
         }
         Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'partial'
-        $script:Replies.perm2 = '{"value":[{"actions":["*/read"],"notActions":[]}]}'
-        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'ok'
+        $script:Replies.res = '{"value":[]}'
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'missing'
+        # cmd.exe (az.cmd on Windows) cuts an argument at '&': no argument may hold one.
+        foreach ($C in $script:FakeAzCalls) { foreach ($A in $C) { [string]$A | Should -Not -Match '&' } }
+        $script:Replies.perm = '{"value":[],"nextLink":"https://example.invalid/p2?a=1&b=2"}'
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'unknown' -Because 'a next page is not read through cmd.exe'
     }
 
     It 'sees a subscription the Azure CLI lists under another tenant' {
@@ -739,5 +741,52 @@ Describe 'Round 3: resource-group Reader, paged replies, a subscription of anoth
         $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
         $R.Result | Should -BeTrue
         $R.Text | Should -Match 'az extension add --name resource-graph'
+    }
+}
+
+Describe 'End notes about the current release' {
+    BeforeAll { . $script:Customer }
+
+    It 'shows the Azure Virtual Desktop note only when Before uses the Azure CLI' {
+        $WithCli = @{ side = 'before'; usesAzureCli = $true }
+        $NoCli = @{ side = 'before'; usesAzureCli = $false }
+        (Get-RdaEndNote -Sides @($WithCli, @{ side = 'after'; usesAzureCli = $false })) | Should -Contain 'Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions'
+        (Get-RdaEndNote -Sides @($NoCli, @{ side = 'after'; usesAzureCli = $false })) | Should -Not -Contain 'Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions'
+    }
+
+    It 'signs in and then gets subscription-other-tenant: stops with the right hint' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $true }
+        $script:CliAfter = 'subscription-other-tenant'
+        Mock Invoke-RdaAz { 0 }
+        Mock Test-RdaAzCliSignIn { if ($script:CliAfter) { $A = $script:CliAfter; $script:CliAfter = $null; $A } else { 'not-signed-in' } }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match 'another tenant than -TenantID'
+        $R.Text | Should -Not -Match 'still not signed in'
+    }
+
+    It 'CLI reader check runs in Cloud Shell too' {
+        $script:Bt = Join-Path $TestDrive ('bt-' + [guid]::NewGuid()); New-Item -ItemType Directory $script:Bt | Out-Null
+        Set-Content (Join-Path $script:Bt 'ResourceInventory.ps1') '$x = az account show --output json'
+        $script:At = Join-Path $TestDrive ('at-' + [guid]::NewGuid()); New-Item -ItemType Directory $script:At | Out-Null
+        Set-Content (Join-Path $script:At 'ResourceInventory.ps1') '# no az here'
+        $script:Clone = Join-Path $TestDrive ('clone-' + [guid]::NewGuid()); New-Item -ItemType Directory $script:Clone | Out-Null
+        Set-Content (Join-Path $script:Clone 'ResourceInventory.ps1') 'throw "not used"'
+        Mock Test-RdaCloudShell { $true }
+        Mock Invoke-RdaAzModuleCheck { [pscustomobject]@{ Ok = $true; Modules = @() } }
+        Mock Import-Module { }
+        Mock Invoke-RdaAzCliCheck { $true }
+        Mock Connect-RdaOnce { $true }
+        Mock Get-AzSubscription { [pscustomobject]@{ State = 'Enabled' } }
+        Mock Invoke-RdaReaderCheck { $true }
+        Mock Invoke-RdaAzCliReaderCheck { $true }
+        Mock Test-RdaChildSeesSignIn { $true }
+        Mock Invoke-RdaSide { throw 'must not start' }
+        Push-Location $script:Clone
+        try { $null = Invoke-Captured { Invoke-RdaBeforeAfter -TenantID $script:T -SubscriptionID $script:S -AfterBranch 'x' -BeforeCodePath $script:Bt -AfterCodePath $script:At -PreflightOnly } }
+        finally { Pop-Location }
+        Should -Invoke Invoke-RdaAzCliReaderCheck -Times 1 -Exactly -ParameterFilter { $Side -eq 'Before' -and $Subscription -eq $script:S }
     }
 }
