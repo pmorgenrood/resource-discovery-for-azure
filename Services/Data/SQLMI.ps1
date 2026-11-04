@@ -11,22 +11,15 @@ if ($Task -eq 'Processing')
 
         # Count each instance's databases once up front instead of scanning every
         # database for every instance. A database belongs to an instance when its
-        # id starts with "<instance id>/databases/", ignoring letter case, so each
-        # place '/databases/' appears in a database id gives one candidate parent.
-        # Ids that are not plain ASCII strings keep the old '-like' match, with any
-        # wildcard characters in the instance id escaped.
+        # id starts with "<instance id>/databases/", so each place '/databases/'
+        # appears in a database id gives one candidate parent. Every id takes this
+        # one path. Letter case is ignored by an ordinal rule, which is the same on
+        # every host culture, and wildcard characters are plain characters.
         $DbCountByParent = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $DbLikeOnly = [System.Collections.Generic.List[object]]::new()
         foreach ($Db in $SQLSERVERMIDB)
         {
-            $DbId = $Db.Id
-            if ($null -eq $DbId) { continue }
-            # -cmatch: a case-blind match would fold some non-ASCII letters into ASCII.
-            if ($DbId -isnot [string] -or $DbId -cmatch '[^\x00-\x7F]')
-            {
-                [void]$DbLikeOnly.Add($Db)
-                continue
-            }
+            if ($null -eq $Db.Id) { continue }
+            $DbId = "$($Db.Id)"
             $At = $DbId.IndexOf('/databases/', [System.StringComparison]::OrdinalIgnoreCase)
             while ($At -ge 0)
             {
@@ -42,23 +35,8 @@ if ($Task -eq 'Processing')
         {
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
-            $InstanceId = "$($1.Id)"
-            # Wildcard characters (* ? [ ] and backtick) in an instance id are
-            # plain characters of the id, so they are escaped for '-like'.
-            $LikeId = $InstanceId -replace '([*?\[\]`])', '`$1'
-            if ($InstanceId -cmatch '[^\x00-\x7F]')
-            {
-                $DbCount = @($SQLSERVERMIDB | Where-Object { $_.Id -like "$LikeId/databases/*" }).Count
-            }
-            else
-            {
-                $DbCount = 0
-                [void]$DbCountByParent.TryGetValue($InstanceId, [ref]$DbCount)
-                if ($DbLikeOnly.Count -gt 0)
-                {
-                    $DbCount += @($DbLikeOnly | Where-Object { $_.Id -like "$LikeId/databases/*" }).Count
-                }
-            }
+            $DbCount = 0
+            [void]$DbCountByParent.TryGetValue("$($1.Id)", [ref]$DbCount)
             # Backup storage redundancy: older API shapes name it storageAccountType,
             # current ones report currentBackupStorageRedundancy (in effect) and
             # requestedBackupStorageRedundancy (asked for). Take the first that is a
