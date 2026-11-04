@@ -23,8 +23,11 @@
 
     Nothing is sent anywhere. You send the files in the "share" folder by hand.
     Both runs only read from Azure. They change nothing in your subscription.
-    This script never changes your saved Az PowerShell default. It may switch the
-    Azure CLI's active subscription, only if you say yes when it asks.
+    If this script signs you in to Az PowerShell, that sign-in becomes your saved
+    default; switching tenant for its own checks stays in this window only. It may
+    switch the Azure CLI's active subscription, only if you say yes when it asks.
+    The current release (Before) may set your default Az PowerShell subscription to
+    the test subscription, and may add the Azure CLI resource-graph extension.
 
 .PARAMETER TenantID
     Your Microsoft Entra tenant id.
@@ -67,8 +70,8 @@
 
 .OUTPUTS
     Exit code 0: both runs wrote their report zip (run exit 0, or 3, 4 or 5, which
-    the new version uses for a report with some data missing), and both zips are in
-    the share folder.
+    the new version uses for a report with some data missing), every file in both
+    zips could be read, and both zips are in the share folder.
     Exit code 1: a check failed, or a run failed. The message says what to do.
 #>
 # The console messages are this script's user interface, so they go to the host.
@@ -536,15 +539,26 @@ function Get-RdaZipCountSafe
 {
     param([Parameter(Mandatory)][string]$Path)
     try { return (Get-RdaZipCount -Path $Path) }
-    catch { return [ordered]@{ reports = 0; problems = @('report zip could not be read') } }
+    catch
+    {
+        return [ordered]@{
+            reports = 0; inventoryRows = 0; inventoryBySection = [ordered]@{}
+            consumptionRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = @('report zip could not be read')
+        }
+    }
 }
 
-# True when both runs wrote a report zip. Exits 3, 4 and 5 of the new version still
-# write the report (with some data missing, as its README says).
+# True when both runs wrote a report zip whose every file could be read (an inventory
+# file in each report, no problem noted). The files are kept either way, to look at.
+# Exits 3, 4 and 5 of the new version still write the report (with some data missing,
+# as its README says).
 function Test-RdaRunsComparable
 {
     param([object[]]$Sides)
-    return (@($Sides | Where-Object { $_.exitCode -in 0, 3, 4, 5 -and $_.zip }).Count -eq 2)
+    $Good = @($Sides | Where-Object {
+            $_.exitCode -in 0, 3, 4, 5 -and $_.zip -and $_.counts -and $_.counts.reports -gt 0 -and @($_.counts.problems).Count -eq 0
+        })
+    return ($Good.Count -eq 2)
 }
 
 # Runs one side's ResourceInventory.ps1 as a child process and samples its memory.
@@ -786,34 +800,38 @@ function Get-RdaAzCliInstallAdvice
     }
 }
 
-# Checks the Azure CLI for one side. Offers to sign it in; never installs it.
 # The Azure CLI is signed in, but its active account is in another tenant. Offers
-# 'az account set --subscription <id>', which only picks the active account.
+# 'az account set --subscription <id>', which only picks the active account. When the
+# subscription is not in the CLI's list either, only 'az login' helps, so that is named.
 function Invoke-RdaAzCliSwitch
 {
-    param([Parameter(Mandatory)][string]$Tenant, [string]$Subscription, [Parameter(Mandatory)][string]$Side)
-    $SetText = if ($Subscription) { 'az account set --subscription {0}' -f $Subscription } else { 'az login --tenant {0}' -f $Tenant }
+    param([Parameter(Mandatory)][string]$Tenant, [string]$Subscription, [Parameter(Mandatory)][string]$Side, [Parameter(Mandatory)][string]$LoginText)
+    $SetText = if ($Subscription) { 'az account set --subscription {0}' -f $Subscription } else { $LoginText }
     Write-Bad ('{0} needs the Azure CLI''s active account in this tenant, and it is in another one.' -f $Side)
     Write-Note ('Left like this, {0} would sign the Azure CLI out of every account (az account clear) and ask you to sign in again.' -f $Side)
     if (-not $Subscription -or -not (Test-RdaInteractiveHost) -or -not (Read-RdaYesNo -Question 'Switch the Azure CLI to this subscription now?'))
     {
         if (-not (Test-RdaInteractiveHost)) { Write-Note 'This PowerShell cannot ask questions (it is non-interactive).' }
         Write-Note ('Run: {0}' -f $SetText)
+        Write-Note ('If that says the subscription is not found, run: {0}' -f $LoginText)
         Write-Note 'Then run this script again.'
         return $false
     }
-    $null = Invoke-RdaAz -Arguments @('account', 'set', '--subscription', $Subscription, '--output', 'none')
-    if ((Test-RdaAzCliSignIn -Tenant $Tenant) -eq 'ok')
+    $Rc = Invoke-RdaAz -Arguments @('account', 'set', '--subscription', $Subscription, '--output', 'none')
+    if ($Rc -eq 0 -and (Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription) -eq 'ok')
     {
         Write-Ok 'The Azure CLI now uses this subscription.'
         return $true
     }
-    Write-Bad 'The Azure CLI still uses another tenant.'
-    Write-Note ('Run: {0}' -f $SetText)
+    # 'az account set' fails when the subscription is not in the CLI's list, which
+    # only 'az login' refreshes. Naming 'az account set' again would loop.
+    Write-Bad 'The Azure CLI could not switch to this subscription: it is not in the CLI''s list of subscriptions.'
+    Write-Note ('Run: {0}' -f $LoginText)
     Write-Note 'Then run this script again.'
     return $false
 }
 
+# Checks the Azure CLI for one side. Offers to sign it in; never installs it.
 function Invoke-RdaAzCliCheck
 {
     param([Parameter(Mandatory)][string]$Tenant, [Parameter(Mandatory)][string]$Side, [string]$Subscription, [switch]$UseDeviceCode)
@@ -825,11 +843,13 @@ function Invoke-RdaAzCliCheck
     $LoginArgs = @('login', '--tenant', $Tenant, '--output', 'none')
     if ($UseDeviceCode) { $LoginArgs += '--use-device-code' }
     $LoginText = 'az ' + (($LoginArgs | Where-Object { $_ -notin '--output', 'none' }) -join ' ')
-    switch (Test-RdaAzCliSignIn -Tenant $Tenant)
+    $State = Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription
+    switch ($State)
     {
         'ok'
         {
             Write-Ok 'Azure CLI is installed and signed in to this tenant.'
+            Write-RdaAzCliExtensionNote -Side $Side
             return $true
         }
         'missing'
@@ -841,10 +861,17 @@ function Invoke-RdaAzCliCheck
         }
         'other-tenant'
         {
-            return (Invoke-RdaAzCliSwitch -Tenant $Tenant -Subscription $Subscription -Side $Side)
+            return (Invoke-RdaAzCliSwitch -Tenant $Tenant -Subscription $Subscription -Side $Side -LoginText $LoginText)
         }
     }
-    Write-Bad ('{0} needs the Azure CLI signed in to this tenant, and it is not.' -f $Side)
+    if ($State -eq 'no-subscription')
+    {
+        # The CLI's list of subscriptions is refreshed only at 'az login'. The Before
+        # release collects billing only for subscriptions in that list.
+        Write-Bad ('{0} needs this subscription in the Azure CLI''s list of subscriptions, and it is not there yet.' -f $Side)
+        Write-Note 'The Azure CLI refreshes that list when you sign in again.'
+    }
+    else { Write-Bad ('{0} needs the Azure CLI signed in to this tenant, and it is not.' -f $Side) }
     if (-not (Test-RdaInteractiveHost))
     {
         Write-Note 'This PowerShell cannot ask questions (it is non-interactive).'
@@ -859,15 +886,27 @@ function Invoke-RdaAzCliCheck
         return $false
     }
     $null = Invoke-RdaAz -Arguments $LoginArgs
-    if ((Test-RdaAzCliSignIn -Tenant $Tenant) -eq 'ok')
+    if ((Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription) -eq 'ok')
     {
         Write-Ok 'Azure CLI is signed in to this tenant.'
+        Write-RdaAzCliExtensionNote -Side $Side
         return $true
     }
-    Write-Bad 'The Azure CLI is still not signed in to this tenant.'
+    Write-Bad 'The Azure CLI is still not signed in to this tenant with this subscription.'
     Write-Note ('Run: {0}' -f $LoginText)
+    Write-Note 'If the subscription is still missing after you sign in, this account cannot see it: ask for the Reader role on it.'
     Write-Note 'Then run this script again.'
     return $false
+}
+
+# The Before release adds the Azure CLI 'resource-graph' extension itself when it is
+# missing, without asking. Said up front, since that needs internet access.
+function Write-RdaAzCliExtensionNote
+{
+    param([Parameter(Mandatory)][string]$Side)
+    if ((Invoke-RdaAz -Arguments @('extension', 'show', '--name', 'resource-graph', '--output', 'none') -Quiet) -eq 0) { return }
+    Write-Note ('The Azure CLI extension resource-graph is not installed. {0} installs it by itself (az extension add --name resource-graph),' -f $Side)
+    Write-Note 'which needs internet access. To add it now yourself, run: az extension add --name resource-graph'
 }
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1029,48 @@ function Invoke-RdaReaderCheck
     }
 }
 
+# The Azure CLI's own read access on the subscription: the Before release reads
+# resources with the CLI's sign-in, which can be another identity than Az PowerShell's.
+# ok | partial | missing | unknown, the same verdict as the Az PowerShell check.
+function Get-RdaAzCliReadState
+{
+    param([Parameter(Mandatory)][string]$Subscription)
+    if ($Subscription -notmatch $script:GuidPattern) { return 'unknown' }
+    $Url = '/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $Subscription
+    try { $Text = & az rest --method get --url $Url --output json --only-show-errors 2> $null } catch { return 'unknown' }
+    if ($LASTEXITCODE -ne 0) { return 'unknown' }
+    try { $J = (@($Text) -join "`n") | ConvertFrom-Json -ErrorAction Stop } catch { return 'unknown' }
+    if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
+    return (Get-RdaReadVerdict -Permission @($J.value))
+}
+
+function Invoke-RdaAzCliReaderCheck
+{
+    param([Parameter(Mandatory)][string]$Subscription, [Parameter(Mandatory)][string]$Side)
+    switch (Get-RdaAzCliReadState -Subscription $Subscription)
+    {
+        'ok' { Write-Ok ('The Azure CLI sign-in ({0}) can read the whole subscription.' -f $Side); return $true }
+        'partial'
+        {
+            Write-Note ('Warning: the Azure CLI sign-in ({0}) can read only some kinds of resources in this subscription.' -f $Side)
+            Write-Note ('{0} may then miss resources that are not a real difference. Sign the Azure CLI in with an account that has Reader.' -f $Side)
+            return $true
+        }
+        'missing'
+        {
+            Write-Bad ('The Azure CLI sign-in ({0}) cannot read the resources in this subscription.' -f $Side)
+            Write-Note 'Sign the Azure CLI in with an account that has the Reader role on it (az login --tenant <tenant id>).'
+            Write-Note 'This script never gives or changes roles. Then run this script again.'
+            return $false
+        }
+        default
+        {
+            Write-Note ('Warning: could not check the Azure CLI sign-in''s role on this subscription ({0}). Carrying on.' -f $Side)
+            return $true
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Sign-in: reuse a working Az PowerShell sign-in, or sign in once. Never twice.
 # ---------------------------------------------------------------------------
@@ -1076,15 +1157,19 @@ function Get-RdaAzCliTenant
     return $null
 }
 
-# ok | missing | not-signed-in | other-tenant (signed in, but the active account is
+# ok | missing | not-signed-in | no-subscription | other-tenant (signed in, but the active account is
 # in another tenant: the Before release would then run 'az account clear', which signs
 # the Azure CLI out of every account, and ask to sign in again).
+# With -Subscription: no-subscription when the CLI's list of subscriptions (refreshed
+# only at 'az login') does not hold it. The Before release builds its subscription
+# list from there, so it would collect no billing for it.
 function Test-RdaAzCliSignIn
 {
-    param([string]$Tenant)
+    param([string]$Tenant, [string]$Subscription)
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return 'missing' }
     $Rc = Invoke-RdaAz -Arguments @('account', 'get-access-token', '--tenant', $Tenant, '--output', 'none') -Quiet
     if ($Rc -ne 0) { return 'not-signed-in' }
+    if ($Subscription -and (Invoke-RdaAz -Arguments @('account', 'show', '--subscription', $Subscription, '--output', 'none') -Quiet) -ne 0) { return 'no-subscription' }
     if ((Get-RdaAzCliTenant) -ne $Tenant) { return 'other-tenant' }
     return 'ok'
 }
@@ -1105,7 +1190,8 @@ function Invoke-RdaBeforeAfter
 
     $RunStart = [datetime]::UtcNow
     if (-not $OutputDirectory) { $OutputDirectory = Join-Path (Get-Location).ProviderPath ('rda-before-after-' + $RunStart.ToString('yyyyMMdd-HHmmss')) }
-    $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+    # PowerShell's own location, not the process folder: Set-Location does not move that.
+    $OutputDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
     if ((Test-Path -LiteralPath $OutputDirectory) -and @(Get-ChildItem -LiteralPath $OutputDirectory -Force).Count -gt 0)
     {
         Write-Bad ('The output folder is not empty: {0}. Pick a new folder.' -f $OutputDirectory); return 1
@@ -1179,6 +1265,8 @@ function Invoke-RdaBeforeAfter
         # 5. Read access on the subscription. Never grants a role.
         Write-Step 'Access to the subscription'
         if (-not (Invoke-RdaReaderCheck -Subscription $SubscriptionID)) { return 1 }
+        $CliSide = @(@(@{ Name = 'Before'; Code = $Before }, @{ Name = 'After'; Code = $After }) | Where-Object { Test-RdaTreeNeedsAzCli -TreePath $_.Code.Tree }) | Select-Object -First 1
+        if ($CliSide -and -not (Test-RdaCloudShell) -and -not (Invoke-RdaAzCliReaderCheck -Subscription $SubscriptionID -Side $CliSide.Name)) { return 1 }
 
         Write-Step 'Sign-in for the runs'
         if (-not (Test-RdaChildSeesSignIn -Tenant $TenantID))
@@ -1188,10 +1276,9 @@ function Invoke-RdaBeforeAfter
             Write-Note 'Then run this script again.'
             return 1
         }
-        $CliSide = @(@(@{ Name = 'Before'; Code = $Before }, @{ Name = 'After'; Code = $After }) | Where-Object { Test-RdaTreeNeedsAzCli -TreePath $_.Code.Tree }) | Select-Object -First 1
         if ($CliSide -and -not (Test-RdaChildSeesSignIn -Tenant $TenantID -DefaultTenant))
         {
-            # This script never changes the saved default itself (-Scope Process only).
+            # Set-AzContext here stays -Scope Process: the saved default is the user's to change.
             Write-Bad ('{0} uses your default Az PowerShell sign-in, and that is in another tenant, so {0} would ask you to sign in again.' -f $CliSide.Name)
             Write-Note ('To make this tenant and subscription your default, run: Set-AzContext -Tenant {0} -Subscription {1}' -f $TenantID, $SubscriptionID)
             Write-Note 'Then run this script again.'
@@ -1277,7 +1364,7 @@ function Invoke-RdaBeforeAfter
         Write-Host ('Keep this folder to yourself: {0}' -f $PrivateDir) -ForegroundColor Yellow
         Write-Host '  It holds the full run logs and, with -Obfuscate, each run''s dictionary.'
         if (-not $Obfuscate) { Write-Host '  Without -Obfuscate the shared zips hold your real resource names and ids, as the tool''s normal report does.' }
-        if (-not $AllOk) { Write-Bad 'A run did not end cleanly. Send the files anyway: they show what went wrong.' }
+        if (-not $AllOk) { Write-Bad 'A run did not end cleanly, or a file in its report could not be read. Send the files anyway: they show what went wrong.' }
         $Exit = $(if ($AllOk) { 0 } else { 1 })
     }
     finally
