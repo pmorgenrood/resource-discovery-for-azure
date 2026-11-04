@@ -30,7 +30,13 @@ if ($Task -eq 'Processing')
             $Data = $1.PROPERTIES
             $Sku = $1.SKU
 
-            if ($1.id -is [string])
+            # A plan with no id (null, empty or not a string) cannot be the
+            # target of a setting, so it is never autoscaled.
+            if ($1.id -isnot [string] -or $1.id.Length -eq 0)
+            {
+                $AutoSc = $false
+            }
+            else
             {
                 $AutoSc = $AutoScaleTargets.Contains($1.id)
                 if (-not $AutoSc -and $AutoScaleOther.Count -gt 0)
@@ -38,11 +44,6 @@ if ($Task -eq 'Processing')
                     $AutoScale = ($AutoScaleOther | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
                     if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
                 }
-            }
-            else
-            {
-                $AutoScale = ($APPAutoScale | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
-                if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
             }
 
             $Obj = @{
