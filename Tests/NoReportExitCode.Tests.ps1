@@ -11,7 +11,8 @@
 # ends with a red 'No report was written' line and exits 2. A run that writes
 # its zip, including one over a subscription with no resources, still exits 0.
 # Under -RunAllSubs the exit code is unchanged; the wrapper checks each
-# subscription's zip itself.
+# subscription's zip itself. Its last line also says 'No report was written'
+# and names no zip.
 #
 # A run that stops during setup (output folder not writable, Azure CLI not
 # installed, service principal sign-in without a secret, -ResourceGroup without
@@ -293,11 +294,13 @@ Describe 'Direct run that writes its report' {
 }
 
 Describe 'Run under -RunAllSubs stopped by the collector circuit breaker' {
-    It 'keeps its exit code 0 and its last line; the wrapper checks the zip' {
+    # The exit code stays 0 (the wrapper checks each zip itself), but the last line
+    # never names a zip the run did not write.
+    It 'keeps its exit code 0, says no report was written and names no zip; the wrapper checks the zip' {
         $Run = Invoke-StandInRun -Service $script:BreakerServices -RunAllSubs
         $Run.Zip.Count | Should -Be 0
-        $Run.Console | Should -Not -Match 'No report was written'
-        $Run.LastLine | Should -Match 'Reporting Data File: '
+        $Run.Console | Should -Not -Match 'Reporting Data File: '
+        $Run.LastLine | Should -Match 'No report was written: .*ResourcesReport_.*\.zip was not created'
         $Run.State.ExitCode | Should -Be 0
         $Run.ProcessExit | Should -Be 0
     }

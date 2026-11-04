@@ -194,9 +194,11 @@ BeforeAll {
     # Extension/Summary.ps1 stand-ins, placed beside the harness where FinalizeOutputs looks.
     $script:SummaryParams = 'param($JsonFile, $HtmlFile, $Title, $TenantId, $Version, $ExtractionRunTime, $ReportingRunTime, $PhaseTimings, $PlatOS, $ConsumptionFile)'
     # Like the real one, it stops when the inventory is not there, so it writes no HTML then.
-    $script:SummaryWrites = $script:SummaryParams + [Environment]::NewLine +
-        'if (-not (Test-Path -LiteralPath $JsonFile -PathType Leaf)) { throw "Summary.ps1: Inventory JSON not found at ''$JsonFile''." }' + [Environment]::NewLine +
+    $script:SummaryWrites = @(
+        $script:SummaryParams
+        'if (-not (Test-Path -LiteralPath $JsonFile -PathType Leaf)) { throw "Summary.ps1: Inventory JSON not found at ''$JsonFile''." }'
         'Set-Content -LiteralPath $HtmlFile -Value ''<html></html>'''
+    ) -join [Environment]::NewLine
 
     # Stand-ins for the Azure-facing steps of a full run: discovery returns two disks and
     # one AVD host pool, and the collector step turns the disks into one collector.
@@ -798,6 +800,15 @@ function CreateResourceJobs
         $R[0].ErrorLog | Should -BeLike ('*Inventory write FAILED*' + $Failure.Expect.Trim('*') + '*') -Because 'the error log the run keeps gets the same line'
         $Output | Should -Not -Match 'Resource Reporting Phase Done' -Because 'the reporting phase did not finish'
         $Output | Should -Not -Match 'Inventory/Metrics/Consumption data files were still written' -Because 'the inventory was not written, so the run must not say it was'
+        $Output | Should -Not -Match 'Please zip the output files manually' -Because 'without the inventory there is nothing worth zipping by hand'
+        $Output | Should -Match 'There is no report to zip'
+        $Output | Should -Not -Match 'Compressing Resources Output' -Because 'there is nothing to compress'
+        $Output | Should -Not -Match 'excluded from zip' -Because 'no zip is made'
+        $Output | Should -Match 'No HTML report: the inventory .*Inventory_ResourcesReport_test\.json was not written'
+        $Output | Should -Not -Match 'HTML report generation FAILED' -Because 'the report step is not run without the inventory, so it does not fail as a second fault'
+        $Output | Should -Not -Match 'Creating Summary Report|Starting Summary Report Processing Job' -Because 'the report step does not start'
+        $Output | Should -Not -Match 'Error Compressing Output File' -Because 'the zip step is not tried, so it cannot fail'
+        $Output | Should -Match 'Reporting Time: not measured' -Because 'the processing step stopped before its time was taken'
         $Output | Should -Not -Match 'Reporting Data File' -Because "no zip was written, so none may be reported. Output:`n$Output"
         $Output | Should -Match 'No report was written' -Because 'the run says plainly that there is no zip'
         @($R[0].Files | Where-Object { $_ -like 'Inventory_*' -or $_ -like '*.tmp' -or $_ -like '*.zip' }) | Should -BeNullOrEmpty -Because 'a failed write leaves no inventory, no cut-off or temporary file and no zip'
@@ -812,11 +823,22 @@ function CreateResourceJobs
         $R[0].ErrorLog | Should -Not -BeLike '*HTML report generation FAILED*' -Because 'the run stops at the write, so the report step never runs'
     }
 
+    It 'keeps the real cause when the Azure session read after the failed write fails too' {
+        $Failure = $script:WriteFailures['out of memory (stand-in writer)']
+        $Stub = $Failure.Stub + [Environment]::NewLine + 'function Get-AzContext { [CmdletBinding()] param() throw ''stand-in: context store unreadable'' }'
+        $R = @(Invoke-InventoryRun -Name 'write-fail-read-fail' -Runs @($Stub))
+
+        $R[0].Escaped | Should -BeLike $Failure.Expect -Because 'the wrapper must see the write error, not the read error'
+        $R[0].SmaResourcesReleased | Should -BeTrue
+    }
+
     It 'leaves nothing behind that changes the next two runs in the same process' {
         $Failure = $script:WriteFailures['out of memory (stand-in writer)']
         $R = @(Invoke-InventoryRun -Name 'write-fail-then-ok' -Runs @($Failure.Stub, '', ''))
 
         $R[0].Escaped | Should -BeLike $Failure.Expect
+        $R[0].SmaResourcesReleased | Should -BeTrue -Because 'the collector output is freed even though the write failed'
+        $R[0].ResourcesReleased | Should -BeTrue -Because 'the discovery rows are freed even though the write failed'
         foreach ($i in 1, 2)
         {
             $R[$i].Escaped | Should -BeNullOrEmpty -Because "run $i has a writer that works"
@@ -828,7 +850,7 @@ function CreateResourceJobs
     }
 
     It 'shows why the zip failed and does not report it on a direct run' {
-        $R = @(Invoke-InventoryRun -Name 'zip-fail-direct' -Runs @('function Compress-Archive { throw ''stand-in: no space left on device'' }') -Direct)
+        $R = @(Invoke-InventoryRun -Name 'zip-fail-direct' -Runs @('function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }') -Direct)
 
         $Output = [string]$R[0].Output
         $Output | Should -Match 'Error Compressing Output File: .*ResourcesReport_test\.zip: stand-in: no space left on device' -Because "the cause is shown, not hidden by 'silentlycontinue'. Output:`n$Output"
@@ -836,36 +858,171 @@ function CreateResourceJobs
         $Output | Should -Not -Match 'Reporting Data File'
         $Output | Should -Match 'No report was written'
         $R[0].Files | Should -Contain 'Inventory_ResourcesReport_test.json' -Because 'only the zip step failed'
+        $Output | Should -Match 'Please zip the output files manually: .*Inventory_ResourcesReport_test\.json' -Because 'the inventory and the HTML report are there to zip by hand, and the run names the files'
+        $Output | Should -Match 'Please zip the output files manually: .*Consumption_ResourcesReport_test\.csv'
+        $Output | Should -Not -Match 'Add only those files' -Because 'that warning is for -Obfuscate runs'
     }
 
     It 'removes a zip the failed zip step left cut off and does not report it' {
-        $Stub = 'function Compress-Archive { param($Path, $CompressionLevel, $DestinationPath) [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4)); throw ''stand-in: stopped part-way'' }'
+        $Stub = 'function Compress-RdaReportArchive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4)); throw ''stand-in: stopped part-way'' }'
         $R = @(Invoke-InventoryRun -Name 'zip-cut-direct' -Runs @($Stub) -Direct)
 
         $Output = [string]$R[0].Output
         $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a cut-off zip must not be left to be shared'
         $Output | Should -Not -Match 'Reporting Data File' -Because "Output:`n$Output"
+        $Output | Should -Match 'stand-in: stopped part-way' -Because 'the stand-in zip step ran and its own error is shown'
         $Output | Should -Match 'No report was written'
+    }
+
+    It 'names only this run''s files in the manual-zip advice when the output folder holds an earlier run' {
+        $Stub = @(
+            'Set-Content -LiteralPath ($Global:DefaultPath + ''Inventory_ResourcesReport_earlier.json'') -Value ''{}'''
+            'function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'zip-fail-reused-folder' -Runs @($Stub) -Direct)
+
+        $Line = @(([string]$R[0].Output) -split '\r?\n' | Where-Object { $_ -like 'Please zip the output files manually*' })
+        $Line.Count | Should -Be 1 -Because "Output:`n$($R[0].Output)"
+        $Line[0] | Should -Match 'Inventory_ResourcesReport_test\.json'
+        $Line[0] | Should -Not -Match 'Inventory_ResourcesReport_earlier\.json' -Because 'an earlier run''s file is not part of this report'
+    }
+
+    It 'does not name a zip that was already at the path as the report of this run' {
+        # Compress-Archive refuses to overwrite it, so it is not this run's report.
+        $R = @(Invoke-InventoryRun -Name 'zip-exists-direct' -Runs @('Set-Content -LiteralPath ($Global:DefaultPath + ''ResourcesReport_test.zip'') -Value ''older file''') -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Error Compressing Output File' -Because "Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+        $R[0].Files | Should -Contain 'ResourcesReport_test.zip' -Because 'a zip that was there before is not removed'
+    }
+
+    It 'says so when the unfinished zip cannot be removed' {
+        $Stub = @'
+function Compress-RdaReportArchive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4)); throw 'stand-in: stopped part-way' }
+function Remove-Item
+{
+    [CmdletBinding()]
+    param([string[]]$LiteralPath, [switch]$Force, [string[]]$Path, [switch]$Recurse)
+    if (@($LiteralPath) -like '*.zip') { throw 'stand-in: file is locked' }
+    Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+}
+'@
+        $R = @(Invoke-InventoryRun -Name 'zip-locked-direct' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Could not remove the unfinished zip .*ResourcesReport_test\.zip: stand-in: file is locked' -Because "Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'shows the run times as a success only when the zip was written (<Case>)' -ForEach @(
+        @{ Case = 'zip written'; Stub = ''; Expect = 'Success' }
+        @{ Case = 'inventory write failed'; Stub = 'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'; Expect = 'Info' }
+    ) {
+        # Write-Log stand-in that prints the severity, so the console shows which one each line used.
+        $Show = 'function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsole, [switch]$ToDebugLog) { if (-not $NoConsole) { Write-Host (''[{0}] {1}'' -f $Severity, $Message) } }'
+        $R = @(Invoke-InventoryRun -Name ('times-{0}' -f $Case.Split(' ')[1]) -Runs @(($Show + [Environment]::NewLine + $Stub)) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match ('\[{0}\] Execution Time: ' -f $Expect) -Because "Output:`n$Output"
+        $Output | Should -Match ('\[{0}\] Reporting Time: ' -f $Expect)
+    }
+
+    It 'does not report a zip the zip step made with a hidden error (<Case>)' -ForEach @(
+        @{ Case = 'zip left behind'; Write = $true }
+        @{ Case = 'no zip'; Write = $false }
+    ) {
+        # An archive step that reports an input it cannot read with a non-terminating error and goes on.
+        $Stub = @(
+            'function Compress-RdaReportArchive'
+            '{'
+            '    [CmdletBinding()]'
+            '    param($Path, $CompressionLevel, $DestinationPath)'
+            $(if ($Write) { '    [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4))' } else { '' })
+            '    Write-Error ''stand-in: cannot read Consumption_ResourcesReport_test.csv'''
+            '}'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name ('zip-hidden-error-{0}' -f $Case.Split(' ')[0]) -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Error Compressing Output File: .*stand-in: cannot read' -Because "the error is not hidden. Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a zip made without one of its files is removed'
     }
 
     It 'says the zip is safe to share under -Obfuscate only when the zip was written (<Case>)' -ForEach @(
         @{ Case = 'zip written'; Stub = '$Obfuscate = [switch]$true'; Expect = $true }
-        @{ Case = 'zip step failed'; Stub = '$Obfuscate = [switch]$true' + [Environment]::NewLine + 'function Compress-Archive { throw ''stand-in: no space left on device'' }'; Expect = $false }
+        @{ Case = 'zip step failed'; Stub = '$Obfuscate = [switch]$true' + [Environment]::NewLine + 'function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }'; Expect = $false }
+        @{ Case = 'inventory write failed'; Stub = '$Obfuscate = [switch]$true' + [Environment]::NewLine + 'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'; Expect = $false }
     ) {
-        $R = @(Invoke-InventoryRun -Name ('obfuscate-notice-{0}' -f $Case.Split(' ')[1]) -Runs @($Stub) -Direct)
+        $R = @(Invoke-InventoryRun -Name ('obfuscate-notice-{0}' -f ($Case -replace ' ', '-')) -Runs @($Stub) -Direct)
 
         $Output = [string]$R[0].Output
         $Output | Should -Match 'OBFUSCATION NOTICE' -Because "the run took the -Obfuscate path. Output:`n$Output"
         ($Output -match 'The ZIP file is safe to share') | Should -Be $Expect -Because "Output:`n$Output"
         ($R[0].Files -contains 'ResourcesReport_test.zip') | Should -Be $Expect
+        ($Output -match 'transcript log excluded from zip') | Should -Be $Expect
+        ($Output -match 'Add only those files: the obfuscation dictionary') | Should -Be ($Case -eq 'zip step failed') -Because 'a hand-made zip under -Obfuscate must leave out the files with real names'
+    }
+
+    It 'makes no zip from an HTML report that has no inventory next to it' {
+        # A writer that writes nothing and does not fail, and an HTML file already there.
+        $Stub = @(
+            'function Write-InventoryJson { param($InputObject, $Path) }'
+            'Set-Content -LiteralPath ($Global:DefaultPath + ''ResourcesReport_test.html'') -Value ''<html></html>'''
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'html-without-inventory' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because "a zip without the inventory fails the whole upload. Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'makes no zip from an HTML file the report step left when it failed' {
+        # Summary.ps1 stand-in that writes the HTML file and then fails.
+        $Stub = @(
+            '$SummaryFailsAfterWrite = @('
+            '    ''param($JsonFile, $HtmlFile, $Title, $TenantId, $Version, $ExtractionRunTime, $ReportingRunTime, $PhaseTimings, $PlatOS, $ConsumptionFile)'''
+            '    ''Set-Content -LiteralPath $HtmlFile -Value ''''<html>cut off'''''''
+            '    ''throw ''''stand-in: disk full after the HTML write'''''''
+            ') -join [Environment]::NewLine'
+            'Set-Content -LiteralPath (Join-Path $PSScriptRoot ''Extension/Summary.ps1'') -Value $SummaryFailsAfterWrite'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'html-cut-off' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'HTML report generation FAILED: stand-in: disk full after the HTML write' -Because "the stand-in ran. Output:`n$Output"
+        $R[0].Files | Should -Contain 'ResourcesReport_test.html' -Because 'the stand-in left its HTML file'
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a report step that failed did not make a report to share'
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'does not show the processing time of an earlier run in the same session' {
+        # The time an earlier run left behind, then a run whose inventory write fails.
+        $Stub = @(
+            '$Global:ReportingRunTime = [timespan]::FromSeconds(4242)'
+            'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'stale-time' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Reporting Time: not measured' -Because "Output:`n$Output"
+        $Output | Should -Not -Match '01:10:42'
     }
 
     It 'reports the zip on a direct run that wrote it' {
         $R = @(Invoke-InventoryRun -Name 'write-ok-direct' -Runs @('') -Direct)
 
         $Output = [string]$R[0].Output
+        $R[0].ExitCode | Should -Be 0
         $R[0].Files | Should -Contain 'ResourcesReport_test.zip'
         $Output | Should -Match 'Reporting Data File: .*ResourcesReport_test\.zip' -Because "Output:`n$Output"
+        $Output | Should -Match 'Compressing Resources Output: .*ResourcesReport_test\.zip'
         $Output | Should -Not -Match 'No report was written'
     }
 }
@@ -932,7 +1089,10 @@ function CreateResourceJobs { throw 'collector step failed' }
                 }, $false) | Select-Object -First 1
             if ($null -eq $Fn) { throw 'ExecuteInventoryProcessing was not found in ResourceInventory.ps1.' }
 
-            $Release = [regex]::new('(?m)^[ \t]*\$Global:Resources = \$null[ \t]*\r?$').Match($script:ScriptText, $Fn.Extent.StartOffset)
+            # From the ProcessResourceResult call, so the nested function's own failure-path release is not matched.
+            $Call = [regex]::new('(?m)^[ \t]*ProcessResourceResult[ \t]*\r?$').Match($script:ScriptText, $Fn.Extent.StartOffset)
+            if (-not $Call.Success -or $Call.Index -ge $Fn.Extent.EndOffset) { throw 'The ProcessResourceResult call was not found in ExecuteInventoryProcessing.' }
+            $Release = [regex]::new('(?m)^[ \t]*\$Global:Resources = \$null[ \t]*\r?$').Match($script:ScriptText, $Call.Index)
             if (-not $Release.Success -or $Release.Index -ge $Fn.Extent.EndOffset) { throw 'The release line ($Global:Resources = $null) was not found in ExecuteInventoryProcessing.' }
             $script:ReleaseStart = $Release.Index
             $script:ReleaseEnd = $Release.Index + $Release.Length
@@ -1106,6 +1266,19 @@ $Rounds = foreach ($Round in 1..3)
                 $Round.HeldAfterNonAz | Should -BeTrue -Because "round $($Round.Round): a statement that is not an Az cmdlet does not free them"
                 $Round.HeldAfterBlock | Should -BeFalse -Because "round $($Round.Round): the session read after the release frees them"
             }
+        }
+
+        It 'reads the Azure context and removes the handler after a failed inventory write too' {
+            # The failure path throws past the release, so it lets go of the rows the Azure session holds itself.
+            $Fn = $script:ScriptAst.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'ProcessResourceResult'
+                }, $true) | Select-Object -First 1
+            $Catch = @($Fn.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.TryStatementAst] }, $true))[0].CatchClauses[0].Body.Extent.Text
+
+            $script:ReadPattern.Match($Catch).Success | Should -BeTrue
+            $Catch | Should -Match 'ClientFactory\.RemoveHandler\(\[Microsoft\.Azure\.Commands\.Common\.Authentication\.Models\.RPRegistrationDelegatingHandler\]\)'
+            $Catch.IndexOf('RemoveHandler') | Should -BeLessThan $Catch.LastIndexOf('throw') -Because 'both run before the error is thrown on'
         }
 
         It 'removes the provider-registration handler right after the read, in the same guarded block' {
