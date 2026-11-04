@@ -382,6 +382,10 @@ function Get-RdaZipCount
                 catch { $Out.problems.Add('inventory file could not be read') }
             }
             else { $Out.problems.Add('no inventory file') }
+            # Both releases always write a Consumption file (headers at least) and a
+            # Metrics file, so a report without one is broken.
+            if (-not $Con) { $Out.problems.Add('no consumption file') }
+            if ($Met.Count -eq 0) { $Out.problems.Add('no metrics file') }
             if ($Con)
             {
                 try
@@ -549,7 +553,8 @@ function Measure-RdaConsumptionCsv
     try
     {
         $P.SetDelimiters(','); $P.HasFieldsEnclosedInQuotes = $true
-        if ($P.EndOfData) { return [pscustomobject]@{ Rows = 0; Dropped = 0; Problems = @() } }
+        # An empty file has no headers, so the reader finds none of its columns.
+        if ($P.EndOfData) { return [pscustomobject]@{ Rows = 0; Dropped = 0; Problems = @('consumption header missing') } }
         $Head = @($P.ReadFields())
         $Ix = @{}
         for ($I = 0; $I -lt $Head.Count; $I++) { $Ix[$Head[$I].Trim().Trim([char]0xFEFF)] = $I }
@@ -1114,16 +1119,25 @@ function Test-RdaReaderAccess
             $State = Get-RdaReadVerdict -Permission @($Value)
             # Roles given only on resource groups or single resources are not in the
             # subscription's reply. If any can be read, some resources can: warn, do not stop.
+            # Missing only when both lists were read and both are empty; a list that
+            # could not be read leaves it unknown (warn).
             if ($State -eq 'missing')
             {
                 foreach ($Child in 'resourcegroups', 'resources')
                 {
+                    $Seen = $null
                     try
                     {
                         $G = Invoke-AzRestMethod -Method GET -Path ('/subscriptions/{0}/{1}?api-version=2021-04-01&$top=1' -f $Subscription, $Child) -ErrorAction Stop
-                        if ([int]$G.StatusCode -eq 200 -and @(Get-RdaJsonList ($G.Content | ConvertFrom-Json) 'value').Count -gt 0) { $State = 'partial'; break }
+                        if ([int]$G.StatusCode -eq 200)
+                        {
+                            $Gj = $G.Content | ConvertFrom-Json -ErrorAction Stop
+                            if ($Gj.PSObject.Properties['value']) { $Seen = @($Gj.value).Count }
+                        }
                     }
                     catch { Write-Verbose ('The {0} list could not be read.' -f $Child) }
+                    if ($null -eq $Seen) { $State = 'unknown'; break }
+                    if ($Seen -gt 0) { $State = 'partial'; break }
                 }
             }
             return [pscustomobject]@{ State = $State; How = 'permissions' }
@@ -1143,8 +1157,8 @@ function Test-RdaReaderAccess
     }
     catch
     {
-        # Reader includes reading role assignments, so a refusal means no Reader.
-        if ($_.Exception.Message -match 'AuthorizationFailed|does not have authorization|Forbidden') { return [pscustomobject]@{ State = 'missing'; How = 'roleAssignments' } }
+        # A refusal shows there is no Reader on the whole subscription, but a role on a
+        # resource group or a resource can still be there: unknown (warn), not missing.
         return [pscustomobject]@{ State = 'unknown'; How = 'roleAssignments' }
     }
     $Defs = foreach ($Ra in $Ras)
@@ -1201,12 +1215,14 @@ function Get-RdaAzCliReadState
     $State = Get-RdaReadVerdict -Permission @($J.value)
     # Roles given only on resource groups or on single resources are not in the
     # subscription's reply. If any can be read, some resources can: warn, do not stop.
+    # Missing only when both lists were read and both are empty.
     if ($State -eq 'missing')
     {
         foreach ($Child in 'resourcegroups', 'resources')
         {
             $G = Invoke-RdaAzRest -Path ('/subscriptions/{0}/{1}' -f $Subscription, $Child) -Parameter @('api-version=2021-04-01', '$top=1')
-            if ($null -ne $G -and $G.PSObject.Properties['value'] -and @($G.value).Count -gt 0) { return 'partial' }
+            if ($null -eq $G -or -not $G.PSObject.Properties['value']) { return 'unknown' }
+            if (@($G.value).Count -gt 0) { return 'partial' }
         }
     }
     return $State

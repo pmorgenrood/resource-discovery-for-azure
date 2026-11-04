@@ -169,16 +169,16 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
         $C.inventoryBySection.PublicIP | Should -Be 1
     }
 
-    It 'notes a cut-off inventory or metrics file and a missing consumption header, and goes on' {
+    It 'notes a cut-off inventory or metrics file and a consumption file with an open quote, and goes on' {
         $Run = Get-FakeRun
         $Run.Inventory = '{"VirtualMachines":[{"ID":"a"},'
         $Run.Metrics = '{"Metrics":[{"ID":"a"'
-        $Run.Consumption = "WrongHeader`n1"
+        $Run.Consumption = "a,b`n1,""x`n2,3"
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'bad.zip') $Run -Wrap)
         $C.reports | Should -Be 1
         @($C.problems) | Should -Contain 'inventory file could not be read'
         @($C.problems) | Should -Contain 'a metrics file could not be read'
-        @($C.problems) | Should -Contain 'consumption header missing'
+        @($C.problems) | Should -Contain 'consumption file could not be read'
     }
 
     It 'gives a fixed problem for a zip that cannot be opened, never a stop' {
@@ -223,8 +223,9 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
 
     It 'does not count a report with a file that could not be read' {
         $Run = Get-FakeRun
-        $Run.Consumption = "WrongHeader`n1"
+        $Run.Consumption = "a,b`n1,""x`n2,3"
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'badcsv.zip') $Run -Wrap)
+        @($C.problems) | Should -Contain 'consumption file could not be read'
         $Ok = @{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }
         Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
     }
@@ -271,6 +272,21 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
         $C.consumptionRows | Should -Be 4
         $C.consumptionDroppedRows | Should -Be 3
         @($C.problems).Count | Should -Be 0
+    }
+
+    It 'notes a report with no consumption file, no metrics file, or an empty consumption file' {
+        $Run = Get-FakeRun
+        $P = Join-Path $TestDrive 'inv-only.zip'
+        $Fs = [IO.File]::Create($P); $Z = [IO.Compression.ZipArchive]::new($Fs, [IO.Compression.ZipArchiveMode]::Create)
+        Add-ZipText -Archive $Z -Name 'Inventory_1.json' -Text $Run.Inventory
+        $Z.Dispose(); $Fs.Dispose()
+        $C = Get-RdaZipCount -Path $P
+        @($C.problems) | Should -Contain 'no consumption file'
+        @($C.problems) | Should -Contain 'no metrics file'
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = $C }, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
+        $Run.Consumption = ''
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'empty-csv.zip') $Run -Wrap)
+        @($C.problems) | Should -Contain 'consumption header missing'
     }
 
     It 'takes only an inventory file whose name starts with Inventory' {
