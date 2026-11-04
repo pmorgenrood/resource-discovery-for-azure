@@ -25,6 +25,9 @@ BeforeAll {
     $script:ObfuscationPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     # An ID is a masked ARM id, every name segment a token (Get-ObfuscatedResourceId).
     $script:ObfuscatedIdPattern = Get-RdaObfuscatedIdPattern
+    # A Front Door ID is always an ARM id, so under -Obfuscate it must be the
+    # full masked ARM path, never a flat token.
+    $script:MaskedIdPattern = Get-RdaMaskedIdPattern
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 
     # Detect whether this zip is from an obfuscated run: the ID starts like a
@@ -160,7 +163,7 @@ Describe "Front Door Obfuscation in Obfuscated Mode" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.ID | Should -Match $script:ObfuscatedIdPattern -Because "Obfuscated mode: ID must be masked"
+            $fd.ID | Should -Match $script:MaskedIdPattern -Because "Obfuscated mode: ID '$($fd.ID)' must be a masked ARM path"
         }
     }
 
