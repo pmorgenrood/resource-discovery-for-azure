@@ -2572,7 +2572,17 @@ if (-not $RunAllSubs.IsPresent -and ([string]::IsNullOrEmpty($Global:ZipOutputFi
     exit 2
 }
 
-Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+# A wrapper run (-RunAllSubs) can reach this line with no zip too: when a step above
+# failed, its throw does not stop the script under 'silentlycontinue'. So name the zip
+# only when it is there. The exit code stays as it is: the wrapper checks the zip itself.
+if (-not [string]::IsNullOrEmpty($Global:ZipOutputFile) -and (Test-Path -LiteralPath $Global:ZipOutputFile))
+{
+    Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+}
+else
+{
+    Write-Log -Message ("No report was written: {0} was not created. See the errors above." -f $Global:ZipOutputFile) -Severity 'Error'
+}
 
 # Direct runs only (the wrapper prints its own): subscriptions the up-front
 # consumption data check passed with no usage values, and subscriptions the
