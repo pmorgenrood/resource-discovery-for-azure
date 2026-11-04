@@ -607,6 +607,51 @@ function Get-RdaSkippedNetworkCount
     return [pscustomobject]@{ Total = $Total; ByType = $ByType }
 }
 
+# The resource type an ARM id names, lowercase: the provider namespace after
+# the last /providers/, then every type segment (the 1st, 3rd, ... segment
+# after it). '.../providers/microsoft.network/privatednszones/z/virtualnetworklinks/l'
+# gives 'microsoft.network/privatednszones/virtualnetworklinks'. $null when the
+# id names no provider type.
+function Get-RdaResourceTypeFromId
+{
+    param([AllowEmptyString()][AllowNull()][string]$Id)
+    if ([string]::IsNullOrEmpty($Id)) { return $null }
+    $Lower = $Id.ToLowerInvariant()
+    $At = $Lower.LastIndexOf('/providers/')
+    if ($At -lt 0) { return $null }
+    $Parts = @($Lower.Substring($At + '/providers/'.Length).Trim('/') -split '/' | Where-Object { $_ })
+    if ($Parts.Count -lt 3) { return $null }
+    $Type = [System.Collections.Generic.List[string]]::new()
+    $Type.Add($Parts[0])
+    for ($i = 1; $i -lt $Parts.Count; $i += 2) { $Type.Add($Parts[$i]) }
+    return ($Type -join '/')
+}
+
+# The skipped-network count from the id rows of the -Obfuscate id query, which
+# already holds every skipped row of the scope: the same { Total; ByType } as
+# Get-RdaSkippedNetworkCount, with no extra query. The type comes from the id.
+# $ExcludeSubscriptionId: the subscriptions the access check skipped.
+function Get-RdaSkippedNetworkCountFromRow
+{
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$Row,
+        [AllowEmptyCollection()][string[]]$ExcludeSubscriptionId = @()
+    )
+    $ByType = [ordered]@{}
+    $Total = [long]0
+    foreach ($R in @($Row))
+    {
+        if ($null -eq $R) { continue }
+        if (@($ExcludeSubscriptionId) -contains [string]$R.subscriptionId) { continue }
+        $Type = Get-RdaResourceTypeFromId -Id ([string]$R.id)
+        if ([string]::IsNullOrEmpty($Type)) { continue }
+        if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
+        $ByType[$Type] += 1
+        $Total += 1
+    }
+    return [pscustomobject]@{ Total = $Total; ByType = $ByType }
+}
+
 
 
 # Build + write the shareable Diagnostics_*.log that ships INSIDE the per-sub

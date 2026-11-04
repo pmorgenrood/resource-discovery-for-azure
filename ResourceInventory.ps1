@@ -1062,7 +1062,16 @@ Function RunInventorySetup()
             # The access-skip filter below drops a skipped subscription's rows
             # from the pull; its network rows are left out of this count too.
             $ExcludeIds = if ($null -ne $script:AccessSkipped) { @($script:AccessSkipped.InaccessibleIds) } else { @() }
-            $Skipped = Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -ExcludeSubscriptionId $ExcludeIds -HideRawOutput:$Obfuscate.IsPresent
+            # Under -Obfuscate the id query above already read every skipped
+            # row of this scope, so count those rows instead of asking again.
+            $Skipped = if ($null -ne $script:NetworkTokenRows)
+            {
+                Get-RdaSkippedNetworkCountFromRow -Row $script:NetworkTokenRows -ExcludeSubscriptionId $ExcludeIds
+            }
+            else
+            {
+                Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -ExcludeSubscriptionId $ExcludeIds -HideRawOutput:$Obfuscate.IsPresent
+            }
             # $null means unknown: the log then reads as if nothing was skipped.
             $Global:SkippedResourceCount = if ($null -ne $Skipped) { $Skipped.Total } else { $null }
             $Global:SkippedResourceTypes = if ($null -ne $Skipped) { $Skipped.ByType } else { [ordered]@{} }
