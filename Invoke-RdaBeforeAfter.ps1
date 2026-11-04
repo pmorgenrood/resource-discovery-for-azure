@@ -330,7 +330,7 @@ function Get-RdaZipCount
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $Out = [ordered]@{
         reports = 0; inventoryRows = 0; inventoryBySection = [ordered]@{}
-        consumptionRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = [System.Collections.Generic.List[string]]::new()
+        consumptionRows = 0; consumptionDroppedRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = [System.Collections.Generic.List[string]]::new()
     }
     $Outer = [IO.Compression.ZipFile]::OpenRead($Path)
     $Archives = [System.Collections.Generic.List[object]]::new()
@@ -359,14 +359,18 @@ function Get-RdaZipCount
         {
             $Out.reports++
             $Entries = @($A.Entries | Where-Object { $_.Name })
-            $Inv = @($Entries | Where-Object { $_.Name -like '*Inventory*' -and $_.Name -like '*.json' }) | Select-Object -First 1
+            # The same picks as the reader of these files: the inventory file name starts
+            # with Inventory, and only the first Consumption*.csv is read.
+            $Inv = @($Entries | Where-Object { $_.Name -like 'Inventory*' -and $_.Name -like '*.json' }) | Select-Object -First 1
             $Con = @($Entries | Where-Object { $_.Name -like 'Consumption*' -and $_.Name -like '*.csv' }) | Select-Object -First 1
             $Met = @($Entries | Where-Object { $_.Name -like 'Metrics*' -and $_.Name -like '*.json' })
             if ($Inv)
             {
                 try
                 {
-                    $Sections = Measure-RdaInventoryEntry -Entry $Inv
+                    $InvResult = Measure-RdaInventoryEntry -Entry $Inv
+                    foreach ($Pb in $InvResult.Problems) { if (-not $Out.problems.Contains($Pb)) { $Out.problems.Add($Pb) } }
+                    $Sections = $InvResult.Sections
                     foreach ($K in $Sections.Keys)
                     {
                         $Out.inventoryRows += $Sections[$K]
@@ -379,7 +383,13 @@ function Get-RdaZipCount
             else { $Out.problems.Add('no inventory file') }
             if ($Con)
             {
-                try { $Out.consumptionRows += (Measure-RdaCsvEntry -Entry $Con) }
+                try
+                {
+                    $Cr = Measure-RdaCsvEntry -Entry $Con
+                    $Out.consumptionRows += $Cr.Rows
+                    $Out.consumptionDroppedRows += $Cr.Dropped
+                    foreach ($Pb in $Cr.Problems) { if (-not $Out.problems.Contains($Pb)) { $Out.problems.Add($Pb) } }
+                }
                 catch { $Out.problems.Add('consumption file could not be read') }
             }
             foreach ($M in $Met)
@@ -388,6 +398,7 @@ function Get-RdaZipCount
                 {
                     $Mc = Measure-RdaMetricsEntry -Entry $M
                     $Out.metricsRows += $Mc.Rows; $Out.metricsErrorRows += $Mc.Errors
+                    foreach ($Pb in $Mc.Problems) { if (-not $Out.problems.Contains($Pb)) { $Out.problems.Add($Pb) } }
                 }
                 catch { $Out.problems.Add('a metrics file could not be read') }
             }
@@ -412,10 +423,13 @@ function New-RdaJsonReader($Entry)
     return $Jr
 }
 
-# Rows per inventory section: each top-level list counts its items.
+# Rows per inventory section: each top-level list counts its items. Also checks the
+# shape the reader of this file needs: each section a list (Version may be a string),
+# and the ID, Name and SKU of a record a string or null, never a number.
 function Measure-RdaInventoryEntry($Entry)
 {
     $Counts = [ordered]@{}
+    $Problems = [System.Collections.Generic.List[string]]::new()
     $Jr = New-RdaJsonReader $Entry
     try
     {
@@ -424,9 +438,27 @@ function Measure-RdaInventoryEntry($Entry)
         {
             $Name = [string]$Jr.Value
             if (-not $Jr.Read()) { throw 'cut-off JSON' }
-            if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartArray) { $Jr.Skip(); continue }
+            if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartArray)
+            {
+                $Ok = $Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::Null -or ($Name -eq 'Version' -and $Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::String)
+                if (-not $Ok -and -not $Problems.Contains('inventory section not a list')) { $Problems.Add('inventory section not a list') }
+                $Jr.Skip(); continue
+            }
             $N = 0
-            while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { $N++; $Jr.Skip() }
+            while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray)
+            {
+                $N++
+                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { $Jr.Skip(); continue }
+                $Rec = [Newtonsoft.Json.Linq.JObject]::Load($Jr)
+                foreach ($F in 'ID', 'Name', 'SKU')
+                {
+                    $V = $Rec[$F]
+                    if ($null -ne $V -and $V.Type -notin [Newtonsoft.Json.Linq.JTokenType]::String, [Newtonsoft.Json.Linq.JTokenType]::Null -and -not $Problems.Contains('inventory ID, Name or SKU not a string'))
+                    {
+                        $Problems.Add('inventory ID, Name or SKU not a string')
+                    }
+                }
+            }
             if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { throw 'cut-off JSON' }
             if (-not $Counts.Contains($Name)) { $Counts[$Name] = 0 }
             $Counts[$Name] += $N
@@ -434,13 +466,17 @@ function Measure-RdaInventoryEntry($Entry)
         if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndObject) { throw 'cut-off JSON' }
     }
     finally { $Jr.Close() }
-    return $Counts
+    return [pscustomobject]@{ Sections = $Counts; Problems = @($Problems) }
 }
 
-# Rows of a metrics file's Metrics list, and how many have MetricError true.
+# Rows of a metrics file's Metrics list, and how many have MetricError true. Also checks
+# the shape the reader needs: an object with a Metrics list, MetricCount, MetricValue and
+# MetricPercentile numbers (not null), MetricError true or false.
 function Measure-RdaMetricsEntry($Entry)
 {
-    $Rows = 0; $Errors = 0
+    $Rows = 0; $Errors = 0; $HasList = $false
+    $Problems = [System.Collections.Generic.List[string]]::new()
+    $Num = @([Newtonsoft.Json.Linq.JTokenType]::Integer, [Newtonsoft.Json.Linq.JTokenType]::Float)
     $Jr = New-RdaJsonReader $Entry
     try
     {
@@ -450,6 +486,7 @@ function Measure-RdaMetricsEntry($Entry)
             $Name = [string]$Jr.Value
             if (-not $Jr.Read()) { throw 'cut-off JSON' }
             if ($Name -ne 'Metrics' -or $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartArray) { $Jr.Skip(); continue }
+            $HasList = $true
             while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray)
             {
                 if ($Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::Null) { continue }
@@ -459,41 +496,82 @@ function Measure-RdaMetricsEntry($Entry)
                 $Rec = [Newtonsoft.Json.Linq.JObject]::Load($Jr)
                 $Err = $Rec['MetricError']
                 if ($null -ne $Err -and $Err.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Boolean -and [bool]$Err) { $Errors++ }
+                $Bad = ($null -eq $Err -or $Err.Type -ne [Newtonsoft.Json.Linq.JTokenType]::Boolean)
+                foreach ($F in 'MetricCount', 'MetricValue', 'MetricPercentile') { $V = $Rec[$F]; if ($null -eq $V -or $V.Type -notin $Num) { $Bad = $true } }
+                if ($Bad -and -not $Problems.Contains('metrics value not a number, or MetricError not true or false')) { $Problems.Add('metrics value not a number, or MetricError not true or false') }
             }
             if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { throw 'cut-off JSON' }
         }
         if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndObject) { throw 'cut-off JSON' }
     }
     finally { $Jr.Close() }
-    return [pscustomobject]@{ Rows = $Rows; Errors = $Errors }
+    if (-not $HasList) { $Problems.Add('metrics file has no Metrics list') }
+    return [pscustomobject]@{ Rows = $Rows; Errors = $Errors; Problems = @($Problems) }
 }
 
 # Data rows of a consumption file, read as a stream.
 function Measure-RdaCsvEntry($Entry)
 {
     $Sr = [IO.StreamReader]::new($Entry.Open(), [Text.Encoding]::UTF8, $true)
-    try { return (Measure-RdaCsvRow -Reader $Sr) } finally { $Sr.Dispose() }
+    try { return (Measure-RdaConsumptionCsv -Reader $Sr) } finally { $Sr.Dispose() }
 }
 
-# Data rows of a CSV (quoted fields may hold commas, quotes and line breaks).
-# Takes text or a TextReader. A field whose quote never closes throws.
-function Measure-RdaCsvRow
+# Rows of a consumption CSV, with the checks its reader makes:
+# - the needed headers are there (else rows are lost);
+# - every Quantity, UsageStartTime and UsageEndTime, and Cost or UnitPrice when
+#   written, parses with a dot and a culture-free date (else the whole file is dropped);
+# - Dropped: rows with an empty ResourceId or MeterId, or a negative Quantity
+#   (the reader drops those rows one by one). Counted, not a problem.
+function Measure-RdaConsumptionCsv
 {
-    param([string]$Text, [IO.TextReader]$Reader)
-    if (-not $Reader)
-    {
-        if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
-        $Reader = [IO.StringReader]::new($Text)
-    }
+    param([Parameter(Mandatory)][IO.TextReader]$Reader)
+    $Problems = [System.Collections.Generic.List[string]]::new()
     $P = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new($Reader)
+    $Rows = 0; $Dropped = 0
+    $Inv = [Globalization.CultureInfo]::InvariantCulture
     try
     {
         $P.SetDelimiters(','); $P.HasFieldsEnclosedInQuotes = $true
-        $N = 0
-        while (-not $P.EndOfData) { $F = $P.ReadFields(); if ($null -ne $F) { $N++ } }
-        return [math]::Max(0, $N - 1)
+        if ($P.EndOfData) { return [pscustomobject]@{ Rows = 0; Dropped = 0; Problems = @() } }
+        $Head = @($P.ReadFields())
+        $Ix = @{}
+        for ($I = 0; $I -lt $Head.Count; $I++) { $Ix[$Head[$I].Trim().Trim([char]0xFEFF)] = $I }
+        foreach ($H in 'ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId')
+        {
+            if (-not $Ix.ContainsKey($H)) { $Problems.Add('consumption header missing'); break }
+        }
+        # Column numbers once, -1 when the column is not there.
+        $Col = @{}
+        foreach ($H in 'Quantity', 'UsageStartTime', 'UsageEndTime', 'Cost', 'UnitPrice', 'ResourceId', 'MeterId') { $Col[$H] = $(if ($Ix.ContainsKey($H)) { [int]$Ix[$H] } else { -1 }) }
+        $CQ = $Col.Quantity; $CS = $Col.UsageStartTime; $CE = $Col.UsageEndTime; $CC = $Col.Cost; $CU = $Col.UnitPrice; $CR = $Col.ResourceId; $CM = $Col.MeterId
+        $Float = [Globalization.NumberStyles]::Float; $Round = [Globalization.DateTimeStyles]::RoundtripKind
+        $BadCell = $false; $Qv = 0.0; $Dt = [datetime]::MinValue; $Cn = 0.0
+        while (-not $P.EndOfData)
+        {
+            $F = $P.ReadFields()
+            if ($null -eq $F) { continue }
+            $Rows++; $Fc = $F.Count; $Qv = 0.0
+            if ($CQ -ge 0 -and $CQ -lt $Fc -and -not [double]::TryParse($F[$CQ], $Float, $Inv, [ref]$Qv)) { $BadCell = $true }
+            if ($CS -ge 0 -and $CS -lt $Fc -and -not [datetime]::TryParse($F[$CS], $Inv, $Round, [ref]$Dt)) { $BadCell = $true }
+            if ($CE -ge 0 -and $CE -lt $Fc -and -not [datetime]::TryParse($F[$CE], $Inv, $Round, [ref]$Dt)) { $BadCell = $true }
+            if ($CC -ge 0 -and $CC -lt $Fc -and $F[$CC] -ne '' -and -not [double]::TryParse($F[$CC], $Float, $Inv, [ref]$Cn)) { $BadCell = $true }
+            if ($CU -ge 0 -and $CU -lt $Fc -and $F[$CU] -ne '' -and -not [double]::TryParse($F[$CU], $Float, $Inv, [ref]$Cn)) { $BadCell = $true }
+            $NoRid = $CR -lt 0 -or $CR -ge $Fc -or [string]::IsNullOrWhiteSpace($F[$CR])
+            $NoMid = $CM -lt 0 -or $CM -ge $Fc -or [string]::IsNullOrWhiteSpace($F[$CM])
+            if ($NoRid -or $NoMid -or $Qv -lt 0) { $Dropped++ }
+        }
+        if ($BadCell) { $Problems.Add('consumption number or date that does not parse') }
     }
     finally { $P.Dispose() }
+    return [pscustomobject]@{ Rows = $Rows; Dropped = $Dropped; Problems = @($Problems) }
+}
+
+# Data rows of a CSV text (quoted fields may hold commas, quotes and line breaks).
+function Measure-RdaCsvRow
+{
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+    return (Measure-RdaConsumptionCsv -Reader ([IO.StringReader]::new($Text))).Rows
 }
 
 # All processes under (and including) a root process id.
@@ -543,7 +621,7 @@ function Get-RdaZipCountSafe
     {
         return [ordered]@{
             reports = 0; inventoryRows = 0; inventoryBySection = [ordered]@{}
-            consumptionRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = @('report zip could not be read')
+            consumptionRows = 0; consumptionDroppedRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = @('report zip could not be read')
         }
     }
 }
@@ -821,6 +899,7 @@ function Invoke-RdaAzCliSwitch
     if ($Rc -eq 0 -and (Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription) -eq 'ok')
     {
         Write-Ok 'The Azure CLI now uses this subscription.'
+        Write-RdaAzCliExtensionNote -Side $Side
         return $true
     }
     # 'az account set' fails when the subscription is not in the CLI's list, which
@@ -835,11 +914,9 @@ function Invoke-RdaAzCliSwitch
 function Invoke-RdaAzCliCheck
 {
     param([Parameter(Mandatory)][string]$Tenant, [Parameter(Mandatory)][string]$Side, [string]$Subscription, [switch]$UseDeviceCode)
-    if (Test-RdaCloudShell)
-    {
-        Write-Ok 'Azure Cloud Shell: the Azure CLI is installed and signed in already.'
-        return $true
-    }
+    # Cloud Shell has the Azure CLI installed and signed in, but its active account and
+    # list of subscriptions are checked there too: the Before release reads them the same way.
+    if (Test-RdaCloudShell) { Write-Ok 'Azure Cloud Shell: the Azure CLI is installed.' }
     $LoginArgs = @('login', '--tenant', $Tenant, '--output', 'none')
     if ($UseDeviceCode) { $LoginArgs += '--use-device-code' }
     $LoginText = 'az ' + (($LoginArgs | Where-Object { $_ -notin '--output', 'none' }) -join ' ')
@@ -862,6 +939,13 @@ function Invoke-RdaAzCliCheck
         'other-tenant'
         {
             return (Invoke-RdaAzCliSwitch -Tenant $Tenant -Subscription $Subscription -Side $Side -LoginText $LoginText)
+        }
+        'subscription-other-tenant'
+        {
+            # Signing in or switching cannot fix this: the ids do not belong together.
+            Write-Bad 'The Azure CLI lists this subscription under another tenant than -TenantID.'
+            Write-Note 'Check -TenantID and -SubscriptionID: the subscription must belong to that tenant.'
+            return $false
         }
     }
     if ($State -eq 'no-subscription')
@@ -934,8 +1018,12 @@ function Get-RdaReadVerdict
         $Acts = @(Get-RdaJsonList $P 'actions')
         $Nots = @(Get-RdaJsonList $P 'notActions')
         $ReadAll = ($Acts -contains '*') -or ($Acts -contains '*/read')
+        # Any excluded read (all reads, or one provider's, e.g. Microsoft.Compute/*/read or
+        # Microsoft.Compute/*) means this role does not read the whole subscription.
         $Blocked = ($Nots -contains '*') -or ($Nots -contains '*/read')
-        if ($ReadAll -and -not $Blocked) { $Full = $true }
+        $SomeBlocked = @($Nots | Where-Object { $_ -like '*/read' -or $_ -like '*/`*' }).Count -gt 0
+        if ($ReadAll -and -not $Blocked -and -not $SomeBlocked) { $Full = $true }
+        elseif ($ReadAll -and -not $Blocked) { $Some = $true }
         elseif (@($Acts | Where-Object { $_ -like '*/read' -or $_ -like '*/`*' }).Count -gt 0) { $Some = $true }
     }
     if ($Full) { return 'ok' }
@@ -963,13 +1051,38 @@ function Test-RdaReaderAccess
     param([Parameter(Mandatory)][string]$Subscription)
     # 1. Ask Azure what this caller may do on the subscription. Anyone may ask this
     #    about themselves, and it counts roles given through groups too.
+    #    The reply can come in pages (nextLink): at most 10 are read, so this always ends.
     try
     {
         $R = Invoke-AzRestMethod -Method GET -Path ('/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $Subscription) -ErrorAction Stop
         if ([int]$R.StatusCode -eq 200)
         {
-            $Value = Get-RdaJsonList ($R.Content | ConvertFrom-Json) 'value'
-            return [pscustomobject]@{ State = (Get-RdaReadVerdict -Permission $Value); How = 'permissions' }
+            $Value = [System.Collections.Generic.List[object]]::new()
+            $Page = 1
+            while ($true)
+            {
+                $J = $R.Content | ConvertFrom-Json
+                foreach ($V in @(Get-RdaJsonList $J 'value')) { $Value.Add($V) }
+                $Next = if ($J.PSObject.Properties['nextLink']) { [string]$J.nextLink } else { '' }
+                if (-not $Next) { break }
+                if ($Page -ge 10) { return [pscustomobject]@{ State = 'unknown'; How = 'permissions' } }
+                $R = Invoke-AzRestMethod -Method GET -Uri $Next -ErrorAction Stop
+                if ([int]$R.StatusCode -ne 200) { return [pscustomobject]@{ State = 'unknown'; How = 'permissions' } }
+                $Page++
+            }
+            $State = Get-RdaReadVerdict -Permission @($Value)
+            # Roles given only on resource groups are not in the subscription's reply.
+            # If a resource group can be read, some resources can: warn, do not stop.
+            if ($State -eq 'missing')
+            {
+                try
+                {
+                    $G = Invoke-AzRestMethod -Method GET -Path ('/subscriptions/{0}/resourcegroups?api-version=2021-04-01&$top=1' -f $Subscription) -ErrorAction Stop
+                    if ([int]$G.StatusCode -eq 200 -and @(Get-RdaJsonList ($G.Content | ConvertFrom-Json) 'value').Count -gt 0) { $State = 'partial' }
+                }
+                catch { Write-Verbose 'The resource group list could not be read.' }
+            }
+            return [pscustomobject]@{ State = $State; How = 'permissions' }
         }
     }
     catch { Write-Verbose ('Permissions check failed: {0}' -f $_.Exception.Message) }
@@ -1037,11 +1150,34 @@ function Get-RdaAzCliReadState
     param([Parameter(Mandatory)][string]$Subscription)
     if ($Subscription -notmatch $script:GuidPattern) { return 'unknown' }
     $Url = '/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $Subscription
-    try { $Text = & az rest --method get --url $Url --output json --only-show-errors 2> $null } catch { return 'unknown' }
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    try { $J = (@($Text) -join "`n") | ConvertFrom-Json -ErrorAction Stop } catch { return 'unknown' }
-    if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
-    return (Get-RdaReadVerdict -Permission @($J.value))
+    $Value = [System.Collections.Generic.List[object]]::new()
+    # At most 10 pages (nextLink), so this always ends.
+    for ($Page = 1; $Page -le 10; $Page++)
+    {
+        $J = Invoke-RdaAzRest -Url $Url
+        if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
+        foreach ($V in @($J.value)) { $Value.Add($V) }
+        $Url = if ($J.PSObject.Properties['nextLink']) { [string]$J.nextLink } else { '' }
+        if (-not $Url) { break }
+    }
+    if ($Url) { return 'unknown' }
+    $State = Get-RdaReadVerdict -Permission @($Value)
+    # Roles given only on resource groups are not in the subscription's reply.
+    if ($State -eq 'missing')
+    {
+        $G = Invoke-RdaAzRest -Url ('/subscriptions/{0}/resourcegroups?api-version=2021-04-01&$top=1' -f $Subscription)
+        if ($null -ne $G -and $G.PSObject.Properties['value'] -and @($G.value).Count -gt 0) { $State = 'partial' }
+    }
+    return $State
+}
+
+# One read-only 'az rest' GET; the parsed JSON, or $null.
+function Invoke-RdaAzRest
+{
+    param([Parameter(Mandatory)][string]$Url)
+    try { $Text = & az rest --method get --url $Url --output json --only-show-errors 2> $null } catch { return $null }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    try { return ((@($Text) -join "`n") | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
 
 function Invoke-RdaAzCliReaderCheck
@@ -1150,14 +1286,18 @@ function Test-RdaChildSeesSignIn
 # one (az account show), not a token for the tenant asked for.
 function Get-RdaAzCliTenant
 {
-    $Text = & az account show --query tenantId --output tsv --only-show-errors 2> $null
+    param([string]$Subscription)
+    $A = @('account', 'show', '--query', 'tenantId', '--output', 'tsv', '--only-show-errors')
+    if ($Subscription) { $A += @('--subscription', $Subscription) }
+    $Text = & az @A 2> $null
     if ($LASTEXITCODE -ne 0) { return $null }
     $Id = ("$(@($Text) | Select-Object -First 1)").Trim()
     if ($Id -match $script:GuidPattern) { return $Id }
     return $null
 }
 
-# ok | missing | not-signed-in | no-subscription | other-tenant (signed in, but the active account is
+# ok | missing | not-signed-in | no-subscription | subscription-other-tenant |
+# other-tenant (signed in, but the active account is
 # in another tenant: the Before release would then run 'az account clear', which signs
 # the Azure CLI out of every account, and ask to sign in again).
 # With -Subscription: no-subscription when the CLI's list of subscriptions (refreshed
@@ -1169,7 +1309,12 @@ function Test-RdaAzCliSignIn
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return 'missing' }
     $Rc = Invoke-RdaAz -Arguments @('account', 'get-access-token', '--tenant', $Tenant, '--output', 'none') -Quiet
     if ($Rc -ne 0) { return 'not-signed-in' }
-    if ($Subscription -and (Invoke-RdaAz -Arguments @('account', 'show', '--subscription', $Subscription, '--output', 'none') -Quiet) -ne 0) { return 'no-subscription' }
+    if ($Subscription)
+    {
+        $SubTenant = Get-RdaAzCliTenant -Subscription $Subscription
+        if (-not $SubTenant) { return 'no-subscription' }
+        if ($SubTenant -ne $Tenant) { return 'subscription-other-tenant' }
+    }
     if ((Get-RdaAzCliTenant) -ne $Tenant) { return 'other-tenant' }
     return 'ok'
 }
@@ -1266,7 +1411,7 @@ function Invoke-RdaBeforeAfter
         Write-Step 'Access to the subscription'
         if (-not (Invoke-RdaReaderCheck -Subscription $SubscriptionID)) { return 1 }
         $CliSide = @(@(@{ Name = 'Before'; Code = $Before }, @{ Name = 'After'; Code = $After }) | Where-Object { Test-RdaTreeNeedsAzCli -TreePath $_.Code.Tree }) | Select-Object -First 1
-        if ($CliSide -and -not (Test-RdaCloudShell) -and -not (Invoke-RdaAzCliReaderCheck -Subscription $SubscriptionID -Side $CliSide.Name)) { return 1 }
+        if ($CliSide -and -not (Invoke-RdaAzCliReaderCheck -Subscription $SubscriptionID -Side $CliSide.Name)) { return 1 }
 
         Write-Step 'Sign-in for the runs'
         if (-not (Test-RdaChildSeesSignIn -Tenant $TenantID))
@@ -1353,6 +1498,11 @@ function Invoke-RdaBeforeAfter
         Write-Host ('Please send back the {0} file(s) in this folder:' -f $ShareFiles.Count) -ForegroundColor Green
         Write-Host ('  {0}' -f $ShareDir)
         $ShareFiles | ForEach-Object { Write-Host ('    {0}' -f $_.Name) }
+        if (@($Sides | Where-Object { $_.side -eq 'before' -and $_.usesAzureCli }).Count -gt 0)
+        {
+            Write-Note 'Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions'
+            Write-Note 'its Azure CLI sign-in can see. The new fixes read only this subscription. See docs/BEFORE-AFTER-TEST.md.'
+        }
         if ($Obfuscate)
         {
             Write-Note 'Before you send the Before zip, check it: the current release can leave the real name of an'
