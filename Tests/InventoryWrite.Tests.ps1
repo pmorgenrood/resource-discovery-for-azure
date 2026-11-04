@@ -221,6 +221,7 @@ function CreateResourceJobs
 }
 function GetResorceConsumption { }
 function Get-AzContext { }
+function Test-SubscriptionRoleAccessAll { }
 '@
 
     # Summary.ps1 stand-in that also records whether the collector data is still held
