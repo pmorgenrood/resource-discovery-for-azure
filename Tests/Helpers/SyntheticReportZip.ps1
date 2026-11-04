@@ -70,7 +70,10 @@ function Get-RdaContractIdPattern
     $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
     if ($AllowParked)
     {
-        $Shapes += '^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + $Guid + '/providers/microsoft\.servicebus/namespaces/\$system$'
+        # G1: '$system' in any name slot of a Service Bus namespace id (the
+        # namespace itself, or a topic or queue under it), at least once.
+        $SbName = '(?:' + $P + $Guid + '|\$system)'
+        $Shapes += '^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + $Guid + '/providers/microsoft\.servicebus/namespaces/' + $SbName + '(?:/[a-z][a-z0-9.]*/' + $SbName + ')*$'
         $Shapes += '^/subscriptions/' + $P + $Guid + $Providers + '$'
     }
     if ($AllowMetricFallback)
