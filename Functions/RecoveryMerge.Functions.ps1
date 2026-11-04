@@ -251,6 +251,22 @@ function Merge-RecoveryData
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
 
+    # A path can reach a source folder in ways no path text shows ('..' after
+    # a link, bind mounts, mapped or substituted drives, short names). So also
+    # refuse when the output folder already holds a source's own inventory:
+    # same name, same size and same bytes.
+    foreach ($SourceInventory in @($GapInventoryFile, $RecoveryInventoryFile))
+    {
+        $InOutput = Join-Path $OutputPath $SourceInventory.Name
+        if (-not (Test-Path -LiteralPath $InOutput -PathType Leaf)) { continue }
+        $OutputCopy = Get-Item -LiteralPath $InOutput -Force
+        if ($OutputCopy.Length -ne $SourceInventory.Length) { continue }
+        if ((Get-FileHash -LiteralPath $OutputCopy.FullName -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $SourceInventory.FullName -Algorithm SHA256).Hash)
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' already holds the source inventory '{1}', so it is or mirrors a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath, $SourceInventory.Name)
+        }
+    }
+
     # -- Guard: obfuscation-dictionary compatibility --------------------------
     # The whole "recovered rows splice in cleanly" guarantee rests on the recovery
     # run having been SEEDED with the gap bundle's dictionary
