@@ -144,6 +144,12 @@ Describe "Consumption to Inventory Cross-Reference" {
         $InventoryByReal = @{}
         foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id)) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
         $Checked = 0
+        # Every masked consumption id is in the dictionary: an id the run
+        # did not record would be a second, unjoinable id for its resource.
+        # The parked 'obfuscated' sentinel for an empty resource id is the
+        # one value that is not.
+        $Unknown = @($script:ConsumptionCsv | Where-Object { -not [string]::IsNullOrEmpty($_.ResourceId) -and $_.ResourceId -ne 'obfuscated' -and -not $RealOf.ContainsKey($_.ResourceId) } | ForEach-Object { $_.ResourceId } | Select-Object -Unique)
+        $Unknown | Should -BeNullOrEmpty -Because 'every consumption ResourceId is a masked id the dictionary records'
         foreach ($row in $script:ConsumptionCsv)
         {
             if ([string]::IsNullOrEmpty($row.ResourceId) -or -not $RealOf.ContainsKey($row.ResourceId)) { continue }
