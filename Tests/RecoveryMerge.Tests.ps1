@@ -248,14 +248,23 @@ Describe 'Merge-RecoveryData consumption handling' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
     }
 
-    It 'leaves the gap inventory untouched when -RecoverConsumption stops with -OutputPath on the gap folder' {
+    It 'refuses an -OutputPath that is the <Which> folder, before writing anything' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Out = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery + [System.IO.Path]::DirectorySeparatorChar }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Out } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
-        $Inv = Join-Path $C.Gap ('Inventory_{0}.json' -f $script:GapBase)
-        $Before = Get-FileHash -LiteralPath $Inv
-        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Gap -RecoverConsumption } | Should -Throw -ExpectedMessage '*has no Consumption_*'
-        (Get-FileHash -LiteralPath $Inv).Hash | Should -BeExactly $Before.Hash
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -ConsumptionCsv $script:CsvHeader
+        $script:CsvHeader | Out-File -FilePath (Join-Path $C.Recovery 'Consumption_second.csv') -Encoding utf8
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
+        @($Result.Warnings | Where-Object { $_ -match "files match 'Consumption_\*\.csv'" }).Count | Should -Be 1
     }
 
     It 'writes a canonical header-only CSV when neither bundle has consumption' {
@@ -545,3 +554,21 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
         (Get-Content -Path $RecInvPath -Raw) | Should -Be $RecBefore -Because 'the recovery bundle is read-only input'
     }
 }
+
+Describe 'Merge-RecoveryData with no report generator next to it' {
+    It 'stops before writing anything when Extension/Summary.ps1 is missing' {
+        $Root = Join-Path $script:TmpRoot ('nosummary_' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Fn = Join-Path $Root 'Functions'
+        New-Item -ItemType Directory -Path $Fn -Force | Out-Null
+        foreach ($F in 'RecoveryMerge.Functions.ps1', 'InventoryJson.Functions.ps1') { Copy-Item -LiteralPath (Join-Path (Split-Path $script:FnFile -Parent) $F) -Destination $Fn }
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Pwsh = (Get-Process -Id $PID).Path
+        $Cmd = ". '{0}'; try {{ Merge-RecoveryData -GapBundlePath '{1}' -RecoveryBundlePath '{2}' -OutputPath '{3}' -WarningAction SilentlyContinue | Out-Null; 'no-stop' }} catch {{ 'STOP ' + `$_.Exception.Message }}" -f (Join-Path $Fn 'RecoveryMerge.Functions.ps1'), $C.Gap, $C.Recovery, $C.Output
+        $Out = (& $Pwsh -NoProfile -NonInteractive -Command $Cmd 2>&1 | Out-String)
+        $Out | Should -Match 'STOP Merge-RecoveryData: report generator not found'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
+    }
+}
+
