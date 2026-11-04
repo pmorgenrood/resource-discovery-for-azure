@@ -206,9 +206,29 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
     }
 
     It 'counts a run that wrote its report with exit 3, 4 or 5 as compared, and not one with no zip' {
-        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 3; zip = 'b' }) | Should -BeTrue
-        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 5; zip = 'b' }) | Should -BeTrue
-        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 2; zip = $null }) | Should -BeFalse
-        Test-RdaRunsComparable -Sides @(@{ exitCode = 1; zip = 'a' }, @{ exitCode = 0; zip = 'b' }) | Should -BeFalse
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }, @{ exitCode = 3; zip = 'b'; counts = @{ reports = 1; problems = @() } }) | Should -BeTrue
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }, @{ exitCode = 5; zip = 'b'; counts = @{ reports = 1; problems = @() } }) | Should -BeTrue
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }, @{ exitCode = 2; zip = $null }) | Should -BeFalse
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 1; zip = 'a'; counts = @{ reports = 1; problems = @() } }, @{ exitCode = 0; zip = 'b'; counts = @{ reports = 1; problems = @() } }) | Should -BeFalse
+    }
+
+    It 'does not count a zip that could not be read, or one with no inventory file' {
+        $Ok = @{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }
+        Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = @{ reports = 1; problems = @() } }) | Should -BeTrue
+        Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = (Get-RdaZipCountSafe -Path (Join-Path $TestDrive 'none.zip')) }) | Should -BeFalse
+        Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = @{ reports = 1; problems = @('no inventory file') } }) | Should -BeFalse
+    }
+
+    It 'does not count a report with a file that could not be read' {
+        $Run = Get-FakeRun
+        $Run.Consumption = "a,b`n1,""x`n2,3"
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'badcsv.zip') $Run -Wrap)
+        $Ok = @{ exitCode = 0; zip = 'a'; counts = @{ reports = 1; problems = @() } }
+        Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
+    }
+
+    It 'gives every count key for a zip that could not be read' {
+        $C = Get-RdaZipCountSafe -Path (Join-Path $TestDrive 'missing.zip')
+        foreach ($K in 'reports', 'inventoryRows', 'inventoryBySection', 'consumptionRows', 'metricsRows', 'metricsErrorRows', 'problems') { $C.Contains($K) | Should -BeTrue -Because $K }
     }
 }

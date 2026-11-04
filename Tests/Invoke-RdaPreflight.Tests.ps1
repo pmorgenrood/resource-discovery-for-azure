@@ -410,6 +410,7 @@ Describe 'PreflightOnly, run from inside a clone' {
         Mock Connect-RdaOnce { $true }
         Mock Get-AzSubscription { [pscustomobject]@{ State = 'Enabled' } }
         Mock Invoke-RdaReaderCheck { $true }
+        Mock Invoke-RdaAzCliReaderCheck { $true }
         Mock Test-RdaChildSeesSignIn { $true }
         Mock Invoke-RdaSide { throw 'a run must not start' }
     }
@@ -425,6 +426,7 @@ Describe 'PreflightOnly, run from inside a clone' {
         Should -Invoke Invoke-RdaSide -Times 0 -Exactly
         Should -Invoke Invoke-RdaAzCliCheck -Times 1 -Exactly -ParameterFilter { $Side -eq 'Before' }
         Should -Invoke Invoke-RdaReaderCheck -Times 1 -Exactly
+        Should -Invoke Invoke-RdaAzCliReaderCheck -Times 1 -Exactly -ParameterFilter { $Side -eq 'Before' -and $Subscription -eq $script:S }
         $R.Text | Should -Match 'Every check passed'
         @(Get-ChildItem -LiteralPath $script:Clone -Directory).Count | Should -Be 0
     }
@@ -565,5 +567,93 @@ Describe 'A side that still uses the Azure CLI, with another tenant active' {
         & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T))) | Should -BeTrue
         Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:T } } }
         & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T -DefaultTenant))) | Should -BeTrue
+    }
+}
+
+Describe 'A side that still uses the Azure CLI, without the subscription in its list' {
+    It 'sees a CLI whose list of subscriptions does not hold the test subscription' {
+        Mock Get-Command { [pscustomobject]@{ Name = 'az' } } -ParameterFilter { $Name -eq 'az' }
+        Mock Invoke-RdaAz { if ($Arguments -contains 'show') { 1 } else { 0 } }
+        Mock Get-RdaAzCliTenant { $script:T }
+        Test-RdaAzCliSignIn -Tenant $script:T -Subscription $script:S | Should -Be 'no-subscription'
+        Test-RdaAzCliSignIn -Tenant $script:T | Should -Be 'ok' -Because 'without -Subscription the list is not read'
+    }
+
+    It 'offers az login for it, and stops with az login advice on N' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $false }
+        Mock Invoke-RdaAz { 0 }
+        Mock Test-RdaAzCliSignIn { 'no-subscription' }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match 'not there yet'
+        $R.Text | Should -Match ([regex]::Escape("Run: az login --tenant $($script:T)"))
+        Should -Invoke Invoke-RdaAz -Times 0 -Exactly
+    }
+
+    It 'names az login, not az account set again, when the switch fails' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $true }
+        Mock Invoke-RdaAz { 1 }
+        Mock Test-RdaAzCliSignIn { 'other-tenant' }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $Last = @($R.Text -split "`n" | Where-Object { $_ -match 'Run: ' })[-1]
+        $Last | Should -Match ([regex]::Escape("Run: az login --tenant $($script:T)"))
+    }
+
+    It 'says up front that Before will add the resource-graph extension when it is missing' {
+        Mock Invoke-RdaAz { 1 } -ParameterFilter { $Arguments -contains 'extension' }
+        $R = Invoke-Captured { Write-RdaAzCliExtensionNote -Side 'Before' }
+        $R.Text | Should -Match 'az extension add --name resource-graph'
+        Mock Invoke-RdaAz { 0 } -ParameterFilter { $Arguments -contains 'extension' }
+        (Invoke-Captured { Write-RdaAzCliExtensionNote -Side 'Before' }).Text | Should -BeNullOrEmpty
+    }
+
+    It 'does not claim in its help that it never changes the saved Az PowerShell default' {
+        $Text = Get-Content -LiteralPath $script:Customer -Raw
+        $Text | Should -Not -Match 'never changes your saved Az PowerShell default'
+        $Text | Should -Match 'that sign-in becomes your saved\s+default'
+    }
+}
+
+Describe 'Read access of the Azure CLI sign-in' {
+    AfterEach { Remove-Item function:global:az -ErrorAction SilentlyContinue }
+
+    It 'reads <Want> from the permissions the Azure CLI gets back' -TestCases @(
+        @{ Json = '{"value":[{"actions":["*/read"],"notActions":[]}]}'; Rc = 0; Want = 'ok' }
+        @{ Json = '{"value":[{"actions":["Microsoft.Compute/*/read"],"notActions":[]}]}'; Rc = 0; Want = 'partial' }
+        @{ Json = '{"value":[]}'; Rc = 0; Want = 'missing' }
+        @{ Json = 'not json'; Rc = 0; Want = 'unknown' }
+        @{ Json = ''; Rc = 1; Want = 'unknown' }
+    ) {
+        param($Json, $Rc, $Want)
+        $script:FakeAzJson = $Json; $script:FakeAzRc = $Rc; $script:FakeAzArgs = $null
+        function global:az { $script:FakeAzArgs = $args; $global:LASTEXITCODE = $script:FakeAzRc; $script:FakeAzJson }
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be $Want
+        ($script:FakeAzArgs -join ' ') | Should -Match ([regex]::Escape("rest --method get --url /subscriptions/$($script:S)/providers/Microsoft.Authorization/permissions"))
+    }
+
+    It 'stops only when the Azure CLI sign-in clearly cannot read, and warns otherwise' {
+        Mock Get-RdaAzCliReadState { 'missing' }
+        $R = Invoke-Captured { Invoke-RdaAzCliReaderCheck -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match 'Reader role'
+        Mock Get-RdaAzCliReadState { 'partial' }
+        (Invoke-Captured { Invoke-RdaAzCliReaderCheck -Subscription $script:S -Side 'Before' }).Result | Should -BeTrue
+        Mock Get-RdaAzCliReadState { 'unknown' }
+        (Invoke-Captured { Invoke-RdaAzCliReaderCheck -Subscription $script:S -Side 'Before' }).Result | Should -BeTrue
+    }
+
+    It 'resolves a relative -OutputDirectory from the PowerShell location' {
+        Mock Invoke-RdaAzModuleCheck { [pscustomobject]@{ Ok = $false; Modules = @() } }
+        $Here = Join-Path $TestDrive ('loc-' + [guid]::NewGuid()); New-Item -ItemType Directory $Here | Out-Null
+        Push-Location $Here
+        try { $R = Invoke-Captured { Invoke-RdaBeforeAfter -TenantID $script:T -SubscriptionID $script:S -AfterBranch 'x' -OutputDirectory 'rel-out' } }
+        finally { Pop-Location }
+        $R.Result | Should -Be 1
+        $R.Text | Should -Match ([regex]::Escape('Output folder: ' + (Join-Path $Here 'rel-out')))
     }
 }
