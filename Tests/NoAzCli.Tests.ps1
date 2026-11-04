@@ -22,6 +22,13 @@ BeforeDiscovery {
             if (Test-Path $Path) { Get-ChildItem -Path $Path -Filter '*.ps1' -File -Recurse }
         }
     ) | ForEach-Object { @{ Name = $_.FullName.Substring($Root.Length + 1); Path = $_.FullName } }
+
+    # Invoke-RdaBeforeAfter.ps1 is not part of the tool: it downloads and runs an older
+    # release of the tool as its Before side, and that release still signs in with the
+    # Azure CLI. So it alone may check for and call az. Every other check here still
+    # applies to it, and the tool itself must never run it (tested below).
+    $script:AzCliAllowed = @('Invoke-RdaBeforeAfter.ps1')
+    $script:ToolFiles = @($script:Files | Where-Object { $_.Name -notin $script:AzCliAllowed })
 }
 
 Describe 'No Azure CLI in the tool' {
@@ -32,7 +39,19 @@ Describe 'No Azure CLI in the tool' {
         @($Names | Where-Object { $_ -like 'Functions*' }).Count | Should -BeGreaterThan 0
     }
 
-    It '<Name> does not call az' -TestCases $script:Files {
+    It '<Name> never runs the Before/After test script (the one file allowed to call az)' -TestCases $script:ToolFiles {
+        param($Name, $Path)
+        $null = $Name
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Hits = @($Ast.FindAll({
+                    param($Node)
+                    ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -or $Node -is [System.Management.Automation.Language.CommandAst]) -and
+                    $Node.Extent.Text -match 'Invoke-RdaBeforeAfter'
+                }, $true) | ForEach-Object { 'line {0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
+        $Hits | Should -BeNullOrEmpty
+    }
+
+    It '<Name> does not call az' -TestCases $script:ToolFiles {
         param($Name, $Path)
         $null = $Name
         $Errors = $null
