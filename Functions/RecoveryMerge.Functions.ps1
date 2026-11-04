@@ -358,8 +358,7 @@ function Merge-RecoveryData
     $BundleBase = $GapInventoryFile.BaseName -replace '^Inventory_', ''
 
     # -- Every requested recovery source is checked before anything is
-    #    written, so a stop never leaves a partial output folder (or, with
-    #    -OutputPath on the gap folder, an overwritten gap inventory).
+    #    written, so a stop never leaves a partial output folder.
     #    Each is looked up once here and used below.
     $RecoveryConsumptionFile = $null
     if ($RecoverConsumption)
