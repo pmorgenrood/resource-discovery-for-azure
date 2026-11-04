@@ -245,6 +245,17 @@ Describe 'Merge-RecoveryData consumption handling' {
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption } |
             Should -Throw -ExpectedMessage '*has no Consumption_*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
+    }
+
+    It 'leaves the gap inventory untouched when -RecoverConsumption stops with -OutputPath on the gap folder' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Inv = Join-Path $C.Gap ('Inventory_{0}.json' -f $script:GapBase)
+        $Before = Get-FileHash -LiteralPath $Inv
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Gap -RecoverConsumption } | Should -Throw -ExpectedMessage '*has no Consumption_*'
+        (Get-FileHash -LiteralPath $Inv).Hash | Should -BeExactly $Before.Hash
     }
 
     It 'writes a canonical header-only CSV when neither bundle has consumption' {
@@ -296,6 +307,7 @@ Describe 'Merge-RecoveryData metrics handling' {
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics } |
             Should -Throw -ExpectedMessage '*has no Metrics_*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
     }
 }
 
