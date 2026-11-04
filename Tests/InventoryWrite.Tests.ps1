@@ -677,17 +677,22 @@ Describe 'Write-InventoryJson' {
 Describe 'ResourceInventory.ps1 start-up loads Write-InventoryJson' {
 
     It 'defines Write-InventoryJson after the start-up load statements run in a fresh pwsh' {
-        # The top-level statements before the first '$Debug.IsPresent' check are the
-        # functions-file loads. Run them in a child pwsh with $PSScriptRoot set to the repo.
+        # The top-level statements before the debug-mode setup (the '$DebugMode = ...'
+        # line, or an older '$Debug.IsPresent' check) are the functions-file loads. Run
+        # them in a child pwsh with $PSScriptRoot set to the repo.
         $Tokens = $null
         $ParseErrors = $null
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:InventoryScript, [ref]$Tokens, [ref]$ParseErrors)
         $Load = @()
+        $FoundEnd = $false
         foreach ($Statement in $Ast.EndBlock.Statements)
         {
-            if ($Statement.Extent.Text -match '^\s*if\s*\(\s*\$Debug\.IsPresent') { break }
+            if ($Statement.Extent.Text -match '^\s*(\$DebugMode\s*=|if\s*\(\s*\$Debug(Mode\b|\.IsPresent))') { $FoundEnd = $true; break }
             $Load += $Statement.Extent.Text
         }
+        # Without the end marker $Load would hold the whole script, and the child would
+        # run a full inventory against whatever Azure sign-in the host has.
+        $FoundEnd | Should -BeTrue -Because 'the start-up loads must end at the debug-mode setup'
         $Load.Count | Should -BeGreaterThan 0
 
         $Q = { param($s) "'" + $s.Replace("'", "''") + "'" }
