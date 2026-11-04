@@ -397,6 +397,7 @@ Describe 'ResourceInventory.ps1 report packaging' {
         @($Commands | Where-Object { $_.GetCommandName() -eq 'Compress-Archive' }).Count | Should -Be 0
         $Calls = @($Commands | Where-Object { $_.GetCommandName() -eq 'Compress-RdaReportArchive' })
         $Calls.Count | Should -Be 1
-        $Calls[0].Extent.Text | Should -Be 'Compress-RdaReportArchive @CompressionOutput'
+        # -ErrorAction Stop: the zip step's catch must see any error (inventory-write fix).
+        $Calls[0].Extent.Text | Should -Be 'Compress-RdaReportArchive @CompressionOutput -ErrorAction Stop'
     }
 }
