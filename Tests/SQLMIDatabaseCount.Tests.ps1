@@ -14,10 +14,12 @@
 #     when it has none;
 #   - parent ids are matched without regard to letter case;
 #   - databases of several instances can arrive in any order;
-#   - odd ids give exactly what the old '-like' match gave: an id that holds
+#   - odd ids give what the old '-like' match gave: an id that holds
 #     '/databases/' twice, a database id with nothing after '/databases/', null
-#     ids, wildcard characters ([ ] * ?) in an instance id, and non-ASCII
-#     letters that '-like' folds to ASCII;
+#     ids, and non-ASCII letters that '-like' folds to ASCII;
+#   - wildcard characters (* ? [ ] and backtick) in an instance id are plain
+#     characters, so the instance counts its own databases and an unclosed
+#     bracket does not throw;
 #   - on a tr-TR host, ids that differ only in I and i still count, which the
 #     old scan got wrong, so this test fails if the old scan comes back.
 #
@@ -95,7 +97,9 @@ BeforeAll {
     {
         param($Resources, $Instance)
         $Dbs = $Resources | Where-Object { $_.TYPE -eq 'microsoft.sql/managedinstances/databases' }
-        $Match = $Dbs | Where-Object { $_.Id -like "$($Instance.Id)/databases/*" }
+        # Wildcard characters in an instance id are plain characters, so escape them.
+        $LikeId = "$($Instance.Id)" -replace '([*?\[\]`])', '`$1'
+        $Match = $Dbs | Where-Object { $_.Id -like "$LikeId/databases/*" }
         if ($null -ne $Match) { $Match.Count } else { '0' }
     }
 
@@ -220,27 +224,46 @@ Describe 'SQLMI database count' {
         $Recs[1]['Databases'] | Should -Be 1 -Because "a null id makes the pattern '/databases/*'"
     }
 
-    It 'keeps the -like result for wildcard characters in an instance id' {
+    It 'reads wildcard characters in an instance id as plain characters' {
         $Bracket = New-TestInstance -Id (Get-MiId 'mi[ab]')
         $Star = New-TestInstance -Id (Get-MiId 'mi*')
         $Query = New-TestInstance -Id (Get-MiId 'mi?')
+        $Tick = New-TestInstance -Id (Get-MiId 'mi`x')
         $Rows = @(
-            $Bracket, $Star, $Query,
+            $Bracket, $Star, $Query, $Tick,
             (New-TestDatabase -Id "$(Get-MiId 'mi[ab]')/databases/db1"),
+            (New-TestDatabase -Id "$(Get-MiId 'mi[ab]')/databases/db2"),
+            (New-TestDatabase -Id "$(Get-MiId 'mi*')/databases/db1"),
+            (New-TestDatabase -Id "$(Get-MiId 'mi`x')/databases/db1"),
             (New-TestDatabase -Id "$(Get-MiId 'mia')/databases/db1"),
             (New-TestDatabase -Id "$(Get-MiId 'mix')/databases/db1")
         )
 
         $Recs = @(Assert-SameAsLike -Resources $Rows)
 
-        $Recs[0]['Databases'] | Should -Be 1 -Because "'[ab]' is a character class, so only 'mia' matches"
-        $Recs[1]['Databases'] | Should -Be 3
-        $Recs[2]['Databases'] | Should -Be 2
+        $Recs[0]['Databases'] | Should -Be 2 -Because "'mi[ab]' counts its own databases, not those of 'mia'"
+        $Recs[1]['Databases'] | Should -Be 1 -Because "'mi*' counts only its own database"
+        $Recs[2]['Databases'] | Should -BeExactly '0' -Because "'mi?' has no databases"
+        $Recs[3]['Databases'] | Should -Be 1 -Because "'mi``x' counts its own database, not that of 'mix'"
     }
 
-    It 'still throws, as -like does, for an instance id with an unclosed bracket' {
+    It 'counts the databases of an instance id with an unclosed bracket, without throwing' {
         $Mi = New-TestInstance -Id (Get-MiId 'mi[')
-        { Invoke-TestCollector -Resources @($Mi, (New-TestDatabase -Id "$($Mi.id)/databases/db1")) } | Should -Throw -ExceptionType ([System.Management.Automation.WildcardPatternException])
+        $Rec = Invoke-TestCollector -Resources @($Mi, (New-TestDatabase -Id "$($Mi.id)/databases/db1"))
+        $Rec['Databases'] | Should -Be 1
+        $Rec['Databases'] | Should -BeOfType ([int])
+    }
+
+    It 'reads wildcard characters as plain characters in an instance id with non-ASCII letters' {
+        $Name = 'mi-' + [char]0x00E4 + '['
+        $Mi = New-TestInstance -Id (Get-MiId $Name)
+        $Other = New-TestInstance -Id (Get-MiId ('mi-' + [char]0x00E4 + '*'))
+        $Rows = @($Mi, $Other, (New-TestDatabase -Id "$(Get-MiId $Name)/databases/db1"))
+
+        $Recs = @(Invoke-TestCollector -Resources $Rows)
+
+        $Recs[0]['Databases'] | Should -Be 1
+        $Recs[1]['Databases'] | Should -BeExactly '0' -Because "'*' is a plain character, so it does not match '['"
     }
 
     It 'gives the -like result for non-ASCII letters in an id' {
