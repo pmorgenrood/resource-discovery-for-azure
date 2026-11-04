@@ -12,6 +12,8 @@
 BeforeAll {
     $script:Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
     . (Join-Path $script:Root 'Functions/ResourceInventory.Functions.ps1')
+    # Write-InventoryJson lives in its own file.
+    . (Join-Path $script:Root 'Functions/InventoryJson.Functions.ps1')
     # The Azure documentation placeholder; not a real subscription id.
     $script:Guid = '12345678-1234-1234-1234-123456789012'
     $script:Subs = @([pscustomobject]@{ id = $script:Guid; Name = 'sub-placeholder' })
