@@ -299,6 +299,26 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
+    It 'never writes into the gap folder for an -OutputPath of a link, then ..' {
+        # A link to a subfolder of the gap folder, then '..'. PowerShell and
+        # .NET both read '..' as text, so the guard and every write agree on
+        # the link's own parent; the gap folder is never reached.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Sub = Join-Path $C.Gap 'sub'
+        $null = New-Item -ItemType Directory -Path $Sub
+        $LinkDir = Join-Path (Split-Path -Parent $C.Output) ('other_' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $LinkDir
+        $Link = Join-Path $LinkDir 'L'
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target $Sub -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath ($Link + [System.IO.Path]::DirectorySeparatorChar + '..')
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+        Test-Path -LiteralPath (Join-Path $LinkDir ('Inventory_{0}.json' -f $script:GapBase)) | Should -BeTrue
+    }
+
     It 'refuses an -OutputPath that already holds the <Which> inventory, however the folder is reached' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
         # A bind mount, a mapped or substituted drive or a short name shows a
         # source folder under another path. Seen from the path, that is an
@@ -312,6 +332,21 @@ Describe 'Merge-RecoveryData consumption handling' {
         $Before = @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw -ExpectedMessage '*already holds the source inventory*Nothing was written*'
         @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'refuses an -OutputPath under a parent link with a relative target' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Parent = Split-Path -Parent $C.Gap
+        $Link = Join-Path $Parent ('plink_' + [guid]::NewGuid().ToString('N'))
+        # The link's target is written as a relative path ('.'), so it is read from the link's own folder.
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target '.' -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $Out = Join-Path $Link (Split-Path -Leaf $C.Gap)
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Out } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
