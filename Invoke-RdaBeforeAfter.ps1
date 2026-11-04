@@ -4,7 +4,7 @@
 .SYNOPSIS
     Runs Resource Discovery for Azure twice on one test subscription: once with the
     current awslabs release (Before) and once with the new fixes (After). It makes
-    two report zips and one small summary file for you to send back.
+    two report zips and one summary file for you to send back.
 
 .DESCRIPTION
     Steps:
@@ -23,13 +23,17 @@
 
     Nothing is sent anywhere. You send the files in the "share" folder by hand.
     Both runs only read from Azure. They change nothing in your subscription.
+    This script never changes your saved Az PowerShell default. It may switch the
+    Azure CLI's active subscription, only if you say yes when it asks.
 
 .PARAMETER TenantID
     Your Microsoft Entra tenant id.
 .PARAMETER SubscriptionID
     The one test subscription to scan.
 .PARAMETER Obfuscate
-    Mask names and ids in both report zips. Each run keeps its own dictionary (the
+    Mask names and ids in both report zips. The current release (Before) can still
+    leave the real name of an Azure SQL server inside its databases' masked ids, so
+    check the Before zip before you send it. Each run keeps its own dictionary (the
     key that turns masks back into real names) in the "private" folder. Keep the
     dictionaries; do not send them.
 .PARAMETER OutputDirectory
@@ -62,7 +66,9 @@
     ./Invoke-RdaBeforeAfter.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -PreflightOnly
 
 .OUTPUTS
-    Exit code 0: both runs ended with exit 0 and both zips are in the share folder.
+    Exit code 0: both runs wrote their report zip (run exit 0, or 3, 4 or 5, which
+    the new version uses for a report with some data missing), and both zips are in
+    the share folder.
     Exit code 1: a check failed, or a run failed. The message says what to do.
 #>
 # The console messages are this script's user interface, so they go to the host.
@@ -313,6 +319,7 @@ function Get-RdaCode
 }
 
 # Counts what a report zip holds. Counts only: no id, name or value leaves here.
+# Streams every file: a big report is never read into memory whole.
 function Get-RdaZipCount
 {
     param([Parameter(Mandatory)][string]$Path)
@@ -324,6 +331,7 @@ function Get-RdaZipCount
     }
     $Outer = [IO.Compression.ZipFile]::OpenRead($Path)
     $Archives = [System.Collections.Generic.List[object]]::new()
+    $TempFiles = [System.Collections.Generic.List[string]]::new()
     try
     {
         $Inner = @($Outer.Entries | Where-Object { $_.Name -like '*.zip' })
@@ -332,10 +340,16 @@ function Get-RdaZipCount
         {
             foreach ($E in $Inner)
             {
-                $Ms = [IO.MemoryStream]::new()
-                $St = $E.Open(); try { $St.CopyTo($Ms) } finally { $St.Dispose() }
-                $Ms.Position = 0
-                $Archives.Add([IO.Compression.ZipArchive]::new($Ms, [IO.Compression.ZipArchiveMode]::Read))
+                # Each inner zip goes to a temp file, not to memory.
+                $Tmp = Join-Path ([IO.Path]::GetTempPath()) ('rda-ab-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+                $TempFiles.Add($Tmp)
+                try
+                {
+                    $St = $E.Open(); $Fs = [IO.File]::Create($Tmp)
+                    try { $St.CopyTo($Fs) } finally { $Fs.Dispose(); $St.Dispose() }
+                    $Archives.Add([IO.Compression.ZipFile]::OpenRead($Tmp))
+                }
+                catch { $Out.problems.Add('an inner report zip could not be read') }
             }
         }
         foreach ($A in $Archives)
@@ -349,28 +363,28 @@ function Get-RdaZipCount
             {
                 try
                 {
-                    $j = Read-RdaEntryText $Inv | ConvertFrom-Json -Depth 200
-                    foreach ($P in $j.PSObject.Properties)
+                    $Sections = Measure-RdaInventoryEntry -Entry $Inv
+                    foreach ($K in $Sections.Keys)
                     {
-                        if ($P.Value -is [System.Collections.IList])
-                        {
-                            $N = @($P.Value).Count
-                            $Out.inventoryRows += $N
-                            if (-not $Out.inventoryBySection.Contains($P.Name)) { $Out.inventoryBySection[$P.Name] = 0 }
-                            $Out.inventoryBySection[$P.Name] += $N
-                        }
+                        $Out.inventoryRows += $Sections[$K]
+                        if (-not $Out.inventoryBySection.Contains($K)) { $Out.inventoryBySection[$K] = 0 }
+                        $Out.inventoryBySection[$K] += $Sections[$K]
                     }
                 }
                 catch { $Out.problems.Add('inventory file could not be read') }
             }
             else { $Out.problems.Add('no inventory file') }
-            if ($Con) { $Out.consumptionRows += (Measure-RdaCsvRow (Read-RdaEntryText $Con)) }
+            if ($Con)
+            {
+                try { $Out.consumptionRows += (Measure-RdaCsvEntry -Entry $Con) }
+                catch { $Out.problems.Add('consumption file could not be read') }
+            }
             foreach ($M in $Met)
             {
                 try
                 {
-                    $Mj = Read-RdaEntryText $M | ConvertFrom-Json -Depth 200
-                    foreach ($R in @($Mj.Metrics)) { if ($null -ne $R) { $Out.metricsRows++; if ($R.PSObject.Properties['MetricError'] -and $R.MetricError -eq $true) { $Out.metricsErrorRows++ } } }
+                    $Mc = Measure-RdaMetricsEntry -Entry $M
+                    $Out.metricsRows += $Mc.Rows; $Out.metricsErrorRows += $Mc.Errors
                 }
                 catch { $Out.problems.Add('a metrics file could not be read') }
             }
@@ -380,22 +394,95 @@ function Get-RdaZipCount
     {
         foreach ($A in $Archives) { if ($A -ne $Outer) { $A.Dispose() } }
         $Outer.Dispose()
+        foreach ($T in $TempFiles) { Remove-Item -LiteralPath $T -Force -ErrorAction SilentlyContinue }
     }
     $Out.problems = @($Out.problems)
     return $Out
 }
 
-function Read-RdaEntryText($Entry)
+function New-RdaJsonReader($Entry)
 {
     $Sr = [IO.StreamReader]::new($Entry.Open(), [Text.Encoding]::UTF8, $true)
-    try { return $Sr.ReadToEnd() } finally { $Sr.Dispose() }
+    $Jr = [Newtonsoft.Json.JsonTextReader]::new($Sr)
+    $Jr.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+    $Jr.CloseInput = $true
+    return $Jr
 }
 
-# Data rows of a CSV text (quoted fields may hold commas, quotes and line breaks).
-function Measure-RdaCsvRow([string]$Text)
+# Rows per inventory section: each top-level list counts its items.
+function Measure-RdaInventoryEntry($Entry)
 {
-    if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
-    $P = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new([IO.StringReader]::new($Text))
+    $Counts = [ordered]@{}
+    $Jr = New-RdaJsonReader $Entry
+    try
+    {
+        if (-not $Jr.Read() -or $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { throw 'not a JSON object' }
+        while ($Jr.Read() -and $Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::PropertyName)
+        {
+            $Name = [string]$Jr.Value
+            if (-not $Jr.Read()) { throw 'cut-off JSON' }
+            if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartArray) { $Jr.Skip(); continue }
+            $N = 0
+            while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { $N++; $Jr.Skip() }
+            if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { throw 'cut-off JSON' }
+            if (-not $Counts.Contains($Name)) { $Counts[$Name] = 0 }
+            $Counts[$Name] += $N
+        }
+        if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndObject) { throw 'cut-off JSON' }
+    }
+    finally { $Jr.Close() }
+    return $Counts
+}
+
+# Rows of a metrics file's Metrics list, and how many have MetricError true.
+function Measure-RdaMetricsEntry($Entry)
+{
+    $Rows = 0; $Errors = 0
+    $Jr = New-RdaJsonReader $Entry
+    try
+    {
+        if (-not $Jr.Read() -or $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { throw 'not a JSON object' }
+        while ($Jr.Read() -and $Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::PropertyName)
+        {
+            $Name = [string]$Jr.Value
+            if (-not $Jr.Read()) { throw 'cut-off JSON' }
+            if ($Name -ne 'Metrics' -or $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartArray) { $Jr.Skip(); continue }
+            while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray)
+            {
+                if ($Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::Null) { continue }
+                $Rows++
+                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { $Jr.Skip(); continue }
+                # One record at a time: a record is small.
+                $Rec = [Newtonsoft.Json.Linq.JObject]::Load($Jr)
+                $Err = $Rec['MetricError']
+                if ($null -ne $Err -and $Err.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Boolean -and [bool]$Err) { $Errors++ }
+            }
+            if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { throw 'cut-off JSON' }
+        }
+        if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndObject) { throw 'cut-off JSON' }
+    }
+    finally { $Jr.Close() }
+    return [pscustomobject]@{ Rows = $Rows; Errors = $Errors }
+}
+
+# Data rows of a consumption file, read as a stream.
+function Measure-RdaCsvEntry($Entry)
+{
+    $Sr = [IO.StreamReader]::new($Entry.Open(), [Text.Encoding]::UTF8, $true)
+    try { return (Measure-RdaCsvRow -Reader $Sr) } finally { $Sr.Dispose() }
+}
+
+# Data rows of a CSV (quoted fields may hold commas, quotes and line breaks).
+# Takes text or a TextReader. A field whose quote never closes throws.
+function Measure-RdaCsvRow
+{
+    param([string]$Text, [IO.TextReader]$Reader)
+    if (-not $Reader)
+    {
+        if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
+        $Reader = [IO.StringReader]::new($Text)
+    }
+    $P = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new($Reader)
     try
     {
         $P.SetDelimiters(','); $P.HasFieldsEnclosedInQuotes = $true
@@ -431,6 +518,35 @@ function Get-RdaProcessTree
     return @($Tree)
 }
 
+# The child's arguments, one list item each (never one command string).
+function Get-RdaSideArgument
+{
+    param([string]$Tree, [string]$ReportDir, [string]$Tenant, [string]$Subscription, [switch]$Mask, [switch]$UseDeviceCode)
+    $L = [System.Collections.Generic.List[string]]::new()
+    foreach ($A in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Tree 'ResourceInventory.ps1'),
+            '-TenantID', $Tenant, '-SubscriptionID', $Subscription, '-OutputDirectory', $ReportDir)) { $L.Add($A) }
+    if ($Mask) { $L.Add('-Obfuscate') }
+    # A run that has to sign in again uses the same way as this script.
+    if ($UseDeviceCode) { $L.Add('-DeviceLogin') }
+    return $L.ToArray()
+}
+
+# Counts a shared zip; a zip that cannot be read gives a fixed problem, never a stop.
+function Get-RdaZipCountSafe
+{
+    param([Parameter(Mandatory)][string]$Path)
+    try { return (Get-RdaZipCount -Path $Path) }
+    catch { return [ordered]@{ reports = 0; problems = @('report zip could not be read') } }
+}
+
+# True when both runs wrote a report zip. Exits 3, 4 and 5 of the new version still
+# write the report (with some data missing, as its README says).
+function Test-RdaRunsComparable
+{
+    param([object[]]$Sides)
+    return (@($Sides | Where-Object { $_.exitCode -in 0, 3, 4, 5 -and $_.zip }).Count -eq 2)
+}
+
 # Runs one side's ResourceInventory.ps1 as a child process and samples its memory.
 function Invoke-RdaSide
 {
@@ -439,17 +555,16 @@ function Invoke-RdaSide
         [Parameter(Mandatory)][string]$ReportDir,
         [Parameter(Mandatory)][string]$Tenant,
         [Parameter(Mandatory)][string]$Subscription,
-        [switch]$Mask
+        [switch]$Mask,
+        [switch]$UseDeviceCode
     )
     New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
     $PwshPath = (Get-Process -Id $PID).Path
     $Psi = [System.Diagnostics.ProcessStartInfo]::new($PwshPath)
-    foreach ($A in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Tree 'ResourceInventory.ps1'),
-            '-TenantID', $Tenant, '-SubscriptionID', $Subscription, '-OutputDirectory', $ReportDir))
+    foreach ($A in (Get-RdaSideArgument -Tree $Tree -ReportDir $ReportDir -Tenant $Tenant -Subscription $Subscription -Mask:$Mask -UseDeviceCode:$UseDeviceCode))
     {
         $Psi.ArgumentList.Add($A)
     }
-    if ($Mask) { $Psi.ArgumentList.Add('-Obfuscate') }
     $Psi.UseShellExecute = $false
     $Psi.WorkingDirectory = $Tree
     $Start = [datetime]::UtcNow
@@ -672,9 +787,36 @@ function Get-RdaAzCliInstallAdvice
 }
 
 # Checks the Azure CLI for one side. Offers to sign it in; never installs it.
+# The Azure CLI is signed in, but its active account is in another tenant. Offers
+# 'az account set --subscription <id>', which only picks the active account.
+function Invoke-RdaAzCliSwitch
+{
+    param([Parameter(Mandatory)][string]$Tenant, [string]$Subscription, [Parameter(Mandatory)][string]$Side)
+    $SetText = if ($Subscription) { 'az account set --subscription {0}' -f $Subscription } else { 'az login --tenant {0}' -f $Tenant }
+    Write-Bad ('{0} needs the Azure CLI''s active account in this tenant, and it is in another one.' -f $Side)
+    Write-Note ('Left like this, {0} would sign the Azure CLI out of every account (az account clear) and ask you to sign in again.' -f $Side)
+    if (-not $Subscription -or -not (Test-RdaInteractiveHost) -or -not (Read-RdaYesNo -Question 'Switch the Azure CLI to this subscription now?'))
+    {
+        if (-not (Test-RdaInteractiveHost)) { Write-Note 'This PowerShell cannot ask questions (it is non-interactive).' }
+        Write-Note ('Run: {0}' -f $SetText)
+        Write-Note 'Then run this script again.'
+        return $false
+    }
+    $null = Invoke-RdaAz -Arguments @('account', 'set', '--subscription', $Subscription, '--output', 'none')
+    if ((Test-RdaAzCliSignIn -Tenant $Tenant) -eq 'ok')
+    {
+        Write-Ok 'The Azure CLI now uses this subscription.'
+        return $true
+    }
+    Write-Bad 'The Azure CLI still uses another tenant.'
+    Write-Note ('Run: {0}' -f $SetText)
+    Write-Note 'Then run this script again.'
+    return $false
+}
+
 function Invoke-RdaAzCliCheck
 {
-    param([Parameter(Mandatory)][string]$Tenant, [Parameter(Mandatory)][string]$Side, [switch]$UseDeviceCode)
+    param([Parameter(Mandatory)][string]$Tenant, [Parameter(Mandatory)][string]$Side, [string]$Subscription, [switch]$UseDeviceCode)
     if (Test-RdaCloudShell)
     {
         Write-Ok 'Azure Cloud Shell: the Azure CLI is installed and signed in already.'
@@ -696,6 +838,10 @@ function Invoke-RdaAzCliCheck
             foreach ($L in (Get-RdaAzCliInstallAdvice -Os (Get-RdaOsName))) { Write-Note $L }
             Write-Note 'Then open a new PowerShell window, and run this script again.'
             return $false
+        }
+        'other-tenant'
+        {
+            return (Invoke-RdaAzCliSwitch -Tenant $Tenant -Subscription $Subscription -Side $Side)
         }
     }
     Write-Bad ('{0} needs the Azure CLI signed in to this tenant, and it is not.' -f $Side)
@@ -899,29 +1045,47 @@ function Connect-RdaOnce
 # The check a new PowerShell process runs: is there a saved sign-in that can get a
 # token for this tenant? Its default context may be another tenant, because this
 # script switches tenant for its own process only; each run switches the same way.
+# -DefaultTenant: the default context itself must be in the tenant. The Before release
+# (it still uses the Azure CLI) signs in to Az PowerShell again when it is not.
 function Get-RdaChildSignInCheck
 {
-    param([Parameter(Mandatory)][string]$Tenant)
+    param([Parameter(Mandatory)][string]$Tenant, [switch]$DefaultTenant)
     if ($Tenant -notmatch $script:GuidPattern) { throw 'The tenant id must be a GUID.' }
-    return "`$c = Get-AzContext -ErrorAction SilentlyContinue; if (-not `$c -or -not `$c.Account) { return `$false }; try { `$null = Get-AzAccessToken -TenantId '$Tenant' -ErrorAction Stop -WarningAction SilentlyContinue; return `$true } catch { return `$false }"
+    $TenantTest = if ($DefaultTenant) { " -or -not `$c.Tenant -or `$c.Tenant.Id -ne '$Tenant'" } else { '' }
+    return "`$c = Get-AzContext -ErrorAction SilentlyContinue; if (-not `$c -or -not `$c.Account$TenantTest) { return `$false }; try { `$null = Get-AzAccessToken -TenantId '$Tenant' -ErrorAction Stop -WarningAction SilentlyContinue; return `$true } catch { return `$false }"
 }
 
 # A new PowerShell process must see the same sign-in, or each run would ask again.
 function Test-RdaChildSeesSignIn
 {
-    param([string]$Tenant)
+    param([string]$Tenant, [switch]$DefaultTenant)
     $PwshPath = (Get-Process -Id $PID).Path
-    $Cmd = "if (& { $(Get-RdaChildSignInCheck -Tenant $Tenant) }) { exit 0 }; exit 3"
+    $Cmd = "if (& { $(Get-RdaChildSignInCheck -Tenant $Tenant -DefaultTenant:$DefaultTenant) }) { exit 0 }; exit 3"
     & $PwshPath -NoProfile -NonInteractive -Command $Cmd *> $null
     return ($LASTEXITCODE -eq 0)
 }
 
+# The tenant of the Azure CLI's active account, or $null. The Before release reads this
+# one (az account show), not a token for the tenant asked for.
+function Get-RdaAzCliTenant
+{
+    $Text = & az account show --query tenantId --output tsv --only-show-errors 2> $null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $Id = ("$(@($Text) | Select-Object -First 1)").Trim()
+    if ($Id -match $script:GuidPattern) { return $Id }
+    return $null
+}
+
+# ok | missing | not-signed-in | other-tenant (signed in, but the active account is
+# in another tenant: the Before release would then run 'az account clear', which signs
+# the Azure CLI out of every account, and ask to sign in again).
 function Test-RdaAzCliSignIn
 {
     param([string]$Tenant)
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return 'missing' }
     $Rc = Invoke-RdaAz -Arguments @('account', 'get-access-token', '--tenant', $Tenant, '--output', 'none') -Quiet
     if ($Rc -ne 0) { return 'not-signed-in' }
+    if ((Get-RdaAzCliTenant) -ne $Tenant) { return 'other-tenant' }
     return 'ok'
 }
 
@@ -1002,7 +1166,7 @@ function Invoke-RdaBeforeAfter
             if (-not (Test-RdaTreeNeedsAzCli -TreePath $S.Code.Tree)) { Write-Ok ('{0} does not use the Azure CLI.' -f $S.Name); continue }
             Write-Note ('{0} still uses the Azure CLI (az) for sign-in and Resource Graph.' -f $S.Name)
             if ($CliChecked) { continue }
-            if (-not (Invoke-RdaAzCliCheck -Tenant $TenantID -Side $S.Name -UseDeviceCode:$UseDevice)) { return 1 }
+            if (-not (Invoke-RdaAzCliCheck -Tenant $TenantID -Subscription $SubscriptionID -Side $S.Name -UseDeviceCode:$UseDevice)) { return 1 }
             $CliChecked = $true
         }
 
@@ -1024,6 +1188,15 @@ function Invoke-RdaBeforeAfter
             Write-Note 'Then run this script again.'
             return 1
         }
+        $CliSide = @(@(@{ Name = 'Before'; Code = $Before }, @{ Name = 'After'; Code = $After }) | Where-Object { Test-RdaTreeNeedsAzCli -TreePath $_.Code.Tree }) | Select-Object -First 1
+        if ($CliSide -and -not (Test-RdaChildSeesSignIn -Tenant $TenantID -DefaultTenant))
+        {
+            # This script never changes the saved default itself (-Scope Process only).
+            Write-Bad ('{0} uses your default Az PowerShell sign-in, and that is in another tenant, so {0} would ask you to sign in again.' -f $CliSide.Name)
+            Write-Note ('To make this tenant and subscription your default, run: Set-AzContext -Tenant {0} -Subscription {1}' -f $TenantID, $SubscriptionID)
+            Write-Note 'Then run this script again.'
+            return 1
+        }
         Write-Ok 'The runs will use this sign-in.'
 
         if ($PreflightOnly)
@@ -1042,7 +1215,7 @@ function Invoke-RdaBeforeAfter
             if (-not $FromGitHub) { $S.Repo = 'local'; $S.Branch = 'local' }
             Write-Step ('{0} run: {1} {2}, commit {3}' -f $S.Name, $S.Repo, $S.Branch, $S.Code.Commit)
             $ReportDir = Join-Path (Join-Path $PrivateDir $S.Name) 'report'
-            $R = Invoke-RdaSide -Tree $S.Code.Tree -ReportDir $ReportDir -Tenant $TenantID -Subscription $SubscriptionID -Mask:$Obfuscate
+            $R = Invoke-RdaSide -Tree $S.Code.Tree -ReportDir $ReportDir -Tenant $TenantID -Subscription $SubscriptionID -Mask:$Obfuscate -UseDeviceCode:$UseDevice
             $Label = if ($S.Name -eq 'before') { 'Before_' + $(if ($FromGitHub) { 'awslabs-main' } else { 'local' }) } else { 'After_' + ($S.Branch -replace '[^A-Za-z0-9._-]', '-') }
             $C7 = if ($S.Code.Commit -match '^[0-9a-f]{40}$') { $S.Code.Commit.Substring(0, 7) } else { 'unknown' }
             $ShareName = 'RDA-{0}_{1}{2}.zip' -f $Label, $C7, $(if ($Obfuscate) { '_masked' } else { '' })
@@ -1053,11 +1226,14 @@ function Invoke-RdaBeforeAfter
                 Copy-Item -LiteralPath $R.Zip -Destination $Dst
                 $Hash = (Get-FileHash -LiteralPath $Dst -Algorithm SHA256).Hash.ToLowerInvariant()
                 $Bytes = (Get-Item -LiteralPath $Dst).Length
-                $Counts = Get-RdaZipCount -Path $Dst
+                # A zip that cannot be read (cut off, or a bad file in it) is noted, and the next run still goes.
+                $Counts = Get-RdaZipCountSafe -Path $Dst
             }
             Write-Host ('   exit {0}, {1} s, peak memory {2} MB' -f $R.ExitCode, $R.WallSeconds, $R.PeakTreeMB)
-            if ($Counts) { Write-Host ('   inventory rows {0}, consumption rows {1}, metrics rows {2}' -f $Counts.inventoryRows, $Counts.consumptionRows, $Counts.metricsRows) }
+            if ($Counts -and $Counts.reports -gt 0) { Write-Host ('   inventory rows {0}, consumption rows {1}, metrics rows {2}' -f $Counts.inventoryRows, $Counts.consumptionRows, $Counts.metricsRows) }
+            elseif ($Counts) { Write-Bad 'The report zip of this run could not be read.' }
             else { Write-Bad 'This run made no report zip.' }
+            if ($Counts -and @($Counts.problems).Count -gt 0) { Write-Note ('Problems: {0}' -f (@($Counts.problems) -join '; ')) }
             $Sides += [ordered]@{
                 side = $S.Name; repo = $S.Repo; branch = $S.Branch; commit = $S.Code.Commit; codeSource = $(if ($FromGitHub) { 'github' } else { 'local' })
                 toolVersion = (Get-RdaToolVersion -TreePath $S.Code.Tree); usesAzureCli = (Test-RdaTreeNeedsAzCli -TreePath $S.Code.Tree)
@@ -1084,11 +1260,19 @@ function Invoke-RdaBeforeAfter
         foreach ($M in $Mods) { $Summary.host.azModules[$M.Name] = [string]$M.Version }
         $Summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $ShareDir 'ab-summary.json') -Encoding utf8
 
-        $AllOk = (@($Sides | Where-Object { $_.exitCode -eq 0 -and $_.zip }).Count -eq 2)
+        $AllOk = Test-RdaRunsComparable -Sides $Sides
         Write-Step 'Done'
-        Write-Host 'Please send back the 3 files in this folder:' -ForegroundColor Green
+        $ShareFiles = @(Get-ChildItem -LiteralPath $ShareDir -File)
+        Write-Host ('Please send back the {0} file(s) in this folder:' -f $ShareFiles.Count) -ForegroundColor Green
         Write-Host ('  {0}' -f $ShareDir)
-        Get-ChildItem -LiteralPath $ShareDir -File | ForEach-Object { Write-Host ('    {0}' -f $_.Name) }
+        $ShareFiles | ForEach-Object { Write-Host ('    {0}' -f $_.Name) }
+        if ($Obfuscate)
+        {
+            Write-Note 'Before you send the Before zip, check it: the current release can leave the real name of an'
+            Write-Note 'Azure SQL server inside the masked ids of its databases. If that name is private, send only'
+            Write-Note 'the After zip and ab-summary.json, and tell us.'
+        }
+        foreach ($Sd in $Sides) { if ($Sd.exitCode -ne 0) { Write-Note ('The {0} run ended with exit {1}.' -f $Sd.side, $Sd.exitCode) } }
         Write-Host ''
         Write-Host ('Keep this folder to yourself: {0}' -f $PrivateDir) -ForegroundColor Yellow
         Write-Host '  It holds the full run logs and, with -Obfuscate, each run''s dictionary.'

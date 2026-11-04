@@ -144,3 +144,71 @@ Describe 'Invoke-RdaBeforeAfter helpers' {
         Test-Path (Join-Path $D 'code') | Should -BeFalse
     }
 }
+
+Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
+    BeforeAll { . $script:Customer }
+
+    It 'counts metrics rows with MetricError true, and leaves nulls out' {
+        $Run = Get-FakeRun -Metrics 3
+        $Run.Metrics = '{"Metrics":[{"ID":"a","MetricError":true,"MetricValue":1},null,{"ID":"b","MetricError":false},{"ID":"c","MetricError":"true"}],"Other":{"x":[1,2]}}'
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'met.zip') $Run -Wrap)
+        $C.metricsRows | Should -Be 3
+        $C.metricsErrorRows | Should -Be 1 -Because 'only a JSON true counts, not the text "true"'
+        @($C.problems).Count | Should -Be 0
+    }
+
+    It 'counts inventory sections without reading other values as rows' {
+        $Run = Get-FakeRun
+        $Run.Inventory = '{"Version":"3.2.3","VirtualMachines":[{"ID":"a","Tags":[1,2,3]},{"ID":"b"}],"Note":{"VMDisk":[1,2]},"VMDisk":[],"PublicIP":[{"ID":"c"}]}'
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'inv.zip') $Run -Wrap)
+        $C.inventoryRows | Should -Be 3
+        $C.inventoryBySection.VirtualMachines | Should -Be 2
+        $C.inventoryBySection.VMDisk | Should -Be 0
+        $C.inventoryBySection.PublicIP | Should -Be 1
+    }
+
+    It 'notes a cut-off inventory or metrics file and a consumption file with an open quote, and goes on' {
+        $Run = Get-FakeRun
+        $Run.Inventory = '{"VirtualMachines":[{"ID":"a"},'
+        $Run.Metrics = '{"Metrics":[{"ID":"a"'
+        $Run.Consumption = "a,b`n1,""x`n2,3"
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'bad.zip') $Run -Wrap)
+        $C.reports | Should -Be 1
+        @($C.problems) | Should -Contain 'inventory file could not be read'
+        @($C.problems) | Should -Contain 'a metrics file could not be read'
+        @($C.problems) | Should -Contain 'consumption file could not be read'
+    }
+
+    It 'gives a fixed problem for a zip that cannot be opened, never a stop' {
+        $P = Join-Path $TestDrive 'corrupt.zip'
+        [IO.File]::WriteAllBytes($P, [byte[]](0x50, 0x4B, 0x03, 0x04, 1, 2))
+        $C = Get-RdaZipCountSafe -Path $P
+        $C.reports | Should -Be 0
+        @($C.problems) | Should -Be @('report zip could not be read')
+    }
+
+    It 'streams every file and leaves no temp file behind' {
+        $Body = (Get-Command Get-RdaZipCount).Definition + (Get-Command Measure-RdaInventoryEntry).Definition + (Get-Command Measure-RdaMetricsEntry).Definition + (Get-Command Measure-RdaCsvEntry).Definition
+        $Body | Should -Not -Match 'MemoryStream|ReadToEnd|ConvertFrom-Json'
+        $Before = @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'rda-ab-*.zip' -ErrorAction SilentlyContinue).Count
+        $null = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'tmp.zip') (Get-FakeRun) -Wrap)
+        @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'rda-ab-*.zip' -ErrorAction SilentlyContinue).Count | Should -Be $Before
+    }
+
+    It 'passes -DeviceLogin to the runs only when asked, each argument on its own' {
+        $T = '22222222-2222-2222-2222-222222222222'
+        $A = Get-RdaSideArgument -Tree '/x/tree' -ReportDir '/x/r p' -Tenant $T -Subscription $script:S1 -UseDeviceCode
+        $A | Should -Contain '-DeviceLogin'
+        $A | Should -Contain '/x/r p'
+        $A[$A.IndexOf('-TenantID') + 1] | Should -Be $T
+        Get-RdaSideArgument -Tree '/x/tree' -ReportDir '/x/r' -Tenant $T -Subscription $script:S1 -Mask | Should -Not -Contain '-DeviceLogin'
+        Get-RdaSideArgument -Tree '/x/tree' -ReportDir '/x/r' -Tenant $T -Subscription $script:S1 -Mask | Should -Contain '-Obfuscate'
+    }
+
+    It 'counts a run that wrote its report with exit 3, 4 or 5 as compared, and not one with no zip' {
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 3; zip = 'b' }) | Should -BeTrue
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 5; zip = 'b' }) | Should -BeTrue
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a' }, @{ exitCode = 2; zip = $null }) | Should -BeFalse
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 1; zip = 'a' }, @{ exitCode = 0; zip = 'b' }) | Should -BeFalse
+    }
+}
