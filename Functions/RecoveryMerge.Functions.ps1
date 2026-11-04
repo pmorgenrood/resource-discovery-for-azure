@@ -251,19 +251,35 @@ function Merge-RecoveryData
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
 
-    # A path can reach a source folder in ways no path text shows ('..' after
-    # a link, bind mounts, mapped or substituted drives, short names). So also
-    # refuse when the output folder already holds a source's own inventory:
-    # same name, same size and same bytes.
-    foreach ($SourceInventory in @($GapInventoryFile, $RecoveryInventoryFile))
+    # Some paths reach a source folder in ways the path text does not show
+    # (bind mounts, mapped or substituted drives, short names). So when the
+    # output folder already exists, a file with a new random name is made in
+    # it and looked for in each source folder; it is removed straight after.
+    # A copy of a source bundle is a different folder and is not refused.
+    if (Test-Path -LiteralPath $OutputPath -PathType Container)
     {
-        $InOutput = Join-Path $OutputPath $SourceInventory.Name
-        if (-not (Test-Path -LiteralPath $InOutput -PathType Leaf)) { continue }
-        $OutputCopy = Get-Item -LiteralPath $InOutput -Force
-        if ($OutputCopy.Length -ne $SourceInventory.Length) { continue }
-        if ((Get-FileHash -LiteralPath $OutputCopy.FullName -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $SourceInventory.FullName -Algorithm SHA256).Hash)
+        $ProbeName = '.rda-merge-probe-' + [guid]::NewGuid().ToString('N')
+        $Probe = Join-Path $OutputPath $ProbeName
+        $SharedSource = $null
+        try
         {
-            throw ("Merge-RecoveryData: -OutputPath '{0}' already holds the source inventory '{1}', so it is or mirrors a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath, $SourceInventory.Name)
+            $null = New-Item -ItemType File -Path $Probe -ErrorAction Stop
+            foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
+            {
+                if (Test-Path -LiteralPath (Join-Path $Source $ProbeName)) { $SharedSource = $Source; break }
+            }
+        }
+        catch
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' cannot be written: {1} Nothing was written." -f $OutputPath, $_.Exception.Message)
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $Probe -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $SharedSource)
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder ('{1}'). Use a new empty folder. Nothing was written." -f $OutputPath, $SharedSource)
         }
     }
 

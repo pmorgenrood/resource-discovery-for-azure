@@ -319,19 +319,28 @@ Describe 'Merge-RecoveryData consumption handling' {
         Test-Path -LiteralPath (Join-Path $LinkDir ('Inventory_{0}.json' -f $script:GapBase)) | Should -BeTrue
     }
 
-    It 'refuses an -OutputPath that already holds the <Which> inventory, however the folder is reached' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
-        # A bind mount, a mapped or substituted drive or a short name shows a
-        # source folder under another path. Seen from the path, that is an
-        # output folder holding the source's own inventory file.
+    It 'merges into an output folder that holds a copy of the <Which> bundle, which is not the source folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
         $Source = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
         $null = New-Item -ItemType Directory -Path $C.Output
         Get-ChildItem -LiteralPath $Source -File | Copy-Item -Destination $C.Output
-        $Before = @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
-        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw -ExpectedMessage '*already holds the source inventory*Nothing was written*'
-        @(Get-ChildItem -LiteralPath $C.Output -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+        @(Get-ChildItem -LiteralPath $C.Output -Force -Filter '.rda-merge-probe-*').Count | Should -Be 0 -Because 'the folder check leaves nothing behind'
+    }
+
+    It 'lets a consumption-only merge run again into the same output folder' {
+        # With an empty recovery inventory the merged inventory is byte for
+        # byte the gap inventory, under the gap inventory's name.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3' }) -ConsumptionCsv $script:CsvHeader
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+        $Second = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+        $Second.ConsumptionSource | Should -Be 'recovery'
     }
 
     It 'refuses an -OutputPath under a parent link with a relative target' {
