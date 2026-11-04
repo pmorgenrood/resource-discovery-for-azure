@@ -94,6 +94,14 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
 }
 . $CommonFunctionsFile
 
+# The supported Az.Accounts version (Get-RdaAzAccountsMinimumVersion). The
+# wrapper already stopped when this file is missing; it only defines functions.
+$AzModulesFunctionsFile = Join-Path $PSScriptRoot 'Functions/AzModules.Functions.ps1'
+if (Test-Path -LiteralPath $AzModulesFunctionsFile -PathType Leaf)
+{
+    . $AzModulesFunctionsFile
+}
+
 # The parent run's record for Write-StreamState; a stream started without one
 # writes none.
 $StreamRunRecord = $null
@@ -145,7 +153,16 @@ Write-Stream ("starting; subs in slice: {0}" -f $SubscriptionIds.Count) 'Cyan'
 $ImportStep = 'module'
 try
 {
-    Import-Module Az.Accounts -ErrorAction Stop -Force | Out-Null
+    # -MinimumVersion, as in the wrapper: a plain import takes the first copy
+    # in PSModulePath order, which can be older than the supported one.
+    # Without Functions/AzModules.Functions.ps1 (the wrapper stops before it
+    # starts a stream then) any version is taken, as before.
+    $AzAccountsMinimum = [version]'0.0'
+    if (Get-Command -Name Get-RdaAzAccountsMinimumVersion -CommandType Function -ErrorAction SilentlyContinue)
+    {
+        $AzAccountsMinimum = Get-RdaAzAccountsMinimumVersion
+    }
+    Import-Module Az.Accounts -MinimumVersion $AzAccountsMinimum -ErrorAction Stop -Force | Out-Null
     # The imported context and its token cache must stay in this process's
     # memory. With autosave on, Import-AzContext also writes them to the user's
     # Az profile files (AzureRmContext.json and the token cache file), where
