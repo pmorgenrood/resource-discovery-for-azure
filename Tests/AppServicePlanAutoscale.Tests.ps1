@@ -21,6 +21,11 @@
 #   - targets that are not one string (missing, an array, a number) and a
 #     plan id that is an array give the same answer as the -eq check
 #   - a resource that is not an autoscale setting does not count
+#
+# The Subscription column is found with a lookup by subscription id instead of
+# a scan per plan. Those tests pin the -eq answer: letter case is ignored, a
+# missing id gives nothing, two subscriptions with one id give both names, and
+# a subscription id that is not a string keeps the scan.
 #   - a plan with no id (null, empty or not a string) is $false, even when a
 #     setting has a missing or empty target
 #
@@ -36,8 +41,15 @@ BeforeAll {
 
     function Invoke-TestCollector
     {
-        param($Resources)
-        & $script:Collector -Sub $script:Subs -Resources $Resources -Task 'Processing' -ResourceIdDictionary $null
+        param($Resources, $Subs = $script:Subs)
+        & $script:Collector -Sub $Subs -Resources $Resources -Task 'Processing' -ResourceIdDictionary $null
+    }
+
+    # The rule the subscription lookup must keep: the -eq scan over every subscription.
+    function Get-ExpectedSubscription
+    {
+        param($Plan, $Subs)
+        ($Subs | Where-Object { $_.id -eq $Plan.subscriptionId }).Name
     }
 
     function Get-TestPlanId
@@ -258,5 +270,66 @@ Describe 'AppServicePlan AutoscaleEnabled' {
         {
             $Rows[$i].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plans[$i] -Settings $Settings) -Because $Plans[$i].NAME
         }
+    }
+}
+
+Describe 'AppServicePlan Subscription' {
+    BeforeAll {
+        $script:GuidB = 'fedcba98-7654-3210-fedc-ba9876543210'
+        $script:GuidC = 'abcdefab-cdef-abcd-efab-cdefabcdefab'
+    }
+
+    It 'gives the -eq answer for each plan' {
+        $Subs = @(
+            [pscustomobject]@{ id = $script:DocGuid; Name = 'sub-a' }
+            [pscustomobject]@{ id = $script:GuidB.ToUpperInvariant(); Name = 'sub-b' }
+            [pscustomobject]@{ id = $script:GuidC; Name = 'sub-c1' }
+            [pscustomobject]@{ id = $script:GuidC; Name = 'sub-c2' }
+        )
+        $Plans = @(
+            New-TestPlan -Name 'plan-s1'
+            New-TestPlan -Name 'plan-s2'
+            New-TestPlan -Name 'plan-s3'
+            New-TestPlan -Name 'plan-s4'
+            New-TestPlan -Name 'plan-s5'
+        )
+        $Plans[1].subscriptionId = $script:GuidB
+        $Plans[2].subscriptionId = $script:GuidC
+        $Plans[3].subscriptionId = '00000000-0000-0000-0000-000000000000'
+        $Plans[4].subscriptionId = $null
+        $Rows = @(Invoke-TestCollector -Resources $Plans -Subs $Subs)
+        $Rows.Count | Should -Be 5
+        for ($i = 0; $i -lt 5; $i++)
+        {
+            $Rows[$i].Subscription | Should -Be (Get-ExpectedSubscription -Plan $Plans[$i] -Subs $Subs) -Because $Plans[$i].NAME
+        }
+        $Rows[0].Subscription | Should -Be 'sub-a'
+        $Rows[0].Subscription | Should -BeOfType [string]
+        $Rows[1].Subscription | Should -Be 'sub-b'
+        $Rows[2].Subscription | Should -Be @('sub-c1', 'sub-c2')
+        $Rows[3].Subscription | Should -BeNullOrEmpty
+        $Rows[4].Subscription | Should -BeNullOrEmpty
+    }
+
+    It 'gives the -eq answer when a subscription id is not a string' {
+        $Subs = @(
+            [pscustomobject]@{ id = 42; Name = 'sub-num' }
+            [pscustomobject]@{ id = $script:DocGuid; Name = 'sub-a' }
+        )
+        $PlanA = New-TestPlan -Name 'plan-s6'
+        $PlanB = New-TestPlan -Name 'plan-s7'
+        $PlanB.subscriptionId = '42'
+        $Rows = @(Invoke-TestCollector -Resources @($PlanA, $PlanB) -Subs $Subs)
+        $Rows[0].Subscription | Should -Be (Get-ExpectedSubscription -Plan $PlanA -Subs $Subs)
+        $Rows[0].Subscription | Should -Be 'sub-a'
+        $Rows[1].Subscription | Should -Be (Get-ExpectedSubscription -Plan $PlanB -Subs $Subs)
+        $Rows[1].Subscription | Should -Be 'sub-num'
+    }
+
+    It 'gives the -eq answer when there are no subscriptions' {
+        $Plan = New-TestPlan -Name 'plan-s8'
+        $Rows = @(Invoke-TestCollector -Resources @($Plan) -Subs $null)
+        $Rows.Count | Should -Be 1
+        $Rows[0].Subscription | Should -BeNullOrEmpty
     }
 }

@@ -20,13 +20,42 @@ if ($Task -eq 'Processing')
             if ($Target -is [string]) { [void]$AutoScaleTargets.Add($Target) } else { $AutoScaleOther.Add($Setting) }
         }
 
+        # Group the subscriptions by id once, with the comparer -eq uses for two
+        # strings, so each plan finds its subscription with a lookup. If any
+        # subscription id is not a string, every plan keeps the -eq scan.
+        $SubById = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
+        $SubIdsAreStrings = $true
+        foreach ($S in $SUB)
+        {
+            if ($S.id -isnot [string]) { $SubIdsAreStrings = $false; break }
+            if (-not $SubById.ContainsKey($S.id)) { $SubById[$S.id] = [System.Collections.Generic.List[object]]::new() }
+            $SubById[$S.id].Add($S)
+        }
+
         $Tmp = @()
 
         foreach ($1 in $APPSvcPlan)
         {
             Remove-Variable AutoScale -ErrorAction SilentlyContinue
 
-            $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
+            if ($SubIdsAreStrings -and $1.subscriptionId -is [string])
+            {
+                # Same result as the Where-Object below: nothing, the one match,
+                # or every match in input order.
+                $SubMatch = $null
+                if ($SubById.TryGetValue($1.subscriptionId, [ref]$SubMatch))
+                {
+                    if ($SubMatch.Count -eq 1) { $Sub1 = $SubMatch[0] } else { $Sub1 = $SubMatch.ToArray() }
+                }
+                else
+                {
+                    $Sub1 = $null
+                }
+            }
+            else
+            {
+                $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
+            }
             $Data = $1.PROPERTIES
             $Sku = $1.SKU
 
