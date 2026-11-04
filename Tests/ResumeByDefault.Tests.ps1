@@ -582,7 +582,7 @@ function global:Compress-Archive
         return ('{0}..{1}' -f $Now.AddDays(-31).ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture), $Now.AddDays(-1).ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture))
     }
 
-    $script:DefaultSettingsText = 'none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled'
+    $script:DefaultSettingsText = 'none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources'
 
     # An interrupted run over A to D. One stream: A and B complete, then C
     # hangs. Two streams (A and C, B and D): A and B complete, then C and D hang.

@@ -55,6 +55,7 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
+    [switch] $IncludeNetworkResources,
     [int]    $ConcurrencyLimit = 6,
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
@@ -81,6 +82,17 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
     exit 1
 }
 . $FunctionsFile
+
+# The per-subscription count line (Get-RdaResourceCountMessage) is shared with
+# the wrapper and the inner script.
+$CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
+if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
+{
+    Write-Host "ERROR: Required functions file not found: $CommonFunctionsFile" -ForegroundColor Red
+    Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
+    exit 1
+}
+. $CommonFunctionsFile
 
 # The parent run's record for Write-StreamState; a stream started without one
 # writes none.
@@ -340,9 +352,16 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # in this stream worker's scope. The inner script resets $Global:ResourceCount
         # to 0 at the start of every invocation.
         $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
-        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount }
+        # Network rows the inner script left out of the pull (reset by it on
+        # every run; $null when its count query failed).
+        # Read with Get-Variable: an inner run that stopped before it set them
+        # leaves them unset, which strict mode would stop on.
+        $SkipRaw = Get-Variable -Name SkippedResourceCount -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $SkipTypes = Get-Variable -Name SkippedResourceTypes -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $SkipCount = if ($null -ne $SkipRaw) { [long]$SkipRaw } else { [long]0 }
+        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount }
 
-        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $SkipRaw -SkippedByType $SkipTypes
         if ($CountMessage.Kind -eq 'Empty')
         {
             Write-Stream ("WARNING: '{0}' returned 0 resources (it passed the up-front role check, so it is an empty subscription)" -f $SubName) 'Yellow'

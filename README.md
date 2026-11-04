@@ -637,6 +637,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `Obfuscate` | Switch | Forwarded. Replace resource IDs, names, subscriptions, resource groups, and tags with masked values. | False | `-Obfuscate` |
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
 | `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front). | False | `-SkipConsumption` |
+| `IncludeNetworkResources` | Switch | Forwarded. Also pull the network types no collector reads; left out by default to save time and memory. Network costs still come from the consumption data. A run started without it continues only without it. | False | `-IncludeNetworkResources` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
 
 ## Troubleshooting

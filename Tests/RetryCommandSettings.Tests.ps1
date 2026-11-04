@@ -77,7 +77,7 @@ Describe 'The command that collects one subscription again with a direct run' {
         $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
         $Calls = [regex]::Matches($Inner, [regex]::Escape("'  ' + (Get-DirectRunRetryCommand -TenantID `$RetryTenant -SubscriptionID `$_.Id @RetryArgs)"))
         $Calls.Count | Should -Be 2
-        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }'))
+        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; IncludeNetworkResources = $IncludeNetworkResources.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }'))
         $Inner | Should -Match ([regex]::Escape('$RetryArgs = @{ ResourceGroup = $ResourceGroup; Settings = $RetrySettings; Appid = [string]$Appid; Service = $Service; OutputDirectory = [string]$OutputDirectory; ObfuscationDictionary = $ObfuscationDictionary }'))
     }
 }

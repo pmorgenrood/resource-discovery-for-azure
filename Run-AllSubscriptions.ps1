@@ -618,7 +618,7 @@ $null = Move-LegacyResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Tenan
 # for a run that continues (unless it is -ResumeFailedOnly, which keeps its own
 # path) and false for one that starts a new run, so the rest of the run does
 # what -Resume, or a run without it, did before.
-$RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled)
+$RunDataSettings = Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)
 # The switches a printed retry or new-run command carries: these settings, and
 # -DeviceLogin when this run signed in that way. -DeviceLogin changes only how
 # a run signs in, so it is not one of the settings a continuing run must keep.
@@ -1506,6 +1506,13 @@ if ($ParallelStreams -le 1)
             # to 0 at the start of every invocation, so the count after return
             # accurately reflects the subscription that just finished.
             $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
+            # Network rows the inner script left out of the pull (reset by it
+            # on every run; $null when its count query failed).
+            # Read with Get-Variable: an inner run that stopped before it set them
+            # leaves them unset, which strict mode would stop on.
+            $SkipRaw = Get-Variable -Name SkippedResourceCount -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            $SkipTypes = Get-Variable -Name SkippedResourceTypes -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            $SkipCount = if ($null -ne $SkipRaw) { [long]$SkipRaw } else { [long]0 }
             $SubResourceCounts += [pscustomobject]@{
                 Name    = $Sub.Name
                 Id      = $Sub.Id
@@ -1513,7 +1520,7 @@ if ($ParallelStreams -le 1)
                 Skipped = $SkipCount
             }
 
-            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $SkipRaw -SkippedByType $SkipTypes
             if ($CountMessage.Kind -eq 'Empty')
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
@@ -1790,8 +1797,14 @@ else
                 # Same null-guard as the sequential branch above.
                 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Script exited with code $LASTEXITCODE" }
                 $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
-                $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount }
-                if ($ResCount -eq 0)
+                # Read with Get-Variable: an inner run that stopped before it set them
+                # leaves them unset, which strict mode would stop on.
+                $SkipRaw = Get-Variable -Name SkippedResourceCount -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+                $SkipTypes = Get-Variable -Name SkippedResourceTypes -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+                $SkipCount = if ($null -ne $SkipRaw) { [long]$SkipRaw } else { [long]0 }
+                $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount; Skipped = $SkipCount }
+                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $SkipRaw -SkippedByType $SkipTypes
+                if ($CountMessage.Kind -eq 'Empty')
                 {
                     Write-Host ("WARNING: '{0}' returned 0 resources." -f $Sub.Name) -ForegroundColor Yellow
                 }
@@ -2796,7 +2809,10 @@ Write-SkippedSubscriptionSummary -Decision $AccessDecision
 
 # Surface the per-subscription resource-count result so the user does not have
 # to scan individual transcripts to find subs that came back empty.
-$EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 })
+# A sub whose only resources are skipped network types (Skipped > 0) is not
+# empty, so it is listed apart and not reported as empty.
+$EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and -not ([long]$_.Skipped -gt 0) })
+$NetworkOnlySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and [long]$_.Skipped -gt 0 })
 $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
 # Initialised here (not only inside the 0-resource branch below) so the
 # run-summary finalization can read them unconditionally even when there
