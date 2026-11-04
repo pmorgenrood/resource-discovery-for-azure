@@ -15,10 +15,12 @@
 #   - a target that differs from the plan id only in letter case matches, as
 #     the -eq it replaces did (Azure resource ids are case-insensitive)
 #   - a target that -eq treats as equal under invariant culture rules (a soft
-#     hyphen) matches too
+#     hyphen) matches too; skipped on a host that compares strings ordinally
+#     (.NET invariant globalization mode), where -eq does not ignore it
 #   - zero plans emit nothing
-#   - targets that are not one string (missing, an array) give the same
-#     answer as the -eq check
+#   - targets that are not one string (missing, an array, a number) and a
+#     plan id that is an array give the same answer as the -eq check
+#   - a resource that is not an autoscale setting does not count
 #   - a plan with no id (null, empty or not a string) is $false, even when a
 #     setting has a missing or empty target
 #
@@ -88,7 +90,7 @@ BeforeAll {
     {
         param($Plan, $Settings)
         if ($Plan.id -isnot [string] -or $Plan.id.Length -eq 0) { return $false }
-        $Enabled = $Settings | Where-Object { $_.Properties.enabled -eq 'true' }
+        $Enabled = $Settings | Where-Object { $_.TYPE -eq 'microsoft.insights/autoscalesettings' -and $_.Properties.enabled -eq 'true' }
         $Hit = ($Enabled | Where-Object { $_.Properties.targetResourceUri -eq $Plan.id })
         -not [string]::IsNullOrEmpty($Hit)
     }
@@ -132,6 +134,13 @@ Describe 'AppServicePlan AutoscaleEnabled' {
     }
 
     It 'matches a target that -eq treats as equal under invariant culture rules' {
+        # In .NET invariant globalization mode the invariant culture compares
+        # ordinally, so -eq does not ignore the soft hyphen there.
+        if ([cultureinfo]::InvariantCulture.CompareInfo.Compare("a$([char]0xAD)b", 'ab', [System.Globalization.CompareOptions]::IgnoreCase) -ne 0)
+        {
+            Set-ItResult -Skipped -Because 'this host compares strings ordinally (invariant globalization mode), so -eq does not ignore a soft hyphen'
+            return
+        }
         $Plan = New-TestPlan -Name 'plan-e'
         # A soft hyphen is ignored by the -eq comparison, so this target matches.
         $Target = $Plan.id.Replace('plan-e', "plan-$([char]0xAD)e")
@@ -168,6 +177,38 @@ Describe 'AppServicePlan AutoscaleEnabled' {
         $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
         $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
         $Rows[0].AutoscaleEnabled | Should -BeTrue
+    }
+
+    It 'gives the -eq answer for a target that is a number' {
+        $Plan = New-TestPlan -Name 'plan-k'
+        $Other = New-TestPlan -Name 'plan-k2' -Id '42'
+        $Settings = @((New-TestAutoscale -Name 'as-k' -Target 42))
+        $Rows = @(Invoke-TestCollector -Resources (@($Plan, $Other) + $Settings))
+        $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
+        # -eq converts the plan id '42' to the number, so the number target matches it.
+        $Rows[1].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Other -Settings $Settings)
+        $Rows[1].AutoscaleEnabled | Should -BeTrue
+    }
+
+    It 'gives the oracle answer for a plan whose id is an array' {
+        $Id = Get-TestPlanId -Name 'plan-l'
+        $Plan = New-TestPlan -Name 'plan-l' -Id @($Id, 'other')
+        $Settings = @((New-TestAutoscale -Name 'as-l1' -Target $Id), (New-TestAutoscale -Name 'as-l2' -Target $null))
+        $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
+        $Rows.Count | Should -Be 1
+        $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
+    }
+
+    It 'does not count a resource that is not an autoscale setting' {
+        $Plan = New-TestPlan -Name 'plan-t'
+        $NotAutoscale = New-TestAutoscale -Name 'not-as' -Target $Plan.id
+        $NotAutoscale.TYPE = 'microsoft.web/sites'
+        $Settings = @($NotAutoscale)
+        $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
+        $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
     }
 
     It 'is $false for a plan with no id, even when a setting has no target' {

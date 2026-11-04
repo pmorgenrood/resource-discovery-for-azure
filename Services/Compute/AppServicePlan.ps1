@@ -39,10 +39,13 @@ if ($Task -eq 'Processing')
             else
             {
                 $AutoSc = $AutoScaleTargets.Contains($1.id)
+                # The side list holds only settings whose target is not one
+                # string. Real settings always have a string target, so it is
+                # expected to be empty and this scan does not run.
                 if (-not $AutoSc -and $AutoScaleOther.Count -gt 0)
                 {
                     $AutoScale = ($AutoScaleOther | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
-                    if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
+                    $AutoSc = -not [string]::IsNullOrEmpty($AutoScale)
                 }
             }
 
