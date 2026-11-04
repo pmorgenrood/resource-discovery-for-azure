@@ -647,6 +647,29 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         $Full.Count | Should -Be $script:AllRows.Count
     }
 
+    It 'under -Obfuscate counts the skipped rows from the id rows with no count query, and gets what the count query gets (<Label>)' -TestCases @(
+        @{ Label = 'all subscriptions'; Skip = @() }
+        @{ Label = 'one subscription access-skipped'; Skip = @('22222222-2222-2222-2222-222222222222') }
+    ) {
+        $null = script:Invoke-Discovery -AccessSkippedIds $Skip
+        $QueryTotal = $Global:SkippedResourceCount
+        $QueryTypes = [ordered]@{}; foreach ($K in @($Global:SkippedResourceTypes.Keys | Sort-Object)) { $QueryTypes[$K] = [long]$Global:SkippedResourceTypes[$K] }
+        $Obf = script:Invoke-Discovery -Obfuscate -AccessSkippedIds $Skip
+        @($Obf.Sent | Where-Object { $_.Query -match 'summarize count\(\) by type, subscriptionId$' }) | Should -BeNullOrEmpty -Because 'the id rows already hold every skipped row'
+        $QueryTotal | Should -BeGreaterThan 0
+        $Global:SkippedResourceCount | Should -Be $QueryTotal
+        $ObfTypes = [ordered]@{}; foreach ($K in @($Global:SkippedResourceTypes.Keys | Sort-Object)) { $ObfTypes[$K] = [long]$Global:SkippedResourceTypes[$K] }
+        @($ObfTypes.Keys) | Should -Be @($QueryTypes.Keys)
+        foreach ($K in $QueryTypes.Keys) { $ObfTypes[$K] | Should -Be $QueryTypes[$K] -Because $K }
+    }
+
+    It 'reads the resource type from an ARM id, child types included' {
+        Get-RdaResourceTypeFromId -Id '/subscriptions/s/resourceGroups/r/providers/Microsoft.Network/privateDnsZones/z.example/virtualNetworkLinks/l1' | Should -Be 'microsoft.network/privatednszones/virtualnetworklinks'
+        Get-RdaResourceTypeFromId -Id '/subscriptions/s/resourcegroups/r/providers/microsoft.network/networkinterfaces/nic1' | Should -Be 'microsoft.network/networkinterfaces'
+        Get-RdaResourceTypeFromId -Id '/subscriptions/s/resourcegroups/r' | Should -BeNullOrEmpty
+        Get-RdaResourceTypeFromId -Id '' | Should -BeNullOrEmpty
+    }
+
     It 'leaves the subscriptions the access check skipped out of the id rows too' {
         $After = script:Invoke-Discovery -Obfuscate -AccessSkippedIds @($script:SubB)
         @($After.Ids.Keys | Where-Object { $_ -like "/subscriptions/$($script:SubB)/*" }) | Should -BeNullOrEmpty
