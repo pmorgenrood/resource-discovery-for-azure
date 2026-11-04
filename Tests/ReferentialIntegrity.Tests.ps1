@@ -50,12 +50,11 @@ BeforeAll {
     # token (name tokens may carry a databricks_/aks_/vmss_ hint); provider and
     # type segments stay as written. Used to prove that a cross-reference /
     # cached metric value is a masked ID, never a raw id or a flat token.
-    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = -join @(
-        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
-        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
-    )
+    # Inventory ids and their cross-references: the contract shape only
+    # (Get-RdaContractIdPattern). Metric fallback ids also take the fallback's
+    # own sub_/rg_ tokens (F2), by name.
+    $script:MaskedIdPattern = Get-RdaContractIdPattern
+    $script:MetricFallbackIdPattern = Get-RdaContractIdPattern -AllowMetricFallback
 }
 
 AfterAll {
@@ -364,7 +363,7 @@ Describe "Metric Per-Resource Cached Token (P8)" {
         if ($AbsentIds.Count -eq 0) { Set-ItResult -Skipped -Because "fixture does not exercise the metric fallback path (all metric-referenced resources are present in the inventory dictionary)"; return }
         foreach ($id in $AbsentIds)
         {
-            $id | Should -Match $script:MaskedIdPattern -Because "a metric resource absent from the main dictionary should still receive a masked ID with cached prod_/nonprod_ tokens, not a raw id ('$id')"
+            $id | Should -Match $script:MetricFallbackIdPattern -Because "a metric resource absent from the main dictionary should still receive a masked ID with cached prod_/nonprod_ tokens, not a raw id ('$id')"
             $id | Should -Not -Be 'obfuscated' -Because "the metric fallback assigns a correlatable cached token, not the lossy sentinel"
         }
     }

@@ -49,6 +49,37 @@ function Get-RdaTokenPattern
     '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 }
 
+# The masked id shape the output contract asks for, for the zip-backed tests:
+#   /subscriptions/<sub tok>/resourcegroups/<rg tok>/providers/<ns>/<type>/<name tok>[/<type>/<name tok>...]
+# Subscription and resource group tokens are prod_/nonprod_ + GUID (an AKS
+# node group keeps its mc_ hint), name tokens may carry the databricks_/aks_/
+# vmss_ hint, provider and type segments stay as written. Shapes the contract
+# does not allow are accepted only by name, so a test says which it lets in:
+#   -AllowParked          G1: the Service Bus '$system' namespace name kept
+#                         as written; G2: a subscription-scope id with no
+#                         resourcegroups segment. Both parked with the owner.
+#   -AllowMetricFallback  F2: the metric fallback's own sub_/rg_ tokens
+#                         (Extension/Metrics.ps1), until it uses the shared ones.
+function Get-RdaContractIdPattern
+{
+    param([switch]$AllowParked, [switch]$AllowMetricFallback)
+    $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $P = '(?:prod|nonprod)_'
+    $Names = '(?:/[a-z][a-z0-9.]*/' + $P + '(?:databricks_|aks_|vmss_)?' + $Guid + ')+'
+    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names
+    $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
+    if ($AllowParked)
+    {
+        $Shapes += '^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + $Guid + '/providers/microsoft\.servicebus/namespaces/\$system$'
+        $Shapes += '^/subscriptions/' + $P + $Guid + $Providers + '$'
+    }
+    if ($AllowMetricFallback)
+    {
+        $Shapes += '^/subscriptions/' + $P + 'sub_' + $Guid + '(?:/resourcegroups/' + $P + 'rg_(?:mc_)?' + $Guid + ')?' + $Providers + '$'
+    }
+    return ('(?i)(?:' + ($Shapes -join '|') + ')')
+}
+
 function Get-RdaMaskedIdPattern
 {
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
