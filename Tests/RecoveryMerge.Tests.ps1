@@ -356,10 +356,14 @@ Describe 'Merge-RecoveryData consumption handling' {
         $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
         $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
         $OutCsv = Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase)
+        $OutInventory = Join-Path $C.Output ('Inventory_{0}.json' -f $script:GapBase)
+        $FirstInventoryHash = (Get-FileHash -LiteralPath $OutInventory).Hash
         'stale' | Out-File -FilePath $OutCsv -Encoding utf8
+        'stale' | Out-File -FilePath $OutInventory -Encoding utf8
         $Second = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
         $Second.ConsumptionSource | Should -Be 'recovery'
         (Get-Content -LiteralPath $OutCsv -Raw) | Should -Not -Match 'stale' -Because 'the second run rewrites the consumption file'
+        (Get-FileHash -LiteralPath $OutInventory).Hash | Should -Be $FirstInventoryHash -Because 'the second run rewrites the inventory file'
         @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Inventory_*.json').Count | Should -Be 1
         @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Consumption_*.csv').Count | Should -Be 1
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
