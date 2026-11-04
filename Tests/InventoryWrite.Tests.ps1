@@ -888,7 +888,7 @@ function CreateResourceJobs
     }
 
     It 'does not name a zip that was already at the path as the report of this run' {
-        # Compress-Archive refuses to overwrite it, so it is not this run's report.
+        # Compress-RdaReportArchive refuses to overwrite it, so it is not this run's report.
         $R = @(Invoke-InventoryRun -Name 'zip-exists-direct' -Runs @('Set-Content -LiteralPath ($Global:DefaultPath + ''ResourcesReport_test.zip'') -Value ''older file''') -Direct)
 
         $Output = [string]$R[0].Output

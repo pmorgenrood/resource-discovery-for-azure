@@ -2577,10 +2577,10 @@ else
     }
 }
 
-# Only this call finishing makes the zip this run's report: a file at the path can be a
-# zip cut off part-way, or one that was there before (Compress-Archive then refuses to
-# overwrite it). -ErrorAction Stop: under 'silentlycontinue' an input Compress-Archive
-# cannot read is only a hidden error, and the zip would be made without it.
+# Only this call finishing makes the zip this run's report: a file at the path can be
+# one that was there before (Compress-RdaReportArchive then refuses to overwrite it).
+# Compress-RdaReportArchive stops on any error and writes to a temp file that it moves
+# into place only when done; -ErrorAction Stop keeps a stand-in for it to the same rule.
 $ZipWritten = $true
 $ZipExistedBefore = Test-Path -LiteralPath $Global:ZipOutputFile
 try
@@ -2600,8 +2600,9 @@ catch
     {
         Write-Log -Message ("Add only those files: the obfuscation dictionary, the transcript and the logs hold real names and stay local.") -Severity 'Error'
     }
-    # Compress-Archive removes its own unfinished zip; this is a backstop so a cut-off zip is
-    # never left to be shared. One that was there before this step is not this step's to remove.
+    # Compress-RdaReportArchive removes its own unfinished temp file; this is a backstop so a
+    # cut-off zip is never left to be shared. One that was there before this step is not this
+    # step's to remove.
     if (-not $ZipExistedBefore -and (Test-Path -LiteralPath $Global:ZipOutputFile))
     {
         try
@@ -2679,8 +2680,8 @@ Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
 # no retry list: the command printed collects the subscription again.
 # Under -RunAllSubs the wrapper treats any non-zero exit as a failed subscription and
 # reports these through its own exit code, so this is skipped there.
-# The zip check keeps these codes to runs that produced their report: Compress-Archive
-# writes no zip when the HTML report is missing.
+# The zip check keeps these codes to runs that produced their report: no zip is made
+# when the inventory or the HTML report is missing.
 # A consumption phase skipped because the sign-in could not be refreshed (the
 # '(auth)' entry) collected no billing data for any subscription of the run:
 # each of them is listed and the run exits 3 (5), as the wrapper does for a
