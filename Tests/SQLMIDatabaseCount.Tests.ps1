@@ -6,17 +6,19 @@
 # The SQLMI collector counts each managed instance's databases. It used to scan
 # every database row for every instance with
 #     $_.Id -like "<instance id>/databases/*"
-# and now counts the databases once, by parent id, before the loop. That is a
-# speed change only, so these tests run the REAL collector with synthetic rows
-# and pin what it emits:
+# and now counts the databases once, by parent id, before the loop. These tests
+# run the REAL collector with synthetic rows and pin what it emits:
 #
 #   - the count is an int when the instance has databases, and the STRING '0'
 #     when it has none;
 #   - parent ids are matched without regard to letter case;
 #   - databases of several instances can arrive in any order;
 #   - odd ids give what the old '-like' match gave: an id that holds
-#     '/databases/' twice, a database id with nothing after '/databases/', null
-#     ids, and non-ASCII letters that '-like' folds to ASCII;
+#     '/databases/' twice, a database id with nothing after '/databases/', and
+#     null ids;
+#   - letter case is ignored the same way on every host culture, for ASCII and
+#     non-ASCII letters, and look-alike letters such as the Kelvin sign stay
+#     apart from 'k';
 #   - wildcard characters (* ? [ ] and backtick) in an instance id are plain
 #     characters, so the instance counts its own databases and an unclosed
 #     bracket does not throw;
@@ -266,17 +268,44 @@ Describe 'SQLMI database count' {
         $Recs[1]['Databases'] | Should -BeExactly '0' -Because "'*' is a plain character, so it does not match '['"
     }
 
-    It 'gives the -like result for non-ASCII letters in an id' {
-        $Mi = New-TestInstance -Id (Get-MiId 'mi-k')
-        # U+212A KELVIN SIGN folds to 'k' under -like but not under an ordinal compare.
-        $Kelvin = New-TestDatabase -Id ("$(Get-MiId 'mi-')" + [char]0x212A + '/databases/db1')
+    It 'ignores the case of non-ASCII letters in an id, and keeps look-alike letters apart' {
+        $Lower = 'mi-' + [char]0x00E4
+        $Upper = 'MI-' + [char]0x00C4
+        $Mi = New-TestInstance -Id (Get-MiId $Lower)
+        $MiK = New-TestInstance -Id (Get-MiId 'mi-k')
+        # U+212A KELVIN SIGN is its own letter, not 'k'.
         $KelvinMi = New-TestInstance -Id ("$(Get-MiId 'mi-')" + [char]0x212A)
-        $Rows = @($Mi, $KelvinMi, $Kelvin, (New-TestDatabase -Id "$($Mi.id)/databases/db2"))
+        $Rows = @(
+            $Mi, $MiK, $KelvinMi,
+            (New-TestDatabase -Id "$(Get-MiId $Upper)/databases/db1"),
+            (New-TestDatabase -Id "$(Get-MiId $Lower)/databases/db2"),
+            (New-TestDatabase -Id ("$(Get-MiId 'mi-')" + [char]0x212A + '/databases/db1')),
+            (New-TestDatabase -Id "$($MiK.id)/databases/db2")
+        )
 
-        $Recs = @(Assert-SameAsLike -Resources $Rows)
+        $Recs = @(Invoke-TestCollector -Resources $Rows)
 
         $Recs[0]['Databases'] | Should -Be 2
-        $Recs[1]['Databases'] | Should -Be 2
+        $Recs[1]['Databases'] | Should -Be 1
+        $Recs[2]['Databases'] | Should -Be 1
+    }
+
+    It 'gives the true count on a tr-TR host for an id with non-ASCII letters that differs only in I and i' {
+        $Mi = New-TestInstance -Id (Get-MiId ('mi-' + [char]0x00E4))
+        $Db = New-TestDatabase -Id ("$($Mi.id)/databases/db1".ToLowerInvariant())
+        $Saved = [System.Globalization.CultureInfo]::CurrentCulture
+        try
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::new('tr-TR')
+            $Rec = Invoke-TestCollector -Resources @($Mi, $Db)
+        }
+        finally
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = $Saved
+        }
+
+        $Rec['Databases'] | Should -Be 1
+        $Rec['Databases'] | Should -BeOfType ([int])
     }
 
     It 'matches the old per-instance scan for a mixed set of instances' {
