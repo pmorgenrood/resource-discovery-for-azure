@@ -195,6 +195,17 @@ function Merge-RecoveryData
 
     if (-not (Test-Path -Path $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
     if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
+    # The merge writes a new bundle; written into a source folder it would
+    # replace that bundle's own files. A new empty folder is the way out.
+    $OutFull = [System.IO.Path]::GetFullPath($OutputPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
+    {
+        $SourceFull = [System.IO.Path]::GetFullPath($Source).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        if ([string]::Equals($OutFull, $SourceFull, [System.StringComparison]::OrdinalIgnoreCase))
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath)
+        }
+    }
 
     $GapInventoryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Inventory_*.json'
     $RecoveryInventoryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Inventory_*.json'
@@ -347,13 +358,29 @@ function Merge-RecoveryData
     # -- Every requested recovery source is checked before anything is
     #    written, so a stop never leaves a partial output folder (or, with
     #    -OutputPath on the gap folder, an overwritten gap inventory).
-    if ($RecoverConsumption -and -not (Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional))
+    #    Each is looked up once here and used below.
+    $RecoveryConsumptionFile = $null
+    if ($RecoverConsumption)
     {
-        throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption. Nothing was written." -f $RecoveryBundlePath)
+        $RecoveryConsumptionFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional
+        if (-not $RecoveryConsumptionFile)
+        {
+            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption. Nothing was written." -f $RecoveryBundlePath)
+        }
     }
-    if ($RecoverMetrics -and @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue).Count -eq 0)
+    $RecoveryMetricsFiles = @()
+    if ($RecoverMetrics)
     {
-        throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
+        $RecoveryMetricsFiles = @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
+        if ($RecoveryMetricsFiles.Count -eq 0)
+        {
+            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
+        }
+    }
+    $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
+    if (-not (Test-Path -Path $SummaryScript -PathType Leaf))
+    {
+        throw ("Merge-RecoveryData: report generator not found at '{0}'. Keep the Extension folder with the Functions folder. Nothing was written." -f $SummaryScript)
     }
 
     if (-not (Test-Path -Path $OutputPath -PathType Container))
@@ -396,11 +423,6 @@ function Merge-RecoveryData
     $ConsumptionSourceFile = $GapConsumptionFile
     if ($RecoverConsumption)
     {
-        $RecoveryConsumptionFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional
-        if (-not $RecoveryConsumptionFile)
-        {
-            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption." -f $RecoveryBundlePath)
-        }
         $ConsumptionSource = 'recovery'
         $ConsumptionSourceFile = $RecoveryConsumptionFile
 
@@ -452,11 +474,6 @@ function Merge-RecoveryData
     $OutMetricsFiles = [System.Collections.Generic.List[string]]::new()
     if ($RecoverMetrics)
     {
-        $RecoveryMetricsFiles = @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
-        if ($RecoveryMetricsFiles.Count -eq 0)
-        {
-            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics." -f $RecoveryBundlePath)
-        }
         # Recovery metrics carry the recovery run's base; rebase to $BundleBase.
         $RecoveryBase = $RecoveryInventoryFile.BaseName -replace '^Inventory_', ''
         foreach ($MetricsFile in $RecoveryMetricsFiles)
@@ -528,12 +545,8 @@ function Merge-RecoveryData
     }
 
     # -- Regenerate the HTML report from the merged inventory via Summary.ps1.
-    #    Located relative to this functions file (Functions/ -> ../Extension). --
-    $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
-    if (-not (Test-Path -Path $SummaryScript -PathType Leaf))
-    {
-        throw ("Merge-RecoveryData: report generator not found at '{0}'." -f $SummaryScript)
-    }
+    #    Located relative to this functions file (Functions/ -> ../Extension);
+    #    checked before anything was written (above). --
     $ReportVersion = if ($GapInventory.PSObject.Properties.Name -contains 'Version') { $GapInventory.Version } else { $null }
     & $SummaryScript -JsonFile $OutInventoryFile -HtmlFile $OutHtmlFile -Title 'Azure Resource Inventory' -Version $ReportVersion -ConsumptionFile $OutConsumptionFile | Out-Null
 
