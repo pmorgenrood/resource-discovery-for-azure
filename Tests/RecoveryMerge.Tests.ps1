@@ -353,9 +353,16 @@ Describe 'Merge-RecoveryData consumption handling' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3' }) -ConsumptionCsv $script:CsvHeader
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
         $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+        $OutCsv = Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase)
+        'stale' | Out-File -FilePath $OutCsv -Encoding utf8
         $Second = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
         $Second.ConsumptionSource | Should -Be 'recovery'
+        (Get-Content -LiteralPath $OutCsv -Raw) | Should -Not -Match 'stale' -Because 'the second run rewrites the consumption file'
+        @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Inventory_*.json').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Consumption_*.csv').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
     It 'refuses an -OutputPath under a parent link with a relative target' {
