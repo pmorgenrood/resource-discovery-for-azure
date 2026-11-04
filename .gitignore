@@ -503,3 +503,6 @@ docs/components/
 .scrub-review/
 testResults.xml
 Tests/test-summary.txt
+
+# Before/After test output (Invoke-RdaBeforeAfter.ps1); its zips can hold real names
+rda-before-after-*/
