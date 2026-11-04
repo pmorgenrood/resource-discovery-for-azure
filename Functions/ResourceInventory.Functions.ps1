@@ -542,6 +542,27 @@ function Get-RdaNetworkSkipFilter
     return ' | where type !in~ ' + (Get-RdaSkippedNetworkTypeList)
 }
 
+# The fields of a resource the -Obfuscate token loop of ResourceInventory.ps1
+# reads: the id (the name hint and the masked id, which Get-ObfuscatedResourceId
+# builds from the id alone), the name (its prod_/nonprod_ prefix), the
+# subscription id (the subscription name's token) and the resource group (its
+# token). Nothing else, so the rows stay small.
+function Get-RdaNetworkTokenField
+{
+    return @('id', 'name', 'resourceGroup', 'subscriptionId')
+}
+
+# The id query for the skipped types under -Obfuscate: the same where clause
+# as the pull, the opposite type filter, so the pull and this query together
+# hold every row the pull held before the skip; only the token loop's fields,
+# sorted by the id in lower case like the pull, so the skip-token paging is
+# stable. $Where is the scope's own where clause, without 'resources |'.
+function Get-RdaNetworkTokenQuery
+{
+    param([Parameter(Mandatory = $true)][string]$Where)
+    return ('resources | where {0} | where type in~ {1} | project {2} | order by tolower(id) asc' -f $Where, (Get-RdaSkippedNetworkTypeList), ((Get-RdaNetworkTokenField) -join ','))
+}
+
 # One cheap query: how many rows of each skipped type the scope holds. It only
 # feeds the log, so a failure warns once and returns $null; it never fails the
 # run and is never retried here (Invoke-AzGraphQuerySafe has its own capped

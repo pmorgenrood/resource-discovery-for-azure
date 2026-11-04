@@ -999,6 +999,37 @@ Function RunInventorySetup()
             }
         }
 
+        # Under -Obfuscate the token loop also gives the skipped rows their
+        # masked ids, as it did when the pull held them, so every id, token and
+        # dictionary entry stays as before the skip. One id-only query reads
+        # them (Get-RdaNetworkTokenQuery): the same scope, where clause, paging
+        # and lower-case text as the pull, through the same query path, so a
+        # failure stops this run (exit 1, or a failed subscription under
+        # -RunAllSubs) as a failed pull does; it is never read as 0 rows. The
+        # rows feed only the token loop, never a collector or the inventory.
+        # Not run without -Obfuscate, nor with -IncludeNetworkResources (the
+        # pull then holds the rows itself).
+        $script:NetworkTokenRows = $null
+        $script:NetworkTokenQueryTime = $null
+        if ($Obfuscate.IsPresent -and -not $IncludeNetworkResources.IsPresent)
+        {
+            $TokenQueryTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            $TokenMemoryBefore = [System.GC]::GetTotalMemory($false)
+            $TokenResult = Invoke-DiscoveryGraphQuery -Query (Get-RdaNetworkTokenQuery -Where $Where) -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+            if ($null -eq $TokenResult -or $null -eq $TokenResult.PSObject.Properties['data'])
+            {
+                $TokenFailure = 'Resource Graph gave no answer to the id query for the skipped network types, so their masked ids cannot be made.'
+                if ($RunAllSubs.IsPresent) { throw $TokenFailure }
+                Write-Log -Message ("Resource discovery failed, so the inventory would be incomplete. No report was written; fix the cause below and re-run. {0}" -f $TokenFailure) -Severity 'Error'
+                exit 1
+            }
+            $script:NetworkTokenRows = @($TokenResult.data)
+            $TokenResult = $null
+            $TokenQueryTimer.Stop()
+            $script:NetworkTokenQueryTime = $TokenQueryTimer.Elapsed
+            Write-Log -Message ("Network id query for the masked ids: {0:N0} rows in {1:N0} ms, about {2:N0} KB of managed memory." -f $script:NetworkTokenRows.Count, $TokenQueryTimer.Elapsed.TotalMilliseconds, [math]::Max(0, ([System.GC]::GetTotalMemory($false) - $TokenMemoryBefore) / 1KB)) -Severity 'Info'
+        }
+
         # How many network rows the filter left out, for the log only. Same
         # scope and same where as the pull. Nothing is skipped, and nothing is
         # counted, with -IncludeNetworkResources.
@@ -1147,6 +1178,10 @@ Function RunInventorySetup()
     if ($null -ne $script:AccessSkipped)
     {
         $Global:Resources = @($Global:Resources | Where-Object { $script:AccessSkipped.InaccessibleIds -notcontains [string]$_.subscriptionId })
+        if ($null -ne $script:NetworkTokenRows)
+        {
+            $script:NetworkTokenRows = @($script:NetworkTokenRows | Where-Object { $script:AccessSkipped.InaccessibleIds -notcontains [string]$_.subscriptionId })
+        }
     }
 
     $Global:ResourceCount = @($Global:Resources).Count
@@ -1203,7 +1238,16 @@ Function RunInventorySetup()
 
         $SubIndex = Get-ObfuscationSubscriptionIndex
 
-        foreach ($resourceItem in $Global:Resources)
+        # The pull's rows, then the skipped network rows of the id query
+        # (ResourceInventoryLoop), so those keep the tokens and dictionary
+        # entries they had when the pull held them. Only this loop reads them.
+        $TokenLoopRows = $Global:Resources
+        if ($null -ne $script:NetworkTokenRows -and $script:NetworkTokenRows.Count -gt 0)
+        {
+            $TokenLoopRows = @(@($Global:Resources) + $script:NetworkTokenRows)
+        }
+
+        foreach ($resourceItem in $TokenLoopRows)
         {
             if ($IdsToMask.Contains($resourceItem.ID)) { continue }
 
@@ -1258,7 +1302,10 @@ Function RunInventorySetup()
         {
             $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId -SubscriptionIndex $SubIndex
         }
+        $TokenLoopRows = $null
     }
+    # The id query's rows are not needed past the token loop.
+    $script:NetworkTokenRows = $null
 }
 
 function ExecuteInventoryProcessing()
@@ -2025,6 +2072,8 @@ function ExecuteInventoryProcessing()
     InitializeInventoryProcessing
 
     $script:PhaseTimings = [ordered]@{}
+    # The -Obfuscate id query for the skipped network types (ResourceInventoryLoop).
+    if ($null -ne $script:NetworkTokenQueryTime) { $script:PhaseTimings['Network id query for masked ids (-Obfuscate)'] = $script:NetworkTokenQueryTime }
     $script:CollectorFailuresThisRun = @()
 
     $MetricsPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
