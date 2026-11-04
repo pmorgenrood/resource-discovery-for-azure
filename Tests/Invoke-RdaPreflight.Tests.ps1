@@ -364,11 +364,21 @@ Describe 'Reader check' {
         Should -Invoke Get-AzRoleDefinition -Times 1 -Exactly -ParameterFilter { $Id -eq 'acdd72a7-3385-48ef-bd42-f606fba81ae7' }
     }
 
-    It 'reads a refused role-assignment read as Reader missing' {
+    It 'reads a refused role-assignment read as unknown (a role on a group or resource may still be there)' {
         Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 500; Content = '' } }
         Mock Get-RdaSignedInObjectId { '44444444-4444-4444-4444-444444444444' }
         Mock Get-AzRoleAssignment { throw "The client does not have authorization to perform action 'Microsoft.Authorization/roleAssignments/read'" }
-        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'missing'
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'unknown'
+    }
+
+    It 'calls it unknown, not missing, when a resource group or resource list cannot be read (Az PowerShell)' {
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*Microsoft.Authorization/permissions*' }
+        Mock Invoke-AzRestMethod { throw 'network' } -ParameterFilter { $Path -like '*/resourcegroups?*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*/resources?*' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'unknown'
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*/resourcegroups?*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 403; Content = '' } } -ParameterFilter { $Path -like '*/resources?*' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'unknown'
     }
 
     It 'calls it unknown when no own role is found (it may come from a group)' {
@@ -680,6 +690,16 @@ Describe 'Round 3: resource-group Reader, paged replies, a subscription of anoth
         (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'partial'
     }
 
+    It 'warns, not stops, when only a single resource can be read (Az PowerShell), and stops when nothing can' {
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*Microsoft.Authorization/permissions*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*/resourcegroups?*' }
+        $script:ResReply = '{"value":[{"id":"x"}]}'
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = $script:ResReply } } -ParameterFilter { $Path -like '*/resources?*' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'partial'
+        $script:ResReply = '{"value":[]}'
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'missing'
+    }
+
     It 'reads every page of the permissions reply (Az PowerShell), at most 10' {
         Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"actions":["Microsoft.Support/*"]}],"nextLink":"https://example.invalid/p2"}' } } -ParameterFilter { $Path }
         Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"actions":["*/read"],"notActions":[]}]}' } } -ParameterFilter { $Uri -eq 'https://example.invalid/p2' }
@@ -707,6 +727,9 @@ Describe 'Round 3: resource-group Reader, paged replies, a subscription of anoth
         Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'missing'
         # cmd.exe (az.cmd on Windows) cuts an argument at '&': no argument may hold one.
         foreach ($C in $script:FakeAzCalls) { foreach ($A in $C) { [string]$A | Should -Not -Match '&' } }
+        $script:Replies.res = 'not json'
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'unknown' -Because 'a list that cannot be read is not proof of no access'
+        $script:Replies.res = '{"value":[]}'
         $script:Replies.perm = '{"value":[],"nextLink":"https://example.invalid/p2?a=1&b=2"}'
         Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'unknown' -Because 'a next page is not read through cmd.exe'
     }
@@ -758,11 +781,13 @@ Describe 'End notes about the current release' {
         Mock Test-RdaCloudShell { $false }
         Mock Test-RdaInteractiveHost { $true }
         Mock Read-RdaYesNo { $true }
-        $script:CliAfter = 'subscription-other-tenant'
+        $script:CliCalls = 0
         Mock Invoke-RdaAz { 0 }
-        Mock Test-RdaAzCliSignIn { if ($script:CliAfter) { $A = $script:CliAfter; $script:CliAfter = $null; $A } else { 'not-signed-in' } }
+        # First check: not in the list yet; after az login: listed under another tenant.
+        Mock Test-RdaAzCliSignIn { $script:CliCalls++; if ($script:CliCalls -eq 1) { 'no-subscription' } else { 'subscription-other-tenant' } }
         $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
         $R.Result | Should -BeFalse
+        Should -Invoke Invoke-RdaAz -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'login' }
         $R.Text | Should -Match 'another tenant than -TenantID'
         $R.Text | Should -Not -Match 'still not signed in'
     }
