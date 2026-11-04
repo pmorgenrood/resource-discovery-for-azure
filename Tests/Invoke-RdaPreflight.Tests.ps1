@@ -777,6 +777,15 @@ Describe 'End notes about the current release' {
         (Get-RdaEndNote -Sides @($NoCli, @{ side = 'after'; usesAzureCli = $false })) | Should -Not -Contain 'Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions'
     }
 
+    It 'with -Obfuscate, says to check the Before zip for a SQL server name before sending it' {
+        $Sides = @(@{ side = 'before'; usesAzureCli = $false }, @{ side = 'after'; usesAzureCli = $false })
+        $Notes = @(Get-RdaEndNote -Sides $Sides -Obfuscate)
+        ($Notes -join ' ') | Should -Match 'send the Before zip, check it'
+        ($Notes -join ' ') | Should -Match 'Azure SQL server'
+        ($Notes -join ' ') | Should -Match 'send only the After zip and ab-summary.json'
+        @(Get-RdaEndNote -Sides $Sides).Count | Should -Be 0
+    }
+
     It 'signs in and then gets subscription-other-tenant: stops with the right hint' {
         Mock Test-RdaCloudShell { $false }
         Mock Test-RdaInteractiveHost { $true }
@@ -823,6 +832,7 @@ Describe 'Round 6: replies that are not conclusive' {
         @{ Case = 'a null permissions list'; Perm = '{"value":null}'; Rg = '{"value":[]}'; Res = '{"value":[]}' }
         @{ Case = 'a null resource group list'; Perm = '{"value":[]}'; Rg = '{"value":null}'; Res = '{"value":[]}' }
         @{ Case = 'an empty resource group page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[],"nextLink":"https://example.invalid/p2"}'; Res = '{"value":[]}' }
+        @{ Case = 'an empty resources page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[]}'; Res = '{"value":[],"nextLink":"https://example.invalid/p2"}' }
     ) {
         param($Case, $Perm, $Rg, $Res)
         $null = $Case
@@ -837,6 +847,7 @@ Describe 'Round 6: replies that are not conclusive' {
         @{ Case = 'a null permissions list'; Perm = '{"value":null}'; Rg = '{"value":[]}'; Res = '{"value":[]}' }
         @{ Case = 'a null resource group list'; Perm = '{"value":[]}'; Rg = '{"value":null}'; Res = '{"value":[]}' }
         @{ Case = 'an empty resource group page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[],"nextLink":"https://example.invalid/p2"}'; Res = '{"value":[]}' }
+        @{ Case = 'an empty resources page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[]}'; Res = '{"value":[],"nextLink":"https://example.invalid/p2"}' }
     ) {
         param($Case, $Perm, $Rg, $Res)
         $null = $Case
