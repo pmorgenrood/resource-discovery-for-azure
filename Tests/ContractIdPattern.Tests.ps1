@@ -18,6 +18,7 @@ BeforeAll {
         ContractMc   = "/subscriptions/prod_$G/resourcegroups/prod_mc_$G/providers/microsoft.compute/virtualmachinescalesets/prod_vmss_$G"
         ContractKid  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.sql/servers/prod_$G/databases/prod_$G"
         G1System     = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/`$system"
+        G1Nested     = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/topics/`$system"
         G2NoRg       = "/subscriptions/prod_$G/providers/microsoft.insights/pricings/prod_$G"
         F2Fallback   = "/subscriptions/prod_sub_$G/resourcegroups/prod_rg_$G/providers/microsoft.compute/virtualmachines/prod_$G"
         SystemOther  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.storage/storageaccounts/`$system"
@@ -41,6 +42,8 @@ Describe 'Get-RdaContractIdPattern' {
 
     It 'takes G1 and G2 only with -AllowParked' {
         $script:Ids.G1System | Should -Match (Get-RdaContractIdPattern -AllowParked)
+        $script:Ids.G1Nested | Should -Match (Get-RdaContractIdPattern -AllowParked) -Because 'the masking keeps $system in any name slot'
+        $script:Ids.G1Nested | Should -Not -Match (Get-RdaContractIdPattern)
         $script:Ids.G2NoRg | Should -Match (Get-RdaContractIdPattern -AllowParked)
         $script:Ids.G1System | Should -Not -Match (Get-RdaContractIdPattern -AllowMetricFallback)
     }
