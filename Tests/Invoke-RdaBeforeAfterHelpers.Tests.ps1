@@ -150,11 +150,12 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
 
     It 'counts metrics rows with MetricError true, and leaves nulls out' {
         $Run = Get-FakeRun -Metrics 3
-        $Run.Metrics = '{"Metrics":[{"ID":"a","MetricError":true,"MetricValue":1},null,{"ID":"b","MetricError":false},{"ID":"c","MetricError":"true"}],"Other":{"x":[1,2]}}'
+        $V = '"MetricCount":1,"MetricValue":1.5,"MetricPercentile":2'
+        $Run.Metrics = '{"Metrics":[{"ID":"a","MetricError":true,' + $V + '},null,{"ID":"b","MetricError":false,' + $V + '},{"ID":"c","MetricError":"true",' + $V + '}],"Other":{"x":[1,2]}}'
         $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'met.zip') $Run -Wrap)
         $C.metricsRows | Should -Be 3
         $C.metricsErrorRows | Should -Be 1 -Because 'only a JSON true counts, not the text "true"'
-        @($C.problems).Count | Should -Be 0
+        @($C.problems) | Should -Be @('metrics value not a number, or MetricError not true or false') -Because 'the text "true" is not true or false'
     }
 
     It 'counts inventory sections without reading other values as rows' {
@@ -227,8 +228,45 @@ Describe 'Invoke-RdaBeforeAfter report counts, run arguments and result' {
         Test-RdaRunsComparable -Sides @($Ok, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
     }
 
+    It 'notes files the reader would drop or refuse: <Case>' -TestCases @(
+        @{ Case = 'metrics with no Metrics list'; Set = { param($R) $R.Metrics = '{"Wrong":[]}' }; Want = 'metrics file has no Metrics list' }
+        @{ Case = 'metrics value null'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":null,"MetricValue":1,"MetricPercentile":1,"MetricError":false}]}' }; Want = 'metrics value not a number, or MetricError not true or false' }
+        @{ Case = 'MetricError as text'; Set = { param($R) $R.Metrics = '{"Metrics":[{"ID":"a","MetricCount":1,"MetricValue":1,"MetricPercentile":1,"MetricError":"false"}]}' }; Want = 'metrics value not a number, or MetricError not true or false' }
+        @{ Case = 'consumption with a renamed header'; Set = { param($R) $R.Consumption = "WrongHeader`n1" }; Want = 'consumption header missing' }
+        @{ Case = 'consumption Quantity with a comma'; Set = { param($R) $R.Consumption = "ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime`n/x,a,b,c,m,""1,5"",2026-10-01T00:00:00Z,2026-10-02T00:00:00Z" }; Want = 'consumption number or date that does not parse' }
+        @{ Case = 'inventory ID as a number'; Set = { param($R) $R.Inventory = '{"VirtualMachines":[{"ID":5,"Name":"a"}]}' }; Want = 'inventory ID, Name or SKU not a string' }
+        @{ Case = 'inventory section as an object'; Set = { param($R) $R.Inventory = '{"VirtualMachines":{"ID":"a"}}' }; Want = 'inventory section not a list' }
+    ) {
+        param($Case, $Set, $Want)
+        $null = $Case
+        $Run = Get-FakeRun
+        & $Set $Run
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive ('c-' + [guid]::NewGuid() + '.zip')) $Run -Wrap)
+        @($C.problems) | Should -Contain $Want
+        Test-RdaRunsComparable -Sides @(@{ exitCode = 0; zip = 'a'; counts = $C }, @{ exitCode = 0; zip = 'b'; counts = $C }) | Should -BeFalse
+    }
+
+    It 'counts rows the reader drops one by one, without calling the file bad' {
+        $Run = Get-FakeRun
+        $Run.Consumption = "ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime`n,a,b,c,m,1,2026-10-01T00:00:00Z,2026-10-02T00:00:00Z`n/x,a,b,c,,1,2026-10-01T00:00:00Z,2026-10-02T00:00:00Z`n/x,a,b,c,m,-2,2026-10-01T00:00:00Z,2026-10-02T00:00:00Z`n/x,a,b,c,m,2.5,10/01/2026 00:00:00,10/02/2026 00:00:00"
+        $C = Get-RdaZipCount -Path (Write-FakeZip (Join-Path $TestDrive 'drop.zip') $Run -Wrap)
+        $C.consumptionRows | Should -Be 4
+        $C.consumptionDroppedRows | Should -Be 3
+        @($C.problems).Count | Should -Be 0
+    }
+
+    It 'takes only an inventory file whose name starts with Inventory' {
+        $Run = Get-FakeRun
+        $P = Join-Path $TestDrive 'name.zip'
+        $Fs = [IO.File]::Create($P); $Z = [IO.Compression.ZipArchive]::new($Fs, [IO.Compression.ZipArchiveMode]::Create)
+        Add-ZipText -Archive $Z -Name 'Full_Inventory_1.json' -Text $Run.Inventory
+        Add-ZipText -Archive $Z -Name 'Consumption_1.csv' -Text $Run.Consumption
+        $Z.Dispose(); $Fs.Dispose()
+        @((Get-RdaZipCount -Path $P).problems) | Should -Contain 'no inventory file'
+    }
+
     It 'gives every count key for a zip that could not be read' {
         $C = Get-RdaZipCountSafe -Path (Join-Path $TestDrive 'missing.zip')
-        foreach ($K in 'reports', 'inventoryRows', 'inventoryBySection', 'consumptionRows', 'metricsRows', 'metricsErrorRows', 'problems') { $C.Contains($K) | Should -BeTrue -Because $K }
+        foreach ($K in 'reports', 'inventoryRows', 'inventoryBySection', 'consumptionRows', 'consumptionDroppedRows', 'metricsRows', 'metricsErrorRows', 'problems') { $C.Contains($K) | Should -BeTrue -Because $K }
     }
 }

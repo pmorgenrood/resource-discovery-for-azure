@@ -278,12 +278,21 @@ Describe 'Azure CLI' {
         $R.Text | Should -Match 'still not signed in'
     }
 
-    It 'skips the check in Azure Cloud Shell' {
+    It 'still checks the active account and the subscription list in Azure Cloud Shell (<State>)' -TestCases @(
+        @{ State = 'ok'; Want = $true }
+        @{ State = 'no-subscription'; Want = $false }
+        @{ State = 'other-tenant'; Want = $false }
+    ) {
+        param($State, $Want)
+        $script:CsState = $State
         Mock Test-RdaCloudShell { $true }
-        Mock Test-RdaAzCliSignIn { throw 'must not check' }
-        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Side 'Before' }
-        $R.Result | Should -BeTrue
-        Should -Invoke Test-RdaAzCliSignIn -Times 0 -Exactly
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $false }
+        Mock Invoke-RdaAz { 0 }
+        Mock Test-RdaAzCliSignIn { $script:CsState }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -Be $Want
+        Should -Invoke Test-RdaAzCliSignIn -Times 1 -Exactly -ParameterFilter { $Subscription -eq $script:S }
         $R.Text | Should -Match 'Cloud Shell'
     }
 }
@@ -319,6 +328,10 @@ Describe 'Reader check' {
         @{ Case = 'Owner (*)'; Perm = @(@{ actions = @('*'); notActions = @() }); Want = 'ok' }
         @{ Case = 'Reader (*/read)'; Perm = @(@{ actions = @('*/read'); notActions = @() }); Want = 'ok' }
         @{ Case = 'a role that blocks */read'; Perm = @(@{ actions = @('*'); notActions = @('*/read') }); Want = 'missing' }
+        @{ Case = 'all reads but one provider''s'; Perm = @(@{ actions = @('*/read'); notActions = @('Microsoft.Compute/*/read') }); Want = 'partial' }
+        @{ Case = 'everything but one provider'; Perm = @(@{ actions = @('*'); notActions = @('Microsoft.Sql/*') }); Want = 'partial' }
+        @{ Case = 'one role blocks a provider, another reads all'; Perm = @(@{ actions = @('*'); notActions = @('Microsoft.Sql/*') }, @{ actions = @('*/read'); notActions = @() }); Want = 'ok' }
+        @{ Case = 'everything but a write'; Perm = @(@{ actions = @('*'); notActions = @('Microsoft.Authorization/*/write') }); Want = 'ok' }
         @{ Case = 'only some reads'; Perm = @(@{ actions = @('Microsoft.Compute/*/read'); notActions = @() }); Want = 'partial' }
         @{ Case = 'no reads'; Perm = @(@{ actions = @('Microsoft.Support/*'); notActions = @() }); Want = 'partial' }
         @{ Case = 'nothing'; Perm = @(); Want = 'missing' }
@@ -573,8 +586,8 @@ Describe 'A side that still uses the Azure CLI, with another tenant active' {
 Describe 'A side that still uses the Azure CLI, without the subscription in its list' {
     It 'sees a CLI whose list of subscriptions does not hold the test subscription' {
         Mock Get-Command { [pscustomobject]@{ Name = 'az' } } -ParameterFilter { $Name -eq 'az' }
-        Mock Invoke-RdaAz { if ($Arguments -contains 'show') { 1 } else { 0 } }
-        Mock Get-RdaAzCliTenant { $script:T }
+        Mock Invoke-RdaAz { 0 }
+        Mock Get-RdaAzCliTenant { if ($Subscription) { $null } else { $script:T } }
         Test-RdaAzCliSignIn -Tenant $script:T -Subscription $script:S | Should -Be 'no-subscription'
         Test-RdaAzCliSignIn -Tenant $script:T | Should -Be 'ok' -Because 'without -Subscription the list is not read'
     }
@@ -630,10 +643,10 @@ Describe 'Read access of the Azure CLI sign-in' {
         @{ Json = ''; Rc = 1; Want = 'unknown' }
     ) {
         param($Json, $Rc, $Want)
-        $script:FakeAzJson = $Json; $script:FakeAzRc = $Rc; $script:FakeAzArgs = $null
-        function global:az { $script:FakeAzArgs = $args; $global:LASTEXITCODE = $script:FakeAzRc; $script:FakeAzJson }
+        $script:FakeAzJson = $Json; $script:FakeAzRc = $Rc; $script:FakeAzCalls = [System.Collections.Generic.List[string]]::new()
+        function global:az { $script:FakeAzCalls.Add(($args -join ' ')); $global:LASTEXITCODE = $script:FakeAzRc; $script:FakeAzJson }
         Get-RdaAzCliReadState -Subscription $script:S | Should -Be $Want
-        ($script:FakeAzArgs -join ' ') | Should -Match ([regex]::Escape("rest --method get --url /subscriptions/$($script:S)/providers/Microsoft.Authorization/permissions"))
+        $script:FakeAzCalls[0] | Should -Match ([regex]::Escape("rest --method get --url /subscriptions/$($script:S)/providers/Microsoft.Authorization/permissions"))
     }
 
     It 'stops only when the Azure CLI sign-in clearly cannot read, and warns otherwise' {
@@ -655,5 +668,76 @@ Describe 'Read access of the Azure CLI sign-in' {
         finally { Pop-Location }
         $R.Result | Should -Be 1
         $R.Text | Should -Match ([regex]::Escape('Output folder: ' + (Join-Path $Here 'rel-out')))
+    }
+}
+
+Describe 'Round 3: resource-group Reader, paged replies, a subscription of another tenant' {
+    AfterEach { Remove-Item function:global:az -ErrorAction SilentlyContinue }
+
+    It 'warns, not stops, when only a resource group can be read (Az PowerShell)' {
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' } } -ParameterFilter { $Path -like '*Microsoft.Authorization/permissions*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"name":"rg1"}]}' } } -ParameterFilter { $Path -like '*/resourcegroups?*' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'partial'
+    }
+
+    It 'reads every page of the permissions reply (Az PowerShell), at most 10' {
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"actions":["Microsoft.Support/*"]}],"nextLink":"https://example.invalid/p2"}' } } -ParameterFilter { $Path }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"actions":["*/read"],"notActions":[]}]}' } } -ParameterFilter { $Uri -eq 'https://example.invalid/p2' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'ok'
+    }
+
+    It 'stops reading pages after 10 and says it cannot tell' {
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[],"nextLink":"https://example.invalid/again"}' } }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'unknown'
+        Should -Invoke Invoke-AzRestMethod -Times 10 -Exactly
+    }
+
+    It 'warns, not stops, when only a resource group can be read, and reads pages (Azure CLI)' {
+        $script:Replies = @{
+            perm1 = '{"value":[],"nextLink":"https://example.invalid/p2"}'
+            perm2 = '{"value":[]}'
+            rg = '{"value":[{"name":"rg1"}]}'
+        }
+        function global:az
+        {
+            $global:LASTEXITCODE = 0
+            $U = $args[$args.IndexOf('--url') + 1]
+            if ($U -like '*/resourcegroups?*') { $script:Replies.rg } elseif ($U -eq 'https://example.invalid/p2') { $script:Replies.perm2 } else { $script:Replies.perm1 }
+        }
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'partial'
+        $script:Replies.perm2 = '{"value":[{"actions":["*/read"],"notActions":[]}]}'
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'ok'
+    }
+
+    It 'sees a subscription the Azure CLI lists under another tenant' {
+        Mock Get-Command { [pscustomobject]@{ Name = 'az' } } -ParameterFilter { $Name -eq 'az' }
+        Mock Invoke-RdaAz { 0 }
+        Mock Get-RdaAzCliTenant { if ($Subscription) { '44444444-4444-4444-4444-444444444444' } else { $script:T } }
+        Test-RdaAzCliSignIn -Tenant $script:T -Subscription $script:S | Should -Be 'subscription-other-tenant'
+    }
+
+    It 'for that, stops with a -TenantID hint and offers nothing' {
+        Mock Invoke-RdaAz { 0 }
+        Mock Test-RdaCloudShell { $false }
+        Mock Read-RdaYesNo { $true }
+        Mock Test-RdaAzCliSignIn { 'subscription-other-tenant' }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match 'another tenant than -TenantID'
+        Should -Invoke Read-RdaYesNo -Times 0 -Exactly
+        Should -Invoke Invoke-RdaAz -Times 0 -Exactly
+    }
+
+    It 'gives the resource-graph note after a successful switch too' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $true }
+        $script:Switched = $false
+        Mock Invoke-RdaAz { $script:Switched = $true; 0 } -ParameterFilter { $Arguments -contains 'set' }
+        Mock Invoke-RdaAz { 1 } -ParameterFilter { $Arguments -contains 'extension' }
+        Mock Test-RdaAzCliSignIn { if ($script:Switched) { 'ok' } else { 'other-tenant' } }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeTrue
+        $R.Text | Should -Match 'az extension add --name resource-graph'
     }
 }

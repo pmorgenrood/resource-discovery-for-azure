@@ -5,7 +5,7 @@ This test runs the tool twice on one test subscription:
 - **Before**: the current release, from github.com/awslabs/resource-discovery-for-azure (branch `main`).
 - **After**: the new fixes, from github.com/pmorgenrood/resource-discovery-for-azure (branch `all-fixes-optimized`).
 
-You send back 3 files: two report zips and one small summary. We use them to check that the new fixes lose no data.
+You send back the files in `share/`: two report zips and `ab-summary.json` (with `-Obfuscate`, maybe only the After zip and the summary, see below). We use them to check that the new fixes lose no data.
 
 Both runs only read from Azure. They change nothing in your subscription. The script sends nothing anywhere: you send the files yourself. If it signs you in to Az PowerShell, that sign-in becomes your saved default. It changes the Azure CLI's active subscription only if you say yes when it asks. The current release (Before) may set your default Az PowerShell subscription to the test subscription, and may add the Azure CLI extension `resource-graph` by itself (that needs internet access).
 
@@ -60,7 +60,7 @@ A new folder `rda-before-after-<date and time>`, in the folder you ran it from, 
 
 | Folder | What | Send it? |
 |---|---|---|
-| `share/` | `RDA-Before_...zip`, `RDA-After_...zip`, `ab-summary.json` | **Yes, these 3 files** |
+| `share/` | `RDA-Before_...zip`, `RDA-After_...zip`, `ab-summary.json` | **Yes** (see the `-Obfuscate` note below) |
 | `private/` | each run's full report folder and logs | No, keep it |
 
 - The two zips are the tool's own report zips, renamed to show which version made them.
@@ -68,6 +68,10 @@ A new folder `rda-before-after-<date and time>`, in the folder you ran it from, 
 - **Without `-Obfuscate`**, the zips hold your real resource names and ids, the same as the tool's normal report.
 - **With `-Obfuscate`, check the Before zip before you send it.** The current release still leaves the real name of an Azure SQL server inside the masked ids of its databases. The new fixes mask it. If that name is private, send the After zip and `ab-summary.json` only, and tell us.
 - **With `-Obfuscate`**, each run makes its own dictionary (the key that turns the masks back into real names). The dictionaries stay in `private/`. Keep them, and do not send them. The two runs use different masks, so we compare counts, not names.
+
+## Differences you should expect
+
+- The current release (Before) reads Azure Virtual Desktop resources from every subscription its Azure CLI sign-in can see, not only the test subscription. The new fixes read only the test subscription. So Before can hold extra Azure Virtual Desktop rows from other subscriptions. That is a fix, not lost data. With `-Obfuscate` those rows are masked like the rest.
 
 ## Options
 
@@ -77,6 +81,9 @@ A new folder `rda-before-after-<date and time>`, in the folder you ran it from, 
 | `-PreflightOnly` | Do the checks only, and stop before the runs. |
 | `-AfterBranch <branch>` | Test another After branch. Use `all-fixes-2026-11-02` if the default is not found. |
 | `-KeepCode` | Keep the downloaded code after the runs. It is deleted by default. |
+| `-DeviceLogin` | Sign in with a code instead of a browser window, here and in both runs. |
+| `-BeforeCodePath <folder or zip>` | Use this code for Before instead of downloading awslabs main. Most people do not need this. |
+| `-AfterCodePath <folder or zip>` | The same, for After. |
 
 ## If something goes wrong
 
