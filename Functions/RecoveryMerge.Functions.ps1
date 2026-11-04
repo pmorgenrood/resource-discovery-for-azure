@@ -197,10 +197,12 @@ function Merge-RecoveryData
     if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
     # The merge writes a new bundle; written into a source folder it would
     # replace that bundle's own files. A new empty folder is the way out.
-    $OutFull = [System.IO.Path]::GetFullPath($OutputPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    # Paths are read against the PowerShell location (and '~' expanded), not
+    # the process directory, so relative and absolute forms compare equal.
+    $OutFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
     foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
     {
-        $SourceFull = [System.IO.Path]::GetFullPath($Source).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $SourceFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
         if ([string]::Equals($OutFull, $SourceFull, [System.StringComparison]::OrdinalIgnoreCase))
         {
             throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath)
