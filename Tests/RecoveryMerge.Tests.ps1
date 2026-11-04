@@ -258,6 +258,29 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
+    It 'refuses a relative -OutputPath that names the gap folder from the PowerShell location' {
+        # A relative path is read against the PowerShell location, which can
+        # differ from the process directory after Set-Location.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $ProcessDir = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath (Split-Path -Parent $C.Gap)
+        try
+        {
+            [System.Environment]::CurrentDirectory = [System.IO.Path]::GetTempPath()
+            $Relative = '.' + [System.IO.Path]::DirectorySeparatorChar + (Split-Path -Leaf $C.Gap)
+            { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Relative } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        }
+        finally
+        {
+            Pop-Location
+            [System.Environment]::CurrentDirectory = $ProcessDir
+        }
+        @(Get-ChildItem -LiteralPath $C.Gap -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
