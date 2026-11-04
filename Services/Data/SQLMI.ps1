@@ -31,9 +31,36 @@ if ($Task -eq 'Processing')
             }
         }
 
+        # Look up each instance's subscription by id instead of scanning every
+        # subscription for every instance. The comparer is the one '-eq' uses for
+        # strings, and subscriptions that share an id stay together in order, so
+        # $Sub1 is what the scan gave. A subscription or instance whose id is not
+        # a string keeps the scan.
+        $SubById = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
+        $SubScanOnly = $false
+        foreach ($S in $SUB)
+        {
+            if ($S.id -isnot [string]) { $SubScanOnly = $true; break }
+            $Same = $null
+            if (-not $SubById.TryGetValue($S.id, [ref]$Same))
+            {
+                $Same = [System.Collections.Generic.List[object]]::new()
+                $SubById[$S.id] = $Same
+            }
+            [void]$Same.Add($S)
+        }
+
         foreach ($1 in $SQLSERVERMI)
         {
-            $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
+            if ($SubScanOnly -or $1.subscriptionId -isnot [string])
+            {
+                $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
+            }
+            else
+            {
+                $Same = $null
+                $Sub1 = if (-not $SubById.TryGetValue($1.subscriptionId, [ref]$Same)) { $null } elseif ($Same.Count -eq 1) { $Same[0] } else { $Same.ToArray() }
+            }
             $Data = $1.PROPERTIES
             $DbCount = 0
             [void]$DbCountByParent.TryGetValue("$($1.Id)", [ref]$DbCount)
