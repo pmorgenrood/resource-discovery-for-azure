@@ -546,6 +546,8 @@ function Get-RdaNetworkSkipFilter
 # feeds the log, so a failure warns once and returns $null; it never fails the
 # run and is never retried here (Invoke-AzGraphQuerySafe has its own capped
 # retries). $Where is the scope's own where clause, without 'resources |'.
+# $ExcludeSubscriptionId: the subscriptions the access check skipped, whose
+# rows the pull drops after it is read, so they are not counted either.
 # Returns { Total; ByType } with the types lowercase and summed across
 # subscription batches.
 function Get-RdaSkippedNetworkCount
@@ -553,10 +555,11 @@ function Get-RdaSkippedNetworkCount
     param(
         [Parameter(Mandatory = $true)][string]$Where,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SubscriptionId,
+        [AllowEmptyCollection()][string[]]$ExcludeSubscriptionId = @(),
         [switch]$HideRawOutput
     )
 
-    $Query = 'resources | where {0} | where type in~ {1} | summarize count() by type' -f $Where, (Get-RdaSkippedNetworkTypeList)
+    $Query = 'resources | where {0} | where type in~ {1} | summarize count() by type, subscriptionId' -f $Where, (Get-RdaSkippedNetworkTypeList)
     try
     {
         $Result = Invoke-AzGraphQuerySafe -Query $Query -SubscriptionId $SubscriptionId -HideRawOutput:$HideRawOutput
@@ -574,6 +577,7 @@ function Get-RdaSkippedNetworkCount
     foreach ($Row in @($Result.data))
     {
         if ($null -eq $Row -or $null -eq $Row.count_ -or [string]::IsNullOrEmpty([string]$Row.type)) { continue }
+        if (@($ExcludeSubscriptionId) -contains [string]$Row.subscriptionId) { continue }
         $Type = ([string]$Row.type).ToLowerInvariant()
         if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
         $ByType[$Type] += [long]$Row.count_

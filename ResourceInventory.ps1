@@ -85,6 +85,10 @@ function Variables
     # is written, so callers read this instead; reset here so an early exit never reports the
     # previous run's count.
     $Global:ResourceCount = 0
+    # Network rows left out of the pull, in total and by type. Cleared on every
+    # run so a wrapper never reads the last subscription's count.
+    $Global:SkippedResourceCount = 0
+    $Global:SkippedResourceTypes = [ordered]@{}
     $Global:Subscriptions = ''
     $Global:ReportName = $ReportName
     $Global:Version = GetLocalVersion
@@ -940,15 +944,15 @@ Function RunInventorySetup()
             $ScopeIds = @($Subscri)
             $Where = "resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
-            $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($Subscri) -HideRawOutput:$Obfuscate.IsPresent
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where resourceGroup == '$ResourceGroup' and (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($Subscri) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -959,15 +963,15 @@ Function RunInventorySetup()
             $ScopeIds = @($SubscriptionID)
             $Where = "(isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
 
-            $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($SubscriptionID) -HideRawOutput:$Obfuscate.IsPresent
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeNum = Get-AzGraphCount -Result $EnvSize
 
             if ($EnvSizeNum -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId @($SubscriptionID) -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.data
             }
@@ -977,8 +981,10 @@ Function RunInventorySetup()
             # Every subscription of the run, named explicitly (in batches of
             # 1000), rather than whatever scope Resource Graph defaults to.
             $RunSubscriptionIds = @($Global:Subscriptions | ForEach-Object { [string]$_.id })
-            $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | summarize count()"
-            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -HideRawOutput:$Obfuscate.IsPresent
+            $ScopeIds = $RunSubscriptionIds
+            $Where = "(isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000)"
+            $GraphQuery = "resources | where $Where$SkipFilter | summarize count()"
+            $EnvSize = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
             $EnvSizeCount = Get-AzGraphCount -Result $EnvSize
 
             Write-Log -Message ("Resources Output: {0} Resources Identified" -f $EnvSizeCount) -Severity 'Success'
@@ -986,8 +992,8 @@ Function RunInventorySetup()
             if ($EnvSizeCount -ge 1)
             {
                 # Every page, read with the skip token.
-                $GraphQuery = "resources | where (isnull(properties.definition.actions) or strlen(properties.definition.actions) < 123000) | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
-                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $RunSubscriptionIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
+                $GraphQuery = "resources | where $Where$SkipFilter | project id,name,type,tenantId,kind,location,resourceGroup,subscriptionId,managedBy,sku,plan,properties,identity,zones,extendedLocation,tags | order by tolower(id) asc"
+                $Resource = Invoke-DiscoveryGraphQuery -Query $GraphQuery -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent
 
                 $Global:Resources += $Resource.Data
             }
@@ -1003,7 +1009,10 @@ Function RunInventorySetup()
         }
         else
         {
-            $Skipped = Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -HideRawOutput:$Obfuscate.IsPresent
+            # The access-skip filter below drops a skipped subscription's rows
+            # from the pull; its network rows are left out of this count too.
+            $ExcludeIds = if ($null -ne $script:AccessSkipped) { @($script:AccessSkipped.InaccessibleIds) } else { @() }
+            $Skipped = Get-RdaSkippedNetworkCount -Where $Where -SubscriptionId $ScopeIds -ExcludeSubscriptionId $ExcludeIds -HideRawOutput:$Obfuscate.IsPresent
             # $null means unknown: the log then reads as if nothing was skipped.
             $Global:SkippedResourceCount = if ($null -ne $Skipped) { $Skipped.Total } else { $null }
             $Global:SkippedResourceTypes = if ($null -ne $Skipped) { $Skipped.ByType } else { [ordered]@{} }
@@ -1141,6 +1150,10 @@ Function RunInventorySetup()
     }
 
     $Global:ResourceCount = @($Global:Resources).Count
+
+    $CountMessage = Get-RdaResourceCountMessage -Collected $Global:ResourceCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+    if ($CountMessage.Kind -eq 'Empty') { Write-Log -Message 'Resources collected: 0' -Severity 'Info' }
+    else { Write-Log -Message $CountMessage.Text -Severity 'Success' }
 
     if ($Obfuscate.IsPresent)
     {
@@ -2491,7 +2504,7 @@ if (-not $RunAllSubs.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFil
     $RetryTenant = if (-not [string]::IsNullOrEmpty($TenantID)) { $TenantID } else { $script:RdaRunTenant }
     # Each command carries this run's resource group, settings, sign-in switches
     # and output switches (never -Secret).
-    $RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }
+    $RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; IncludeNetworkResources = $IncludeNetworkResources.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }
     $RetryArgs = @{ ResourceGroup = $ResourceGroup; Settings = $RetrySettings; Appid = [string]$Appid; Service = $Service; OutputDirectory = [string]$OutputDirectory; ObfuscationDictionary = $ObfuscationDictionary }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
     Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ' + (Get-DirectRunRetryCommand -TenantID $RetryTenant -SubscriptionID $_.Id @RetryArgs) }))

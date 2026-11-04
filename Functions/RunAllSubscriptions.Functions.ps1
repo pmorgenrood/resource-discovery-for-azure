@@ -1181,20 +1181,31 @@ function Write-StartOfRunId
 # The settings that change what a run collects or how it masks it, so one
 # consolidated zip must not mix them: -Obfuscate masks the reports,
 # -SkipMetrics and -SkipConsumption leave a phase out, -IncludeDisabled changes
-# which subscriptions are in scope. The others do not count: -DeviceLogin (how
+# which subscriptions are in scope, -IncludeNetworkResources puts the network
+# types no collector reads back into the pull. The others do not count: -DeviceLogin (how
 # the run signs in), -ConcurrencyLimit and -ParallelStreams (how many at once),
 # -Detailed (read only when the main summary is built at the end of the run,
 # over every report in the zip), -MainSummary and -AllowPartialAccess (accepted
 # and change nothing).
 function Get-RunDataSettingNames
 {
-    return @('Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeDisabled')
+    return @('Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeDisabled', 'IncludeNetworkResources')
+}
+
+# Settings added after runs began to record them. A record written before one
+# was added has no key for it, and it reads as off, which is what such a run
+# collected: before -IncludeNetworkResources the pull already left those
+# network rows out of every inventory section. So an unfinished older run
+# continues as before; it does not stop on unreadable settings.
+function Get-RunDataSettingDefaultOff
+{
+    return @('IncludeNetworkResources')
 }
 
 function Get-RunDataSettings
 {
-    param([bool]$Obfuscate, [bool]$SkipMetrics, [bool]$SkipConsumption, [bool]$IncludeDisabled)
-    return [ordered]@{ Obfuscate = $Obfuscate; SkipMetrics = $SkipMetrics; SkipConsumption = $SkipConsumption; IncludeDisabled = $IncludeDisabled }
+    param([bool]$Obfuscate, [bool]$SkipMetrics, [bool]$SkipConsumption, [bool]$IncludeDisabled, [bool]$IncludeNetworkResources)
+    return [ordered]@{ Obfuscate = $Obfuscate; SkipMetrics = $SkipMetrics; SkipConsumption = $SkipConsumption; IncludeDisabled = $IncludeDisabled; IncludeNetworkResources = $IncludeNetworkResources }
 }
 
 # The settings as the start line and the stop name them: the switches that are
@@ -1203,7 +1214,7 @@ function Format-RunDataSettings
 {
     param([System.Collections.IDictionary]$Settings)
     $On = @(foreach ($Name in @(Get-RunDataSettingNames)) { if ($null -ne $Settings -and $Settings[$Name]) { '-' + $Name } })
-    if ($On.Count -eq 0) { return 'none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled' }
+    if ($On.Count -eq 0) { return 'none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources' }
     return ($On -join ' ')
 }
 
@@ -1358,6 +1369,7 @@ function Set-ResumeRunInfoFields
         foreach ($Name in @(Get-RunDataSettingNames))
         {
             $Prop = $SettingsProp.Value.PSObject.Properties[$Name]
+            if ($null -eq $Prop -and @(Get-RunDataSettingDefaultOff) -contains $Name) { $Settings[$Name] = $false; continue }
             if ($null -eq $Prop) { $Info.SettingsProblem = ('{0} is not recorded' -f $Name); break }
             if ($Prop.Value -isnot [bool]) { $Info.SettingsProblem = ('{0} is not true or false' -f $Name); break }
             $Settings[$Name] = $Prop.Value
