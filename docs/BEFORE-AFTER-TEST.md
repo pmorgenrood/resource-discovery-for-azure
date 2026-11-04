@@ -22,8 +22,9 @@ The script checks all of this first:
 - **PowerShell too old**: it stops and shows how to install PowerShell 7 for your system.
 - **Az modules missing or too old**: it lists them and asks `Install/update them now for your user only? [Y/N]`. Say Y and it installs them from the PowerShell Gallery into your own user folder. No admin rights are needed. Say N and it stops and shows the exact commands. PowerShell may then ask once more if you trust the PowerShell Gallery: answer Y.
 - **Azure CLI missing**: it stops and shows how to install it. It does not install it for you.
-- **Azure CLI not signed in**: it asks `Sign in to the Azure CLI now? [Y/N]`. Say Y and it runs `az login --tenant <tenant id>`. Cloud Shell is signed in already, so it skips this.
+- **Azure CLI not signed in**: it asks `Sign in to the Azure CLI now? [Y/N]`. Say Y and it runs `az login --tenant <tenant id>`. Cloud Shell is signed in already; its active account and list of subscriptions are still checked.
 - **Test subscription not in the Azure CLI's list**: the CLI refreshes its list only when you sign in. The Before version collects billing only for subscriptions in that list. So the script asks `Sign in to the Azure CLI now? [Y/N]` again.
+- **Test subscription listed under another tenant**: the script stops. Check `-TenantID` and `-SubscriptionID`.
 - **Azure CLI on another tenant**: the Before version would sign the Azure CLI out of every account and ask again. So the script asks `Switch the Azure CLI to this subscription now? [Y/N]`. Say Y and it runs `az account set --subscription <id>`. Say N and it stops and shows that command.
 - **Az PowerShell default on another tenant**: the Before version would ask you to sign in again. The script stops and shows `Set-AzContext -Tenant <tenant id> -Subscription <id>`, which makes this tenant your default. Run it, then run the script again.
 - **Reader**: after you sign in, it checks that you can read the subscription. For the Before version it also checks the Azure CLI's own sign-in, which can be another account. If you clearly cannot, it stops and tells you to ask for the Reader role. It never gives or changes roles.
@@ -87,4 +88,4 @@ A new folder `rda-before-after-<date and time>`, in the folder you ran it from, 
 
 ## If something goes wrong
 
-The script ends with exit code 0 when both runs wrote their report zip and every file in them could be read, and 1 when a check or a run failed. A run of the new version can end with exit 3, 4 or 5: its report was written, with some data missing (see the exit-code table in README.md). The script then still ends with 0 and prints that run's exit code. It prints what to do. If a run failed, send the files anyway: they show what went wrong.
+The script ends with exit code 0 when both runs wrote their report zip and every file in them could be read and passed a quick format check, and 1 when a check or a run failed. The full check of the files is made by us, on the files you send. A run of the new version can end with exit 3, 4 or 5: its report was written, with some data missing (see the exit-code table in README.md). The script then still ends with 0 and prints that run's exit code. It prints what to do. If a run failed, send the files anyway: they show what went wrong.

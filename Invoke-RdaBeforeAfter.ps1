@@ -71,7 +71,8 @@
 .OUTPUTS
     Exit code 0: both runs wrote their report zip (run exit 0, or 3, 4 or 5, which
     the new version uses for a report with some data missing), every file in both
-    zips could be read, and both zips are in the share folder.
+    zips could be read and passed a quick format check, and both zips are in the
+    share folder. The full check of the files is made by us, on the files you send.
     Exit code 1: a check failed, or a run failed. The message says what to do.
 #>
 # The console messages are this script's user interface, so they go to the host.
@@ -448,7 +449,11 @@ function Measure-RdaInventoryEntry($Entry)
             while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray)
             {
                 $N++
-                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { $Jr.Skip(); continue }
+                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject)
+                {
+                    if (-not $Problems.Contains('inventory record not an object')) { $Problems.Add('inventory record not an object') }
+                    $Jr.Skip(); continue
+                }
                 $Rec = [Newtonsoft.Json.Linq.JObject]::Load($Jr)
                 foreach ($F in 'ID', 'Name', 'SKU')
                 {
@@ -489,16 +494,28 @@ function Measure-RdaMetricsEntry($Entry)
             $HasList = $true
             while ($Jr.Read() -and $Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray)
             {
-                if ($Jr.TokenType -eq [Newtonsoft.Json.JsonToken]::Null) { continue }
+                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject)
+                {
+                    # A null, a number or a text in the list is not a metric record.
+                    if (-not $Problems.Contains('metrics record not an object')) { $Problems.Add('metrics record not an object') }
+                    $Jr.Skip(); continue
+                }
                 $Rows++
-                if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::StartObject) { $Jr.Skip(); continue }
                 # One record at a time: a record is small.
                 $Rec = [Newtonsoft.Json.Linq.JObject]::Load($Jr)
                 $Err = $Rec['MetricError']
                 if ($null -ne $Err -and $Err.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Boolean -and [bool]$Err) { $Errors++ }
                 $Bad = ($null -eq $Err -or $Err.Type -ne [Newtonsoft.Json.Linq.JTokenType]::Boolean)
                 foreach ($F in 'MetricCount', 'MetricValue', 'MetricPercentile') { $V = $Rec[$F]; if ($null -eq $V -or $V.Type -notin $Num) { $Bad = $true } }
-                if ($Bad -and -not $Problems.Contains('metrics value not a number, or MetricError not true or false')) { $Problems.Add('metrics value not a number, or MetricError not true or false') }
+                # MetricSeries: one number, or a list of numbers only. Both releases write a
+                # null series on a record whose call failed (MetricError true); that one is
+                # left to the full check on our side, so a failed call alone does not end 1.
+                $Ser = $Rec['MetricSeries']
+                $ErrTrue = $null -ne $Err -and $Err.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Boolean -and [bool]$Err
+                if ($null -eq $Ser -or $Ser.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Null) { if (-not $ErrTrue) { $Bad = $true } }
+                elseif ($Ser.Type -eq [Newtonsoft.Json.Linq.JTokenType]::Array) { foreach ($X in $Ser) { if ($X.Type -notin $Num) { $Bad = $true; break } } }
+                elseif ($Ser.Type -notin $Num) { $Bad = $true }
+                if ($Bad -and -not $Problems.Contains('metrics value or series not a number, or MetricError not true or false')) { $Problems.Add('metrics value or series not a number, or MetricError not true or false') }
             }
             if ($Jr.TokenType -ne [Newtonsoft.Json.JsonToken]::EndArray) { throw 'cut-off JSON' }
         }
@@ -536,7 +553,7 @@ function Measure-RdaConsumptionCsv
         $Head = @($P.ReadFields())
         $Ix = @{}
         for ($I = 0; $I -lt $Head.Count; $I++) { $Ix[$Head[$I].Trim().Trim([char]0xFEFF)] = $I }
-        foreach ($H in 'ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId')
+        foreach ($H in 'ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId', 'Quantity', 'UsageStartTime', 'UsageEndTime')
         {
             if (-not $Ix.ContainsKey($H)) { $Problems.Add('consumption header missing'); break }
         }
@@ -551,6 +568,8 @@ function Measure-RdaConsumptionCsv
             $F = $P.ReadFields()
             if ($null -eq $F) { continue }
             $Rows++; $Fc = $F.Count; $Qv = 0.0
+            # A row cut short (fewer cells than headers) does not parse either.
+            if ($Fc -lt $Head.Count) { $BadCell = $true }
             if ($CQ -ge 0 -and $CQ -lt $Fc -and -not [double]::TryParse($F[$CQ], $Float, $Inv, [ref]$Qv)) { $BadCell = $true }
             if ($CS -ge 0 -and $CS -lt $Fc -and -not [datetime]::TryParse($F[$CS], $Inv, $Round, [ref]$Dt)) { $BadCell = $true }
             if ($CE -ge 0 -and $CE -lt $Fc -and -not [datetime]::TryParse($F[$CE], $Inv, $Round, [ref]$Dt)) { $BadCell = $true }
@@ -624,6 +643,25 @@ function Get-RdaZipCountSafe
             consumptionRows = 0; consumptionDroppedRows = 0; metricsRows = 0; metricsErrorRows = 0; problems = @('report zip could not be read')
         }
     }
+}
+
+# Notes printed at the end, for what the current release (Before) is known to do.
+function Get-RdaEndNote
+{
+    param([object[]]$Sides, [switch]$Obfuscate)
+    $L = [System.Collections.Generic.List[string]]::new()
+    if (@($Sides | Where-Object { $_.side -eq 'before' -and $_.usesAzureCli }).Count -gt 0)
+    {
+        $L.Add('Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions')
+        $L.Add('its Azure CLI sign-in can see. The new fixes read only this subscription. See docs/BEFORE-AFTER-TEST.md.')
+    }
+    if ($Obfuscate)
+    {
+        $L.Add('Before you send the Before zip, check it: the current release can leave the real name of an')
+        $L.Add('Azure SQL server inside the masked ids of its databases. If that name is private, send only')
+        $L.Add('the After zip and ab-summary.json, and tell us.')
+    }
+    return $L.ToArray()
 }
 
 # True when both runs wrote a report zip whose every file could be read (an inventory
@@ -910,6 +948,13 @@ function Invoke-RdaAzCliSwitch
     return $false
 }
 
+# Signing in or switching cannot fix this: the ids do not belong together.
+function Write-RdaSubscriptionTenantStop
+{
+    Write-Bad 'The Azure CLI lists this subscription under another tenant than -TenantID.'
+    Write-Note 'Check -TenantID and -SubscriptionID: the subscription must belong to that tenant.'
+}
+
 # Checks the Azure CLI for one side. Offers to sign it in; never installs it.
 function Invoke-RdaAzCliCheck
 {
@@ -940,13 +985,7 @@ function Invoke-RdaAzCliCheck
         {
             return (Invoke-RdaAzCliSwitch -Tenant $Tenant -Subscription $Subscription -Side $Side -LoginText $LoginText)
         }
-        'subscription-other-tenant'
-        {
-            # Signing in or switching cannot fix this: the ids do not belong together.
-            Write-Bad 'The Azure CLI lists this subscription under another tenant than -TenantID.'
-            Write-Note 'Check -TenantID and -SubscriptionID: the subscription must belong to that tenant.'
-            return $false
-        }
+        'subscription-other-tenant' { Write-RdaSubscriptionTenantStop; return $false }
     }
     if ($State -eq 'no-subscription')
     {
@@ -970,12 +1009,14 @@ function Invoke-RdaAzCliCheck
         return $false
     }
     $null = Invoke-RdaAz -Arguments $LoginArgs
-    if ((Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription) -eq 'ok')
+    $After = Test-RdaAzCliSignIn -Tenant $Tenant -Subscription $Subscription
+    if ($After -eq 'ok')
     {
         Write-Ok 'Azure CLI is signed in to this tenant.'
         Write-RdaAzCliExtensionNote -Side $Side
         return $true
     }
+    if ($After -eq 'subscription-other-tenant') { Write-RdaSubscriptionTenantStop; return $false }
     Write-Bad 'The Azure CLI is still not signed in to this tenant with this subscription.'
     Write-Note ('Run: {0}' -f $LoginText)
     Write-Note 'If the subscription is still missing after you sign in, this account cannot see it: ask for the Reader role on it.'
@@ -1071,16 +1112,19 @@ function Test-RdaReaderAccess
                 $Page++
             }
             $State = Get-RdaReadVerdict -Permission @($Value)
-            # Roles given only on resource groups are not in the subscription's reply.
-            # If a resource group can be read, some resources can: warn, do not stop.
+            # Roles given only on resource groups or single resources are not in the
+            # subscription's reply. If any can be read, some resources can: warn, do not stop.
             if ($State -eq 'missing')
             {
-                try
+                foreach ($Child in 'resourcegroups', 'resources')
                 {
-                    $G = Invoke-AzRestMethod -Method GET -Path ('/subscriptions/{0}/resourcegroups?api-version=2021-04-01&$top=1' -f $Subscription) -ErrorAction Stop
-                    if ([int]$G.StatusCode -eq 200 -and @(Get-RdaJsonList ($G.Content | ConvertFrom-Json) 'value').Count -gt 0) { $State = 'partial' }
+                    try
+                    {
+                        $G = Invoke-AzRestMethod -Method GET -Path ('/subscriptions/{0}/{1}?api-version=2021-04-01&$top=1' -f $Subscription, $Child) -ErrorAction Stop
+                        if ([int]$G.StatusCode -eq 200 -and @(Get-RdaJsonList ($G.Content | ConvertFrom-Json) 'value').Count -gt 0) { $State = 'partial'; break }
+                    }
+                    catch { Write-Verbose ('The {0} list could not be read.' -f $Child) }
                 }
-                catch { Write-Verbose 'The resource group list could not be read.' }
             }
             return [pscustomobject]@{ State = $State; How = 'permissions' }
         }
@@ -1149,33 +1193,34 @@ function Get-RdaAzCliReadState
 {
     param([Parameter(Mandatory)][string]$Subscription)
     if ($Subscription -notmatch $script:GuidPattern) { return 'unknown' }
-    $Url = '/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $Subscription
-    $Value = [System.Collections.Generic.List[object]]::new()
-    # At most 10 pages (nextLink), so this always ends.
-    for ($Page = 1; $Page -le 10; $Page++)
-    {
-        $J = Invoke-RdaAzRest -Url $Url
-        if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
-        foreach ($V in @($J.value)) { $Value.Add($V) }
-        $Url = if ($J.PSObject.Properties['nextLink']) { [string]$J.nextLink } else { '' }
-        if (-not $Url) { break }
-    }
-    if ($Url) { return 'unknown' }
-    $State = Get-RdaReadVerdict -Permission @($Value)
-    # Roles given only on resource groups are not in the subscription's reply.
+    $J = Invoke-RdaAzRest -Path ('/subscriptions/{0}/providers/Microsoft.Authorization/permissions' -f $Subscription) -Parameter @('api-version=2022-04-01')
+    if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
+    # A next page is not read here: its link holds '&', which cmd.exe (az.cmd on
+    # Windows) would cut. Without the rest of the reply the answer is unknown (warn).
+    if ($J.PSObject.Properties['nextLink'] -and $J.nextLink) { return 'unknown' }
+    $State = Get-RdaReadVerdict -Permission @($J.value)
+    # Roles given only on resource groups or on single resources are not in the
+    # subscription's reply. If any can be read, some resources can: warn, do not stop.
     if ($State -eq 'missing')
     {
-        $G = Invoke-RdaAzRest -Url ('/subscriptions/{0}/resourcegroups?api-version=2021-04-01&$top=1' -f $Subscription)
-        if ($null -ne $G -and $G.PSObject.Properties['value'] -and @($G.value).Count -gt 0) { $State = 'partial' }
+        foreach ($Child in 'resourcegroups', 'resources')
+        {
+            $G = Invoke-RdaAzRest -Path ('/subscriptions/{0}/{1}' -f $Subscription, $Child) -Parameter @('api-version=2021-04-01', '$top=1')
+            if ($null -ne $G -and $G.PSObject.Properties['value'] -and @($G.value).Count -gt 0) { return 'partial' }
+        }
     }
     return $State
 }
 
-# One read-only 'az rest' GET; the parsed JSON, or $null.
+# One read-only 'az rest' GET; the parsed JSON, or $null. The query goes in
+# --url-parameters, one item each, so no argument holds '&' (cmd.exe would cut it).
 function Invoke-RdaAzRest
 {
-    param([Parameter(Mandatory)][string]$Url)
-    try { $Text = & az rest --method get --url $Url --output json --only-show-errors 2> $null } catch { return $null }
+    param([Parameter(Mandatory)][string]$Path, [string[]]$Parameter = @())
+    $A = @('rest', '--method', 'get', '--url', $Path)
+    if ($Parameter.Count -gt 0) { $A += '--url-parameters'; $A += $Parameter }
+    $A += @('--output', 'json', '--only-show-errors')
+    try { $Text = & az @A 2> $null } catch { return $null }
     if ($LASTEXITCODE -ne 0) { return $null }
     try { return ((@($Text) -join "`n") | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
@@ -1498,23 +1543,13 @@ function Invoke-RdaBeforeAfter
         Write-Host ('Please send back the {0} file(s) in this folder:' -f $ShareFiles.Count) -ForegroundColor Green
         Write-Host ('  {0}' -f $ShareDir)
         $ShareFiles | ForEach-Object { Write-Host ('    {0}' -f $_.Name) }
-        if (@($Sides | Where-Object { $_.side -eq 'before' -and $_.usesAzureCli }).Count -gt 0)
-        {
-            Write-Note 'Note: the current release (Before) also reads Azure Virtual Desktop resources from other subscriptions'
-            Write-Note 'its Azure CLI sign-in can see. The new fixes read only this subscription. See docs/BEFORE-AFTER-TEST.md.'
-        }
-        if ($Obfuscate)
-        {
-            Write-Note 'Before you send the Before zip, check it: the current release can leave the real name of an'
-            Write-Note 'Azure SQL server inside the masked ids of its databases. If that name is private, send only'
-            Write-Note 'the After zip and ab-summary.json, and tell us.'
-        }
+        foreach ($L in (Get-RdaEndNote -Sides $Sides -Obfuscate:$Obfuscate)) { Write-Note $L }
         foreach ($Sd in $Sides) { if ($Sd.exitCode -ne 0) { Write-Note ('The {0} run ended with exit {1}.' -f $Sd.side, $Sd.exitCode) } }
         Write-Host ''
         Write-Host ('Keep this folder to yourself: {0}' -f $PrivateDir) -ForegroundColor Yellow
         Write-Host '  It holds the full run logs and, with -Obfuscate, each run''s dictionary.'
         if (-not $Obfuscate) { Write-Host '  Without -Obfuscate the shared zips hold your real resource names and ids, as the tool''s normal report does.' }
-        if (-not $AllOk) { Write-Bad 'A run did not end cleanly, or a file in its report could not be read. Send the files anyway: they show what went wrong.' }
+        if (-not $AllOk) { Write-Bad 'A run did not end cleanly, or a file in its report could not be read or failed a quick format check (see Problems above). Send the files anyway: they show what went wrong.' }
         $Exit = $(if ($AllOk) { 0 } else { 1 })
     }
     finally
