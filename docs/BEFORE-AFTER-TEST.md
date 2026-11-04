@@ -5,9 +5,9 @@ This test runs the tool twice on one test subscription:
 - **Before**: the current release, from github.com/awslabs/resource-discovery-for-azure (branch `main`).
 - **After**: the new fixes, from github.com/pmorgenrood/resource-discovery-for-azure (branch `all-fixes-optimized`).
 
-You send back 3 small files. We use them to check that the new fixes lose no data.
+You send back 3 files: two report zips and one small summary. We use them to check that the new fixes lose no data.
 
-Both runs only read from Azure. They change nothing in your subscription. The script sends nothing anywhere: you send the files yourself.
+Both runs only read from Azure. They change nothing in your subscription. The script sends nothing anywhere: you send the files yourself. It never changes your saved Az PowerShell default. It changes the Azure CLI's active subscription only if you say yes when it asks.
 
 ## What you need
 
@@ -23,6 +23,8 @@ The script checks all of this first:
 - **Az modules missing or too old**: it lists them and asks `Install/update them now for your user only? [Y/N]`. Say Y and it installs them from the PowerShell Gallery into your own user folder. No admin rights are needed. Say N and it stops and shows the exact commands. PowerShell may then ask once more if you trust the PowerShell Gallery: answer Y.
 - **Azure CLI missing**: it stops and shows how to install it. It does not install it for you.
 - **Azure CLI not signed in**: it asks `Sign in to the Azure CLI now? [Y/N]`. Say Y and it runs `az login --tenant <tenant id>`. Cloud Shell is signed in already, so it skips this.
+- **Azure CLI on another tenant**: the Before version would sign the Azure CLI out of every account and ask again. So the script asks `Switch the Azure CLI to this subscription now? [Y/N]`. Say Y and it runs `az account set --subscription <id>`. Say N and it stops and shows that command.
+- **Az PowerShell default on another tenant**: the Before version would ask you to sign in again. The script stops and shows `Set-AzContext -Tenant <tenant id> -Subscription <id>`, which makes this tenant your default. Run it, then run the script again.
 - **Reader**: after you sign in, it checks that you can read the subscription. If you clearly cannot, it stops and tells you to ask for the Reader role. It never gives or changes roles.
 
 If PowerShell cannot ask questions (for example when started with `-NonInteractive`), it does not ask. It stops and shows the commands to run.
@@ -47,7 +49,7 @@ To check everything first without starting the runs, add `-PreflightOnly`. It en
 
 The script downloads both versions from GitHub itself. It does not run the code in the folder you cloned.
 
-It uses your current Az PowerShell sign-in. If there is none, it asks you to sign in once. Add `-DeviceLogin` to sign in with a code instead of a browser window.
+It uses your current Az PowerShell sign-in. If there is none, it asks you to sign in once. Add `-DeviceLogin` to sign in with a code instead of a browser window. The two runs then use a code too, if they have to sign in.
 
 Each run takes about as long as one normal run of the tool on that subscription. The runs go one after the other.
 
@@ -77,4 +79,4 @@ A new folder `rda-before-after-<date and time>`, in the folder you ran it from, 
 
 ## If something goes wrong
 
-The script ends with exit code 0 when both runs worked, and 1 when a check or a run failed. It prints what to do. If a run failed, send the 3 files anyway: they show what went wrong.
+The script ends with exit code 0 when both runs wrote their report zip, and 1 when a check or a run failed. A run of the new version can end with exit 3, 4 or 5: its report was written, with some data missing (see the exit-code table in README.md). The script then still ends with 0 and prints that run's exit code. It prints what to do. If a run failed, send the files anyway: they show what went wrong.

@@ -3,7 +3,7 @@
 # Az modules (offer to install), Azure CLI (never installed, offer to sign in),
 # Reader check, and -PreflightOnly. Install-Module, az and the Azure calls are mocked:
 # nothing is installed, no sign-in happens, and no real az is needed.
-# Run: pwsh -NoProfile -NonInteractive -Command "Invoke-Pester -Path ./tests -Output Detailed"
+# Run: pwsh -NoProfile -NonInteractive -Command "Invoke-Pester -Path ./Tests/Invoke-RdaPreflight.Tests.ps1 -Output Detailed"
 
 BeforeAll {
     $script:Root = Split-Path -Parent $PSScriptRoot
@@ -292,7 +292,7 @@ Describe 'Azure CLI with a fake az on PATH' -Skip:($IsWindows) {
     BeforeAll {
         $script:Bin = Join-Path $TestDrive 'fakeaz'; New-Item -ItemType Directory $script:Bin -Force | Out-Null
         $script:Log = Join-Path $TestDrive 'az-args.log'; $script:Flag = Join-Path $TestDrive 'az-signed-in'
-        $Sh = "#!/bin/sh`necho `"`$*`" >> '$($script:Log)'`ncase `"`$1`" in`n  login) touch '$($script:Flag)'; exit 0 ;;`n  account) [ -f '$($script:Flag)' ] && exit 0 || exit 1 ;;`nesac`nexit 2`n"
+        $Sh = "#!/bin/sh`necho `"`$*`" >> '$($script:Log)'`ncase `"`$1`" in`n  login) touch '$($script:Flag)'; exit 0 ;;`n  account) [ -f '$($script:Flag)' ] || exit 1; [ `"`$2`" = show ] && echo '$($script:T)'; exit 0 ;;`nesac`nexit 2`n"
         [IO.File]::WriteAllText((Join-Path $script:Bin 'az'), $Sh)
         & chmod +x (Join-Path $script:Bin 'az')
         $script:OldPath = $env:PATH
@@ -429,6 +429,28 @@ Describe 'PreflightOnly, run from inside a clone' {
         @(Get-ChildItem -LiteralPath $script:Clone -Directory).Count | Should -Be 0
     }
 
+    It 'stops with the Set-AzContext command when the CLI side would see another default tenant' {
+        Mock Test-RdaChildSeesSignIn { -not $DefaultTenant }
+        Push-Location $script:Clone
+        try
+        {
+            $R = Invoke-Captured { Invoke-RdaBeforeAfter -TenantID $script:T -SubscriptionID $script:S -AfterBranch 'x' -BeforeCodePath $script:Bt -AfterCodePath $script:At -PreflightOnly }
+        }
+        finally { Pop-Location }
+        $R.Result | Should -Be 1
+        $R.Text | Should -Match ([regex]::Escape("Set-AzContext -Tenant $($script:T) -Subscription $($script:S)"))
+        $R.Text | Should -Match 'Before uses your default Az PowerShell sign-in'
+        Should -Invoke Test-RdaChildSeesSignIn -Times 1 -Exactly -ParameterFilter { $DefaultTenant }
+        Should -Invoke Invoke-RdaSide -Times 0 -Exactly
+    }
+
+    It 'passes the subscription to the Azure CLI check' {
+        Push-Location $script:Clone
+        try { $null = Invoke-Captured { Invoke-RdaBeforeAfter -TenantID $script:T -SubscriptionID $script:S -AfterBranch 'x' -BeforeCodePath $script:Bt -AfterCodePath $script:At -PreflightOnly } }
+        finally { Pop-Location }
+        Should -Invoke Invoke-RdaAzCliCheck -Times 1 -Exactly -ParameterFilter { $Subscription -eq $script:S }
+    }
+
     It 'stops before the runs when Reader is missing' {
         Mock Invoke-RdaReaderCheck { $false }
         $Out = Join-Path $TestDrive ('o-' + [guid]::NewGuid())
@@ -488,5 +510,60 @@ Describe 'Sign-in stays in this process' {
 
     It 'takes only a GUID as the tenant, so nothing else lands in the command' {
         { Get-RdaChildSignInCheck -Tenant "x'; Remove-Item ~ -Recurse; '" } | Should -Throw '*GUID*'
+    }
+}
+
+Describe 'A side that still uses the Azure CLI, with another tenant active' {
+    BeforeAll {
+        $script:Other = '44444444-4444-4444-4444-444444444444'
+        $script:Acct = [pscustomobject]@{ Id = 'user' }
+    }
+
+    It 'sees a CLI that has a token for the tenant but another active tenant' {
+        Mock Get-Command { [pscustomobject]@{ Name = 'az' } } -ParameterFilter { $Name -eq 'az' }
+        Mock Invoke-RdaAz { 0 }
+        Mock Get-RdaAzCliTenant { $script:Other }
+        Test-RdaAzCliSignIn -Tenant $script:T | Should -Be 'other-tenant'
+        Mock Get-RdaAzCliTenant { $script:T }
+        Test-RdaAzCliSignIn -Tenant $script:T | Should -Be 'ok'
+    }
+
+    It 'asks, and on Y switches the CLI to the subscription with az account set' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $true }
+        $script:Switched = $false
+        Mock Invoke-RdaAz { $script:Switched = $true; 0 }
+        Mock Test-RdaAzCliSignIn { if ($script:Switched) { 'ok' } else { 'other-tenant' } }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeTrue
+        $R.Text | Should -Match 'az account clear'
+        Should -Invoke Invoke-RdaAz -Times 1 -Exactly -ParameterFilter { ($Arguments -join ' ') -eq "account set --subscription $($script:S) --output none" }
+    }
+
+    It 'on N, or when it cannot ask, stops with the command and runs nothing' {
+        Mock Test-RdaCloudShell { $false }
+        Mock Test-RdaAzCliSignIn { 'other-tenant' }
+        Mock Invoke-RdaAz { 0 }
+        Mock Test-RdaInteractiveHost { $true }
+        Mock Read-RdaYesNo { $false }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match ([regex]::Escape("Run: az account set --subscription $($script:S)"))
+        Mock Test-RdaInteractiveHost { $false }
+        $R = Invoke-Captured { Invoke-RdaAzCliCheck -Tenant $script:T -Subscription $script:S -Side 'Before' }
+        $R.Result | Should -BeFalse
+        $R.Text | Should -Match 'non-interactive'
+        Should -Invoke Invoke-RdaAz -Times 0 -Exactly
+        Should -Invoke Read-RdaYesNo -Times 1 -Exactly
+    }
+
+    It 'with -DefaultTenant, says no when the saved default is another tenant' {
+        Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:Other } } }
+        Mock Get-AzAccessToken { 'token' }
+        & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T -DefaultTenant))) | Should -BeFalse
+        & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T))) | Should -BeTrue
+        Mock Get-AzContext { [pscustomobject]@{ Account = $script:Acct; Tenant = [pscustomobject]@{ Id = $script:T } } }
+        & ([scriptblock]::Create((Get-RdaChildSignInCheck -Tenant $script:T -DefaultTenant))) | Should -BeTrue
     }
 }
