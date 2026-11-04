@@ -6,7 +6,7 @@
 # A direct ResourceInventory.ps1 run (no -RunAllSubs) can reach its last line
 # without having written the report zip: when 5 collectors fail in a row the
 # collection phase stops before the inventory is written, and when the HTML
-# report cannot be built Compress-Archive writes no zip. Such a run used to
+# report cannot be built no zip is made. Such a run used to
 # print the missing zip on its 'Reporting Data File:' line and exit 0. It now
 # ends with a red 'No report was written' line and exits 2. A run that writes
 # its zip, including one over a subscription with no resources, still exits 0.
