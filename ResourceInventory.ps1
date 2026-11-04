@@ -2468,7 +2468,6 @@ if ($Obfuscate.IsPresent)
         Write-Log -Message ("  - Debug log:  {0}" -f $Global:DebugLogFile) -Severity 'Warning'
     }
     Write-Log -Message ("") -Severity 'Info'
-    Write-Log -Message ("The ZIP file is safe to share with AWS or partners.") -Severity 'Success'
     Write-Log -Message ("Partners may ask about obfuscated names (e.g. 'prod_a1b2c3d4-...'). Use the dictionary file to look up the real resource name and respond.") -Severity 'Info'
     Write-Log -Message ("Delete the dictionary and transcript when no longer needed for security.") -Severity 'Warning'
 }
@@ -2543,6 +2542,7 @@ else
     Write-Log -Message ('Transcript log excluded from zip (kept locally for debug)') -Severity 'Info'
 }
 
+$ZipExistedBefore = Test-Path -LiteralPath $Global:ZipOutputFile
 try
 {
     Compress-RdaReportArchive @CompressionOutput
@@ -2553,6 +2553,17 @@ catch
     # Write-Log, not Write-Error: the script's 'silentlycontinue' preference hides Write-Error.
     Write-Log -Message ("Error Compressing Output File: {0}: {1}" -f $Global:ZipOutputFile, $_.Exception.Message) -Severity 'Error'
     Write-Log -Message ("Please zip the output files manually.") -Severity 'Error'
+    # A zip cut off part-way must not be named as the report below. One that was there
+    # before this step is not this step's to remove.
+    if (-not $ZipExistedBefore -and (Test-Path -LiteralPath $Global:ZipOutputFile))
+    {
+        Remove-Item -LiteralPath $Global:ZipOutputFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($Obfuscate.IsPresent -and (Test-Path -LiteralPath $Global:ZipOutputFile))
+{
+    Write-Log -Message ("The ZIP file is safe to share with AWS or partners.") -Severity 'Success'
 }
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
