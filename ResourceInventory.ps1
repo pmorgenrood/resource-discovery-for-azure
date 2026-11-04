@@ -46,6 +46,15 @@ if (-not (Test-Path -LiteralPath $CommonFunctionsFile -PathType Leaf))
 }
 . $CommonFunctionsFile
 
+$InventoryJsonFunctionsFile = Join-Path $PSScriptRoot 'Functions/InventoryJson.Functions.ps1'
+if (-not (Test-Path -LiteralPath $InventoryJsonFunctionsFile -PathType Leaf))
+{
+    Write-Host "ERROR: Required functions file not found: $InventoryJsonFunctionsFile" -ForegroundColor Red
+    Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
+    exit 1
+}
+. $InventoryJsonFunctionsFile
+
 # -Debug:$false is bound too, so read the value, not only whether it was passed.
 $DebugMode = $PSBoundParameters.ContainsKey('Debug') -and [bool]$PSBoundParameters['Debug']
 
