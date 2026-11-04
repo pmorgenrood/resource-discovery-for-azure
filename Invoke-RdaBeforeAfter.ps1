@@ -1108,6 +1108,8 @@ function Test-RdaReaderAccess
             while ($true)
             {
                 $J = $R.Content | ConvertFrom-Json
+                # A reply with no list (missing or null) tells nothing: unknown.
+                if (-not $J.PSObject.Properties['value'] -or $J.value -isnot [System.Array]) { return [pscustomobject]@{ State = 'unknown'; How = 'permissions' } }
                 foreach ($V in @(Get-RdaJsonList $J 'value')) { $Value.Add($V) }
                 $Next = if ($J.PSObject.Properties['nextLink']) { [string]$J.nextLink } else { '' }
                 if (-not $Next) { break }
@@ -1132,7 +1134,14 @@ function Test-RdaReaderAccess
                         if ([int]$G.StatusCode -eq 200)
                         {
                             $Gj = $G.Content | ConvertFrom-Json -ErrorAction Stop
-                            if ($Gj.PSObject.Properties['value']) { $Seen = @($Gj.value).Count }
+                            # Conclusive only as a real list; an empty page with more pages
+                            # after it, or a null list, is not proof of nothing.
+                            if ($Gj.PSObject.Properties['value'] -and $Gj.value -is [System.Array])
+                            {
+                                $Seen = $Gj.value.Count
+                                $More = $Gj.PSObject.Properties['nextLink'] -and $Gj.nextLink
+                                if ($Seen -eq 0 -and $More) { $Seen = $null }
+                            }
                         }
                     }
                     catch { Write-Verbose ('The {0} list could not be read.' -f $Child) }
@@ -1208,7 +1217,7 @@ function Get-RdaAzCliReadState
     param([Parameter(Mandatory)][string]$Subscription)
     if ($Subscription -notmatch $script:GuidPattern) { return 'unknown' }
     $J = Invoke-RdaAzRest -Path ('/subscriptions/{0}/providers/Microsoft.Authorization/permissions' -f $Subscription) -Parameter @('api-version=2022-04-01')
-    if ($null -eq $J -or -not $J.PSObject.Properties['value']) { return 'unknown' }
+    if ($null -eq $J -or -not $J.PSObject.Properties['value'] -or $J.value -isnot [System.Array]) { return 'unknown' }
     # A next page is not read here: its link holds '&', which cmd.exe (az.cmd on
     # Windows) would cut. Without the rest of the reply the answer is unknown (warn).
     if ($J.PSObject.Properties['nextLink'] -and $J.nextLink) { return 'unknown' }
@@ -1221,8 +1230,10 @@ function Get-RdaAzCliReadState
         foreach ($Child in 'resourcegroups', 'resources')
         {
             $G = Invoke-RdaAzRest -Path ('/subscriptions/{0}/{1}' -f $Subscription, $Child) -Parameter @('api-version=2021-04-01', '$top=1')
-            if ($null -eq $G -or -not $G.PSObject.Properties['value']) { return 'unknown' }
-            if (@($G.value).Count -gt 0) { return 'partial' }
+            if ($null -eq $G -or -not $G.PSObject.Properties['value'] -or $G.value -isnot [System.Array]) { return 'unknown' }
+            if ($G.value.Count -gt 0) { return 'partial' }
+            # An empty page with more pages after it is not proof of nothing.
+            if ($G.PSObject.Properties['nextLink'] -and $G.nextLink) { return 'unknown' }
         }
     }
     return $State

@@ -815,3 +815,38 @@ Describe 'End notes about the current release' {
         Should -Invoke Invoke-RdaAzCliReaderCheck -Times 1 -Exactly -ParameterFilter { $Side -eq 'Before' -and $Subscription -eq $script:S }
     }
 }
+
+Describe 'Round 6: replies that are not conclusive' {
+    AfterEach { Remove-Item function:global:az -ErrorAction SilentlyContinue }
+
+    It 'Az PowerShell: <Case> gives unknown' -TestCases @(
+        @{ Case = 'a null permissions list'; Perm = '{"value":null}'; Rg = '{"value":[]}'; Res = '{"value":[]}' }
+        @{ Case = 'a null resource group list'; Perm = '{"value":[]}'; Rg = '{"value":null}'; Res = '{"value":[]}' }
+        @{ Case = 'an empty resource group page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[],"nextLink":"https://example.invalid/p2"}'; Res = '{"value":[]}' }
+    ) {
+        param($Case, $Perm, $Rg, $Res)
+        $null = $Case
+        $script:R6 = @{ Perm = $Perm; Rg = $Rg; Res = $Res }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = $script:R6.Perm } } -ParameterFilter { $Path -like '*Microsoft.Authorization/permissions*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = $script:R6.Rg } } -ParameterFilter { $Path -like '*/resourcegroups?*' }
+        Mock Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = $script:R6.Res } } -ParameterFilter { $Path -like '*/resources?*' }
+        (Test-RdaReaderAccess -Subscription $script:S).State | Should -Be 'unknown'
+    }
+
+    It 'Azure CLI: <Case> gives unknown' -TestCases @(
+        @{ Case = 'a null permissions list'; Perm = '{"value":null}'; Rg = '{"value":[]}'; Res = '{"value":[]}' }
+        @{ Case = 'a null resource group list'; Perm = '{"value":[]}'; Rg = '{"value":null}'; Res = '{"value":[]}' }
+        @{ Case = 'an empty resource group page with more after it'; Perm = '{"value":[]}'; Rg = '{"value":[],"nextLink":"https://example.invalid/p2"}'; Res = '{"value":[]}' }
+    ) {
+        param($Case, $Perm, $Rg, $Res)
+        $null = $Case
+        $script:R6 = @{ Perm = $Perm; Rg = $Rg; Res = $Res }
+        function global:az
+        {
+            $global:LASTEXITCODE = 0
+            $U = $args[$args.IndexOf('--url') + 1]
+            if ($U -like '*/resourcegroups') { $script:R6.Rg } elseif ($U -like '*/resources') { $script:R6.Res } else { $script:R6.Perm }
+        }
+        Get-RdaAzCliReadState -Subscription $script:S | Should -Be 'unknown'
+    }
+}
