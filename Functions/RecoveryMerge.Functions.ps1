@@ -344,6 +344,18 @@ function Merge-RecoveryData
     # "<ReportName>_<stamp>" base so the rebuilt bundle keeps the run's identity.
     $BundleBase = $GapInventoryFile.BaseName -replace '^Inventory_', ''
 
+    # -- Every requested recovery source is checked before anything is
+    #    written, so a stop never leaves a partial output folder (or, with
+    #    -OutputPath on the gap folder, an overwritten gap inventory).
+    if ($RecoverConsumption -and -not (Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional))
+    {
+        throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption. Nothing was written." -f $RecoveryBundlePath)
+    }
+    if ($RecoverMetrics -and @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue).Count -eq 0)
+    {
+        throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
+    }
+
     if (-not (Test-Path -Path $OutputPath -PathType Container))
     {
         New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
