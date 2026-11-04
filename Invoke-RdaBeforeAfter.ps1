@@ -854,7 +854,8 @@ function Test-RdaAzSignIn
     if (-not $Ctx -or -not $Ctx.Tenant -or $Ctx.Tenant.Id -ne $Tenant -or -not $Ctx.Subscription -or $Ctx.Subscription.Id -ne $Subscription)
     {
         # Pick the tenant and subscription from the cached sign-in, if it has them. No prompt.
-        try { $null = Set-AzContext -Tenant $Tenant -Subscription $Subscription -ErrorAction Stop -WarningAction SilentlyContinue }
+        # -Scope Process: never change the user's saved default tenant or subscription.
+        try { $null = Set-AzContext -Tenant $Tenant -Subscription $Subscription -Scope Process -ErrorAction Stop -WarningAction SilentlyContinue }
         catch { return $false }
     }
     try
@@ -895,12 +896,22 @@ function Connect-RdaOnce
     return $false
 }
 
+# The check a new PowerShell process runs: is there a saved sign-in that can get a
+# token for this tenant? Its default context may be another tenant, because this
+# script switches tenant for its own process only; each run switches the same way.
+function Get-RdaChildSignInCheck
+{
+    param([Parameter(Mandatory)][string]$Tenant)
+    if ($Tenant -notmatch $script:GuidPattern) { throw 'The tenant id must be a GUID.' }
+    return "`$c = Get-AzContext -ErrorAction SilentlyContinue; if (-not `$c -or -not `$c.Account) { return `$false }; try { `$null = Get-AzAccessToken -TenantId '$Tenant' -ErrorAction Stop -WarningAction SilentlyContinue; return `$true } catch { return `$false }"
+}
+
 # A new PowerShell process must see the same sign-in, or each run would ask again.
 function Test-RdaChildSeesSignIn
 {
     param([string]$Tenant)
     $PwshPath = (Get-Process -Id $PID).Path
-    $Cmd = "`$c = Get-AzContext -ErrorAction SilentlyContinue; if (`$c -and `$c.Tenant -and `$c.Tenant.Id -eq '$Tenant') { exit 0 }; exit 3"
+    $Cmd = "if (& { $(Get-RdaChildSignInCheck -Tenant $Tenant) }) { exit 0 }; exit 3"
     & $PwshPath -NoProfile -NonInteractive -Command $Cmd *> $null
     return ($LASTEXITCODE -eq 0)
 }
