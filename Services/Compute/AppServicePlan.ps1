@@ -7,6 +7,19 @@ if ($Task -eq 'Processing')
 
     if ($APPSvcPlan)
     {
+        # Collect the autoscale targets once so each plan checks them with a lookup
+        # instead of scanning every autoscale setting. The comparer is the one the
+        # -eq this replaces uses for two strings (invariant culture, ignore case).
+        # A setting whose target is not a single string keeps the -eq check, so
+        # every plan gets the same answer as before.
+        $AutoScaleTargets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
+        $AutoScaleOther = [System.Collections.Generic.List[object]]::new()
+        foreach ($Setting in $APPAutoScale)
+        {
+            $Target = $Setting.Properties.targetResourceUri
+            if ($Target -is [string]) { [void]$AutoScaleTargets.Add($Target) } else { $AutoScaleOther.Add($Setting) }
+        }
+
         $Tmp = @()
 
         foreach ($1 in $APPSvcPlan)
@@ -16,9 +29,21 @@ if ($Task -eq 'Processing')
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
             $Sku = $1.SKU
-            $AutoScale = ($APPAutoScale | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
 
-            if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
+            if ($1.id -is [string])
+            {
+                $AutoSc = $AutoScaleTargets.Contains($1.id)
+                if (-not $AutoSc -and $AutoScaleOther.Count -gt 0)
+                {
+                    $AutoScale = ($AutoScaleOther | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
+                    if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
+                }
+            }
+            else
+            {
+                $AutoScale = ($APPAutoScale | Where-Object { $_.Properties.targetResourceUri -eq $1.id })
+                if ([string]::IsNullOrEmpty($AutoScale)) { $AutoSc = $false }else { $AutoSc = $true }
+            }
 
             $Obj = @{
                 'ID'                    = $1.id;
