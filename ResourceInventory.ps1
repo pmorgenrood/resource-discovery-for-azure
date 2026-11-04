@@ -1792,7 +1792,19 @@ function ExecuteInventoryProcessing()
         $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Version' -Value NotSet
         $Global:SmaResources.Version = $Global:Version
 
-        Write-InventoryJson -InputObject $Global:SmaResources -Path $Global:JsonFile
+        # Write-InventoryJson removes its temporary file and throws when the write fails (out of
+        # memory on a large estate, a full disk, a value ConvertTo-Json rejects). The script runs
+        # with ErrorActionPreference 'silentlycontinue', and on a direct run no caller catches
+        # the throw, so nothing would show it: log the real cause here first, then throw it on.
+        try
+        {
+            Write-InventoryJson -InputObject $Global:SmaResources -Path $Global:JsonFile
+        }
+        catch
+        {
+            Write-Log -Message ("Inventory write FAILED: {0} was not written: {1}" -f $Global:JsonFile, $_.Exception.Message) -Severity 'Error' -ToDebugLog
+            throw
+        }
 
         Write-Log -Message ('Resource Reporting Phase Done.') -Severity 'Info'
     }
