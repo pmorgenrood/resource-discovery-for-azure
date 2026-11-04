@@ -24,12 +24,13 @@ BeforeAll {
     $script:Base = "/subscriptions/$script:Sub/resourcegroups/rg-demo/providers"
     $script:Token = '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
-    # A masked id without the random GUIDs of its tokens, so a leak check on
-    # a short real name ('aa-a') is not set off by a GUID that holds it.
+    # A masked id with each prod_/nonprod_ token replaced, so a leak check on
+    # a short real name ('aa-a') is not set off by a token's random GUID. Only
+    # token GUIDs go: a real subscription GUID left in the text is still seen.
     function Get-TextOutsideTokenGuid
     {
         param([string]$Text)
-        return ($Text -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<guid>')
+        return ($Text -replace '(?:prod|nonprod)_(?:[a-z]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '<token>')
     }
 
     function Reset-ObfuscationState
@@ -79,6 +80,7 @@ Describe 'Get-ObfuscatedResourceId' {
         $Masked = '/subscriptions/prod_0000aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/resourcegroups/prod_11111111-1111-4111-8111-111111111111/providers/microsoft.automation/automationaccounts/prod_123456aa-aaaa-4bbb-8ccc-dddddddddddd'
         Get-TextOutsideTokenGuid $Masked | Should -Not -Match ([regex]::Escape('aa-a'))
         Get-TextOutsideTokenGuid ($Masked + '/runbooks/aa-a') | Should -Match ([regex]::Escape('aa-a')) -Because 'a real name outside a token is still caught'
+        Get-TextOutsideTokenGuid "/subscriptions/$script:Sub/resourcegroups/prod_11111111-1111-4111-8111-111111111111" | Should -Match ([regex]::Escape($script:Sub)) -Because 'a real subscription GUID is not a token, so it is still caught'
     }
 
     It 'uses the parent resource''s own name token for the parent segment' {
