@@ -40,11 +40,19 @@ BeforeAll {
         if ($InvFile) { $script:Inventory = Get-Content $InvFile.FullName -Raw | ConvertFrom-Json }
     }
 
-    # The optional type-prefix group (databricks_, aks_, vmss_) covers the
-    # legitimate variants the obfuscator emits for resources whose IDs do not
-    # fit the standard ARM shape. See ResourceInventory.ps1 lines 650-655 and
-    # 1030-1034 for where these are produced.
-    $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # A ResourceIdMap key is the masked resource ID: an ARM-shaped path, never
+    # a flat token, and the same string the inventory ID and the consumption
+    # ResourceId use for that resource.
+    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
+    # Every subscription, resource group and name segment is a prod_/nonprod_
+    # token, so a real name left in any of them fails. Name tokens may carry
+    # the databricks_/aks_/vmss_ type hint; provider and type segments stay as written.
+    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+    # Any masked token anywhere in a value; a real Azure ID never holds one.
+    $script:MaskedTokenPattern = '(^|/)(prod|nonprod)_[a-z_]*' + $MaskedGuid + '(/|$)'
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 }
 
@@ -67,12 +75,12 @@ Describe "Dictionary Structure" {
         $script:Dictionary.GeneratedAt | Should -Not -BeNullOrEmpty
     }
 
-    It "ResourceIdMap keys should be obfuscated values" {
+    It "ResourceIdMap keys should be masked ARM paths" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
         $Keys = $script:Dictionary.ResourceIdMap.PSObject.Properties.Name
         foreach ($key in $Keys)
         {
-            $key | Should -Match $script:ObfuscationPattern -Because "Dictionary key '$key' should be an obfuscated ID"
+            $key | Should -Match $script:MaskedIdPattern -Because "Dictionary key '$key' should be a masked ARM path"
         }
     }
 
@@ -108,7 +116,7 @@ Describe "No Double Obfuscation" {
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
         foreach ($val in $Values)
         {
-            $val | Should -Not -Match $script:ObfuscationPattern -Because "Real ID '$val' should not look like an obfuscated value"
+            $val | Should -Not -Match $script:MaskedTokenPattern -Because "Real ID '$val' should not hold an obfuscated token"
         }
     }
 }

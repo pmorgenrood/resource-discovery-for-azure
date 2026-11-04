@@ -44,10 +44,16 @@ BeforeAll {
     }
     $script:MetricRows = @($MetricRows)
 
-    # Obfuscation token grammar (same shape used by Obfuscation.Tests.ps1):
-    # prod_/nonprod_ + optional type hint + GUID. Used to prove that a
-    # cross-reference / cached metric value is a real token, never a raw id.
-    $script:TokenPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # Masked resource ID grammar (same shape used by Obfuscation.Tests.ps1):
+    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
+    # Every subscription, resource group and name segment is a prod_/nonprod_
+    # token (name tokens may carry a databricks_/aks_/vmss_ hint); provider and
+    # type segments stay as written. Used to prove that a cross-reference /
+    # cached metric value is a masked ID, never a raw id or a flat token.
+    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
 }
 
 AfterAll {
@@ -286,8 +292,8 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
         # 'obfuscated' sentinel when the target is out of scope (Req 2.3).
         # There is no dedicated Service Fabric collector/inventory bucket, so
         # a Service-Fabric-backed match can't be looked up against a known-ID
-        # allowlist the way AKS can - instead we accept any well-formed
-        # prod_/nonprod_ token, which the AKS-cluster case already satisfies.
+        # allowlist the way AKS can - instead we accept any well-formed masked
+        # ID, which the AKS-cluster case already satisfies.
         $ClusterIds = @(@($script:Inventory.AKS) | Where-Object { $null -ne $_ } | ForEach-Object { $_.ID })
         $Checked = 0
         foreach ($ss in $VmssItems)
@@ -296,7 +302,7 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
             {
                 $IsKnownClusterId = $ss.AKS -in $ClusterIds
                 $IsSentinel = $ss.AKS -eq 'obfuscated'
-                $IsWellFormedToken = $ss.AKS -match $script:TokenPattern
+                $IsWellFormedToken = $ss.AKS -match $script:MaskedIdPattern
                 ($IsKnownClusterId -or $IsSentinel -or $IsWellFormedToken) | Should -BeTrue `
                     -Because "VMSS '$($ss.ID)' related-cluster value should match its cluster's own obfuscated ID (AKS or Service Fabric), or be the out-of-scope sentinel"
                 $Checked++
@@ -325,7 +331,7 @@ Describe "Cross-Reference Out-of-Scope Sentinel (P8)" {
         foreach ($ref in $Refs)
         {
             if ($ref -in $Tolerated) { continue }
-            ($ref -in $script:AllIds -or $ref -match $script:TokenPattern) | Should -BeTrue -Because "cross-reference '$ref' must be a valid target token or the 'obfuscated' sentinel, never a raw identifier"
+            ($ref -in $script:AllIds -or $ref -match $script:MaskedIdPattern) | Should -BeTrue -Because "cross-reference '$ref' must be a valid target token or the 'obfuscated' sentinel, never a raw identifier"
         }
     }
 }
@@ -356,7 +362,7 @@ Describe "Metric Per-Resource Cached Token (P8)" {
         if ($AbsentIds.Count -eq 0) { Set-ItResult -Skipped -Because "fixture does not exercise the metric fallback path (all metric-referenced resources are present in the inventory dictionary)"; return }
         foreach ($id in $AbsentIds)
         {
-            $id | Should -Match $script:TokenPattern -Because "a metric resource absent from the main dictionary should still receive a cached prod_/nonprod_ token, not a raw id"
+            $id | Should -Match $script:MaskedIdPattern -Because "a metric resource absent from the main dictionary should still receive a masked ID with cached prod_/nonprod_ tokens, not a raw id ('$id')"
             $id | Should -Not -Be 'obfuscated' -Because "the metric fallback assigns a correlatable cached token, not the lossy sentinel"
         }
     }
