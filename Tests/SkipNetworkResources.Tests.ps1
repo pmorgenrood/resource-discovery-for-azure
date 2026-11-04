@@ -156,7 +156,7 @@ Describe 'The skip list' {
             $Hits = [System.Collections.Generic.List[string]]::new()
             $Unchecked = [System.Collections.Generic.List[string]]::new()
             $Literals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $Compare = '(?i)\btype\b[''"]?(?:\.ToLower(?:Invariant)?\(\))?\s*-[ic]?(eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains)\s*(''[^'']*''|"[^"]*"|\S+)'
+            $Compare = '(?i)\btype\b[''"]?(?:\.ToLower(?:Invariant)?\(\))?(?:\s*\))?[''"]?\s*-[ic]?(eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains)\s*(''[^'']*''|"[^"]*"|\S+)'
             foreach ($M in [regex]::Matches($Text, $Compare))
             {
                 $Op = $M.Groups[1].Value.ToLowerInvariant() -replace '^not', '' -replace '^ne$', 'eq'
@@ -231,6 +231,8 @@ Describe 'The skip list' {
         @{ Label = 'by .ToLower() and -match'; Text = '$Resources | Where-Object { $_.type.ToLower() -match ''^microsoft\.network/route'' }'; Expect = 'hit' }
         @{ Label = 'by .ToLowerInvariant() and -in a variable'; Text = '$Resources | Where-Object { $_.type.ToLowerInvariant() -in $Net }'; Expect = 'unchecked' }
         @{ Label = 'by -split on the type'; Text = '$Resources | Where-Object { ($_.type -split ''/'')[1] -eq ''routetables'' }'; Expect = 'unchecked' }
+        @{ Label = 'by the type in brackets and -match'; Text = '$Resources | Where-Object { ($_.type) -match ''^microsoft\.network/route'' }'; Expect = 'hit' }
+        @{ Label = 'by the type in a string and -match'; Text = '$Resources | Where-Object { "$($_.type)" -match ''^microsoft\.network/route'' }'; Expect = 'hit' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
