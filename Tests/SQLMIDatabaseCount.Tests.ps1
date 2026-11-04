@@ -52,8 +52,8 @@ BeforeAll {
 
     function Invoke-TestCollector
     {
-        param($Resources)
-        & $script:Collector -Sub $script:Subs -Resources $Resources -Task 'Processing' -ResourceIdDictionary $null
+        param($Resources, $Subs = $script:Subs)
+        & $script:Collector -Sub $Subs -Resources $Resources -Task 'Processing' -ResourceIdDictionary $null
     }
 
     function New-TestInstance
@@ -348,6 +348,121 @@ Describe 'SQLMI database count' {
 
         $Rec['Databases'] | Should -Be 2
         $Rec['Databases'] | Should -BeOfType ([int])
+    }
+}
+
+Describe 'SQLMI subscription name' {
+
+    BeforeAll {
+        # What the old per-instance '-eq' scan gave for the same rows.
+        function Get-ScanSubscription
+        {
+            param($Subs, $Instance)
+            $Found = $Subs | Where-Object { $_.id -eq $Instance.subscriptionId }
+            $Found.Name
+        }
+
+        function Assert-SameAsScan
+        {
+            param($Subs, $Instances)
+            $Recs = @(Invoke-TestCollector -Resources $Instances -Subs $Subs)
+            $Recs.Count | Should -Be @($Instances).Count
+            for ($i = 0; $i -lt $Recs.Count; $i++)
+            {
+                $Want = Get-ScanSubscription -Subs $Subs -Instance @($Instances)[$i]
+                $Got = $Recs[$i]['Subscription']
+                if ($null -eq $Want)
+                {
+                    $null -eq $Got | Should -BeTrue -Because "instance $i has no subscription"
+                }
+                else
+                {
+                    $Got.GetType() | Should -Be $Want.GetType() -Because "instance $i keeps the value type"
+                    @($Got) | Should -Be @($Want) -Because "instance $i"
+                }
+            }
+            $Recs
+        }
+
+        function New-SubInstance
+        {
+            param($SubscriptionId, [string]$Name)
+            $Mi = New-TestInstance -Id (Get-MiId $Name) -Name $Name
+            $Mi.subscriptionId = $SubscriptionId
+            $Mi
+        }
+    }
+
+    It 'finds the subscription by id, ignoring letter case, as the scan did' {
+        $Upper = 'ABCDEF00-1234-1234-1234-123456789012'
+        $Subs = @(
+            [pscustomobject]@{ id = $Upper.ToLowerInvariant(); Name = 'sub-a' },
+            [pscustomobject]@{ id = $script:DocGuid; Name = 'sub-b' }
+        )
+        $Rows = @(
+            (New-SubInstance -SubscriptionId $Upper -Name 'mi-1'),
+            (New-SubInstance -SubscriptionId $script:DocGuid -Name 'mi-2'),
+            (New-SubInstance -SubscriptionId 'not-a-sub' -Name 'mi-3')
+        )
+
+        $Recs = @(Assert-SameAsScan -Subs $Subs -Instances $Rows)
+
+        $Recs[0]['Subscription'] | Should -BeExactly 'sub-a'
+        $Recs[1]['Subscription'] | Should -BeExactly 'sub-b'
+        $null -eq $Recs[2]['Subscription'] | Should -BeTrue
+    }
+
+    It 'gives every name, in order, when two subscriptions share an id, as the scan did' {
+        $Subs = @(
+            [pscustomobject]@{ id = $script:DocGuid; Name = 'first' },
+            [pscustomobject]@{ id = 'other'; Name = 'other' },
+            [pscustomobject]@{ id = $script:DocGuid.ToUpperInvariant(); Name = 'second' }
+        )
+        $Recs = @(Assert-SameAsScan -Subs $Subs -Instances @((New-SubInstance -SubscriptionId $script:DocGuid -Name 'mi-dup')))
+        @($Recs[0]['Subscription']) | Should -Be @('first', 'second')
+    }
+
+    It 'gives what the scan gave for null and non-string ids' {
+        $Subs = @(
+            [pscustomobject]@{ id = $script:DocGuid; Name = 'sub-a' },
+            [pscustomobject]@{ id = $null; Name = 'sub-null' },
+            [pscustomobject]@{ id = 42; Name = 'sub-int' }
+        )
+        $Rows = @(
+            (New-SubInstance -SubscriptionId $script:DocGuid -Name 'mi-1'),
+            (New-SubInstance -SubscriptionId $null -Name 'mi-2'),
+            (New-SubInstance -SubscriptionId '42' -Name 'mi-3'),
+            (New-SubInstance -SubscriptionId 42 -Name 'mi-4')
+        )
+        $null = Assert-SameAsScan -Subs $Subs -Instances $Rows
+        $null = Assert-SameAsScan -Subs @($Subs[0]) -Instances $Rows
+    }
+
+    It 'gives what the scan gave for non-ASCII ids, on the invariant and the tr-TR culture' {
+        $Subs = @(
+            [pscustomobject]@{ id = 'sub-' + [char]0x00E4 + '-i'; Name = 'sub-a' },
+            [pscustomobject]@{ id = 'sub-k'; Name = 'sub-k' }
+        )
+        $Rows = @(
+            (New-SubInstance -SubscriptionId ('SUB-' + [char]0x00C4 + '-I') -Name 'mi-1'),
+            (New-SubInstance -SubscriptionId ('sub-' + [char]0x212A) -Name 'mi-2')
+        )
+        $null = Assert-SameAsScan -Subs $Subs -Instances $Rows
+        $Saved = [System.Globalization.CultureInfo]::CurrentCulture
+        try
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::new('tr-TR')
+            $null = Assert-SameAsScan -Subs $Subs -Instances $Rows
+        }
+        finally
+        {
+            [System.Globalization.CultureInfo]::CurrentCulture = $Saved
+        }
+    }
+
+    It 'gives no subscription name when there are no subscriptions' {
+        $Recs = @(Invoke-TestCollector -Resources @((New-SubInstance -SubscriptionId $script:DocGuid -Name 'mi-1')) -Subs $null)
+        $null -eq $Recs[0]['Subscription'] | Should -BeTrue
     }
 }
 
