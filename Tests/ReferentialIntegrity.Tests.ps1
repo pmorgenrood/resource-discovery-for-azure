@@ -51,9 +51,11 @@ BeforeAll {
     # type segments stay as written. Used to prove that a cross-reference /
     # cached metric value is a masked ID, never a raw id or a flat token.
     $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+    $script:MaskedIdPattern = -join @(
+        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
         '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+    )
 }
 
 AfterAll {
