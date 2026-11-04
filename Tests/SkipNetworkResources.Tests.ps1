@@ -142,28 +142,84 @@ Describe 'The skip list' {
         ($List | Sort-Object) -join ',' | Should -Be (($script:ExpectedSkip | Sort-Object) -join ',')
     }
 
-    It 'holds no type that any collector reads (a new collector must not be starved silently)' {
-        $Files = @(Get-ChildItem -Path (Join-Path $script:RepoRoot 'Services'), (Join-Path $script:RepoRoot 'Extension') -Recurse -Filter '*.ps1')
-        $Read = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($File in $Files)
+    BeforeAll {
+        # What a collector's text says about the resource types it reads:
+        # every type comparison (.type / TYPE with -eq, -like, -match, -in,
+        # -contains and their negated or case forms) and every spelled-out
+        # provider type. A -like or -match pattern counts as reading each
+        # skip-list type it matches; a comparison whose right side is not a
+        # quoted literal (a variable, an expression) cannot be checked, so it
+        # is reported on its own.
+        function script:Get-CollectorTypeRead
         {
-            $Text = Get-Content -Path $File.FullName -Raw
-            foreach ($M in [regex]::Matches($Text, '(?i)\.type\s*-[ic]?(eq|like|match|contains|in)\s*[''"]([a-z0-9./*]+)[''"]'))
+            param([string]$Text, [string[]]$SkipList)
+            $Hits = [System.Collections.Generic.List[string]]::new()
+            $Unchecked = [System.Collections.Generic.List[string]]::new()
+            $Literals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $Compare = '(?i)\btype\b[''"]?\s*-[ic]?(eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains)\s*(''[^'']*''|"[^"]*"|\S+)'
+            foreach ($M in [regex]::Matches($Text, $Compare))
             {
-                [void]$Read.Add($M.Groups[2].Value)
+                $Op = $M.Groups[1].Value.ToLowerInvariant() -replace '^not', '' -replace '^ne$', 'eq'
+                $Right = $M.Groups[2].Value
+                if ($Right -notmatch '^[''"].*[''"]$')
+                {
+                    $Unchecked.Add($M.Value)
+                    continue
+                }
+                $Value = $Right.Substring(1, $Right.Length - 2)
+                switch ($Op)
+                {
+                    'like' { foreach ($T in $SkipList) { if ($T -like $Value) { $Hits.Add("$T (by -like '$Value')") } } }
+                    'match' { foreach ($T in $SkipList) { if ($T -match $Value) { $Hits.Add("$T (by -match '$Value')") } } }
+                    default { [void]$Literals.Add($Value) }
+                }
             }
-            # Any spelled-out provider type, wherever it appears in a collector.
             foreach ($M in [regex]::Matches($Text, '(?i)[''"](microsoft\.[a-z0-9]+/[a-z0-9./]+)[''"]'))
             {
-                [void]$Read.Add($M.Groups[1].Value)
+                [void]$Literals.Add($M.Groups[1].Value)
             }
+            foreach ($T in $SkipList) { if ($Literals.Contains($T)) { $Hits.Add($T) } }
+            [pscustomobject]@{ Literals = $Literals; Hits = @($Hits); Unchecked = @($Unchecked) }
+        }
+    }
+
+    It 'holds no type that any collector reads (a new collector must not be starved silently)' {
+        $Files = @(Get-ChildItem -Path (Join-Path $script:RepoRoot 'Services'), (Join-Path $script:RepoRoot 'Extension') -Recurse -Filter '*.ps1')
+        $Skip = @(Get-RdaNetworkSkipList)
+        $AllLiterals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $Hits = [System.Collections.Generic.List[string]]::new()
+        $Unchecked = [System.Collections.Generic.List[string]]::new()
+        foreach ($File in $Files)
+        {
+            $Read = script:Get-CollectorTypeRead -Text (Get-Content -Path $File.FullName -Raw) -SkipList $Skip
+            foreach ($L in $Read.Literals) { [void]$AllLiterals.Add($L) }
+            foreach ($H in $Read.Hits) { $Hits.Add("$($File.Name): $H") }
+            foreach ($U in $Read.Unchecked) { $Unchecked.Add("$($File.Name): $U") }
         }
         # Guard against a regex that silently matches nothing.
-        $Read.Count | Should -BeGreaterThan 50
-        $Read.Contains('microsoft.network/publicipaddresses') | Should -BeTrue
+        $AllLiterals.Count | Should -BeGreaterThan 50
+        $AllLiterals.Contains('microsoft.network/publicipaddresses') | Should -BeTrue
 
-        $Overlap = @(Get-RdaNetworkSkipList | Where-Object { $Read.Contains($_) })
-        $Overlap | Should -BeNullOrEmpty -Because 'a collector reads these types, so they must not be skipped'
+        @($Hits) | Should -BeNullOrEmpty -Because 'a collector reads these types, so they must not be skipped'
+        @($Unchecked) | Should -BeNullOrEmpty -Because 'a type comparison against a variable or expression cannot be checked against the skip list'
+    }
+
+    It 'the collector check catches a skipped type read <Label>' -TestCases @(
+        @{ Label = 'by a literal'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/routetables'' }'; Expect = 'hit' }
+        @{ Label = 'by a -like wildcard'; Text = '$Resources | Where-Object { $_.TYPE -like ''microsoft.network/*'' }'; Expect = 'hit' }
+        @{ Label = 'by a -match pattern'; Text = '$Resources | Where-Object { $_.type -imatch ''^microsoft\.network/route'' }'; Expect = 'hit' }
+        @{ Label = 'by a variable'; Text = '$T = ''microsoft.net'' + ''work/routetables''; $Resources | Where-Object { $_.TYPE -eq $T }'; Expect = 'unchecked' }
+        @{ Label = 'in a -in list held in a variable'; Text = '$Resources | Where-Object { $_.type -in $NetTypes }'; Expect = 'unchecked' }
+    ) {
+        $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
+        if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
+        else { @($Read.Unchecked) | Should -Not -BeNullOrEmpty }
+    }
+
+    It 'the collector check passes a collector that reads only kept types' {
+        $Read = script:Get-CollectorTypeRead -Text '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/publicipaddresses'' -or $_.TYPE -like ''microsoft.compute/*'' }' -SkipList @(Get-RdaNetworkSkipList)
+        @($Read.Hits) | Should -BeNullOrEmpty
+        @($Read.Unchecked) | Should -BeNullOrEmpty
     }
 
     It 'is lowercase, with no duplicates' {
