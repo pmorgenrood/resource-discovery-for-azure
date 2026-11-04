@@ -281,6 +281,24 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Gap -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
+    It 'refuses an -OutputPath that is a link to the <Which> folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Target = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        $Link = Join-Path (Split-Path -Parent $C.Output) ('link_' + [guid]::NewGuid().ToString('N'))
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target $Target -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Link } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        # The reverse spelling: the source given through the link, the output as the real folder.
+        if ($Which -eq 'gap')
+        {
+            { Merge-RecoveryData -GapBundlePath $Link -RecoveryBundlePath $C.Recovery -OutputPath $C.Gap } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        }
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })

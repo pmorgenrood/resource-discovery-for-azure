@@ -195,14 +195,50 @@ function Merge-RecoveryData
 
     if (-not (Test-Path -Path $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
     if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
+    # Full path with every link (symbolic link or junction) on it followed,
+    # so a link and its target compare equal. Parts that do not exist yet are
+    # kept as written. Read against the PowerShell location, '~' expanded.
+    function Resolve-MergeRealPath([string]$Path)
+    {
+        $Sep = [System.IO.Path]::DirectorySeparatorChar
+        $Full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        for ($Hop = 0; $Hop -lt 40; $Hop++)
+        {
+            $Root = [System.IO.Path]::GetPathRoot($Full)
+            $Parts = @($Full.Substring($Root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries))
+            $Current = $Root
+            $Followed = $false
+            for ($i = 0; $i -lt $Parts.Count; $i++)
+            {
+                $Current = [System.IO.Path]::Combine($Current, $Parts[$i])
+                $Item = Get-Item -LiteralPath $Current -Force -ErrorAction SilentlyContinue
+                if ($null -eq $Item) { $Current = [System.IO.Path]::Combine([string[]](@($Current) + @($Parts | Select-Object -Skip ($i + 1)))); break }
+                if ($Item.LinkType -in @('SymbolicLink', 'Junction'))
+                {
+                    $LinkTarget = [string](@($Item.Target)[0])
+                    if (-not [System.IO.Path]::IsPathRooted($LinkTarget)) { $LinkTarget = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($Current), $LinkTarget) }
+                    $Full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine([string[]](@($LinkTarget) + @($Parts | Select-Object -Skip ($i + 1)))))
+                    $Followed = $true
+                    break
+                }
+            }
+            if (-not $Followed)
+            {
+                $Real = [System.IO.Path]::GetFullPath($Current)
+                if ($Real.Length -gt [System.IO.Path]::GetPathRoot($Real).Length) { $Real = $Real.TrimEnd($Sep, [System.IO.Path]::AltDirectorySeparatorChar) }
+                return $Real
+            }
+        }
+        throw ("Merge-RecoveryData: too many links on path '{0}'." -f $Path)
+    }
+
     # The merge writes a new bundle; written into a source folder it would
     # replace that bundle's own files. A new empty folder is the way out.
-    # Paths are read against the PowerShell location (and '~' expanded), not
-    # the process directory, so relative and absolute forms compare equal.
-    $OutFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    # Relative, absolute, '~' and linked forms of one folder compare equal.
+    $OutFull = Resolve-MergeRealPath $OutputPath
     foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
     {
-        $SourceFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $SourceFull = Resolve-MergeRealPath $Source
         if ([string]::Equals($OutFull, $SourceFull, [System.StringComparison]::OrdinalIgnoreCase))
         {
             throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath)
