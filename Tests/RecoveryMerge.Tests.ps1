@@ -332,6 +332,21 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Output -Force -Filter '.rda-merge-probe-*').Count | Should -Be 0 -Because 'the folder check leaves nothing behind'
     }
 
+    It 'refuses an existing -OutputPath whose probe file shows up in the <Which> folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        # Stands in for a bind mount or mapped drive: the path guard sees two
+        # folders, but a file made in the output shows up in the source.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $null = New-Item -ItemType Directory -Path $C.Output
+        $script:ProbeSource = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        Mock Test-Path -ParameterFilter { $LiteralPath -and ([string]$LiteralPath -like ((Join-Path $script:ProbeSource '.rda-merge-probe-') + '*')) } -MockWith { $true }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Output -Force).Count | Should -Be 0 -Because 'the probe is removed and nothing else is written'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
     It 'lets a consumption-only merge run again into the same output folder' {
         # With an empty recovery inventory the merged inventory is byte for
         # byte the gap inventory, under the gap inventory's name.
