@@ -8,7 +8,7 @@
 # -Obfuscate: a report with real names) and exits 0.
 #
 # The script is run the way a user runs it (pwsh -File) from a copy in
-# TestDrive whose three helper files are stand-ins. The stand-ins define
+# TestDrive whose four helper files are stand-ins. The stand-ins define
 # Write-Debug, which the script calls right after it applies -Debug: the
 # stand-in records the error and debug preferences the script set, then exits.
 # So a run that records nothing never got past parameter binding.
@@ -37,6 +37,7 @@ function Write-Debug
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/ResourceInventory.Functions.ps1') -Value $Stub
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/Common.Functions.ps1') -Value '# stand-in'
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/InventoryJson.Functions.ps1') -Value '# stand-in'
+    Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/AzModules.Functions.ps1') -Value '# stand-in'
 
     function script:Invoke-Inventory
     {
