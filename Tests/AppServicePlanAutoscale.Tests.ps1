@@ -17,8 +17,10 @@
 #   - a target that -eq treats as equal under invariant culture rules (a soft
 #     hyphen) matches too
 #   - zero plans emit nothing
-#   - targets that are not one string (missing, an array) and a plan with no
-#     id give the same answer as the -eq check
+#   - targets that are not one string (missing, an array) give the same
+#     answer as the -eq check
+#   - a plan with no id (null, empty or not a string) is $false, even when a
+#     setting has a missing or empty target
 #
 # No live Azure. All GUIDs are the Azure documentation placeholder, not real
 # identifiers.
@@ -80,10 +82,12 @@ BeforeAll {
         }
     }
 
-    # The rule the collector must keep: the -eq scan over every enabled setting.
+    # The rule the collector must keep: a plan with no id is $false, and any
+    # other plan gets the -eq scan over every enabled setting.
     function Get-ExpectedAutoscale
     {
         param($Plan, $Settings)
+        if ($Plan.id -isnot [string] -or $Plan.id.Length -eq 0) { return $false }
         $Enabled = $Settings | Where-Object { $_.Properties.enabled -eq 'true' }
         $Hit = ($Enabled | Where-Object { $_.Properties.targetResourceUri -eq $Plan.id })
         -not [string]::IsNullOrEmpty($Hit)
@@ -166,12 +170,29 @@ Describe 'AppServicePlan AutoscaleEnabled' {
         $Rows[0].AutoscaleEnabled | Should -BeTrue
     }
 
-    It 'gives the -eq answer for a plan with no id' {
+    It 'is $false for a plan with no id, even when a setting has no target' {
         $Plan = New-TestPlan -Name 'plan-i' -Id $null
         $Settings = @((New-TestAutoscale -Name 'as-i1' -Target $null), (New-TestAutoscale -Name 'as-i2' -Target ''))
         $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
         $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
-        $Rows[0].AutoscaleEnabled | Should -BeTrue
+        $Rows[0].AutoscaleEnabled | Should -BeOfType [bool]
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
+    }
+
+    It 'is $false for a plan with an empty id, even when a setting has an empty target' {
+        $Plan = New-TestPlan -Name 'plan-i2' -Id ''
+        $Settings = @((New-TestAutoscale -Name 'as-i3' -Target ''))
+        $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
+        $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
+    }
+
+    It 'is $false for a plan whose id is not a string' {
+        $Plan = New-TestPlan -Name 'plan-i3' -Id 0
+        $Settings = @((New-TestAutoscale -Name 'as-i4' -Target $null), (New-TestAutoscale -Name 'as-i5' -Target '0'))
+        $Rows = @(Invoke-TestCollector -Resources (@($Plan) + $Settings))
+        $Rows[0].AutoscaleEnabled | Should -Be (Get-ExpectedAutoscale -Plan $Plan -Settings $Settings)
+        $Rows[0].AutoscaleEnabled | Should -BeFalse
     }
 
     It 'is $false for a plan with an empty id and only a missing target' {
