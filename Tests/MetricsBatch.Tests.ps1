@@ -23,7 +23,9 @@
 # Pester mocks do not reach, so the batch endpoint is a local HttpListener
 # (Metrics.ps1's internal -MetricsBatchEndpointFormat points at it). It writes
 # every request to a file and answers from the same deterministic data as the
-# stand-in Get-AzMetric, so the two paths can be compared record by record.
+# stand-in Get-AzMetric, so the two paths can be compared record by record. It
+# answers the way the live API does (seen on the sandbox, 2026-11-05): no
+# errorCode on an answered metric, and only the asked aggregation in a point.
 #
 # No live Azure. Run with:
 #   Invoke-Pester ./Tests/MetricsBatch.Tests.ps1 -Output Detailed
@@ -160,10 +162,15 @@ Export-ModuleMember -Function Get-AzMetric
                         $Points = foreach ($Fields in (Get-TestPoints -ResourceId $Id -Name $Name))
                         {
                             $Json = [ordered]@{ timeStamp = '2026-01-01T00:00:00Z' }
-                            foreach ($Key in $Fields.Keys) { if ($null -ne $Fields[$Key]) { $Json[$Key.ToLowerInvariant()] = $Fields[$Key] } }
+                            # As the live API answers: only the asked aggregation, and no field for a point without a value.
+                            $Asked = [string]$Query['aggregation']
+                            foreach ($Key in $Fields.Keys) { if ($null -ne $Fields[$Key] -and $Key -eq $Asked) { $Json[$Key.ToLowerInvariant()] = $Fields[$Key] } }
                             $Json
                         }
-                        @{ name = @{ value = $Name; localizedValue = $Name }; errorCode = 'Success'; unit = 'Count'; timeseries = @(@{ metadatavalues = @(); data = @($Points) }) }
+                        $Answer = @{ name = @{ value = $Name; localizedValue = $Name }; unit = 'Count'; timeseries = @(@{ metadatavalues = @(); data = @($Points) }) }
+                        # The live API leaves errorCode out of an answered metric; the doc's sample has 'Success'.
+                        if ($Control['WithErrorCode']) { $Answer['errorCode'] = 'Success' }
+                        $Answer
                     }
                     $ReturnId = if ($Control['UpperIds']) { $Id.ToUpperInvariant() } else { $Id }
                     @{ resourceid = $ReturnId; resourceregion = 'westeurope'; namespace = [string]$Query['metricnamespace']; value = @($Metrics) }
@@ -455,6 +462,13 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run.Posts.Count | Should -BeGreaterThan 0
         Assert-SameRecords -Expected $script:PerResource -Actual $Run
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'also takes an answer that carries errorCode Success, as the doc shows it' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-doc-shape' -Batch -Control @{ WithErrorCode = $true }
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
     }
 
     It 'keeps whole numbers as JSON numbers with a fraction, as the per-resource path writes them' {
