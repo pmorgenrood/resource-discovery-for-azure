@@ -213,6 +213,14 @@ To collect **one** subscription with the wrapper (its setup checks, sign-in, acc
 
 The run stops with exit code `1`, before it collects anything, when the id is not a GUID (before any file is written), when `Get-AzSubscription -TenantId <tenant>` does not list it, or when it is not `Enabled` (add `-IncludeDisabled` to collect it anyway). Its resume state is its own file, `InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`, so it never changes what a run of the whole tenant has completed or has left to retry, and a run of the whole tenant never changes it; to continue it, run the same command again with `-Resume`.
 
+To check everything before a run, without collecting anything, add `-PreflightOnly`:
+
+```powershell
+./Run-AllSubscriptions.ps1 -TenantID "contoso.onmicrosoft.com" -SubscriptionID "12345678-1234-1234-1234-123456789012" -PreflightOnly
+```
+
+It runs the checks a run makes before it collects: PowerShell 7, the Azure CLI and the Az modules (with the same offers to install them), the tenant, the sign-in, that the tenant lists the subscription and that it is `Enabled` (or every subscription in scope, without `-SubscriptionID`), that the signed-in identity can read it, and its consumption access (unless `-SkipConsumption`). It ends with `Every check passed.` and exit code `0`, or with `Preflight failed: <the check>.` and exit code `1`; a subscription that cannot be read fails it even with `-AllowPartialAccess`. It does not create the `InventoryReports` folder and writes no transcript, report, zip or resume state there, and it does not run the free-space and write checks of that folder.
+
 To scope a run to a **single** resource group, call `ResourceInventory.ps1` directly — the wrapper does not expose `-ResourceGroup`. A direct run can also take one subscription. It accepts the same `-SkipConsumption`, `-SkipMetrics`, and `-Obfuscate` switches.
 
 **Scan a specific subscription directly:**
@@ -520,6 +528,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection. | False | `-SkipConsumption` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
 | `SubscriptionID` | String | Collect only this subscription (its id, a GUID). Stops with exit code `1`, before collecting anything, when the id is not a GUID, the tenant does not list it, or it is not `Enabled` (without `-IncludeDisabled`). Uses its own resume state file (`InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`), so it never changes a run of the whole tenant's state. See [Targeting a single subscription or resource group](#targeting-a-single-subscription-or-resource-group). | — | `-SubscriptionID "12345678-1234-1234-1234-123456789012"` |
+| `PreflightOnly` | Switch | Run only the checks a run makes before it collects (setup, sign-in, the subscription list or `-SubscriptionID`, read and consumption access), then stop: exit code `0` after `Every check passed.`, or `1` after `Preflight failed: <the check>.`. Writes nothing to the inventory folder. See [Targeting a single subscription or resource group](#targeting-a-single-subscription-or-resource-group). | False | `-PreflightOnly` |
 
 ## Troubleshooting
 
@@ -587,7 +596,7 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 | Code | Meaning |
 |---|---|
 | `0` | Clean run — no failures of any kind. |
-| `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). With `-SubscriptionID`: the id is not a GUID (before any file is written), `Get-AzSubscription` does not list it for the tenant, or it is not `Enabled` without `-IncludeDisabled` (before anything is collected). |
+| `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). With `-SubscriptionID`: the id is not a GUID (before any file is written), `Get-AzSubscription` does not list it for the tenant, or it is not `Enabled` without `-IncludeDisabled` (before anything is collected). With `-PreflightOnly`: any check that fails, read access to a subscription included. |
 | `2` | Per-subscription output verification gap (a subscription reported success but its output zip is missing). |
 | `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner. |
 | `4` | Completed, but one or more `Services/*/*.ps1` collectors failed for one or more subscriptions — see the "FAILED (collectors)" banner and "Collector Failures" summary. Affected resource types are missing (not empty) from those subscriptions' reports. |

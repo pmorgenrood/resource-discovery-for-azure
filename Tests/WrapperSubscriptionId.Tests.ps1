@@ -9,6 +9,9 @@
 #   - Its resume state is its own file (.resume-state-<tenant>-subscription-
 #     <id>.json), so it never reads or changes the state of a run of the whole
 #     tenant, and a run of the whole tenant never changes it.
+#   - -PreflightOnly runs the checks of a run and stops: exit 0 after 'Every
+#     check passed.', exit 1 after 'Preflight failed: <the check>.', and the
+#     inventory folder is never created, or left exactly as it was.
 # The helpers are also tested on their own.
 #
 # Every end-to-end run is Run-AllSubscriptions.ps1 itself, as its own pwsh
@@ -215,6 +218,17 @@ exit 0
     function script:Get-Calls { @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'call-*.log' | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() } | Sort-Object) }
     function script:Clear-Calls { Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'call-*.log' | Remove-Item -Force }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $script:Subs[$_].Id } | Sort-Object) }
+    # Every file and folder under the inventory root, and the root itself, with
+    # name, size, time and hash, so a run that changes nothing there leaves the
+    # same list.
+    function script:Get-RootSnapshot
+    {
+        if (-not (Test-Path -LiteralPath $script:Root)) { return @('(no inventory folder)') }
+        @((Get-Item -LiteralPath $script:Root -Force) | ForEach-Object { 'root|{0}' -f $_.LastWriteTimeUtc.Ticks }) + @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Sort-Object FullName | ForEach-Object {
+                if ($_.PSIsContainer) { 'dir|{0}|{1}' -f $_.FullName, $_.LastWriteTimeUtc.Ticks }
+                else { 'file|{0}|{1}|{2}|{3}' -f $_.FullName, $_.Length, $_.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+            })
+    }
     function script:Get-FileHashOrNone { param([string]$Path) if (Test-Path -LiteralPath $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } else { 'none' } }
     # The ids a resume state file lists as completed and as failed.
     function script:Read-StateAt
@@ -312,12 +326,14 @@ Describe 'The -SubscriptionID helpers' {
         $With.Subscription.Id | Should -Be 'aaaaaaaa-0000-4000-8000-000000000001'
     }
 
-    It 'adds -SubscriptionID last in the param block, so the positions of the others stay' {
+    It 'adds -SubscriptionID, then -PreflightOnly, last in the param block, so the positions of the others stay' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
         $Names = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-        $Names[-2] | Should -Be 'ParallelStreams'
-        $Names[-1] | Should -Be 'SubscriptionID'
+        $Names[-3] | Should -Be 'ParallelStreams'
+        $Names[-2] | Should -Be 'SubscriptionID'
+        $Names[-1] | Should -Be 'PreflightOnly'
         @($Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'SubscriptionID' })[0].StaticType | Should -Be ([string])
+        @($Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PreflightOnly' })[0].StaticType | Should -Be ([switch])
     }
 }
 
@@ -430,5 +446,75 @@ Describe 'Run-AllSubscriptions.ps1 -SubscriptionID, end to end' -Skip:($IsWindow
         $Whole.ExitCode | Should -Be 0
         @($Whole.Text | Where-Object { $_ -like 'Resume mode: 1 previously completed subscription(s) will be skipped.' }).Count | Should -Be 1
         script:Get-Calls | Should -Be (script:Get-Ids 'B', 'C')
+    }
+}
+
+Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows) {
+    AfterEach {
+        if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
+    }
+
+    It 'passes with exit 0, collecting nothing and creating no inventory folder (<Label>)' -ForEach @(
+        @{ Label = 'the whole tenant'; One = $false }
+        @{ Label = 'one subscription'; One = $true }
+    ) {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        $Arguments = @('-PreflightOnly')
+        if ($One) { $Arguments += @('-SubscriptionID', $script:Subs['B'].Id) }
+        $Run = script:Invoke-Wrapper -Arguments $Arguments
+        $Run.ExitCode | Should -Be 0
+        @($Run.Text | Where-Object { $_ -eq 'Every check passed.' }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('Subscriptions to process: {0}' -f $(if ($One) { 1 } else { 2 })) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like 'Preflight failed*' }).Count | Should -Be 0
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+        script:Get-Calls | Should -BeNullOrEmpty
+    }
+
+    It 'fails with exit 1 at <Check>, creating no inventory folder' -ForEach @(
+        @{ Check = 'the subscription id'; Arguments = @('-SubscriptionID', 'my-subscription') }
+        @{ Check = 'the subscription'; Arguments = @('-SubscriptionID', 'cccccccc-0000-4000-8000-000000000003') }
+        @{ Check = 'read access'; Arguments = @() }
+        @{ Check = 'read access'; Arguments = @('-AllowPartialAccess') }
+    ) {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $Run = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + @($Arguments))
+        $Run.ExitCode | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('Preflight failed: {0}. Nothing was collected or written to the inventory folder (exit 1).' -f $Check) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq 'Every check passed.' }).Count | Should -Be 0
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+        script:Get-Calls | Should -BeNullOrEmpty
+    }
+
+    It 'fails a denied subscription with read access, naming it' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $Run = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-SubscriptionID', $script:Subs['B'].Id)
+        $Run.ExitCode | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like ('    - Sub B ({0}) - no role on the subscription' -f $script:Subs['B'].Id) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' }).Count | Should -Be 1
+    }
+
+    It 'leaves an existing inventory folder exactly as it is, on <Label>' -ForEach @(
+        @{ Label = 'pass'; Denied = @(); Code = 0 }
+        @{ Label = 'fail'; Denied = @('A'); Code = 1 }
+    ) {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Denied $Denied
+        # A state file of an unfinished run, a report folder with its zip, a note.
+        New-Item -ItemType Directory -Path (Join-Path $script:Root 'ResourcesReport_earlier') -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json | Set-Content -LiteralPath $script:State -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $script:Root 'ResourcesReport_earlier/ResourcesReport_earlier.zip') -Value 'zip bytes'
+        Set-Content -LiteralPath (Join-Path $script:Root 'note.txt') -Value 'operator note'
+        $Old = (Get-Date).AddDays(-2)
+        foreach ($Item in @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force) + @(Get-Item -LiteralPath $script:Root -Force)) { $Item.LastWriteTimeUtc = $Old.ToUniversalTime() }
+        $Before = script:Get-RootSnapshot
+        $Run = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume')
+        $Run.ExitCode | Should -Be $Code
+        if ($Code -eq 0) { @($Run.Text | Where-Object { $_ -eq 'Every check passed.' }).Count | Should -Be 1 }
+        else { @($Run.Text | Where-Object { $_ -eq 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' }).Count | Should -Be 1 }
+        script:Get-RootSnapshot | Should -Be $Before
+        script:Get-Calls | Should -BeNullOrEmpty
     }
 }

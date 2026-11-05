@@ -25,6 +25,13 @@
 function Exit-Wrapper
 {
     param([int]$Code = 0)
+    # A -PreflightOnly run names the check that stopped it ($PreflightCheck,
+    # set by the wrapper before each one). It never started a transcript, so
+    # the stop below is skipped for it.
+    if ($PreflightOnly -and $Code -ne 0)
+    {
+        Write-Host ('Preflight failed: {0}. Nothing was collected or written to the inventory folder (exit {1}).' -f $PreflightCheck, $Code) -ForegroundColor Red
+    }
     if ($WrapperTranscriptStarted)
     {
         try { Stop-Transcript | Out-Null }

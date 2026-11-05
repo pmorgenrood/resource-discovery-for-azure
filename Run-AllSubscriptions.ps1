@@ -94,8 +94,21 @@ param (
     # state is its own file (.resume-state-<tenant>-subscription-<id>.json), so
     # it never changes what a run of the whole tenant has completed or has left
     # to retry, and a run of the whole tenant never changes it.
-    # Last in this block, so the positions of the parameters above stay as they were.
-    [string]$SubscriptionID
+    # After -ParallelStreams, so the positions of the parameters above stay as they were.
+    [string]$SubscriptionID,
+
+    # Run only the checks a run makes before it collects, then stop: PowerShell
+    # 7, az, the Az modules and that Az.Accounts loads, the tenant, the
+    # sign-in, that the tenant lists the subscriptions (with -SubscriptionID:
+    # that one, and that it is Enabled unless -IncludeDisabled), that the
+    # signed-in identity can read them, and its consumption access unless
+    # -SkipConsumption. Exits 0 after 'Every check passed.', or 1 after
+    # 'Preflight failed: <the check>.' (PowerShell 7, az and the Az modules are
+    # checked before the helpers load, so a failure there exits 1 with its own
+    # message, as in a run). It creates no inventory folder and
+    # writes no transcript, report, zip or resume state there.
+    # Last, so the positions of the parameters above stay as they were.
+    [switch]$PreflightOnly
 )
 
 # ---------------------------------------------------------------------------
@@ -466,10 +479,19 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
 # sessions and never throws. See Disable-ConsoleQuickEdit for details.
 Disable-ConsoleQuickEdit
 
+# -PreflightOnly: from here every check names itself in $PreflightCheck before
+# it runs, and Exit-Wrapper names it when it fails.
+if ($PreflightOnly)
+{
+    Write-Host 'Preflight only: running the checks of a run, then stopping. Nothing is collected or written to the inventory folder.' -ForegroundColor Cyan
+    Write-Host ('  PowerShell {0}, az, and the Az modules ({1}) with Az.Accounts loaded: ok.' -f $PSVersionTable.PSVersion, ($RequiredAzSubModules -join ', ')) -ForegroundColor Green
+}
+
 # -SubscriptionID must be a subscription id (a GUID). Checked here, before the
 # run creates or writes any file (the inventory folder, the transcript), so a
 # mistyped id never starts a run. Given but empty is a mistake too, never a run
 # of the whole tenant.
+$script:PreflightCheck = 'the subscription id'
 $OneSubscription = $PSBoundParameters.ContainsKey('SubscriptionID')
 if ($OneSubscription)
 {
@@ -512,56 +534,61 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
-# Inventory root (used for resume state, consolidated output, and the wrapper
-# transcript). Computed up front so the transcript can be started before
-# anything else writes to the host.
-$InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
-if (-not (Test-Path -Path $InventoryRoot -PathType Container))
-{
-    try { New-Item -Path $InventoryRoot -ItemType Directory -Force | Out-Null }
-    catch { Write-Verbose ("InventoryRoot create failed at {0}: {1}" -f $InventoryRoot, $_.Exception.Message) }
-}
-
-# Wrapper-level transcript.
-#
-# ResourceInventory.ps1 already records a per-subscription transcript inside
-# each subscription's output folder. That captures everything inside a single
-# sub's run, but it does not capture the wrapper's own output: tenant
-# resolution, the auth gate's decisions, resume-state messages, the
-# Processing/Completed/ERROR cross-iteration narration, the consolidation
-# step, or the final summary. For multi-subscription runs that bookkeeping is
-# the most useful diagnostic signal of all - which sub failed, why, what came
-# before, and how the wrapper proceeded.
-#
-# This transcript runs at the wrapper level for every invocation (single sub
-# or many) and lands at:
-#   <InventoryRoot>/RunAllSubscriptions_transcript_<timestamp>.txt
-# It also catches everything Write-Host'd by the inner script into the same
-# console session, so the file is a complete record of one wrapper invocation.
-# Start-Transcript is idempotent in the sense that we Stop it on every exit
-# path via Exit-Wrapper.
+# A -PreflightOnly run skips all of this: it creates no inventory folder, starts
+# no transcript, and does not run Invoke-PreFlightChecks (its write probe writes
+# a file there). Nothing on its path below uses $InventoryRoot.
 $WrapperTranscriptStarted = $false
-$WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
-try
+if (-not $PreflightOnly)
 {
-    Start-Transcript -Path $WrapperTranscriptFile -UseMinimalHeader -Force | Out-Null
-    $WrapperTranscriptStarted = $true
-    Write-Host ("Wrapper transcript: {0}" -f $WrapperTranscriptFile) -ForegroundColor DarkGray
+    # Inventory root (used for resume state, consolidated output, and the wrapper
+    # transcript). Computed up front so the transcript can be started before
+    # anything else writes to the host.
+    $InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+    if (-not (Test-Path -Path $InventoryRoot -PathType Container))
+    {
+        try { New-Item -Path $InventoryRoot -ItemType Directory -Force | Out-Null }
+        catch { Write-Verbose ("InventoryRoot create failed at {0}: {1}" -f $InventoryRoot, $_.Exception.Message) }
+    }
+
+    # Wrapper-level transcript.
+    #
+    # ResourceInventory.ps1 already records a per-subscription transcript inside
+    # each subscription's output folder. That captures everything inside a single
+    # sub's run, but it does not capture the wrapper's own output: tenant
+    # resolution, the auth gate's decisions, resume-state messages, the
+    # Processing/Completed/ERROR cross-iteration narration, the consolidation
+    # step, or the final summary. For multi-subscription runs that bookkeeping is
+    # the most useful diagnostic signal of all - which sub failed, why, what came
+    # before, and how the wrapper proceeded.
+    #
+    # This transcript runs at the wrapper level for every invocation (single sub
+    # or many) and lands at:
+    #   <InventoryRoot>/RunAllSubscriptions_transcript_<timestamp>.txt
+    # It also catches everything Write-Host'd by the inner script into the same
+    # console session, so the file is a complete record of one wrapper invocation.
+    # Start-Transcript is idempotent in the sense that we Stop it on every exit
+    # path via Exit-Wrapper.
+    $WrapperTranscriptStarted = $false
+    $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
+    try
+    {
+        Start-Transcript -Path $WrapperTranscriptFile -UseMinimalHeader -Force | Out-Null
+        $WrapperTranscriptStarted = $true
+        Write-Host ("Wrapper transcript: {0}" -f $WrapperTranscriptFile) -ForegroundColor DarkGray
+    }
+    catch
+    {
+        # Non-fatal. If transcript fails to start (rare - usually permissions or
+        # an already-running transcript on this host), the run continues without
+        # one rather than aborting.
+        Write-Host ("WARNING: Could not start wrapper transcript at {0}: {1}" -f $WrapperTranscriptFile, $_.Exception.Message) -ForegroundColor Yellow
+    }
+
+    Invoke-PreFlightChecks -InventoryRoot $InventoryRoot
 }
-catch
-{
-    # Non-fatal. If transcript fails to start (rare - usually permissions or
-    # an already-running transcript on this host), the run continues without
-    # one rather than aborting.
-    Write-Host ("WARNING: Could not start wrapper transcript at {0}: {1}" -f $WrapperTranscriptFile, $_.Exception.Message) -ForegroundColor Yellow
-}
 
 
-
-
-Invoke-PreFlightChecks -InventoryRoot $InventoryRoot
-
-
+$script:PreflightCheck = 'the tenant'
 try
 {
     $TenantID = Resolve-TenantId -Value $TenantID
@@ -581,7 +608,9 @@ catch
 # .resume-state-<tenant>-subscription-<id>.json, never the whole tenant's
 # .resume-state-<tenant>.json or its per-stream files, nor they its own.
 $ResumeKey = Get-ResumeStateKey -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
-$ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $ResumeKey)
+# A -PreflightOnly run has no inventory folder and stops before any resume
+# state is read or written.
+if (-not $PreflightOnly) { $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $ResumeKey) }
 
 
 
@@ -615,6 +644,7 @@ $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $Resume
 
 
 
+$script:PreflightCheck = 'the sign-in'
 try
 {
     $CliTenant = Get-AzCliSignedInTenant
@@ -701,6 +731,7 @@ catch
 # this wrapper to report "All subscriptions processed!" with an empty
 # inventory. Capture warnings and treat zero-results-with-warnings as a
 # loud failure instead of a silent one.
+$script:PreflightCheck = 'the subscription list'
 $SubWarnings = @()
 $AllSubscriptions = Get-AzSubscription -TenantId $TenantID -WarningVariable subWarnings -WarningAction SilentlyContinue
 if ($null -eq $AllSubscriptions) { $AllSubscriptions = @() }
@@ -738,8 +769,10 @@ if ($AllSubscriptions.Count -eq 0)
 # before it reads or writes the resume state or collects anything.
 if ($OneSubscription)
 {
+    $script:PreflightCheck = 'the subscription'
     $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @($SubWarnings | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    foreach ($Line in @($OnePick.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
+    # The pick's lines speak of a run; a preflight only stops its check.
+    foreach ($Line in @($OnePick.Lines)) { Write-Host $(if ($PreflightOnly) { $Line.Text -replace ', so this run stopped before collecting anything \(exit 1\)', '' } else { $Line.Text }) -ForegroundColor $Line.Colour }
     if ($OnePick.Stop) { Exit-Wrapper -Code 1 }
     $AllSubscriptions = @($OnePick.Subscription)
 }
@@ -761,6 +794,58 @@ if ($Excluded.Count -gt 0)
     Write-Host ("Excluded {0} non-Enabled subscription(s) [{1}]. Use -IncludeDisabled to inventory them anyway." -f $Excluded.Count, ($ByState -join ', ')) -ForegroundColor Yellow
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
+
+# -PreflightOnly ends here, before any resume state is read or written: the
+# read access check (the same probe the run's up-front access gate makes, on
+# the same scope, and a failure for any subscription that is not readable,
+# since the run would stop or skip it) and, unless -SkipConsumption, the
+# consumption access check. Then exit 0, or 1 naming the check.
+if ($PreflightOnly)
+{
+    if ($Subscriptions.Count -eq 0)
+    {
+        Write-Host ("ERROR: None of the {0} subscription(s) the tenant lists is Enabled. To check them anyway, run the same command with -IncludeDisabled." -f $AllSubscriptions.Count) -ForegroundColor Red
+        Exit-Wrapper -Code 1
+    }
+    $script:PreflightCheck = 'read access'
+    Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $Subscriptions.Count) -ForegroundColor Cyan
+    $PfDecision = Resolve-AccessPreflight -Probed (Test-SubscriptionAccessAll -Subscriptions $Subscriptions)
+    if ($PfDecision.Inaccessible.Count -gt 0)
+    {
+        Write-Host ("  {0} subscription(s) are NOT readable by the signed-in identity:" -f $PfDecision.Inaccessible.Count) -ForegroundColor Red
+        foreach ($NA in $PfDecision.Inaccessible)
+        {
+            $Label = if ($NA.State -eq 'Unknown') { 'access probe inconclusive after retries' } else { 'no role on the subscription' }
+            Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
+        }
+        Write-Host "  Grant the identity Reader on these subscriptions, then run the check again." -ForegroundColor Yellow
+        Exit-Wrapper -Code 1
+    }
+    Write-Host ("  Access verified: all {0} in-scope subscription(s) are readable." -f $Subscriptions.Count) -ForegroundColor Green
+    if (-not $SkipConsumption)
+    {
+        $script:PreflightCheck = 'consumption access'
+        Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $Subscriptions[0].Name) -ForegroundColor Cyan
+        $PfConsumption = Test-ConsumptionAccess -SubscriptionId $Subscriptions[0].Id
+        if ($PfConsumption.Outcome -eq 'Denied')
+        {
+            Write-Host ("ERROR: The signed-in identity is not authorized to read consumption/billing data. Reason: {0}" -f $PfConsumption.Detail) -ForegroundColor Red
+            Write-Host "Grant this identity 'Cost Management Reader' (or 'Billing Reader' on the billing scope), or add -SkipConsumption." -ForegroundColor Yellow
+            Exit-Wrapper -Code 1
+        }
+        elseif ($PfConsumption.Outcome -eq 'Unavailable')
+        {
+            # As in a run: a transient/token issue, not a denial, does not stop it.
+            Write-Host ("WARNING: Could not verify consumption access (a transient/token issue, not an authorization denial): {0}" -f $PfConsumption.Detail) -ForegroundColor Yellow
+        }
+        else
+        {
+            Write-Host "Consumption access confirmed." -ForegroundColor Green
+        }
+    }
+    Write-Host 'Every check passed.' -ForegroundColor Green
+    Exit-Wrapper -Code 0
+}
 
 # Always seed $CompletedIds from the existing state file. -Resume only
 # controls whether we *use* that list to skip subscriptions; reading it
