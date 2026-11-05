@@ -21,8 +21,7 @@ BeforeAll {
 
     function Plan([hashtable]$Over)
     {
-        $P = @{ Attempt = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; Permanent = $false
-            MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
+        $P = @{ Attempt = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; Permanent = $false; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
         foreach ($K in $Over.Keys) { $P[$K] = $Over[$K] }
         Get-RdaMetricRetryPlan @P
     }
