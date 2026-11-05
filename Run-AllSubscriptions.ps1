@@ -593,7 +593,7 @@ if ($PreflightOnly)
     }
     $PfStateKey = Get-ResumeStateScope -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
     $PfStateFile = Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey
-    $PfView = Get-RunStartView -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays
+    $PfView = Get-RunStartView -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays -OneSubscription:$OneSubscription
     $PfStart = $PfView.RunStart
     # Resolve-RunStart words its lines for a run; here they say what a run would do.
     foreach ($Line in @($PfStart.Lines)) { Write-Host ('  A run would say: ' + ($Line.Text -replace 'This run stops here \(exit 1\), before it signs in, collects anything or writes the resume state', 'A run stops here (exit 1)')) -ForegroundColor $Line.Colour }
@@ -849,7 +849,7 @@ $RetryCommandSettings = Get-RetryCommandSettings -Settings $RunDataSettings -Dev
 # What the resume state and the per-stream state files say about the
 # unfinished run, and how this run starts from it (Get-RunStartView, read
 # only; -PreflightOnly reads it the same way).
-$RunStartView = Get-RunStartView -InventoryRoot $InventoryRoot -ResumeStateFile $ResumeStateFile -Key $ResumeScope -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings -MaxAgeDays $ResumeMaxAgeDays
+$RunStartView = Get-RunStartView -InventoryRoot $InventoryRoot -ResumeStateFile $ResumeStateFile -Key $ResumeScope -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings -MaxAgeDays $ResumeMaxAgeDays -OneSubscription:$OneSubscription
 $StoredRun = $RunStartView.StoredRun
 $RunStart = $RunStartView.RunStart
 foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }

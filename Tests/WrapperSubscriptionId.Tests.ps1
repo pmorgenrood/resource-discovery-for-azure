@@ -1012,5 +1012,14 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $C.Text | Should -Contain '  Nothing is left for the run to collect, so no access check is needed.'
     }
 
+    It 'words the run-start lines of a -SubscriptionID run for that one subscription' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Fresh')
+        $R.ExitCode | Should -Be 0
+        @($R.Text | Where-Object { $_ -like 'Starting a new run (-Fresh). The unfinished run * is not continued: this run collects the subscription again.' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -like '*every subscription*' }) | Should -BeNullOrEmpty
+    }
 }
 
