@@ -1987,7 +1987,8 @@ function ExecuteInventoryProcessing()
                             Start-Sleep -Seconds $ConsumptionBackoffSeconds
                         }
                     }
-                    $UsageDataExport = $UsageData.UsageAggregations.Properties | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime
+                    # An array even for one row, since each row is replaced in place below.
+                    $UsageDataExport = @($UsageData.UsageAggregations.Properties | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime)
 
                     Write-Log -Message ("Records found: $($UsageDataExport.Count)...") -Severity 'Info'
 
@@ -2012,63 +2013,73 @@ function ExecuteInventoryProcessing()
                             $InstanceInfo = [pscustomobject]@{ 'microsoft.resources' = [pscustomobject]@{ resourceuri = ''; location = ''; additionalinfo = [pscustomobject]@{} } }
                         }
 
+                        # Read once: the resource part and its additionalInfo (null when absent).
+                        $UsageResource = $InstanceInfo.'Microsoft.Resources'
+                        $UsageInfo = $UsageResource.additionalInfo
+
                         if (![string]::IsNullOrEmpty($ResourceGroup))
                         {
                             # Same test the up-front consumption data check counts rows by.
-                            if (-not (Test-ConsumptionResourceUriInResourceGroup -ResourceUri $InstanceInfo.'Microsoft.Resources'.resourceUri -ResourceGroup $ResourceGroup))
+                            if (-not (Test-ConsumptionResourceUriInResourceGroup -ResourceUri $UsageResource.resourceUri -ResourceGroup $ResourceGroup))
                             {
                                 continue;
                             }
                         }
 
                         # The clock value as Get-UsageAggregates returned it, no time-zone conversion.
-                        foreach ($DateField in @('UsageStartTime', 'UsageEndTime'))
-                        {
-                            $DateValue = $UsageDataExport[$Item].$DateField
-                            if ($DateValue -is [datetime]) { $UsageDataExport[$Item].$DateField = $DateValue.ToString($UsageDateFormat, $InvariantCulture) }
+                        $UsageRecord = $UsageDataExport[$Item]
+                        $StartText = $UsageRecord.UsageStartTime
+                        if ($StartText -is [datetime]) { $StartText = $StartText.ToString($UsageDateFormat, $InvariantCulture) }
+                        $EndText = $UsageRecord.UsageEndTime
+                        if ($EndText -is [datetime]) { $EndText = $EndText.ToString($UsageDateFormat, $InvariantCulture) }
+
+                        # The row and its JSON column are each built in one go: an Add-Member per
+                        # column was about half of this loop's time. Column order and values are
+                        # the ones the file always had.
+                        $UsageDataExport[$Item] = [pscustomobject]@{
+                            InstanceData       = $UsageRecord.InstanceData
+                            MeterCategory      = $UsageRecord.MeterCategory
+                            MeterId            = $UsageRecord.MeterId
+                            MeterName          = $UsageRecord.MeterName
+                            MeterRegion        = $UsageRecord.MeterRegion
+                            MeterSubCategory   = $UsageRecord.MeterSubCategory
+                            Quantity           = $UsageRecord.Quantity
+                            Unit               = $UsageRecord.Unit
+                            UsageStartTime     = $StartText
+                            UsageEndTime       = $EndText
+                            ResourceId         = $UsageResource.resourceUri
+                            ResourceLocation   = $UsageResource.location
+                            ConsumptionMeter   = $UsageInfo.ConsumptionMeter
+                            ReservationId      = $UsageInfo.ReservationId
+                            ReservationOrderId = $UsageInfo.ReservationOrderId
                         }
 
-                        $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ResourceId -Value NotSet
-                        $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ResourceLocation -Value NotSet
-
-                        $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ConsumptionMeter -Value NotSet
-                        $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ReservationId -Value NotSet
-                        $UsageDataExport[$Item] | Add-Member -MemberType NoteProperty -Name ReservationOrderId -Value NotSet
-
-                        $UsageDataExport[$Item].ResourceId = $InstanceInfo.'Microsoft.Resources'.resourceUri
-                        $UsageDataExport[$Item].ResourceLocation = $InstanceInfo.'Microsoft.Resources'.location
-                        $UsageDataExport[$Item].ConsumptionMeter = $InstanceInfo.'Microsoft.Resources'.additionalInfo.ConsumptionMeter
-                        $UsageDataExport[$Item].ReservationId = $InstanceInfo.'Microsoft.Resources'.additionalInfo.ReservationId
-                        $UsageDataExport[$Item].ReservationOrderId = $InstanceInfo.'Microsoft.Resources'.additionalInfo.ReservationOrderId
-
-                        $InstanceObject = [PSCustomObject]@{}
-
                         $AdditionalInfoInstance = [PSCustomObject]@{
-                            ResourceUri = $InstanceInfo.'Microsoft.Resources'.resourceUri
-                            Location = $InstanceInfo.'Microsoft.Resources'.location
+                            ResourceUri = $UsageResource.resourceUri
+                            Location = $UsageResource.location
                             additionalInfo = [PSCustomObject]@{
-                                ConsumptionMeter = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.ConsumptionMeter) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.ConsumptionMeter }
-                                ImageType = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.ImageType) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.ImageType }
-                                AHB = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.AHB) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.AHB }
-                                vCores = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.vCores) { 0 } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.vCores }
-                                VCPUs = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.VCPUs) { 0 } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.VCPUs }
-                                ServiceType = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServiceType) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServiceType }
+                                ConsumptionMeter = if ($null -eq $UsageInfo.ConsumptionMeter) { "" } else { $UsageInfo.ConsumptionMeter }
+                                ImageType = if ($null -eq $UsageInfo.ImageType) { "" } else { $UsageInfo.ImageType }
+                                AHB = if ($null -eq $UsageInfo.AHB) { "" } else { $UsageInfo.AHB }
+                                vCores = if ($null -eq $UsageInfo.vCores) { 0 } else { $UsageInfo.vCores }
+                                VCPUs = if ($null -eq $UsageInfo.VCPUs) { 0 } else { $UsageInfo.VCPUs }
+                                ServiceType = if ($null -eq $UsageInfo.ServiceType) { "" } else { $UsageInfo.ServiceType }
                                 ResourceCategory = ""
-                                Edition = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.Edition) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.Edition }
-                                LicenseType = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.LicenseType) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.LicenseType }
-                                HostLicenseType = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.HostLicenseType) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.HostLicenseType }
-                                OS = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.OS) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.OS }
-                                IsVM = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.IsVM) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.IsVM }
-                                NumberOfCores = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.NumberOfCores) { 0 } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.NumberOfCores }
-                                NumberOfLogicalProcessors = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.NumberOfLogicalProcessors) { 0 } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.NumberOfLogicalProcessors }
-                                SLO = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.SLO) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.SLO }
-                                ServerSku = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServerSku) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServerSku }
-                                ServerEdition = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServerEdition) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.ServerEdition }
-                                IsHAEnabled = if ($null -eq $InstanceInfo.'Microsoft.Resources'.additionalInfo.IsHAEnabled) { "" } else { $InstanceInfo.'Microsoft.Resources'.additionalInfo.IsHAEnabled }
+                                Edition = if ($null -eq $UsageInfo.Edition) { "" } else { $UsageInfo.Edition }
+                                LicenseType = if ($null -eq $UsageInfo.LicenseType) { "" } else { $UsageInfo.LicenseType }
+                                HostLicenseType = if ($null -eq $UsageInfo.HostLicenseType) { "" } else { $UsageInfo.HostLicenseType }
+                                OS = if ($null -eq $UsageInfo.OS) { "" } else { $UsageInfo.OS }
+                                IsVM = if ($null -eq $UsageInfo.IsVM) { "" } else { $UsageInfo.IsVM }
+                                NumberOfCores = if ($null -eq $UsageInfo.NumberOfCores) { 0 } else { $UsageInfo.NumberOfCores }
+                                NumberOfLogicalProcessors = if ($null -eq $UsageInfo.NumberOfLogicalProcessors) { 0 } else { $UsageInfo.NumberOfLogicalProcessors }
+                                SLO = if ($null -eq $UsageInfo.SLO) { "" } else { $UsageInfo.SLO }
+                                ServerSku = if ($null -eq $UsageInfo.ServerSku) { "" } else { $UsageInfo.ServerSku }
+                                ServerEdition = if ($null -eq $UsageInfo.ServerEdition) { "" } else { $UsageInfo.ServerEdition }
+                                IsHAEnabled = if ($null -eq $UsageInfo.IsHAEnabled) { "" } else { $UsageInfo.IsHAEnabled }
                             }
                         }
 
-                        $InstanceObject | Add-Member -MemberType NoteProperty -Name "Microsoft.Resources" -Value $AdditionalInfoInstance
+                        $InstanceObject = [pscustomobject]@{ 'Microsoft.Resources' = $AdditionalInfoInstance }
 
                         if ($Obfuscate.IsPresent)
                         {
