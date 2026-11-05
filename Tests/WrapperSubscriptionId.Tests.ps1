@@ -499,7 +499,7 @@ Describe 'The -SubscriptionID helpers' {
         $Names = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         $Names.IndexOf('SubscriptionID') | Should -Be ($Names.IndexOf('ResumeMaxAgeDays') + 1)
         $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly')
-        $Names[0..($Names.IndexOf('ResumeMaxAgeDays'))] | Should -Be @('TenantID', 'DeviceLogin', 'Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeNetworkResources', 'Resume', 'ResumeFailedOnly', 'Fresh', 'IncludeDisabled', 'AllowPartialAccess', 'MainSummary', 'Detailed', 'ConcurrencyLimit', 'ParallelStreams', 'ResumeMaxAgeDays')
+        $Names[0..($Names.IndexOf('ResumeMaxAgeDays'))] | Should -Be @('TenantID', 'DeviceLogin', 'Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeNetworkResources', 'UseMetricsBatch', 'Resume', 'ResumeFailedOnly', 'Fresh', 'IncludeDisabled', 'AllowPartialAccess', 'MainSummary', 'Detailed', 'ConcurrencyLimit', 'ParallelStreams', 'ResumeMaxAgeDays')
     }
 }
 
