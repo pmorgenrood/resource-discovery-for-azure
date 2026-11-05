@@ -1431,6 +1431,48 @@ function Add-MetricRecord
                     return @{ Retry = $true; SleepSeconds = $Backoff }
                 }
 
+                # The exception and the ones it wraps (inner exceptions and a wrapped error
+                # record's exception), outermost first, at most 10.
+                function Get-MetricExceptionChain
+                {
+                    param([System.Exception]$Exception)
+
+                    $Chain = [System.Collections.Generic.List[object]]::new()
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Chain.Add($Ex)
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+                    return , $Chain
+                }
+
+                # The HTTP status an exception carries itself (its response's, else its own), as
+                # text ('404' or 'NotFound' style), or $null when it carries none.
+                function Get-MetricExceptionStatus
+                {
+                    param($Ex)
+
+                    $StatusCode = $null
+                    if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                    {
+                        $StatusCode = $Ex.Response.StatusCode
+                    }
+                    elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                    {
+                        $StatusCode = $Ex.StatusCode
+                    }
+                    if ($null -eq $StatusCode) { return $null }
+                    return [string]$StatusCode
+                }
+
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
                 # metric name is not valid for the resource. The status code and the message
                 # of the exception and of every exception it wraps are checked, because an
@@ -1439,25 +1481,9 @@ function Add-MetricRecord
                 {
                     param([System.Exception]$Exception)
 
-                    $Pending = [System.Collections.Generic.Queue[object]]::new()
-                    $Pending.Enqueue($Exception)
-                    $Checked = 0
-                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    foreach ($Ex in (Get-MetricExceptionChain -Exception $Exception))
                     {
-                        $Ex = $Pending.Dequeue()
-                        if ($null -eq $Ex) { continue }
-                        $Checked++
-
-                        $StatusCode = $null
-                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.Response.StatusCode
-                        }
-                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.StatusCode
-                        }
-                        if ($null -ne $StatusCode -and "$StatusCode" -in @('400', 'BadRequest'))
+                        if ((Get-MetricExceptionStatus -Ex $Ex) -in @('400', 'BadRequest'))
                         {
                             return $true
                         }
@@ -1465,61 +1491,40 @@ function Add-MetricRecord
                         {
                             return $true
                         }
-
-                        $Pending.Enqueue($Ex.InnerException)
-                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-                        {
-                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
-                        }
                     }
-
                     return $false
                 }
 
                 # True when Azure answered HTTP 404 (NotFound): the resource is not there any more
                 # (deleted, or being deleted, after discovery) or is not in this subscription. The
                 # same request is refused the same way on every retry, so it gets one attempt.
-                # Get-AzMetric reports it as "invalid status code 'NotFound'" with no status code
-                # on the exception, so the status phrase is read as well (quotes optional, the
-                # literal 'invalid status code ' prefix is the anchor). Ported from fork old-main.
+                # A status code decides: the outermost exception in the chain that carries one is
+                # read, so a 5xx that wraps or quotes a 404 keeps its retries. Only when no
+                # exception carries a status is the text read: Get-AzMetric reports a 404 as
+                # "invalid status code 'NotFound'" with no status code on the exception (quotes
+                # optional, the literal 'invalid status code ' prefix is the anchor), and a newer
+                # SDK may give the error code 'ResourceNotFound' instead. Ported from fork old-main.
                 function Test-MetricNotFound
                 {
                     param([System.Exception]$Exception)
 
-                    $Pending = [System.Collections.Generic.Queue[object]]::new()
-                    $Pending.Enqueue($Exception)
-                    $Checked = 0
-                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    $Chain = Get-MetricExceptionChain -Exception $Exception
+                    foreach ($Ex in $Chain)
                     {
-                        $Ex = $Pending.Dequeue()
-                        if ($null -eq $Ex) { continue }
-                        $Checked++
-
-                        $StatusCode = $null
-                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.Response.StatusCode
-                        }
-                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.StatusCode
-                        }
-                        if ($null -ne $StatusCode -and "$StatusCode" -in @('404', 'NotFound'))
+                        $Status = Get-MetricExceptionStatus -Ex $Ex
+                        if ($null -ne $Status) { return ($Status -in @('404', 'NotFound')) }
+                    }
+                    foreach ($Ex in $Chain)
+                    {
+                        if ([string]$Ex.Message -match "invalid status code '?NotFound\b|^\s*\[ResourceNotFound\]")
                         {
                             return $true
                         }
-                        if ([string]$Ex.Message -match "invalid status code '?NotFound\b'?")
+                        if ($null -ne $Ex.PSObject.Properties['Body'] -and $null -ne $Ex.Body -and $null -ne $Ex.Body.PSObject.Properties['Code'] -and [string]$Ex.Body.Code -eq 'ResourceNotFound')
                         {
                             return $true
-                        }
-
-                        $Pending.Enqueue($Ex.InnerException)
-                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-                        {
-                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
                         }
                     }
-
                     return $false
                 }
 
