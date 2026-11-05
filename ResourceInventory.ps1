@@ -1214,7 +1214,9 @@ Function RunInventorySetup()
         # under -RunAllSubs the wrapper has asked already).
         if ($UseMetricsBatch.IsPresent -and -not $SkipMetrics.IsPresent -and @($ConsumptionCheckScope).Count -gt 0)
         {
-            $MetricsBatchPerCallSubscriptionIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds @($ConsumptionCheckScope | ForEach-Object { [string]$_.Id })).NotRegistered)
+            # Script scope: this runs inside RunInventorySetup, and the metrics phase
+            # (another function) must see the list.
+            $script:MetricsBatchPerCallSubscriptionIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds @($ConsumptionCheckScope | ForEach-Object { [string]$_.Id })).NotRegistered)
         }
     }
 
