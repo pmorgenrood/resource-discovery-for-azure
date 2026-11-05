@@ -918,6 +918,8 @@ function Add-MetricRecord
                             $TokenObj = Get-AzAccessToken @RenewArgs
                             $Held.Value = if ($TokenObj.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $TokenObj.Token).Password } else { [string]$TokenObj.Token }
                             $Held.ExpiresOn = $TokenObj.ExpiresOn
+                            # A new token: a 401 for it gets its own renewal.
+                            $MetricBatchTokenRenewed.Remove($TenantKey)
                         }
                         catch
                         {
@@ -1067,8 +1069,12 @@ function Add-MetricRecord
                         # The doc's rule: resource ids in the body in lower case.
                         $Body = ConvertTo-Json -InputObject @{ resourceids = [string[]]@($Unit.ResourceIds) } -Compress
 
-                        Add-BatchCount 0 1
-                        Add-BatchCount 2 $Unit.ResourceIds.Count
+                        # A request sent again after a 401 is not counted again.
+                        if (-not $IsLastPass)
+                        {
+                            Add-BatchCount 0 1
+                            Add-BatchCount 2 $Unit.ResourceIds.Count
+                        }
                         $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                         $Response = $null
                         $Attempt = 0
