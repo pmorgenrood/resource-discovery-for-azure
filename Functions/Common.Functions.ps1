@@ -287,12 +287,12 @@ function Get-RdaInsightsRegisterCommand
 # when the state could not be read (the error is in Error).
 function Get-RdaInsightsProviderState
 {
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     try
     {
-        $Read = Invoke-RoleCheckGet -Path $Path
+        $Read = Invoke-RoleCheckGet -Path $Path -MaxRetries $MaxRetries
     }
     catch
     {
@@ -453,11 +453,14 @@ function Invoke-RdaInsightsProviderPreflight
     }
 
     $Deadline = (Get-Date).AddSeconds([math]::Max(0, $DeadlineSeconds))
-    while ($Waiting.Count -gt 0)
+    # Every read checks the time first, so the wait ends at the deadline however many
+    # subscriptions there are; a read while waiting is not retried (a failed one means
+    # not registered yet).
+    while ($Waiting.Count -gt 0 -and (Get-Date) -lt $Deadline)
     {
-        for ($Idx = $Waiting.Count - 1; $Idx -ge 0; $Idx--)
+        for ($Idx = $Waiting.Count - 1; $Idx -ge 0 -and (Get-Date) -lt $Deadline; $Idx--)
         {
-            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx]).State -eq 'Registered')
+            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0).State -eq 'Registered')
             {
                 Write-Host ('  Microsoft.Insights is now registered on subscription {0}.' -f $Waiting[$Idx]) -ForegroundColor Green
                 $Result.Registered.Add($Waiting[$Idx])
