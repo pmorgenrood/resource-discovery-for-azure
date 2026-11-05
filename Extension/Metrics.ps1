@@ -1101,12 +1101,13 @@ function Add-MetricRecord
                                                             if ($Property.Value.ValueKind -ne $Kind::Number) { continue }
                                                             switch ($Property.Name)
                                                             {
-                                                                # switch compares without case.
-                                                                'average' { $Value.Average = $Property.Value.GetDouble() }
-                                                                'minimum' { $Value.Minimum = $Property.Value.GetDouble() }
-                                                                'maximum' { $Value.Maximum = $Property.Value.GetDouble() }
-                                                                'total' { $Value.Total = $Property.Value.GetDouble() }
-                                                                'count' { $Value.Count = $Property.Value.GetDouble() }
+                                                                # switch compares without case; the first key of a
+                                                                # name wins, as in Get-BatchJsonValue.
+                                                                'average' { if ($null -eq $Value.Average) { $Value.Average = $Property.Value.GetDouble() } }
+                                                                'minimum' { if ($null -eq $Value.Minimum) { $Value.Minimum = $Property.Value.GetDouble() } }
+                                                                'maximum' { if ($null -eq $Value.Maximum) { $Value.Maximum = $Property.Value.GetDouble() } }
+                                                                'total' { if ($null -eq $Value.Total) { $Value.Total = $Property.Value.GetDouble() } }
+                                                                'count' { if ($null -eq $Value.Count) { $Value.Count = $Property.Value.GetDouble() } }
                                                             }
                                                         }
                                                         $Data.Add($Value)
