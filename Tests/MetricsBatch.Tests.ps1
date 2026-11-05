@@ -946,8 +946,8 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
 
         @($Result.NotRegistered) | Should -Be @('sub-b')
         $Result.Registered.Count | Should -Be 0
-        # One read before asking, one poll after starting: no loop past the deadline.
-        Should -Invoke Get-RdaInsightsProviderState -Times 2 -Exactly
+        # One read before asking, and no poll once the deadline has passed.
+        Should -Invoke Get-RdaInsightsProviderState -Times 1 -Exactly
     }
 
     It 'shares one wait between several registrations' {
@@ -972,6 +972,27 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         $script:Prompts.Count | Should -Be 1
         $Second.NotRegistered.Count | Should -Be 0
         Should -Invoke Register-RdaInsightsProvider -Times 2 -Exactly
+    }
+
+    It 'ends the wait at the deadline even when each read is slow' {
+        $Subs = @(1..6 | ForEach-Object { 'sub-slow-{0}' -f $_ })
+        foreach ($Sub in $Subs) { $script:States[$Sub] = 'NotRegistered' }
+        Mock Register-RdaInsightsProvider { $null }
+        $script:PollReads = 0
+        $script:Answered = $false
+        Mock Get-RdaInsightsProviderState {
+            # The reads after the answer (the wait) are slow.
+            if ($script:Answered) { $script:PollReads++; [System.Threading.Thread]::Sleep(400) }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'NotRegistered'; Error = $null }
+        }
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds $Subs -Interactive $true -ReadAnswer { param($P) $script:Answered = $true; 'y' } -DeadlineSeconds 1 -PollSeconds 10
+        $Clock.Stop()
+
+        @($Result.NotRegistered).Count | Should -Be 6
+        # 6 reads of 0.4 s would take 2.4 s; the deadline stops them after 1 s.
+        $script:PollReads | Should -BeLessOrEqual 3
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 2
     }
 
     It 'never sleeps past the deadline' {
