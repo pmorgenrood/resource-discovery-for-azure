@@ -950,7 +950,10 @@ if ($Task -eq 'Processing')
                         foreach ($Def in $Group)
                         {
                             $Metric = $null
-                            if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and [string]$Metric.errorCode -eq 'Success')
+                            # The live API leaves errorCode out of a metric it answered (the doc's
+                            # sample shows 'Success'), so no code is a success too; any other code
+                            # is not, and that metric gets a request of its own.
+                            if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and ($null -eq $Metric.PSObject.Properties['errorCode'] -or [string]::IsNullOrEmpty([string]$Metric.errorCode) -or [string]$Metric.errorCode -eq 'Success'))
                             {
                                 $GroupPairs.Add([pscustomobject]@{ Def = $Def; Query = (ConvertTo-BatchMetricQuery -Metric $Metric) })
                             }
