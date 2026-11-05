@@ -45,6 +45,23 @@ BeforeAll {
     function Test-DataPlaneAuthReady { param($Phase) $true }
 
     $script:Rows = New-ConsumptionTestRows
+    # Row 402 is in resource group rg-one, has a resource URI and is not in the
+    # dictionary the -Obfuscate runs preload (rows 0-399), so a one-row page of
+    # it takes the row replace, the -ResourceGroup keep and the masking call.
+    $script:OneRow = $script:Rows[402]
+    # Rows whose values take the loop's less common branches: dates that are
+    # text or missing, and 'Microsoft.Resources' or additionalInfo that is an
+    # array, text or holds a nested object.
+    $Odd = { param($Instance, $Start, $End) $R = $script:Rows[402].PSObject.Copy(); $R.InstanceData = $Instance; $R.UsageStartTime = $Start; $R.UsageEndTime = $End; $R }
+    $Uri = '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Compute/disks/DISK-ODD'
+    $script:OddRows = @(
+        (& $Odd $script:Rows[402].InstanceData '10/1/2026 12:00:00 AM' $null)
+        (& $Odd ('{{"Microsoft.Resources":[{{"resourceUri":"{0}","location":"westeurope"}},{{"resourceUri":"{0}-2","location":"eastus"}}]}}' -f $Uri) $script:Rows[402].UsageStartTime $script:Rows[402].UsageEndTime)
+        (& $Odd '{"Microsoft.Resources":"just text"}' $script:Rows[402].UsageStartTime $script:Rows[402].UsageEndTime)
+        (& $Odd ('{{"Microsoft.Resources":{{"resourceUri":"{0}","location":"westeurope","additionalInfo":[{{"ImageType":"a"}},{{"ImageType":"b"}}]}}}}' -f $Uri) $script:Rows[402].UsageStartTime $script:Rows[402].UsageEndTime)
+        (& $Odd ('{{"Microsoft.Resources":{{"resourceUri":"{0}","location":"westeurope","additionalInfo":"text info"}}}}' -f $Uri) $script:Rows[402].UsageStartTime $script:Rows[402].UsageEndTime)
+        (& $Odd ('{{"Microsoft.Resources":{{"resourceUri":"{0}","location":"westeurope","additionalInfo":{{"ImageType":{{"Publisher":"p","Offer":"o"}},"vCores":2}}}}}}' -f $Uri) $script:Rows[402].UsageStartTime $script:Rows[402].UsageEndTime)
+    )
     $script:Window = [pscustomobject]@{ Start = [datetime]'2026-10-01'; End = [datetime]'2026-11-01' }
 
     # Runs one billing phase function for one subscription on $script:Pages
@@ -72,7 +89,8 @@ BeforeAll {
         }
         if ($Base) { GetResorceConsumptionBase } else { GetResorceConsumption }
         $Bytes = [byte[]]::new(0)
-        if (Test-Path -LiteralPath $Global:ConsumptionFileCsv) { $Bytes = [System.IO.File]::ReadAllBytes($Global:ConsumptionFileCsv) }
+        $Written = Test-Path -LiteralPath $Global:ConsumptionFileCsv
+        if ($Written) { $Bytes = [System.IO.File]::ReadAllBytes($Global:ConsumptionFileCsv) }
         $Text = [System.Text.Encoding]::UTF8.GetString($Bytes)
         $NewLine = [Environment]::NewLine
         $Lf = if ($NewLine -eq "`n") { $Text } else { $Text.Replace($NewLine, "`n") }
@@ -88,6 +106,7 @@ BeforeAll {
             # Every line end is the platform's: no lone CR or LF of another kind.
             LineEndsOk  = ($NewLine -eq "`n" -and -not $Text.Contains("`r")) -or ($NewLine -eq "`r`n" -and -not ($Text -replace "`r`n", '').Contains("`n") -and -not ($Text -replace "`r`n", '').Contains("`r"))
             Bom         = ($Bytes.Count -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF)
+            Written     = $Written
             FailedSubs  = @($Global:ConsumptionFailedSubs).Count
             RecordCount = $Global:ConsumptionRecordCount
         }
@@ -129,29 +148,34 @@ Describe 'Billing row loop: the Consumption CSV byte for byte' {
     It 'writes the same bytes as the frozen Add-Member loop, <Mode>, <Case>' -ForEach @(
         foreach ($Mode in 'Plain', 'Obfuscate', 'ResourceGroup')
         {
-            @{ Mode = $Mode; Case = '3 pages of up to 1,000 rows'; Count = 2437; PageSize = 1000; Shape = $null }
-            @{ Mode = $Mode; Case = 'a last page of one row'; Count = 2001; PageSize = 1000; Shape = $null }
-            @{ Mode = $Mode; Case = 'a single page of one row'; Count = 1; PageSize = 1000; Shape = $null }
-            @{ Mode = $Mode; Case = 'an empty page between two pages'; Count = 1500; PageSize = 1000; Shape = {
+            @{ Mode = $Mode; Case = '3 pages of up to 1,000 rows'; Count = 2437; PageSize = 1000; Shape = $null; Pick = $null }
+            @{ Mode = $Mode; Case = 'a last page of one row (row 402)'; Count = 0; PageSize = 1000; Shape = $null; Pick = { @($script:Rows | Select-Object -First 2000) + @($script:OneRow) } }
+            @{ Mode = $Mode; Case = 'a single page of one row (row 402)'; Count = 0; PageSize = 1000; Shape = $null; Pick = { @($script:OneRow) } }
+            @{ Mode = $Mode; Case = 'rows with text or missing dates, and Microsoft.Resources or additionalInfo as an array, text or nested object'; Count = 0; PageSize = 1000; Shape = $null; Pick = { $script:OddRows } }
+            @{ Mode = $Mode; Case = 'each of those odd rows on a page of its own'; Count = 0; PageSize = 1; Shape = $null; Pick = { $script:OddRows } }
+            @{ Mode = $Mode; Case = 'an empty page between two pages'; Count = 1500; PageSize = 1000; Pick = $null; Shape = {
                     param($Pages)
                     @($Pages[0], [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = 'page-3' }, [pscustomobject]@{ UsageAggregations = $Pages[1].UsageAggregations; ContinuationToken = $null })
                 }
             }
-            @{ Mode = $Mode; Case = 'a page with no row list after a page'; Count = 1500; PageSize = 1000; Shape = {
+            @{ Mode = $Mode; Case = 'a page with no row list after a page'; Count = 1500; PageSize = 1000; Pick = $null; Shape = {
                     param($Pages)
                     @([pscustomobject]@{ UsageAggregations = $Pages[0].UsageAggregations; ContinuationToken = 'page-2' }, [pscustomobject]@{ UsageAggregations = $null; ContinuationToken = $null })
                 }
             }
-            @{ Mode = $Mode; Case = 'an answer with no rows'; Count = 1; PageSize = 1000; Shape = { param($Pages) @([pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null }) } }
+            @{ Mode = $Mode; Case = 'an answer with no rows'; Count = 1; PageSize = 1000; Pick = $null; Shape = { param($Pages) @([pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null }) } }
         }
     ) {
-        $Rows = @($script:Rows | Select-Object -First $Count)
+        $Rows = if ($null -ne $Pick) { @(& $Pick) } else { @($script:Rows | Select-Object -First $Count) }
         $Old = Invoke-Phase -Mode $Mode -Base -Rows $Rows -PageSize $PageSize -Shape $Shape
         $New = Invoke-Phase -Mode $Mode -Rows $Rows -PageSize $PageSize -Shape $Shape
         [System.Convert]::ToBase64String($New.Bytes) | Should -BeExactly ([System.Convert]::ToBase64String($Old.Bytes))
         $New.RecordCount | Should -Be $Old.RecordCount
         $New.FailedSubs | Should -Be $Old.FailedSubs
         $New.FailedSubs | Should -Be 0
+        $New.Written | Should -Be $Old.Written
+        # An answer with no rows leaves an empty file (Export-Csv -Append on no input), in both loops.
+        if ($Case -eq 'an answer with no rows') { $New.Bytes.Count | Should -Be 0 } else { $New.RecordCount | Should -BeGreaterThan 0 }
         # No page shape adds a row of its own (a page with no row list writes
         # nothing): every data row has its meter id.
         @($New.Text | ConvertFrom-Csv | Where-Object { [string]::IsNullOrEmpty($_.MeterId) }).Count | Should -Be 0
