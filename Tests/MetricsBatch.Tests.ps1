@@ -185,6 +185,11 @@ Export-ModuleMember -Function Get-AzMetric
                 $Out = @{ values = @($Values) }
             }
             $Text = if ($Control['BadJson'] -and $Status -eq 200) { '{"values":[ not json' } else { $Out | ConvertTo-Json -Depth 12 -Compress }
+            if ($Control['DuplicateMaximum'])
+            {
+                # A second "Maximum" key after each "maximum", with another value: the first must win.
+                $Text = [regex]::Replace($Text, '"maximum":(-?[0-9.Ee+-]+)', { param($M) '"maximum":' + $M.Groups[1].Value + ',"Maximum":-1' })
+            }
             if ($Control['PascalKeys'])
             {
                 # Keys in another case than the doc's, to show they are read without case.
@@ -771,6 +776,22 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
 
         $Run.Calls.Count | Should -Be 0
         Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'reads an error code in another key case as an error, not as an answer' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-pascal-error' -Batch -Control @{ PascalKeys = $true; ErrorMetrics = @('disk-02|Composite Disk Read Bytes/sec') }
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName) | Should -Be @('Composite Disk Read Bytes/sec')
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'takes the first of two point keys that differ only in case' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-dup-keys' -Batch -Control @{ DuplicateMaximum = $true }
+        $PerCall = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'per-dup-keys'
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $PerCall -Actual $Run
     }
 
     It 'uses the per-resource path when the batch point type cannot be loaded' {
