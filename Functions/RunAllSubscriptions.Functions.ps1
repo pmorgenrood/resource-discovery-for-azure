@@ -1648,7 +1648,8 @@ function Get-RunStartView
         [bool]$ResumeFailedOnly,
         [bool]$Fresh,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Settings,
-        [int]$MaxAgeDays = 7
+        [int]$MaxAgeDays = 7,
+        [switch]$OneSubscription
     )
     $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $Key
     $StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'main'
@@ -1685,7 +1686,7 @@ function Get-RunStartView
         $StoredRun.StreamOnly = $true
         $StoredRun.Legacy = $true
     }
-    $RunStart = Resolve-RunStart -Info $StoredRun -Resume $Resume -ResumeFailedOnly $ResumeFailedOnly -Fresh $Fresh -Settings $Settings -MaxAgeDays $MaxAgeDays
+    $RunStart = Resolve-RunStart -Info $StoredRun -Resume $Resume -ResumeFailedOnly $ResumeFailedOnly -Fresh $Fresh -Settings $Settings -MaxAgeDays $MaxAgeDays -OneSubscription:$OneSubscription
     return [pscustomobject]@{ StoredRun = $StoredRun; RunStart = $RunStart }
 }
 
@@ -1722,7 +1723,9 @@ function Resolve-RunStart
         [bool]$Fresh,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Settings,
         [int]$MaxAgeDays = 7,
-        [datetime]$Now = [datetime]::UtcNow
+        [datetime]$Now = [datetime]::UtcNow,
+        # A -SubscriptionID run: its lines speak of that one subscription.
+        [switch]$OneSubscription
     )
     $Lines = [System.Collections.Generic.List[object]]::new()
     $Differences = [System.Collections.Generic.List[object]]::new()
@@ -1732,7 +1735,11 @@ function Resolve-RunStart
         param([string]$Mode, [string]$Reason, [int]$Code = 0)
         [pscustomobject]@{ Mode = $Mode; Reason = $Reason; ExitCode = $Code; Lines = $Lines.ToArray(); Differences = $Differences.ToArray() }
     }
-    $Say = { param([string]$Text, [string]$Colour = 'Cyan') $Lines.Add([pscustomobject]@{ Text = $Text; Colour = $Colour }) }
+    $Say = {
+        param([string]$Text, [string]$Colour = 'Cyan')
+        if ($OneSubscription) { $Text = $Text.Replace('every subscription', 'the subscription').Replace('processing all subscriptions', 'processing the subscription').Replace('resume state file for this tenant', 'resume state file for this subscription') }
+        $Lines.Add([pscustomobject]@{ Text = $Text; Colour = $Colour })
+    }
     # How to start over: -Fresh, which -ResumeFailedOnly does not take.
     $FreshHow = if ($ResumeFailedOnly) { 'run the same command without -ResumeFailedOnly, with -Fresh,' } else { 'pass -Fresh' }
     $FreshAgain = if ($ResumeFailedOnly) { 'end this run and run the same command without -ResumeFailedOnly, with -Fresh' } else { 'end this run and start again with -Fresh' }
