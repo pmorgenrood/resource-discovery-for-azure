@@ -140,12 +140,19 @@ Describe 'Run-AllSubscriptions.ps1 sign-in gate' {
 
     It 'signs in through Connect-RdaWrapperSession and stops with exit 1 when it throws' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
-        $Gate = $Ast.FindAll({
-                param($Node)
-                $Node -is [System.Management.Automation.Language.TryStatementAst] -and
-                @($Node.Body.FindAll({ param($C) $C -is [System.Management.Automation.Language.CommandAst] -and $C.GetCommandName() -eq 'Connect-RdaWrapperSession' }, $true)).Count -gt 0
-            }, $false) | Select-Object -First 1
-        $Gate | Should -Not -BeNullOrEmpty
-        $Gate.CatchClauses[0].Body.Extent.Text | Should -Match 'Exit-Wrapper -Code 1'
+        # The try statements whose own body signs in (not one that only holds such a try).
+        $Gates = @($Ast.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.TryStatementAst] -and $Node.CatchClauses.Count -gt 0 -and
+                    @($Node.Body.Statements | Where-Object { @($_.FindAll({ param($C) $C -is [System.Management.Automation.Language.CommandAst] -and $C.GetCommandName() -eq 'Connect-RdaWrapperSession' }, $true)).Count -gt 0 }).Count -gt 0
+                }, $true))
+        # A run's gate, and the -PreflightOnly one, which names the check that failed.
+        $InPreflight = { param($Node) $P = $Node.Parent; while ($null -ne $P) { if ($P -is [System.Management.Automation.Language.IfStatementAst] -and $P.Clauses[0].Item1.Extent.Text -eq '$PreflightOnly') { return $true }; $P = $P.Parent }; return $false }
+        $RunGate = @($Gates | Where-Object { -not (& $InPreflight $_) })
+        $RunGate.Count | Should -Be 1
+        $RunGate[0].CatchClauses[0].Body.Extent.Text | Should -Match 'Exit-Wrapper -Code 1'
+        $PreflightGate = @($Gates | Where-Object { & $InPreflight $_ })
+        $PreflightGate.Count | Should -Be 1
+        $PreflightGate[0].CatchClauses[0].Body.Extent.Text | Should -Match ([regex]::Escape("& `$PreflightFailed 'the sign-in'"))
     }
 }

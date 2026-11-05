@@ -104,7 +104,7 @@ $Global:ResourceCount = 1
     "`$FailedAttempts = Get-FailedAttempts -Path `$ResumeStateFile -Tenant `$TenantID`n" +
     "`$CompletedReports = Get-CompletedReports -Path `$ResumeStateFile -Tenant `$TenantID`n" +
     $ReadText + "`n"
-    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$Unreadable)`n"
+    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$Unreadable)`n`$ResumeScope = `$TenantID`n"
     $Result = "`n[pscustomobject]@{ SkippedSubscriptions = @(`$SkippedSubscriptions); SubResourceCounts = @(`$SubResourceCounts) }"
 
     # A run that ends before the cleanup (the session ended): the access check and the loop only.
