@@ -15,6 +15,10 @@ param(
     # resources of one subscription, region and type in one request. Anything it
     # cannot answer goes through the per-resource Get-AzMetric path below.
     [switch]$UseMetricsBatch,
+    # Subscriptions the -UseMetricsBatch preflight left without Microsoft.Insights
+    # (the person said no, nobody could answer, the register failed or did not
+    # finish in time): their metrics stay on the per-resource path this run.
+    [string[]]$MetricsBatchPerCallSubscriptionIds = @(),
     # The batch API's regional endpoint, {0} being the region. Internal: tests
     # point it at a local listener.
     [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com'
@@ -279,14 +283,16 @@ function New-MetricBatchPlan
         $Target = Get-MetricBatchTarget -Id ([string]$First.Id)
         $Region = ([string]$First.Location).ToLowerInvariant()
         $IsoGrain = ConvertTo-MetricBatchInterval -Interval $First.Interval
-        $Expressible = $null -ne $Target -and $Allowed.Contains($Target.SubscriptionId) -and $Region -match '^[a-z0-9]+$' -and $null -ne $IsoGrain -and $Aggregations -contains [string]$First.Aggregation -and $First.StartTime -is [datetime] -and $First.EndTime -is [datetime]
+        $Expressible = $null -ne $Target -and $Allowed.Contains($Target.SubscriptionId) -and $Region -match '^[a-z0-9]+$' -and $Region -ne 'global' -and $null -ne $IsoGrain -and $Aggregations -contains [string]$First.Aggregation -and $First.StartTime -is [datetime] -and $First.EndTime -is [datetime]
         if (-not $Expressible)
         {
             $Items.Add($Group)
             continue
         }
 
-        $Names = [string[]]@($Group | ForEach-Object { [string]$_.MetricName } | Select-Object -Unique)
+        # Distinct names without regard to case, as Group-MetricDefinition groups them.
+        $NameSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $Names = [string[]]@($Group | ForEach-Object { [string]$_.MetricName } | Where-Object { $NameSet.Add($_) })
         $NameKey = (@($Names | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|')
         $Key = '{0}|{1}|{2}|{3}|{4}' -f $Target.SubscriptionId, $Region, $Target.Namespace, $NameKey, (Get-MetricGroupKey -Def $First)
         $ResourceKey = ([string]$First.Id).TrimEnd('/').ToLowerInvariant()
@@ -716,6 +722,11 @@ if ($Task -eq 'Processing')
     # data plane refused the token or the caller: 401 or 403).
     $MetricBatchOffSubs = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $MetricBatchNotes = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+    # Tenant -> 1 when the data plane refused that tenant's token (401) during a
+    # batch. Before the next batch the token is renewed once; a second refusal
+    # after that renewal turns batch off for the tenant (its metrics go per call).
+    $MetricBatchTokenRefused = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $MetricBatchTokenRenewed = @{}
     $MetricBatchTokens = @{}
     $MetricBatchTenantOfSub = @{}
     if ($UseMetricsBatch -and $MetricGroups.Count -gt 0)
@@ -743,8 +754,15 @@ if ($Task -eq 'Processing')
                 }
             }
             $AllowedBatchSubs = [System.Collections.Generic.List[string]]::new()
+            $PreflightPerCall = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($PerCallId in @($MetricsBatchPerCallSubscriptionIds)) { if (-not [string]::IsNullOrEmpty([string]$PerCallId)) { [void]$PreflightPerCall.Add([string]$PerCallId) } }
             foreach ($BatchSub in $BatchSubIds)
             {
+                if ($PreflightPerCall.Contains($BatchSub))
+                {
+                    Write-MetricsDiag ("[batch] subscription {0} was left without Microsoft.Insights at the start of the run; its metrics use the per-resource path this run." -f $BatchSub)
+                    continue
+                }
                 # The provider must be registered: the batch API answers 403 otherwise.
                 # The preflight offered to register it; this only reads the state.
                 $ProviderRead = Get-RdaInsightsProviderState -SubscriptionId $BatchSub
@@ -959,12 +977,23 @@ function Add-MetricRecord
             $DispatchItems = $BatchGroups
             if ($UseBatchApi)
             {
-                # Renew a token that ends within 10 minutes, on this thread, before the batch.
+                # Renew a token that ends within 10 minutes, or that the data plane refused
+                # (401) in the batch before, on this thread, before the batch. A tenant refused
+                # again after its one renewal gets no more batch requests this phase.
                 foreach ($TenantKey in @($MetricBatchTokens.Keys))
                 {
                     $Held = $MetricBatchTokens[$TenantKey]
-                    if ($null -ne $Held -and $null -ne $Held.ExpiresOn -and $Held.ExpiresOn -lt [DateTimeOffset]::UtcNow.AddMinutes(10))
+                    $Refused = 0
+                    $WasRefused = $MetricBatchTokenRefused.TryRemove($TenantKey, [ref]$Refused)
+                    if ($null -ne $Held -and $WasRefused -and $MetricBatchTokenRenewed.ContainsKey($TenantKey))
                     {
+                        Write-MetricsDiag "[batch] the metrics data plane refused a renewed token (401); the subscriptions of that tenant use the per-resource path for the rest of the phase."
+                        $MetricBatchTokens[$TenantKey] = $null
+                        continue
+                    }
+                    if ($null -ne $Held -and ($WasRefused -or ($null -ne $Held.ExpiresOn -and $Held.ExpiresOn -lt [DateTimeOffset]::UtcNow.AddMinutes(10))))
+                    {
+                        if ($WasRefused) { $MetricBatchTokenRenewed[$TenantKey] = $true }
                         try
                         {
                             $RenewArgs = $Held.Args
@@ -997,6 +1026,7 @@ function Add-MetricRecord
                     $Notes = $using:MetricBatchNotes
                     $Tokens = $using:BatchTokenValues
                     $TenantOfSub = $using:MetricBatchTenantOfSub
+                    $TokenRefused = $using:MetricBatchTokenRefused
                     $EndpointFormat = $using:MetricsBatchEndpointFormat
                     $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                     $CallMaxRetries = $using:MetricMaxRetries
@@ -1018,6 +1048,18 @@ function Add-MetricRecord
                             $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
                             Add-BatchCount 5 @($Group).Count
                         }
+                    }
+
+                    # The seconds a 429 answer asks to wait (Retry-After), or 0.
+                    function Get-BatchRetryAfter([System.Exception]$Exception)
+                    {
+                        try
+                        {
+                            $Delta = $Exception.Response.Headers.RetryAfter.Delta
+                            if ($null -ne $Delta) { return [math]::Max(0, $Delta.TotalSeconds) }
+                        }
+                        catch { }
+                        return 0
                     }
 
                     # The HTTP status of a failed request, or $null.
@@ -1095,6 +1137,7 @@ function Add-MetricRecord
                     $Attempt = 0
                     $LastError = $null
                     $Kind = $null
+                    $RetryAfter = 0
                     # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
                     # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
                     # at once (the same request is refused the same way again).
@@ -1111,17 +1154,19 @@ function Add-MetricRecord
                         {
                             $LastError = [string]$_.Exception.Message
                             $Status = Get-BatchStatusCode -Exception $_.Exception
-                            $Kind = if ($Status -in 401, 403) { 'Refused' }
+                            $RetryAfter = Get-BatchRetryAfter -Exception $_.Exception
+                            $Kind = if ($Status -eq 401) { 'TokenRefused' }
+                            elseif ($Status -eq 403) { 'Refused' }
                             elseif ($Status -in 400, 404) { 'BadRequest' }
                             elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
                             else { 'Error' }
                             if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
                         }
-                        if ($Kind -in 'Refused', 'BadRequest') { break }
+                        if ($Kind -in 'Refused', 'TokenRefused', 'BadRequest') { break }
                         if ($Attempt -lt $CallMaxRetries)
                         {
                             $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-                            if ($Kind -eq 'Throttled') { $Backoff = [math]::Min($Backoff * 2, 60) }
+                            if ($Kind -eq 'Throttled') { $Backoff = [math]::Min([math]::Max($Backoff * 2, $RetryAfter), 60) }
                             Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
                         }
                         $Attempt++
@@ -1131,9 +1176,17 @@ function Add-MetricRecord
 
                     if ($null -ne $Kind)
                     {
+                        if ($Kind -eq 'TokenRefused')
+                        {
+                            # The token may have ended: it is renewed once before the next batch.
+                            if ($TokenRefused.TryAdd($TenantKey, 1))
+                            {
+                                $Notes.Add(('The metrics data plane refused the token (401) for subscription {0}; the token is renewed once before the next batch, and refused again turns batch off for its tenant.' -f $Unit.SubscriptionId))
+                            }
+                        }
                         if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
                         {
-                            $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader (or Reader) on the subscription itself and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
+                            $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader on the subscription itself (not only on its resource groups) and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
                         }
                         $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
                         Send-AllGroupsOn

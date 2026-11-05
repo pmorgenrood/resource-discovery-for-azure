@@ -57,6 +57,9 @@ param (
     [switch] $SkipConsumption,
     [switch] $IncludeNetworkResources,
     [switch] $UseMetricsBatch,
+    # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
+    # on the per-resource path this run (Microsoft.Insights not registered).
+    [string[]] $MetricsBatchPerCallSubscriptionIds = @(),
     [int]    $ConcurrencyLimit = 6,
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
@@ -280,6 +283,7 @@ if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
 if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
+if ($UseMetricsBatch -and @($MetricsBatchPerCallSubscriptionIds).Count -gt 0) { $InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]$MetricsBatchPerCallSubscriptionIds }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart)) { $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowStart }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowEnd)) { $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowEnd }
