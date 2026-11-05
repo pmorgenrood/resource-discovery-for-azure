@@ -806,7 +806,16 @@ if ($Task -eq 'Processing')
                 # One point of a batch answer. A compiled type, so the parallel runspaces
                 # can make it (a PowerShell class does not resolve there), and far smaller
                 # than a [PSCustomObject] per point.
-                Add-Type -TypeDefinition 'public sealed class RdaBatchMetricPoint { public System.Nullable<double> Average { get; set; } public System.Nullable<double> Minimum { get; set; } public System.Nullable<double> Maximum { get; set; } public System.Nullable<double> Total { get; set; } public System.Nullable<double> Count { get; set; } }'
+                try
+                {
+                    Add-Type -TypeDefinition 'public sealed class RdaBatchMetricPoint { public System.Nullable<double> Average { get; set; } public System.Nullable<double> Minimum { get; set; } public System.Nullable<double> Maximum { get; set; } public System.Nullable<double> Total { get; set; } public System.Nullable<double> Count { get; set; } }' -ErrorAction Stop
+                }
+                catch
+                {
+                    # For example Constrained Language Mode, where Add-Type is not allowed.
+                    Write-MetricsDiag ("[batch] -UseMetricsBatch: could not load the batch point type ({0}); every metric uses the per-resource path." -f $_.Exception.Message)
+                    $AllowedBatchSubs.Clear()
+                }
             }
             if ($AllowedBatchSubs.Count -gt 0)
             {
@@ -1113,47 +1122,69 @@ function Add-MetricRecord
                         # series, as PSMetric.Data is. A point field is read as Azure writes it (lower
                         # case). Parsing this way keeps memory low: a 50-resource answer holds tens of
                         # thousands of points.
-                        function ConvertFrom-BatchAnswer([string]$Text)
+                        # The value of one key of a JSON object, matched without regard to case (as
+                        # Invoke-RestMethod reads keys), or $null when the key is not there.
+                        function Get-BatchJsonValue($Object, [string]$Name)
+                        {
+                            if ($Object -isnot [System.Text.Json.JsonElement] -or $Object.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+                            foreach ($Property in $Object.EnumerateObject())
+                            {
+                                if ([string]::Equals($Property.Name, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $Property.Value }
+                            }
+                            return $null
+                        }
+
+                        function ConvertFrom-BatchAnswer([System.IO.Stream]$Stream)
                         {
                             $Answer = [System.Collections.Generic.List[object]]::new()
-                            $Doc = [System.Text.Json.JsonDocument]::Parse($Text)
+                            $Doc = [System.Text.Json.JsonDocument]::Parse($Stream)
                             try
                             {
-                                $Root = $Doc.RootElement
-                                $Values = [System.Text.Json.JsonElement]::new()
-                                if ($Root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or -not $Root.TryGetProperty('values', [ref]$Values) -or $Values.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return , $Answer }
+                                $Kind = [System.Text.Json.JsonValueKind]
+                                $Values = Get-BatchJsonValue $Doc.RootElement 'values'
+                                if ($null -eq $Values -or $Values.ValueKind -ne $Kind::Array) { return , $Answer }
                                 foreach ($Entry in $Values.EnumerateArray())
                                 {
-                                    if ($Entry.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
-                                    $Field = [System.Text.Json.JsonElement]::new()
-                                    $EntryId = if ($Entry.TryGetProperty('resourceid', [ref]$Field) -and $Field.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $Field.GetString() } else { '' }
+                                    if ($Entry.ValueKind -ne $Kind::Object) { continue }
+                                    $Field = Get-BatchJsonValue $Entry 'resourceid'
+                                    $EntryId = if ($null -ne $Field -and $Field.ValueKind -eq $Kind::String) { $Field.GetString() } else { '' }
                                     $Metrics = [System.Collections.Generic.List[object]]::new()
-                                    $List = [System.Text.Json.JsonElement]::new()
-                                    if ($Entry.TryGetProperty('value', [ref]$List) -and $List.ValueKind -eq [System.Text.Json.JsonValueKind]::Array)
+                                    $List = Get-BatchJsonValue $Entry 'value'
+                                    if ($null -ne $List -and $List.ValueKind -eq $Kind::Array)
                                     {
                                         foreach ($Metric in $List.EnumerateArray())
                                         {
-                                            if ($Metric.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
-                                            $NameObj = [System.Text.Json.JsonElement]::new()
-                                            $NameValue = [System.Text.Json.JsonElement]::new()
-                                            if (-not ($Metric.TryGetProperty('name', [ref]$NameObj) -and $NameObj.ValueKind -eq [System.Text.Json.JsonValueKind]::Object -and $NameObj.TryGetProperty('value', [ref]$NameValue) -and $NameValue.ValueKind -eq [System.Text.Json.JsonValueKind]::String)) { continue }
-                                            $Code = if ($Metric.TryGetProperty('errorCode', [ref]$Field) -and $Field.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $Field.GetString() } else { $null }
+                                            $NameValue = Get-BatchJsonValue (Get-BatchJsonValue $Metric 'name') 'value'
+                                            if ($null -eq $NameValue -or $NameValue.ValueKind -ne $Kind::String) { continue }
+                                            $Field = Get-BatchJsonValue $Metric 'errorCode'
+                                            $Code = if ($null -ne $Field -and $Field.ValueKind -eq $Kind::String) { $Field.GetString() } else { $null }
+                                            # Data as PSMetric gives it: the FIRST time series' points, $null
+                                            # when there is none or it has no data (null entries are not skipped,
+                                            # as Timeseries.FirstOrDefault() does not skip them).
                                             $Data = $null
-                                            $Series = [System.Text.Json.JsonElement]::new()
-                                            if ($Metric.TryGetProperty('timeseries', [ref]$Series) -and $Series.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and $Series.GetArrayLength() -gt 0)
+                                            $Series = Get-BatchJsonValue $Metric 'timeseries'
+                                            if ($null -ne $Series -and $Series.ValueKind -eq $Kind::Array -and $Series.GetArrayLength() -gt 0)
                                             {
-                                                $First = $Series.get_Item(0)
-                                                $Points = [System.Text.Json.JsonElement]::new()
-                                                if ($First.ValueKind -eq [System.Text.Json.JsonValueKind]::Object -and $First.TryGetProperty('data', [ref]$Points) -and $Points.ValueKind -eq [System.Text.Json.JsonValueKind]::Array)
+                                                $Points = Get-BatchJsonValue $Series.get_Item(0) 'data'
+                                                if ($null -ne $Points -and $Points.ValueKind -eq $Kind::Array)
                                                 {
                                                     $Data = [System.Collections.Generic.List[object]]::new()
                                                     foreach ($Point in $Points.EnumerateArray())
                                                     {
-                                                        if ($Point.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
+                                                        if ($Point.ValueKind -ne $Kind::Object) { continue }
                                                         $Value = [RdaBatchMetricPoint]::new()
-                                                        foreach ($Aggregation in 'Average', 'Minimum', 'Maximum', 'Total', 'Count')
+                                                        foreach ($Property in $Point.EnumerateObject())
                                                         {
-                                                            if ($Point.TryGetProperty($Aggregation.ToLowerInvariant(), [ref]$Field) -and $Field.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $Value.$Aggregation = $Field.GetDouble() }
+                                                            if ($Property.Value.ValueKind -ne $Kind::Number) { continue }
+                                                            switch ($Property.Name)
+                                                            {
+                                                                # switch compares without case.
+                                                                'average' { $Value.Average = $Property.Value.GetDouble() }
+                                                                'minimum' { $Value.Minimum = $Property.Value.GetDouble() }
+                                                                'maximum' { $Value.Maximum = $Property.Value.GetDouble() }
+                                                                'total' { $Value.Total = $Property.Value.GetDouble() }
+                                                                'count' { $Value.Count = $Property.Value.GetDouble() }
+                                                            }
                                                         }
                                                         $Data.Add($Value)
                                                     }
@@ -1271,7 +1302,9 @@ function Add-MetricRecord
                         $Entries = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
                         try
                         {
-                            $Parsed = ConvertFrom-BatchAnswer -Text ([string]$Response.Content)
+                            # The raw bytes, not the Content string, so the answer is not copied again.
+                            $Response.RawContentStream.Position = 0
+                            $Parsed = ConvertFrom-BatchAnswer -Stream $Response.RawContentStream
                         }
                         catch
                         {
