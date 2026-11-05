@@ -50,6 +50,7 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
+    [switch] $UseMetricsBatch,
     [int]    $ConcurrencyLimit = 6
 )
 
@@ -166,6 +167,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 
 # ---- Per-sub iteration -------------------------------------------------------

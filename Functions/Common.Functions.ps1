@@ -252,3 +252,189 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Microsoft.Insights provider check for -UseMetricsBatch.
+#
+# The Azure Monitor batch API (metrics:getBatch) answers 403 on a subscription
+# where the Microsoft.Insights resource provider is not registered. Only with
+# -UseMetricsBatch, the preflight reads the provider's state on every
+# subscription in scope (a read, which Reader allows). When some are not
+# registered it lists them and asks once whether to register them. Only a "y"
+# registers; registering needs the /register/action permission, which the
+# Contributor and Owner roles include (Microsoft docs: Azure resource providers
+# and types). A "n", no answer (no console) or a failed register leaves those
+# subscriptions on the one-call-per-resource metrics path, with the command
+# that registers it printed, so no metrics are lost. The wait for a started
+# registration is bounded by one shared deadline; nothing loops past it.
+# ---------------------------------------------------------------------------
+
+# The ARM API version used to read and register a resource provider.
+function Get-RdaInsightsProviderApiVersion
+{
+    return '2021-04-01'
+}
+
+# The command a person runs to register Microsoft.Insights on one subscription.
+function Get-RdaInsightsRegisterCommand
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+    return ('Set-AzContext -Subscription {0}; Register-AzResourceProvider -ProviderNamespace Microsoft.Insights' -f $SubscriptionId)
+}
+
+# The registration state of Microsoft.Insights on one subscription:
+# 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
+# when the state could not be read (the error is in Error).
+function Get-RdaInsightsProviderState
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+
+    $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
+    try
+    {
+        $Read = Invoke-RoleCheckGet -Path $Path
+    }
+    catch
+    {
+        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$_.Exception.Message }
+    }
+    if ($null -ne $Read.Error -or $null -eq $Read.Body)
+    {
+        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$Read.Error }
+    }
+    $State = [string]$Read.Body.registrationState
+    if ([string]::IsNullOrEmpty($State)) { $State = 'Unknown' }
+    return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+}
+
+# Starts the registration of Microsoft.Insights on one subscription. Returns
+# $null when Azure took it, or the error text.
+function Register-RdaInsightsProvider
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+
+    $Path = '/subscriptions/{0}/providers/Microsoft.Insights/register?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
+    try
+    {
+        $Response = Invoke-AzRestMethod -Method POST -Path $Path -ErrorAction Stop
+        $Status = [int]$Response.StatusCode
+        if ($Status -ge 200 -and $Status -lt 300) { return $null }
+        $Code = ''
+        try { $Code = [string](([string]$Response.Content | ConvertFrom-Json -ErrorAction Stop).error.code) } catch { $Code = '' }
+        return ('HTTP {0}{1}' -f $Status, $(if ($Code) { ' ' + $Code } else { '' }))
+    }
+    catch
+    {
+        return [string]$_.Exception.Message
+    }
+}
+
+# The preflight. Reads every subscription's state, asks once for those not
+# registered, registers on "y" and waits for them on one deadline. Returns
+# { Registered; NotRegistered; Asked; Answer }: Registered holds the ids that
+# batch may use (registered, or whose state could not be read, so the batch
+# call decides and falls back on its own), NotRegistered the ids that stay on
+# the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds and
+# $PollSeconds are there for tests.
+function Invoke-RdaInsightsProviderPreflight
+{
+    param(
+        [string[]]$SubscriptionIds,
+        [Nullable[bool]]$Interactive = $null,
+        [scriptblock]$ReadAnswer = { param($Prompt) Read-Host -Prompt $Prompt },
+        [int]$DeadlineSeconds = 60,
+        [int]$PollSeconds = 10
+    )
+
+    $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
+    $Result = [pscustomobject]@{ Registered = [System.Collections.Generic.List[string]]::new(); NotRegistered = [System.Collections.Generic.List[string]]::new(); Asked = $false; Answer = $null }
+    if ($Ids.Count -eq 0) { return $Result }
+    if ($null -eq $Interactive) { $Interactive = Test-RdaInteractiveSession }
+
+    Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
+    $Missing = [System.Collections.Generic.List[object]]::new()
+    foreach ($Id in $Ids)
+    {
+        $Read = Get-RdaInsightsProviderState -SubscriptionId $Id
+        if ($Read.State -eq 'Registered')
+        {
+            $Result.Registered.Add($Id)
+        }
+        elseif ($Read.State -eq 'Unknown')
+        {
+            # Not readable: the batch call is tried and falls back by itself.
+            Write-Host ('  Could not read the Microsoft.Insights state of subscription {0} ({1}); its metrics batch is tried and falls back to one call per resource if Azure refuses it.' -f $Id, $Read.Error) -ForegroundColor Yellow
+            $Result.Registered.Add($Id)
+        }
+        else
+        {
+            $Missing.Add($Read)
+        }
+    }
+    if ($Missing.Count -eq 0)
+    {
+        Write-Host '  Microsoft.Insights is registered on every subscription in scope.' -ForegroundColor DarkGray
+        return $Result
+    }
+
+    Write-Host ('  Microsoft.Insights is not registered on {0} subscription(s); the metrics batch API needs it:' -f $Missing.Count) -ForegroundColor Yellow
+    foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
+
+    $Answer = $null
+    if ($Interactive)
+    {
+        $Result.Asked = $true
+        $Answer = [string](& $ReadAnswer ('Register Microsoft.Insights on these {0} subscription(s) now? [Y/N]' -f $Missing.Count))
+        $Result.Answer = $Answer
+    }
+
+    if ($Answer -notmatch '^\s*(y|yes)\s*$')
+    {
+        $Why = if ($Interactive) { 'Not registering.' } else { 'No one can answer a prompt in this session, so nothing is registered.' }
+        Write-Host ('  {0} Their metrics are collected with one call per resource, so none are lost. To register it later (needs Contributor or Owner), run per subscription:' -f $Why) -ForegroundColor Yellow
+        foreach ($Entry in $Missing)
+        {
+            Write-Host ('    ' + (Get-RdaInsightsRegisterCommand -SubscriptionId $Entry.SubscriptionId)) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Entry.SubscriptionId)
+        }
+        return $Result
+    }
+
+    # Start every registration first, then wait for all of them on one deadline.
+    $Waiting = [System.Collections.Generic.List[string]]::new()
+    foreach ($Entry in $Missing)
+    {
+        $RegisterError = Register-RdaInsightsProvider -SubscriptionId $Entry.SubscriptionId
+        if ($null -eq $RegisterError)
+        {
+            $Waiting.Add($Entry.SubscriptionId)
+        }
+        else
+        {
+            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}). Registering needs the /register/action permission, which the Contributor and Owner roles include. Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Entry.SubscriptionId)
+        }
+    }
+
+    $Deadline = (Get-Date).AddSeconds([math]::Max(0, $DeadlineSeconds))
+    while ($Waiting.Count -gt 0)
+    {
+        for ($Idx = $Waiting.Count - 1; $Idx -ge 0; $Idx--)
+        {
+            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx]).State -eq 'Registered')
+            {
+                Write-Host ('  Microsoft.Insights is now registered on subscription {0}.' -f $Waiting[$Idx]) -ForegroundColor Green
+                $Result.Registered.Add($Waiting[$Idx])
+                $Waiting.RemoveAt($Idx)
+            }
+        }
+        if ($Waiting.Count -eq 0 -or (Get-Date) -ge $Deadline) { break }
+        Start-Sleep -Seconds ([math]::Max(0, $PollSeconds))
+    }
+    foreach ($Id in $Waiting)
+    {
+        Write-Host ('  Microsoft.Insights is still not registered on subscription {0} after {1} s; its metrics are collected with one call per resource this run. A later run finds it registered and uses the batch API.' -f $Id, $DeadlineSeconds) -ForegroundColor Yellow
+        $Result.NotRegistered.Add($Id)
+    }
+    return $Result
+}

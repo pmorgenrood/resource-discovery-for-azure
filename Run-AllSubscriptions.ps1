@@ -5,6 +5,11 @@ param (
     [switch]$Obfuscate,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
+    # Forwarded. Collect metrics with the Azure Monitor batch API (one request
+    # for up to 50 resources of one subscription, region and type) instead of
+    # one request per resource. Off by default. Asks before registering the
+    # Microsoft.Insights resource provider where it is missing (see README).
+    [switch]$UseMetricsBatch,
     [switch]$Resume,
     # Retry only the subscriptions that failed on a previous run: the script
     # processes exactly the failures recorded in the resume-state file and
@@ -869,6 +874,17 @@ if ($ScopeForProbe.Count -gt 0)
     }
 }
 
+# -UseMetricsBatch only: the metrics batch API needs the Microsoft.Insights
+# resource provider registered on each subscription. Read its state on every
+# subscription this run collects, and offer once to register it where it is
+# missing (Invoke-RdaInsightsProviderPreflight). Nothing is registered without
+# a "y"; a subscription left unregistered has its metrics collected with one
+# request per resource, so the run goes on either way.
+if ($UseMetricsBatch -and -not $SkipMetrics -and $Subscriptions.Count -gt 0)
+{
+    $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds @($Subscriptions | ForEach-Object { [string]$_.Id })
+}
+
 # ---------------------------------------------------------------------------
 # Up-front consumption (billing) access gate. Consumption was REQUESTED unless
 # -SkipConsumption was passed. If the signed-in identity is not authorized to
@@ -948,6 +964,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
 # Always forward ConcurrencyLimit so the operator can tune metrics-phase
 # throttling end-to-end from a single param instead of editing the inner
 # script's default. Defaults to 6 (the inner script's existing default), so
@@ -1348,6 +1365,7 @@ else
                 if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
+                if ($UseMetricsBatch) { $WorkerArgs.UseMetricsBatch = $true }
 
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)

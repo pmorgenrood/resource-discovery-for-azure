@@ -13,6 +13,11 @@ param ($TenantID,
     [switch]$DeviceLogin,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
+    # Collect metrics with the Azure Monitor batch API (metrics:getBatch): one
+    # request for up to 50 resources of one subscription, region and type.
+    # Off by default. Whatever the batch cannot answer is collected with one
+    # request per resource, so the records are the same.
+    [switch]$UseMetricsBatch,
     $ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
@@ -681,6 +686,16 @@ Function RunInventorySetup()
     CheckCliRequirements
     CheckPowerShell
     GetSubscriptionsData
+
+    # -UseMetricsBatch only: offer once to register the Microsoft.Insights
+    # resource provider where it is missing (see Run-AllSubscriptions.ps1;
+    # under -RunAllSubs the wrapper has asked already).
+    $PreflightScope = if (![string]::IsNullOrEmpty($SubscriptionID)) { @($SubscriptionID) } else { @($Global:Subscriptions | ForEach-Object { [string]$_.id }) }
+    if ($UseMetricsBatch.IsPresent -and -not $SkipMetrics.IsPresent -and -not $RunAllSubs.IsPresent -and @($PreflightScope).Count -gt 0)
+    {
+        $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds @($PreflightScope)
+    }
+
     ResourceInventoryLoop
     ResourceInventoryAvd
 
@@ -946,7 +961,7 @@ function ExecuteInventoryProcessing()
 
             $Global:AzMetrics = New-Object PSObject
             $Global:AzMetrics | Add-Member -MemberType NoteProperty -Name Metrics -Value NotSet
-            $Global:AzMetrics.Metrics = & $MetricPath -Subscriptions $Subscriptions -Resources $Resources -Task "Processing" -ConcurrencyLimit $ConcurrencyLimit -FilePath $MetricsFilePath -ResourceIdDictionary $(if ($Obfuscate.IsPresent) { $ResourceIdDictionary } else { $null }) -ResourceNameDictionary $(if ($Obfuscate.IsPresent) { $ResourceNameDictionary } else { $null }) -ResourceSubDictionary $(if ($Obfuscate.IsPresent) { $ResourceSubscriptionDictionary } else { $null }) -ResourceGroupDictionary $(if ($Obfuscate.IsPresent) { $ResourceResourceGroupDictionary } else { $null }) -Obfuscate $Obfuscate.IsPresent -MetricsLookbackDays $MetricsLookbackDays
+            $Global:AzMetrics.Metrics = & $MetricPath -Subscriptions $Subscriptions -Resources $Resources -Task "Processing" -ConcurrencyLimit $ConcurrencyLimit -FilePath $MetricsFilePath -ResourceIdDictionary $(if ($Obfuscate.IsPresent) { $ResourceIdDictionary } else { $null }) -ResourceNameDictionary $(if ($Obfuscate.IsPresent) { $ResourceNameDictionary } else { $null }) -ResourceSubDictionary $(if ($Obfuscate.IsPresent) { $ResourceSubscriptionDictionary } else { $null }) -ResourceGroupDictionary $(if ($Obfuscate.IsPresent) { $ResourceResourceGroupDictionary } else { $null }) -Obfuscate $Obfuscate.IsPresent -MetricsLookbackDays $MetricsLookbackDays -UseMetricsBatch:$UseMetricsBatch.IsPresent
         }
     }
 
