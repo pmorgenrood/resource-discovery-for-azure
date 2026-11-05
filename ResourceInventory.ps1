@@ -26,10 +26,6 @@ param ($TenantID,
     # Off by default. Whatever the batch cannot answer is collected with one
     # request per resource, so the records are the same.
     [switch]$UseMetricsBatch,
-    # Internal, set by Run-AllSubscriptions.ps1 with -UseMetricsBatch: the
-    # subscriptions its preflight left without Microsoft.Insights, whose
-    # metrics stay on the per-resource path this run.
-    [string[]]$MetricsBatchPerCallSubscriptionIds,
     $ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
@@ -39,7 +35,12 @@ param ($TenantID,
     # this run collects the same window even after midnight. When absent (or
     # not valid) the run computes the window itself.
     [string]$ConsumptionWindowStart,
-    [string]$ConsumptionWindowEnd)
+    [string]$ConsumptionWindowEnd,
+    # Internal, set by Run-AllSubscriptions.ps1 with -UseMetricsBatch: the
+    # subscriptions its preflight left without Microsoft.Insights, whose
+    # metrics stay on the per-resource path this run. Last, so the position
+    # of every earlier parameter stays as it was.
+    [string[]]$MetricsBatchPerCallSubscriptionIds)
 
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
 if (-not (Test-Path -LiteralPath $FunctionsFile -PathType Leaf))

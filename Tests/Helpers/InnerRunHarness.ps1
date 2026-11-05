@@ -18,6 +18,11 @@
 #   -Obfuscate       pass -Obfuscate.
 #   -NoResources     the subscriptions hold no resources and have no usage.
 #   -DebugOutput     pass -Debug.
+#   -UseMetricsBatch pass -UseMetricsBatch. The disk is then attached (so it has
+#                    metrics), Microsoft.Insights reads NotRegistered at the
+#                    preflight and Registered after it (registered meanwhile),
+#                    and no metrics data plane token is given, so nothing is
+#                    sent to the batch endpoint.
 #
 # Every subscription holds one disk in resource group RG-INFRA, and its usage
 # page has one row for that disk with a consumption meter in additionalInfo.
@@ -34,8 +39,11 @@ param(
     [switch]$SignInFirst,
     [switch]$Obfuscate,
     [switch]$NoResources,
-    [switch]$DebugOutput
+    [switch]$DebugOutput,
+    [switch]$UseMetricsBatch
 )
+$Global:StandInBatch = [bool]$UseMetricsBatch
+$Global:StandInInsightsReads = 0
 $PSStyle.OutputRendering = 'PlainText'
 [System.Globalization.CultureInfo]::CurrentCulture = $Culture
 [System.Globalization.CultureInfo]::CurrentUICulture = $Culture
@@ -73,6 +81,7 @@ function global:Invoke-StandInGraph
             {
                 @{ id = (Get-StandInDiskId $Sub); name = 'DISK-INFRA'; type = 'microsoft.compute/disks'; location = 'eastus'; subscriptionId = $Sub; resourceGroup = 'rg-infra'
                     sku = @{ name = 'Premium_LRS' }; properties = @{ diskSizeGB = 32; diskState = 'Unattached'; timeCreated = '2024-03-15T09:41:27Z' }
+                    managedBy = $(if ($Global:StandInBatch) { '/subscriptions/{0}/resourceGroups/RG-INFRA/providers/Microsoft.Compute/virtualMachines/VM-INFRA' -f $Sub } else { $null })
                 }
             })
         if ($Joined -match "resourceGroup == '([^']*)'") { $Want = $Matches[1]; $Rows = @($Rows | Where-Object { $_.resourceGroup -ceq $Want }) }
@@ -86,7 +95,7 @@ function global:Get-AzContext
 {
     [CmdletBinding()] param()
     if (-not $Global:StandInSignedIn) { return $null }
-    [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $Global:StandInTenant }; Subscription = [pscustomobject]@{ Id = $Global:StandInContextSub; Name = 'stand-in' }; Account = [pscustomobject]@{ Id = 'tester'; Type = 'User' } }
+    [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $Global:StandInTenant }; Subscription = [pscustomobject]@{ Id = $Global:StandInContextSub; Name = 'stand-in' }; Account = [pscustomobject]@{ Id = 'tester'; Type = 'User' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } }
 }
 function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $Context, $Tenant) $Global:StandInContextSub = [string]$Subscription; $null }
 function global:Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication, $Scope) $Global:StandInSignedIn = $true; $null }
@@ -95,6 +104,7 @@ function global:Get-AzAccessToken
 {
     [CmdletBinding()] param($ResourceUrl, $TenantId)
     if (-not $Global:StandInSignedIn) { throw 'stand-in: not signed in' }
+    if ([string]$ResourceUrl -like '*metrics.monitor.azure.com*') { throw 'stand-in: no metrics data plane token' }
     [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig'); TenantId = $Global:StandInTenant }
 }
 function global:Get-AzSubscription
@@ -127,6 +137,7 @@ function global:Invoke-AzRestMethod
     if ($Target -match '/roleDefinitions/') { return (& $Json @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } }) }
     if ($Target -match '/providers/Microsoft\.Authorization/permissions\?') { return (& $Json @{ value = @(@{ actions = @('*/read'); notActions = @() }) }) }
     if ($Target -match '/UsageAggregates\?') { return (& $Json @{ value = @() }) }
+    if ($Target -match '/providers/Microsoft\.Insights\?') { $Global:StandInInsightsReads++; return (& $Json @{ namespace = 'Microsoft.Insights'; registrationState = $(if ($Global:StandInInsightsReads -eq 1) { 'NotRegistered' } else { 'Registered' }) }) }
     if ($Target -match 'Microsoft\.ResourceGraph/resources') { return (& $Json @{ data = @($Global:StandInSubs | Where-Object { -not $Global:StandInNoResources } | ForEach-Object { @{ subscriptionId = [string]$_.id; ResourceCount = 1 } }) }) }
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
@@ -149,6 +160,7 @@ if ($Out) { $Params.OutputDirectory = $Out }
 if ($ResourceGroup) { $Params.ResourceGroup = $ResourceGroup }
 if ($Obfuscate) { $Params.Obfuscate = $true }
 if ($DebugOutput) { $Params.Debug = $true }
+if ($UseMetricsBatch) { $Params.UseMetricsBatch = $true }
 Set-Location -LiteralPath $Tree
 & (Join-Path $Tree 'ResourceInventory.ps1') @Params
 exit $LASTEXITCODE
