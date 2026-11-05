@@ -595,6 +595,24 @@ if ($PreflightOnly)
     }
     $PfStateKey = Get-ResumeStateScope -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
     $PfStateFile = Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey
+    # Resume state files an earlier version named with the tenant id: a run of
+    # the whole tenant renames them to their current names first (when those
+    # are free) and continues them, so the preflight reads them under their
+    # old names. Read only; nothing is renamed here.
+    $PfLegacyStreams = @()
+    if (-not $OneSubscription -and (Test-Path -LiteralPath $PfRoot -PathType Container))
+    {
+        $PfLegacyPattern = '^\.resume-state-{0}(-stream-\d+)?\.json$' -f [regex]::Escape($TenantID.Trim())
+        $PfLegacy = @(Get-ChildItem -LiteralPath $PfRoot -Filter '.resume-state-*' -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $PfLegacyPattern })
+        foreach ($PfOld in $PfLegacy)
+        {
+            $PfIsMain = $PfOld.Name -notmatch '-stream-\d+\.json$'
+            $PfNew = if ($PfIsMain) { $PfStateFile } else { Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey -Stream ([regex]::Match($PfOld.Name, '-stream-(\d+)\.json$').Groups[1].Value) }
+            if (Test-Path -LiteralPath $PfNew) { continue }
+            Write-Host ('  A run would first rename {0}, written by an earlier version, to {1}; this check reads it under its old name.' -f $PfOld.Name, (Split-Path -Path $PfNew -Leaf)) -ForegroundColor Yellow
+            if ($PfIsMain) { $PfStateFile = $PfOld.FullName } else { $PfLegacyStreams += $PfOld }
+        }
+    }
     $PfView = Get-RunStartView -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays -OneSubscription:$OneSubscription
     $PfStart = $PfView.RunStart
     # Resolve-RunStart words its lines for a run; here they say what a run would do.
@@ -651,10 +669,17 @@ if ($PreflightOnly)
     {
         # The lists after the per-stream state files of an interrupted parallel
         # run are folded in, as the run folds them (Get-PreflightRunLists).
-        $PfLists = Get-PreflightRunLists -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -View $PfView -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly)
+        $PfLists = Get-PreflightRunLists -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -View $PfView -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -ExtraStreamFiles $PfLegacyStreams
         $PfCompleted = @($PfLists.Completed)
         $PfFailed = @($PfLists.Failed)
-        foreach ($PfName in @($PfLists.Skipped)) { Write-Host ('  A run would move the per-stream state file {0} aside (it cannot be read or is not the right shape) and leave out what it lists.' -f $PfName) -ForegroundColor Yellow }
+        foreach ($PfName in @($PfLists.Skipped)) { Write-Host ('  A run would move the per-stream state file {0} aside (it cannot be read) and leave out what it lists.' -f $PfName) -ForegroundColor Yellow }
+        foreach ($PfName in @($PfLists.WrongShape)) { Write-Host ('  A run would move the resume state file {0} aside (it is not the right shape) and leave out what it lists.' -f $PfName) -ForegroundColor Yellow }
+        if ($ResumeFailedOnly -and @($PfLists.WrongShape).Count -gt 0)
+        {
+            # As the run: its retry list is not complete, so it stops before retrying anything.
+            Write-Host '  A -ResumeFailedOnly run would stop there (exit 1): its retry list is not complete. Run the same command without -ResumeFailedOnly, with -Resume.' -ForegroundColor Red
+            & $PreflightFailed 'how the run would start'
+        }
         $PfBefore = $PfScope.Count
         if ($ResumeFailedOnly)
         {
@@ -2213,6 +2238,9 @@ else
                 # named-parameter contract. Switches are only included when they
                 # are set, since switch parameters bind correctly from a splatted
                 # hashtable when present with value $true.
+                # The stream worker names its state file from the tenant. A
+                # -SubscriptionID run never gets here: with one subscription
+                # left it runs inline (StreamCount is 1 at most).
                 $WorkerArgs = @{
                     TenantID           = $TenantID
                     StreamId           = [string]$S
