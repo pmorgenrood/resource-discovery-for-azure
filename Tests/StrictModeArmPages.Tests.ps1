@@ -7,6 +7,10 @@
 # page without them: the role check would come back inconclusive and skip
 # every subscription.
 #
+# The role check's and the consumption check's reading of Failed (set only on
+# a check that threw) is tested end to end under strict mode in
+# WrapperSubscriptionId.Tests.ps1 (a passing -PreflightOnly prints no error).
+#
 # Run with: Invoke-Pester ./Tests/StrictModeArmPages.Tests.ps1 -Output Detailed
 
 BeforeAll {
