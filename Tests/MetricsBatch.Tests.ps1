@@ -200,8 +200,21 @@ Export-ModuleMember -Function Get-AzMetric
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfterDateSeconds')) { $Context.Response.AddHeader('Retry-After', [DateTimeOffset]::UtcNow.AddSeconds([int]$Control['RetryAfterDateSeconds']).ToString('r')) }
             $Context.Response.ContentType = 'application/json'
-            $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
-            $Context.Response.Close()
+            if ($Control['StallBodySeconds'])
+            {
+                # Headers and half the body, then a stall: only a timeout on the whole request ends it.
+                $Context.Response.ContentLength64 = $Bytes.Length
+                $Half = [int]($Bytes.Length / 2)
+                $Context.Response.OutputStream.Write($Bytes, 0, $Half)
+                $Context.Response.OutputStream.Flush()
+                Start-Sleep -Seconds ([int]$Control['StallBodySeconds'])
+                try { $Context.Response.OutputStream.Write($Bytes, $Half, $Bytes.Length - $Half) } catch { }
+            }
+            else
+            {
+                $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+            }
+            try { $Context.Response.Close() } catch { }
         }
     }
     # Wait for the listener to answer.
@@ -280,7 +293,7 @@ Export-ModuleMember -Function Get-AzMetric
     # the records and the debug log lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [switch]$Batch, [hashtable]$Control = @{}, [int]$Concurrency = 16, [switch]$Obfuscate, [hashtable]$Dictionaries, [string[]]$PerCallSubscriptions = @(), [object[]]$Subscriptions = $script:Subscriptions)
+        param([object[]]$Resources, [string]$RunName, [switch]$Batch, [hashtable]$Control = @{}, [int]$Concurrency = 16, [switch]$Obfuscate, [hashtable]$Dictionaries, [string[]]$PerCallSubscriptions = @(), [object[]]$Subscriptions = $script:Subscriptions, [int]$CallTimeout = 120)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -302,6 +315,7 @@ Export-ModuleMember -Function Get-AzMetric
             Obfuscate                  = [bool]$Obfuscate
             UseMetricsBatch            = [bool]$Batch
             MetricsBatchEndpointFormat = $script:Endpoint
+            MetricsCallTimeoutSeconds  = $CallTimeout
         }
         if ($PerCallSubscriptions.Count -gt 0) { $Arguments['MetricsBatchPerCallSubscriptionIds'] = $PerCallSubscriptions }
         if ($Obfuscate)
@@ -831,6 +845,15 @@ $null = & (Join-Path $RepoRoot 'Extension/Metrics.ps1') -Subscriptions @([pscust
         $Run.Calls.Count | Should -Be 2
         $Run.Records.Count | Should -Be 8
         @($Run.DebugLines | Where-Object { $_ -match 'could not be read' }).Count | Should -Be 1
+    }
+
+    It 'times out a batch answer whose body stalls, and falls back' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-stall' -Batch -Control @{ StallBodySeconds = 4 } -CallTimeout 2
+
+        $Run.Calls.Count | Should -Be 1
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt\(s\) \(Timed out after 2s\)' }).Count | Should -Be 1
     }
 
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {

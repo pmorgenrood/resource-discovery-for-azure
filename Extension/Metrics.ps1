@@ -21,7 +21,9 @@ param(
     [string[]]$MetricsBatchPerCallSubscriptionIds = @(),
     # The batch API's regional endpoint, {0} being the region. Internal: tests
     # point it at a local listener.
-    [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com'
+    [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com',
+    # Internal: seconds each Azure Monitor request may take. Tests lower it.
+    [int]$MetricsCallTimeoutSeconds = 120
 )
 
 
@@ -611,7 +613,7 @@ if ($Task -eq 'Processing')
         Write-MetricsDiag "WARNING: could not capture Az context for parallel runspaces; metric calls will rely on per-runspace context autosave."
     }
 
-    $MetricTimeoutSeconds = 120
+    $MetricTimeoutSeconds = $MetricsCallTimeoutSeconds
     $MetricMaxRetries = 3
 
 
@@ -983,6 +985,7 @@ function Add-MetricRecord
                         $EndpointFormat = $using:MetricsBatchEndpointFormat
                         $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                         $CallMaxRetries = $using:MetricMaxRetries
+                        $ThreadJobLimit = $using:ConcurrencyLimit
                         $DiagBag = $using:MetricDiagnostics
                         $MetricBag = ($using:Tmp).Metrics
                         # Add-MetricRecord, defined by the source text below, reads these two.
@@ -1168,23 +1171,35 @@ function Add-MetricRecord
                         while ($Attempt -le $CallMaxRetries)
                         {
                             Add-BatchCount 1 1
-                            try
+                            # The whole request, body included, runs in a thread job bounded by Wait-Job, as
+                            # one Get-AzMetric request is: -TimeoutSec alone does not cover reading the body.
+                            $Failure = $null
+                            $Job = Start-ThreadJob -ScriptBlock { param($RequestArgs) Invoke-WebRequest @RequestArgs } -ArgumentList @{ Method = 'Post'; Uri = $Uri; Headers = @{ Authorization = 'Bearer ' + $Token }; ContentType = 'application/json'; Body = $Body; TimeoutSec = $CallTimeoutSeconds; ErrorAction = 'Stop' } -ThrottleLimit $ThreadJobLimit
+                            if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                             {
-                                $Response = Invoke-WebRequest -Method Post -Uri $Uri -Headers @{ Authorization = 'Bearer ' + $Token } -ContentType 'application/json' -Body $Body -TimeoutSec $CallTimeoutSeconds -ErrorAction Stop
-                                $Kind = $null
-                                break
-                            }
-                            catch
-                            {
-                                $LastError = [string]$_.Exception.Message
-                                $Status = Get-BatchStatusCode -Exception $_.Exception
-                                $RetryAfter = Get-BatchRetryAfter -Exception $_.Exception
+                                try { $Response = Receive-Job -Job $Job -ErrorAction Stop } catch { $Failure = $_ }
+                                Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+                                if ($null -eq $Failure)
+                                {
+                                    $Kind = $null
+                                    break
+                                }
+                                $LastError = [string]$Failure.Exception.Message
+                                $Status = Get-BatchStatusCode -Exception $Failure.Exception
+                                $RetryAfter = Get-BatchRetryAfter -Exception $Failure.Exception
                                 $Kind = if ($Status -eq 401) { 'TokenRefused' }
                                 elseif ($Status -eq 403) { 'Refused' }
                                 elseif ($Status -in 400, 404) { 'BadRequest' }
                                 elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
                                 else { 'Error' }
                                 if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
+                            }
+                            else
+                            {
+                                Stop-Job -Job $Job -ErrorAction SilentlyContinue
+                                Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+                                $Kind = 'Error'
+                                $LastError = ('Timed out after {0}s' -f $CallTimeoutSeconds)
                             }
                             if ($Kind -in 'Refused', 'TokenRefused', 'BadRequest') { break }
                             if ($Attempt -lt $CallMaxRetries)
