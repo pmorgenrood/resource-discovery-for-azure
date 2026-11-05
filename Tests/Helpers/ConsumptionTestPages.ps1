@@ -54,10 +54,10 @@ function New-ConsumptionTestRows
         # One to three pieces, on consecutive reported days from the first.
         $FirstDay = [int][math]::Floor($i * $Days / $Count)
         $PieceCount = if ($i % 6 -eq 0) { 3 } elseif ($i % 3 -eq 0) { 2 } else { 1 }
-        $Pieces = @(for ($p = 0; $p -lt $PieceCount; $p++)
+        $Pieces = @(for ($PieceIndex = 0; $PieceIndex -lt $PieceCount; $PieceIndex++)
             {
-                $Text = $QuantityText[($i + $p) % $QuantityText.Count]
-                [pscustomobject]@{ Day = [math]::Min($FirstDay + $p, $Days - 1); Quantity = [double]::Parse($Text, $Inv) }
+                $Text = $QuantityText[($i + $PieceIndex) % $QuantityText.Count]
+                [pscustomobject]@{ Day = [math]::Min($FirstDay + $PieceIndex, $Days - 1); Quantity = [double]::Parse($Text, $Inv) }
             })
         $Sum = [double]0
         foreach ($Piece in $Pieces) { $Sum += $Piece.Quantity }
