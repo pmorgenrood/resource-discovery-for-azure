@@ -1,12 +1,10 @@
-# Made-up usage pages for the consumption phase tests (ConsumptionDaySplit.Tests.ps1).
+# Made-up usage pages for the consumption phase tests (ConsumptionRowLoop.Tests.ps1).
 # Placeholder ids and generic names only; nothing here comes from a real tenant.
 #
 # New-ConsumptionTestRows gives whole-window rows shaped as Get-UsageAggregates
 # gives them (Quantity a decimal made from a double, UsageStartTime and
-# UsageEndTime UTC DateTimes), each with the one-day pieces the usage API would
-# report it in (Pieces: the reported day and the double quantity of each piece).
-# Rows are in the order of their first reported day, so the day-split join gives
-# them back in the same order. The rows cover the cases the billing row loop
+# UsageEndTime UTC DateTimes); each quantity is the double sum of one to three
+# made-up parts (Pieces). The rows cover the cases the billing row loop
 # treats apart: no InstanceData, InstanceData that is not JSON, JSON without
 # 'Microsoft.Resources', no additionalInfo, a reservation row, a null resource
 # URI, every additionalInfo key the loop reads (some in other letter case),
@@ -103,48 +101,4 @@ function New-ConsumptionTestPages
         $Pages.Add([pscustomobject]@{ UsageAggregations = $Aggregations; ContinuationToken = $(if ($Last + 1 -lt $Rows.Count) { 'page-{0}' -f ($Pages.Count + 2) } else { $null }) })
     }
     return , $Pages.ToArray()
-}
-
-# The same rows as the usage API reports them one day at a time, shaped as
-# Get-UsageAggregatesPage gives them (ConvertFrom-Json of the REST answer):
-# camelCase properties, a double quantity, local DateTimes. Returns a hashtable
-# 'yyyy-MM-dd' -> list of pages ({ UsageAggregations; ContinuationToken }), with
-# $PageSize rows a page and at least one (maybe empty) page a day. The null rows
-# of New-ConsumptionTestPages are left out (they have no pieces).
-function New-ConsumptionTestDayPages
-{
-    param([object[]]$Rows, [datetime]$WindowStart = [datetime]'2026-10-01', [int]$Days = 31, [int]$PageSize = 50)
-    $ByDay = @{}
-    for ($d = 0; $d -lt $Days; $d++) { $ByDay[$d] = [System.Collections.Generic.List[object]]::new() }
-    for ($i = 0; $i -lt $Rows.Count; $i++)
-    {
-        if ($i % 97 -eq 96) { continue }
-        $R = $Rows[$i]
-        foreach ($Piece in $R.Pieces)
-        {
-            $ByDay[[int]$Piece.Day].Add([pscustomobject]@{ Properties = [pscustomobject]@{
-                        meterId = $R.MeterId; meterName = $R.MeterName; meterCategory = $R.MeterCategory; meterSubCategory = $R.MeterSubCategory; unit = $R.Unit
-                        meterRegion = $R.MeterRegion; usageStartTime = $R.UsageStartTime.ToLocalTime(); usageEndTime = $R.UsageEndTime.ToLocalTime()
-                        instanceData = $R.InstanceData; quantity = $Piece.Quantity
-                    }
-                })
-        }
-    }
-    $Result = @{}
-    for ($d = 0; $d -lt $Days; $d++)
-    {
-        $Key = $WindowStart.AddDays($d).ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
-        $All = $ByDay[$d]
-        $Pages = [System.Collections.Generic.List[object]]::new()
-        $First = 0
-        do
-        {
-            $Last = [math]::Min($First + $PageSize, $All.Count) - 1
-            $Slice = @(for ($i = $First; $i -le $Last; $i++) { $All[$i] })
-            $First += $PageSize
-            $Pages.Add([pscustomobject]@{ UsageAggregations = $Slice; ContinuationToken = $(if ($First -lt $All.Count) { '{0}-page-{1}' -f $Key, ($Pages.Count + 2) } else { $null }) })
-        } while ($First -lt $All.Count)
-        $Result[$Key] = $Pages.ToArray()
-    }
-    return $Result
 }
