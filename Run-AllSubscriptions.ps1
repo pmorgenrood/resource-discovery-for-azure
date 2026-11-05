@@ -148,6 +148,16 @@ param (
 # ---------------------------------------------------------------------------
 if ($PSVersionTable.PSVersion.Major -lt 7)
 {
+    # Windows PowerShell drops an empty native argument, so an empty
+    # -SubscriptionID would reach PowerShell 7 with no value. Stop here, first,
+    # before any offer to install PowerShell 7, with the message PowerShell 7
+    # gives for it.
+    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
+    {
+        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID) -ForegroundColor Red
+        exit 1
+    }
+
     Write-Host ("Detected Windows PowerShell {0}. This tool requires PowerShell 7." -f $PSVersionTable.PSVersion) -ForegroundColor Yellow
 
     $PwshPath = $null
@@ -232,15 +242,6 @@ if ($PSVersionTable.PSVersion.Major -lt 7)
             Write-Host "Close this window, open a new PowerShell 7 (pwsh) prompt, then re-run the same command." -ForegroundColor Yellow
             exit 1
         }
-    }
-
-    # Windows PowerShell drops an empty native argument, so an empty
-    # -SubscriptionID would reach PowerShell 7 with no value. Stop here with
-    # the message PowerShell 7 gives for it.
-    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
-    {
-        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID) -ForegroundColor Red
-        exit 1
     }
 
     # Rebuild the original invocation as CLI tokens so `pwsh -File` binds them to
