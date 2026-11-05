@@ -516,7 +516,8 @@ function Invoke-RoleCheckGet
         {
             $Items += @(@($Body.value) | Where-Object { $null -ne $_ })
         }
-        $Next = if ($null -ne $Body) { [string]$Body.nextLink } else { '' }
+        # A last page has no nextLink at all; read it so Set-StrictMode allows that.
+        $Next = if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['nextLink']) { [string]$Body.nextLink } else { '' }
         $Target = $null
         if (-not [string]::IsNullOrEmpty($Next))
         {
@@ -948,7 +949,9 @@ function Test-SubscriptionRoleAccessAll
     $RoleRecords = [System.Collections.Generic.List[object]]::new()
     Invoke-SubscriptionCheckInOrder -Items $Subs -Command 'Get-SubscriptionRoleAccess' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
         param($RoleRecord)
-        if ($RoleRecord.Failed)
+        # Only a check that threw carries Failed (Invoke-SubscriptionCheckInOrder);
+        # read it so Set-StrictMode allows a result without it.
+        if ($null -ne $RoleRecord.PSObject.Properties['Failed'] -and $RoleRecord.Failed)
         {
             $FailedId = [string]$RoleRecord.Item.Id
             $RoleRecord = [pscustomobject]@{
@@ -1586,7 +1589,9 @@ function Get-UsageAggregatesPage
     # The next page is asked for with the token alone, as the cmdlet does, so
     # the request never goes to a host named in the answer.
     $Token = $null
-    $NextLink = [string]$Body.nextLink
+    # A last page has no nextLink (and an empty one may have no value); read
+    # both so Set-StrictMode allows that.
+    $NextLink = if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['nextLink']) { [string]$Body.nextLink } else { '' }
     if (-not [string]::IsNullOrEmpty($NextLink))
     {
         $NextUri = $null
@@ -1594,7 +1599,7 @@ function Get-UsageAggregatesPage
         if ([string]::IsNullOrEmpty($Token)) { throw 'The usage answer''s nextLink has no continuationToken, so the next page cannot be read.' }
     }
     return [pscustomobject]@{
-        UsageAggregations = @(@($Body.value) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Properties = $_.properties } })
+        UsageAggregations = @(@(if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['value']) { $Body.value }) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Properties = $_.properties } })
         ContinuationToken = $Token
     }
 }
@@ -1856,7 +1861,9 @@ function Invoke-ConsumptionDataCheck
     $Arguments = @{ Window = $Window; ResourceGroup = $ResourceGroup; MaxRetries = $MaxRetries }
     Invoke-SubscriptionCheckInOrder -Items $Items -Command 'Get-SubscriptionConsumptionCheck' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
         param($CheckResult)
-        if ($CheckResult.Failed)
+        # Only a check that threw carries Failed (Invoke-SubscriptionCheckInOrder);
+        # read it so Set-StrictMode allows a result without it.
+        if ($null -ne $CheckResult.PSObject.Properties['Failed'] -and $CheckResult.Failed)
         {
             $CheckResult = [pscustomobject]@{
                 Id             = [string]$CheckResult.Item.Id
@@ -1918,7 +1925,9 @@ function Format-RunDataSwitches
 {
     param([System.Collections.IDictionary]$Settings)
     if ($null -eq $Settings) { return '' }
-    return (-join @(foreach ($Name in @($Settings.Keys)) { if ($Settings[$Name]) { ' -' + $Name } }))
+    # SubscriptionID is a value, not a switch: the command that takes it names
+    # it itself (Get-WrapperRunCommand, Get-DirectRunRetryCommand).
+    return (-join @(foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'SubscriptionID' -and $Settings[$Name]) { ' -' + $Name } }))
 }
 
 # A value as a printed command gives it: in single quotes, escaped by
