@@ -630,6 +630,38 @@ if ($PreflightOnly)
         }
         Write-Host ('  Subscriptions listed: {0}, of which {1} in scope: ok.' -f $PfAll.Count, $PfScope.Count) -ForegroundColor Green
     }
+    # The run checks access only for the subscriptions it would collect: a run
+    # that continues the unfinished run leaves out those it completed,
+    # -ResumeFailedOnly takes only the retry list, and both leave out those
+    # past the retry limit. The same lists are read here, without changing
+    # them (per-stream state files of an interrupted parallel run are not read).
+    $PfContinues = $PfStart.Mode -eq 'Continue'
+    $PfResume = $PfContinues -and ($Resume -or -not $ResumeFailedOnly)
+    if ($PfContinues -or $ResumeFailedOnly)
+    {
+        $PfStateFile = Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey
+        $PfCompleted = @(Get-CompletedSubscriptionIds -Path $PfStateFile -Tenant $PfStateKey | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $PfFailed = @(Get-FailedAttempts -Path $PfStateFile -Tenant $PfStateKey | Where-Object { $null -ne $_ })
+        $PfBefore = $PfScope.Count
+        if ($ResumeFailedOnly)
+        {
+            $PfFailedIds = @($PfFailed | ForEach-Object { [string]$_.Id })
+            $PfScope = @($PfScope | Where-Object { $PfFailedIds -contains [string]$_.Id })
+        }
+        if ($PfResume -or $ResumeFailedOnly)
+        {
+            $PfLimitedIds = @(Get-RetryLimitedAttempts -FailedAttempts $PfFailed | ForEach-Object { [string]$_.Id })
+            $PfScope = @($PfScope | Where-Object { $PfLimitedIds -notcontains [string]$_.Id })
+        }
+        if ($PfResume) { $PfScope = @($PfScope | Where-Object { $PfCompleted -notcontains [string]$_.Id }) }
+        if ($PfScope.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out); only those are checked.' -f $PfScope.Count, $PfBefore) -ForegroundColor Cyan }
+    }
+    if ($PfScope.Count -eq 0)
+    {
+        Write-Host '  Nothing is left for the run to collect, so no access check is needed.' -ForegroundColor Green
+        Write-Host 'Every check passed.' -ForegroundColor Green
+        Exit-Wrapper -Code 0
+    }
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $PfScope.Count) -ForegroundColor Cyan
     $PfProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $PfScope -IncludeUsage:(-not $SkipConsumption))
     $PfDecision = Resolve-AccessPreflight -Probed $PfProbed

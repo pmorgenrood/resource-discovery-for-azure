@@ -917,5 +917,27 @@ Describe 'A -SubscriptionID run whose subscription is gone' -Skip:$IsWindows {
         $W = script:Invoke-Wrapper
         @($W.Text | Where-Object { $_ -like '-SubscriptionID: *' }) | Should -BeNullOrEmpty
     }
+
+    It 'checks access only for what the run would collect: <Case>' -ForEach @(
+        @{ Case = 'a continued run leaves out a completed subscription that is now unreadable'; Extra = @(); Denied = 'A'; Code = 0 }
+        @{ Case = '-ResumeFailedOnly leaves out a subscription not on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'C'; Code = 0 }
+        @{ Case = '-ResumeFailedOnly still checks the subscription on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1 }
+    ) {
+        # An unfinished run of the whole tenant: A completed, B failed, C never reached.
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B' -Hang 'C'
+        $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'C') -and ((script:Read-StateAt $script:State).Failed -join ',') -eq $script:Subs['B'].Id }
+        $State = script:Read-StateAt $script:State
+        $State.Completed | Should -Be (script:Get-Ids 'A')
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        $R = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + $Extra)
+        $R.ExitCode | Should -Be $Code
+        @($R.Text | Where-Object { $_ -like '  The run would collect * of these 3 subscription(s)*' }).Count | Should -Be 1
+        script:Get-RootSnapshot | Should -Be $Before
+        # The run itself gets past its access check the same way.
+        $Run = script:Invoke-Wrapper -Arguments $Extra
+        if ($Code -eq 0) { @($Run.Text | Where-Object { $_ -like '*NOT readable*' }) | Should -BeNullOrEmpty }
+        else { @($Run.Text | Where-Object { $_ -like '*NOT readable*' }).Count | Should -BeGreaterThan 0 }
+    }
 }
 
