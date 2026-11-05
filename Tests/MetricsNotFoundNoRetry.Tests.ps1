@@ -9,9 +9,12 @@ BeforeAll {
     $script:MetricsSrc = Get-Content -LiteralPath (Join-Path $Repo 'Extension/Metrics.ps1') -Raw
     $Tokens = $null; $Errors = $null
     $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
-    $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Test-MetricNotFound' }, $true) | Select-Object -First 1
-    if (-not $FnAst) { throw 'Test-MetricNotFound was not found in Extension/Metrics.ps1' }
-    . ([scriptblock]::Create($FnAst.Extent.Text))
+    foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricNotFound')
+    {
+        $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $Name }, $true) | Select-Object -First 1
+        if (-not $FnAst) { throw "$Name was not found in Extension/Metrics.ps1" }
+        . ([scriptblock]::Create($FnAst.Extent.Text))
+    }
 }
 
 Describe 'Test-MetricNotFound' {
@@ -48,9 +51,44 @@ Describe 'Test-MetricNotFound' {
         Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new('busy', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)) | Should -BeFalse
     }
 
-    It 'the retry loop checks NotFound before the throttle match and passes it to the plan as permanent' {
-        $script:MetricsSrc | Should -Match '(?s)if \(Test-MetricNotFound -Exception \$_\.Exception\)\s*\{\s*\$NotFound = \$true\s*\}\s*elseif \(\$LastError -match ''429\|throttl'
-        $script:MetricsSrc | Should -Match 'Get-RdaMetricRetryPlan -Attempt \$Attempt .*-Permanent \$NotFound'
+    It 'lets a status code decide over 404 text: a 503 that quotes a 404 is not permanent' {
+        Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new("upstream said: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)) | Should -BeFalse
+    }
+
+    It 'reads the outermost status: a 500 that wraps a 404 is not permanent' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Inner, [System.Net.HttpStatusCode]::InternalServerError)) | Should -BeFalse
+    }
+
+    It 'reads the status of a wrapped exception when the outer one carries none' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        Test-MetricNotFound -Exception ([System.Exception]::new('The request failed.', $Inner)) | Should -BeTrue
+    }
+
+    It 'reads the status of the response an SDK exception carries (<Code>)' -ForEach @(@{ Code = 'NotFound'; Want = $true }, @{ Code = 'ServiceUnavailable'; Want = $false }) {
+        $Ex = [System.Exception]::new("Operation returned an invalid status code 'NotFound'")
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = [System.Net.HttpStatusCode]$Code })
+        Test-MetricNotFound -Exception $Ex | Should -Be $Want
+    }
+
+    It 'follows a wrapped error record whose exception holds the 404, under a neutral outer message' {
+        $Inner = [System.Exception]::new("Operation returned an invalid status code 'NotFound'")
+        $Outer = [System.Exception]::new('The running command stopped.')
+        $Outer | Add-Member -NotePropertyName ErrorRecord -NotePropertyValue ([System.Management.Automation.ErrorRecord]::new($Inner, 'Metric', 'NotSpecified', $null))
+        Test-MetricNotFound -Exception $Outer | Should -BeTrue
+    }
+
+    It 'matches the newer SDK form of a 404 (<Label>)' -ForEach @(@{ Label = 'error code in the body'; Body = $true }, @{ Label = 'error code in the message'; Body = $false }) {
+        if ($Body)
+        {
+            $Ex = [System.Exception]::new('The resource was not found.')
+            $Ex | Add-Member -NotePropertyName Body -NotePropertyValue ([PSCustomObject]@{ Code = 'ResourceNotFound' })
+        }
+        else
+        {
+            $Ex = [System.Exception]::new("[ResourceNotFound] : The Resource 'x' was not found.")
+        }
+        Test-MetricNotFound -Exception $Ex | Should -BeTrue
     }
 }
 
@@ -63,15 +101,17 @@ Describe 'Get-MetricDeletingState' {
             [PSCustomObject]@{ Id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.DBforMySQL/flexibleServers/my-1'; properties = [PSCustomObject]@{ state = 'Ready' } }
             [PSCustomObject]@{ Id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/disks/d-1'; properties = [PSCustomObject]@{ provisioningState = 'Deleting' } }
             [PSCustomObject]@{ Id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute/disks/d-2'; properties = $null }
+            [PSCustomObject]@{ Id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Sql/servers/sv/databases/db-1'; properties = [PSCustomObject]@{ status = 'dropping' } }
         )
     }
 
     It 'maps only the asked ids whose state says they are being deleted, ignoring case' {
         $Ids = @($script:Rows.Id.ToUpperInvariant())
         $Found = Get-MetricDeletingState -Resources $script:Rows -Ids $Ids
-        $Found.Count | Should -Be 2
+        $Found.Count | Should -Be 3
         $Found[$script:Rows[0].Id] | Should -Be 'Dropping'
         $Found[$script:Rows[2].Id] | Should -Be 'Deleting'
+        $Found[$script:Rows[4].Id] | Should -Be 'dropping'
     }
 
     It 'reads nothing for an id that was not asked' {
