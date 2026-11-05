@@ -119,7 +119,7 @@ $Global:LASTEXITCODE = 0
     if ($MergeStart -lt 0) { throw 'Expected the end-of-run merge of per-stream state in the wrapper.' }
     $MergeText = (@($Body[$MergeStart..($Body.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
-    $Prelude = "param(`$FakeScriptRoot, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Subscriptions, `$Resume)`n" +
+    $Prelude = "param(`$FakeScriptRoot, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Subscriptions, `$Resume)`n`$ResumeScope = `$TenantID`n" +
     "`$ResumeFailedOnly = `$false; `$FailedSubscriptions = @()`n" +
     $StartupText + "`n" + $SetupText + "`n"
     $script:SequentialRun = [scriptblock]::Create($Prelude + '. ' + $SeqText)

@@ -108,7 +108,7 @@ $Global:ResourceCount = 1
     if ($SeqIf.Count -ne 1) { throw "Expected one 'if (`$ParallelStreams -le 1)' in the wrapper, found $($SeqIf.Count)." }
     $SeqText = $SeqIf[0].Clauses[0].Item2.Extent.Text -replace '\$PSScriptRoot', '$FakeScriptRoot'
     $script:SequentialBlock = [scriptblock]::Create(
-        "param(`$FakeScriptRoot, `$Subscriptions, `$Resume, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Obfuscate)`n" +
+        "param(`$FakeScriptRoot, `$Subscriptions, `$Resume, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Obfuscate)`n`$ResumeScope = `$TenantID`n" +
         "`$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }; if (`$Obfuscate) { `$InventoryPassthrough['Obfuscate'] = `$true }`n" +
         ". " + $SeqText + "`n" +
         "[pscustomobject]@{ SkippedSubscriptions = @(`$SkippedSubscriptions); SubResourceCounts = @(`$SubResourceCounts); CompletedIds = @(`$CompletedIds); CompletedReports = @(`$CompletedReports) }")
@@ -117,7 +117,7 @@ $Global:ResourceCount = 1
     $Fold = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$Resume -or $ResumeFailedOnly' })
     if ($Fold.Count -ne 1) { throw "Expected one top-level 'if (`$Resume -or `$ResumeFailedOnly)' in the wrapper, found $($Fold.Count)." }
     $script:FoldBlock = [scriptblock]::Create(
-        "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n`$Resume = `$true; `$ResumeFailedOnly = `$false`n" +
+        "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n`$ResumeScope = `$TenantID`n`$Resume = `$true; `$ResumeFailedOnly = `$false`n" +
         $Fold[0].Extent.Text + "`n[pscustomobject]@{ CompletedIds = @(`$CompletedIds); CompletedReports = @(`$CompletedReports) }")
 
     # The parallel parent's aggregation of stream summaries and per-stream state:
@@ -133,7 +133,7 @@ $Global:ResourceCount = 1
     if ($AggStart -lt 0) { throw 'Expected the stream-summary aggregation loop in the wrapper.' }
     $AggText = (@($Body[$AggStart..($Body.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
     $script:AggregateBlock = [scriptblock]::Create(
-        "param(`$StreamSummaries, `$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n" +
+        "param(`$StreamSummaries, `$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n`$ResumeScope = `$TenantID`n" +
         "`$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null`n" +
         $AggText + "`n[pscustomobject]@{ SkippedSubscriptions = @(`$SkippedSubscriptions); SubResourceCounts = @(`$SubResourceCounts); CompletedIds = @(`$CompletedIds); CompletedReports = @(`$CompletedReports); FailedSubscriptions = @(`$FailedSubscriptions) }")
 
@@ -150,7 +150,7 @@ $Global:ResourceCount = 1
     if ($From -lt 0 -or $To -lt 0) { throw 'Expected the post-processing statements (verification, consolidation, main summary) in the wrapper.' }
     $PostText = (@($Top[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n") -replace '\$PSScriptRoot', '$RealScriptRoot'
     $script:PostBlock = [scriptblock]::Create(
-        "param(`$RealScriptRoot, `$InventoryRoot, `$RunStartTime, `$SubResourceCounts, `$SkippedSubscriptions, `$CompletedReports, `$Resume, `$Obfuscate, `$ResumeStateFile, `$TenantID)`n" +
+        "param(`$RealScriptRoot, `$InventoryRoot, `$RunStartTime, `$SubResourceCounts, `$SkippedSubscriptions, `$CompletedReports, `$Resume, `$Obfuscate, `$ResumeStateFile, `$TenantID)`n`$ResumeScope = `$TenantID`n" +
         "function Exit-Wrapper { param([int]`$Code) throw ('Exit-Wrapper ' + `$Code) }`n" +
         "`$WrapperTranscriptStarted = `$false; `$FailedSubscriptions = @(); `$Detailed = `$false`n" +
         "# This run's own report records: the report zips the test wrote for this run.`n" +
@@ -570,7 +570,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         $OneIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$StreamCount -le 1' }, $true))
         if ($OneIf.Count -ne 1) { throw "Expected one 'if (`$StreamCount -le 1)' in the wrapper, found $($OneIf.Count)." }
         $script:FallbackBlock = [scriptblock]::Create(
-            "param(`$FakeScriptRoot, `$Subscriptions, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID)`n" +
+            "param(`$FakeScriptRoot, `$Subscriptions, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID)`n`$ResumeScope = `$TenantID`n" +
             "`$StreamCount = 1; `$Obfuscate = `$false; `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }`n" +
             # The fallback takes the pending list, which the wrapper builds just before it.
             "`$PendingSubscriptions = @(`$Subscriptions)`n" +
@@ -864,7 +864,7 @@ Describe 'A -Resume run on a state file written before CompletedReports existed'
         if ($From -lt 0 -or $To -lt 0) { throw 'Expected the resume-state loading at startup in the wrapper.' }
         $StartText = (@($Top[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n")
         $script:StartupBlock = [scriptblock]::Create(
-            "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$Resume)`n`$ResumeFailedOnly = `$false`n" +
+            "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$Resume)`n`$ResumeScope = `$TenantID`n`$ResumeFailedOnly = `$false`n" +
             $StartText + "`n[pscustomobject]@{ CompletedIds = @(`$CompletedIds); FailedAttempts = @(`$FailedAttempts); CompletedReports = @(`$CompletedReports) }")
 
         # Startup, then the sequential loop over sub-a and sub-b, then the post-processing.
