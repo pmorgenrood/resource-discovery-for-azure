@@ -460,6 +460,8 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
     It 'keeps whole numbers as JSON numbers with a fraction, as the per-resource path writes them' {
         $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-numbers' -Batch
         $PerCall = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'per-numbers'
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
 
         $Strip = { param($Text) ([regex]::Matches(($Text -join ''), '"MetricSeries":\[[^\]]*\]') | ForEach-Object { $_.Value } | Sort-Object) -join ';' }
         (& $Strip $Run.RawJson) | Should -Be (& $Strip $PerCall.RawJson)
@@ -599,6 +601,8 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Plain = Invoke-MetricsRun -Resources $script:Mixed -RunName 'per-masked' -Obfuscate -Dictionaries (& $Dict)
         $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-masked' -Batch -Obfuscate -Dictionaries (& $Dict)
 
+        $Run.Posts.Count | Should -BeGreaterThan 0
+        $Run.Calls.Count | Should -Be 0
         Assert-SameRecords -Expected $Plain -Actual $Run
         @($Run.Records | Where-Object { $_.ID -notmatch '/prod_\d+$' }).Count | Should -Be 0
     }
