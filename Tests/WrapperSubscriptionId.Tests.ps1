@@ -498,7 +498,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
 
     It 'leaves an existing inventory folder exactly as it is, on <Label>' -ForEach @(
         @{ Label = 'pass'; Denied = @(); Code = 0 }
-        @{ Label = 'fail'; Denied = @('A'); Code = 1 }
+        @{ Label = 'fail'; Denied = @('B'); Code = 1 }
     ) {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B' -Denied $Denied
@@ -517,4 +517,26 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         script:Get-RootSnapshot | Should -Be $Before
         script:Get-Calls | Should -BeNullOrEmpty
     }
+
+    It 'checks access only for what the run would collect: <Case>' -ForEach @(
+        @{ Case = '-Resume leaves out a completed subscription that is now unreadable'; Extra = @('-Resume'); Denied = 'A'; Code = 0 }
+        @{ Case = '-ResumeFailedOnly leaves out a subscription not on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'C'; Code = 0 }
+        @{ Case = '-ResumeFailedOnly still checks the subscription on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1 }
+    ) {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{
+            TenantID                 = $script:Tenant
+            CompletedSubscriptionIds = @($script:Subs['A'].Id)
+            FailedAttempts           = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = 'Sub B'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'earlier failure'; Attempts = 1 })
+            LastUpdated              = '2026-11-01T00:00:00.0000000Z'
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        $R = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + $Extra)
+        $R.ExitCode | Should -Be $Code
+        @($R.Text | Where-Object { $_ -like '  The run would collect * of these 3 subscription(s)*' }).Count | Should -Be 1
+        script:Get-RootSnapshot | Should -Be $Before
+    }
 }
+

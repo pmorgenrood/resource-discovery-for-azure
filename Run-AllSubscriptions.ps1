@@ -816,6 +816,33 @@ if ($PreflightOnly)
         Write-Host ("ERROR: None of the {0} subscription(s) the tenant lists is Enabled. To check them anyway, run the same command with -IncludeDisabled." -f $AllSubscriptions.Count) -ForegroundColor Red
         Exit-Wrapper -Code 1
     }
+    # The run checks access only for the subscriptions it would collect:
+    # -Resume leaves out those it completed, -ResumeFailedOnly takes only the
+    # retry list. The same lists are read here, without changing them (the
+    # per-stream state files of an interrupted parallel run are not read).
+    if ($Resume -or $ResumeFailedOnly)
+    {
+        $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+        $PfStateFile = Join-Path $PfRoot (".resume-state-{0}.json" -f $ResumeKey)
+        $PfBefore = $Subscriptions.Count
+        if ($ResumeFailedOnly)
+        {
+            $PfFailedIds = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+            $Subscriptions = @($Subscriptions | Where-Object { $PfFailedIds -contains [string]$_.Id })
+        }
+        else
+        {
+            $PfCompleted = @(Get-CompletedSubscriptionIds -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $Subscriptions = @($Subscriptions | Where-Object { $PfCompleted -notcontains [string]$_.Id })
+        }
+        if ($Subscriptions.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (an earlier run completed the others, or -ResumeFailedOnly leaves them out); only those are checked.' -f $Subscriptions.Count, $PfBefore) -ForegroundColor Cyan }
+        if ($Subscriptions.Count -eq 0)
+        {
+            Write-Host '  Nothing is left for the run to collect, so no access check is needed.' -ForegroundColor Green
+            Write-Host 'Every check passed.' -ForegroundColor Green
+            Exit-Wrapper -Code 0
+        }
+    }
     $script:PreflightCheck = 'read access'
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $Subscriptions.Count) -ForegroundColor Cyan
     $PfDecision = Resolve-AccessPreflight -Probed (Test-SubscriptionAccessAll -Subscriptions $Subscriptions)
