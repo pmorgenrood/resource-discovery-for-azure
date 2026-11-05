@@ -566,6 +566,33 @@ Get-ChildItem -File -Path ./* -Include *.html, Consumption_*.csv, Inventory_*.js
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
 | `IncludeNetworkResources` | Switch | Also pull the network types that no collector reads (virtual networks, NSGs, NICs, private endpoints, route tables and the like). They are left out by default because they can be most of the rows, time and memory of a run. Network costs still come from the consumption data either way. | False | `-IncludeNetworkResources` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
+| `UseMetricsBatch` | Switch | Collect metrics with the Azure Monitor batch API: one request for up to 50 resources of one subscription, region and type, instead of one request per resource. The metrics files are the same. Anything the batch cannot answer is collected one resource at a time. See [Faster metrics for big tenants](#faster-metrics-for-big-tenants--usemetricsbatch). | False | `-UseMetricsBatch` |
+
+### Faster metrics for big tenants (-UseMetricsBatch)
+
+By default the tool asks Azure Monitor for the metrics of one resource at a time. With `-UseMetricsBatch` it uses the Azure Monitor batch API (`metrics:getBatch`) instead: one request covers up to 50 resources that share a subscription, region and resource type. Use it on big tenants with many resources of one type (VMs, disks, SQL databases). It sends far fewer requests, so it is less likely to be throttled.
+
+```powershell
+./Run-AllSubscriptions.ps1 -TenantID <tenant-id> -UseMetricsBatch
+./ResourceInventory.ps1 -TenantID <tenant-id> -SubscriptionID <subscription-id> -UseMetricsBatch
+```
+
+What stays the same:
+
+- The `Metrics_*.json` records: same fields, same values, same masked tokens with `-Obfuscate`.
+- Nothing is lost. A metric the batch cannot answer, a resource missing from its answer, a request that still fails after 3 retries, or a request Azure refuses is collected one resource at a time, as without the switch.
+
+What it needs:
+
+- **Monitoring Reader (or Reader) on the subscription itself.** The batch API is a subscription-level call; access granted only on resource groups or resources is not enough ([Microsoft docs](https://learn.microsoft.com/azure/azure-monitor/metrics/migrate-to-batch-api)). Without it Azure answers 401/403, batch is turned off for that subscription, and its metrics are collected one resource at a time.
+- **The `Microsoft.Insights` resource provider registered on the subscription.** The run checks this first, for every subscription in scope (a read). If some are not registered it lists them and asks once: `Register Microsoft.Insights on these N subscription(s) now? [Y/N]`.
+  - `Y` registers them together and waits up to 60 seconds for all of them. Registering needs the `/register/action` permission, which the Contributor and Owner roles include ([Microsoft docs](https://learn.microsoft.com/azure/azure-resource-manager/management/resource-providers-and-types#register-resource-provider)). A subscription where the register is refused, or that is not registered within the 60 seconds, has its metrics collected one resource at a time this run.
+  - `N`, or a run with no one to answer (scheduled, piped, CI), registers nothing. The run prints the command to register it per subscription and collects those metrics one resource at a time.
+  - The next run finds a registered subscription registered and does not ask again.
+  - Nothing is registered without `-UseMetricsBatch` and a `Y`.
+- Azure public cloud (`AzureCloud`). In other clouds the switch has no effect.
+
+The debug log (`-Debug`) has a `Metrics batch` line in the metrics summary: requests sent, resources answered, and how many metrics went one resource at a time, with the reason for each fallback.
 
 ### Metrics Lookback Window
 
@@ -638,6 +665,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
 | `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front). | False | `-SkipConsumption` |
 | `IncludeNetworkResources` | Switch | Forwarded. Also pull the network types no collector reads; left out by default to save time and memory. Network costs still come from the consumption data. A run started without it continues only without it. | False | `-IncludeNetworkResources` |
+| `UseMetricsBatch` | Switch | Forwarded. Collect metrics with the Azure Monitor batch API (up to 50 resources per request); same metrics files. Before collecting, offers once to register `Microsoft.Insights` where it is missing. See [Faster metrics for big tenants](#faster-metrics-for-big-tenants--usemetricsbatch). | False | `-UseMetricsBatch` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
 
 ## Troubleshooting
