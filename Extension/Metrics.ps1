@@ -710,6 +710,148 @@ if ($Task -eq 'Processing')
         }
     }
 
+    # The one copy of Add-MetricRecord, defined in each parallel runspace that builds
+    # records (the per-resource requests and, with -UseMetricsBatch, the batch
+    # requests), so both write exactly the same records. It reads $DiagBag and
+    # $MetricBag from the runspace that defines it.
+    $AddMetricRecordSource = @'
+# Adds the result record and the diagnostics record for one definition.
+# $MetricQuery is the response for this metric alone, whether it was
+# requested on its own or together with other metrics of the resource.
+# The reported time is $ExtraSeconds plus, when given, the time on
+# $CallStopwatch when the record is added.
+function Add-MetricRecord
+{
+    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
+
+    $ElapsedSeconds = $ExtraSeconds
+    $MetricError = $false
+    $CallOutcome = $Request.Outcome
+    $CallErrorMsg = $null
+    $MetricTimeSeries = $null
+
+    try
+    {
+        if (-not $Request.Succeeded)
+        {
+            throw $Request.ErrorMessage
+        }
+
+        $MetricTotalCount = @($MetricQuery.Data).Count
+
+        $MetricQueryResults = 0
+        $MetricTimeSeries = 0
+
+        switch ($Def.Aggregation)
+        {
+            'Average'
+            {
+                $MetricQueryResults = $MetricQuery.Data.Average
+            }
+            'Maximum'
+            {
+                $MetricQueryResults = $MetricQuery.Data.Maximum
+            }
+            'Count'
+            {
+                # .Data has a Count of its own, the number of data points, so read the
+                # property of each point. A point without one reads as $null, not as 1.
+                $MetricQueryResults = foreach ($DataPoint in $MetricQuery.Data) { $DataPoint.PSObject.Properties['Count'].Value }
+            }
+            'Total'
+            {
+                $MetricQueryResults = $MetricQuery.Data.Total
+            }
+            'Minimum'
+            {
+                $MetricQueryResults = $MetricQuery.Data.Minimum
+            }
+        }
+
+        $MetricQueryResultsCount = ($MetricQueryResults.Where({ $_ -ne $null }).Count)
+
+        if ($MetricQueryResultsCount -eq 0)
+        {
+            $MetricQueryResults = 0
+            $MetricQueryResultsCount = 0
+            $MetricPercentileIndex = 0
+            $MetricPercentile = 0
+        }
+        else
+        {
+            $MetricQueryResultsSorted = $MetricQueryResults | Sort-Object
+            $MetricPercentileIndex = [math]::Ceiling(0.95 * $MetricQueryResultsSorted.Count) - 1
+            $MetricPercentile = $MetricQueryResultsSorted[$MetricPercentileIndex]
+
+            if ($Def.Series -eq 'true')
+            {
+                $MetricTimeSeries = $MetricQueryResults.Where({ $_ -ne $null })
+            }
+
+            switch ($Def.Measure)
+            {
+                'Average' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Average).Average }
+                'Maximum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Maximum).Maximum }
+                'Sum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Sum).Sum }
+                'Minimum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Minimum).Minimum }
+                'Largest' { $MetricQueryResults = ($MetricQueryResults | Sort-Object -Descending)[0] }
+            }
+        }
+    }
+    catch
+    {
+        $MetricQueryResults = 0
+        $MetricQueryResultsCount = 0
+        $MetricTotalCount = 0
+        $MetricPercentileIndex = 0
+        $MetricPercentile = 0
+
+        $MetricError = $true
+        if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
+        $CallErrorMsg = $_.Exception.Message
+    }
+
+    if ($null -ne $CallStopwatch)
+    {
+        $ElapsedSeconds += $CallStopwatch.Elapsed.TotalSeconds
+    }
+
+    $DiagBag.Add([PSCustomObject]@{
+            MetricIndex = $Def.MetricIndex
+            Service     = $Def.Service
+            Name        = $Def.Name
+            Metric      = $Def.MetricName
+            Interval    = $Def.Interval
+            Outcome     = $CallOutcome
+            Attempts    = $Request.Attempts
+            ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
+            Error       = $CallErrorMsg
+        })
+
+
+    $Obj = @{
+        'ID'                   = $Def.Id;
+        'Subscription'         = $Def.SubName;
+        'ResourceGroup'        = $Def.ResourceGroup;
+        'Name'                 = $Def.Name;
+        'Location'             = $Def.Location;
+        'Service'              = $Def.Service;
+        'Metric'               = $Def.MetricName;
+        'MetricAggregate'      = $Def.Aggregation;
+        'MetricTimeGrain'      = $Def.Interval;
+        'MetricMeasure'        = $Def.Measure;
+        'MetricPercentile'     = $MetricPercentile;
+        'MetricValue'          = $MetricQueryResults;
+        'MetricCount'          = $MetricQueryResultsCount;
+        'MetricTotalCount'     = $MetricTotalCount;
+        'MetricSeries'         = $MetricTimeSeries;
+        'MetricError'          = $MetricError;
+    }
+
+    $MetricBag.Add($Obj)
+}
+'@
+
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays))
 
@@ -781,6 +923,9 @@ if ($Task -eq 'Processing')
                     $EndpointFormat = $using:MetricsBatchEndpointFormat
                     $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                     $CallMaxRetries = $using:MetricMaxRetries
+                    $DiagBag = $using:MetricDiagnostics
+                    $MetricBag = ($using:Tmp).Metrics
+                    . ([scriptblock]::Create($using:AddMetricRecordSource))
 
                     function Add-BatchCount([int]$Index, [long]$By)
                     {
@@ -927,7 +1072,9 @@ if ($Task -eq 'Processing')
                         if (-not [string]::IsNullOrEmpty($EntryId) -and -not $Entries.ContainsKey($EntryId)) { $Entries[$EntryId] = $Entry }
                     }
                     $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    $Pairs = [System.Collections.Generic.List[object]]::new()
+                    $AnsweredDefs = 0
+                    # The answer of a request that worked, for the records of the definitions it answered.
+                    $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false }
                     foreach ($Group in $Unit.Groups)
                     {
                         $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
@@ -946,7 +1093,7 @@ if ($Task -eq 'Processing')
                             if (-not [string]::IsNullOrEmpty($MetricName) -and -not $ByName.ContainsKey($MetricName)) { $ByName[$MetricName] = $Metric }
                         }
                         $Missing = [System.Collections.Generic.List[object]]::new()
-                        $GroupPairs = [System.Collections.Generic.List[object]]::new()
+                        $GroupAnswers = [System.Collections.Generic.List[object]]::new()
                         foreach ($Def in $Group)
                         {
                             $Metric = $null
@@ -955,21 +1102,27 @@ if ($Task -eq 'Processing')
                             # is not, and that metric gets a request of its own.
                             if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and ($null -eq $Metric.PSObject.Properties['errorCode'] -or [string]::IsNullOrEmpty([string]$Metric.errorCode) -or [string]$Metric.errorCode -eq 'Success'))
                             {
-                                $GroupPairs.Add([pscustomobject]@{ Def = $Def; Query = (ConvertTo-BatchMetricQuery -Metric $Metric) })
+                                $GroupAnswers.Add([pscustomobject]@{ Def = $Def; Metric = $Metric })
                             }
                             else
                             {
                                 $Missing.Add($Def)
                             }
                         }
-                        if ($GroupPairs.Count -eq 0)
+                        if ($GroupAnswers.Count -eq 0)
                         {
                             # Nothing usable for this resource: its group as without -UseMetricsBatch.
                             $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
                             Add-BatchCount 5 @($Group).Count
                             continue
                         }
-                        foreach ($Pair in $GroupPairs) { $Pairs.Add($Pair) }
+                        # Each record is built now, so only this request's answer is held, never
+                        # the answers of every request of the batch.
+                        foreach ($Answer in $GroupAnswers)
+                        {
+                            Add-MetricRecord -Def $Answer.Def -Request $Answered -MetricQuery (ConvertTo-BatchMetricQuery -Metric $Answer.Metric) -ExtraSeconds $Seconds
+                            $AnsweredDefs++
+                        }
                         foreach ($Def in $Missing)
                         {
                             # A metric with an errorCode other than Success, or not in the answer: one request of its own.
@@ -978,24 +1131,18 @@ if ($Task -eq 'Processing')
                         }
                     }
                     Add-BatchCount 3 $AnsweredIds.Count
-                    Add-BatchCount 4 $Pairs.Count
-                    if ($Pairs.Count -gt 0)
-                    {
-                        $Outcomes.Add([pscustomobject]@{ Kind = 'Answered'; Pairs = $Pairs; Attempts = $Attempts; Seconds = $Seconds })
-                    }
+                    Add-BatchCount 4 $AnsweredDefs
+                    $Response = $null
+                    $Entries = $null
                 } -ThrottleLimit $ConcurrencyLimit
 
-                foreach ($Outcome in $BatchOutcomes)
-                {
-                    if ($Outcome.Kind -eq 'Fallback') { $DispatchItems.Add($Outcome.Group) }
-                    else { $DispatchItems.Add([pscustomobject]@{ RdaAnswered = $true; Pairs = $Outcome.Pairs; Attempts = $Outcome.Attempts; Seconds = $Outcome.Seconds }) }
-                }
+                foreach ($Outcome in $BatchOutcomes) { $DispatchItems.Add($Outcome.Group) }
                 $BatchOutcomes = $null
                 $BatchUnits = $null
             }
 
-            # Each parallel item is one group of definitions, or, with -UseMetricsBatch,
-            # the definitions one batch request answered.
+            # Each parallel item is one group of definitions (with -UseMetricsBatch: one the
+            # batch requests did not answer, or could not express).
             $DispatchItems | ForEach-Object -Parallel {
                 $AzContext = $using:MetricAzContext
                 $CallTimeoutSeconds = $using:MetricTimeoutSeconds
@@ -1189,153 +1336,7 @@ if ($Task -eq 'Processing')
                     return $Request
                 }
 
-                # Adds the result record and the diagnostics record for one definition.
-                # $MetricQuery is the response for this metric alone, whether it was
-                # requested on its own or together with other metrics of the resource.
-                # The reported time is $ExtraSeconds plus, when given, the time on
-                # $CallStopwatch when the record is added.
-                function Add-MetricRecord
-                {
-                    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
-
-                    $ElapsedSeconds = $ExtraSeconds
-                    $MetricError = $false
-                    $CallOutcome = $Request.Outcome
-                    $CallErrorMsg = $null
-                    $MetricTimeSeries = $null
-
-                    try
-                    {
-                        if (-not $Request.Succeeded)
-                        {
-                            throw $Request.ErrorMessage
-                        }
-
-                        $MetricTotalCount = @($MetricQuery.Data).Count
-
-                        $MetricQueryResults = 0
-                        $MetricTimeSeries = 0
-
-                        switch ($Def.Aggregation)
-                        {
-                            'Average'
-                            {
-                                $MetricQueryResults = $MetricQuery.Data.Average
-                            }
-                            'Maximum'
-                            {
-                                $MetricQueryResults = $MetricQuery.Data.Maximum
-                            }
-                            'Count'
-                            {
-                                # .Data has a Count of its own, the number of data points, so read the
-                                # property of each point. A point without one reads as $null, not as 1.
-                                $MetricQueryResults = foreach ($DataPoint in $MetricQuery.Data) { $DataPoint.PSObject.Properties['Count'].Value }
-                            }
-                            'Total'
-                            {
-                                $MetricQueryResults = $MetricQuery.Data.Total
-                            }
-                            'Minimum'
-                            {
-                                $MetricQueryResults = $MetricQuery.Data.Minimum
-                            }
-                        }
-
-                        $MetricQueryResultsCount = ($MetricQueryResults.Where({ $_ -ne $null }).Count)
-
-                        if ($MetricQueryResultsCount -eq 0)
-                        {
-                            $MetricQueryResults = 0
-                            $MetricQueryResultsCount = 0
-                            $MetricPercentileIndex = 0
-                            $MetricPercentile = 0
-                        }
-                        else
-                        {
-                            $MetricQueryResultsSorted = $MetricQueryResults | Sort-Object
-                            $MetricPercentileIndex = [math]::Ceiling(0.95 * $MetricQueryResultsSorted.Count) - 1
-                            $MetricPercentile = $MetricQueryResultsSorted[$MetricPercentileIndex]
-
-                            if ($Def.Series -eq 'true')
-                            {
-                                $MetricTimeSeries = $MetricQueryResults.Where({ $_ -ne $null })
-                            }
-
-                            switch ($Def.Measure)
-                            {
-                                'Average' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Average).Average }
-                                'Maximum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Maximum).Maximum }
-                                'Sum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Sum).Sum }
-                                'Minimum' { $MetricQueryResults = ($MetricQueryResults | Measure-Object -Minimum).Minimum }
-                                'Largest' { $MetricQueryResults = ($MetricQueryResults | Sort-Object -Descending)[0] }
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        $MetricQueryResults = 0
-                        $MetricQueryResultsCount = 0
-                        $MetricTotalCount = 0
-                        $MetricPercentileIndex = 0
-                        $MetricPercentile = 0
-
-                        $MetricError = $true
-                        if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
-                        $CallErrorMsg = $_.Exception.Message
-                    }
-
-                    if ($null -ne $CallStopwatch)
-                    {
-                        $ElapsedSeconds += $CallStopwatch.Elapsed.TotalSeconds
-                    }
-
-                    $DiagBag.Add([PSCustomObject]@{
-                            MetricIndex = $Def.MetricIndex
-                            Service     = $Def.Service
-                            Name        = $Def.Name
-                            Metric      = $Def.MetricName
-                            Interval    = $Def.Interval
-                            Outcome     = $CallOutcome
-                            Attempts    = $Request.Attempts
-                            ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
-                            Error       = $CallErrorMsg
-                        })
-
-
-                    $Obj = @{
-                        'ID'                   = $Def.Id;
-                        'Subscription'         = $Def.SubName;
-                        'ResourceGroup'        = $Def.ResourceGroup;
-                        'Name'                 = $Def.Name;
-                        'Location'             = $Def.Location;
-                        'Service'              = $Def.Service;
-                        'Metric'               = $Def.MetricName;
-                        'MetricAggregate'      = $Def.Aggregation;
-                        'MetricTimeGrain'      = $Def.Interval;
-                        'MetricMeasure'        = $Def.Measure;
-                        'MetricPercentile'     = $MetricPercentile;
-                        'MetricValue'          = $MetricQueryResults;
-                        'MetricCount'          = $MetricQueryResultsCount;
-                        'MetricTotalCount'     = $MetricTotalCount;
-                        'MetricSeries'         = $MetricTimeSeries;
-                        'MetricError'          = $MetricError;
-                    }
-
-                    $MetricBag.Add($Obj)
-                }
-
-                # Definitions a batch request answered: their records are built here, with
-                # the same Add-MetricRecord, so they match the per-resource path's.
-                if ($_ -isnot [System.Array] -and $null -ne $_.PSObject.Properties['RdaAnswered'])
-                {
-                    $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $_.Attempts; ErrorMessage = $null; BadRequest = $false }
-                    foreach ($Pair in $_.Pairs)
-                    {
-                        Add-MetricRecord -Def $Pair.Def -Request $Answered -MetricQuery $Pair.Query -ExtraSeconds $_.Seconds
-                    }
-                    return
-                }
+                . ([scriptblock]::Create($using:AddMetricRecordSource))
 
                 $GroupDefs = @($_)
                 $CallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
