@@ -180,6 +180,7 @@ Export-ModuleMember -Function Get-AzMetric
             $Bytes = [System.Text.Encoding]::UTF8.GetBytes(($Out | ConvertTo-Json -Depth 12 -Compress))
             $Context.Response.StatusCode = $Status
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
+            if ($Status -eq 429 -and $Control.ContainsKey('RetryAfterDateSeconds')) { $Context.Response.AddHeader('Retry-After', [DateTimeOffset]::UtcNow.AddSeconds([int]$Control['RetryAfterDateSeconds']).ToString('r')) }
             $Context.Response.ContentType = 'application/json'
             $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
             $Context.Response.Close()
@@ -703,13 +704,24 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-401'
         $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-401' -Batch -Control @{ Status = 401 }
 
-        # First Metrics file batch: 2 requests refused, no retry. The token is renewed once;
-        # the second file batch's request is refused again, and nothing is sent after that.
-        $Run.Posts.Count | Should -Be 3
+        # First Metrics file batch: 2 requests refused; the token is renewed once and both
+        # are sent again, refused again, and batch stops for the tenant: the second file
+        # batch sends nothing.
+        $Run.Posts.Count | Should -Be 4
         $Run.TokenCalls.Count | Should -Be 2
         Assert-SameRecords -Expected $Expected -Actual $Run
-        @($Run.DebugLines | Where-Object { $_ -match 'refused the token \(401\)' }).Count | Should -Be 2
+        @($Run.DebugLines | Where-Object { $_ -match 'renewing the token of 1 tenant' }).Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 1
         @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
+    }
+
+    It 'renews a refused token at once and uses the answer of the request sent again' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-once' -Batch -Control @{ Status = 401; FailFirst = 1 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.TokenCalls.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
     }
 
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {
@@ -728,6 +740,14 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run.Posts.Count | Should -Be 2
         $Run.Calls.Count | Should -Be 0
         $Run.Seconds | Should -BeGreaterOrEqual 6
+    }
+
+    It 'waits until a Retry-After date before retrying a throttled request' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after-date' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfterDateSeconds = 7 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Seconds | Should -BeGreaterOrEqual 5
     }
 
     It 'writes the same masked records under -Obfuscate' {
@@ -905,7 +925,11 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         while ($Function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $Function = $Function.Parent }
         $Function.Name | Should -Be 'Invoke-RdaInsightsProviderPreflight'
         $Body = $Function.Body.Extent.Text
-        $Body.IndexOf("if (`$Answer -notmatch '^\s*(y|yes)\s*$')") | Should -BeLessThan $Body.IndexOf('Register-RdaInsightsProvider -SubscriptionId')
+        $Guard = $Body.IndexOf("`$Answer -notmatch '^\s*(y|yes)\s*$'")
+        $Guard | Should -BeGreaterOrEqual 0
+        $Guard | Should -BeLessThan $Body.IndexOf('Register-RdaInsightsProvider -SubscriptionId')
+        # Only the "y" branch fills the list of subscriptions to register.
+        $Body | Should -Match ([regex]::Escape("else`n    {`n        `$ToRegister = @(`$Missing)`n    }"))
         @($script:Calls | Where-Object { $_.Ast.Extent.Text -match '/register\?' }).Count | Should -Be 0
     }
 
@@ -920,6 +944,14 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         $Stream | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$InventoryPassthrough['UseMetricsBatch'] = `$true }"))
         $Stream | Should -Match ([regex]::Escape("`$InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]`$MetricsBatchPerCallSubscriptionIds"))
         $Inner | Should -Match ([regex]::Escape('-UseMetricsBatch:$UseMetricsBatch.IsPresent -MetricsBatchPerCallSubscriptionIds'))
+    }
+
+    It 'keeps a direct run''s preflight result where the metrics phase reads it (script scope)' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Assignments = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $N.Left.VariablePath.UserPath -match 'MetricsBatchPerCallSubscriptionIds$' }, $true))
+        $Assignments.Count | Should -Be 1
+        # Set inside a function (RunInventorySetup), read in another: only script scope reaches it.
+        $Assignments[0].Left.VariablePath.IsScript | Should -BeTrue
     }
 
     It 'asks only for subscriptions this run collects (not those a resumed run already completed)' {
