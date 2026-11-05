@@ -1918,7 +1918,9 @@ function Format-RunDataSwitches
 {
     param([System.Collections.IDictionary]$Settings)
     if ($null -eq $Settings) { return '' }
-    return (-join @(foreach ($Name in @($Settings.Keys)) { if ($Settings[$Name]) { ' -' + $Name } }))
+    # SubscriptionID is a value, not a switch: the command that takes it names
+    # it itself (Get-WrapperRunCommand, Get-DirectRunRetryCommand).
+    return (-join @(foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'SubscriptionID' -and $Settings[$Name]) { ' -' + $Name } }))
 }
 
 # A value as a printed command gives it: in single quotes, escaped by
