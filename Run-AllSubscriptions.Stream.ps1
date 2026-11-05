@@ -51,7 +51,11 @@ param (
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
     [switch] $UseMetricsBatch,
-    [int]    $ConcurrencyLimit = 6
+    [int]    $ConcurrencyLimit = 6,
+    # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
+    # on the per-resource path this run (Microsoft.Insights not registered).
+    # Last, so the position of every earlier parameter stays as it was.
+    [string[]] $MetricsBatchPerCallSubscriptionIds = @()
 )
 
 # ---------------------------------------------------------------------------
@@ -168,6 +172,7 @@ if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
+if ($UseMetricsBatch -and @($MetricsBatchPerCallSubscriptionIds).Count -gt 0) { $InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]$MetricsBatchPerCallSubscriptionIds }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 
 # ---- Per-sub iteration -------------------------------------------------------
