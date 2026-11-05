@@ -45,10 +45,14 @@ BeforeAll {
     function Test-DataPlaneAuthReady { param($Phase) $true }
 
     $script:Rows = New-ConsumptionTestRows
-    # Row 402 is in resource group rg-one, has a resource URI and is not in the
-    # dictionary the -Obfuscate runs preload (rows 0-399), so a one-row page of
-    # it takes the row replace, the -ResourceGroup keep and the masking call.
+    # Row 402 is in resource group rg-one and has a resource URI, so a one-row
+    # page of it takes the row replace and the -ResourceGroup keep. Its URI is
+    # also on earlier rows, so the -Obfuscate runs find it in the dictionary
+    # they preload; $script:MissRow is the row whose URI they never preload.
     $script:OneRow = $script:Rows[402]
+    $script:MissUri = '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Compute/virtualMachines/VM-ONLY-HERE'
+    $script:MissRow = $script:Rows[402].PSObject.Copy()
+    $script:MissRow.InstanceData = $script:Rows[402].InstanceData -replace '"resourceUri":"[^"]+"', ('"resourceUri":"{0}"' -f $script:MissUri)
     # Rows whose values take the loop's less common branches: dates that are
     # text or missing, and 'Microsoft.Resources' or additionalInfo that is an
     # array, text or holds a nested object.
@@ -179,6 +183,21 @@ Describe 'Billing row loop: the Consumption CSV byte for byte' {
         # No page shape adds a row of its own (a page with no row list writes
         # nothing): every data row has its meter id.
         @($New.Text | ConvertFrom-Csv | Where-Object { [string]::IsNullOrEmpty($_.MeterId) }).Count | Should -Be 0
+    }
+
+    It 'masks a resource the preloaded dictionary does not hold, the same as the frozen loop, under -Obfuscate' {
+        $Rows = @($script:Rows | Select-Object -First 2000) + @($script:MissRow)
+        @($Rows | Where-Object { $_.InstanceData -like ('*{0}*' -f $script:MissUri) }).Count | Should -Be 1
+        $Old = Invoke-Phase -Mode Obfuscate -Base -Rows $Rows
+        $New = Invoke-Phase -Mode Obfuscate -Rows $Rows
+        [System.Convert]::ToBase64String($New.Bytes) | Should -BeExactly ([System.Convert]::ToBase64String($Old.Bytes))
+        Should -Invoke Get-ObfuscatedResourceId -ParameterFilter { $ResourceId -eq $script:MissUri.ToLowerInvariant() } -Times 2 -Exactly
+        $Masked = '/subscriptions/prod_s2/resourcegroups/prod_r2/providers/masked/prod_' + $script:MissUri.Length
+        $Last = @($New.Text | ConvertFrom-Csv)[-1]
+        $Last.ResourceId | Should -Be $Masked
+        $Last.InstanceData | Should -BeLike ('*"resourceUri":"{0}"*' -f $Masked)
+        $New.Text | Should -Not -Match 'vm-only-here'
+        $script:ResourceIdDictionary[$script:MissUri.ToLowerInvariant()] | Should -Be $Masked
     }
 
     It 'covers a row with no additionalInfo, a reservation row and a row of another resource group' {
