@@ -178,7 +178,7 @@ Describe 'Metrics phase diagnostics across several batches' {
         # requests (252, 252, 252 and 44 definitions). The read-operations metric
         # of each of the 7 disks below is then requested on its own (7 fallback
         # requests). A disk's read-operations call has MetricIndex 4 * disk + 1.
-        # A failed call takes at least 7 s of retry backoff (14 s when throttled),
+        # A failed call takes at least 7 s of retry backoff (122 s when throttled),
         # so the five slowest are the three failures and the 6 s and 7 s calls,
         # several seconds clear of the 1 s call and of every other call.
         $Special = @{
@@ -229,7 +229,7 @@ Describe 'Metrics phase diagnostics across several batches' {
         $Log = $script:Run.Log
         # 14 summary lines, then the metrics-incomplete line (the next case).
         $Log.Count | Should -Be 15
-        $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
+        $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, throttle retries=6 (honours Retry-After up to 120s), lookback=31 day(s).'
         $Log[1] | Should -Be '[Metrics] ===== Metrics phase summary ====='
         $Log[3] | Should -Be '[Metrics] Azure Monitor requests: 207 for 800 metric definition(s), of which 7 single-metric fallback request(s); retries not counted'
         $Log[4] | Should -Be '[Metrics] Non-success calls (where it got stuck):'
@@ -247,7 +247,7 @@ Describe 'Metrics phase diagnostics across several batches' {
     It 'lists every non-success call from every batch, slowest first' {
         $Lines = $script:Run.Log[5..7]
         $Expected = @(
-            ('[Metrics]   Throttled {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:Throttled, $script:ThrottleMessage)
+            ('[Metrics]   Throttled {0} attempts=7 <s>s Get-AzMetric failed after 7 attempt(s): {1}' -f $script:Throttled, $script:ThrottleMessage)
             ('[Metrics]   Error {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:BadMetricA, $script:BadMetricMessage)
             ('[Metrics]   Error {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:BadMetricB, $script:BadMetricMessage)
         )
@@ -295,7 +295,7 @@ Describe 'Metrics phase diagnostics with no metric definitions' {
         $Run.Output.Count | Should -Be 0
         $Run.Verbose.Count | Should -Be 0
         @($Run.Log | ForEach-Object { Hide-Seconds $_ }) | Should -Be @(
-            '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
+            '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, throttle retries=6 (honours Retry-After up to 120s), lookback=31 day(s).'
             '[Metrics] ===== Metrics phase summary ====='
             '[Metrics] Metric definitions: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
             '[Metrics] Azure Monitor requests: 0 for 0 metric definition(s), of which 0 single-metric fallback request(s); retries not counted'

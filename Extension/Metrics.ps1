@@ -678,6 +678,12 @@ if ($Task -eq 'Processing')
 
     $MetricTimeoutSeconds = $MetricsCallTimeoutSeconds
     $MetricMaxRetries = 3
+    # Throttling (429) has its OWN retry budget and honours the server's Retry-After: a throttle wave used to exhaust
+    # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
+    $MetricMaxThrottleRetries = 6
+    $MetricMaxRetryAfterSeconds = 120
+    # Get-RdaRetryAfterSeconds (Functions/ResourceInventory.Functions.ps1) is not visible inside -Parallel runspaces; ship its definition.
+    $MetricRetryAfterFnDef = if (Get-Command Get-RdaRetryAfterSeconds -CommandType Function -ErrorAction SilentlyContinue) { ${function:Get-RdaRetryAfterSeconds}.ToString() } else { $null }
 
 
     $MetricDiagnostics = [System.Collections.Concurrent.ConcurrentBag[psobject]]::new()
@@ -972,7 +978,7 @@ function Add-MetricRecord
 '@
 
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays))
+    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, throttle retries={5} (honours Retry-After up to {6}s), lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays), $MetricMaxThrottleRetries, $MetricMaxRetryAfterSeconds)
 
     $RangeBatch = [math]::Min($MetricCount , 250)
     $RangeIdx = 1
@@ -1440,6 +1446,10 @@ function Add-MetricRecord
                 $AzContext = $using:MetricAzContext
                 $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                 $CallMaxRetries = $using:MetricMaxRetries
+                $CallMaxThrottleRetries = $using:MetricMaxThrottleRetries
+                $CallMaxRetryAfterSeconds = $using:MetricMaxRetryAfterSeconds
+                $RetryAfterFnDef = $using:MetricRetryAfterFnDef
+                if ($RetryAfterFnDef) { Set-Item -Path function:Get-RdaRetryAfterSeconds -Value ([scriptblock]::Create($RetryAfterFnDef)) }
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
                 $RequestCounts = $using:MetricRequestCounts
@@ -1448,6 +1458,27 @@ function Add-MetricRecord
                 # run's limit is passed to it too; otherwise no more than 5 calls are in
                 # flight whatever -ConcurrencyLimit says.
                 $ThreadJobLimit = $using:ConcurrencyLimit
+
+                # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
+                # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
+                # other failure uses the generic budget and 2^attempt backoff. Returns @{ Retry; SleepSeconds } (no jitter).
+                function Get-RdaMetricRetryPlan
+                {
+                    param(
+                        [int]$Attempt, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds, [bool]$Permanent,
+                        [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds
+                    )
+                    if ($Permanent) { return @{ Retry = $false; SleepSeconds = 0 } }
+                    $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $Attempt -lt $MaxRetries }
+                    if (-not $Retry) { return @{ Retry = $false; SleepSeconds = 0 } }
+                    $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                    if ($Throttled)
+                    {
+                        $Backoff = [math]::Min($Backoff * 2, 60)
+                        if ($RetryAfterSeconds -gt 0) { $Backoff = [math]::Min([math]::Max($RetryAfterSeconds, $Backoff), $MaxRetryAfterSeconds) }
+                    }
+                    return @{ Retry = $true; SleepSeconds = $Backoff }
+                }
 
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
                 # metric name is not valid for the resource. The status code and the message
@@ -1536,16 +1567,18 @@ function Add-MetricRecord
                     try
                     {
                         $Attempt = 0
+                        $ThrottledAttempts = 0
                         $Succeeded = $false
                         $LastError = $null
                         $MetricQuery = $null
 
-                        while (-not $Succeeded -and $Attempt -le $CallMaxRetries)
+                        while (-not $Succeeded)
                         {
                             $CallAttempts = $Attempt + 1
                             $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $TimedOut = $false
                             $Throttled = $false
+                            $RetryAfterSeconds = 0
                             $BadRequest = $false
 
                             $Job = Start-ThreadJob -ScriptBlock {
@@ -1566,6 +1599,12 @@ function Add-MetricRecord
                                     if ($LastError -match '429|throttl|TooManyRequests|rate limit')
                                     {
                                         $Throttled = $true
+                                        $ThrottledAttempts++
+                                        # Server-directed wait (Retry-After header) when present; 0 means fall back to our own backoff.
+                                        if (Get-Command Get-RdaRetryAfterSeconds -ErrorAction SilentlyContinue)
+                                        {
+                                            try { $RetryAfterSeconds = [double](Get-RdaRetryAfterSeconds -ErrorRecord $_) } catch { $RetryAfterSeconds = 0 }
+                                        }
                                     }
                                     else
                                     {
@@ -1599,17 +1638,22 @@ function Add-MetricRecord
                                 break
                             }
 
-                            if ($Attempt -lt $CallMaxRetries)
+                            # A BadRequest under -StopOnBadRequest has already left the loop above, so the
+                            # plan sees no permanent failure here.
+                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $false `
+                                -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
+                            if ($Plan.Retry)
                             {
-                                $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-                                if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, 60) }
+                                # Jitter so a wave of throttled calls does not retry in lockstep.
                                 $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-                                $SleepSeconds = [math]::Round($Backoff + $Jitter, 2)
+                                $SleepSeconds = [math]::Round($Plan.SleepSeconds + $Jitter, 2)
                                 Start-Sleep -Seconds $SleepSeconds
                             }
                             else
                             {
                                 $CallOutcome = if ($TimedOut) { 'Timeout' } elseif ($Throttled) { 'Throttled' } else { 'Error' }
+                                # Budget exhausted: leave the loop; the throw below records the metric as having no data.
+                                break
                             }
 
                             $Attempt++

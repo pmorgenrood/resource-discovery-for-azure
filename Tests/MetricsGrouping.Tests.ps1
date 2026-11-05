@@ -528,13 +528,14 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
     It 'retries a throttled grouped request and does not fall back to one request per metric' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-throttled' -MultiError 'Throttled'
 
-        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        # Throttled attempts have their own budget: 1 + 6 retries.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 7
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         $Run.Records.Count | Should -Be 4
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
         foreach ($Name in $script:DiskMetricNames)
         {
-            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
     }
 
@@ -727,8 +728,9 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
         @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
 
-        # Each request keeps its retries: 4 attempts for each of the 2 metrics.
-        $Run.Calls.Count | Should -Be 8
+        # Each request keeps its retries: 4 attempts for each of the 2 metrics, or 7
+        # when throttled (its own budget).
+        $Run.Calls.Count | Should -Be $(if ($SingleError -eq 'Throttled') { 14 } else { 8 })
         $Run.Records.Count | Should -Be 2
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
     }
