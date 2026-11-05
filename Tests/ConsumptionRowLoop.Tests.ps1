@@ -1,17 +1,13 @@
 #Requires -Version 7.0
 # =============================================================================
-# ConsumptionDaySplit.Tests.ps1
+# ConsumptionRowLoop.Tests.ps1
 #
-# 1. The billing row loop (GetResorceConsumption in ResourceInventory.ps1)
-#    builds each row and its JSON column as object literals. The Consumption
-#    CSV it writes must stay byte for byte what the earlier loop (Add-Member
-#    per column) wrote: the expected SHA-256 values below were taken from that
-#    loop (fork all-fixes-optimized fe84096) on the same made-up pages, plain,
-#    under -Obfuscate and with -ResourceGroup.
-# 2. -UseConsumptionDaySplit (Functions/ConsumptionDaySplit.Functions.ps1):
-#    one-day pieces read side by side and joined back into the whole-window
-#    rows, Retry-After, the fallback to the usual read (once), and the switch
-#    off leaving the usual read alone.
+# The billing row loop (GetResorceConsumption in ResourceInventory.ps1)
+# builds each row and its JSON column as object literals. The Consumption
+# CSV it writes must stay byte for byte what the earlier loop (Add-Member
+# per column) wrote: the expected SHA-256 values below were taken from that
+# loop (fork all-fixes-optimized fe84096) on the same made-up pages, plain,
+# under -Obfuscate and with -ResourceGroup.
 #
 # Offline: Azure is replaced by Pester mocks and made-up pages
 # (Helpers/ConsumptionTestPages.ps1). Placeholder ids and generic names only.
@@ -65,7 +61,9 @@ BeforeAll {
         if (-not (Test-Path -LiteralPath $Global:ConsumptionFileCsv)) { return [pscustomobject]@{ Text = ''; Hash = ''; Rows = 0; Bom = $false } }
         $Bytes = [System.IO.File]::ReadAllBytes($Global:ConsumptionFileCsv)
         $Text = [System.Text.Encoding]::UTF8.GetString($Bytes).Replace("`r`n", "`n")
-        $Hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Text))).Replace('-', '')
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        $Hash = [System.BitConverter]::ToString($Hasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))).Replace('-', '')
+        $Hasher.Dispose()
         $Lines = @($Text.TrimEnd("`n") -split "`n")
         [pscustomobject]@{ Text = $Text; Hash = $Hash; Rows = ($Lines.Count - 1); Bom = ($Bytes.Count -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) }
     }
