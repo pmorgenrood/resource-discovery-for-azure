@@ -80,6 +80,8 @@ function Get-AzMetric
     $Names = @($MetricName)
     $CallFile = Join-Path $env:RDA_TEST_METRIC_CALL_DIR ([guid]::NewGuid().ToString() + '.json')
     [ordered]@{ ResourceId = $ResourceId; MetricName = $Names; AggregationType = $AggregationType } | ConvertTo-Json -Compress | Set-Content -LiteralPath $CallFile -Encoding utf8
+    # RDA_TEST_METRIC_NOTFOUND lists resource names (';') Azure Monitor answers with 404, as Get-AzMetric reports it.
+    if (@($env:RDA_TEST_METRIC_NOTFOUND -split ';' | Where-Object { $_ }) -contains ($ResourceId -split '/')[-1]) { throw "Operation returned an invalid status code 'NotFound'" }
     foreach ($Name in $Names)
     {
         $Start = $StartTime
@@ -381,7 +383,7 @@ AfterAll {
     $script:Listener | Remove-Job -Force -ErrorAction SilentlyContinue
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_NOTFOUND' -ErrorAction SilentlyContinue
     Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure -ErrorAction SilentlyContinue
 }
 
@@ -607,6 +609,37 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         Assert-SameRecords -Expected $Expected -Actual $Run
         $Run.FailedSubs.Count | Should -Be 0
         @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt' }).Count | Should -Be 1
+    }
+
+    It 'gives a 404 batch request 1 attempt and its Get-AzMetric fallback 1 attempt too (<Case>)' -ForEach @(
+        @{ Case = 'the batch request answers 404'; Tag = 'status404'; Control = @{ Status = 404 }; Posts = 1 }
+        @{ Case = 'the batch answer leaves the gone resource out'; Tag = 'omitted'; Control = @{ OmitNames = @('disk-002') }; Posts = 1 }
+    ) {
+        $Disks = @(1..3 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $env:RDA_TEST_METRIC_NOTFOUND = 'disk-002'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName ('batch-notfound-' + $Tag) -Batch -Control $Control
+        }
+        finally
+        {
+            Remove-Item -Path 'Env:RDA_TEST_METRIC_NOTFOUND' -ErrorAction SilentlyContinue
+        }
+
+        $Run.Posts.Count | Should -Be $Posts -Because 'a 404 batch request is not retried'
+        # The gone disk's 4 metrics go to Get-AzMetric as one grouped request: 1 attempt, not 4.
+        @($Run.Calls | Where-Object { $_.ResourceId -like '*/disk-002' }).Count | Should -Be 1
+        $Gone = @($Run.Records | Where-Object { $_.ID -like '*/disk-002' })
+        $Gone.Count | Should -Be 4
+        foreach ($Record in $Gone)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+        }
+        @($Run.Records | Where-Object { $_.ID -notlike '*/disk-002' -and $_.MetricError }).Count | Should -Be 0
+        @($Run.DebugLines | Where-Object { $_ -match 'disk-002/.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' }).Count | Should -Be 4
     }
 
     It 'retries a throttled request and then uses its answer' {
