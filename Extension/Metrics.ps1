@@ -722,10 +722,9 @@ if ($Task -eq 'Processing')
     # data plane refused the token or the caller: 401 or 403).
     $MetricBatchOffSubs = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $MetricBatchNotes = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
-    # Tenant -> 1 when the data plane refused that tenant's token (401) during a
-    # batch. Before the next batch the token is renewed once; a second refusal
-    # after that renewal turns batch off for the tenant (its metrics go per call).
-    $MetricBatchTokenRefused = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # Tenants whose token was renewed after a 401 and has not worked since: a
+    # second 401 for one of them turns batch off for that tenant for the rest of
+    # the phase. A request that works with the renewed token clears it.
     $MetricBatchTokenRenewed = @{}
     $MetricBatchTokens = @{}
     $MetricBatchTenantOfSub = @{}
@@ -984,23 +983,12 @@ function Add-MetricRecord
             $DispatchItems = $BatchGroups
             if ($UseBatchApi)
             {
-                # Renew a token that ends within 10 minutes, or that the data plane refused
-                # (401) in the batch before, on this thread, before the batch. A tenant refused
-                # again after its one renewal gets no more batch requests this phase.
+                # Renew a token that ends within 10 minutes, on this thread, before the batch.
                 foreach ($TenantKey in @($MetricBatchTokens.Keys))
                 {
                     $Held = $MetricBatchTokens[$TenantKey]
-                    $Refused = 0
-                    $WasRefused = $MetricBatchTokenRefused.TryRemove($TenantKey, [ref]$Refused)
-                    if ($null -ne $Held -and $WasRefused -and $MetricBatchTokenRenewed.ContainsKey($TenantKey))
+                    if ($null -ne $Held -and $null -ne $Held.ExpiresOn -and $Held.ExpiresOn -lt [DateTimeOffset]::UtcNow.AddMinutes(10))
                     {
-                        Write-MetricsDiag "[batch] the metrics data plane refused a renewed token (401); the subscriptions of that tenant use the per-resource path for the rest of the phase."
-                        $MetricBatchTokens[$TenantKey] = $null
-                        continue
-                    }
-                    if ($null -ne $Held -and ($WasRefused -or ($null -ne $Held.ExpiresOn -and $Held.ExpiresOn -lt [DateTimeOffset]::UtcNow.AddMinutes(10))))
-                    {
-                        if ($WasRefused) { $MetricBatchTokenRenewed[$TenantKey] = $true }
                         try
                         {
                             $RenewArgs = $Held.Args
@@ -1014,264 +1002,317 @@ function Add-MetricRecord
                         }
                     }
                 }
-                $BatchTokenValues = @{}
-                foreach ($TenantKey in @($MetricBatchTokens.Keys)) { if ($null -ne $MetricBatchTokens[$TenantKey]) { $BatchTokenValues[$TenantKey] = $MetricBatchTokens[$TenantKey].Value } }
-
                 $BatchUnits = @($BatchGroups | Where-Object { $_ -isnot [System.Array] })
                 $DispatchItems = [System.Collections.Generic.List[object]]::new()
                 foreach ($Item in $BatchGroups) { if ($Item -is [System.Array]) { $DispatchItems.Add($Item) } }
                 $BatchOutcomes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
-                # One getBatch request per unit, in parallel. A unit answers each of its
-                # definitions, or hands it (or its whole group) to the per-resource path
-                # below; it never drops one.
-                $BatchUnits | ForEach-Object -Parallel {
-                    $Unit = $_
-                    $Outcomes = $using:BatchOutcomes
-                    $Counts = $using:MetricBatchCounts
-                    $OffSubs = $using:MetricBatchOffSubs
-                    $Notes = $using:MetricBatchNotes
-                    $Tokens = $using:BatchTokenValues
-                    $TenantOfSub = $using:MetricBatchTenantOfSub
-                    $TokenRefused = $using:MetricBatchTokenRefused
-                    $EndpointFormat = $using:MetricsBatchEndpointFormat
-                    $CallTimeoutSeconds = $using:MetricTimeoutSeconds
-                    $CallMaxRetries = $using:MetricMaxRetries
-                    $DiagBag = $using:MetricDiagnostics
-                    $MetricBag = ($using:Tmp).Metrics
-                    . ([scriptblock]::Create($using:AddMetricRecordSource))
+                # At most two passes. A request whose token is refused (401) on the first
+                # pass is held back; its tenant's token is renewed once and the request is
+                # sent again in the second pass. A 401 on the second pass, or for a tenant
+                # renewed earlier whose new token has not worked since, sends its groups to
+                # the per-resource path and stops batching that tenant this phase.
+                $PassUnits = $BatchUnits
+                for ($BatchPass = 1; $BatchPass -le 2 -and @($PassUnits).Count -gt 0; $BatchPass++)
+                {
+                    $LastBatchPass = ($BatchPass -eq 2)
+                    $RenewedTenants = @{} + $MetricBatchTokenRenewed
+                    $BatchTokenValues = @{}
+                    foreach ($TenantKey in @($MetricBatchTokens.Keys)) { if ($null -ne $MetricBatchTokens[$TenantKey]) { $BatchTokenValues[$TenantKey] = $MetricBatchTokens[$TenantKey].Value } }
+                    $HeldBack = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+                    $TokenWorked = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    $TenantsOff = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-                    function Add-BatchCount([int]$Index, [long]$By)
-                    {
-                        [System.Threading.Monitor]::Enter($Counts)
-                        try { $Counts[$Index] += $By } finally { [System.Threading.Monitor]::Exit($Counts) }
-                    }
+                    # One getBatch request per unit, in parallel. A unit answers each of its
+                    # definitions, or hands it (or its whole group) to the per-resource path
+                    # below; it never drops one.
+                    $PassUnits | ForEach-Object -Parallel {
+                        $Unit = $_
+                        $Outcomes = $using:BatchOutcomes
+                        $Counts = $using:MetricBatchCounts
+                        $OffSubs = $using:MetricBatchOffSubs
+                        $Notes = $using:MetricBatchNotes
+                        $Tokens = $using:BatchTokenValues
+                        $TenantOfSub = $using:MetricBatchTenantOfSub
+                        $HeldBackUnits = $using:HeldBack
+                        $Worked = $using:TokenWorked
+                        $Off = $using:TenantsOff
+                        $IsLastPass = $using:LastBatchPass
+                        $Renewed = $using:RenewedTenants
+                        $EndpointFormat = $using:MetricsBatchEndpointFormat
+                        $CallTimeoutSeconds = $using:MetricTimeoutSeconds
+                        $CallMaxRetries = $using:MetricMaxRetries
+                        $DiagBag = $using:MetricDiagnostics
+                        $MetricBag = ($using:Tmp).Metrics
+                        . ([scriptblock]::Create($using:AddMetricRecordSource))
 
-                    # Every group of the unit to the per-resource path, as without -UseMetricsBatch.
-                    function Send-AllGroupsOn
-                    {
+                        function Add-BatchCount([int]$Index, [long]$By)
+                        {
+                            [System.Threading.Monitor]::Enter($Counts)
+                            try { $Counts[$Index] += $By } finally { [System.Threading.Monitor]::Exit($Counts) }
+                        }
+
+                        # Every group of the unit to the per-resource path, as without -UseMetricsBatch.
+                        function Send-AllGroupsOn
+                        {
+                            foreach ($Group in $Unit.Groups)
+                            {
+                                $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                                Add-BatchCount 5 @($Group).Count
+                            }
+                        }
+
+                        # The seconds a 429 answer asks to wait (Retry-After), or 0.
+                        function Get-BatchRetryAfter([System.Exception]$Exception)
+                        {
+                            try
+                            {
+                                # Retry-After is either a number of seconds or an HTTP date.
+                                $Header = $Exception.Response.Headers.RetryAfter
+                                if ($null -ne $Header.Delta) { return [math]::Max(0, $Header.Delta.TotalSeconds) }
+                                if ($null -ne $Header.Date) { return [math]::Max(0, ($Header.Date - [DateTimeOffset]::UtcNow).TotalSeconds) }
+                            }
+                            catch { }
+                            return 0
+                        }
+
+                        # The HTTP status of a failed request, or $null.
+                        function Get-BatchStatusCode([System.Exception]$Exception)
+                        {
+                            $Ex = $Exception
+                            $Depth = 0
+                            while ($null -ne $Ex -and $Depth -lt 10)
+                            {
+                                $Depth++
+                                if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                                {
+                                    try { return [int]$Ex.Response.StatusCode } catch { }
+                                }
+                                if ($null -ne $Ex.PSObject.Properties['StatusCode'] -and $null -ne $Ex.StatusCode)
+                                {
+                                    try { return [int]$Ex.StatusCode } catch { }
+                                }
+                                $Ex = $Ex.InnerException
+                            }
+                            return $null
+                        }
+
+                        # A REST answer for one metric, in the shape Get-AzMetric returns: Name.Value,
+                        # and Data as the first time series' points (null when there is no time series,
+                        # as PSMetric.Data is), each point with all five aggregation fields as
+                        # [double] or null, so records are built the same way.
+                        function ConvertTo-BatchMetricQuery($Metric)
+                        {
+                            $Series = @(@($Metric.timeseries) | Where-Object { $null -ne $_ })
+                            $Data = $null
+                            if ($Series.Count -gt 0 -and $null -ne $Series[0].PSObject.Properties['data'] -and $null -ne $Series[0].data)
+                            {
+                                $Data = [System.Collections.Generic.List[object]]::new()
+                                foreach ($Point in @($Series[0].data))
+                                {
+                                    if ($null -eq $Point) { continue }
+                                    $Fields = [ordered]@{ TimeStamp = $Point.timeStamp }
+                                    foreach ($Field in 'Average', 'Minimum', 'Maximum', 'Total', 'Count')
+                                    {
+                                        $Prop = $Point.PSObject.Properties[$Field]
+                                        $Fields[$Field] = if ($null -ne $Prop -and $null -ne $Prop.Value) { [double]$Prop.Value } else { $null }
+                                    }
+                                    $Data.Add([pscustomobject]$Fields)
+                                }
+                            }
+                            return [pscustomobject]@{ Name = [pscustomobject]@{ Value = [string]$Metric.name.value }; Data = $Data }
+                        }
+
+                        $Reason = $null
+                        if ($OffSubs.TryGetValue($Unit.SubscriptionId, [ref]$Reason))
+                        {
+                            Send-AllGroupsOn
+                            return
+                        }
+                        $TenantKey = [string]$TenantOfSub[$Unit.SubscriptionId]
+                        $Token = $Tokens[$TenantKey]
+                        if ([string]::IsNullOrEmpty($Token))
+                        {
+                            Send-AllGroupsOn
+                            return
+                        }
+
+                        $Uri = ('{0}/subscriptions/{1}/metrics:getBatch?api-version=2023-10-01&metricnamespace={2}&metricnames={3}&aggregation={4}&interval={5}&starttime={6}&endtime={7}' -f
+                            ($EndpointFormat -f $Unit.Region), $Unit.SubscriptionId, [uri]::EscapeDataString($Unit.Namespace),
+                            ((@($Unit.MetricNames) | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','),
+                            $Unit.Aggregation.ToLowerInvariant(), $Unit.Interval, $Unit.StartTime, $Unit.EndTime)
+                        # The doc's rule: resource ids in the body in lower case.
+                        $Body = ConvertTo-Json -InputObject @{ resourceids = [string[]]@($Unit.ResourceIds) } -Compress
+
+                        Add-BatchCount 0 1
+                        Add-BatchCount 2 $Unit.ResourceIds.Count
+                        $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                        $Response = $null
+                        $Attempt = 0
+                        $LastError = $null
+                        $Kind = $null
+                        $RetryAfter = 0
+                        # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
+                        # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
+                        # at once (the same request is refused the same way again).
+                        while ($Attempt -le $CallMaxRetries)
+                        {
+                            Add-BatchCount 1 1
+                            try
+                            {
+                                $Response = Invoke-RestMethod -Method Post -Uri $Uri -Headers @{ Authorization = 'Bearer ' + $Token } -ContentType 'application/json' -Body $Body -TimeoutSec $CallTimeoutSeconds -ErrorAction Stop
+                                $Kind = $null
+                                break
+                            }
+                            catch
+                            {
+                                $LastError = [string]$_.Exception.Message
+                                $Status = Get-BatchStatusCode -Exception $_.Exception
+                                $RetryAfter = Get-BatchRetryAfter -Exception $_.Exception
+                                $Kind = if ($Status -eq 401) { 'TokenRefused' }
+                                elseif ($Status -eq 403) { 'Refused' }
+                                elseif ($Status -in 400, 404) { 'BadRequest' }
+                                elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
+                                else { 'Error' }
+                                if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
+                            }
+                            if ($Kind -in 'Refused', 'TokenRefused', 'BadRequest') { break }
+                            if ($Attempt -lt $CallMaxRetries)
+                            {
+                                $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                                if ($Kind -eq 'Throttled') { $Backoff = [math]::Min([math]::Max($Backoff * 2, $RetryAfter), 60) }
+                                Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
+                            }
+                            $Attempt++
+                        }
+                        $Seconds = $Stopwatch.Elapsed.TotalSeconds
+                        $Attempts = [math]::Min($Attempt, $CallMaxRetries) + 1
+
+                        if ($null -ne $Kind)
+                        {
+                            if ($Kind -eq 'TokenRefused')
+                            {
+                                if (-not $IsLastPass -and -not $Renewed.ContainsKey($TenantKey))
+                                {
+                                    # The token may have ended: renewed once, then this request is sent again.
+                                    $HeldBackUnits.Add($Unit)
+                                    return
+                                }
+                                if ($Off.TryAdd($TenantKey, 1))
+                                {
+                                    $Notes.Add(('The metrics data plane refused a renewed token (401) for subscription {0}; batch is off for its tenant for the rest of the phase.' -f $Unit.SubscriptionId))
+                                }
+                            }
+                            if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
+                            {
+                                $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader on the subscription itself (not only on its resource groups) and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
+                            }
+                            $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
+                            Send-AllGroupsOn
+                            return
+                        }
+
+                        [void]$Worked.TryAdd($TenantKey, 1)
+
+                        # Each answer back to its resource, ids compared without case.
+                        $Entries = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        foreach ($Entry in @($Response.values))
+                        {
+                            if ($null -eq $Entry) { continue }
+                            $EntryId = ([string]$Entry.resourceid).TrimEnd('/')
+                            if (-not [string]::IsNullOrEmpty($EntryId) -and -not $Entries.ContainsKey($EntryId)) { $Entries[$EntryId] = $Entry }
+                        }
+                        $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        $AnsweredDefs = 0
+                        # The answer of a request that worked, for the records of the definitions it answered.
+                        $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false }
                         foreach ($Group in $Unit.Groups)
                         {
-                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
-                            Add-BatchCount 5 @($Group).Count
-                        }
-                    }
-
-                    # The seconds a 429 answer asks to wait (Retry-After), or 0.
-                    function Get-BatchRetryAfter([System.Exception]$Exception)
-                    {
-                        try
-                        {
-                            $Delta = $Exception.Response.Headers.RetryAfter.Delta
-                            if ($null -ne $Delta) { return [math]::Max(0, $Delta.TotalSeconds) }
-                        }
-                        catch { }
-                        return 0
-                    }
-
-                    # The HTTP status of a failed request, or $null.
-                    function Get-BatchStatusCode([System.Exception]$Exception)
-                    {
-                        $Ex = $Exception
-                        $Depth = 0
-                        while ($null -ne $Ex -and $Depth -lt 10)
-                        {
-                            $Depth++
-                            if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                            $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
+                            if (-not $Entries.ContainsKey($GroupKey))
                             {
-                                try { return [int]$Ex.Response.StatusCode } catch { }
+                                $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                                Add-BatchCount 5 @($Group).Count
+                                continue
                             }
-                            if ($null -ne $Ex.PSObject.Properties['StatusCode'] -and $null -ne $Ex.StatusCode)
+                            [void]$AnsweredIds.Add($GroupKey)
+                            $ByName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                            foreach ($Metric in @($Entries[$GroupKey].value))
                             {
-                                try { return [int]$Ex.StatusCode } catch { }
+                                if ($null -eq $Metric -or $null -eq $Metric.name) { continue }
+                                $MetricName = [string]$Metric.name.value
+                                if (-not [string]::IsNullOrEmpty($MetricName) -and -not $ByName.ContainsKey($MetricName)) { $ByName[$MetricName] = $Metric }
                             }
-                            $Ex = $Ex.InnerException
-                        }
-                        return $null
-                    }
-
-                    # A REST answer for one metric, in the shape Get-AzMetric returns: Name.Value,
-                    # and Data as the first time series' points (null when there is no time series,
-                    # as PSMetric.Data is), each point with all five aggregation fields as
-                    # [double] or null, so records are built the same way.
-                    function ConvertTo-BatchMetricQuery($Metric)
-                    {
-                        $Series = @(@($Metric.timeseries) | Where-Object { $null -ne $_ })
-                        $Data = $null
-                        if ($Series.Count -gt 0 -and $null -ne $Series[0].PSObject.Properties['data'] -and $null -ne $Series[0].data)
-                        {
-                            $Data = [System.Collections.Generic.List[object]]::new()
-                            foreach ($Point in @($Series[0].data))
+                            $Missing = [System.Collections.Generic.List[object]]::new()
+                            $GroupAnswers = [System.Collections.Generic.List[object]]::new()
+                            foreach ($Def in $Group)
                             {
-                                if ($null -eq $Point) { continue }
-                                $Fields = [ordered]@{ TimeStamp = $Point.timeStamp }
-                                foreach ($Field in 'Average', 'Minimum', 'Maximum', 'Total', 'Count')
+                                $Metric = $null
+                                # The live API leaves errorCode out of a metric it answered (the doc's
+                                # sample shows 'Success'), so no code is a success too; any other code
+                                # is not, and that metric gets a request of its own.
+                                if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and ($null -eq $Metric.PSObject.Properties['errorCode'] -or [string]::IsNullOrEmpty([string]$Metric.errorCode) -or [string]$Metric.errorCode -eq 'Success'))
                                 {
-                                    $Prop = $Point.PSObject.Properties[$Field]
-                                    $Fields[$Field] = if ($null -ne $Prop -and $null -ne $Prop.Value) { [double]$Prop.Value } else { $null }
+                                    $GroupAnswers.Add([pscustomobject]@{ Def = $Def; Metric = $Metric })
                                 }
-                                $Data.Add([pscustomobject]$Fields)
+                                else
+                                {
+                                    $Missing.Add($Def)
+                                }
                             }
-                        }
-                        return [pscustomobject]@{ Name = [pscustomobject]@{ Value = [string]$Metric.name.value }; Data = $Data }
-                    }
-
-                    $Reason = $null
-                    if ($OffSubs.TryGetValue($Unit.SubscriptionId, [ref]$Reason))
-                    {
-                        Send-AllGroupsOn
-                        return
-                    }
-                    $TenantKey = [string]$TenantOfSub[$Unit.SubscriptionId]
-                    $Token = $Tokens[$TenantKey]
-                    if ([string]::IsNullOrEmpty($Token))
-                    {
-                        Send-AllGroupsOn
-                        return
-                    }
-
-                    $Uri = ('{0}/subscriptions/{1}/metrics:getBatch?api-version=2023-10-01&metricnamespace={2}&metricnames={3}&aggregation={4}&interval={5}&starttime={6}&endtime={7}' -f
-                        ($EndpointFormat -f $Unit.Region), $Unit.SubscriptionId, [uri]::EscapeDataString($Unit.Namespace),
-                        ((@($Unit.MetricNames) | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','),
-                        $Unit.Aggregation.ToLowerInvariant(), $Unit.Interval, $Unit.StartTime, $Unit.EndTime)
-                    # The doc's rule: resource ids in the body in lower case.
-                    $Body = ConvertTo-Json -InputObject @{ resourceids = [string[]]@($Unit.ResourceIds) } -Compress
-
-                    Add-BatchCount 0 1
-                    Add-BatchCount 2 $Unit.ResourceIds.Count
-                    $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                    $Response = $null
-                    $Attempt = 0
-                    $LastError = $null
-                    $Kind = $null
-                    $RetryAfter = 0
-                    # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
-                    # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
-                    # at once (the same request is refused the same way again).
-                    while ($Attempt -le $CallMaxRetries)
-                    {
-                        Add-BatchCount 1 1
-                        try
-                        {
-                            $Response = Invoke-RestMethod -Method Post -Uri $Uri -Headers @{ Authorization = 'Bearer ' + $Token } -ContentType 'application/json' -Body $Body -TimeoutSec $CallTimeoutSeconds -ErrorAction Stop
-                            $Kind = $null
-                            break
-                        }
-                        catch
-                        {
-                            $LastError = [string]$_.Exception.Message
-                            $Status = Get-BatchStatusCode -Exception $_.Exception
-                            $RetryAfter = Get-BatchRetryAfter -Exception $_.Exception
-                            $Kind = if ($Status -eq 401) { 'TokenRefused' }
-                            elseif ($Status -eq 403) { 'Refused' }
-                            elseif ($Status -in 400, 404) { 'BadRequest' }
-                            elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
-                            else { 'Error' }
-                            if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
-                        }
-                        if ($Kind -in 'Refused', 'TokenRefused', 'BadRequest') { break }
-                        if ($Attempt -lt $CallMaxRetries)
-                        {
-                            $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-                            if ($Kind -eq 'Throttled') { $Backoff = [math]::Min([math]::Max($Backoff * 2, $RetryAfter), 60) }
-                            Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
-                        }
-                        $Attempt++
-                    }
-                    $Seconds = $Stopwatch.Elapsed.TotalSeconds
-                    $Attempts = [math]::Min($Attempt, $CallMaxRetries) + 1
-
-                    if ($null -ne $Kind)
-                    {
-                        if ($Kind -eq 'TokenRefused')
-                        {
-                            # The token may have ended: it is renewed once before the next batch.
-                            if ($TokenRefused.TryAdd($TenantKey, 1))
+                            if ($GroupAnswers.Count -eq 0)
                             {
-                                $Notes.Add(('The metrics data plane refused the token (401) for subscription {0}; the token is renewed once before the next batch, and refused again turns batch off for its tenant.' -f $Unit.SubscriptionId))
+                                # Nothing usable for this resource: its group as without -UseMetricsBatch.
+                                $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                                Add-BatchCount 5 @($Group).Count
+                                continue
+                            }
+                            # Each record is built now, so only this request's answer is held, never
+                            # the answers of every request of the batch.
+                            foreach ($Answer in $GroupAnswers)
+                            {
+                                Add-MetricRecord -Def $Answer.Def -Request $Answered -MetricQuery (ConvertTo-BatchMetricQuery -Metric $Answer.Metric) -ExtraSeconds $Seconds
+                                $AnsweredDefs++
+                            }
+                            foreach ($Def in $Missing)
+                            {
+                                # A metric with an errorCode other than Success, or not in the answer: one request of its own.
+                                $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = [object[]]@($Def) })
+                                Add-BatchCount 5 1
                             }
                         }
-                        if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
-                        {
-                            $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader on the subscription itself (not only on its resource groups) and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
-                        }
-                        $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
-                        Send-AllGroupsOn
-                        return
-                    }
+                        Add-BatchCount 3 $AnsweredIds.Count
+                        Add-BatchCount 4 $AnsweredDefs
+                        $Response = $null
+                        $Entries = $null
+                    } -ThrottleLimit $ConcurrencyLimit
 
-                    # Each answer back to its resource, ids compared without case.
-                    $Entries = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    foreach ($Entry in @($Response.values))
+                    foreach ($TenantKey in @($TokenWorked.Keys)) { $MetricBatchTokenRenewed.Remove($TenantKey) }
+                    foreach ($TenantKey in @($TenantsOff.Keys)) { $MetricBatchTokens[$TenantKey] = $null }
+                    $PassUnits = @($HeldBack)
+                    if ($PassUnits.Count -gt 0)
                     {
-                        if ($null -eq $Entry) { continue }
-                        $EntryId = ([string]$Entry.resourceid).TrimEnd('/')
-                        if (-not [string]::IsNullOrEmpty($EntryId) -and -not $Entries.ContainsKey($EntryId)) { $Entries[$EntryId] = $Entry }
-                    }
-                    $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    $AnsweredDefs = 0
-                    # The answer of a request that worked, for the records of the definitions it answered.
-                    $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false }
-                    foreach ($Group in $Unit.Groups)
-                    {
-                        $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
-                        if (-not $Entries.ContainsKey($GroupKey))
+                        $RefusedTenants = @($PassUnits | ForEach-Object { [string]$MetricBatchTenantOfSub[$_.SubscriptionId] } | Sort-Object -Unique)
+                        Write-MetricsDiag ("[batch] the metrics data plane refused the token (401) for {0} request(s); renewing the token of {1} tenant(s) once and sending them again." -f $PassUnits.Count, $RefusedTenants.Count)
+                        foreach ($TenantKey in $RefusedTenants)
                         {
-                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
-                            Add-BatchCount 5 @($Group).Count
-                            continue
-                        }
-                        [void]$AnsweredIds.Add($GroupKey)
-                        $ByName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                        foreach ($Metric in @($Entries[$GroupKey].value))
-                        {
-                            if ($null -eq $Metric -or $null -eq $Metric.name) { continue }
-                            $MetricName = [string]$Metric.name.value
-                            if (-not [string]::IsNullOrEmpty($MetricName) -and -not $ByName.ContainsKey($MetricName)) { $ByName[$MetricName] = $Metric }
-                        }
-                        $Missing = [System.Collections.Generic.List[object]]::new()
-                        $GroupAnswers = [System.Collections.Generic.List[object]]::new()
-                        foreach ($Def in $Group)
-                        {
-                            $Metric = $null
-                            # The live API leaves errorCode out of a metric it answered (the doc's
-                            # sample shows 'Success'), so no code is a success too; any other code
-                            # is not, and that metric gets a request of its own.
-                            if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and ($null -eq $Metric.PSObject.Properties['errorCode'] -or [string]::IsNullOrEmpty([string]$Metric.errorCode) -or [string]$Metric.errorCode -eq 'Success'))
+                            $MetricBatchTokenRenewed[$TenantKey] = $true
+                            $Held = $MetricBatchTokens[$TenantKey]
+                            if ($null -eq $Held) { continue }
+                            try
                             {
-                                $GroupAnswers.Add([pscustomobject]@{ Def = $Def; Metric = $Metric })
+                                $RenewArgs = $Held.Args
+                                $TokenObj = Get-AzAccessToken @RenewArgs
+                                $Held.Value = if ($TokenObj.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $TokenObj.Token).Password } else { [string]$TokenObj.Token }
+                                $Held.ExpiresOn = $TokenObj.ExpiresOn
                             }
-                            else
+                            catch
                             {
-                                $Missing.Add($Def)
+                                Write-MetricsDiag ("[batch] could not renew a metrics data plane token ({0}); those requests are sent again with the token held." -f $_.Exception.Message)
                             }
                         }
-                        if ($GroupAnswers.Count -eq 0)
-                        {
-                            # Nothing usable for this resource: its group as without -UseMetricsBatch.
-                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
-                            Add-BatchCount 5 @($Group).Count
-                            continue
-                        }
-                        # Each record is built now, so only this request's answer is held, never
-                        # the answers of every request of the batch.
-                        foreach ($Answer in $GroupAnswers)
-                        {
-                            Add-MetricRecord -Def $Answer.Def -Request $Answered -MetricQuery (ConvertTo-BatchMetricQuery -Metric $Answer.Metric) -ExtraSeconds $Seconds
-                            $AnsweredDefs++
-                        }
-                        foreach ($Def in $Missing)
-                        {
-                            # A metric with an errorCode other than Success, or not in the answer: one request of its own.
-                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = [object[]]@($Def) })
-                            Add-BatchCount 5 1
-                        }
                     }
-                    Add-BatchCount 3 $AnsweredIds.Count
-                    Add-BatchCount 4 $AnsweredDefs
-                    $Response = $null
-                    $Entries = $null
-                } -ThrottleLimit $ConcurrencyLimit
+                }
 
                 foreach ($Outcome in $BatchOutcomes) { $DispatchItems.Add($Outcome.Group) }
                 $BatchOutcomes = $null
