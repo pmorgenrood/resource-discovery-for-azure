@@ -1062,6 +1062,8 @@ function Add-MetricRecord
                         $CallMaxRetries = $using:MetricMaxRetries
                         $DiagBag = $using:MetricDiagnostics
                         $MetricBag = ($using:Tmp).Metrics
+                        # Add-MetricRecord, defined by the source text below, reads these two.
+                        $null = $DiagBag, $MetricBag
                         . ([scriptblock]::Create($using:AddMetricRecordSource))
 
                         function Add-BatchCount([int]$Index, [long]$By)
@@ -1618,6 +1620,8 @@ function Add-MetricRecord
                     return $Request
                 }
 
+                # Add-MetricRecord, defined by the source text below, reads these two.
+                $null = $DiagBag, $MetricBag
                 . ([scriptblock]::Create($using:AddMetricRecordSource))
 
                 $GroupDefs = @($_)
