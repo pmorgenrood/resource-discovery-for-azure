@@ -822,8 +822,8 @@ if ($PreflightOnly)
     }
     # The run checks access only for the subscriptions it would collect:
     # -Resume leaves out those it completed, -ResumeFailedOnly takes only the
-    # retry list. The same lists are read here, without changing them (the
-    # per-stream state files of an interrupted parallel run are not read).
+    # retry list. The same lists are read here, the per-stream state files of
+    # an interrupted parallel run folded in, without changing them.
     if ($Resume -or $ResumeFailedOnly)
     {
         $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
