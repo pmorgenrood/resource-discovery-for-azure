@@ -885,6 +885,8 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly' -Skip:$IsWindows {
         $R = script:Invoke-Wrapper -Arguments (@('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly') + $Extra)
         $R.ExitCode | Should -Be 1
         $R.Text | Should -Contain 'Preflight failed: how the run would start. Nothing was collected or written to the inventory folder (exit 1).'
+        @($R.Text | Where-Object { $_ -like '*This run stops here*' }) | Should -BeNullOrEmpty -Because 'a preflight says what a run would do'
+        @($R.Text | Where-Object { $_ -like '  A run would say: *A run stops here (exit 1)*' }).Count | Should -BeGreaterThan 0
         script:Get-RootSnapshot | Should -Be $Before
         # The same command without -PreflightOnly stops the same way.
         $Run = script:Invoke-Wrapper -Arguments (@('-SubscriptionID', $script:Subs['B'].Id) + $Extra)
@@ -913,7 +915,7 @@ Describe 'A -SubscriptionID run whose subscription is gone' -Skip:$IsWindows {
         script:Set-Scenario -Subs 'A', 'B'
         $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Resume')
         $R.ExitCode | Should -Be 0
-        $R.Text | Should -Contain ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Path (script:Get-OneState 'B') -Leaf))
+        $R.Text | Should -Contain ('-SubscriptionID: this run collects only subscription {0} and keeps its own resume state ({1}); the resume state of a run of the whole tenant is neither read nor changed.' -f $script:Subs['B'].Id, (Split-Path -Path (script:Get-OneState 'B') -Leaf))
         $W = script:Invoke-Wrapper
         @($W.Text | Where-Object { $_ -like '-SubscriptionID: *' }) | Should -BeNullOrEmpty
     }
@@ -938,6 +940,35 @@ Describe 'A -SubscriptionID run whose subscription is gone' -Skip:$IsWindows {
         $Run = script:Invoke-Wrapper -Arguments $Extra
         if ($Code -eq 0) { @($Run.Text | Where-Object { $_ -like '*NOT readable*' }) | Should -BeNullOrEmpty }
         else { @($Run.Text | Where-Object { $_ -like '*NOT readable*' }).Count | Should -BeGreaterThan 0 }
+    }
+}
+
+Describe 'An early stop of the wrapper releases only its own run lock' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'leaves a run lock that the calling session holds when the wrapper stops before taking its own' {
+        script:Set-Scenario -Subs 'A'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Lock = Join-Path $script:Root 'session-held.lock.json'
+        $Functions = Join-Path $script:ToolRoot 'Functions/RunAllSubscriptions.Functions.ps1'
+        $Command = ". '{0}'; `$RunLock = Request-RunLock -Path '{1}' -RunStartTime (Get-Date); if (-not `$RunLock.Acquired) {{ exit 9 }}; & '{2}' -TenantID '{3}' -SubscriptionID 'not-a-guid'; exit `$LASTEXITCODE" -f $Functions, $Lock, $script:Wrapper, $script:Tenant
+        $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
+        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $Command)) { $Info.ArgumentList.Add($Arg) }
+        $Info.UseShellExecute = $false
+        $Info.RedirectStandardInput = $true
+        $Info.RedirectStandardOutput = $true
+        $Info.RedirectStandardError = $true
+        $Info.Environment['HOME'] = $script:CaseHome
+        $Info.Environment['PSModulePath'] = $script:Modules
+        $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
+        $Proc = [System.Diagnostics.Process]::Start($Info)
+        $Proc.StandardInput.Close()
+        $Out = $Proc.StandardOutput.ReadToEndAsync()
+        $null = $Proc.StandardError.ReadToEndAsync()
+        $Proc.WaitForExit(120000) | Should -BeTrue
+        $Proc.ExitCode | Should -Be 1 -Because $Out.Result
+        Test-Path -LiteralPath $Lock | Should -BeTrue -Because 'the lock is the calling session''s, not the wrapper''s'
     }
 }
 

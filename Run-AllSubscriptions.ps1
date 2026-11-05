@@ -239,7 +239,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7)
     # the message PowerShell 7 gives for it.
     if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
     {
-        Write-Host "ERROR: -SubscriptionID '' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -ForegroundColor Red
+        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID) -ForegroundColor Red
         exit 1
     }
 
@@ -498,12 +498,6 @@ $Global:CollectorFailures = @()
 # the same PowerShell session lists the subscriptions again.
 Remove-Variable -Name RdaTenantSubscriptionCache -Scope Global -ErrorAction SilentlyContinue
 
-# The tenant key names this tenant's run lock and resume state files
-# (Get-TenantFileKey). Without a key of 12 hex characters every tenant would
-# share the same names, so the run stops here, before it creates or writes any
-# file (the inventory folder, the transcript, the lock or a state file). The key
-# is the SHA-256 of the text, so one that comes out right for -TenantID as given
-# comes out right for the tenant id a domain name resolves to below.
 # Read by Exit-Wrapper at every exit, so they are set before the first one (the
 # checks below and -PreflightOnly exit before the transcript is started), and a
 # run under Set-StrictMode never reads one unset. Whether the wrapper transcript
@@ -533,6 +527,12 @@ if ($OneSubscription)
     $SubscriptionID = $SubscriptionID.Trim().ToLowerInvariant()
 }
 
+# The tenant key names this tenant's run lock and resume state files
+# (Get-TenantFileKey). Without a key of 12 hex characters every tenant would
+# share the same names, so the run stops here, before it creates or writes any
+# file (the inventory folder, the transcript, the lock or a state file). The key
+# is the SHA-256 of the text, so one that comes out right for -TenantID as given
+# comes out right for the tenant id a domain name resolves to below.
 $TenantKeyProblem = $null
 try
 {
@@ -549,6 +549,11 @@ if ($null -ne $TenantKeyProblem)
     Write-Host ("ERROR: Could not work out the tenant key that names this tenant's files in the inventory folder on PowerShell {0}: {1}. The run stopped before creating or writing any file." -f $PSVersionTable.PSVersion, $TenantKeyProblem) -ForegroundColor Red
     Exit-Wrapper -Code 1
 }
+
+# The inventory folder (resume state, consolidated output, transcript). Only
+# the path here, so -PreflightOnly reads the lock and state of the same folder
+# as a run; the folder is created below, after -PreflightOnly has stopped.
+$InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
 
 # -PreflightOnly: the checks a run makes before it collects, and nothing else.
 # PowerShell 7, the Az modules, the Az.Accounts version and its load have
@@ -577,7 +582,7 @@ if ($PreflightOnly)
     # resume state (Resolve-RunStart: switches that cannot go together, settings
     # that differ from the unfinished run's). Nothing is created, moved or
     # written; with no inventory folder there is no lock or state to read.
-    $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+    $PfRoot = $InventoryRoot
     foreach ($PfLockPath in @((Get-RunLockLegacyPath -InventoryRoot $PfRoot -Tenant $TenantID), (Get-RunLockPath -InventoryRoot $PfRoot -Tenant $TenantID)))
     {
         if (-not (Test-Path -LiteralPath $PfLockPath -PathType Leaf)) { continue }
@@ -588,7 +593,8 @@ if ($PreflightOnly)
     }
     $PfStateKey = Get-ResumeStateScope -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
     $PfStart = Resolve-RunStart -Info (Read-ResumeRunInfo -Path (Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey) -Tenant $PfStateKey) -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays
-    foreach ($Line in @($PfStart.Lines)) { Write-Host ($Line.Text -replace '^ERROR: This run stops here \(exit 1\), before it signs in, collects anything or writes the resume state: ', 'ERROR: A run would stop here (exit 1): ') -ForegroundColor $Line.Colour }
+    # Resolve-RunStart words its lines for a run; here they say what a run would do.
+    foreach ($Line in @($PfStart.Lines)) { Write-Host ('  A run would say: ' + ($Line.Text -replace 'This run stops here \(exit 1\), before it signs in, collects anything or writes the resume state', 'A run stops here (exit 1)')) -ForegroundColor $Line.Colour }
     if ($PfStart.Mode -eq 'Stop') { & $PreflightFailed 'how the run would start' }
     Write-Host '  Run lock and run start: ok.' -ForegroundColor Green
     try { Connect-RdaWrapperSession -TenantID $TenantID -DeviceLogin:$DeviceLogin }
@@ -678,7 +684,6 @@ if ($PreflightOnly)
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
-$InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
 if (-not (Test-Path -Path $InventoryRoot -PathType Container))
 {
     try { New-Item -Path $InventoryRoot -ItemType Directory -Force | Out-Null }
@@ -868,7 +873,7 @@ $RunStart = Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFai
 foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
 # The lines above speak of this run's own resume state: for a -SubscriptionID
 # run, that one subscription's, never the whole tenant's.
-if ($OneSubscription) { Write-Host ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor DarkGray }
+if ($OneSubscription) { Write-Host ('-SubscriptionID: this run collects only subscription {0} and keeps its own resume state ({1}); the resume state of a run of the whole tenant is neither read nor changed.' -f $SubscriptionID, (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor DarkGray }
 if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
 $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnly))
 # The cost window of this run: the one the unfinished run recorded when this
