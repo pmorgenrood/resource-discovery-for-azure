@@ -832,8 +832,10 @@ if ($PreflightOnly)
     $PfConsumptionCheck = {
         if ($SkipConsumption) { return }
         $script:PreflightCheck = 'consumption access'
-        Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $PfEligible[0].Name) -ForegroundColor Cyan
-        $PfConsumption = Test-ConsumptionAccess -SubscriptionId $PfEligible[0].Id
+        # -ResumeFailedOnly probes the first subscription of its retry list, as the run does.
+        $PfProbeSub = if ($ResumeFailedOnly) { $Subscriptions[0] } else { $PfEligible[0] }
+        Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $PfProbeSub.Name) -ForegroundColor Cyan
+        $PfConsumption = Test-ConsumptionAccess -SubscriptionId $PfProbeSub.Id
         if ($PfConsumption.Outcome -eq 'Denied')
         {
             Write-Host ("ERROR: The signed-in identity is not authorized to read consumption/billing data. Reason: {0}" -f $PfConsumption.Detail) -ForegroundColor Red
