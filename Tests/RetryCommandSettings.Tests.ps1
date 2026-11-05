@@ -63,6 +63,10 @@ Describe 'The command that collects one subscription again with a direct run' {
         Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Settings (script:New-Settings -On $Name) | Should -Be ('./ResourceInventory.ps1 -TenantID {0} -SubscriptionID sub-a -{1}' -f $script:Tenant, $Name)
     }
 
+    It 'carries -UseMetricsBatch, so a retry collects metrics the same way' {
+        Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Settings ([ordered]@{ UseMetricsBatch = $true }) | Should -Be ('./ResourceInventory.ps1 -TenantID {0} -SubscriptionID sub-a -UseMetricsBatch' -f $script:Tenant)
+    }
+
     It 'leaves out -IncludeDisabled, which ResourceInventory.ps1 does not take' {
         Get-DirectRunRetryCommand -TenantID $script:Tenant -SubscriptionID 'sub-a' -Settings (script:New-Settings -On 'IncludeDisabled', 'SkipMetrics') | Should -Be ('./ResourceInventory.ps1 -TenantID {0} -SubscriptionID sub-a -SkipMetrics' -f $script:Tenant)
     }
@@ -77,7 +81,7 @@ Describe 'The command that collects one subscription again with a direct run' {
         $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
         $Calls = [regex]::Matches($Inner, [regex]::Escape("'  ' + (Get-DirectRunRetryCommand -TenantID `$RetryTenant -SubscriptionID `$_.Id @RetryArgs)"))
         $Calls.Count | Should -Be 2
-        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; IncludeNetworkResources = $IncludeNetworkResources.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }'))
+        $Inner | Should -Match ([regex]::Escape('$RetrySettings = [ordered]@{ Obfuscate = $Obfuscate.IsPresent; SkipMetrics = $SkipMetrics.IsPresent; SkipConsumption = $SkipConsumption.IsPresent; IncludeNetworkResources = $IncludeNetworkResources.IsPresent; UseMetricsBatch = $UseMetricsBatch.IsPresent; DeviceLogin = $DeviceLogin.IsPresent; UseManagedIdentity = $UseManagedIdentity.IsPresent }'))
         $Inner | Should -Match ([regex]::Escape('$RetryArgs = @{ ResourceGroup = $ResourceGroup; Settings = $RetrySettings; Appid = [string]$Appid; Service = $Service; OutputDirectory = [string]$OutputDirectory; ObfuscationDictionary = $ObfuscationDictionary }'))
     }
 }
