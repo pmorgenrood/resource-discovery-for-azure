@@ -151,6 +151,36 @@ class RdaMetricDefinition
     $Series
 }
 
+# For the summary log: of the given resource ids (Azure Monitor answered 404 for them), the ones
+# Resource Graph lists as being deleted, mapped to that state (for example a PostgreSQL flexible
+# server whose properties.state is 'Dropping'). Read only for those ids, so a run with no 404
+# reads nothing. Matching ignores case.
+function Get-MetricDeletingState
+{
+    param($Resources, [string[]]$Ids)
+
+    $Found = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (@($Ids).Count -eq 0) { return $Found }
+    $Wanted = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Ids), [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Resource in $Resources)
+    {
+        $Id = [string]$Resource.Id
+        if ([string]::IsNullOrEmpty($Id) -or -not $Wanted.Contains($Id) -or $Found.ContainsKey($Id)) { continue }
+        $Properties = $Resource.properties
+        if ($null -eq $Properties) { continue }
+        foreach ($Field in 'state', 'status', 'provisioningState')
+        {
+            $Value = [string]$Properties.$Field
+            if ($Value -match '^(dropping|deleting)$')
+            {
+                $Found[$Id] = $Value
+                break
+            }
+        }
+    }
+    return $Found
+}
+
 # Definitions of one resource that share a time window, time grain and aggregation
 # can be fetched with one Get-AzMetric call, since -MetricName takes several names.
 # -AggregationType takes a single value, so different aggregations stay separate
@@ -951,6 +981,9 @@ function Add-MetricRecord
             Attempts    = $Request.Attempts
             ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
             Error       = $CallErrorMsg
+            # For the summary only: a 404 on a resource Resource Graph lists as being deleted is said so in plain words.
+            Id          = $Def.Id
+            NotFound    = [bool]$Request.NotFound
         })
 
 
@@ -1347,7 +1380,7 @@ function Add-MetricRecord
                         $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                         $AnsweredDefs = 0
                         # The answer of a request that worked, for the records of the definitions it answered.
-                        $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false }
+                        $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false; NotFound = $false }
                         foreach ($Group in $Unit.Groups)
                         {
                             $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
@@ -1525,6 +1558,53 @@ function Add-MetricRecord
                     return $false
                 }
 
+                # True when Azure answered HTTP 404 (NotFound): the resource is not there any more
+                # (deleted, or being deleted, after discovery) or is not in this subscription. The
+                # same request is refused the same way on every retry, so it gets one attempt.
+                # Get-AzMetric reports it as "invalid status code 'NotFound'" with no status code
+                # on the exception, so the status phrase is read as well (quotes optional, the
+                # literal 'invalid status code ' prefix is the anchor). Ported from fork old-main.
+                function Test-MetricNotFound
+                {
+                    param([System.Exception]$Exception)
+
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    $Checked = 0
+                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Checked++
+
+                        $StatusCode = $null
+                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.Response.StatusCode
+                        }
+                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.StatusCode
+                        }
+                        if ($null -ne $StatusCode -and "$StatusCode" -in @('404', 'NotFound'))
+                        {
+                            return $true
+                        }
+                        if ([string]$Ex.Message -match "invalid status code '?NotFound\b'?")
+                        {
+                            return $true
+                        }
+
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+
+                    return $false
+                }
+
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
                 # failure is recorded for each definition. BadRequest is true when the
@@ -1547,7 +1627,7 @@ function Add-MetricRecord
                     }
                     $CallOutcome = 'Success'
                     $CallAttempts = 0
-                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false }
+                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false; NotFound = $false }
 
                     $MetricArgs = @{
                         ResourceId      = $Def.Id
@@ -1580,6 +1660,7 @@ function Add-MetricRecord
                             $Throttled = $false
                             $RetryAfterSeconds = 0
                             $BadRequest = $false
+                            $NotFound = $false
 
                             $Job = Start-ThreadJob -ScriptBlock {
                                 param($mArgs)
@@ -1596,7 +1677,13 @@ function Add-MetricRecord
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    if ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    # NotFound first: the throttle match below is a loose substring
+                                    # test that text inside a 404 message could meet by chance.
+                                    if (Test-MetricNotFound -Exception $_.Exception)
+                                    {
+                                        $NotFound = $true
+                                    }
+                                    elseif ($LastError -match '429|throttl|TooManyRequests|rate limit')
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++
@@ -1638,9 +1725,10 @@ function Add-MetricRecord
                                 break
                             }
 
-                            # A BadRequest under -StopOnBadRequest has already left the loop above, so the
-                            # plan sees no permanent failure here.
-                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $false `
+                            # A BadRequest under -StopOnBadRequest has already left the loop above. A
+                            # NotFound (404) is permanent: no retry can find the resource, so it ends
+                            # after this attempt and is recorded as an Error, as before.
+                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $NotFound `
                                 -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
                             if ($Plan.Retry)
                             {
@@ -1662,6 +1750,7 @@ function Add-MetricRecord
                         if (-not $Succeeded)
                         {
                             $Request.BadRequest = $BadRequest
+                            $Request.NotFound = $NotFound
                             throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
                         }
 
@@ -1852,9 +1941,16 @@ function Add-MetricRecord
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
         Write-MetricsDiag ("Non-success calls (where it got stuck):")
+        # A 404 (NotFound, not retried) on a resource Resource Graph lists as being deleted is said so.
+        $DeletingStates = Get-MetricDeletingState -Resources $Resources -Ids @($DiagNonSuccess | Where-Object { $_.NotFound } | ForEach-Object { [string]$_.Id } | Select-Object -Unique)
         foreach ($rec in ($DiagNonSuccess | Sort-Object ElapsedSec -Descending))
         {
-            Write-MetricsDiag ("  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error)
+            $Line = "  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error
+            if ($rec.NotFound -and $DeletingStates.ContainsKey([string]$rec.Id))
+            {
+                $Line += (" - not found because the resource is being deleted (its state is '{0}'); not retried" -f $DeletingStates[[string]$rec.Id])
+            }
+            Write-MetricsDiag $Line
         }
     }
 
