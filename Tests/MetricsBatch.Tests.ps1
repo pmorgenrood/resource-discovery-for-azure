@@ -614,6 +614,23 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         @($Run.DebugLines | Where-Object { $_ -match "Microsoft.Insights is 'NotRegistered'" }).Count | Should -Be 1
     }
 
+    It 'sends no token to an endpoint that is not Azure Monitor' {
+        $Saved = $script:Endpoint
+        $script:Endpoint = 'https://{0}.example.com'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-bad-endpoint' -Batch
+        }
+        finally
+        {
+            $script:Endpoint = $Saved
+        }
+
+        $Run.TokenCalls.Count | Should -Be 0
+        $Run.Calls.Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'not the Azure Monitor one' }).Count | Should -Be 1
+    }
+
     It 'uses the per-resource path outside AzureCloud' {
         $Global:RdaTestBatchEnvironment = 'AzureUSGovernment'
         try

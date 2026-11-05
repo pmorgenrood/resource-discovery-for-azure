@@ -655,7 +655,14 @@ if ($Task -eq 'Processing')
     if ($UseMetricsBatch -and $MetricGroups.Count -gt 0)
     {
         $BatchEnvironment = if ($null -ne $MetricAzContext -and $null -ne $MetricAzContext.Environment) { [string]$MetricAzContext.Environment.Name } else { '' }
-        if ($BatchEnvironment -ne 'AzureCloud')
+        # The token is sent to this host, so only the Azure Monitor endpoint (or a
+        # loopback listener, for tests) is accepted.
+        $EndpointOk = $MetricsBatchEndpointFormat -ceq 'https://{0}.metrics.monitor.azure.com' -or $MetricsBatchEndpointFormat -match '^http://(127\.0\.0\.1|localhost)(:\d+)?/'
+        if (-not $EndpointOk)
+        {
+            Write-MetricsDiag "[batch] -UseMetricsBatch: the batch endpoint is not the Azure Monitor one; every metric uses the per-resource path."
+        }
+        elseif ($BatchEnvironment -ne 'AzureCloud')
         {
             Write-MetricsDiag ("[batch] -UseMetricsBatch: the Azure environment is '{0}', not AzureCloud; the batch endpoint is only known for AzureCloud, so every metric uses the per-resource path." -f $BatchEnvironment)
         }
