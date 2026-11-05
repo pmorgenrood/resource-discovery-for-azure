@@ -139,7 +139,14 @@ Export-ModuleMember -Function Get-AzMetric
             $Status = 200
             $Out = $null
             $FailFirst = if ($Control.ContainsKey('FailFirst')) { [int]$Control['FailFirst'] } else { [int]::MaxValue }
-            if ($Control.ContainsKey('Status') -and $Seen -le $FailFirst)
+            $Sequence = @($Control['StatusSequence'])
+            if ($Control.ContainsKey('StatusSequence') -and $Seen -le $Sequence.Count -and [int]$Sequence[$Seen - 1] -ne 0)
+            {
+                # StatusSequence: the status of the run's nth request (0: answer it).
+                $Status = [int]$Sequence[$Seen - 1]
+                $Out = @{ error = @{ code = 'TestError'; message = 'test failure' } }
+            }
+            elseif ($Control.ContainsKey('Status') -and $Seen -le $FailFirst)
             {
                 $Status = [int]$Control['Status']
                 $Out = @{ error = @{ code = 'TestError'; message = 'test failure' } }
@@ -724,6 +731,35 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run.Records.Count | Should -Be 4
     }
 
+    It 'gives a token renewed before a batch its own renewal on a 401' {
+        # File batch 1: both requests refused (401), the token renewed, both sent again
+        # and failing (500, 4 attempts each) so the renewal never worked. File batch 2:
+        # the near-expiry renewal makes a new token; its 401 is renewed again and the
+        # request sent again works.
+        $Disks = @(1..130 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Sequence = @(401, 401) + @(500) * 8 + @(401, 0)
+        $Global:RdaTestBatchTokenMinutes = 5
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-401-generation' -Batch -Control @{ StatusSequence = $Sequence } -Concurrency 1
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenMinutes = 60
+        }
+
+        $Run.Posts.Count | Should -Be 12
+        # Only the 100 disks of the first file batch go per call.
+        @($Run.Calls | ForEach-Object { $_.ResourceId } | Sort-Object -Unique).Count | Should -Be 100
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 0
+    }
+
+    It 'counts a request sent again after a 401 once' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-count' -Batch -Control @{ Status = 401; FailFirst = 1 }
+
+        @($Run.DebugLines | Where-Object { $_ -match 'Metrics batch \(-UseMetricsBatch\): 1 getBatch request\(s\) \(2 attempt\(s\)\) for 1 resource\(s\)' }).Count | Should -Be 1
+    }
+
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {
         $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
         $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-400'
@@ -903,6 +939,27 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
     }
 }
 
+Describe 'A direct run hands its preflight result to the metrics phase' -Skip:$IsWindows {
+
+    It 'keeps a subscription answered no (no console) on the per-resource path, though registered meanwhile' {
+        $Harness = Join-Path $PSScriptRoot 'Helpers/InnerRunHarness.ps1'
+        $Work = Join-Path $TestDrive 'direct-run'
+        $Tree = Join-Path $Work 'tree'
+        $Out = Join-Path $Work 'out'
+        New-Item -ItemType Directory -Path $Tree, $Out -Force | Out-Null
+        foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services')) { Copy-Item -LiteralPath (Join-Path $script:RepoRoot $Item) -Destination $Tree -Recurse -Force }
+        $Pwsh = (Get-Process -Id $PID).Path
+
+        $Console = @(& $Pwsh -NoProfile -NonInteractive -File $Harness -Tree $Tree -Out $Out -UseMetricsBatch -DebugOutput 2>&1 | ForEach-Object { [string]$_ })
+        $Debug = @(Get-ChildItem -LiteralPath $Out -Recurse -Filter 'DebugLog_*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName })
+
+        ($Console -join "`n") | Should -Match 'No one can answer a prompt in this session'
+        @($Debug | Where-Object { $_ -match 'was left without Microsoft.Insights at the start of the run' }).Count | Should -Be 1
+        # Without the hand-off the metrics phase would read Registered and ask for a token.
+        @($Debug | Where-Object { $_ -match 'could not get a metrics data plane token' }).Count | Should -Be 0
+    }
+}
+
 Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a y' {
 
     BeforeAll {
@@ -929,7 +986,7 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         $Guard | Should -BeGreaterOrEqual 0
         $Guard | Should -BeLessThan $Body.IndexOf('Register-RdaInsightsProvider -SubscriptionId')
         # Only the "y" branch fills the list of subscriptions to register.
-        $Body | Should -Match ([regex]::Escape("else`n    {`n        `$ToRegister = @(`$Missing)`n    }"))
+        $Body | Should -Match 'else\r?\n\s*\{\r?\n\s*\$ToRegister = @\(\$Missing\)\r?\n\s*\}'
         @($script:Calls | Where-Object { $_.Ast.Extent.Text -match '/register\?' }).Count | Should -Be 0
     }
 
@@ -958,6 +1015,23 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $Wrapper | Should -Match ([regex]::Escape('$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })'))
         $Wrapper | Should -Match ([regex]::Escape('Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope'))
+    }
+
+    It 'keeps the position of every earlier parameter of the scripts it adds parameters to' {
+        $Base = 'd90882f5f871b7c8e0c119de5260afa0059d41ba'
+        $HasBase = $null -ne (git -C $script:RepoRoot cat-file -t $Base 2>$null)
+        if (-not $HasBase) { Set-ItResult -Skipped -Because 'the base commit is not in this clone' ; return }
+        foreach ($File in 'ResourceInventory.ps1', 'Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1', 'Extension/Metrics.ps1')
+        {
+            $Positional = {
+                param([string]$Text)
+                $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+                @($Ast.ParamBlock.Parameters | Where-Object { $_.StaticType -ne [switch] -and $_.StaticType -ne [System.Management.Automation.SwitchParameter] } | ForEach-Object { $_.Name.VariablePath.UserPath })
+            }
+            $Old = & $Positional ((git -C $script:RepoRoot show ('{0}:{1}' -f $Base, $File)) -join "`n")
+            $New = & $Positional (Get-Content -LiteralPath (Join-Path $script:RepoRoot $File) -Raw)
+            @($New | Select-Object -First $Old.Count) | Should -Be $Old -Because $File
+        }
     }
 
     It 'runs the preflight only under -UseMetricsBatch' {
