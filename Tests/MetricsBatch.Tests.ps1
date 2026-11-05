@@ -185,6 +185,11 @@ Export-ModuleMember -Function Get-AzMetric
                 $Out = @{ values = @($Values) }
             }
             $Text = if ($Control['BadJson'] -and $Status -eq 200) { '{"values":[ not json' } else { $Out | ConvertTo-Json -Depth 12 -Compress }
+            if ($Control['PascalKeys'])
+            {
+                # Keys in another case than the doc's, to show they are read without case.
+                $Text = [regex]::Replace($Text, '"(values|resourceid|value|name|errorCode|timeseries|data|average|minimum|maximum|total|count)":', { param($M) '"' + $M.Groups[1].Value.Substring(0, 1).ToUpperInvariant() + $M.Groups[1].Value.Substring(1) + '":' })
+            }
             $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
             $Context.Response.StatusCode = $Status
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
@@ -759,6 +764,43 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-count' -Batch -Control @{ Status = 401; FailFirst = 1 }
 
         @($Run.DebugLines | Where-Object { $_ -match 'Metrics batch \(-UseMetricsBatch\): 1 getBatch request\(s\) \(2 attempt\(s\)\) for 1 resource\(s\)' }).Count | Should -Be 1
+    }
+
+    It 'reads the answer''s keys without regard to case' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-pascal' -Batch -Control @{ PascalKeys = $true }
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'uses the per-resource path when the batch point type cannot be loaded' {
+        # A fresh process, where the type is not loaded yet, with Add-Type failing as it
+        # does under Constrained Language Mode.
+        $Child = Join-Path $TestDrive 'no-add-type.ps1'
+        Set-Content -LiteralPath $Child -Encoding utf8 -Value @'
+param($RepoRoot, $ModuleRoot, $Endpoint, $Out)
+$env:PSModulePath = $ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
+. (Join-Path $RepoRoot 'Functions/Common.Functions.ps1')
+function Get-AzContext { [pscustomobject]@{ Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function Get-AzAccessToken { [pscustomobject]@{ Token = 'test-token'; ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1) } }
+function Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' } }
+function Add-Type { throw 'Cannot add type. Definition of new types is not supported in this language mode.' }
+$env:RDA_TEST_METRIC_CALL_DIR = Join-Path $Out 'calls'
+New-Item -ItemType Directory -Path $env:RDA_TEST_METRIC_CALL_DIR -Force | Out-Null
+$Global:DebugLogFile = Join-Path $Out 'debug.log'
+$Disk = [pscustomobject]@{ TYPE = 'microsoft.compute/disks'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg/providers/Microsoft.Compute/disks/disk-x'; subscriptionId = '12345678-1234-1234-1234-123456789012'; ResourceGroup = 'rg'; Name = 'disk-x'; Location = 'westeurope'; ManagedBy = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm' }
+$null = & (Join-Path $RepoRoot 'Extension/Metrics.ps1') -Subscriptions @([pscustomobject]@{ id = '12345678-1234-1234-1234-123456789012'; Name = 's'; tenantId = 't' }) -Resources @($Disk) -Task 'Processing' -ConcurrencyLimit 4 -FilePath (Join-Path $Out 'Metrics_test') -Obfuscate $false -UseMetricsBatch -MetricsBatchEndpointFormat $Endpoint *>&1
+'@
+        $Out = Join-Path $TestDrive 'no-add-type'
+        New-Item -ItemType Directory -Path $Out -Force | Out-Null
+        Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -File | Remove-Item -Force
+        $Pwsh = (Get-Process -Id $PID).Path
+        & $Pwsh -NoProfile -NonInteractive -File $Child -RepoRoot $script:RepoRoot -ModuleRoot $script:ModuleRoot -Endpoint $script:Endpoint -Out $Out | Out-Null
+
+        @(Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -File).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath (Join-Path $Out 'calls') -File).Count | Should -Be 1
+        @((Get-Content -LiteralPath (Join-Path $Out 'Metrics_test_1.json') -Raw | ConvertFrom-Json).Metrics).Count | Should -Be 4
+        @(Get-Content -LiteralPath (Join-Path $Out 'debug.log') | Where-Object { $_ -match 'could not load the batch point type' }).Count | Should -Be 1
     }
 
     It 'asks Get-AzMetric for every resource of an answer that is not readable JSON' {
