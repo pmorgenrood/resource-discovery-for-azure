@@ -116,7 +116,18 @@ param (
     # the whole tenant never changes it. The run lock is the tenant's, so it
     # never runs at the same time as another run of the same tenant.
     # After -ResumeMaxAgeDays, so the positions of the parameters above stay.
-    [string]$SubscriptionID
+    [string]$SubscriptionID,
+
+    # Run only the checks a run makes before it collects, then stop: PowerShell
+    # 7 and the Az modules (with the same install offers), the Az.Accounts
+    # version, that Az.Accounts loads, the sign-in, that the tenant lists the
+    # subscriptions (with -SubscriptionID: that one, and that it is Enabled
+    # unless -IncludeDisabled), and that the signed-in identity can read them
+    # (with usage access unless -SkipConsumption). Exits 0 after 'Every check
+    # passed', or 1 naming the check that failed. It writes no report, zip,
+    # transcript, resume state or run lock, and creates nothing in the
+    # inventory folder. Last, so the positions of the parameters above stay.
+    [switch]$PreflightOnly
 )
 
 # ---------------------------------------------------------------------------
@@ -512,6 +523,80 @@ if ($null -ne $TenantKeyProblem)
 {
     Write-Host ("ERROR: Could not work out the tenant key that names this tenant's files in the inventory folder on PowerShell {0}: {1}. The run stopped before creating or writing any file." -f $PSVersionTable.PSVersion, $TenantKeyProblem) -ForegroundColor Red
     Exit-Wrapper -Code 1
+}
+
+# -PreflightOnly: the checks a run makes before it collects, and nothing else.
+# PowerShell 7, the Az modules, the Az.Accounts version and its load have
+# passed above (each failure there exits 1 with its own message). Here: the
+# tenant, the sign-in, the subscription list (and -SubscriptionID), and read
+# access. It runs before the inventory folder is created, before the
+# transcript, the run lock and the resume state, so it creates, writes, moves
+# or removes nothing in the inventory folder. It does not run the consumption
+# data check (which reads usage values), the free-space and write probes of
+# the inventory folder (the write probe writes a file there) or the resume
+# state checks. Every failure exits 1, naming the check; a pass exits 0.
+if ($PreflightOnly)
+{
+    Write-Host 'Preflight only: running the checks of a run, then stopping. Nothing is collected or written to the inventory folder.' -ForegroundColor Cyan
+    Write-Host ('  PowerShell {0}: ok.' -f $PSVersionTable.PSVersion) -ForegroundColor Green
+    Write-Host ('  Az modules ({0}), Az.Accounts {1} loaded: ok.' -f ($RequiredAzSubModules -join ', '), (@(Get-Module -Name Az.Accounts | Sort-Object Version -Descending)[0].Version)) -ForegroundColor Green
+    $PreflightFailed = { param([string]$Check) Write-Host ('Preflight failed: {0}. Nothing was collected or written to the inventory folder (exit 1).' -f $Check) -ForegroundColor Red; Exit-Wrapper -Code 1 }
+    try { $TenantID = Resolve-TenantId -Value $TenantID }
+    catch
+    {
+        Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        & $PreflightFailed 'the tenant'
+    }
+    try { Connect-RdaWrapperSession -TenantID $TenantID -DeviceLogin:$DeviceLogin }
+    catch
+    {
+        Write-Host "ERROR: Authentication failed. $_" -ForegroundColor Red
+        & $PreflightFailed 'the sign-in'
+    }
+    Write-Host ('  Sign-in to tenant {0}: ok.' -f $TenantID) -ForegroundColor Green
+    $PfWarnings = @()
+    $PfErrors = @()
+    $PfAll = @(Get-AzSubscription -TenantId $TenantID -WarningVariable PfWarnings -WarningAction SilentlyContinue -ErrorVariable PfErrors -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+    $PfProblems = @(@($PfWarnings) + @($PfErrors) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($PfAll.Count -eq 0)
+    {
+        Write-Host ("ERROR: Get-AzSubscription returned no subscriptions for tenant {0}." -f $TenantID) -ForegroundColor Red
+        foreach ($Problem in $PfProblems) { Write-Host ("  - {0}" -f $Problem) -ForegroundColor Red }
+        & $PreflightFailed 'the subscription list'
+    }
+    if ($OneSubscription)
+    {
+        $PfPick = Select-OneSubscription -Subscriptions $PfAll -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems $PfProblems
+        if ($PfPick.Stop)
+        {
+            # The pick's lines speak of a run; here only the check stops.
+            foreach ($Line in @($PfPick.Lines)) { Write-Host ($Line.Text -replace ', so this run stopped before collecting anything \(exit 1\)', '') -ForegroundColor $Line.Colour }
+            & $PreflightFailed 'the subscription'
+        }
+        $PfScope = @($PfPick.Subscription)
+        Write-Host ('  Subscription {0} ({1}) is listed and {2}: ok.' -f $PfScope[0].Name, $PfScope[0].Id, $PfScope[0].State) -ForegroundColor Green
+    }
+    else
+    {
+        $PfScope = if ($IncludeDisabled) { $PfAll } else { @($PfAll | Where-Object { $_.State -eq 'Enabled' }) }
+        if ($PfScope.Count -eq 0)
+        {
+            Write-Host ("ERROR: None of the {0} subscription(s) the tenant lists is Enabled. To check them anyway, run the same command with -IncludeDisabled." -f $PfAll.Count) -ForegroundColor Red
+            & $PreflightFailed 'the subscription list'
+        }
+        Write-Host ('  Subscriptions listed: {0}, of which {1} in scope: ok.' -f $PfAll.Count, $PfScope.Count) -ForegroundColor Green
+    }
+    Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $PfScope.Count) -ForegroundColor Cyan
+    $PfProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $PfScope -IncludeUsage:(-not $SkipConsumption))
+    $PfDecision = Resolve-AccessPreflight -Probed $PfProbed
+    if (@($PfDecision.Inaccessible).Count -gt 0)
+    {
+        Write-PreflightOnlyAccessFailure -Decision $PfDecision
+        & $PreflightFailed 'read access'
+    }
+    Write-AccessPreflightReport -Decision $PfDecision -ScopeCount $PfScope.Count
+    Write-Host 'Every check passed.' -ForegroundColor Green
+    Exit-Wrapper -Code 0
 }
 
 # Inventory root (used for resume state, consolidated output, and the wrapper

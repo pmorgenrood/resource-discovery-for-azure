@@ -263,10 +263,10 @@ function Get-UsageAggregates
 
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$Denied = @())
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$Denied = @(), [string]$SignedInTenant)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
-            Tenant        = $script:Tenant
+            Tenant        = $(if ($SignedInTenant) { $SignedInTenant } else { $script:Tenant })
             Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = $script:Subs[$_].Name; State = $(if ($Disabled -contains $_) { 'Disabled' } else { 'Enabled' }) } })
             FailIds       = @($Fail | ForEach-Object { & $Id $_ })
             HangIds       = @($Hang | ForEach-Object { & $Id $_ })
@@ -282,7 +282,7 @@ function Get-UsageAggregates
     # is killed and its run lock removed, as a user would after a closed window.
     function script:Invoke-Wrapper
     {
-        param([string[]]$Arguments = @(), [int]$Streams = 1, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300)
+        param([string[]]$Arguments = @(), [int]$Streams = 1, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300, [string]$ModulePath)
         $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant)
         if ($Streams -gt 0) { $All += @('-ParallelStreams', [string]$Streams) }
         $All += @($Arguments)
@@ -294,7 +294,7 @@ function Get-UsageAggregates
         $Info.RedirectStandardOutput = $true
         $Info.RedirectStandardError = $true
         $Info.Environment['HOME'] = $script:CaseHome
-        $Info.Environment['PSModulePath'] = $script:Modules
+        $Info.Environment['PSModulePath'] = $(if ($ModulePath) { $ModulePath } else { $script:Modules })
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['NO_COLOR'] = '1'
         $Proc = [System.Diagnostics.Process]::Start($Info)
@@ -380,6 +380,16 @@ function Get-UsageAggregates
     }
     function script:Get-Calls { @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'call-*.log' | ForEach-Object { (Get-Content -LiteralPath $_.FullName) -replace '\|.*$', '' }) }
     function script:Clear-Calls { Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'call-*.log' | Remove-Item -Force }
+    # Every file and folder under the inventory root with its size, time and
+    # hash, so a run that changes nothing there leaves the same list.
+    function script:Get-RootSnapshot
+    {
+        if (-not (Test-Path -LiteralPath $script:Root)) { return @('(no inventory folder)') }
+        @((Get-Item -LiteralPath $script:Root -Force) | ForEach-Object { 'root|{0}' -f $_.LastWriteTimeUtc.Ticks }) + @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Sort-Object FullName | ForEach-Object {
+            if ($_.PSIsContainer) { 'dir|{0}|{1}' -f $_.FullName, $_.LastWriteTimeUtc.Ticks }
+            else { 'file|{0}|{1}|{2}|{3}' -f $_.FullName, $_.Length, $_.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+        })
+    }
     function script:Get-FileHashOrNone { param([string]$Path) if (Test-Path -LiteralPath $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } else { 'none' } }
 }
 
@@ -460,10 +470,11 @@ Describe 'The -SubscriptionID helpers' {
         Get-WrapperRunCommand -TenantID $script:Tenant -Mode '-Fresh' -Settings $Whole | Should -BeExactly ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -Obfuscate' -f $script:Tenant)
     }
 
-    It 'keeps -SubscriptionID as the last parameter of the wrapper, after every earlier one' {
+    It 'keeps -SubscriptionID and then -PreflightOnly as the last parameters of the wrapper, after every earlier one' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
         $Names = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         $Names.IndexOf('SubscriptionID') | Should -Be ($Names.IndexOf('ResumeMaxAgeDays') + 1)
+        $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly')
         $Names[0..($Names.IndexOf('ResumeMaxAgeDays'))] | Should -Be @('TenantID', 'DeviceLogin', 'Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeNetworkResources', 'Resume', 'ResumeFailedOnly', 'Fresh', 'IncludeDisabled', 'AllowPartialAccess', 'MainSummary', 'Detailed', 'ConcurrencyLimit', 'ParallelStreams', 'ResumeMaxAgeDays')
     }
 }
@@ -676,5 +687,110 @@ Describe 'The resume state of a -SubscriptionID run is its own' -Skip:$IsWindows
         $F.ExitCode | Should -Be 0
         script:Get-Calls | Should -Be @($script:Subs['B'].Id)
         script:Read-StateAt (script:Get-OneState 'B') | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Run-AllSubscriptions.ps1 -PreflightOnly' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'passes every check for one subscription, exits 0 and creates no inventory folder' {
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain 'Every check passed.'
+        $R.Text | Should -Contain ('  Subscription Sub B ({0}) is listed and Enabled: ok.' -f $script:Subs['B'].Id)
+        $R.Text | Should -Contain 'Verifying subscription access up front for 1 subscription(s)...'
+        $R.Text | Should -Contain '  Access verified: all 1 in-scope subscription(s) are readable.'
+        Test-Path -LiteralPath $script:Root | Should -BeFalse -Because 'a preflight creates nothing in the inventory folder'
+        script:Get-Calls | Should -BeNullOrEmpty
+    }
+
+    It 'passes every check for the whole tenant without -SubscriptionID' {
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Disabled 'C'
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain '  Subscriptions listed: 3, of which 2 in scope: ok.'
+        $R.Text | Should -Contain 'Every check passed.'
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+    }
+
+    It 'leaves an inventory folder, its reports, resume state and lock files exactly as they were (<Case>)' -ForEach @(
+        @{ Case = 'pass'; Denied = @(); Code = 0; Last = 'Every check passed.' }
+        @{ Case = 'fail'; Denied = @('B'); Code = 1; Last = 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' }
+    ) {
+        # An unfinished run of the whole tenant and of one subscription, as on disk.
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Hang 'B'
+        $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'B') -and ((script:Read-StateAt $script:State).Completed -join ',') -eq $script:Subs['A'].Id }
+        Set-Content -LiteralPath (Join-Path $script:Root 'note.txt') -Value 'kept'
+        Set-Content -LiteralPath (script:Get-OneState 'C') -Value '{"TenantID":"x"}'
+        Start-Sleep -Milliseconds 50
+        $Before = script:Get-RootSnapshot
+        $Before.Count | Should -BeGreaterThan 3
+
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly')
+        $R.ExitCode | Should -Be $Code
+        $R.Text | Should -Contain $Last
+        $R2 = script:Invoke-Wrapper -Arguments @('-PreflightOnly')
+        $R2.ExitCode | Should -Be $Code
+        $R2.Text | Should -Contain $Last
+        script:Get-RootSnapshot | Should -Be $Before
+        script:Get-Calls | Where-Object { $_ -ne $script:Subs['A'].Id -and $_ -ne $script:Subs['B'].Id } | Should -BeNullOrEmpty
+    }
+
+    It 'fails with exit 1 naming the subscription when the tenant does not list it' {
+        script:Set-Scenario -Subs 'A'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['C'].Id, '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        ($R.Text | Where-Object { $_ -like 'ERROR: -SubscriptionID*' }) | Should -BeLike ('ERROR: -SubscriptionID {0} is not among the 1 subscription(s) Get-AzSubscription lists for tenant *.' -f $script:Subs['C'].Id)
+        $R.Text | Should -Contain 'Preflight failed: the subscription. Nothing was collected or written to the inventory folder (exit 1).'
+        $R.Text | Should -Not -Contain 'Every check passed.'
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+    }
+
+    It 'fails with exit 1 for a subscription that is not Enabled, and passes with -IncludeDisabled' {
+        script:Set-Scenario -Subs 'A', 'B' -Disabled 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain ('ERROR: Subscription Sub B ({0}) is Disabled, not Enabled. A subscription that is not Enabled returns little or no data.' -f $script:Subs['B'].Id)
+        $R.Text | Should -Contain 'Preflight failed: the subscription. Nothing was collected or written to the inventory folder (exit 1).'
+        $R2 = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly', '-IncludeDisabled')
+        $R2.ExitCode | Should -Be 0
+        $R2.Text | Should -Contain 'Every check passed.'
+    }
+
+    It 'fails with exit 1 naming read access when a subscription cannot be read (<Mode>)' -ForEach @(
+        @{ Mode = 'one subscription'; One = $true }
+        @{ Mode = 'whole tenant'; One = $false }
+    ) {
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $Arguments = if ($One) { @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly') } else { @('-PreflightOnly') }
+        $R = script:Invoke-Wrapper -Arguments $Arguments
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like ('    - Sub B ({0}) - *' -f $script:Subs['B'].Id) }).Count | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).'
+        @($R.Text | Where-Object { $_ -like '*Skipping them and continuing*' }) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+    }
+
+    It 'fails with exit 1 naming the sign-in when there is no usable sign-in for the tenant' {
+        script:Set-Scenario -Subs 'A' -SignedInTenant '99999999-9999-9999-9999-999999999999'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['A'].Id, '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: the sign-in. Nothing was collected or written to the inventory folder (exit 1).'
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
+    }
+
+    It 'fails with exit 1 when an Az module is missing, before it signs in, and creates no inventory folder' {
+        $Partial = Join-Path $script:CaseHome 'partial-modules'
+        Copy-Item -LiteralPath $script:Modules -Destination $Partial -Recurse -Force
+        Remove-Item -LiteralPath (Join-Path $Partial 'Az.Billing') -Recurse -Force
+        script:Set-Scenario -Subs 'A'
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly') -ModulePath $Partial
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like 'Required Az submodule(s) not found or too old (Az.Billing)*' }).Count | Should -Be 1
+        $R.Text | Should -Not -Contain 'Every check passed.'
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
     }
 }
