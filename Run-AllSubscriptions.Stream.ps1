@@ -57,9 +57,6 @@ param (
     [switch] $SkipConsumption,
     [switch] $IncludeNetworkResources,
     [switch] $UseMetricsBatch,
-    # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
-    # on the per-resource path this run (Microsoft.Insights not registered).
-    [string[]] $MetricsBatchPerCallSubscriptionIds = @(),
     [int]    $ConcurrencyLimit = 6,
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
@@ -70,7 +67,11 @@ param (
     [string] $RunId = '',
     # The parent run's record (start time, settings, cost window) as JSON:
     # written into this stream's state file with its lists (Write-StreamState).
-    [string] $RunRecordJson = ''
+    [string] $RunRecordJson = '',
+    # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
+    # on the per-resource path this run (Microsoft.Insights not registered).
+    # Last, so the position of every earlier parameter stays as it was.
+    [string[]] $MetricsBatchPerCallSubscriptionIds = @()
 )
 
 # ---------------------------------------------------------------------------
