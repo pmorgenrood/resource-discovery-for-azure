@@ -184,7 +184,8 @@ Export-ModuleMember -Function Get-AzMetric
                 }
                 $Out = @{ values = @($Values) }
             }
-            $Bytes = [System.Text.Encoding]::UTF8.GetBytes(($Out | ConvertTo-Json -Depth 12 -Compress))
+            $Text = if ($Control['BadJson'] -and $Status -eq 200) { '{"values":[ not json' } else { $Out | ConvertTo-Json -Depth 12 -Compress }
+            $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
             $Context.Response.StatusCode = $Status
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
             if ($Status -eq 429 -and $Control.ContainsKey('RetryAfterDateSeconds')) { $Context.Response.AddHeader('Retry-After', [DateTimeOffset]::UtcNow.AddSeconds([int]$Control['RetryAfterDateSeconds']).ToString('r')) }
@@ -758,6 +759,15 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-count' -Batch -Control @{ Status = 401; FailFirst = 1 }
 
         @($Run.DebugLines | Where-Object { $_ -match 'Metrics batch \(-UseMetricsBatch\): 1 getBatch request\(s\) \(2 attempt\(s\)\) for 1 resource\(s\)' }).Count | Should -Be 1
+    }
+
+    It 'asks Get-AzMetric for every resource of an answer that is not readable JSON' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2], $script:Mixed[3]) -RunName 'batch-bad-json' -Batch -Control @{ BadJson = $true }
+
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 2
+        $Run.Records.Count | Should -Be 8
+        @($Run.DebugLines | Where-Object { $_ -match 'could not be read' }).Count | Should -Be 1
     }
 
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {
