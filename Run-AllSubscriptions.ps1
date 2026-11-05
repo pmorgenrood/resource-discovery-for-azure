@@ -122,9 +122,12 @@ param (
     # 7 and the Az modules (with the same install offers), the Az.Accounts
     # version, that Az.Accounts loads, the sign-in, that the tenant lists the
     # subscriptions (with -SubscriptionID: that one, and that it is Enabled
-    # unless -IncludeDisabled), and that the signed-in identity can read them
-    # (with usage access unless -SkipConsumption). Exits 0 after 'Every check
-    # passed', or 1 naming the check that failed. It writes no report, zip,
+    # unless -IncludeDisabled), that no other run holds the tenant's run lock
+    # and that the run could start from its resume state, and that the
+    # signed-in identity can read them (with usage access unless
+    # -SkipConsumption). Exits 0 after 'Every check passed', or 1 naming the
+    # check that failed (a setup check, PowerShell 7 to the Az.Accounts load,
+    # stops with its own message, as in a run). It writes no report, zip,
     # transcript, resume state or run lock, and creates nothing in the
     # inventory folder. Last, so the positions of the parameters above stay.
     [switch]$PreflightOnly
@@ -229,6 +232,15 @@ if ($PSVersionTable.PSVersion.Major -lt 7)
             Write-Host "Close this window, open a new PowerShell 7 (pwsh) prompt, then re-run the same command." -ForegroundColor Yellow
             exit 1
         }
+    }
+
+    # Windows PowerShell drops an empty native argument, so an empty
+    # -SubscriptionID would reach PowerShell 7 with no value. Stop here with
+    # the message PowerShell 7 gives for it.
+    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
+    {
+        Write-Host "ERROR: -SubscriptionID '' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -ForegroundColor Red
+        exit 1
     }
 
     # Rebuild the original invocation as CLI tokens so `pwsh -File` binds them to
@@ -492,6 +504,19 @@ Remove-Variable -Name RdaTenantSubscriptionCache -Scope Global -ErrorAction Sile
 # file (the inventory folder, the transcript, the lock or a state file). The key
 # is the SHA-256 of the text, so one that comes out right for -TenantID as given
 # comes out right for the tenant id a domain name resolves to below.
+# Read by Exit-Wrapper at every exit, so they are set before the first one (the
+# checks below and -PreflightOnly exit before the transcript is started), and a
+# run under Set-StrictMode never reads one unset. Whether the wrapper transcript
+# was started (below).
+$WrapperTranscriptStarted = $false
+# The startup fold of per-stream state fills these (see there); until then they
+# are empty, so an exit before it has nothing to clean up.
+$FoldedStreamFiles = @()
+$FoldedRecordIds = @()
+# Set once the run id is known; from then on Exit-Wrapper names another run's
+# per-stream state files left on disk (Write-OtherRunStreamStateLine).
+$OtherRunLineReady = $false
+
 # -SubscriptionID must be a subscription id (a GUID). Checked here, before the
 # run creates or writes any file, so a mistyped id never starts a run. Given
 # but empty is a mistake too, never a run of the whole tenant.
@@ -547,6 +572,25 @@ if ($PreflightOnly)
         Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
         & $PreflightFailed 'the tenant'
     }
+    # What a run checks before it signs in, read only: another run's lock on
+    # this tenant in the inventory folder, and how the run would start from its
+    # resume state (Resolve-RunStart: switches that cannot go together, settings
+    # that differ from the unfinished run's). Nothing is created, moved or
+    # written; with no inventory folder there is no lock or state to read.
+    $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+    foreach ($PfLockPath in @((Get-RunLockLegacyPath -InventoryRoot $PfRoot -Tenant $TenantID), (Get-RunLockPath -InventoryRoot $PfRoot -Tenant $TenantID)))
+    {
+        if (-not (Test-Path -LiteralPath $PfLockPath -PathType Leaf)) { continue }
+        $PfLock = Read-RunLock -Path $PfLockPath
+        if (-not $PfLock.Exists) { continue }
+        Write-RunLockHeldMessage -Request ([pscustomobject]@{ Acquired = $false; Path = $PfLockPath; Held = $PfLock; Holder = (Get-RunLockHolder -Lock $PfLock); Problem = $null }) -Tenant $TenantID
+        & $PreflightFailed 'the run lock'
+    }
+    $PfStateKey = Get-ResumeStateScope -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
+    $PfStart = Resolve-RunStart -Info (Read-ResumeRunInfo -Path (Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey) -Tenant $PfStateKey) -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays
+    foreach ($Line in @($PfStart.Lines)) { Write-Host ($Line.Text -replace '^ERROR: This run stops here \(exit 1\), before it signs in, collects anything or writes the resume state: ', 'ERROR: A run would stop here (exit 1): ') -ForegroundColor $Line.Colour }
+    if ($PfStart.Mode -eq 'Stop') { & $PreflightFailed 'how the run would start' }
+    Write-Host '  Run lock and run start: ok.' -ForegroundColor Green
     try { Connect-RdaWrapperSession -TenantID $TenantID -DeviceLogin:$DeviceLogin }
     catch
     {
@@ -627,15 +671,6 @@ if (-not (Test-Path -Path $InventoryRoot -PathType Container))
 # console session, so the file is a complete record of one wrapper invocation.
 # Start-Transcript is idempotent in the sense that we Stop it on every exit
 # path via Exit-Wrapper.
-$WrapperTranscriptStarted = $false
-# Read by Exit-Wrapper at every early exit. The startup fold of per-stream state
-# fills them (see there); until then they are empty, so an exit before it has
-# nothing to clean up.
-$FoldedStreamFiles = @()
-$FoldedRecordIds = @()
-# Set once the run id is known; from then on Exit-Wrapper names another run's
-# per-stream state files left on disk (Write-OtherRunStreamStateLine).
-$OtherRunLineReady = $false
 $WrapperTranscriptFile = Join-Path $InventoryRoot ("RunAllSubscriptions_transcript_{0}.txt" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
 try
 {
@@ -799,6 +834,9 @@ if (-not $StoredRun.Exists -and -not $Fresh -and (Test-ResumableStreamStateFiles
 }
 $RunStart = Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings -MaxAgeDays $ResumeMaxAgeDays
 foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
+# The lines above speak of this run's own resume state: for a -SubscriptionID
+# run, that one subscription's, never the whole tenant's.
+if ($OneSubscription) { Write-Host ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor DarkGray }
 if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
 $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnly))
 # The cost window of this run: the one the unfinished run recorded when this
@@ -898,7 +936,16 @@ if ($OneSubscription)
 {
     $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @(@($SubWarnings) + @($SubErrors) | Where-Object { $_ } | ForEach-Object { [string]$_ })
     foreach ($Line in @($OnePick.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
-    if ($OnePick.Stop) { Exit-Wrapper -Code 1 }
+    if ($OnePick.Stop)
+    {
+        # An earlier run of this subscription may have left its own resume
+        # state; no run of the whole tenant reads or removes it.
+        if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)
+        {
+            Write-Host ("  This subscription's resume state file {0} is kept for the next run of this command. If the subscription is gone for good, remove it with: {1}" -f $ResumeStateFile, (Get-RemoveFileCommand -Path $ResumeStateFile)) -ForegroundColor Yellow
+        }
+        Exit-Wrapper -Code 1
+    }
     $AllSubscriptions = @($OnePick.Subscription)
 }
 if ($IncludeDisabled)

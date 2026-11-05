@@ -274,6 +274,11 @@ function Get-UsageAggregates
             ReadOnlyAfterIds = @()
             DeniedIds     = @($Denied | ForEach-Object { & $Id $_ })
             RoleUnknownIds = @()
+            FailReason    = $null
+            BlockStateWrite = $false
+            ConsumptionDenied = $false
+            LoseZipOnFold = $false
+            CutStreamFile = $null
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -282,11 +287,14 @@ function Get-UsageAggregates
     # is killed and its run lock removed, as a user would after a closed window.
     function script:Invoke-Wrapper
     {
-        param([string[]]$Arguments = @(), [int]$Streams = 1, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300, [string]$ModulePath)
+        param([string[]]$Arguments = @(), [int]$Streams = 1, [scriptblock]$EndWhen, [int]$TimeoutSeconds = 300, [string]$ModulePath, [switch]$StrictMode)
         $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper, '-TenantID', $script:Tenant)
         if ($Streams -gt 0) { $All += @('-ParallelStreams', [string]$Streams) }
         $All += @($Arguments)
-        $Label = (@($All | Select-Object -Skip 7) -join ' ')
+        $Label = ((@($All | Select-Object -Skip 7) + @(if ($StrictMode) { '(strict mode)' })) -join ' ')
+        # With -StrictMode the wrapper runs under Set-StrictMode -Version Latest,
+        # set by the shell that starts it (as in ResumeByDefault.Tests.ps1).
+        if ($StrictMode) { $All = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ("Set-StrictMode -Version Latest; & '{0}' {1}; exit `$LASTEXITCODE" -f $script:Wrapper, (@($All | Select-Object -Skip 5 | ForEach-Object { if ($_ -match '^-') { $_ } else { "'" + $_ + "'" } }) -join ' '))) }
         $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
         foreach ($Arg in @($All)) { $Info.ArgumentList.Add($Arg) }
         $Info.UseShellExecute = $false
@@ -385,10 +393,13 @@ function Get-UsageAggregates
     function script:Get-RootSnapshot
     {
         if (-not (Test-Path -LiteralPath $script:Root)) { return @('(no inventory folder)') }
-        @((Get-Item -LiteralPath $script:Root -Force) | ForEach-Object { 'root|{0}' -f $_.LastWriteTimeUtc.Ticks }) + @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Sort-Object FullName | ForEach-Object {
-            if ($_.PSIsContainer) { 'dir|{0}|{1}' -f $_.FullName, $_.LastWriteTimeUtc.Ticks }
-            else { 'file|{0}|{1}|{2}|{3}' -f $_.FullName, $_.Length, $_.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
-        })
+        $Lines = @('root|{0}' -f (Get-Item -LiteralPath $script:Root -Force).LastWriteTimeUtc.Ticks)
+        foreach ($Item in @(Get-ChildItem -LiteralPath $script:Root -Recurse -Force | Sort-Object FullName))
+        {
+            if ($Item.PSIsContainer) { $Lines += 'dir|{0}|{1}' -f $Item.FullName, $Item.LastWriteTimeUtc.Ticks }
+            else { $Lines += 'file|{0}|{1}|{2}|{3}' -f $Item.FullName, $Item.Length, $Item.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $Item.FullName -Algorithm SHA256).Hash }
+        }
+        return $Lines
     }
     function script:Get-FileHashOrNone { param([string]$Path) if (Test-Path -LiteralPath $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } else { 'none' } }
 }
@@ -495,13 +506,11 @@ Describe 'A run with -SubscriptionID' -Skip:$IsWindows {
         $Shape = script:Get-NewestBundleShape
 
         # The same run on a tenant that holds only B.
-        $Other = $script:CaseHome
         script:New-Case
         script:Set-Scenario -Subs 'B'
         $Plain = script:Invoke-Wrapper -Streams $Streams
         $Plain.ExitCode | Should -Be 0
         script:Get-NewestBundleShape | Should -Be $Shape
-        $null = $Other
     }
 
     It 'stops with exit 1 before creating any file for an id that is not a GUID (<Value>)' -ForEach @(@{ Value = 'not-a-guid' }, @{ Value = '' }) {
@@ -574,8 +583,6 @@ Describe 'The resume state of a -SubscriptionID run is its own' -Skip:$IsWindows
         $One.TenantID | Should -BeExactly ('{0}/subscriptions/{1}' -f $script:Tenant, $script:Subs['B'].Id)
         script:Read-StateAt $script:State | Should -BeNullOrEmpty -Because 'the one-subscription run writes only its own state'
         $OneHash = script:Get-FileHashOrNone (script:Get-OneState 'B')
-        # Its printed commands go on with the one-subscription run.
-        @($R1.Text | Where-Object { $_ -like '*./Run-AllSubscriptions.ps1 -TenantID*' }) | ForEach-Object { $_ | Should -BeLike ('*-SubscriptionID {0}*' -f $script:Subs['B'].Id) }
 
         script:Set-Scenario -Subs 'A', 'B', 'C'
         script:Clear-Calls
@@ -679,6 +686,10 @@ Describe 'The resume state of a -SubscriptionID run is its own' -Skip:$IsWindows
         }
         $CollectedAt | Should -Be @(1, 1, 1, 0) -Because 'three failed runs in a row reach the retry limit, and the fourth run does not collect B again'
         $Codes[3] | Should -Not -Be 0
+        # The fourth run prints the command that starts over: it carries -SubscriptionID.
+        $Commands = @($R.Text | Where-Object { $_ -like '*./Run-AllSubscriptions.ps1 -TenantID*' })
+        $Commands.Count | Should -BeGreaterThan 0
+        $Commands | ForEach-Object { $_ | Should -BeLike ('*./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID {1} -Fresh*' -f $script:Tenant, $script:Subs['B'].Id) }
         script:Read-StateAt $script:State | Should -BeNullOrEmpty
 
         script:Set-Scenario -Subs 'A', 'B'
@@ -793,4 +804,118 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly' -Skip:$IsWindows {
         $R.Text | Should -Not -Contain 'Every check passed.'
         Test-Path -LiteralPath $script:Root | Should -BeFalse
     }
+
+    It 'runs under Set-StrictMode -Version Latest with no strict-mode error: <Case>' -ForEach @(
+        @{ Case = 'a passing preflight'; Arguments = @('-SubscriptionID', 'B', '-PreflightOnly'); Code = 0; Line = 'Every check passed.' }
+        @{ Case = 'a passing preflight of the whole tenant'; Arguments = @('-PreflightOnly'); Code = 0; Line = 'Every check passed.' }
+        @{ Case = 'a failing preflight'; Arguments = @('-SubscriptionID', 'C', '-PreflightOnly'); Code = 1; Line = 'Preflight failed: the subscription. Nothing was collected or written to the inventory folder (exit 1).' }
+        @{ Case = 'an id that is not a GUID'; Arguments = @('-SubscriptionID', 'not-a-guid'); Code = 1; Line = $null }
+        @{ Case = 'an id the tenant does not list'; Arguments = @('-SubscriptionID', 'C'); Code = 1; Line = $null }
+    ) {
+        script:Set-Scenario -Subs 'A', 'B'
+        $Resolved = @($Arguments | ForEach-Object { if ($script:Subs.ContainsKey($_)) { $script:Subs[$_].Id } else { $_ } })
+        $R = script:Invoke-Wrapper -Arguments $Resolved -StrictMode
+        $R.ExitCode | Should -Be $Code
+        $R.Error | Should -BeNullOrEmpty -Because 'these paths print no strict-mode error'
+        if ($Line) { $R.Text | Should -Contain $Line }
+    }
+
+    It 'a one-subscription run under Set-StrictMode -Version Latest prints no strict-mode error outside the older-code list of ResumeByDefault.Tests.ps1, and collects only that subscription' {
+        # The strict-mode errors older code prints on a run (the role check, the
+        # consumption check, the end-of-run summary), as listed in
+        # ResumeByDefault.Tests.ps1: '<file>|<start of the source line>'.
+        $Known = @(
+            'Run-AllSubscriptions.ps1|if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($ConsumptionFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($MetricsFailures.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($CollectorFailuresList.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($ConsumptionAuthSkipped.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($MetricsAuthSkipped.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if ($FailedAttempts.Count -eq 0)'
+            'Run-AllSubscriptions.ps1|if ($ScopeForProbe.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|if (-not $SkipConsumption -and $ConsumptionCheckScope.Count -gt 0)'
+            'Run-AllSubscriptions.ps1|elseif (($FailedAttempts.Count - $RetryLimited.Count) -gt 0)'
+        )
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id) -StrictMode
+        $Found = [System.Collections.Generic.List[string]]::new()
+        $File = $null
+        foreach ($Line in @(([string]$R.Error) -split "`r?`n"))
+        {
+            $Plain = $Line -replace "`e\[[0-9;]*m", ''
+            if ($Plain -match '^\S+Exception: (.+):(\d+)\s*$' -or $Plain -match '^\S+: (/.+\.ps1):(\d+)\s*$') { $File = Split-Path -Path $Matches[1] -Leaf; continue }
+            if ($null -ne $File -and $Plain -match '^\s*\d+ \|\s(.*)$') { $Found.Add(('{0}|{1}' -f $File, $Matches[1].Trim().TrimEnd([char]0x2026).TrimEnd())); $File = $null }
+        }
+        foreach ($Line in @($R.Text | Where-Object { $_ -match '^ERROR processing subscription ' })) { if ($Line -notmatch "The variable '\`$LASTEXITCODE' cannot be retrieved because it has not been set\.$") { $Found.Add('stdout|' + $Line) } }
+        @($Found | Where-Object { $E = $_; @($Known | Where-Object { $E -eq $_ -or $E.StartsWith($_) -or $_.StartsWith($E) }).Count -eq 0 }) | Should -BeNullOrEmpty
+        script:Get-Collected $R | Should -Be (script:Get-Ids 'B')
+    }
+
+    It 'fails with exit 1 naming the run lock when another run of the tenant holds it, and leaves the lock as it is' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        # A lock as a run that is going holds it: its process is alive.
+        $Holder = Start-Process -FilePath $script:Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120') -PassThru
+        try
+        {
+            $LockPath = Join-Path $script:Root ('.run-lock-{0}.json' -f (script:Get-Key $script:Tenant))
+            $Record = [ordered]@{ InvocationId = [guid]::NewGuid().ToString(); MachineName = [Environment]::MachineName; ProcessId = $Holder.Id; ProcessStartTimeUtc = $Holder.StartTime.ToUniversalTime().ToString('o'); RunStartTimeUtc = [datetime]::UtcNow.ToString('o'); HeartbeatUtc = [datetime]::UtcNow.ToString('o') }
+            $Record | ConvertTo-Json | Set-Content -LiteralPath $LockPath -Encoding utf8
+            $Before = script:Get-FileHashOrNone $LockPath
+            script:Set-Scenario -Subs 'A', 'B'
+            $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly')
+            $R.ExitCode | Should -Be 1
+            $R.Text | Should -Contain 'Preflight failed: the run lock. Nothing was collected or written to the inventory folder (exit 1).'
+            script:Get-FileHashOrNone $LockPath | Should -Be $Before
+        }
+        finally { Stop-Process -Id $Holder.Id -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'fails with exit 1 when the run could not start: <Case>' -ForEach @(
+        @{ Case = '-Fresh with -Resume'; Extra = @('-Fresh', '-Resume'); Seed = $false }
+        @{ Case = 'settings that differ from the unfinished one-subscription run'; Extra = @('-Obfuscate'); Seed = $true }
+    ) {
+        if ($Seed)
+        {
+            script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+            $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+            (script:Read-StateAt (script:Get-OneState 'B')).Failed | Should -Be (script:Get-Ids 'B')
+        }
+        script:Set-Scenario -Subs 'A', 'B'
+        $Before = script:Get-RootSnapshot
+        $R = script:Invoke-Wrapper -Arguments (@('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly') + $Extra)
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: how the run would start. Nothing was collected or written to the inventory folder (exit 1).'
+        script:Get-RootSnapshot | Should -Be $Before
+        # The same command without -PreflightOnly stops the same way.
+        $Run = script:Invoke-Wrapper -Arguments (@('-SubscriptionID', $script:Subs['B'].Id) + $Extra)
+        $Run.ExitCode | Should -Be 1
+    }
 }
+
+Describe 'A -SubscriptionID run whose subscription is gone' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'names its kept resume state file and how to remove it, and leaves the file as it is' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+        $File = script:Get-OneState 'B'
+        $Hash = script:Get-FileHashOrNone $File
+        $Hash | Should -Not -Be 'none'
+        script:Set-Scenario -Subs 'A'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like ("  This subscription's resume state file {0} is kept for the next run of this command. If the subscription is gone for good, remove it with: *" -f $File) }).Count | Should -Be 1
+        script:Get-FileHashOrNone $File | Should -Be $Hash
+    }
+
+    It 'says its resume state is its own on every run' {
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Resume')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Path (script:Get-OneState 'B') -Leaf))
+        $W = script:Invoke-Wrapper
+        @($W.Text | Where-Object { $_ -like '-SubscriptionID: *' }) | Should -BeNullOrEmpty
+    }
+}
+
