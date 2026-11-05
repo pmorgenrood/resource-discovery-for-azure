@@ -102,6 +102,8 @@ function Invoke-AzRestMethod
 function Get-UsageAggregates
 {
     [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, [switch]$ShowDetails, $ContinuationToken)
+    $Scenario = Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json
+    if ($Scenario.PSObject.Properties['ConsumptionDenied'] -and $Scenario.ConsumptionDenied) { throw 'AuthorizationFailed: stand-in: the client does not have authorization to read usage' }
     [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null }
 }
 '@
@@ -157,12 +159,13 @@ exit 0
 
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Disabled = @(), [string[]]$Denied = @())
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Disabled = @(), [string[]]$Denied = @(), [switch]$ConsumptionDenied)
         [pscustomobject]@{
             Tenant        = $script:Tenant
             Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = $script:Subs[$_].Name; State = $(if ($Disabled -contains $_) { 'Disabled' } else { 'Enabled' }) } })
             FailIds       = @($Fail | ForEach-Object { $script:Subs[$_].Id })
             DeniedIds     = @($Denied | ForEach-Object { $script:Subs[$_].Id })
+            ConsumptionDenied = [bool]$ConsumptionDenied
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -600,5 +603,59 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         ([string]$Out.Result) | Should -BeLike ("*ERROR: -SubscriptionID '{0}' cannot be used*" -f $Value)
         Test-Path -LiteralPath $script:Root | Should -BeFalse
     }
+
+    It 'probes consumption access as the run does, also when -Resume leaves nothing to collect' {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id, $script:Subs['B'].Id); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B' -ConsumptionDenied
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume')
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like 'Preflight failed: consumption access.*' }).Count | Should -Be 1
+        $Skip = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-SkipConsumption')
+        $Skip.ExitCode | Should -Be 0
+    }
 }
 
+
+Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
+    BeforeAll {
+        # The statements of the Windows PowerShell 5.1 block that matter here,
+        # run as a script of their own under the wrapper's param block (this
+        # host has no Windows PowerShell): the empty -SubscriptionID stop and
+        # the loop that rebuilds the arguments for the PowerShell 7 run.
+        $Path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
+        $Body = @($Block.Clauses[0].Item2.Statements)
+        $EmptyStop = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match "ContainsKey\('SubscriptionID'\)" })
+        $Forward = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.ForEachStatementAst] -and $_.Extent.Text -match 'PSBoundParameters\.GetEnumerator' })
+        $script:Found = @($EmptyStop.Count, $Forward.Count)
+        $script:Probe = Join-Path ([System.IO.Path]::GetTempPath()) ('ps51-probe-' + [guid]::NewGuid().ToString('N') + '.ps1')
+        $Text = $Ast.ParamBlock.Extent.Text + "`n" + $EmptyStop[0].Extent.Text + "`n`$ForwardArgs = @()`n" + $Forward[0].Extent.Text + "`nWrite-Output ('ARGS ' + (`$ForwardArgs -join '|'))`n"
+        Set-Content -LiteralPath $script:Probe -Value $Text -Encoding utf8
+        $script:Pwsh = Join-Path $PSHOME 'pwsh'
+    }
+    AfterAll { Remove-Item -LiteralPath $script:Probe -Force -ErrorAction SilentlyContinue }
+
+    It 'finds the empty -SubscriptionID stop as the first statement, before any install offer, and the forwarding loop' {
+        $script:Found | Should -Be @(1, 1)
+        $Path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
+        @($Block.Clauses[0].Item2.Statements)[0].Extent.Text | Should -Match "ContainsKey\('SubscriptionID'\)"
+    }
+
+    It 'forwards -SubscriptionID with its value and -PreflightOnly as a bare switch' {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001' -PreflightOnly
+        $LASTEXITCODE | Should -Be 0
+        @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -Be @('ARGS -TenantID|t|-SubscriptionID|aaaaaaaa-0000-4000-8000-000000000001|-PreflightOnly')
+    }
+
+    It 'stops an empty or blank -SubscriptionID with exit 1 before re-launching, naming the value' -ForEach @(@{ Value = '' }, @{ Value = '  ' }) {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID $Value
+        $LASTEXITCODE | Should -Be 1
+        ($Out -join "`n") | Should -BeLike ("*ERROR: -SubscriptionID '{0}' cannot be used: it is empty.*" -f $Value)
+        @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -BeNullOrEmpty
+    }
+}

@@ -126,6 +126,16 @@ param (
 # ---------------------------------------------------------------------------
 if ($PSVersionTable.PSVersion.Major -lt 7)
 {
+    # Windows PowerShell drops an empty native argument, so an empty
+    # -SubscriptionID would reach PowerShell 7 with no value. Stop here, first,
+    # before any offer to install PowerShell 7, with the message PowerShell 7
+    # gives for it.
+    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
+    {
+        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID) -ForegroundColor Red
+        exit 1
+    }
+
     Write-Host ("Detected Windows PowerShell {0}. This tool requires PowerShell 7." -f $PSVersionTable.PSVersion) -ForegroundColor Yellow
 
     $PwshPath = $null
@@ -210,15 +220,6 @@ if ($PSVersionTable.PSVersion.Major -lt 7)
             Write-Host "Close this window, open a new PowerShell 7 (pwsh) prompt, then re-run the same command." -ForegroundColor Yellow
             exit 1
         }
-    }
-
-    # Windows PowerShell drops an empty native argument, so an empty
-    # -SubscriptionID would reach PowerShell 7 with no value. Stop here with
-    # the message PowerShell 7 gives for it.
-    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
-    {
-        Write-Host "ERROR: -SubscriptionID '' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -ForegroundColor Red
-        exit 1
     }
 
     # Rebuild the original invocation as CLI tokens so `pwsh -File` binds them to
@@ -824,6 +825,31 @@ if ($PreflightOnly)
     # -Resume leaves out those it completed, -ResumeFailedOnly takes only the
     # retry list. The same lists are read here, the per-stream state files of
     # an interrupted parallel run folded in, without changing them.
+    # The run's consumption gate probes the first subscription of the whole
+    # eligible list, even when -Resume leaves some out of the access check,
+    # so the preflight does the same, also when nothing is left to collect.
+    $PfEligible = @($Subscriptions)
+    $PfConsumptionCheck = {
+        if ($SkipConsumption) { return }
+        $script:PreflightCheck = 'consumption access'
+        Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $PfEligible[0].Name) -ForegroundColor Cyan
+        $PfConsumption = Test-ConsumptionAccess -SubscriptionId $PfEligible[0].Id
+        if ($PfConsumption.Outcome -eq 'Denied')
+        {
+            Write-Host ("ERROR: The signed-in identity is not authorized to read consumption/billing data. Reason: {0}" -f $PfConsumption.Detail) -ForegroundColor Red
+            Write-Host "Grant this identity 'Cost Management Reader' (or 'Billing Reader' on the billing scope), or add -SkipConsumption." -ForegroundColor Yellow
+            Exit-Wrapper -Code 1
+        }
+        elseif ($PfConsumption.Outcome -eq 'Unavailable')
+        {
+            # As in a run: a transient/token issue, not a denial, does not stop it.
+            Write-Host ("WARNING: Could not verify consumption access (a transient/token issue, not an authorization denial): {0}" -f $PfConsumption.Detail) -ForegroundColor Yellow
+        }
+        else
+        {
+            Write-Host "Consumption access confirmed." -ForegroundColor Green
+        }
+    }
     if ($Resume -or $ResumeFailedOnly)
     {
         $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
@@ -863,7 +889,8 @@ if ($PreflightOnly)
         if ($Subscriptions.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (an earlier run completed the others, or -ResumeFailedOnly leaves them out); only those are checked.' -f $Subscriptions.Count, $PfBefore) -ForegroundColor Cyan }
         if ($Subscriptions.Count -eq 0)
         {
-            Write-Host '  Nothing is left for the run to collect, so no access check is needed.' -ForegroundColor Green
+            Write-Host '  Nothing is left for the run to collect, so no read access check is needed.' -ForegroundColor Green
+            & $PfConsumptionCheck
             Write-Host 'Every check passed.' -ForegroundColor Green
             Exit-Wrapper -Code 0
         }
@@ -883,27 +910,7 @@ if ($PreflightOnly)
         Exit-Wrapper -Code 1
     }
     Write-Host ("  Access verified: all {0} in-scope subscription(s) are readable." -f $Subscriptions.Count) -ForegroundColor Green
-    if (-not $SkipConsumption)
-    {
-        $script:PreflightCheck = 'consumption access'
-        Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $Subscriptions[0].Name) -ForegroundColor Cyan
-        $PfConsumption = Test-ConsumptionAccess -SubscriptionId $Subscriptions[0].Id
-        if ($PfConsumption.Outcome -eq 'Denied')
-        {
-            Write-Host ("ERROR: The signed-in identity is not authorized to read consumption/billing data. Reason: {0}" -f $PfConsumption.Detail) -ForegroundColor Red
-            Write-Host "Grant this identity 'Cost Management Reader' (or 'Billing Reader' on the billing scope), or add -SkipConsumption." -ForegroundColor Yellow
-            Exit-Wrapper -Code 1
-        }
-        elseif ($PfConsumption.Outcome -eq 'Unavailable')
-        {
-            # As in a run: a transient/token issue, not a denial, does not stop it.
-            Write-Host ("WARNING: Could not verify consumption access (a transient/token issue, not an authorization denial): {0}" -f $PfConsumption.Detail) -ForegroundColor Yellow
-        }
-        else
-        {
-            Write-Host "Consumption access confirmed." -ForegroundColor Green
-        }
-    }
+    & $PfConsumptionCheck
     Write-Host 'Every check passed.' -ForegroundColor Green
     Exit-Wrapper -Code 0
 }
