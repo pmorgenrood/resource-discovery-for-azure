@@ -257,7 +257,10 @@ Describe 'The sign-in and output switches a printed command carries' {
     It 'the wrapper prints its commands with the run settings and -DeviceLogin, and checks a continuing run against the run settings only' {
         $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $Wrapper | Should -Match ([regex]::Escape('$RetryCommandSettings = Get-RetryCommandSettings -Settings $RunDataSettings -DeviceLogin ([bool]$DeviceLogin)'))
-        $Wrapper | Should -Match ([regex]::Escape('Resolve-RunStart -Info $StoredRun -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings'))
+        # How the run starts is read by Get-RunStartView, given the run settings.
+        $Wrapper | Should -Match ([regex]::Escape('Get-RunStartView -InventoryRoot $InventoryRoot -ResumeStateFile $ResumeStateFile -Key $ResumeScope -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings $RunDataSettings'))
+        $Functions = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1') -Raw
+        $Functions | Should -Match ([regex]::Escape('$RunStart = Resolve-RunStart -Info $StoredRun -Resume $Resume -ResumeFailedOnly $ResumeFailedOnly -Fresh $Fresh -Settings $Settings'))
         @([regex]::Matches($Wrapper, '(Get-WrapperRunCommand|Get-DirectRunRetryCommand|Get-ConsumptionFailedAdvice|Write-RetryLimitSummary|Write-MissingReportBanner) [^\r\n]*-Settings \$RunDataSettings')) | Should -BeNullOrEmpty
     }
 }
