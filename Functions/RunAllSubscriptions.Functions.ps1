@@ -466,6 +466,84 @@ function Resolve-TenantId
     return $Resolved
 }
 
+# Why -SubscriptionID cannot be used ($Value), or $null when it can: it must be
+# a subscription id, which Azure writes as a GUID (8-4-4-4-12 hex digits,
+# spaces around it allowed). Empty is a reason too, so a -SubscriptionID that
+# was given never turns into a run of the whole tenant.
+function Get-SubscriptionIdProblem
+{
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return 'it is empty' }
+    if ($Value.Trim() -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+    {
+        return 'it is not a subscription id, which is a GUID such as 00000000-0000-0000-0000-000000000000'
+    }
+    return $null
+}
+
+# The key that names a run's resume state files and is recorded in them as
+# TenantID (the -Tenant value of every resume state helper): the tenant, as
+# before, for a run of the whole tenant, and '<tenant>-subscription-<id>' in
+# small letters for a run with -SubscriptionID. So a one-subscription run has
+# its own .resume-state-<tenant>-subscription-<id>.json, which the whole
+# tenant's names (.resume-state-<tenant>.json and its per-stream files
+# .resume-state-<tenant>-stream-<N>.json) never match, and the other way round.
+function Get-ResumeStateKey
+{
+    param([Parameter(Mandatory = $true)][string]$Tenant, [string]$SubscriptionID)
+    if ([string]::IsNullOrWhiteSpace($SubscriptionID)) { return $Tenant }
+    return ('{0}-subscription-{1}' -f $Tenant.Trim(), $SubscriptionID.Trim()).ToLowerInvariant()
+}
+
+# The subscription a -SubscriptionID run collects, from the list
+# Get-AzSubscription gave for the tenant ($Subscriptions), the id compared
+# without regard to case. Returns { Subscription; Stop; Lines }; Lines are
+# { Text; Colour } to print. Stop is true, with the reason and the way on in
+# Lines, when the list does not hold the id ($ListingProblems: the warnings the
+# listing gave, named so a list cut short by them is told apart from a wrong
+# id), or when the subscription is not Enabled and -IncludeDisabled was not
+# passed. The run then ends with exit 1 before it collects anything: never a
+# run of no subscription, and never a run of another one.
+function Select-OneSubscription
+{
+    param(
+        [object[]]$Subscriptions = @(),
+        [Parameter(Mandatory = $true)][string]$SubscriptionID,
+        [bool]$IncludeDisabled,
+        [string]$Tenant,
+        [string[]]$ListingProblems = @()
+    )
+    $Lines = [System.Collections.Generic.List[object]]::new()
+    $Say = { param([string]$Text, [string]$Colour) $Lines.Add([pscustomobject]@{ Text = $Text; Colour = $Colour }) }
+    $All = @($Subscriptions | Where-Object { $null -ne $_ })
+    $Match = @($All | Where-Object { [string]::Equals(([string]$_.Id).Trim(), $SubscriptionID.Trim(), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+    $Problems = @($ListingProblems | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($Match.Count -eq 0)
+    {
+        & $Say ("ERROR: -SubscriptionID {0} is not among the {1} subscription(s) Get-AzSubscription lists for tenant {2}, so this run stopped before collecting anything (exit 1)." -f $SubscriptionID, $All.Count, $Tenant) 'Red'
+        if ($Problems.Count -gt 0)
+        {
+            & $Say '  The list came back with warnings, so it may be incomplete:' 'Red'
+            foreach ($Problem in $Problems) { & $Say ('    - {0}' -f $Problem) 'Red' }
+            & $Say ("  Next: fix those until 'Get-AzSubscription -TenantId {0}' lists the subscription, then run the same command again." -f $Tenant) 'Yellow'
+        }
+        else
+        {
+            & $Say ("  Next: check the id, and that the signed-in identity can see the subscription in this tenant: 'Get-AzSubscription -TenantId {0}' lists the ones it can." -f $Tenant) 'Yellow'
+        }
+        return [pscustomobject]@{ Subscription = $null; Stop = $true; Lines = $Lines.ToArray() }
+    }
+    $Sub = $Match[0]
+    if (-not $IncludeDisabled -and [string]$Sub.State -ne 'Enabled')
+    {
+        & $Say ("ERROR: Subscription {0} ({1}) is {2}, not Enabled, so this run stopped before collecting anything (exit 1). A subscription that is not Enabled returns little or no data." -f $Sub.Name, $Sub.Id, $(if ([string]::IsNullOrWhiteSpace([string]$Sub.State)) { 'in no state' } else { [string]$Sub.State })) 'Red'
+        & $Say '  Next: to collect it anyway, run the same command with -IncludeDisabled.' 'Yellow'
+        return [pscustomobject]@{ Subscription = $null; Stop = $true; Lines = $Lines.ToArray() }
+    }
+    & $Say ("Only subscription {0} ({1}) is collected (-SubscriptionID); the tenant lists {2}." -f $Sub.Name, $Sub.Id, $All.Count) 'Cyan'
+    return [pscustomobject]@{ Subscription = $Sub; Stop = $false; Lines = $Lines.ToArray() }
+}
+
 function Get-CompletedSubscriptionIds
 {
     param([string]$Path, [string]$Tenant)

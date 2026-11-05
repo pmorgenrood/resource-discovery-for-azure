@@ -84,7 +84,18 @@ param (
     # Tenant-scoped Azure Resource Graph rate limits (~15 req/sec/tenant) are
     # the hard ceiling - more than ~6 parallel streams in one tenant will
     # start to throttle and provide no further wall-time benefit.
-    [int]$ParallelStreams = 1
+    [int]$ParallelStreams = 1,
+
+    # Collect only this subscription (its id, a GUID), with the same checks,
+    # report, zip and summary as a run on a tenant that holds only it. The run
+    # stops with exit 1, before it collects anything, when the id is not a GUID
+    # (before any file is written), when Get-AzSubscription does not list it for
+    # -TenantID, or when it is not Enabled (unless -IncludeDisabled). Its resume
+    # state is its own file (.resume-state-<tenant>-subscription-<id>.json), so
+    # it never changes what a run of the whole tenant has completed or has left
+    # to retry, and a run of the whole tenant never changes it.
+    # Last in this block, so the positions of the parameters above stay as they were.
+    [string]$SubscriptionID
 )
 
 # ---------------------------------------------------------------------------
@@ -455,6 +466,23 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
 # sessions and never throws. See Disable-ConsoleQuickEdit for details.
 Disable-ConsoleQuickEdit
 
+# -SubscriptionID must be a subscription id (a GUID). Checked here, before the
+# run creates or writes any file (the inventory folder, the transcript), so a
+# mistyped id never starts a run. Given but empty is a mistake too, never a run
+# of the whole tenant.
+$OneSubscription = $PSBoundParameters.ContainsKey('SubscriptionID')
+if ($OneSubscription)
+{
+    $SubscriptionIdProblem = Get-SubscriptionIdProblem -Value $SubscriptionID
+    if ($null -ne $SubscriptionIdProblem)
+    {
+        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: {1}. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID, $SubscriptionIdProblem) -ForegroundColor Red
+        Write-Host "  Next: pass the subscription's id, as 'Get-AzSubscription -TenantId <tenant>' lists it, or leave -SubscriptionID out to collect every subscription." -ForegroundColor Yellow
+        Exit-Wrapper -Code 1
+    }
+    $SubscriptionID = $SubscriptionID.Trim().ToLowerInvariant()
+}
+
 $RunStartTime = Get-Date
 $FailedSubscriptions = @()
 
@@ -545,7 +573,15 @@ catch
 }
 
 # Resume state helpers
-$ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $TenantID)
+#
+# $ResumeKey names this run's resume state files and is the -Tenant of every
+# resume state helper call below (Get-ResumeStateKey): the tenant, as before,
+# or '<tenant>-subscription-<id>' for a run with -SubscriptionID. So a
+# one-subscription run reads and writes only its own
+# .resume-state-<tenant>-subscription-<id>.json, never the whole tenant's
+# .resume-state-<tenant>.json or its per-stream files, nor they its own.
+$ResumeKey = Get-ResumeStateKey -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
+$ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $ResumeKey)
 
 
 
@@ -693,6 +729,20 @@ if ($AllSubscriptions.Count -eq 0)
 # reports while still costing wall-clock time (which matters for environments
 # like Azure Cloud Shell where the session has a hard maximum lifetime).
 # Pass -IncludeDisabled to inventory every subscription regardless of state.
+#
+# With -SubscriptionID the list is cut to that one subscription first
+# (Select-OneSubscription), so from here on the run is the run of a tenant that
+# holds only it: the access checks, the collection, the consolidated zip and
+# the summary all see that one. A subscription the list does not hold, or one
+# that is not Enabled without -IncludeDisabled, stops the run here with exit 1,
+# before it reads or writes the resume state or collects anything.
+if ($OneSubscription)
+{
+    $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @($SubWarnings | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    foreach ($Line in @($OnePick.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
+    if ($OnePick.Stop) { Exit-Wrapper -Code 1 }
+    $AllSubscriptions = @($OnePick.Subscription)
+}
 if ($IncludeDisabled)
 {
     $Subscriptions = $AllSubscriptions
@@ -716,11 +766,11 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
-$FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
+$FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -736,7 +786,7 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # Runs at startup before any stream is launched, so it cannot race live streams.
 if ($Resume -or $ResumeFailedOnly)
 {
-    $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
+    $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeKey)
     if ($StrandedStreamFiles.Count -gt 0)
     {
         $StrandedCompleted = @()
@@ -767,7 +817,7 @@ if ($Resume -or $ResumeFailedOnly)
             # Heal the unified file immediately so even a re-interrupted run keeps
             # the recovered picture. Per-stream files are intentionally left for
             # the end-of-run merge to reconcile and clean up.
-            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
         }
     }
 }
@@ -1039,7 +1089,7 @@ if ($ParallelStreams -le 1)
             if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
             if ($StateChanged)
             {
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
         }
         catch
@@ -1128,7 +1178,7 @@ if ($ParallelStreams -le 1)
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                 -Id $Sub.Id -Name $Sub.Name `
                 -Reason $ErrRecord.Exception.Message
-            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
         }
 
         Write-Host "-----------------------------------" -ForegroundColor Gray
@@ -1207,7 +1257,7 @@ else
                 {
                     $CompletedIds += $Sub.Id
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
-                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
                 }
             }
             catch
@@ -1238,7 +1288,7 @@ else
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                     -Id $Sub.Id -Name $Sub.Name `
                     -Reason $ErrRecord.Exception.Message
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
         }
         # Skip the parallel orchestration entirely; fall through to the
@@ -1515,7 +1565,9 @@ else
             # Discover every per-stream resume file on disk for this tenant. See
             # Get-StreamResumeStateFiles for why this is a full-disk scan rather
             # than an iteration over 0..($StreamCount-1).
-            $AllStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
+            # $ResumeKey is the tenant here: the streams run only with two or
+            # more subscriptions, so never with -SubscriptionID.
+            $AllStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeKey)
             $AllCompletedFromStreams = @()
             $AllFailedFromStreams = @()
             foreach ($StreamFile in $AllStreamFiles)
@@ -1553,7 +1605,7 @@ else
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
             if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0)
             {
-                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
             # Also delete per-stream resume files now that the unified file holds
             # the truth - this prevents drift if a future run uses a different

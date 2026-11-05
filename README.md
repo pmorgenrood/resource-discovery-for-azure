@@ -205,9 +205,17 @@ To mask identifying details before sharing externally, add `-Obfuscate` — see 
 
 #### Targeting a single subscription or resource group
 
-The wrapper always covers the whole tenant. To scope a run to **one** subscription or a **single** resource group (producing one consolidated report), call `ResourceInventory.ps1` directly — the wrapper does not expose `-SubscriptionID` or `-ResourceGroup`. It accepts the same `-SkipConsumption`, `-SkipMetrics`, and `-Obfuscate` switches.
+To collect **one** subscription with the wrapper (its setup checks, sign-in, access checks, zip and summary, the same as a run on a tenant that holds only that subscription), pass `-SubscriptionID` with the subscription's id:
 
-**Scan a specific subscription:**
+```powershell
+./Run-AllSubscriptions.ps1 -TenantID "contoso.onmicrosoft.com" -SubscriptionID "12345678-1234-1234-1234-123456789012"
+```
+
+The run stops with exit code `1`, before it collects anything, when the id is not a GUID (before any file is written), when `Get-AzSubscription -TenantId <tenant>` does not list it, or when it is not `Enabled` (add `-IncludeDisabled` to collect it anyway). Its resume state is its own file, `InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`, so it never changes what a run of the whole tenant has completed or has left to retry, and a run of the whole tenant never changes it; to continue it, run the same command again with `-Resume`.
+
+To scope a run to a **single** resource group, call `ResourceInventory.ps1` directly — the wrapper does not expose `-ResourceGroup`. A direct run can also take one subscription. It accepts the same `-SkipConsumption`, `-SkipMetrics`, and `-Obfuscate` switches.
+
+**Scan a specific subscription directly:**
 ```powershell
 ./ResourceInventory.ps1 -ReportName "CompanyName" -SubscriptionID "12345678-1234-1234-1234-123456789012"
 ```
@@ -273,7 +281,7 @@ For tenants with many subscriptions, the run can be cut short by environment-lev
 ./Run-AllSubscriptions.ps1 -TenantID "12345678-1234-1234-1234-123456789012" -Resume
 ```
 
-After each subscription is fully processed (its per-subscription ZIP has been written), the wrapper records the subscription ID in a state file at `InventoryReports/.resume-state-<TenantID>.json`. Re-running with `-Resume` reads that file and skips subscriptions that are already complete; the partially processed subscription (the one that was running when the session ended) is re-run from the start. The state file is cleared automatically after a clean run with no failures.
+After each subscription is fully processed (its per-subscription ZIP has been written), the wrapper records the subscription ID in a state file at `InventoryReports/.resume-state-<TenantID>.json` (a run with `-SubscriptionID` uses its own file, `InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`, in small letters). Re-running with `-Resume` reads that file and skips subscriptions that are already complete; the partially processed subscription (the one that was running when the session ended) is re-run from the start. The state file is cleared automatically after a clean run with no failures.
 
 `-Resume` is opt-in. Without it, the wrapper processes every subscription returned by `Get-AzSubscription`, and existing state is left untouched.
 
@@ -511,6 +519,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
 | `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection. | False | `-SkipConsumption` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
+| `SubscriptionID` | String | Collect only this subscription (its id, a GUID). Stops with exit code `1`, before collecting anything, when the id is not a GUID, the tenant does not list it, or it is not `Enabled` (without `-IncludeDisabled`). Uses its own resume state file (`InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`), so it never changes a run of the whole tenant's state. See [Targeting a single subscription or resource group](#targeting-a-single-subscription-or-resource-group). | — | `-SubscriptionID "12345678-1234-1234-1234-123456789012"` |
 
 ## Troubleshooting
 
@@ -578,7 +587,7 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 | Code | Meaning |
 |---|---|
 | `0` | Clean run — no failures of any kind. |
-| `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). |
+| `1` | Hard failure during pre-flight, authentication, or setup (the run did not meaningfully start). With `-SubscriptionID`: the id is not a GUID (before any file is written), `Get-AzSubscription` does not list it for the tenant, or it is not `Enabled` without `-IncludeDisabled` (before anything is collected). |
 | `2` | Per-subscription output verification gap (a subscription reported success but its output zip is missing). |
 | `3` | Completed, but a requested data phase (Metrics and/or Consumption) was skipped for one or more subscriptions due to an authentication problem — see the "FAILED (auth)" banner. |
 | `4` | Completed, but one or more `Services/*/*.ps1` collectors failed for one or more subscriptions — see the "FAILED (collectors)" banner and "Collector Failures" summary. Affected resource types are missing (not empty) from those subscriptions' reports. |
