@@ -1021,5 +1021,42 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         @($R.Text | Where-Object { $_ -like 'Starting a new run (-Fresh). The unfinished run * is not continued: this run collects the subscription again.' }).Count | Should -Be 1
         @($R.Text | Where-Object { $_ -like '*every subscription*' }) | Should -BeNullOrEmpty
     }
+
+    It 'fails -ResumeFailedOnly where the run stops: a per-stream state file that is not the right shape, and leaves it in place' {
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        $Stream = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f (script:Get-Key $script:Tenant)) | Sort-Object Name)[0]
+        $Obj = Get-Content -LiteralPath $Stream.FullName -Raw | ConvertFrom-Json
+        $Obj | Add-Member -NotePropertyName 'FailedAttempts' -NotePropertyValue 'not a list' -Force
+        $Obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Stream.FullName -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly') -Streams 2
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain ('  A run would move the resume state file {0} aside (it is not the right shape) and leave out what it lists.' -f $Stream.Name)
+        $R.Text | Should -Contain 'Preflight failed: how the run would start. Nothing was collected or written to the inventory folder (exit 1).'
+        script:Get-RootSnapshot | Should -Be $Before
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly') -Streams 2
+        $Run.ExitCode | Should -Be 1 -Because 'the run stops there too'
+    }
+
+    It 'reads a resume state file that an earlier version named with the tenant id, as a run would after renaming it, and leaves it in place' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Legacy = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        [pscustomobject]@{
+            TenantID                 = $script:Tenant
+            CompletedSubscriptionIds = @($script:Subs['A'].Id)
+            FailedAttempts           = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = 'Sub B'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'earlier failure'; Attempts = 1 })
+            LastUpdated              = '2026-11-01T00:00:00.0000000Z'
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Legacy -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly')
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like ('  A run would first rename .resume-state-{0}.json, written by an earlier version, to *; this check reads it under its old name.' -f $script:Tenant) }).Count | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' -Because 'it checks B, on the earlier run''s retry list'
+        script:Get-RootSnapshot | Should -Be $Before
+        Test-Path -LiteralPath $Legacy | Should -BeTrue
+    }
 }
 

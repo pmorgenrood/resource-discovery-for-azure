@@ -1583,10 +1583,14 @@ function Add-ResumeRunRecordKeys
 # answer. A new run starts with nothing completed and keeps the retry list.
 # Per-stream files are folded only for a run that continues (-Resume, or the
 # default continue) or -ResumeFailedOnly, and only those of the same run id;
-# one that cannot be read or is not the right shape is left out, as the run
-# moves it aside and leaves it out (named in Skipped). A main file that is not
-# the right shape gives empty lists, as the run moves it aside.
-# Returns { Completed (ids); Failed (retry-list entries); Skipped (file names) }.
+# one that cannot be read is left out, as the run moves it aside and leaves
+# it out (named in Skipped); one that is not the right shape too (named in
+# WrongShape, which a -ResumeFailedOnly run stops on). A main file that is not
+# the right shape gives empty main lists, as the run moves it aside (named in
+# WrongShape). $ExtraStreamFiles are per-stream files an earlier version named
+# with the tenant id, which a run renames to their current name first.
+# Returns { Completed (ids); Failed (retry-list entries); Skipped and
+# WrongShape (file names) }.
 function Get-PreflightRunLists
 {
     param(
@@ -1595,15 +1599,18 @@ function Get-PreflightRunLists
         [Parameter(Mandatory = $true)][string]$Key,
         [Parameter(Mandatory = $true)]$View,
         [bool]$Resume,
-        [bool]$ResumeFailedOnly
+        [bool]$ResumeFailedOnly,
+        [object[]]$ExtraStreamFiles = @()
     )
     $Stored = $View.StoredRun
     $Mode = [string]$View.RunStart.Mode
     $Completed = @()
     $Failed = @()
     $Skipped = @()
+    $WrongShape = @()
     $MainUsable = $null -eq $Stored.PSObject.Properties['ShapeProblem'] -or $null -eq $Stored.ShapeProblem
     if ($Stored.PSObject.Properties['MainShapeProblem'] -and $Stored.MainShapeProblem) { $MainUsable = $false }
+    if (-not $MainUsable -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) { $WrongShape += (Split-Path -Path $ResumeStateFile -Leaf) }
     if ($MainUsable)
     {
         $Completed = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $Key | Where-Object { $_ } | ForEach-Object { [string]$_ })
@@ -1613,15 +1620,17 @@ function Get-PreflightRunLists
     if (-not $Continues) { $Completed = @() }
     $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Key)
     if ($Stored.PSObject.Properties['RecordSource'] -and $Stored.RecordSource -eq 'stream' -and $Continues) { $RunId = [string]$Stored.RunId }
-    $Folds = ($Continues -and ($Resume -or -not $ResumeFailedOnly)) -or ($ResumeFailedOnly -and $Continues)
-    if ($Folds)
+    # The run folds them whenever it continues (-Resume, the default continue,
+    # or -ResumeFailedOnly, which always continues).
+    if ($Continues)
     {
         $StreamCompleted = @()
         $StreamFailed = @()
-        foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Key))
+        foreach ($File in @(@(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Key) + @($ExtraStreamFiles) | Where-Object { $null -ne $_ }))
         {
             $Obj = Read-StreamResumeStateFile -Path $File.FullName
-            if ($null -eq $Obj -or $null -ne (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)) { $Skipped += $File.Name; continue }
+            if ($null -eq $Obj) { $Skipped += $File.Name; continue }
+            if ($null -ne (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)) { $WrongShape += $File.Name; continue }
             if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
             if ($null -ne $Obj.PSObject.Properties['Completed']) { $StreamCompleted += @($Obj.Completed | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
             if ($null -ne $Obj.PSObject.Properties['FailedAttempts']) { $StreamFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
@@ -1629,7 +1638,7 @@ function Get-PreflightRunLists
         if ($StreamCompleted.Count -gt 0) { $Completed = @($Completed + $StreamCompleted | Sort-Object -Unique) }
         $Failed = @(Merge-FailedAttempts -ExistingFailedAttempts $Failed -StreamFailedAttempts $StreamFailed -CompletedIds $Completed | Where-Object { $null -ne $_ })
     }
-    return [pscustomobject]@{ Completed = @($Completed); Failed = @($Failed); Skipped = @($Skipped) }
+    return [pscustomobject]@{ Completed = @($Completed); Failed = @($Failed); Skipped = @($Skipped); WrongShape = @($WrongShape) }
 }
 
 # How a run starts from the unfinished run (read only): the resume state file
