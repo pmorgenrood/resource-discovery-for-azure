@@ -135,6 +135,14 @@ function Get-AzSubscription
 {
     [CmdletBinding()] param($TenantId, $SubscriptionId)
     $Scenario = Get-RdaStandInScenario
+    # For the preflight copy test: the mode of each private copy that exists now,
+    # then a terminating error that ends the script.
+    if ($Scenario.PSObject.Properties['ProbeCopy'] -and $Scenario.ProbeCopy)
+    {
+        $Modes = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Filter 'rda-preflight-*' -Directory -Force | ForEach-Object { [string]$_.UnixFileMode })
+        Set-Content -LiteralPath (Join-Path $HOME 'copy-mode.txt') -Value ($Modes -join ';')
+        throw [System.InvalidOperationException]::new('stand-in: the subscription list failed')
+    }
     @($Scenario.Subscriptions | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = $_.State; TenantId = $Scenario.Tenant } })
 }
 function Invoke-AzRestMethod
@@ -263,7 +271,7 @@ function Get-UsageAggregates
 
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$Denied = @(), [string]$SignedInTenant)
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$Denied = @(), [string]$SignedInTenant, [switch]$ProbeCopy)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $(if ($SignedInTenant) { $SignedInTenant } else { $script:Tenant })
@@ -279,6 +287,7 @@ function Get-UsageAggregates
             ConsumptionDenied = $false
             LoseZipOnFold = $false
             CutStreamFile = $null
+            ProbeCopy     = [bool]$ProbeCopy
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -1063,6 +1072,21 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $R.Text | Should -Contain 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' -Because 'it checks B, on the earlier run''s retry list'
         script:Get-RootSnapshot | Should -Be $Before
         Test-Path -LiteralPath $Legacy | Should -BeTrue
+    }
+
+    It 'keeps its private copy of the state readable by the user only, and removes it when an error ends the script' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)) -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B' -ProbeCopy
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly')
+        $R.ExitCode | Should -Not -Be 0
+        $Mode = (Get-Content -LiteralPath (Join-Path $script:CaseHome 'copy-mode.txt') -Raw).Trim()
+        $Mode | Should -Not -BeNullOrEmpty -Because 'the copy existed when the error came'
+        $Mode | Should -Match 'UserRead'
+        $Mode | Should -Not -Match 'Group|Other' -Because 'the copy is readable by the user only'
+        @(Get-ChildItem -LiteralPath (Join-Path $script:CaseHome 'tmp') -Filter 'rda-preflight-*' -Force -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty -Because 'the finally removes it'
+        script:Get-RootSnapshot | Should -Be $Before
     }
 
     It 'reads only per-stream state files an earlier version named with the tenant id, as a run would after renaming them' {
