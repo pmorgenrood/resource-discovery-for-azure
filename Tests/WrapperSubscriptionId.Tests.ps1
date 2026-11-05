@@ -615,6 +615,31 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Skip = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-SkipConsumption')
         $Skip.ExitCode | Should -Be 0
     }
+
+    It 'does not probe consumption for -ResumeFailedOnly with nothing to retry, as the run stops before it' {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @([pscustomobject]@{ Id = 'cccccccc-0000-4000-8000-00000000000c'; Name = 'Gone'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 }); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B' -ConsumptionDenied
+        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly')
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly')
+        $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight ends as the run does'
+        $Pf.ExitCode | Should -Be 0
+    }
+}
+
+Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {
+    It 'takes the subscription off the retry list when it was also listed as completed, and clears the state' {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $One = script:Get-OneState 'B'
+        [pscustomobject]@{ TenantID = ('{0}-subscription-{1}' -f $script:Tenant, $script:Subs['B'].Id); CompletedSubscriptionIds = @($script:Subs['B'].Id); FailedAttempts = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = 'Sub B'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'earlier failure'; Attempts = 1 }); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $One -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-ResumeFailedOnly') -Streams 4
+        $R.ExitCode | Should -Be 0
+        script:Get-Calls | Should -Be (script:Get-Ids 'B')
+        Test-Path -LiteralPath $One | Should -BeFalse -Because 'a clean retry clears the state, so the next run does not retry it again'
+    }
 }
 
 

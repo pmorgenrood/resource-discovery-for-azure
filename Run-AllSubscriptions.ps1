@@ -890,7 +890,9 @@ if ($PreflightOnly)
         if ($Subscriptions.Count -eq 0)
         {
             Write-Host '  Nothing is left for the run to collect, so no read access check is needed.' -ForegroundColor Green
-            & $PfConsumptionCheck
+            # A -ResumeFailedOnly run with nothing to retry stops before its
+            # consumption gate; a -Resume run still reaches it.
+            if (-not $ResumeFailedOnly) { & $PfConsumptionCheck }
             Write-Host 'Every check passed.' -ForegroundColor Green
             Exit-Wrapper -Code 0
         }
@@ -1406,10 +1408,21 @@ else
                 {
                     Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
                 }
+                # As the sequential branch: a retry that succeeded leaves the
+                # retry list also when its id was already listed as completed
+                # (a run that completed it and a later run that failed it), and
+                # the state is saved when either list changed.
+                $StateChanged = $false
                 if (-not ($CompletedIds -contains $Sub.Id))
                 {
                     $CompletedIds += $Sub.Id
-                    $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                    $StateChanged = $true
+                }
+                $BeforeFailedCount = @($FailedAttempts).Count
+                $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
+                if ($StateChanged)
+                {
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
                 }
             }
