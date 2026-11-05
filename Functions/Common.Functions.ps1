@@ -2462,6 +2462,9 @@ function Invoke-RdaInsightsProviderPreflight
 
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
     $Missing = [System.Collections.Generic.List[object]]::new()
+    # Already being registered (by someone else, or an earlier run): nothing to
+    # ask; it joins the shared wait below.
+    $AlreadyRegistering = [System.Collections.Generic.List[string]]::new()
     foreach ($Id in $Ids)
     {
         $Read = Get-RdaInsightsProviderState -SubscriptionId $Id
@@ -2475,43 +2478,76 @@ function Invoke-RdaInsightsProviderPreflight
             Write-Host ('  Could not read the Microsoft.Insights state of subscription {0} ({1}); its metrics batch is tried and falls back to one call per resource if Azure refuses it.' -f $Id, $Read.Error) -ForegroundColor Yellow
             $Result.Registered.Add($Id)
         }
+        elseif ($Read.State -eq 'Registering')
+        {
+            $AlreadyRegistering.Add($Id)
+        }
         else
         {
             $Missing.Add($Read)
         }
     }
-    if ($Missing.Count -eq 0)
+    if ($Missing.Count -eq 0 -and $AlreadyRegistering.Count -eq 0)
     {
         Write-Host '  Microsoft.Insights is registered on every subscription in scope.' -ForegroundColor DarkGray
         return $Result
     }
-
-    Write-Host ('  Microsoft.Insights is not registered on {0} subscription(s); the metrics batch API needs it:' -f $Missing.Count) -ForegroundColor Yellow
-    foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
-
-    $Answer = $null
-    if ($Interactive)
+    $Waiting = [System.Collections.Generic.List[string]]::new()
+    foreach ($Id in $AlreadyRegistering)
     {
-        $Result.Asked = $true
-        $Answer = [string](& $ReadAnswer ('Register Microsoft.Insights on these {0} subscription(s) now? [Y/N]' -f $Missing.Count))
-        $Result.Answer = $Answer
+        Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
+        $Waiting.Add($Id)
     }
 
-    if ($Answer -notmatch '^\s*(y|yes)\s*$')
+    $Answer = $null
+    $Answered = $false
+    if ($Missing.Count -gt 0)
     {
-        $Why = if ($Interactive) { 'Not registering.' } else { 'No one can answer a prompt in this session, so nothing is registered.' }
+        Write-Host ('  Microsoft.Insights is not registered on {0} subscription(s); the metrics batch API needs it:' -f $Missing.Count) -ForegroundColor Yellow
+        foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
+        if ($Interactive)
+        {
+            $Result.Asked = $true
+            # Under pwsh -NonInteractive with a terminal attached, Read-Host writes an
+            # error instead of asking. With errors stopping here, that is caught and
+            # read as "no one can answer".
+            $SavedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Stop'
+            try
+            {
+                $Answer = [string](& $ReadAnswer ('Register Microsoft.Insights on these {0} subscription(s) now? [Y/N]' -f $Missing.Count))
+                $Answered = $true
+            }
+            catch
+            {
+                $Answer = $null
+            }
+            finally
+            {
+                $ErrorActionPreference = $SavedPreference
+            }
+            $Result.Answer = $Answer
+        }
+    }
+
+    $ToRegister = @()
+    if ($Missing.Count -gt 0 -and $Answer -notmatch '^\s*(y|yes)\s*$')
+    {
+        $Why = if ($Answered) { 'Not registering.' } else { 'No one can answer a prompt in this session, so nothing is registered.' }
         Write-Host ('  {0} Their metrics are collected with one call per resource, so none are lost. To register it later (needs Contributor or Owner), run per subscription:' -f $Why) -ForegroundColor Yellow
         foreach ($Entry in $Missing)
         {
             Write-Host ('    ' + (Get-RdaInsightsRegisterCommand -SubscriptionId $Entry.SubscriptionId)) -ForegroundColor Yellow
             $Result.NotRegistered.Add($Entry.SubscriptionId)
         }
-        return $Result
+    }
+    else
+    {
+        $ToRegister = @($Missing)
     }
 
     # Start every registration first, then wait for all of them on one deadline.
-    $Waiting = [System.Collections.Generic.List[string]]::new()
-    foreach ($Entry in $Missing)
+    foreach ($Entry in $ToRegister)
     {
         $RegisterError = Register-RdaInsightsProvider -SubscriptionId $Entry.SubscriptionId
         if ($null -eq $RegisterError)
@@ -2537,8 +2573,10 @@ function Invoke-RdaInsightsProviderPreflight
                 $Waiting.RemoveAt($Idx)
             }
         }
-        if ($Waiting.Count -eq 0 -or (Get-Date) -ge $Deadline) { break }
-        Start-Sleep -Seconds ([math]::Max(0, $PollSeconds))
+        $Left = ($Deadline - (Get-Date)).TotalSeconds
+        if ($Waiting.Count -eq 0 -or $Left -le 0) { break }
+        # Never sleep past the deadline.
+        Start-Sleep -Milliseconds ([int]([math]::Max(0, [math]::Min($PollSeconds, $Left)) * 1000))
     }
     foreach ($Id in $Waiting)
     {
