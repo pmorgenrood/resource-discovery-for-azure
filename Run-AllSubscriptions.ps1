@@ -558,13 +558,15 @@ $InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryRepo
 # -PreflightOnly: the checks a run makes before it collects, and nothing else.
 # PowerShell 7, the Az modules, the Az.Accounts version and its load have
 # passed above (each failure there exits 1 with its own message). Here: the
-# tenant, the sign-in, the subscription list (and -SubscriptionID), and read
-# access. It runs before the inventory folder is created, before the
-# transcript, the run lock and the resume state, so it creates, writes, moves
-# or removes nothing in the inventory folder. It does not run the consumption
-# data check (which reads usage values), the free-space and write probes of
-# the inventory folder (the write probe writes a file there) or the resume
-# state checks. Every failure exits 1, naming the check; a pass exits 0.
+# tenant, the run lock and how the run would start from its resume state and
+# per-stream state files (read only), the sign-in, the subscription list (and
+# -SubscriptionID), and read access for what the run would collect. It runs
+# before the inventory folder is created, before the transcript, the run lock
+# and any write of the resume state, so it creates, writes, moves or removes
+# nothing in the inventory folder. It does not run the consumption data check
+# (which reads usage values) or the free-space and write probes of the
+# inventory folder (the write probe writes a file there). Every failure exits
+# 1, naming the check; a pass exits 0.
 if ($PreflightOnly)
 {
     Write-Host 'Preflight only: running the checks of a run, then stopping. Nothing is collected or written to the inventory folder.' -ForegroundColor Cyan
@@ -641,8 +643,8 @@ if ($PreflightOnly)
     # The run checks access only for the subscriptions it would collect: a run
     # that continues the unfinished run leaves out those it completed,
     # -ResumeFailedOnly takes only the retry list, and both leave out those
-    # past the retry limit. The same lists are read here, without changing
-    # them (per-stream state files of an interrupted parallel run are not read).
+    # past the retry limit. The same lists are read here, the per-stream state
+    # files of an interrupted parallel run folded in, without changing them.
     $PfContinues = $PfStart.Mode -eq 'Continue'
     $PfResume = $PfContinues -and ($Resume -or -not $ResumeFailedOnly)
     if ($PfContinues -or $ResumeFailedOnly)
