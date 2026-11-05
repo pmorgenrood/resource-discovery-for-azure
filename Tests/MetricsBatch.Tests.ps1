@@ -179,6 +179,7 @@ Export-ModuleMember -Function Get-AzMetric
             }
             $Bytes = [System.Text.Encoding]::UTF8.GetBytes(($Out | ConvertTo-Json -Depth 12 -Compress))
             $Context.Response.StatusCode = $Status
+            if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
             $Context.Response.ContentType = 'application/json'
             $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
             $Context.Response.Close()
@@ -197,7 +198,16 @@ Export-ModuleMember -Function Get-AzMetric
     $Global:RdaTestBatchEnvironment = 'AzureCloud'
     function Get-AzContext { return [PSCustomObject]@{ Environment = [PSCustomObject]@{ Name = $Global:RdaTestBatchEnvironment } } }
     $Global:RdaTestBatchTokenCalls = [System.Collections.Generic.List[object]]::new()
-    function Get-AzAccessToken { param([string]$ResourceUrl, [string]$TenantId) $Global:RdaTestBatchTokenCalls.Add([PSCustomObject]@{ ResourceUrl = $ResourceUrl; TenantId = $TenantId }); return [PSCustomObject]@{ Token = 'test-token'; ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1) } }
+    # Token options: RdaTestBatchTokenMinutes (lifetime), RdaTestBatchTokenSecure (a SecureString, as Az.Accounts 5 gives).
+    $Global:RdaTestBatchTokenMinutes = 60
+    $Global:RdaTestBatchTokenSecure = $false
+    function Get-AzAccessToken
+    {
+        param([string]$ResourceUrl, [string]$TenantId)
+        $Global:RdaTestBatchTokenCalls.Add([PSCustomObject]@{ ResourceUrl = $ResourceUrl; TenantId = $TenantId })
+        $Value = if ($Global:RdaTestBatchTokenSecure) { ConvertTo-SecureString -String 'test-token' -AsPlainText -Force } else { 'test-token' }
+        return [PSCustomObject]@{ Token = $Value; ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes($Global:RdaTestBatchTokenMinutes) }
+    }
     $Global:RdaTestBatchProviderStates = @{}
     $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
     function Invoke-AzRestMethod
@@ -251,7 +261,7 @@ Export-ModuleMember -Function Get-AzMetric
     # the records and the debug log lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [switch]$Batch, [hashtable]$Control = @{}, [int]$Concurrency = 16, [switch]$Obfuscate, [hashtable]$Dictionaries)
+        param([object[]]$Resources, [string]$RunName, [switch]$Batch, [hashtable]$Control = @{}, [int]$Concurrency = 16, [switch]$Obfuscate, [hashtable]$Dictionaries, [string[]]$PerCallSubscriptions = @(), [object[]]$Subscriptions = $script:Subscriptions)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -265,7 +275,7 @@ Export-ModuleMember -Function Get-AzMetric
         $Global:RdaTestBatchArmCalls.Clear()
 
         $Arguments = @{
-            Subscriptions              = $script:Subscriptions
+            Subscriptions              = $Subscriptions
             Resources                  = $Resources
             Task                       = 'Processing'
             ConcurrencyLimit           = $Concurrency
@@ -274,6 +284,7 @@ Export-ModuleMember -Function Get-AzMetric
             UseMetricsBatch            = [bool]$Batch
             MetricsBatchEndpointFormat = $script:Endpoint
         }
+        if ($PerCallSubscriptions.Count -gt 0) { $Arguments['MetricsBatchPerCallSubscriptionIds'] = $PerCallSubscriptions }
         if ($Obfuscate)
         {
             $Arguments['ResourceIdDictionary'] = $Dictionaries.Id
@@ -282,6 +293,7 @@ Export-ModuleMember -Function Get-AzMetric
             $Arguments['ResourceGroupDictionary'] = $Dictionaries.Rg
         }
         $Global:MetricsFailedSubs = @()
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
         try
         {
             $null = & $script:MetricsScript @Arguments *>&1
@@ -301,6 +313,7 @@ Export-ModuleMember -Function Get-AzMetric
             TokenCalls   = @($Global:RdaTestBatchTokenCalls)
             ArmCalls     = @($Global:RdaTestBatchArmCalls)
             FailedSubs   = @($Global:MetricsFailedSubs)
+            Seconds      = $Clock.Elapsed.TotalSeconds
         }
     }
 
@@ -336,7 +349,7 @@ AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
     Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR' -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 batch work items' {
@@ -417,6 +430,24 @@ Describe 'Metrics.ps1 batch work items' {
         $Items.Count | Should -Be 1
         $Items[0].ResourceIds.Count | Should -Be 1
         $Items[0].Groups.Count | Should -Be 2
+    }
+
+    It 'keeps a global resource on the per-resource path' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1) -Location 'global'))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        $Items[0] -is [System.Array] | Should -BeTrue
+    }
+
+    It 'asks for a metric name once when two definitions differ only in its case' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@((New-Def -Id (Get-DiskId 1) -Name 'cpu_percent'), (New-Def -Id (Get-DiskId 1) -Name 'CPU_Percent')))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        @($Items[0].MetricNames) | Should -Be @('cpu_percent')
     }
 
     It 'keeps the per-resource path for what it cannot express or may not batch' {
@@ -598,6 +629,90 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         Assert-SameRecords -Expected $script:PerResource -Actual $Run
     }
 
+    It 'keeps a subscription the preflight left unregistered on the per-resource path, even once registered' {
+        # The provider reads Registered now, but the preflight decided per call for this run.
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-preflight-percall' -Batch -PerCallSubscriptions @($script:SubscriptionId)
+
+        $Run.Posts.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'was left without Microsoft.Insights at the start of the run' }).Count | Should -Be 1
+    }
+
+    It 'renews a token that ends within 10 minutes before a batch' {
+        $Global:RdaTestBatchTokenMinutes = 5
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-renew' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenMinutes = 60
+        }
+
+        $Run.TokenCalls.Count | Should -Be 2
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
+    }
+
+    It 'sends a SecureString token as plain text in the header' {
+        $Global:RdaTestBatchTokenSecure = $true
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-secure' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenSecure = $false
+        }
+
+        $Run.Posts[0].Authorization | Should -Be 'Bearer test-token'
+        $Run.Calls.Count | Should -Be 0
+    }
+
+    It 'gets one token per tenant' {
+        $Subs = @(
+            [PSCustomObject]@{ id = $script:SubscriptionId; Name = 'a'; tenantId = 'tenant-a' },
+            [PSCustomObject]@{ id = $script:OtherSubscriptionId; Name = 'b'; tenantId = 'tenant-b' }
+        )
+        $Resources = @((New-TestDisk -Name 'disk-a'), (New-TestDisk -Name 'disk-b' -SubscriptionId $script:OtherSubscriptionId))
+        $Run = Invoke-MetricsRun -Resources $Resources -RunName 'batch-tenants' -Batch -Subscriptions $Subs
+
+        @($Run.TokenCalls | ForEach-Object { $_.TenantId } | Sort-Object) | Should -Be @('tenant-a', 'tenant-b')
+        $Run.Posts.Count | Should -Be 2
+    }
+
+    It 'renews a refused token (401) once, then stops batching that tenant' {
+        $Disks = @(1..130 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-401'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-401' -Batch -Control @{ Status = 401 }
+
+        # First Metrics file batch: 2 requests refused, no retry. The token is renewed once;
+        # the second file batch's request is refused again, and nothing is sent after that.
+        $Run.Posts.Count | Should -Be 3
+        $Run.TokenCalls.Count | Should -Be 2
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'refused the token \(401\)' }).Count | Should -Be 2
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
+    }
+
+    It 'does not retry a request Azure rejects (400) and does not turn batch off' {
+        $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-400'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-400' -Batch -Control @{ Status = 400 } -Concurrency 1
+
+        $Run.Posts.Count | Should -Be 2
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
+    }
+
+    It 'waits at least what Retry-After asks before retrying a throttled request' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfter = 6 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Seconds | Should -BeGreaterOrEqual 6
+    }
+
     It 'writes the same masked records under -Obfuscate' {
         $Dict = {
             $D = @{ Id = @{}; Name = @{}; Sub = @{}; Rg = @{} }
@@ -713,6 +828,35 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         Should -Invoke Register-RdaInsightsProvider -Times 2 -Exactly
     }
 
+    It 'never sleeps past the deadline' {
+        $script:Slept = [System.Collections.Generic.List[double]]::new()
+        Mock Register-RdaInsightsProvider { $null }
+        Mock Start-Sleep { $script:Slept.Add([double]$Milliseconds + 1000 * [double]$Seconds) }
+        $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -DeadlineSeconds 1 -PollSeconds 10
+
+        $script:Slept.Count | Should -BeGreaterThan 0
+        foreach ($Ms in $script:Slept) { $Ms | Should -BeLessOrEqual 1000 }
+    }
+
+    It 'reads a prompt that cannot be shown (pwsh -NonInteractive) as no one there to answer' {
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) Write-Error 'PowerShell is in NonInteractive mode. Read and Prompt functionality is not available.' }
+
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*No one can answer a prompt*' } -Times 1 -Exactly
+    }
+
+    It 'waits for a subscription already being registered, without asking' {
+        $script:States['sub-b'] = 'Registering'
+        $script:Reads = 0
+        Mock Get-RdaInsightsProviderState { $script:Reads++; $State = if ($script:Reads -gt 1) { 'Registered' } else { $script:States[$SubscriptionId] }; [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null } }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.Registered) | Should -Be @('sub-b')
+    }
+
     It 'lets the batch call decide for a subscription whose state cannot be read' {
         $script:States['sub-b'] = 'Unknown'
         $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
@@ -746,6 +890,25 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         $Body = $Function.Body.Extent.Text
         $Body.IndexOf("if (`$Answer -notmatch '^\s*(y|yes)\s*$')") | Should -BeLessThan $Body.IndexOf('Register-RdaInsightsProvider -SubscriptionId')
         @($script:Calls | Where-Object { $_.Ast.Extent.Text -match '/register\?' }).Count | Should -Be 0
+    }
+
+    It 'forwards -UseMetricsBatch and the per-call list to every inner run and to Metrics.ps1' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Stream = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1') -Raw
+        $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$InventoryPassthrough['UseMetricsBatch'] = `$true }"))
+        $Wrapper | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$WorkerArgs.UseMetricsBatch = `$true }"))
+        $Wrapper | Should -Match ([regex]::Escape("`$InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]`$MetricsBatchPerCallIds"))
+        $Wrapper | Should -Match ([regex]::Escape("`$WorkerArgs.MetricsBatchPerCallSubscriptionIds = [string[]]`$MetricsBatchPerCallIds"))
+        $Stream | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$InventoryPassthrough['UseMetricsBatch'] = `$true }"))
+        $Stream | Should -Match ([regex]::Escape("`$InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]`$MetricsBatchPerCallSubscriptionIds"))
+        $Inner | Should -Match ([regex]::Escape('-UseMetricsBatch:$UseMetricsBatch.IsPresent -MetricsBatchPerCallSubscriptionIds'))
+    }
+
+    It 'asks only for subscriptions this run collects (not those a resumed run already completed)' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })'))
+        $Wrapper | Should -Match ([regex]::Escape('Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope'))
     }
 
     It 'runs the preflight only under -UseMetricsBatch' {

@@ -880,9 +880,14 @@ if ($ScopeForProbe.Count -gt 0)
 # missing (Invoke-RdaInsightsProviderPreflight). Nothing is registered without
 # a "y"; a subscription left unregistered has its metrics collected with one
 # request per resource, so the run goes on either way.
-if ($UseMetricsBatch -and -not $SkipMetrics -and $Subscriptions.Count -gt 0)
+# The subscriptions left unregistered are handed to every inner run, which keeps
+# them on the per-resource path for this whole run, even if the provider gets
+# registered meanwhile; the next run reads the state again.
+$MetricsBatchPerCallIds = @()
+$InsightsScope = @($Subscriptions | ForEach-Object { [string]$_.Id } | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })
+if ($UseMetricsBatch -and -not $SkipMetrics -and $InsightsScope.Count -gt 0)
 {
-    $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds @($Subscriptions | ForEach-Object { [string]$_.Id })
+    $MetricsBatchPerCallIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope).NotRegistered)
 }
 
 # ---------------------------------------------------------------------------
@@ -965,6 +970,7 @@ if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
+if ($UseMetricsBatch -and $MetricsBatchPerCallIds.Count -gt 0) { $InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]$MetricsBatchPerCallIds }
 # Always forward ConcurrencyLimit so the operator can tune metrics-phase
 # throttling end-to-end from a single param instead of editing the inner
 # script's default. Defaults to 6 (the inner script's existing default), so
@@ -1366,6 +1372,7 @@ else
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
                 if ($UseMetricsBatch) { $WorkerArgs.UseMetricsBatch = $true }
+                if ($UseMetricsBatch -and $MetricsBatchPerCallIds.Count -gt 0) { $WorkerArgs.MetricsBatchPerCallSubscriptionIds = [string[]]$MetricsBatchPerCallIds }
 
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)
