@@ -114,6 +114,9 @@ function Get-AzMetric
         'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource was not found.', $null, [System.Net.HttpStatusCode]::NotFound) }
         # A 404 whose message also holds text the loose throttle match would meet ('429').
         'NotFoundWith429Text' { throw "Operation returned an invalid status code 'NotFound' for request 4291" }
+        # A 5xx that quotes a 404, and a 5xx that wraps one: the status code decides, so both keep their retries.
+        'Status503WithNotFoundText' { throw [System.Net.Http.HttpRequestException]::new("upstream: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -688,10 +691,10 @@ Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
         foreach ($Key in $Want.Keys) { $Got[$Key] | Should -Be $Want[$Key] -Because $Key }
     }
 
-    It 'says in the log that a 404 resource is being deleted when Resource Graph lists it as <State>' -ForEach @(@{ State = 'Dropping'; Field = 'state' }, @{ State = 'Deleting'; Field = 'provisioningState' }) {
+    It 'says in the log that a 404 resource is being deleted when Resource Graph lists it as <State>' -ForEach @(@{ State = 'Dropping'; Field = 'state' }, @{ State = 'Deleting'; Field = 'provisioningState' }, @{ State = 'Dropping'; Field = 'status' }) {
         $Vm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-dropping'
         $Vm | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ $Field = $State })
-        $Run = Invoke-MetricsRun -Resources @($Vm) -RunName ('notfound-deleting-' + $State) -SingleError 'NotFound'
+        $Run = Invoke-MetricsRun -Resources @($Vm) -RunName ('notfound-deleting-' + $State + '-' + $Field) -SingleError 'NotFound'
 
         @($Run.DebugLines | Where-Object { $_ -match ("  Error idx=.*vm-dropping/.* attempts=1 .* - not found because the resource is being deleted \(its state is '{0}'\); not retried$" -f $State) }).Count | Should -Be 2
         $Run.Records.Count | Should -Be 2
@@ -710,7 +713,7 @@ Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
         @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
     }
 
-    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }) {
+    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }, @{ SingleError = 'Status503WithNotFoundText'; Calls = 8 }, @{ SingleError = 'Status500Wrapping404'; Calls = 8 }) {
         $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-kept-' + $SingleError) -SingleError $SingleError
 
         $Run.Calls.Count | Should -Be $Calls
