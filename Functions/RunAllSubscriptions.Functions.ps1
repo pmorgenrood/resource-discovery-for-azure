@@ -31,7 +31,7 @@ function Exit-Wrapper
     # The key of this run's resume state files: the tenant, or the tenant and
     # the subscription of a -SubscriptionID run (Get-ResumeStateScope). Before
     # the wrapper sets it, no state file is read or written, so the tenant.
-    $StateKey = Get-Variable -Name 'ResumeScope' -ValueOnly -ErrorAction SilentlyContinue
+    $StateKey = Get-Variable -Name 'ResumeScope' -Scope Script -ValueOnly -ErrorAction SilentlyContinue
     if ([string]::IsNullOrEmpty([string]$StateKey)) { $StateKey = $TenantID }
     # Every early exit of the wrapper passes here, and the resume state is kept
     # at each of them. The per-stream state files the run folded in at startup
@@ -57,7 +57,9 @@ function Exit-Wrapper
     # Then the run lock, after the per-stream files (their clean-up writes the
     # resume state, so the lock must still be held) and before the transcript
     # stops. Before the lock is taken there is none to release.
-    $HeldRunLock = Get-Variable -Name 'RunLock' -ValueOnly -ErrorAction SilentlyContinue
+    # The run's own lock only: -Scope Script, so a $RunLock of the session that
+    # started the wrapper (an earlier run's, a dot-sourced copy) is never released.
+    $HeldRunLock = Get-Variable -Name 'RunLock' -Scope Script -ValueOnly -ErrorAction SilentlyContinue
     if ($null -ne $HeldRunLock) { Remove-RunLock -Lock $HeldRunLock }
     if ($WrapperTranscriptStarted)
     {
