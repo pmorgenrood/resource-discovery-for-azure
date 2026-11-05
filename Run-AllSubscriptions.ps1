@@ -572,7 +572,10 @@ if ($PreflightOnly)
     Write-Host 'Preflight only: running the checks of a run, then stopping. Nothing is collected or written to the inventory folder.' -ForegroundColor Cyan
     Write-Host ('  PowerShell {0}: ok.' -f $PSVersionTable.PSVersion) -ForegroundColor Green
     Write-Host ('  Az modules ({0}), Az.Accounts {1} loaded: ok.' -f ($RequiredAzSubModules -join ', '), (@(Get-Module -Name Az.Accounts | Sort-Object Version -Descending)[0].Version)) -ForegroundColor Green
-    $PreflightFailed = { param([string]$Check) Write-Host ('Preflight failed: {0}. Nothing was collected or written to the inventory folder (exit 1).' -f $Check) -ForegroundColor Red; Exit-Wrapper -Code 1 }
+    # The private copy of the resume state (below), removed at every end.
+    $PfCopy = $null
+    $PfDone = { param([int]$Code) if ($null -ne $PfCopy -and (Test-Path -LiteralPath $PfCopy)) { Remove-Item -LiteralPath $PfCopy -Recurse -Force -ErrorAction SilentlyContinue }; Exit-Wrapper -Code $Code }
+    $PreflightFailed = { param([string]$Check) Write-Host ('Preflight failed: {0}. Nothing was collected or written to the inventory folder (exit 1).' -f $Check) -ForegroundColor Red; & $PfDone 1 }
     try { $TenantID = Resolve-TenantId -Value $TenantID }
     catch
     {
@@ -594,26 +597,29 @@ if ($PreflightOnly)
         & $PreflightFailed 'the run lock'
     }
     $PfStateKey = Get-ResumeStateScope -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
-    $PfStateFile = Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey
-    # Resume state files an earlier version named with the tenant id: a run of
-    # the whole tenant renames them to their current names first (when those
-    # are free) and continues them, so the preflight reads them under their
-    # old names. Read only; nothing is renamed here.
-    $PfLegacyStreams = @()
+    # A run of the whole tenant first renames the state files an earlier
+    # version named with the tenant id (Move-LegacyResumeStateFiles), then
+    # reads the state. To read exactly what it would, the preflight copies the
+    # resume state files into a private folder outside the inventory folder,
+    # renames them there the same way, and reads that copy; the inventory folder
+    # itself is only read. The copy is removed at every end of the preflight.
+    $PfStateRoot = $PfRoot
     if (-not $OneSubscription -and (Test-Path -LiteralPath $PfRoot -PathType Container))
     {
         $PfLegacyPattern = '^\.resume-state-{0}(-stream-\d+)?\.json$' -f [regex]::Escape($TenantID.Trim())
-        $PfLegacy = @(Get-ChildItem -LiteralPath $PfRoot -Filter '.resume-state-*' -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $PfLegacyPattern })
-        foreach ($PfOld in $PfLegacy)
+        $PfStateFiles = @(Get-ChildItem -LiteralPath $PfRoot -Filter '.resume-state-*' -File -Force -ErrorAction SilentlyContinue)
+        if (@($PfStateFiles | Where-Object { $_.Name -match $PfLegacyPattern }).Count -gt 0)
         {
-            $PfIsMain = $PfOld.Name -notmatch '-stream-\d+\.json$'
-            $PfNew = if ($PfIsMain) { $PfStateFile } else { Get-ResumeStatePath -InventoryRoot $PfRoot -Tenant $PfStateKey -Stream ([regex]::Match($PfOld.Name, '-stream-(\d+)\.json$').Groups[1].Value) }
-            if (Test-Path -LiteralPath $PfNew) { continue }
-            Write-Host ('  A run would first rename {0}, written by an earlier version, to {1}; this check reads it under its old name.' -f $PfOld.Name, (Split-Path -Path $PfNew -Leaf)) -ForegroundColor Yellow
-            if ($PfIsMain) { $PfStateFile = $PfOld.FullName } else { $PfLegacyStreams += $PfOld }
+            $PfCopy = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-preflight-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path $PfCopy -Force
+            foreach ($PfFile in $PfStateFiles) { Copy-Item -LiteralPath $PfFile.FullName -Destination (Join-Path $PfCopy $PfFile.Name) -Force }
+            Write-Host '  A run would first rename the resume state files an earlier version named with the tenant id; this check reads a copy renamed the same way:' -ForegroundColor Yellow
+            $null = Move-LegacyResumeStateFiles -InventoryRoot $PfCopy -Tenant $TenantID
+            $PfStateRoot = $PfCopy
         }
     }
-    $PfView = Get-RunStartView -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays -OneSubscription:$OneSubscription
+    $PfStateFile = Get-ResumeStatePath -InventoryRoot $PfStateRoot -Tenant $PfStateKey
+    $PfView = Get-RunStartView -InventoryRoot $PfStateRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -Fresh ([bool]$Fresh) -Settings (Get-RunDataSettings -Obfuscate ([bool]$Obfuscate) -SkipMetrics ([bool]$SkipMetrics) -SkipConsumption ([bool]$SkipConsumption) -IncludeDisabled ([bool]$IncludeDisabled) -IncludeNetworkResources ([bool]$IncludeNetworkResources)) -MaxAgeDays $ResumeMaxAgeDays -OneSubscription:$OneSubscription
     $PfStart = $PfView.RunStart
     # Resolve-RunStart words its lines for a run; here they say what a run would do.
     foreach ($Line in @($PfStart.Lines)) { Write-Host ('  A run would say: ' + ($Line.Text -replace 'This run stops here \(exit 1\), before it signs in, collects anything or writes the resume state', 'A run stops here (exit 1)')) -ForegroundColor $Line.Colour }
@@ -669,7 +675,7 @@ if ($PreflightOnly)
     {
         # The lists after the per-stream state files of an interrupted parallel
         # run are folded in, as the run folds them (Get-PreflightRunLists).
-        $PfLists = Get-PreflightRunLists -InventoryRoot $PfRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -View $PfView -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly) -ExtraStreamFiles $PfLegacyStreams
+        $PfLists = Get-PreflightRunLists -InventoryRoot $PfStateRoot -ResumeStateFile $PfStateFile -Key $PfStateKey -View $PfView -Resume ([bool]$Resume) -ResumeFailedOnly ([bool]$ResumeFailedOnly)
         $PfCompleted = @($PfLists.Completed)
         $PfFailed = @($PfLists.Failed)
         foreach ($PfName in @($PfLists.Skipped)) { Write-Host ('  A run would move the per-stream state file {0} aside (it cannot be read) and leave out what it lists.' -f $PfName) -ForegroundColor Yellow }
@@ -705,7 +711,7 @@ if ($PreflightOnly)
     {
         Write-Host '  Nothing is left for the run to collect, so no access check is needed.' -ForegroundColor Green
         Write-Host 'Every check passed.' -ForegroundColor Green
-        Exit-Wrapper -Code 0
+        & $PfDone 0
     }
     Write-Host ("Verifying subscription access up front for {0} subscription(s)..." -f $PfScope.Count) -ForegroundColor Cyan
     $PfProbed = @(Test-SubscriptionRoleAccessAll -Subscriptions $PfScope -IncludeUsage:(-not $SkipConsumption))
@@ -717,7 +723,7 @@ if ($PreflightOnly)
     }
     Write-AccessPreflightReport -Decision $PfDecision -ScopeCount $PfScope.Count
     Write-Host 'Every check passed.' -ForegroundColor Green
-    Exit-Wrapper -Code 0
+    & $PfDone 0
 }
 
 # Inventory root (used for resume state, consolidated output, and the wrapper

@@ -305,6 +305,10 @@ function Get-UsageAggregates
         $Info.Environment['PSModulePath'] = $(if ($ModulePath) { $ModulePath } else { $script:Modules })
         $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
         $Info.Environment['NO_COLOR'] = '1'
+        # A temp folder of the case's own, so a test can see what a run leaves there.
+        $CaseTemp = Join-Path $script:CaseHome 'tmp'
+        New-Item -ItemType Directory -Path $CaseTemp -Force | Out-Null
+        $Info.Environment['TMPDIR'] = $CaseTemp
         $Proc = [System.Diagnostics.Process]::Start($Info)
         $Proc.StandardInput.Close()
         $Out = $Proc.StandardOutput.ReadToEndAsync()
@@ -1053,10 +1057,26 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'B'
         $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly')
         $R.ExitCode | Should -Be 1
-        @($R.Text | Where-Object { $_ -like ('  A run would first rename .resume-state-{0}.json, written by an earlier version, to *; this check reads it under its old name.' -f $script:Tenant) }).Count | Should -Be 1
+        $R.Text | Should -Contain '  A run would first rename the resume state files an earlier version named with the tenant id; this check reads a copy renamed the same way:'
+        @($R.Text | Where-Object { $_ -like 'Renamed a resume state file of an earlier version of this tool to *' }).Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath (Join-Path $script:CaseHome 'tmp') -Filter 'rda-preflight-*' -Force -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty -Because 'the private copy is removed'
         $R.Text | Should -Contain 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' -Because 'it checks B, on the earlier run''s retry list'
         script:Get-RootSnapshot | Should -Be $Before
         Test-Path -LiteralPath $Legacy | Should -BeTrue
     }
-}
 
+    It 'reads only per-stream state files an earlier version named with the tenant id, as a run would after renaming them' {
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ Tenant = $script:Tenant; StreamId = '0'; Completed = @($script:Subs['A'].Id); FailedAttempts = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = 'Sub B'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'earlier failure'; Attempts = 1 }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: read access. Nothing was collected or written to the inventory folder (exit 1).' -Because 'the run continues that state and retries B'
+        script:Get-RootSnapshot | Should -Be $Before
+        @(Get-ChildItem -LiteralPath (Join-Path $script:CaseHome 'tmp') -Filter 'rda-preflight-*' -Force -ErrorAction SilentlyContinue) | Should -BeNullOrEmpty
+        # The run itself, from the same state, checks B and skips it.
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly')
+        @($Run.Text | Where-Object { $_ -like '*Sub B*NOT readable*' -or $_ -like '    - Sub B (*' }).Count | Should -BeGreaterThan 0
+    }
+}
