@@ -1587,8 +1587,8 @@ function Add-ResumeRunRecordKeys
 # it out (named in Skipped); one that is not the right shape too (named in
 # WrongShape, which a -ResumeFailedOnly run stops on). A main file that is not
 # the right shape gives empty main lists, as the run moves it aside (named in
-# WrongShape). $ExtraStreamFiles are per-stream files an earlier version named
-# with the tenant id, which a run renames to their current name first.
+# WrongShape). The caller passes a folder where the state files an earlier
+# version named with the tenant id already have their current names.
 # Returns { Completed (ids); Failed (retry-list entries); Skipped and
 # WrongShape (file names) }.
 function Get-PreflightRunLists
@@ -1599,8 +1599,7 @@ function Get-PreflightRunLists
         [Parameter(Mandatory = $true)][string]$Key,
         [Parameter(Mandatory = $true)]$View,
         [bool]$Resume,
-        [bool]$ResumeFailedOnly,
-        [object[]]$ExtraStreamFiles = @()
+        [bool]$ResumeFailedOnly
     )
     $Stored = $View.StoredRun
     $Mode = [string]$View.RunStart.Mode
@@ -1626,7 +1625,7 @@ function Get-PreflightRunLists
     {
         $StreamCompleted = @()
         $StreamFailed = @()
-        foreach ($File in @(@(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Key) + @($ExtraStreamFiles) | Where-Object { $null -ne $_ }))
+        foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Key))
         {
             $Obj = Read-StreamResumeStateFile -Path $File.FullName
             if ($null -eq $Obj) { $Skipped += $File.Name; continue }
