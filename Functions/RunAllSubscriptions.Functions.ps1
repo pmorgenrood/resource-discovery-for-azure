@@ -1576,6 +1576,119 @@ function Add-ResumeRunRecordKeys
 }
 
 
+# The completed list and the retry list a run would work from after it read
+# the resume state file and folded in the per-stream state files of the
+# unfinished run, as Run-AllSubscriptions.ps1 does at its start, read only:
+# nothing is moved aside, written or removed. $View is Get-RunStartView's
+# answer. A new run starts with nothing completed and keeps the retry list.
+# Per-stream files are folded only for a run that continues (-Resume, or the
+# default continue) or -ResumeFailedOnly, and only those of the same run id;
+# one that cannot be read or is not the right shape is left out, as the run
+# moves it aside and leaves it out (named in Skipped). A main file that is not
+# the right shape gives empty lists, as the run moves it aside.
+# Returns { Completed (ids); Failed (retry-list entries); Skipped (file names) }.
+function Get-PreflightRunLists
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$ResumeStateFile,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)]$View,
+        [bool]$Resume,
+        [bool]$ResumeFailedOnly
+    )
+    $Stored = $View.StoredRun
+    $Mode = [string]$View.RunStart.Mode
+    $Completed = @()
+    $Failed = @()
+    $Skipped = @()
+    $MainUsable = $null -eq $Stored.PSObject.Properties['ShapeProblem'] -or $null -eq $Stored.ShapeProblem
+    if ($Stored.PSObject.Properties['MainShapeProblem'] -and $Stored.MainShapeProblem) { $MainUsable = $false }
+    if ($MainUsable)
+    {
+        $Completed = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $Key | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $Failed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $Key | Where-Object { $null -ne $_ })
+    }
+    $Continues = $Mode -eq 'Continue'
+    if (-not $Continues) { $Completed = @() }
+    $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Key)
+    if ($Stored.PSObject.Properties['RecordSource'] -and $Stored.RecordSource -eq 'stream' -and $Continues) { $RunId = [string]$Stored.RunId }
+    $Folds = ($Continues -and ($Resume -or -not $ResumeFailedOnly)) -or ($ResumeFailedOnly -and $Continues)
+    if ($Folds)
+    {
+        $StreamCompleted = @()
+        $StreamFailed = @()
+        foreach ($File in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $Key))
+        {
+            $Obj = Read-StreamResumeStateFile -Path $File.FullName
+            if ($null -eq $Obj -or $null -ne (Get-ResumeStateShapeProblem -Record $Obj -Kind Stream)) { $Skipped += $File.Name; continue }
+            if (-not (Test-StreamStateRunId -State $Obj -RunId $RunId)) { continue }
+            if ($null -ne $Obj.PSObject.Properties['Completed']) { $StreamCompleted += @($Obj.Completed | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+            if ($null -ne $Obj.PSObject.Properties['FailedAttempts']) { $StreamFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
+        }
+        if ($StreamCompleted.Count -gt 0) { $Completed = @($Completed + $StreamCompleted | Sort-Object -Unique) }
+        $Failed = @(Merge-FailedAttempts -ExistingFailedAttempts $Failed -StreamFailedAttempts $StreamFailed -CompletedIds $Completed | Where-Object { $null -ne $_ })
+    }
+    return [pscustomobject]@{ Completed = @($Completed); Failed = @($Failed); Skipped = @($Skipped) }
+}
+
+# How a run starts from the unfinished run (read only): the resume state file
+# ($ResumeStateFile, for the state key $Key), and, when it is missing or not
+# the right shape, the run record the per-stream state files hold, then
+# Resolve-RunStart. Returns { StoredRun; RunStart }. Run-AllSubscriptions.ps1
+# calls it once before it signs in; -PreflightOnly calls it the same way, so a
+# preflight sees the start a run would make. It reads files only.
+function Get-RunStartView
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$InventoryRoot,
+        [Parameter(Mandatory = $true)][string]$ResumeStateFile,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [bool]$Resume,
+        [bool]$ResumeFailedOnly,
+        [bool]$Fresh,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Settings,
+        [int]$MaxAgeDays = 7
+    )
+    $StoredRun = Read-ResumeRunInfo -Path $ResumeStateFile -Tenant $Key
+    $StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'main'
+    # With no resume state file, or one that is not the right shape (moved aside
+    # below), the run record the per-stream state files of the unfinished run hold
+    # is checked as the resume state file's would be: age, then settings
+    # (Read-StreamRunInfo). Files that carry different records stop the run.
+    # Files without a record keep the rule below.
+    $StreamRun = $null
+    if (-not $Fresh -and (-not $StoredRun.Exists -or $null -ne $StoredRun.ShapeProblem))
+    {
+        $StreamRun = Read-StreamRunInfo -InventoryRoot $InventoryRoot -Tenant $Key -MainExists ([bool]$StoredRun.Exists) -RunId ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Key))
+    }
+    if ($null -ne $StreamRun -and ($StreamRun.HasRecord -or @($StreamRun.Conflict).Count -gt 0))
+    {
+        $MainShape = $null -ne $StoredRun.ShapeProblem
+        $StoredRun = if ($null -ne $StreamRun.Info) { $StreamRun.Info } else { [pscustomobject]@{ Present = $true; Exists = $true; StreamOnly = $false; ShapeProblem = $null; Legacy = $false; StartedAt = $null; StartedAtProblem = $null; Settings = $null; SettingsProblem = $null; Window = $null; WindowProblem = $null; Values = [ordered]@{} } }
+        $StoredRun | Add-Member -NotePropertyName 'RecordSource' -NotePropertyValue 'stream' -Force
+        $StoredRun | Add-Member -NotePropertyName 'RunId' -NotePropertyValue ([string]$StreamRun.RunId) -Force
+        $StoredRun | Add-Member -NotePropertyName 'StreamFiles' -NotePropertyValue @($StreamRun.Files) -Force
+        $StoredRun | Add-Member -NotePropertyName 'RecordConflict' -NotePropertyValue @($StreamRun.Conflict) -Force
+        $StoredRun | Add-Member -NotePropertyName 'MainShapeProblem' -NotePropertyValue $MainShape -Force
+    }
+    # With a usable resume state file that records the run, the per-stream state
+    # files of the same run that carry a record must record the same one; they are
+    # compared before anything of them is folded in (Get-StreamRecordMismatches).
+    if (-not $Fresh -and $StoredRun.RecordSource -eq 'main' -and $StoredRun.Exists -and $null -eq $StoredRun.ShapeProblem -and -not $StoredRun.Legacy)
+    {
+        $StoredRun | Add-Member -NotePropertyName 'StreamMismatch' -NotePropertyValue @(Get-StreamRecordMismatches -InventoryRoot $InventoryRoot -Tenant $Key -RunId ([string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $Key)) -Main $StoredRun) -Force
+    }
+    $StreamFileMode = if ($Resume) { 'Any' } elseif ($ResumeFailedOnly) { 'Parsed' } else { 'Records' }
+    if (-not $StoredRun.Exists -and -not $Fresh -and (Test-ResumableStreamStateFiles -InventoryRoot $InventoryRoot -Tenant $Key -Mode $StreamFileMode))
+    {
+        $StoredRun.StreamOnly = $true
+        $StoredRun.Legacy = $true
+    }
+    $RunStart = Resolve-RunStart -Info $StoredRun -Resume $Resume -ResumeFailedOnly $ResumeFailedOnly -Fresh $Fresh -Settings $Settings -MaxAgeDays $MaxAgeDays
+    return [pscustomobject]@{ StoredRun = $StoredRun; RunStart = $RunStart }
+}
+
 # Decide how a run starts, from what the resume state file holds (-Info, from
 # Read-ResumeRunInfo), the switches given and this run's settings (-Settings,
 # from Get-RunDataSettings). Prints nothing; returns { Mode; Reason; ExitCode;

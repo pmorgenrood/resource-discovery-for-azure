@@ -740,6 +740,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly' -Skip:$IsWindows {
         $Before.Count | Should -BeGreaterThan 3
 
         script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        script:Clear-Calls
         $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-PreflightOnly')
         $R.ExitCode | Should -Be $Code
         $R.Text | Should -Contain $Last
@@ -747,7 +748,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly' -Skip:$IsWindows {
         $R2.ExitCode | Should -Be $Code
         $R2.Text | Should -Contain $Last
         script:Get-RootSnapshot | Should -Be $Before
-        script:Get-Calls | Where-Object { $_ -ne $script:Subs['A'].Id -and $_ -ne $script:Subs['B'].Id } | Should -BeNullOrEmpty
+        script:Get-Calls | Should -BeNullOrEmpty -Because 'a preflight collects nothing'
     }
 
     It 'fails with exit 1 naming the subscription when the tenant does not list it' {
@@ -970,5 +971,46 @@ Describe 'An early stop of the wrapper releases only its own run lock' -Skip:$Is
         $Proc.ExitCode | Should -Be 1 -Because $Out.Result
         Test-Path -LiteralPath $Lock | Should -BeTrue -Because 'the lock is the calling session''s, not the wrapper''s'
     }
+}
+
+Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would read' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'after an interrupted parallel run, checks what the run would collect from the per-stream state: <Case>' -ForEach @(
+        @{ Case = '-ResumeFailedOnly checks the subscription only a per-stream file has on its retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1; Collect = 1 }
+        @{ Case = 'a continued run leaves out the subscription only a per-stream file has completed'; Extra = @(); Denied = 'A'; Code = 0; Collect = 3 }
+    ) {
+        # Two streams: A then C, and B then D. A completes, B fails, C and D hang.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
+        $StreamFilter = '.resume-state-{0}-stream-*.json' -f (script:Get-Key $script:Tenant)
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter $StreamFilter).Count | Should -Be 2
+        $Main = script:Read-StateAt $script:State
+        @($Main.Failed) | Should -Not -Contain $script:Subs['B'].Id -Because 'the retry list is only in a per-stream file'
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Denied $Denied
+        $R = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + $Extra) -Streams 2
+        $R.ExitCode | Should -Be $Code
+        @($R.Text | Where-Object { $_ -like ('  The run would collect {0} of these 4 subscription(s)*' -f $Collect) }).Count | Should -Be 1
+        script:Get-RootSnapshot | Should -Be $Before
+    }
+
+    It 'fails -ResumeFailedOnly naming the retry list when everything on it is past the retry limit, and a continued run with nothing left passes' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        foreach ($N in 1..3) { $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Resume') }
+        (script:Read-StateAt (script:Get-OneState 'B')).Failed | Should -Be (script:Get-Ids 'B')
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-ResumeFailedOnly', '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain 'Preflight failed: the retry list. Nothing was collected or written to the inventory folder (exit 1).'
+        $Run = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-ResumeFailedOnly')
+        $Run.ExitCode | Should -Be 2 -Because 'the run retries nothing either'
+        # Past the limit, a continued run leaves B out: nothing to collect, and B's denied access is not checked.
+        $C = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Resume', '-PreflightOnly')
+        $C.ExitCode | Should -Be 0
+        $C.Text | Should -Contain '  Nothing is left for the run to collect, so no access check is needed.'
+    }
+
 }
 
