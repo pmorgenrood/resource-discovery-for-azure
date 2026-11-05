@@ -1080,3 +1080,46 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         @($Run.Text | Where-Object { $_ -like '*Sub B*NOT readable*' -or $_ -like '    - Sub B (*' }).Count | Should -BeGreaterThan 0
     }
 }
+
+
+Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
+    BeforeAll {
+        # The statements of the Windows PowerShell 5.1 block that matter here,
+        # run as a script of their own under the wrapper's param block (this
+        # host has no Windows PowerShell): the empty -SubscriptionID stop and
+        # the loop that rebuilds the arguments for the PowerShell 7 run.
+        $Path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
+        $Body = @($Block.Clauses[0].Item2.Statements)
+        $EmptyStop = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match "ContainsKey\('SubscriptionID'\)" })
+        $Forward = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.ForEachStatementAst] -and $_.Extent.Text -match 'PSBoundParameters\.GetEnumerator' })
+        $script:Found = @($EmptyStop.Count, $Forward.Count)
+        $script:Probe = Join-Path ([System.IO.Path]::GetTempPath()) ('ps51-probe-' + [guid]::NewGuid().ToString('N') + '.ps1')
+        $Text = $Ast.ParamBlock.Extent.Text + "`n" + $EmptyStop[0].Extent.Text + "`n`$ForwardArgs = @()`n" + $Forward[0].Extent.Text + "`nWrite-Output ('ARGS ' + (`$ForwardArgs -join '|'))`n"
+        Set-Content -LiteralPath $script:Probe -Value $Text -Encoding utf8
+        $script:Pwsh = Join-Path $PSHOME 'pwsh'
+    }
+    AfterAll { Remove-Item -LiteralPath $script:Probe -Force -ErrorAction SilentlyContinue }
+
+    It 'finds the empty -SubscriptionID stop as the first statement, before any install offer, and the forwarding loop' {
+        $script:Found | Should -Be @(1, 1)
+        $Path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
+        @($Block.Clauses[0].Item2.Statements)[0].Extent.Text | Should -Match "ContainsKey\('SubscriptionID'\)"
+    }
+
+    It 'forwards -SubscriptionID with its value and -PreflightOnly as a bare switch' {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001' -PreflightOnly
+        $LASTEXITCODE | Should -Be 0
+        @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -Be @('ARGS -TenantID|t|-SubscriptionID|aaaaaaaa-0000-4000-8000-000000000001|-PreflightOnly')
+    }
+
+    It 'stops an empty or blank -SubscriptionID with exit 1 before re-launching, naming the value' -ForEach @(@{ Value = '' }, @{ Value = '  ' }) {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID $Value
+        $LASTEXITCODE | Should -Be 1
+        ($Out -join "`n") | Should -BeLike ("*ERROR: -SubscriptionID '{0}' cannot be used: it is empty.*" -f $Value)
+        @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -BeNullOrEmpty
+    }
+}
