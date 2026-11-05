@@ -103,6 +103,7 @@ function Get-AzMetric
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -110,6 +111,12 @@ function Get-AzMetric
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'ServiceUnavailable' { throw "Operation returned an invalid status code 'ServiceUnavailable'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        # A 404 as Get-AzMetric reports it, with the status phrase only in the message.
+        'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
+        # A 404 that carries the status code but names no status in its message.
+        'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource was not found.', $null, [System.Net.HttpStatusCode]::NotFound) }
+        # A 404 whose message also holds text the loose throttle match would meet ('429').
+        'NotFoundWith429Text' { throw "Operation returned an invalid status code 'NotFound' for request 4291" }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -767,5 +774,112 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Errors = @($Run.Records | Where-Object { $_.MetricError })
         $Errors.Count | Should -Be 1
         $Errors[0].Metric | Should -Be 'Composite Disk Write Bytes/sec'
+    }
+}
+
+Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
+    # A 404 cannot turn into data on a retry: the resource is gone (or being deleted) or is not
+    # in this subscription. It used to take all 4 attempts and their backoff (~100 s per request
+    # on a live run); it now ends after 1. The records, the incomplete entry and the exit code
+    # stay as they were: a 404 is still an Error and still makes the subscription incomplete.
+    BeforeAll {
+        $script:NotFoundVm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-notfound'
+        $script:NotFoundDisk = New-TestDisk -Name 'disk-notfound'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_notfound') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'makes 1 attempt, not 4, for a single-metric request that fails with <SingleError>' -ForEach @(@{ SingleError = 'NotFound' }, @{ SingleError = 'Status404' }, @{ SingleError = 'NotFoundWith429Text' }) {
+        # The VM's two metrics are requested one at a time.
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-single-' + $SingleError) -SingleError $SingleError
+
+        $Run.Calls.Count | Should -Be 2 -Because 'one attempt for each of the 2 metrics'
+        foreach ($Name in 'Percentage CPU', 'Available Memory Bytes')
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'makes 1 attempt for a grouped request that fails with NotFound, with no request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-grouped' -MultiError 'NotFound'
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+    }
+
+    It 'still records the subscription as metrics incomplete, with the same entry as a server error' {
+        $null = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-incomplete' -MultiError 'NotFound'
+        $NotFoundEntries = @($Global:MetricsFailedSubs)
+        $Global:MetricsFailedSubs = @()
+        $null = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-incomplete-5xx' -MultiError 'ServerError'
+        $ServerErrorEntries = @($Global:MetricsFailedSubs)
+
+        $NotFoundEntries.Count | Should -Be 1
+        $NotFoundEntries[0].Complete | Should -BeFalse
+        ($NotFoundEntries | ConvertTo-Json -Depth 5 -Compress) | Should -Be ($ServerErrorEntries | ConvertTo-Json -Depth 5 -Compress)
+    }
+
+    It 'writes the same error records as a request that failed after all its retries (<Shape>)' -ForEach @(
+        @{ Shape = 'grouped'; Multi = 'NotFound'; Single = ''; Compare = 'ServerError'; CompareSingle = '' }
+        @{ Shape = 'single'; Multi = ''; Single = 'NotFound'; Compare = ''; CompareSingle = 'ServiceUnavailable' }
+    ) {
+        $Resource = if ($Shape -eq 'grouped') { $script:NotFoundDisk } else { $script:NotFoundVm }
+        $NotFound = Invoke-MetricsRun -Resources @($Resource) -RunName ('notfound-records-' + $Shape) -MultiError $Multi -SingleError $Single
+        $Retried = Invoke-MetricsRun -Resources @($Resource) -RunName ('notfound-records-retried-' + $Shape) -MultiError $Compare -SingleError $CompareSingle
+
+        $NotFound.Records.Count | Should -BeGreaterThan 0
+        foreach ($Record in $NotFound.Records)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricTotalCount | Should -Be 0
+        }
+        $Want = ConvertTo-RecordMap -Records $Retried.Records
+        $Got = ConvertTo-RecordMap -Records $NotFound.Records
+        @($Got.Keys | Sort-Object) | Should -Be @($Want.Keys | Sort-Object)
+        foreach ($Key in $Want.Keys) { $Got[$Key] | Should -Be $Want[$Key] -Because $Key }
+    }
+
+    It 'says in the log that a 404 resource is being deleted when Resource Graph lists it as <State>' -ForEach @(@{ State = 'Dropping'; Field = 'state' }, @{ State = 'Deleting'; Field = 'provisioningState' }) {
+        $Vm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-dropping'
+        $Vm | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ $Field = $State })
+        $Run = Invoke-MetricsRun -Resources @($Vm) -RunName ('notfound-deleting-' + $State) -SingleError 'NotFound'
+
+        @($Run.DebugLines | Where-Object { $_ -match ("  Error idx=.*vm-dropping/.* attempts=1 .* - not found because the resource is being deleted \(its state is '{0}'\); not retried$" -f $State) }).Count | Should -Be 2
+        $Run.Records.Count | Should -Be 2
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+        @($Global:MetricsFailedSubs).Count | Should -Be 1 -Because 'the exit code is kept: a 404 still makes the subscription incomplete'
+    }
+
+    It 'adds no deleting note for a 404 on a resource that is not being deleted, nor for a 5xx on a deleting one' {
+        $Ready = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-ready'
+        $Ready | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ state = 'Ready' })
+        $Run = Invoke-MetricsRun -Resources @($Ready) -RunName 'notfound-ready' -SingleError 'NotFound'
+        @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
+
+        $Dropping = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-dropping-5xx'
+        $Dropping | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ state = 'Dropping' })
+        $Run = Invoke-MetricsRun -Resources @($Dropping) -RunName 'notfound-dropping-5xx' -SingleError 'ServiceUnavailable'
+        @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
+    }
+
+    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }) {
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-kept-' + $SingleError) -SingleError $SingleError
+
+        $Run.Calls.Count | Should -Be $Calls
     }
 }
