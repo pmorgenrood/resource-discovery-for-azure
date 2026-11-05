@@ -211,7 +211,7 @@ To collect **one** subscription with the wrapper (its setup checks, sign-in, acc
 ./Run-AllSubscriptions.ps1 -TenantID "contoso.onmicrosoft.com" -SubscriptionID "12345678-1234-1234-1234-123456789012"
 ```
 
-The run stops with exit code `1`, before it collects anything, when the id is not a GUID (before any file is written), when `Get-AzSubscription -TenantId <tenant>` does not list it, or when it is not `Enabled` (add `-IncludeDisabled` to collect it anyway). Its resume state is its own file, `InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`, so it never changes what a run of the whole tenant has completed or has left to retry, and a run of the whole tenant never changes it; to continue it, run the same command again with `-Resume`.
+The run stops with exit code `1`, before it collects anything, when the id is not a GUID (before any file is written), when `Get-AzSubscription -TenantId <tenant>` does not list it, or when it is not `Enabled` (add `-IncludeDisabled` to collect it anyway). Its resume state is its own file, `InventoryReports/.resume-state-<TenantID>-subscription-<SubscriptionID>.json`, so it never changes what a run of the whole tenant has completed or has left to retry, and a run of the whole tenant never changes it; to continue it, run the same command again with `-Resume`. Do not start it while another run of the same tenant is going on this machine: the two would share the inventory folder, and their consolidated zips and transcripts are named by the second they start or end.
 
 To check everything before a run, without collecting anything, add `-PreflightOnly`:
 
