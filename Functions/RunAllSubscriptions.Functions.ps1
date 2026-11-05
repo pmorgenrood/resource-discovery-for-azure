@@ -3124,6 +3124,25 @@ function Select-OneSubscription
     return [pscustomobject]@{ Subscription = $Sub; Stop = $false; Lines = $Lines.ToArray() }
 }
 
+# The access failure of a -PreflightOnly run ($Decision, from
+# Resolve-AccessPreflight, with at least one subscription not readable): each
+# such subscription with its reason, then the fix for each cause
+# (Write-AccessRemedyLines), ending in running the check again. A run would
+# skip these and collect the rest; a preflight names them as a failure, so
+# its exit code says that the run would not be complete.
+function Write-PreflightOnlyAccessFailure
+{
+    param([Parameter(Mandatory = $true)]$Decision)
+    $Inaccessible = @($Decision.Inaccessible | Where-Object { $null -ne $_ })
+    Write-Host ("  {0} subscription(s) are NOT readable by the signed-in identity, so a run would skip them:" -f $Inaccessible.Count) -ForegroundColor Red
+    foreach ($NA in $Inaccessible)
+    {
+        $Label = if (-not [string]::IsNullOrEmpty([string]$NA.Reason)) { [string]$NA.Reason } else { 'not readable' }
+        Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
+    }
+    $null = Write-AccessRemedyLines -Inaccessible $Inaccessible -Lead '  To fix it:' -ReRun 'run the check again' -Colour 'Yellow'
+}
+
 # The resume state file of a tenant, and its per-stream state files with -Stream.
 function Get-ResumeStatePath
 {
