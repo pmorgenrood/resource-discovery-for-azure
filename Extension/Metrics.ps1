@@ -10,7 +10,14 @@ param(
     [Alias('ResourceSubscriptionDictionary')]$ResourceSubDictionary, # Map dictionary to obfuscate subscription names
     [Alias('ResourceResourceGroupDictionary')]$ResourceGroupDictionary, # Map dictionary to obfuscate resource group names
     $Obfuscate, # Boolean flag toggle indicating whether sensitive infrastructure details should be masked
-    $MetricsLookbackDays = 31 # Default tracking duration window determining how far back to ask Azure for data
+    $MetricsLookbackDays = 31, # Default tracking duration window determining how far back to ask Azure for data
+    # Opt-in: ask the Azure Monitor batch API (metrics:getBatch) for up to 50
+    # resources of one subscription, region and type in one request. Anything it
+    # cannot answer goes through the per-resource Get-AzMetric path below.
+    [switch]$UseMetricsBatch,
+    # The batch API's regional endpoint, {0} being the region. Internal: tests
+    # point it at a local listener.
+    [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com'
 )
 
 
@@ -204,6 +211,127 @@ function Group-MetricDefinition
     }
 
     Write-Output -NoEnumerate -InputObject $Capped
+}
+
+# What the batch API needs to know of one resource id: its subscription and its
+# metric namespace (the resource type, lower case, for example
+# 'microsoft.sql/servers/databases'). $null when the id is not a plain ARM
+# resource id (no resource group, an extension resource with a second
+# '/providers/', an odd number of type and name parts), which the batch call
+# cannot express, so that resource keeps the per-resource path.
+function Get-MetricBatchTarget
+{
+    param([string]$Id)
+
+    if ([string]::IsNullOrEmpty($Id)) { return $null }
+    if ($Id -notmatch '^/subscriptions/([^/]+)/resourcegroups/[^/]+/providers/(.+)$') { return $null }
+    $SubscriptionId = $Matches[1]
+    $ProviderPart = $Matches[2]
+    if ($ProviderPart -match '(?i)/providers/') { return $null }
+    $Parts = @($ProviderPart -split '/')
+    if ($Parts.Count -lt 3 -or ($Parts.Count % 2) -ne 1) { return $null }
+    foreach ($Part in $Parts) { if ([string]::IsNullOrEmpty($Part)) { return $null } }
+    $Types = for ($Pi = 1; $Pi -lt $Parts.Count; $Pi += 2) { $Parts[$Pi] }
+    return [pscustomobject]@{
+        SubscriptionId = $SubscriptionId.ToLowerInvariant()
+        Namespace      = (@($Parts[0]) + @($Types) -join '/').ToLowerInvariant()
+    }
+}
+
+# A time grain as the batch API takes it (ISO 8601: 'PT1H', 'P1D', 'PT1M'), or
+# $null when it is not a time span.
+function ConvertTo-MetricBatchInterval
+{
+    param($Interval)
+
+    $Grain = [timespan]::Zero
+    if (-not [timespan]::TryParse([string]$Interval, [cultureinfo]::InvariantCulture, [ref]$Grain) -or $Grain -le [timespan]::Zero) { return $null }
+    return [System.Xml.XmlConvert]::ToString($Grain)
+}
+
+# Splits the per-resource groups (Group-MetricDefinition) into work items, in
+# order of first appearance:
+#   - a batch unit: groups of up to $MaxResources distinct resources that share
+#     subscription, region, namespace, metric-name set, time window, time grain
+#     and aggregation, so one getBatch request answers all of them;
+#   - a plain group (the group's own array), for a group the batch call cannot
+#     express, or of a subscription not in $AllowedSubscriptionIds; it goes
+#     through the per-resource path exactly as without -UseMetricsBatch.
+# Resource ids are compared without case. A resource listed twice joins the
+# same unit and each of its groups gets the same answer.
+function New-MetricBatchPlan
+{
+    param(
+        $MetricGroups,
+        $AllowedSubscriptionIds,
+        [int]$MaxResources = 50
+    )
+
+    $Allowed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($AllowedId in @($AllowedSubscriptionIds)) { if (-not [string]::IsNullOrEmpty([string]$AllowedId)) { [void]$Allowed.Add([string]$AllowedId) } }
+    $Aggregations = @('Average', 'Maximum', 'Minimum', 'Total', 'Count')
+
+    $Items = [System.Collections.Generic.List[object]]::new()
+    $OpenUnits = @{}
+    foreach ($Group in $MetricGroups)
+    {
+        $First = $Group[0]
+        $Target = Get-MetricBatchTarget -Id ([string]$First.Id)
+        $Region = ([string]$First.Location).ToLowerInvariant()
+        $IsoGrain = ConvertTo-MetricBatchInterval -Interval $First.Interval
+        $Expressible = $null -ne $Target -and $Allowed.Contains($Target.SubscriptionId) -and $Region -match '^[a-z0-9]+$' -and $null -ne $IsoGrain -and $Aggregations -contains [string]$First.Aggregation -and $First.StartTime -is [datetime] -and $First.EndTime -is [datetime]
+        if (-not $Expressible)
+        {
+            $Items.Add($Group)
+            continue
+        }
+
+        $Names = [string[]]@($Group | ForEach-Object { [string]$_.MetricName } | Select-Object -Unique)
+        $NameKey = (@($Names | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|')
+        $Key = '{0}|{1}|{2}|{3}|{4}' -f $Target.SubscriptionId, $Region, $Target.Namespace, $NameKey, (Get-MetricGroupKey -Def $First)
+        $ResourceKey = ([string]$First.Id).TrimEnd('/').ToLowerInvariant()
+
+        $Unit = $OpenUnits[$Key]
+        if ($null -ne $Unit -and -not $Unit.ResourceSet.Contains($ResourceKey) -and $Unit.ResourceSet.Count -ge $MaxResources)
+        {
+            $Unit = $null
+        }
+        if ($null -eq $Unit)
+        {
+            $Unit = [pscustomobject]@{
+                RdaBatchUnit   = $true
+                SubscriptionId = $Target.SubscriptionId
+                Region         = $Region
+                Namespace      = $Target.Namespace
+                MetricNames    = $Names
+                Aggregation    = [string]$First.Aggregation
+                Interval       = $IsoGrain
+                StartTime      = ([datetime]$First.StartTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [cultureinfo]::InvariantCulture)
+                EndTime        = ([datetime]$First.EndTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [cultureinfo]::InvariantCulture)
+                Groups         = [System.Collections.Generic.List[object]]::new()
+                ResourceIds    = [System.Collections.Generic.List[string]]::new()
+                ResourceSet    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                DefCount       = 0
+            }
+            $OpenUnits[$Key] = $Unit
+            $Items.Add($Unit)
+        }
+        if ($Unit.ResourceSet.Add($ResourceKey)) { $Unit.ResourceIds.Add($ResourceKey) }
+        $Unit.Groups.Add($Group)
+        $Unit.DefCount += @($Group).Count
+    }
+
+    Write-Output -NoEnumerate -InputObject $Items
+}
+
+# The number of metric definitions in one work item: a plain group (an array)
+# or a batch unit.
+function Get-MetricWorkItemDefCount
+{
+    param($Item)
+    if ($Item -is [System.Array]) { return $Item.Count }
+    if ($null -ne $Item.PSObject.Properties['DefCount']) { return [int]$Item.DefCount }
+    return @($Item).Count
 }
 
 if ($Task -eq 'Processing')
@@ -575,6 +703,90 @@ if ($Task -eq 'Processing')
         $MetricGroups = [System.Collections.Generic.List[object]]::new()
     }
 
+    # -UseMetricsBatch: which subscriptions may use the batch API, and a token
+    # for the metrics data plane per tenant. A subscription left out keeps the
+    # per-resource path, with one line in the debug log saying why.
+    $UseBatchApi = $false
+    # Batch counts for the summary: [0] requests (retries not counted),
+    # [1] attempts, [2] resources asked, [3] resources answered, [4] definitions
+    # answered, [5] definitions sent on to the per-resource path. Shared by the
+    # parallel batch runspaces under a lock (Monitor) on the array itself.
+    $MetricBatchCounts = [long[]]::new(6)
+    # Subscription id -> why batch was turned off for it during the phase (the
+    # data plane refused the token or the caller: 401 or 403).
+    $MetricBatchOffSubs = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $MetricBatchNotes = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+    $MetricBatchTokens = @{}
+    $MetricBatchTenantOfSub = @{}
+    if ($UseMetricsBatch -and $MetricGroups.Count -gt 0)
+    {
+        $BatchEnvironment = if ($null -ne $MetricAzContext -and $null -ne $MetricAzContext.Environment) { [string]$MetricAzContext.Environment.Name } else { '' }
+        if ($BatchEnvironment -ne 'AzureCloud')
+        {
+            Write-MetricsDiag ("[batch] -UseMetricsBatch: the Azure environment is '{0}', not AzureCloud; the batch endpoint is only known for AzureCloud, so every metric uses the per-resource path." -f $BatchEnvironment)
+        }
+        else
+        {
+            $BatchSubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($Group in $MetricGroups)
+            {
+                $Target = Get-MetricBatchTarget -Id ([string]$Group[0].Id)
+                if ($null -ne $Target) { [void]$BatchSubIds.Add($Target.SubscriptionId) }
+            }
+            $SubTenant = @{}
+            foreach ($subItem in $Subscriptions)
+            {
+                if ($null -ne $subItem -and -not [string]::IsNullOrEmpty([string]$subItem.id))
+                {
+                    $TenantOfSub = [string]$subItem.tenantId
+                    $SubTenant[([string]$subItem.id).ToLowerInvariant()] = $TenantOfSub
+                }
+            }
+            $AllowedBatchSubs = [System.Collections.Generic.List[string]]::new()
+            foreach ($BatchSub in $BatchSubIds)
+            {
+                # The provider must be registered: the batch API answers 403 otherwise.
+                # The preflight offered to register it; this only reads the state.
+                $ProviderRead = Get-RdaInsightsProviderState -SubscriptionId $BatchSub
+                if ($ProviderRead.State -ne 'Registered' -and $ProviderRead.State -ne 'Unknown')
+                {
+                    Write-MetricsDiag ("[batch] Microsoft.Insights is '{0}' on subscription {1}; its metrics use the per-resource path. Register it to batch: {2}" -f $ProviderRead.State, $BatchSub, (Get-RdaInsightsRegisterCommand -SubscriptionId $BatchSub))
+                    continue
+                }
+                $TenantKey = [string]$SubTenant[$BatchSub.ToLowerInvariant()]
+                if (-not $MetricBatchTokens.ContainsKey($TenantKey))
+                {
+                    $MetricBatchTokens[$TenantKey] = $null
+                    try
+                    {
+                        $TokenArgs = @{ ResourceUrl = 'https://metrics.monitor.azure.com'; WarningAction = 'SilentlyContinue'; ErrorAction = 'Stop' }
+                        if (-not [string]::IsNullOrEmpty($TenantKey)) { $TokenArgs['TenantId'] = $TenantKey }
+                        $TokenObj = Get-AzAccessToken @TokenArgs
+                        $MetricBatchTokens[$TenantKey] = [pscustomobject]@{
+                            Value     = $(if ($TokenObj.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $TokenObj.Token).Password } else { [string]$TokenObj.Token })
+                            ExpiresOn = $TokenObj.ExpiresOn
+                            Args      = $TokenArgs
+                        }
+                    }
+                    catch
+                    {
+                        Write-MetricsDiag ("[batch] could not get a metrics data plane token ({0}); the subscriptions of that tenant use the per-resource path." -f $_.Exception.Message)
+                    }
+                }
+                if ($null -eq $MetricBatchTokens[$TenantKey]) { continue }
+                $MetricBatchTenantOfSub[$BatchSub.ToLowerInvariant()] = $TenantKey
+                $AllowedBatchSubs.Add($BatchSub)
+            }
+            if ($AllowedBatchSubs.Count -gt 0)
+            {
+                $UseBatchApi = $true
+                $MetricGroups = New-MetricBatchPlan -MetricGroups $MetricGroups -AllowedSubscriptionIds $AllowedBatchSubs
+                $BatchUnitCount = @($MetricGroups | Where-Object { $_ -isnot [System.Array] }).Count
+                Write-MetricsDiag ("[batch] -UseMetricsBatch: {0} batch request(s) planned for {1} subscription(s); {2} group(s) keep the per-resource path." -f $BatchUnitCount, $AllowedBatchSubs.Count, ($MetricGroups.Count - $BatchUnitCount))
+            }
+        }
+    }
+
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays))
 
@@ -591,8 +803,9 @@ if ($Task -eq 'Processing')
     for ($i = 0; $i -lt $MetricGroups.Count; $i++)
     {
         $BatchGroups.Add($MetricGroups[$i])
-        $BatchDefCount += $MetricGroups[$i].Count
-        $MetricsProcessed += $MetricGroups[$i].Count
+        $ItemDefCount = Get-MetricWorkItemDefCount -Item $MetricGroups[$i]
+        $BatchDefCount += $ItemDefCount
+        $MetricsProcessed += $ItemDefCount
 
         if ($BatchDefCount -ge $RangeBatch -or ($i + 1) -ge $MetricGroups.Count)
         {
@@ -601,8 +814,263 @@ if ($Task -eq 'Processing')
             Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} call(s))" -f $RangeIdx, $BatchGroups.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
             Write-Verbose ("[Metrics] Batch {0}: dispatching {1} metric call(s) (processed {2}/{3})." -f $RangeIdx, $BatchGroups.Count, $MetricsProcessed, $MetricCount)
 
-            # Each parallel item is one group of definitions.
-            $BatchGroups | ForEach-Object -Parallel {
+            $DispatchItems = $BatchGroups
+            if ($UseBatchApi)
+            {
+                # Renew a token that ends within 10 minutes, on this thread, before the batch.
+                foreach ($TenantKey in @($MetricBatchTokens.Keys))
+                {
+                    $Held = $MetricBatchTokens[$TenantKey]
+                    if ($null -ne $Held -and $null -ne $Held.ExpiresOn -and $Held.ExpiresOn -lt [DateTimeOffset]::UtcNow.AddMinutes(10))
+                    {
+                        try
+                        {
+                            $RenewArgs = $Held.Args
+                            $TokenObj = Get-AzAccessToken @RenewArgs
+                            $Held.Value = if ($TokenObj.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $TokenObj.Token).Password } else { [string]$TokenObj.Token }
+                            $Held.ExpiresOn = $TokenObj.ExpiresOn
+                        }
+                        catch
+                        {
+                            Write-MetricsDiag ("[batch] could not renew a metrics data plane token ({0}); the batch requests that use it fall back to the per-resource path when Azure refuses it." -f $_.Exception.Message)
+                        }
+                    }
+                }
+                $BatchTokenValues = @{}
+                foreach ($TenantKey in @($MetricBatchTokens.Keys)) { if ($null -ne $MetricBatchTokens[$TenantKey]) { $BatchTokenValues[$TenantKey] = $MetricBatchTokens[$TenantKey].Value } }
+
+                $BatchUnits = @($BatchGroups | Where-Object { $_ -isnot [System.Array] })
+                $DispatchItems = [System.Collections.Generic.List[object]]::new()
+                foreach ($Item in $BatchGroups) { if ($Item -is [System.Array]) { $DispatchItems.Add($Item) } }
+                $BatchOutcomes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+                # One getBatch request per unit, in parallel. A unit answers each of its
+                # definitions, or hands it (or its whole group) to the per-resource path
+                # below; it never drops one.
+                $BatchUnits | ForEach-Object -Parallel {
+                    $Unit = $_
+                    $Outcomes = $using:BatchOutcomes
+                    $Counts = $using:MetricBatchCounts
+                    $OffSubs = $using:MetricBatchOffSubs
+                    $Notes = $using:MetricBatchNotes
+                    $Tokens = $using:BatchTokenValues
+                    $TenantOfSub = $using:MetricBatchTenantOfSub
+                    $EndpointFormat = $using:MetricsBatchEndpointFormat
+                    $CallTimeoutSeconds = $using:MetricTimeoutSeconds
+                    $CallMaxRetries = $using:MetricMaxRetries
+
+                    function Add-BatchCount([int]$Index, [long]$By)
+                    {
+                        [System.Threading.Monitor]::Enter($Counts)
+                        try { $Counts[$Index] += $By } finally { [System.Threading.Monitor]::Exit($Counts) }
+                    }
+
+                    # Every group of the unit to the per-resource path, as without -UseMetricsBatch.
+                    function Send-AllGroupsOn
+                    {
+                        foreach ($Group in $Unit.Groups)
+                        {
+                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                            Add-BatchCount 5 @($Group).Count
+                        }
+                    }
+
+                    # The HTTP status of a failed request, or $null.
+                    function Get-BatchStatusCode([System.Exception]$Exception)
+                    {
+                        $Ex = $Exception
+                        $Depth = 0
+                        while ($null -ne $Ex -and $Depth -lt 10)
+                        {
+                            $Depth++
+                            if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                            {
+                                try { return [int]$Ex.Response.StatusCode } catch { }
+                            }
+                            if ($null -ne $Ex.PSObject.Properties['StatusCode'] -and $null -ne $Ex.StatusCode)
+                            {
+                                try { return [int]$Ex.StatusCode } catch { }
+                            }
+                            $Ex = $Ex.InnerException
+                        }
+                        return $null
+                    }
+
+                    # A REST answer for one metric, in the shape Get-AzMetric returns: Name.Value,
+                    # and Data as the first time series' points (null when there is no time series,
+                    # as PSMetric.Data is), each point with all five aggregation fields as
+                    # [double] or null, so records are built the same way.
+                    function ConvertTo-BatchMetricQuery($Metric)
+                    {
+                        $Series = @(@($Metric.timeseries) | Where-Object { $null -ne $_ })
+                        $Data = $null
+                        if ($Series.Count -gt 0 -and $null -ne $Series[0].PSObject.Properties['data'] -and $null -ne $Series[0].data)
+                        {
+                            $Data = [System.Collections.Generic.List[object]]::new()
+                            foreach ($Point in @($Series[0].data))
+                            {
+                                if ($null -eq $Point) { continue }
+                                $Fields = [ordered]@{ TimeStamp = $Point.timeStamp }
+                                foreach ($Field in 'Average', 'Minimum', 'Maximum', 'Total', 'Count')
+                                {
+                                    $Prop = $Point.PSObject.Properties[$Field]
+                                    $Fields[$Field] = if ($null -ne $Prop -and $null -ne $Prop.Value) { [double]$Prop.Value } else { $null }
+                                }
+                                $Data.Add([pscustomobject]$Fields)
+                            }
+                        }
+                        return [pscustomobject]@{ Name = [pscustomobject]@{ Value = [string]$Metric.name.value }; Data = $Data }
+                    }
+
+                    $Reason = $null
+                    if ($OffSubs.TryGetValue($Unit.SubscriptionId, [ref]$Reason))
+                    {
+                        Send-AllGroupsOn
+                        return
+                    }
+                    $TenantKey = [string]$TenantOfSub[$Unit.SubscriptionId]
+                    $Token = $Tokens[$TenantKey]
+                    if ([string]::IsNullOrEmpty($Token))
+                    {
+                        Send-AllGroupsOn
+                        return
+                    }
+
+                    $Uri = ('{0}/subscriptions/{1}/metrics:getBatch?api-version=2023-10-01&metricnamespace={2}&metricnames={3}&aggregation={4}&interval={5}&starttime={6}&endtime={7}' -f
+                        ($EndpointFormat -f $Unit.Region), $Unit.SubscriptionId, [uri]::EscapeDataString($Unit.Namespace),
+                        ((@($Unit.MetricNames) | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','),
+                        $Unit.Aggregation.ToLowerInvariant(), $Unit.Interval, $Unit.StartTime, $Unit.EndTime)
+                    # The doc's rule: resource ids in the body in lower case.
+                    $Body = ConvertTo-Json -InputObject @{ resourceids = [string[]]@($Unit.ResourceIds) } -Compress
+
+                    Add-BatchCount 0 1
+                    Add-BatchCount 2 $Unit.ResourceIds.Count
+                    $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    $Response = $null
+                    $Attempt = 0
+                    $LastError = $null
+                    $Kind = $null
+                    # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
+                    # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
+                    # at once (the same request is refused the same way again).
+                    while ($Attempt -le $CallMaxRetries)
+                    {
+                        Add-BatchCount 1 1
+                        try
+                        {
+                            $Response = Invoke-RestMethod -Method Post -Uri $Uri -Headers @{ Authorization = 'Bearer ' + $Token } -ContentType 'application/json' -Body $Body -TimeoutSec $CallTimeoutSeconds -ErrorAction Stop
+                            $Kind = $null
+                            break
+                        }
+                        catch
+                        {
+                            $LastError = [string]$_.Exception.Message
+                            $Status = Get-BatchStatusCode -Exception $_.Exception
+                            $Kind = if ($Status -in 401, 403) { 'Refused' }
+                            elseif ($Status -in 400, 404) { 'BadRequest' }
+                            elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
+                            else { 'Error' }
+                            if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
+                        }
+                        if ($Kind -in 'Refused', 'BadRequest') { break }
+                        if ($Attempt -lt $CallMaxRetries)
+                        {
+                            $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                            if ($Kind -eq 'Throttled') { $Backoff = [math]::Min($Backoff * 2, 60) }
+                            Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
+                        }
+                        $Attempt++
+                    }
+                    $Seconds = $Stopwatch.Elapsed.TotalSeconds
+                    $Attempts = [math]::Min($Attempt, $CallMaxRetries) + 1
+
+                    if ($null -ne $Kind)
+                    {
+                        if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
+                        {
+                            $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader (or Reader) on the subscription itself and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
+                        }
+                        $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
+                        Send-AllGroupsOn
+                        return
+                    }
+
+                    # Each answer back to its resource, ids compared without case.
+                    $Entries = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($Entry in @($Response.values))
+                    {
+                        if ($null -eq $Entry) { continue }
+                        $EntryId = ([string]$Entry.resourceid).TrimEnd('/')
+                        if (-not [string]::IsNullOrEmpty($EntryId) -and -not $Entries.ContainsKey($EntryId)) { $Entries[$EntryId] = $Entry }
+                    }
+                    $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    $Pairs = [System.Collections.Generic.List[object]]::new()
+                    foreach ($Group in $Unit.Groups)
+                    {
+                        $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
+                        if (-not $Entries.ContainsKey($GroupKey))
+                        {
+                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                            Add-BatchCount 5 @($Group).Count
+                            continue
+                        }
+                        [void]$AnsweredIds.Add($GroupKey)
+                        $ByName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        foreach ($Metric in @($Entries[$GroupKey].value))
+                        {
+                            if ($null -eq $Metric -or $null -eq $Metric.name) { continue }
+                            $MetricName = [string]$Metric.name.value
+                            if (-not [string]::IsNullOrEmpty($MetricName) -and -not $ByName.ContainsKey($MetricName)) { $ByName[$MetricName] = $Metric }
+                        }
+                        $Missing = [System.Collections.Generic.List[object]]::new()
+                        $GroupPairs = [System.Collections.Generic.List[object]]::new()
+                        foreach ($Def in $Group)
+                        {
+                            $Metric = $null
+                            if ($ByName.TryGetValue([string]$Def.MetricName, [ref]$Metric) -and [string]$Metric.errorCode -eq 'Success')
+                            {
+                                $GroupPairs.Add([pscustomobject]@{ Def = $Def; Query = (ConvertTo-BatchMetricQuery -Metric $Metric) })
+                            }
+                            else
+                            {
+                                $Missing.Add($Def)
+                            }
+                        }
+                        if ($GroupPairs.Count -eq 0)
+                        {
+                            # Nothing usable for this resource: its group as without -UseMetricsBatch.
+                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
+                            Add-BatchCount 5 @($Group).Count
+                            continue
+                        }
+                        foreach ($Pair in $GroupPairs) { $Pairs.Add($Pair) }
+                        foreach ($Def in $Missing)
+                        {
+                            # A metric with an errorCode other than Success, or not in the answer: one request of its own.
+                            $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = [object[]]@($Def) })
+                            Add-BatchCount 5 1
+                        }
+                    }
+                    Add-BatchCount 3 $AnsweredIds.Count
+                    Add-BatchCount 4 $Pairs.Count
+                    if ($Pairs.Count -gt 0)
+                    {
+                        $Outcomes.Add([pscustomobject]@{ Kind = 'Answered'; Pairs = $Pairs; Attempts = $Attempts; Seconds = $Seconds })
+                    }
+                } -ThrottleLimit $ConcurrencyLimit
+
+                foreach ($Outcome in $BatchOutcomes)
+                {
+                    if ($Outcome.Kind -eq 'Fallback') { $DispatchItems.Add($Outcome.Group) }
+                    else { $DispatchItems.Add([pscustomobject]@{ RdaAnswered = $true; Pairs = $Outcome.Pairs; Attempts = $Outcome.Attempts; Seconds = $Outcome.Seconds }) }
+                }
+                $BatchOutcomes = $null
+                $BatchUnits = $null
+            }
+
+            # Each parallel item is one group of definitions, or, with -UseMetricsBatch,
+            # the definitions one batch request answered.
+            $DispatchItems | ForEach-Object -Parallel {
                 $AzContext = $using:MetricAzContext
                 $CallTimeoutSeconds = $using:MetricTimeoutSeconds
                 $CallMaxRetries = $using:MetricMaxRetries
@@ -937,6 +1405,18 @@ if ($Task -eq 'Processing')
                     $MetricBag.Add($Obj)
                 }
 
+                # Definitions a batch request answered: their records are built here, with
+                # the same Add-MetricRecord, so they match the per-resource path's.
+                if ($_ -isnot [System.Array] -and $null -ne $_.PSObject.Properties['RdaAnswered'])
+                {
+                    $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $_.Attempts; ErrorMessage = $null; BadRequest = $false }
+                    foreach ($Pair in $_.Pairs)
+                    {
+                        Add-MetricRecord -Def $Pair.Def -Request $Answered -MetricQuery $Pair.Query -ExtraSeconds $_.Seconds
+                    }
+                    return
+                }
+
                 $GroupDefs = @($_)
                 $CallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -1093,6 +1573,15 @@ if ($Task -eq 'Processing')
     # so the request count is reported on the next line.
     Write-MetricsDiag ("Metric definitions: {0} | Success: {1} | Timeout: {2} | Throttled: {3} | Error: {4} | Elapsed: {5}s" -f $DiagTotal, $OkCount, $TimeoutCount, $ThrottledCount, $ErrorCount, [math]::Round($PhaseStopwatch.Elapsed.TotalSeconds, 1))
     Write-MetricsDiag ("Azure Monitor requests: {0} for {1} metric definition(s), of which {2} single-metric fallback request(s); retries not counted" -f $MetricRequestCounts[0], $MetricCount, $MetricRequestCounts[1])
+    if ($UseMetricsBatch)
+    {
+        # The per-resource requests above include those made for what the batch could not answer.
+        Write-MetricsDiag ("Metrics batch (-UseMetricsBatch): {0} getBatch request(s) ({1} attempt(s)) for {2} resource(s); {3} resource(s) answered, {4} metric definition(s) answered, {5} sent on to the per-resource path." -f $MetricBatchCounts[0], $MetricBatchCounts[1], $MetricBatchCounts[2], $MetricBatchCounts[3], $MetricBatchCounts[4], $MetricBatchCounts[5])
+        foreach ($Note in @($MetricBatchNotes | Sort-Object))
+        {
+            Write-MetricsDiag ('[batch] ' + $Note)
+        }
+    }
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
@@ -1148,4 +1637,6 @@ if ($Task -eq 'Processing')
 
     $MetricDefs = $null;
     $MetricGroups = $null
+    $MetricBatchTokens = $null
+    $BatchTokenValues = $null
 }

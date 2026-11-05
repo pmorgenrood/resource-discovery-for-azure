@@ -56,6 +56,7 @@ param (
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
     [switch] $IncludeNetworkResources,
+    [switch] $UseMetricsBatch,
     [int]    $ConcurrencyLimit = 6,
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
@@ -278,6 +279,7 @@ if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
+if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart)) { $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowStart }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowEnd)) { $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowEnd }
