@@ -496,6 +496,11 @@ if ($PreflightOnly)
     Write-Host ('  PowerShell {0}, az, and the Az modules ({1}) with Az.Accounts loaded: ok.' -f $PSVersionTable.PSVersion, ($RequiredAzSubModules -join ', ')) -ForegroundColor Green
 }
 
+# Read by Exit-Wrapper at every exit, so it is set before the first one (the
+# -SubscriptionID check below exits before the transcript is started), and a
+# run under Set-StrictMode never reads it unset.
+$WrapperTranscriptStarted = $false
+
 # -SubscriptionID must be a subscription id (a GUID). Checked here, before the
 # run creates or writes any file (the inventory folder, the transcript), so a
 # mistyped id never starts a run. Given but empty is a mistake too, never a run
@@ -546,7 +551,6 @@ $Global:CollectorFailures = @()
 # A -PreflightOnly run skips all of this: it creates no inventory folder, starts
 # no transcript, and does not run Invoke-PreFlightChecks (its write probe writes
 # a file there). Nothing on its path below uses $InventoryRoot.
-$WrapperTranscriptStarted = $false
 if (-not $PreflightOnly)
 {
     # Inventory root (used for resume state, consolidated output, and the wrapper
@@ -825,14 +829,35 @@ if ($PreflightOnly)
         $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
         $PfStateFile = Join-Path $PfRoot (".resume-state-{0}.json" -f $ResumeKey)
         $PfBefore = $Subscriptions.Count
+        # The lists the run would work from, after it folds in the per-stream
+        # state files of an interrupted parallel run as it does at its start
+        # (read only here: nothing is written back).
+        $PfCompleted = @(Get-CompletedSubscriptionIds -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $PfFailed = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ })
+        $PfStreamCompleted = @()
+        $PfStreamFailed = @()
+        foreach ($PfStreamFile in @(Get-StreamResumeStateFiles -InventoryRoot $PfRoot -Tenant $ResumeKey))
+        {
+            try
+            {
+                $PfObj = Get-Content -Path $PfStreamFile.FullName -Raw | ConvertFrom-Json
+                if ($null -ne $PfObj.Completed) { $PfStreamCompleted += @($PfObj.Completed | ForEach-Object { [string]$_ }) }
+                if ($null -ne $PfObj.FailedAttempts) { $PfStreamFailed += @($PfObj.FailedAttempts) }
+            }
+            catch
+            {
+                Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $PfStreamFile.FullName, $_.Exception.Message)
+            }
+        }
+        if ($PfStreamCompleted.Count -gt 0) { $PfCompleted = @($PfCompleted + $PfStreamCompleted | Sort-Object -Unique) }
+        $PfFailed = @(Merge-FailedAttempts -ExistingFailedAttempts $PfFailed -StreamFailedAttempts $PfStreamFailed -CompletedIds $PfCompleted | Where-Object { $null -ne $_ })
         if ($ResumeFailedOnly)
         {
-            $PfFailedIds = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+            $PfFailedIds = @($PfFailed | ForEach-Object { [string]$_.Id })
             $Subscriptions = @($Subscriptions | Where-Object { $PfFailedIds -contains [string]$_.Id })
         }
         else
         {
-            $PfCompleted = @(Get-CompletedSubscriptionIds -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ })
             $Subscriptions = @($Subscriptions | Where-Object { $PfCompleted -notcontains [string]$_.Id })
         }
         if ($Subscriptions.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (an earlier run completed the others, or -ResumeFailedOnly leaves them out); only those are checked.' -f $Subscriptions.Count, $PfBefore) -ForegroundColor Cyan }

@@ -229,6 +229,18 @@ exit 0
                 else { 'file|{0}|{1}|{2}|{3}' -f $_.FullName, $_.Length, $_.LastWriteTimeUtc.Ticks, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
             })
     }
+    # The entry names of the newest consolidated zip with ids and times
+    # replaced, so two runs' zips can be compared by shape; and the inner
+    # per-subscription reports it holds.
+    function script:Get-NewestBundleShape
+    {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Newest = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip' | Sort-Object LastWriteTimeUtc | Select-Object -Last 1)
+        if ($Newest.Count -eq 0) { return @() }
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($Newest[0].FullName)
+        try { @($Archive.Entries | ForEach-Object { ($_.FullName -replace '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<id>') -replace '\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', '<time>' -replace '\d{8,}', '<stamp>' } | Sort-Object) }
+        finally { $Archive.Dispose() }
+    }
     function script:Get-FileHashOrNone { param([string]$Path) if (Test-Path -LiteralPath $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } else { 'none' } }
     # The ids a resume state file lists as completed and as failed.
     function script:Read-StateAt
@@ -354,6 +366,14 @@ Describe 'Run-AllSubscriptions.ps1 -SubscriptionID, end to end' -Skip:($IsWindow
         # A clean run clears its own state; none of the whole tenant was written.
         Test-Path -LiteralPath (script:Get-OneState 'B') | Should -BeFalse
         Test-Path -LiteralPath $script:State | Should -BeFalse
+        # Its zip has the entries of a run on a tenant that holds only B.
+        $Shape = script:Get-NewestBundleShape
+        @($Shape | Where-Object { $_ -like '*.zip' }).Count | Should -Be 1
+        script:New-Case
+        script:Set-Scenario -Subs 'B'
+        $Plain = script:Invoke-Wrapper
+        $Plain.ExitCode | Should -Be 0
+        script:Get-NewestBundleShape | Should -Be $Shape
     }
 
     It 'stops a non-GUID id with exit 1 before it creates the inventory folder' -ForEach @(
@@ -537,6 +557,48 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $R.ExitCode | Should -Be $Code
         @($R.Text | Where-Object { $_ -like '  The run would collect * of these 3 subscription(s)*' }).Count | Should -Be 1
         script:Get-RootSnapshot | Should -Be $Before
+    }
+
+    It 'after an interrupted parallel run, checks what the run would collect from the per-stream state: <Case>' -ForEach @(
+        @{ Case = '-ResumeFailedOnly checks the subscription only a per-stream file has on its retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1; Collect = 1 }
+        @{ Case = '-Resume leaves out the subscription only a per-stream file has completed'; Extra = @('-Resume'); Denied = 'A'; Code = 0; Collect = 2 }
+    ) {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @(); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        [pscustomobject]@{ Tenant = $script:Tenant; StreamId = '0'; Completed = @($script:Subs['A'].Id); FailedAttempts = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = 'Sub B'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'earlier failure'; Attempts = 1 }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
+        $Before = script:Get-RootSnapshot
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        $R = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + $Extra)
+        $R.ExitCode | Should -Be $Code
+        @($R.Text | Where-Object { $_ -like ('  The run would collect {0} of these 3 subscription(s)*' -f $Collect) }).Count | Should -Be 1
+        script:Get-RootSnapshot | Should -Be $Before
+    }
+
+    It 'stops an id that is not a GUID with exit 1 under Set-StrictMode -Version Latest, with no strict-mode error' -ForEach @(@{ Value = 'not-a-guid' }) {
+        script:New-Case
+        script:Set-Scenario -Subs 'A'
+        $Command = "Set-StrictMode -Version Latest; & '{0}' -TenantID '{1}' -SubscriptionID '{2}'; exit `$LASTEXITCODE" -f $script:Wrapper, $script:Tenant, $Value
+        $Info = [System.Diagnostics.ProcessStartInfo]::new($script:Pwsh)
+        foreach ($Arg in @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $Command)) { $Info.ArgumentList.Add($Arg) }
+        $Info.UseShellExecute = $false
+        $Info.RedirectStandardInput = $true
+        $Info.RedirectStandardOutput = $true
+        $Info.RedirectStandardError = $true
+        $Info.Environment['HOME'] = $script:CaseHome
+        $Info.Environment['PSModulePath'] = $script:Modules
+        $Info.Environment['PATH'] = $script:Bin + [System.IO.Path]::PathSeparator + $env:PATH
+        $Info.Environment['RDA_STANDIN_AZURE'] = $script:Scenario
+        $Info.Environment['RDA_STANDIN_TENANT'] = $script:Tenant
+        $Proc = [System.Diagnostics.Process]::Start($Info)
+        $Proc.StandardInput.Close()
+        $Out = $Proc.StandardOutput.ReadToEndAsync()
+        $Err = $Proc.StandardError.ReadToEndAsync()
+        $Proc.WaitForExit(120000) | Should -BeTrue
+        $Proc.ExitCode | Should -Be 1
+        [string]$Err.Result | Should -BeNullOrEmpty
+        ([string]$Out.Result) | Should -BeLike ("*ERROR: -SubscriptionID '{0}' cannot be used*" -f $Value)
+        Test-Path -LiteralPath $script:Root | Should -BeFalse
     }
 }
 
