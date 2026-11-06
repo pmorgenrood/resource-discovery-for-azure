@@ -9,7 +9,7 @@ BeforeAll {
     $script:MetricsSrc = Get-Content -LiteralPath (Join-Path $Repo 'Extension/Metrics.ps1') -Raw
     $Tokens = $null; $Errors = $null
     $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
-    foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricNotFound')
+    foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricNotFound', 'Test-MetricBadRequest')
     {
         $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $Name }, $true) | Select-Object -First 1
         if (-not $FnAst) { throw "$Name was not found in Extension/Metrics.ps1" }
@@ -108,6 +108,14 @@ Describe 'Test-MetricNotFound' {
             $Ex = [System.Net.Http.HttpRequestException]::new("[ResourceNotFound] : The Resource 'x' was not found.", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
         }
         Test-MetricNotFound -Exception $Ex | Should -BeFalse
+    }
+}
+
+Describe 'Test-MetricBadRequest on the shared status helper' {
+    It 'reads the exception''s own status when its response has no status value (<Code>)' -ForEach @(@{ Code = 'BadRequest'; Want = $true }, @{ Code = 'ServiceUnavailable'; Want = $false }) {
+        $Ex = [System.Net.Http.HttpRequestException]::new('The request failed.', $null, [System.Net.HttpStatusCode]$Code)
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $null })
+        Test-MetricBadRequest -Exception $Ex | Should -Be $Want
     }
 }
 
