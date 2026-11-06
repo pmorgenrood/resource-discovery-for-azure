@@ -90,6 +90,19 @@ Describe 'Test-MetricNotFound' {
         }
         Test-MetricNotFound -Exception $Ex | Should -BeTrue
     }
+
+    It 'reads the newer SDK form only when no exception carries a status: a 503 with it keeps its retries (<Label>)' -ForEach @(@{ Label = 'error code in the body'; Body = $true }, @{ Label = 'error code in the message'; Body = $false }) {
+        if ($Body)
+        {
+            $Ex = [System.Net.Http.HttpRequestException]::new('busy', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
+            $Ex | Add-Member -NotePropertyName Body -NotePropertyValue ([PSCustomObject]@{ Code = 'ResourceNotFound' })
+        }
+        else
+        {
+            $Ex = [System.Net.Http.HttpRequestException]::new("[ResourceNotFound] : The Resource 'x' was not found.", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
+        }
+        Test-MetricNotFound -Exception $Ex | Should -BeFalse
+    }
 }
 
 Describe 'Get-MetricDeletingState' {
