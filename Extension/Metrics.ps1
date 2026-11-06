@@ -1465,7 +1465,8 @@ function Add-MetricRecord
                     {
                         $StatusCode = $Ex.Response.StatusCode
                     }
-                    elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                    # A response with no status value does not hide the exception's own status.
+                    if ($null -eq $StatusCode -and $null -ne $Ex.PSObject.Properties['StatusCode'])
                     {
                         $StatusCode = $Ex.StatusCode
                     }
