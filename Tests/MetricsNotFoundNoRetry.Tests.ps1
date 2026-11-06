@@ -71,6 +71,12 @@ Describe 'Test-MetricNotFound' {
         Test-MetricNotFound -Exception $Ex | Should -Be $Want
     }
 
+    It 'reads the exception''s own status when its response has no status value (<Code>)' -ForEach @(@{ Code = 'NotFound'; Message = 'The request failed.'; Want = $true }, @{ Code = 'ServiceUnavailable'; Message = "upstream: Operation returned an invalid status code 'NotFound'"; Want = $false }) {
+        $Ex = [System.Net.Http.HttpRequestException]::new($Message, $null, [System.Net.HttpStatusCode]$Code)
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $null })
+        Test-MetricNotFound -Exception $Ex | Should -Be $Want
+    }
+
     It 'follows a wrapped error record whose exception holds the 404, under a neutral outer message' {
         $Inner = [System.Exception]::new("Operation returned an invalid status code 'NotFound'")
         $Outer = [System.Exception]::new('The running command stopped.')
