@@ -3,14 +3,14 @@
 # Run with: Invoke-Pester ./Tests/DataIntegrity.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    $ZipPath = if ($env:TEST_ZIP_PATH) { $env:TEST_ZIP_PATH } else
-    {
-        Get-ChildItem -Path $PSScriptRoot -Filter "ResourcesReport_*.zip" |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # $env:TEST_ZIP_PATH, else the newest Tests/ResourcesReport_*.zip, else a
+    # synthetic report generated offline (Tests/Helpers/SyntheticReportZip.ps1).
+    . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+    $script:Fixture = Get-RdaTestReportZip
+    $ZipPath = $script:Fixture.ZipPath
     if ([string]::IsNullOrEmpty($ZipPath) -or -not (Test-Path $ZipPath))
     {
-        throw "No test zip found. Copy a ResourcesReport_*.zip to Tests/ or set `$env:TEST_ZIP_PATH"
+        throw ("No test zip found, and generating a synthetic one failed (exit {0}):`n{1}" -f $script:Fixture.Exit, $script:Fixture.Console)
     }
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "/tmp" }
     $script:ExtractPath = Join-Path $TmpBase ("DataIntTest_" + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -29,9 +29,13 @@ BeforeAll {
 
     $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
-    # Detect obfuscation mode: if any resource ID matches the obfuscation
-    # pattern, treat the run as obfuscated. The PII-leak Describe later
-    # also depends on this signal.
+    # Detect obfuscation mode: if any resource ID starts like a masked id (its
+    # subscription segment a token) or is a token (an id that is not an ARM id),
+    # treat the run as obfuscated. Only the start is read, so an id that leaks a
+    # real segment further on still marks the run obfuscated and is caught by
+    # the checks below rather than turning them into skips. The PII-leak
+    # Describe later also depends on this signal.
+    $script:ObfuscatedRunSignal = '^(/subscriptions/)?(prod|nonprod)_'
     $script:IsObfuscated = $false
     if ($null -ne $script:Inventory)
     {
@@ -40,7 +44,7 @@ BeforeAll {
             ForEach-Object {
                 @($_.Value) | ForEach-Object {
                     if ($script:IsObfuscated) { return }
-                    if ($null -ne $_ -and $null -ne $_.ID -and $_.ID -match $script:ObfuscationPattern)
+                    if ($null -ne $_ -and $null -ne $_.ID -and $_.ID -match $script:ObfuscatedRunSignal)
                     {
                         $script:IsObfuscated = $true
                     }
@@ -50,6 +54,7 @@ BeforeAll {
 }
 
 AfterAll {
+    Remove-RdaTestReportZip $script:Fixture
     if (Test-Path $script:ExtractPath) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
 }
 

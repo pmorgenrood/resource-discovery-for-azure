@@ -24,8 +24,9 @@ if ($Task -eq 'Processing')
                 'ResourceGroup'       = $1.RESOURCEGROUP;
                 'Name'                = $1.NAME;
                 'Location'            = $1.LOCATION;
-                'SKU'                 = $Data.sku.name;
-                'Capacity'            = $Data.sku.capacity;
+                # The SKU is on the resource itself, not in its properties.
+                'SKU'                 = $1.sku.name;
+                'Capacity'            = $1.sku.capacity;
                 'CreatedBy'           = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { Protect-FreeTextValue $Data.createdBy } else { $Data.createdBy };
                 'FriendlyName'        = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { Protect-FreeTextValue $Data.friendlyName } else { $Data.friendlyName };
                 'CreatedTime'         = $Timecreated;

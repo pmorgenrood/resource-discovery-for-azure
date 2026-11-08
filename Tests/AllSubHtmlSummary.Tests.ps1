@@ -23,6 +23,9 @@ BeforeAll {
     $FunctionsFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/AllSubHtmlSummary.Functions.ps1'
     if (-not (Test-Path $FunctionsFile)) { throw "AllSubHtmlSummary.Functions.ps1 not found at $FunctionsFile" }
     . $FunctionsFile
+    # The wrapper loads Common before it passes metrics entries: their two kinds
+    # are told apart by Test-MetricsIncompleteEntry there.
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
 
     $script:TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AllSubHtmlSummaryTest_' + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $script:TmpRoot -Force | Out-Null
@@ -138,7 +141,23 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         (Get-Card $Html 'Empty (0 resources)') | Should -Be '1'
         (Get-Card $Html 'Failed') | Should -Be '2'
         $Html | Should -Match 'failed to process'
-        $Html | Should -Match 'returned 0 resources'
+        $Html | Should -Match '1 subscription\(s\) have 0 resources in their report'
+    }
+
+    It 'says what a report with 0 resources means, without naming read access as a cause' {
+        # Every subscription a run collects passed the up-front role check, and a
+        # report lists only the types a collector covers, so a subscription with
+        # only virtual networks has 0 resources in its report.
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{ VirtualMachines = 3 } -SubName 'Sub A' | Out-Null
+        New-SubFolder -Root $Run -Services @{} -SubName 'Network Only Sub' | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'hold no resources of the types this tool reports'
+        $Html | Should -Not -Match 'Reader'
+        $Html | Should -Not -Match 'permission'
     }
 
     It 'detects obfuscated posture from prod_/nonprod_ tokens' {
@@ -160,6 +179,42 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
         $Html = Get-Content -Path $Out -Raw
         $Html | Should -Match 'privacy-banner identifiable'
+    }
+
+    It 'shows the obfuscated banner under -Obfuscated when the reports hold no records to sample' {
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{} -Obfuscated | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'privacy-banner obfuscated'
+        $Html | Should -Not -Match 'privacy-banner identifiable'
+    }
+
+    It 'shows the identifiable banner without -Obfuscated when the reports hold no records to sample' {
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{} -SubName 'sub-a' | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'privacy-banner identifiable'
+        $Html | Should -Not -Match 'privacy-banner obfuscated'
+    }
+
+    It 'says Privacy: <Expected> on the console line when the reports hold no records to sample (-Obfuscated: <Obf>)' -ForEach @(
+        @{ Obf = $true; Expected = 'obfuscated' }
+        @{ Obf = $false; Expected = 'identifiable' }
+    ) {
+        $Run = New-Run
+        if ($Obf) { New-SubFolder -Root $Run -Services @{} -Obfuscated | Out-Null } else { New-SubFolder -Root $Run -Services @{} -SubName 'sub-a' | Out-Null }
+        $Out = Join-Path $Run 'main.html'
+
+        $Printed = @(New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated:$Obf 6>&1 | ForEach-Object { [string]$_ })
+        $Line = @($Printed | Where-Object { $_ -like '*Privacy:*' })
+        $Line.Count | Should -Be 1
+        $Line[0] | Should -BeLike ('* failed. Privacy: {0}.' -f $Expected)
     }
 
     It 'renders run-wide charts only when -Detailed is passed' {
@@ -392,7 +447,7 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
         # But the banners (and their counts) still render so the operator sees the health signal.
         $Html | Should -Match 'failed to process'
         $Html | Should -Match 'consumption \(billing\) issues'
-        $Html | Should -Match 'metrics issues'
+        $Html | Should -Match 'Metrics auth-skipped: 1 subscription\(s\)'
     }
 
     It 'without -Obfuscated a non-obfuscated bundle still lists the affected subscription names' {
@@ -407,5 +462,162 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
 
         $Html | Should -Match 'Tenant:' -Because 'an identifiable bundle shows the tenant'
         $Html | Should -Match 'Fabrikam-Billing' -Because 'an identifiable bundle names the affected subs'
+    }
+}
+
+# A consumption failure entry names the report folder its run writes to
+# (ReportFolder, set by ResourceInventory.ps1). The row of that folder says
+# 'consumption incomplete', so the summary says which subscription is missing
+# cost data even when every name on it is an obfuscation token.
+Describe 'New-RdaAllSubHtmlSummary marks the row of a subscription whose consumption failed' {
+    BeforeAll {
+        # Health tag of the row whose report link points into the given folder.
+        function Get-RowHealth
+        {
+            param([string]$Html, [string]$Folder)
+            $M = [regex]::Match($Html, ('<td><span class="tag [a-z]+">([^<]*)</span></td><td><a href="' + [regex]::Escape($Folder) + '[/\\]'))
+            if ($M.Success) { return $M.Groups[1].Value }
+            return '<no row for this folder>'
+        }
+    }
+
+    It 'under -Obfuscated, only the failed subscription''s row says consumption incomplete and no real name appears' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam-Billing'; Id = '12345678-1234-1234-1234-123456789012'; Message = 'usage page failed'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+        $Html | Should -Match '<b>1 subscription\(s\) had consumption \(billing\) issues\.</b>' -Because 'the banner is unchanged'
+        $Html | Should -Not -Match 'Fabrikam-Billing'
+        $Html | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+    }
+
+    It 'without -Obfuscated, the row is marked the same way' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -SubName 'Contoso Production')
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -SubName 'Fabrikam Billing')
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam Billing'; Id = '12345678-1234-1234-1234-123456789012'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+    }
+
+    It 'the row of a subscription whose metrics were skipped for sign-in says metrics incomplete, under -Obfuscated too' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $C = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+        $Skip = 'Metrics phase skipped: no usable Azure context/token after one reconnect attempt.'
+        $MetricsSkips = @(
+            [pscustomobject]@{ Name = 'y'; Id = 'sub-b'; Message = $Skip; ReportFolder = $B }
+            [pscustomobject]@{ Name = 'z'; Id = 'sub-c'; Message = $Skip; ReportFolder = $C }
+        )
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'x'; Id = 'sub-c'; ReportFolder = $C }) `
+            -MetricsFailedSubs $MetricsSkips | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'metrics incomplete'
+        Get-RowHealth -Html $Html -Folder $C | Should -Be 'consumption and metrics incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+    }
+
+    It 'a subscription with 0 resources whose consumption failed says consumption incomplete and still counts as empty' {
+        $Run = New-Run
+        $E = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{} -Obfuscated)
+        New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated | Out-Null
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'x'; Id = 'sub-e'; ReportFolder = $E }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $E | Should -Be 'consumption incomplete'
+        Get-Card $Html 'Empty (0 resources)' | Should -Be '1'
+    }
+
+    It 'an entry with no usable ReportFolder marks no row: <Case>' -TestCases @(
+        @{ Case = 'no ReportFolder field (an entry written before the field existed)'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x' } } },
+        @{ Case = 'null'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = $null } } },
+        @{ Case = 'empty'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = '' } } },
+        @{ Case = 'whitespace'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = '   ' } } },
+        @{ Case = 'a number'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 5 } } },
+        @{ Case = 'a folder of another run'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = 'ResourcesReport000000000000' } } },
+        @{ Case = 'the folder name with a path in front'; Entry = { param($A) [pscustomobject]@{ Name = 'x'; Id = 'sub-x'; ReportFolder = ('/somewhere/' + $A) } } },
+        @{ Case = 'the sign-in skip entry without a ReportFolder'; Entry = { param($A) [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)' } } }
+    ) {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        { New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated -ConsumptionFailedSubs @((& $Entry $A)) | Out-Null } | Should -Not -Throw
+        Get-RowHealth -Html (Get-Content -Path $Out -Raw) -Folder $A | Should -Be 'ok'
+    }
+
+    It 'a consumption phase skipped for sign-in marks the row of the folder it names, and the banner still does not count it' {
+        $Run = New-Run
+        $A = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 2 } -Obfuscated)
+        $B = Split-Path -Leaf (New-SubFolder -Root $Run -Services @{ VirtualMachines = 1 } -Obfuscated)
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -Obfuscated `
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped'; ReportFolder = $B }) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+
+        Get-RowHealth -Html $Html -Folder $B | Should -Be 'consumption incomplete'
+        Get-RowHealth -Html $Html -Folder $A | Should -Be 'ok'
+        $Html | Should -Not -Match 'had consumption \(billing\) issues' -Because 'the banner does not count a sign-in skip (unchanged)'
+    }
+}
+
+# The metrics phase of ResourceInventory.ps1 (CreateMetricsJob), lifted from its
+# AST and run as written, records the report folder on the entry it adds when
+# the sign-in cannot be refreshed, as the consumption phase does, so the main
+# summary can mark that row.
+Describe 'ResourceInventory.ps1 names the report folder when metrics are skipped for sign-in' {
+    BeforeAll {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'CreateMetricsJob' }, $true))
+        if ($Fn.Count -ne 1) { throw 'CreateMetricsJob was not found in ResourceInventory.ps1.' }
+        . ([scriptblock]::Create($Fn[0].Extent.Text))
+        # Write-Log, which the lifted function calls.
+        . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
+        function Test-DataPlaneAuthReady { param($Phase) $false }
+        Mock Write-Log { }
+    }
+
+    BeforeEach {
+        $script:Saved = @{}
+        foreach ($Name in @('MetricsFailedSubs', 'Subscriptions', 'DefaultPath', 'AzMetrics')) { $script:Saved[$Name] = Get-Variable -Name $Name -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    }
+
+    AfterEach {
+        foreach ($Name in $script:Saved.Keys) { Set-Variable -Name $Name -Scope Global -Value $script:Saved[$Name] }
+        Remove-Variable -Name SkipMetrics, SubscriptionID -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    It 'records ReportFolder, the run''s report folder name, on each subscription''s entry' {
+        $Global:MetricsFailedSubs = @()
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' })
+        $Sep = [IO.Path]::DirectorySeparatorChar
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport202611020000000000000') + $Sep
+        $script:SkipMetrics = [switch]$false
+        $script:SubscriptionID = 'sub-b'
+        CreateMetricsJob
+        @($Global:MetricsFailedSubs).Count | Should -Be 1
+        $Global:MetricsFailedSubs[0].Id | Should -Be 'sub-b'
+        $Global:MetricsFailedSubs[0].ReportFolder | Should -Be 'ResourcesReport202611020000000000000'
     }
 }

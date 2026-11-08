@@ -10,6 +10,13 @@
 #     point's Count, not from the number of data points;
 #   - a group that Azure rejects with BadRequest is not retried and falls back to
 #     one call per metric, so only the invalid metric is marked as an error;
+#   - a group that fails for another reason (throttling, server error) is retried
+#     and does not fall back to one call per metric;
+#   - a request, grouped or for one metric, that still fails after its retries
+#     for a reason other than BadRequest makes its subscription metrics
+#     incomplete, and each subscription's entry counts its own failed resources;
+#   - one call never asks for more than 20 metric names;
+#   - the diagnostics summary counts metric definitions, not calls;
 #   - each metric's diagnostics time is the time of the request that answered it;
 #   - a batch written to Metrics_*.json never splits one call's metrics, and
 #     there are no more batches than with one definition at a time.
@@ -95,6 +102,24 @@ function Get-AzMetric
         'Status500Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::InternalServerError) }
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
+        'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
+    }
+    # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
+    switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
+    {
+        'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
+        'ServiceUnavailable' { throw "Operation returned an invalid status code 'ServiceUnavailable'" }
+        'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        # A 404 as Get-AzMetric reports it, with the status phrase only in the message.
+        'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
+        # A 404 that carries the status code but names no status in its message.
+        'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource was not found.', $null, [System.Net.HttpStatusCode]::NotFound) }
+        # A 404 whose message also holds text the loose throttle match would meet ('429').
+        'NotFoundWith429Text' { throw "Operation returned an invalid status code 'NotFound' for request 4291" }
+        # A 5xx that quotes a 404, and a 5xx that wraps one: the status code decides, so both keep their retries.
+        'Status503WithNotFoundText' { throw [System.Net.Http.HttpRequestException]::new("upstream: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -159,12 +184,12 @@ Export-ModuleMember -Function Get-AzMetric
 
     function New-TestResource
     {
-        param([string]$Type, [string]$Provider, [string]$Name, [string]$Kind = '', [string]$ManagedBy = '')
+        param([string]$Type, [string]$Provider, [string]$Name, [string]$Kind = '', [string]$ManagedBy = '', [string]$SubscriptionId = $script:SubscriptionId)
 
         return [PSCustomObject]@{
             TYPE           = $Type
-            Id             = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/{1}/{2}' -f $script:SubscriptionId, $Provider, $Name
-            subscriptionId = $script:SubscriptionId
+            Id             = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/{1}/{2}' -f $SubscriptionId, $Provider, $Name
+            subscriptionId = $SubscriptionId
             ResourceGroup  = 'rg-metrics-test'
             Name           = $Name
             Location       = 'westeurope'
@@ -175,9 +200,9 @@ Export-ModuleMember -Function Get-AzMetric
 
     function New-TestDisk
     {
-        param([string]$Name)
+        param([string]$Name, [string]$SubscriptionId = $script:SubscriptionId)
 
-        return New-TestResource -Type 'microsoft.compute/disks' -Provider 'Microsoft.Compute/disks' -Name $Name -ManagedBy ('/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/virtualMachines/vm-owner' -f $script:SubscriptionId)
+        return New-TestResource -Type 'microsoft.compute/disks' -Provider 'Microsoft.Compute/disks' -Name $Name -SubscriptionId $SubscriptionId -ManagedBy ('/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/virtualMachines/vm-owner' -f $SubscriptionId)
     }
 
     # Runs Metrics.ps1 against the stand-in module and returns the calls it made,
@@ -185,7 +210,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [object[]]$Subscriptions = $script:Subscriptions)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -201,13 +226,14 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_INVALID = $Invalid
         $env:RDA_TEST_METRIC_OMIT = $Omit
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
+        $env:RDA_TEST_METRIC_SINGLE_ERROR = $SingleError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $env:RDA_TEST_METRIC_POINTS = $PointsFile
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
         try
         {
-            $null = & $script:MetricsScript -Subscriptions $script:Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
+            $null = & $script:MetricsScript -Subscriptions $Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
         }
         finally
         {
@@ -245,7 +271,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_METRIC_SINGLE_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -316,6 +342,35 @@ Describe 'Metrics.ps1 metric grouping key' {
         @($Groups[1] | ForEach-Object { $_.MetricName }) | Should -Be @('m3')
         @($Groups[2] | ForEach-Object { $_.MetricName }) | Should -Be @('m4')
         @($Groups[3] | ForEach-Object { $_.MetricName }) | Should -Be @('m5')
+    }
+
+    It 'puts at most 20 metric names in one group' {
+        $Id = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/disks/disk-many' -f $script:SubscriptionId
+        $Defs = @(1..45 | ForEach-Object {
+                [PSCustomObject]@{ MetricName = ('m{0:d2}' -f $_); Id = $Id; StartTime = $script:Start; EndTime = $script:End; Interval = '1:00:00'; Aggregation = 'Maximum' }
+            })
+
+        $Groups = Group-MetricDefinition -MetricDefs $Defs
+
+        $Groups.Count | Should -Be 3
+        @($Groups | ForEach-Object { @($_).Count }) | Should -Be @(20, 20, 5)
+        @($Groups | ForEach-Object { $_ } | ForEach-Object { $_.MetricName }) | Should -Be @($Defs | ForEach-Object { $_.MetricName })
+    }
+
+    It 'keeps definitions that share a metric name in one group when splitting at 20 names' {
+        $Id = '/subscriptions/{0}/resourceGroups/rg-metrics-test/providers/Microsoft.Compute/disks/disk-dup' -f $script:SubscriptionId
+        # 21 distinct names; 'm01' is defined twice, the second time after the 20th name.
+        $Names = @(1..21 | ForEach-Object { 'm{0:d2}' -f $_ }) + @('m01')
+        $Defs = @($Names | ForEach-Object {
+                [PSCustomObject]@{ MetricName = $_; Id = $Id; StartTime = $script:Start; EndTime = $script:End; Interval = '1:00:00'; Aggregation = 'Maximum' }
+            })
+
+        $Groups = Group-MetricDefinition -MetricDefs $Defs
+
+        $Groups.Count | Should -Be 2
+        @($Groups[0] | ForEach-Object { $_.MetricName } | Select-Object -Unique).Count | Should -Be 20
+        @($Groups[0] | Where-Object { $_.MetricName -eq 'm01' }).Count | Should -Be 2
+        @($Groups[1] | ForEach-Object { $_.MetricName }) | Should -Be @('m21')
     }
 
     It 'never groups definitions of different resources' {
@@ -458,20 +513,47 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-wrapped503' -MultiError 'Status500Wrapping503'
 
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
-        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        # Not a BadRequest, so the group's metrics are not requested again one by one.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
     }
 
-    It 'retries a grouped request that fails for another reason before falling back' {
+    It 'retries a grouped request that fails for another reason and does not fall back to one request per metric' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-server-error' -MultiError 'ServerError'
 
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
-        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
-        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
-        $RunMap = ConvertTo-RecordMap -Records $Run.Records
-        foreach ($Key in $CleanMap.Keys)
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError -and $_.MetricValue -eq 0 -and $_.MetricTotalCount -eq 0 }).Count | Should -Be 4
+        @(($script:DiskMetricNames | Sort-Object)) | Should -Be @($Run.Records | ForEach-Object { $_.Metric } | Sort-Object)
+        # Each metric carries the group request's outcome and attempts.
+        foreach ($Name in $script:DiskMetricNames)
         {
-            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=4 .*InternalServerError' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
+        @($Run.DebugLines | Where-Object { $_ -match 'Azure Monitor requests: 1 for 4 metric definition\(s\), of which 0 single-metric fallback request\(s\)' }).Count | Should -Be 1
+    }
+
+    It 'retries a throttled grouped request and does not fall back to one request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-throttled' -MultiError 'Throttled'
+
+        # Throttled attempts have their own budget: 1 + 6 retries.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 7
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+    }
+
+    It 'counts metric definitions, not calls, in the diagnostics summary outcome line' {
+        # One grouped request answered all four definitions.
+        @($script:Clean.DebugLines | Where-Object { $_ -match '\[Metrics\] Metric definitions: 4 \| Success: 4 \| Timeout: 0 \| Throttled: 0 \| Error: 0 \| Elapsed: ' }).Count | Should -Be 1
+        @($script:Rejected.DebugLines | Where-Object { $_ -match '\[Metrics\] Metric definitions: 4 \| Success: 3 \| Timeout: 0 \| Throttled: 0 \| Error: 1 \| Elapsed: ' }).Count | Should -Be 1
+        @($script:Clean.DebugLines + $script:Rejected.DebugLines | Where-Object { $_ -match 'Total calls:' }).Count | Should -Be 0
     }
 
     It 'reports the number of Azure Monitor requests in the diagnostics summary' {
@@ -546,5 +628,261 @@ Describe 'Metrics.ps1 batches' {
         $FilesPerResource.Count | Should -Be 125
         @($FilesPerResource.Keys | Where-Object { $FilesPerResource[$_].Count -ne 1 }) | Should -BeNullOrEmpty
         $Run.Calls.Count | Should -Be 125
+    }
+}
+
+Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its retries' {
+    BeforeAll {
+        $script:IncompleteDisk = New-TestDisk -Name 'disk-incomplete'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_incomplete') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'records the subscription as metrics incomplete when the grouped request fails with <MultiError> on every attempt' -ForEach @(@{ MultiError = 'Throttled' }, @{ MultiError = 'ServerError' }) {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName ('incomplete-' + $MultiError) -MultiError $MultiError
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Name | Should -Be 'test-subscription'
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeOfType [bool]
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].ReportFolder | Should -Be 'ResourcesReport_incomplete'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
+
+        # The grouped request is kept: no request for one metric is made.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -ne 4 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        foreach ($Record in $Run.Records)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricTotalCount | Should -Be 0
+        }
+        @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 1 subscription(s): Azure Monitor requests for 1 resource(s) still failed after their retries*' }).Count | Should -Be 1
+    }
+
+    It 'does not record it when Azure rejects the grouped request with BadRequest and each metric succeeds on its own' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-badrequest' -MultiError 'BadRequest'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'does not record a subscription whose requests succeed' {
+        $null = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-clean'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+    }
+
+    It 'counts in each subscription''s entry only the failed resources of that subscription' {
+        $Subs = @($script:Subscriptions) + @([PSCustomObject]@{ id = 'sub-b'; Name = 'second-subscription' })
+        $Disks = @(
+            New-TestDisk -Name 'disk-a1'
+            New-TestDisk -Name 'disk-a2'
+            New-TestDisk -Name 'disk-b1' -SubscriptionId 'sub-b'
+        )
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'incomplete-two-subs' -MultiError 'ServerError' -Subscriptions $Subs
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 2
+        $First = @($Entries | Where-Object { $_.Id -eq $script:SubscriptionId })
+        $Second = @($Entries | Where-Object { $_.Id -eq 'sub-b' })
+        $First.Count | Should -Be 1
+        $Second.Count | Should -Be 1
+        $First[0].Name | Should -Be 'test-subscription'
+        $Second[0].Name | Should -Be 'second-subscription'
+        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        # The phase line covers the whole run.
+        @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 2 subscription(s): Azure Monitor requests for 3 resource(s) still failed after their retries*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Metrics.ps1 subscriptions whose single-metric request still fails after its retries' {
+    BeforeAll {
+        $script:IncompleteVm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-incomplete'
+        $script:IncompleteDisk = New-TestDisk -Name 'disk-incomplete'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_single') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'records the subscription as metrics incomplete when a single-metric request fails with <SingleError> on every attempt' -ForEach @(@{ SingleError = 'Throttled' }, @{ SingleError = 'ServiceUnavailable' }) {
+        # The VM's two metrics are requested one at a time, each with its own request.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-' + $SingleError) -SingleError $SingleError
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Name | Should -Be 'test-subscription'
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeOfType [bool]
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].ReportFolder | Should -Be 'ResourcesReport_single'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
+
+        # Each request keeps its retries: 4 attempts for each of the 2 metrics, or 7
+        # when throttled (its own budget).
+        $Run.Calls.Count | Should -Be $(if ($SingleError -eq 'Throttled') { 14 } else { 8 })
+        $Run.Records.Count | Should -Be 2
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'records it when a request for one metric, after Azure rejected the grouped request, fails with ServiceUnavailable on every attempt' {
+        # The four requests of the group run one after another, each with its retries.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'fallback-single-unavailable' -MultiError 'BadRequest' -SingleError 'ServiceUnavailable'
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeFalse
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+
+        # One rejected grouped request, then 4 attempts for each of the 4 metrics.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 16
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+    }
+
+    It 'does not record it when a single-metric request fails with BadRequest on every attempt' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName 'single-badrequest' -SingleError 'BadRequest'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        # The retries are unchanged: 4 attempts for each of the 2 metrics.
+        $Run.Calls.Count | Should -Be 8
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
+    }
+
+    It 'does not record it when the request for a metric Azure rejects fails with BadRequest' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'fallback-single-badrequest' -Invalid 'disk-incomplete|Composite Disk Write Bytes/sec'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        $Errors = @($Run.Records | Where-Object { $_.MetricError })
+        $Errors.Count | Should -Be 1
+        $Errors[0].Metric | Should -Be 'Composite Disk Write Bytes/sec'
+    }
+}
+
+Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
+    # A 404 cannot turn into data on a retry: the resource is gone (or being deleted) or is not
+    # in this subscription. It used to take all 4 attempts and their backoff (~100 s per request
+    # on a live run); it now ends after 1. The records, the incomplete entry and the exit code
+    # stay as they were: a 404 is still an Error and still makes the subscription incomplete.
+    BeforeAll {
+        $script:NotFoundVm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-notfound'
+        $script:NotFoundDisk = New-TestDisk -Name 'disk-notfound'
+        $script:OriginalDefaultPath = $Global:DefaultPath
+    }
+    BeforeEach {
+        $Global:MetricsFailedSubs = @()
+        $Global:DefaultPath = (Join-Path $TestDrive 'ResourcesReport_notfound') + '/'
+    }
+    AfterAll {
+        $Global:DefaultPath = $script:OriginalDefaultPath
+        Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'makes 1 attempt, not 4, for a single-metric request that fails with <SingleError>' -ForEach @(@{ SingleError = 'NotFound' }, @{ SingleError = 'Status404' }, @{ SingleError = 'NotFoundWith429Text' }) {
+        # The VM's two metrics are requested one at a time.
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-single-' + $SingleError) -SingleError $SingleError
+
+        $Run.Calls.Count | Should -Be 2 -Because 'one attempt for each of the 2 metrics'
+        foreach ($Name in 'Percentage CPU', 'Available Memory Bytes')
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'makes 1 attempt for a grouped request that fails with NotFound, with no request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-grouped' -MultiError 'NotFound'
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+    }
+
+    It 'still records the subscription as metrics incomplete, with the same entry as a server error' {
+        $null = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-incomplete' -MultiError 'NotFound'
+        $NotFoundEntries = @($Global:MetricsFailedSubs)
+        $Global:MetricsFailedSubs = @()
+        $null = Invoke-MetricsRun -Resources @($script:NotFoundDisk) -RunName 'notfound-incomplete-5xx' -MultiError 'ServerError'
+        $ServerErrorEntries = @($Global:MetricsFailedSubs)
+
+        $NotFoundEntries.Count | Should -Be 1
+        $NotFoundEntries[0].Complete | Should -BeFalse
+        ($NotFoundEntries | ConvertTo-Json -Depth 5 -Compress) | Should -Be ($ServerErrorEntries | ConvertTo-Json -Depth 5 -Compress)
+    }
+
+    It 'writes the same error records as a request that failed after all its retries (<Shape>)' -ForEach @(
+        @{ Shape = 'grouped'; Multi = 'NotFound'; Single = ''; Compare = 'ServerError'; CompareSingle = '' }
+        @{ Shape = 'single'; Multi = ''; Single = 'NotFound'; Compare = ''; CompareSingle = 'ServiceUnavailable' }
+    ) {
+        $Resource = if ($Shape -eq 'grouped') { $script:NotFoundDisk } else { $script:NotFoundVm }
+        $NotFound = Invoke-MetricsRun -Resources @($Resource) -RunName ('notfound-records-' + $Shape) -MultiError $Multi -SingleError $Single
+        $Retried = Invoke-MetricsRun -Resources @($Resource) -RunName ('notfound-records-retried-' + $Shape) -MultiError $Compare -SingleError $CompareSingle
+
+        $NotFound.Records.Count | Should -BeGreaterThan 0
+        foreach ($Record in $NotFound.Records)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricTotalCount | Should -Be 0
+        }
+        $Want = ConvertTo-RecordMap -Records $Retried.Records
+        $Got = ConvertTo-RecordMap -Records $NotFound.Records
+        @($Got.Keys | Sort-Object) | Should -Be @($Want.Keys | Sort-Object)
+        foreach ($Key in $Want.Keys) { $Got[$Key] | Should -Be $Want[$Key] -Because $Key }
+    }
+
+    It 'says in the log that a 404 resource is being deleted when Resource Graph lists it as <State>' -ForEach @(@{ State = 'Dropping'; Field = 'state' }, @{ State = 'Deleting'; Field = 'provisioningState' }, @{ State = 'Dropping'; Field = 'status' }) {
+        $Vm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-dropping'
+        $Vm | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ $Field = $State })
+        $Run = Invoke-MetricsRun -Resources @($Vm) -RunName ('notfound-deleting-' + $State + '-' + $Field) -SingleError 'NotFound'
+
+        @($Run.DebugLines | Where-Object { $_ -match ("  Error idx=.*vm-dropping/.* attempts=1 .* - not found because the resource is being deleted \(its state is '{0}'\); not retried$" -f $State) }).Count | Should -Be 2
+        $Run.Records.Count | Should -Be 2
+        @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+        @($Global:MetricsFailedSubs).Count | Should -Be 1 -Because 'the exit code is kept: a 404 still makes the subscription incomplete'
+    }
+
+    It 'adds no deleting note for a 404 on a resource that is not being deleted, nor for a 5xx on a deleting one' {
+        $Ready = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-ready'
+        $Ready | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ state = 'Ready' })
+        $Run = Invoke-MetricsRun -Resources @($Ready) -RunName 'notfound-ready' -SingleError 'NotFound'
+        @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
+
+        $Dropping = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-dropping-5xx'
+        $Dropping | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ state = 'Dropping' })
+        $Run = Invoke-MetricsRun -Resources @($Dropping) -RunName 'notfound-dropping-5xx' -SingleError 'ServiceUnavailable'
+        @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
+    }
+
+    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }, @{ SingleError = 'Status503WithNotFoundText'; Calls = 8 }, @{ SingleError = 'Status500Wrapping404'; Calls = 8 }) {
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-kept-' + $SingleError) -SingleError $SingleError
+
+        $Run.Calls.Count | Should -Be $Calls
     }
 }

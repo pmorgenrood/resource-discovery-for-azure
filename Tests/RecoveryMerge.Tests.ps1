@@ -245,6 +245,152 @@ Describe 'Merge-RecoveryData consumption handling' {
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption } |
             Should -Throw -ExpectedMessage '*has no Consumption_*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
+    }
+
+    It 'refuses an -OutputPath that is the <Which> folder, before writing anything' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Out = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery + [System.IO.Path]::DirectorySeparatorChar }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Out } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'refuses a relative -OutputPath that names the gap folder from the PowerShell location' {
+        # A relative path is read against the PowerShell location, which can
+        # differ from the process directory after Set-Location.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $ProcessDir = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath (Split-Path -Parent $C.Gap)
+        try
+        {
+            [System.Environment]::CurrentDirectory = [System.IO.Path]::GetTempPath()
+            $Relative = '.' + [System.IO.Path]::DirectorySeparatorChar + (Split-Path -Leaf $C.Gap)
+            { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Relative } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        }
+        finally
+        {
+            Pop-Location
+            [System.Environment]::CurrentDirectory = $ProcessDir
+        }
+        @(Get-ChildItem -LiteralPath $C.Gap -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'refuses an -OutputPath that is a link to the <Which> folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Target = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        $Link = Join-Path (Split-Path -Parent $C.Output) ('link_' + [guid]::NewGuid().ToString('N'))
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target $Target -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Link } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        # The reverse spelling: the source given through the link, the output as the real folder.
+        if ($Which -eq 'gap')
+        {
+            { Merge-RecoveryData -GapBundlePath $Link -RecoveryBundlePath $C.Recovery -OutputPath $C.Gap } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        }
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'never writes into the gap folder for an -OutputPath of a link, then ..' {
+        # A link to a subfolder of the gap folder, then '..'. PowerShell and
+        # .NET both read '..' as text, so the guard and every write agree on
+        # the link's own parent; the gap folder is never reached.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Sub = Join-Path $C.Gap 'sub'
+        $null = New-Item -ItemType Directory -Path $Sub
+        $LinkDir = Join-Path (Split-Path -Parent $C.Output) ('other_' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $LinkDir
+        $Link = Join-Path $LinkDir 'L'
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target $Sub -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath ($Link + [System.IO.Path]::DirectorySeparatorChar + '..')
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+        Test-Path -LiteralPath (Join-Path $LinkDir ('Inventory_{0}.json' -f $script:GapBase)) | Should -BeTrue
+    }
+
+    It 'merges into an output folder that holds a copy of the <Which> bundle, which is not the source folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Source = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        $null = New-Item -ItemType Directory -Path $C.Output
+        Get-ChildItem -LiteralPath $Source -File | Copy-Item -Destination $C.Output
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+        @(Get-ChildItem -LiteralPath $C.Output -Force -Filter '.rda-merge-probe-*').Count | Should -Be 0 -Because 'the folder check leaves nothing behind'
+    }
+
+    It 'refuses an existing -OutputPath whose probe file shows up in the <Which> folder' -ForEach @(@{ Which = 'gap' }, @{ Which = 'recovery' }) {
+        # Stands in for a bind mount or mapped drive: the path guard sees two
+        # folders, but a file made in the output shows up in the source.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $null = New-Item -ItemType Directory -Path $C.Output
+        $script:ProbeSource = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        Mock Test-Path -ParameterFilter { $LiteralPath -and ([string]$LiteralPath -like ((Join-Path $script:ProbeSource '.rda-merge-probe-') + '*')) } -MockWith { $true }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Output -Force).Count | Should -Be 0 -Because 'the probe is removed and nothing else is written'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'lets a consumption-only merge run again into the same output folder' {
+        # With an empty recovery inventory the merged inventory is byte for
+        # byte the gap inventory, under the gap inventory's name.
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3' }) -ConsumptionCsv $script:CsvHeader
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+        $OutCsv = Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase)
+        $OutInventory = Join-Path $C.Output ('Inventory_{0}.json' -f $script:GapBase)
+        $FirstInventoryHash = (Get-FileHash -LiteralPath $OutInventory).Hash
+        'stale' | Out-File -FilePath $OutCsv -Encoding utf8
+        'stale' | Out-File -FilePath $OutInventory -Encoding utf8
+        $Second = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+        $Second.ConsumptionSource | Should -Be 'recovery'
+        (Get-Content -LiteralPath $OutCsv -Raw) | Should -Not -Match 'stale' -Because 'the second run rewrites the consumption file'
+        (Get-FileHash -LiteralPath $OutInventory).Hash | Should -Be $FirstInventoryHash -Because 'the second run rewrites the inventory file'
+        @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Inventory_*.json').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $C.Output -File -Filter 'Consumption_*.csv').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'refuses an -OutputPath under a parent link with a relative target' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Parent = Split-Path -Parent $C.Gap
+        $Link = Join-Path $Parent ('plink_' + [guid]::NewGuid().ToString('N'))
+        # The link's target is written as a relative path ('.'), so it is read from the link's own folder.
+        try { $null = New-Item -ItemType SymbolicLink -Path $Link -Target '.' -ErrorAction Stop }
+        catch { Set-ItResult -Skipped -Because 'this host cannot make symbolic links'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $Out = Join-Path $Link (Split-Path -Leaf $C.Gap)
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Out } | Should -Throw -ExpectedMessage '*is a source bundle folder*Nothing was written*'
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -ConsumptionCsv $script:CsvHeader
+        $script:CsvHeader | Out-File -FilePath (Join-Path $C.Recovery 'Consumption_second.csv') -Encoding utf8
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
+        @($Result.Warnings | Where-Object { $_ -match "files match 'Consumption_\*\.csv'" }).Count | Should -Be 1
     }
 
     It 'writes a canonical header-only CSV when neither bundle has consumption' {
@@ -296,6 +442,7 @@ Describe 'Merge-RecoveryData metrics handling' {
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics } |
             Should -Throw -ExpectedMessage '*has no Metrics_*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
     }
 }
 
@@ -532,4 +679,58 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
         (Get-Content -Path $GapInvPath -Raw) | Should -Be $GapBefore -Because 'the merge writes to OutputPath only, never back into the gap bundle'
         (Get-Content -Path $RecInvPath -Raw) | Should -Be $RecBefore -Because 'the recovery bundle is read-only input'
     }
+
+    It 'zips only this bundle''s files when -OutputPath already holds another report''s merge' {
+        $First = New-Case
+        $Second = New-Case
+        $Control = New-Case
+        $OtherBase = 'OtherReport_20260103_000000'
+        $SharedOutput = Join-Path $script:TmpRoot ('shared_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_tokA' = '/id/a' } }
+
+        # A plain report merged first, then an obfuscated report merged into the same folder.
+        New-Bundle -Dir $First.Gap -Base $OtherBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'web-prod-01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["plain"]}' }
+        New-Bundle -Dir $First.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-prod-01')) })
+        New-Bundle -Dir $Second.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["obf"]}' } -Dictionary $GapDict
+        New-Bundle -Dir $Second.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $GapDict
+
+        $null = Merge-RecoveryData -GapBundlePath $First.Gap -RecoveryBundlePath $First.Recovery -OutputPath $SharedOutput -WarningAction SilentlyContinue
+        $Result = Merge-RecoveryData -GapBundlePath $Second.Gap -RecoveryBundlePath $Second.Recovery -OutputPath $SharedOutput -WarningAction SilentlyContinue
+        $Fresh = Merge-RecoveryData -GapBundlePath $Second.Gap -RecoveryBundlePath $Second.Recovery -OutputPath $Control.Output -WarningAction SilentlyContinue
+
+        $Entries = Get-ZipEntryNames -ZipPath $Result.OutputZip
+        ($Entries | Where-Object { $_ -like "*$OtherBase*" }) | Should -BeNullOrEmpty -Because 'the earlier merge''s inventory and metrics in the same folder belong to another report'
+        ($Entries | Sort-Object) | Should -Be (Get-ZipEntryNames -ZipPath $Fresh.OutputZip | Sort-Object) -Because 'a reused folder zips the same files as a new one'
+    }
+
+    It 'zips only the recovered metrics when a merge is repeated with -RecoverMetrics into the same folder' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["gap-0"]}'; '__1' = '{"Metrics":["gap-1"]}'; '__2' = '{"Metrics":["gap-2"]}' }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["rec-0"]}' }
+
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics -WarningAction SilentlyContinue
+
+        $Result.MetricsSource | Should -Be 'recovery'
+        $MetricsEntries = @(Get-ZipEntryNames -ZipPath $Result.OutputZip | Where-Object { $_ -like 'Metrics_*.json' })
+        $MetricsEntries | Should -Be @(('Metrics_{0}__0.json' -f $script:GapBase)) -Because 'the first merge''s gap batches __1 and __2 are not part of the recovered metrics'
+    }
 }
+
+Describe 'Merge-RecoveryData with no report generator next to it' {
+    It 'stops before writing anything when Extension/Summary.ps1 is missing' {
+        $Root = Join-Path $script:TmpRoot ('nosummary_' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Fn = Join-Path $Root 'Functions'
+        New-Item -ItemType Directory -Path $Fn -Force | Out-Null
+        foreach ($F in 'RecoveryMerge.Functions.ps1', 'InventoryJson.Functions.ps1') { Copy-Item -LiteralPath (Join-Path (Split-Path $script:FnFile -Parent) $F) -Destination $Fn }
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Pwsh = (Get-Process -Id $PID).Path
+        $Cmd = ". '{0}'; try {{ Merge-RecoveryData -GapBundlePath '{1}' -RecoveryBundlePath '{2}' -OutputPath '{3}' -WarningAction SilentlyContinue | Out-Null; 'no-stop' }} catch {{ 'STOP ' + `$_.Exception.Message }}" -f (Join-Path $Fn 'RecoveryMerge.Functions.ps1'), $C.Gap, $C.Recovery, $C.Output
+        $Out = (& $Pwsh -NoProfile -NonInteractive -Command $Cmd 2>&1 | Out-String)
+        $Out | Should -Match 'STOP Merge-RecoveryData: report generator not found'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
+    }
+}
+

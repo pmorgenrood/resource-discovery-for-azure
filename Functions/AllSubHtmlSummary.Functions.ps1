@@ -207,8 +207,21 @@ function New-RdaAllSubHtmlSummary
         # from the earlier run that completed those subscriptions.
         $IncludeFolders = @(),
 
+        # Optional: the report folder names whose report zip went into the
+        # consolidated zip. When given, only these folders are listed and
+        # counted, so a folder whose report zip is missing is not.
+        $ReportFolders = $null,
+
+        # Optional: lines from Get-RunReportCoverageLines (the subscriptions in
+        # the run, the reports in this zip, and each subscription without one
+        # with its reason), shown under the header.
+        [string[]]$CoverageLines = @(),
+
         # Optional run-health collections passed through from the wrapper. Each is an
-        # array; when empty the corresponding banner is omitted.
+        # array; when empty the corresponding banner is omitted. A consumption or
+        # metrics entry whose ReportFolder names a report folder of this run also
+        # marks that folder's row "consumption incomplete" or "metrics incomplete"
+        # ("consumption and metrics incomplete" for both).
         $FailedSubscriptions = @(),
         $ConsumptionFailedSubs = @(),
         $MetricsFailedSubs = @(),
@@ -250,6 +263,11 @@ function New-RdaAllSubHtmlSummary
     {
         $Included = @($IncludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
         $Folders = @($Folders | Where-Object { $_.LastWriteTime -ge $SinceTime -or $Included -contains $_.Name })
+    }
+    if ($null -ne $ReportFolders)
+    {
+        $InZipFolders = @(@($ReportFolders) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        $Folders = @($Folders | Where-Object { $InZipFolders -contains $_.Name })
     }
 
     $ObfPattern = '^(?:' + (Get-RdaObfuscationTokenPattern) + ')$'
@@ -327,7 +345,9 @@ function New-RdaAllSubHtmlSummary
     $VersionSafe = if ([string]::IsNullOrWhiteSpace([string]$Version)) { '' } else { ConvertTo-HtmlSafe ([string]$Version) }
     $PlatSafe = if ([string]::IsNullOrWhiteSpace([string]$PlatOS)) { '' } else { ConvertTo-HtmlSafe ([string]$PlatOS) }
 
-    $PrivacyBanner = if ($ObfuscationStatus -eq 'obfuscated')
+    # Follows the redaction gate, so an obfuscated run whose reports hold no
+    # records to sample still says it is obfuscated.
+    $PrivacyBanner = if ($IsObfuscated)
     {
         '<div class="privacy-banner obfuscated"><span>&#128274;</span><div><b>Obfuscated.</b> Names shown are deterministic pseudonyms (prod_/nonprod_ prefixes); no real identifiers are present. Safe to share.</div></div>'
     }
@@ -340,10 +360,31 @@ function New-RdaAllSubHtmlSummary
     # read-only; a null/empty collection renders nothing.
     $FailedList = @(@($FailedSubscriptions) | Where-Object { $_ })
     $ConsumpList = @(@($ConsumptionFailedSubs) | Where-Object { $_ -and $_.Id -ne '(auth)' })
-    $MetricsList = @(@($MetricsFailedSubs) | Where-Object { $_ })
+    # Metrics skipped for the sign-in, and metrics left incomplete because Azure
+    # Monitor kept failing (Complete = $false), each with its own banner and count.
+    # The two are told apart by Functions/Common.Functions.ps1, which the wrapper
+    # (the caller that passes metrics entries) has loaded; with no entries it is
+    # not needed, as for Build-MainSummaryFromZip.ps1.
+    $MetricsEntries = @(@($MetricsFailedSubs) | Where-Object { $_ })
+    $MetricsList = @($MetricsEntries | Where-Object { -not (Test-MetricsIncompleteEntry -Entry $_) })
+    $MetricsIncompleteList = if ($MetricsEntries.Count -gt 0) { @(Get-MetricsIncompleteEntries -Entries $MetricsEntries) } else { @() }
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
 
     $Banners = New-Object System.Text.StringBuilder
+    # The subscriptions in the run against the reports in this zip, and why
+    # each subscription without a report has none (the caller already left
+    # out names under -Obfuscate).
+    $Coverage = @(@($CoverageLines) | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    if ($Coverage.Count -gt 0)
+    {
+        [void]$Banners.AppendFormat('<div class="coverage"><b>{0}</b></div>', (ConvertTo-HtmlSafe $Coverage[0]))
+    }
+    if ($Coverage.Count -gt 1)
+    {
+        [void]$Banners.AppendFormat('<div class="banner err"><b>{0}</b><ul>', (ConvertTo-HtmlSafe $Coverage[1]))
+        foreach ($CoverageLine in @($Coverage | Select-Object -Skip 2)) { [void]$Banners.AppendFormat('<li>{0}</li>', (ConvertTo-HtmlSafe ($CoverageLine -replace '^\s*-\s*', ''))) }
+        [void]$Banners.Append('</ul></div>')
+    }
     if ($FailedList.Count -gt 0)
     {
         if ($IsObfuscated)
@@ -357,7 +398,10 @@ function New-RdaAllSubHtmlSummary
     }
     if ($EmptyCount -gt 0)
     {
-        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) returned 0 resources.</b> Often a Reader-permission gap rather than a genuinely empty subscription.</div>', $EmptyCount)
+        # A report lists only the types a collector covers, so 0 here is not the
+        # subscription's Resource Graph count. Read access is not the cause: a
+        # subscription the identity cannot read is skipped before it is collected.
+        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) have 0 resources in their report.</b> They hold no resources of the types this tool reports (only virtual networks, for example), or none at all.</div>', $EmptyCount)
     }
     if ($ConsumpList.Count -gt 0)
     {
@@ -374,11 +418,22 @@ function New-RdaAllSubHtmlSummary
     {
         if ($IsObfuscated)
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had metrics issues.</b> Metric data may be incomplete for those subscriptions.</div>', $MetricsList.Count)
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics auth-skipped: {0} subscription(s).</b> Metrics were skipped because the sign-in could not be refreshed for those subscriptions.</div>', $MetricsList.Count)
         }
         else
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had metrics issues.</b> Metric data may be incomplete for: {1}</div>', $MetricsList.Count, (ConvertTo-HtmlSafe (($MetricsList | ForEach-Object { [string]$_.Name }) -join ', ')))
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics auth-skipped: {0} subscription(s).</b> Metrics were skipped because the sign-in could not be refreshed for: {1}</div>', $MetricsList.Count, (ConvertTo-HtmlSafe (($MetricsList | ForEach-Object { [string]$_.Name }) -join ', ')))
+        }
+    }
+    if ($MetricsIncompleteList.Count -gt 0)
+    {
+        if ($IsObfuscated)
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for those subscriptions.</div>', $MetricsIncompleteList.Count)
+        }
+        else
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for: {1}</div>', $MetricsIncompleteList.Count, (ConvertTo-HtmlSafe (($MetricsIncompleteList | ForEach-Object { [string]$_.Name }) -join ', ')))
         }
     }
     if ($CollectorList.Count -gt 0)
@@ -397,13 +452,22 @@ function New-RdaAllSubHtmlSummary
         $ChartsHtml = "<div class='charts'><div class='chart-card'><h3>Resources by service (run-wide)</h3>$DonutSvg</div><div class='chart-card'><h3>Top services</h3>$BarSvg</div></div>"
     }
 
+    # Report folders whose subscription's consumption collection failed or was
+    # skipped for sign-in. The banner does not count a sign-in skip ('(auth)'
+    # entry), but its row is marked too. The folder ties an entry to its row:
+    # under -Obfuscate the row's name is a token, so a name cannot.
+    $ConsumpFolders = @(@($ConsumptionFailedSubs) | Where-Object { $_ } | ForEach-Object { [string]$_.ReportFolder } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    # The same for metrics skipped because the sign-in could not be refreshed.
+    $MetricsFolders = @(@($MetricsFailedSubs) | Where-Object { $_ } | ForEach-Object { [string]$_.ReportFolder } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
     # Per-subscription table.
     $Rows = New-Object System.Text.StringBuilder
     foreach ($Sr in $SubReports)
     {
         $NameSafe = ConvertTo-HtmlSafe $Sr.Name
         $CountText = '{0:N0}' -f $Sr.Total
-        $HealthCell = if ($Sr.Total -eq 0) { '<span class="tag warn">0 resources</span>' } else { '<span class="tag ok">ok</span>' }
+        $Incomplete = @(if ($ConsumpFolders -contains $Sr.Folder) { 'consumption' }; if ($MetricsFolders -contains $Sr.Folder) { 'metrics' })
+        $HealthCell = if ($Incomplete.Count -gt 0) { '<span class="tag warn">{0} incomplete</span>' -f ($Incomplete -join ' and ') } elseif ($Sr.Total -eq 0) { '<span class="tag warn">0 resources</span>' } else { '<span class="tag ok">ok</span>' }
         $LinkCell = if ($Sr.Link) { ('<a href="{0}">open &#8599;</a>' -f (ConvertTo-HtmlSafe $Sr.Link)) } else { '<span class="muted">no report</span>' }
         [void]$Rows.AppendFormat('<tr><td>{0}</td><td class="num">{1}</td><td>{2}</td><td>{3}</td></tr>', $NameSafe, $CountText, $HealthCell, $LinkCell)
     }
@@ -429,7 +493,8 @@ h1{font-size:22px;margin:0 0 4px}h3{margin:0 0 8px;font-size:14px;color:var(--mu
 .privacy-banner.obfuscated{background:#ddf4e4;border:1px solid #52c41a}
 .privacy-banner.identifiable{background:#fff3cd;border:1px solid #e0b000}
 .banner{padding:10px 14px;border-radius:8px;margin:8px 0;font-size:13px}
-.banner.err{background:#ffebe9;border:1px solid #ff818a}.banner.warn{background:#fff8c5;border:1px solid #e0c000}
+.banner.err{background:#ffebe9;border:1px solid #ff818a}.banner ul{margin:4px 0 0;padding-left:20px}
+.coverage{margin:8px 0;font-size:13px}.banner.warn{background:#fff8c5;border:1px solid #e0c000}
 .cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;min-width:150px}
 .card .n{font-size:26px;font-weight:700}.card .l{color:var(--muted);font-size:12px}
@@ -470,7 +535,38 @@ $ChartsHtml
 
     $Html | Out-File -FilePath $HtmlFile -Encoding utf8
     Write-Host ("Main summary written: {0}" -f $HtmlFile) -ForegroundColor Green
-    Write-Host ("  {0} subscription(s), {1:N0} total resource(s), {2} empty, {3} failed. Privacy: {4}." -f $SubCount, $RunTotalResources, $EmptyCount, $FailedList.Count, $ObfuscationStatus) -ForegroundColor DarkGray
+    # The same gate as the privacy banner, so an obfuscated run whose reports
+    # hold no records to sample does not call itself identifiable here either.
+    $PrivacyText = if ($IsObfuscated) { 'obfuscated' } else { 'identifiable' }
+    Write-Host ("  {0} subscription(s), {1:N0} total resource(s), {2} empty, {3} failed. Privacy: {4}." -f $SubCount, $RunTotalResources, $EmptyCount, $FailedList.Count, $PrivacyText) -ForegroundColor DarkGray
+}
+
+# The items -PackageZip puts in the bundle: the given -Path items (the summary
+# and the folders this call reconstructed), or what the -Directory '*' wildcard
+# lists (on Linux and macOS that leaves out dot-files; on Windows it does not),
+# minus every Az context snapshot ('.rda-stream-azcontext-*'), which holds an
+# Azure token cache and is in the folder when the folder is the inventory root
+# while a parallel run is starting. A subfolder that holds a snapshot at any
+# depth is left out with a warning, because Compress-Archive packs a folder
+# whole. Returns full paths.
+function Get-RdaPackageZipItem
+{
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Directory')][string]$Directory,
+        [Parameter(Mandatory, ParameterSetName = 'Path')][string[]]$Path
+    )
+    $Snapshot = '.rda-stream-azcontext-*'
+    $Candidates = if ($PSCmdlet.ParameterSetName -eq 'Path') { @($Path | ForEach-Object { Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }) } else { @(Get-ChildItem -Path (Join-Path $Directory '*') -ErrorAction SilentlyContinue) }
+    foreach ($Item in $Candidates)
+    {
+        if ($Item.Name -like $Snapshot) { continue }
+        if ($Item.PSIsContainer -and @(Get-ChildItem -LiteralPath $Item.FullName -Recurse -Force -File -Filter $Snapshot -ErrorAction SilentlyContinue).Count -gt 0)
+        {
+            Write-Warning ("Left {0} out of the bundle: it holds an Az context snapshot ({1}), which is an Azure token cache." -f $Item.FullName, $Snapshot)
+            continue
+        }
+        $Item.FullName
+    }
 }
 
 # =============================================================================
@@ -489,8 +585,8 @@ $ChartsHtml
 #      target) and Inventory_*.json (the summary's input). The per-sub HTML is
 #      self-contained, so navigation works without the bulky csv/metrics members.
 #   3. Build MainSummary.html in -OutputDirectory (links now resolve on disk).
-#   4. Optionally (-PackageZip) zip that folder into a portable bundle whose
-#      links survive being moved/emailed.
+#   4. Optionally (-PackageZip) zip the summary and the folders reconstructed
+#      in step 2 into a portable bundle whose links survive being moved/emailed.
 #
 # Backward-compatible: works on any consolidated zip, old or new, because it only
 # relies on the long-standing inner-zip layout. Falls back to already-extracted
@@ -570,6 +666,8 @@ function New-RdaAllSubHtmlSummaryFromZip
                 Where-Object { $_.Name -notlike '*_revealed*' })
 
         $Reconstructed = 0
+        # Folders this call writes; -PackageZip bundles only these.
+        $ReconstructedDirs = New-Object System.Collections.Generic.List[string]
         foreach ($InnerZip in $InnerZips)
         {
             # Folder named after the inner zip base (ResourcesReport_<stamp>), which
@@ -593,6 +691,7 @@ function New-RdaAllSubHtmlSummaryFromZip
                 }
             }
             finally { $Archive.Dispose() }
+            if (-not $ReconstructedDirs.Contains($Dest)) { $ReconstructedDirs.Add($Dest) }
             $Reconstructed++
         }
 
@@ -609,6 +708,7 @@ function New-RdaAllSubHtmlSummaryFromZip
                 $Dest = Join-Path $OutputDirectory $Ef.Name
                 New-Item -ItemType Directory -Path $Dest -Force | Out-Null
                 foreach ($F in $Files) { Copy-Item -LiteralPath $F.FullName -Destination (Join-Path $Dest $F.Name) -Force }
+                if (-not $ReconstructedDirs.Contains($Dest)) { $ReconstructedDirs.Add($Dest) }
                 $Reconstructed++
             }
         }
@@ -632,13 +732,15 @@ function New-RdaAllSubHtmlSummaryFromZip
     # cannot be re-rendered keeps its original html so its drill-down link still
     # resolves. $PSScriptRoot here is the Functions/ folder (where this function is
     # defined), so the sibling Extension/Summary.ps1 resolves from the repo root.
+    # Only the folders this call reconstructed: other ResourcesReport* folders in
+    # -OutputDirectory are left as they are.
     if (-not $KeepOriginalReports)
     {
         $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
         if (Test-Path -Path $SummaryScript -PathType Leaf)
         {
             $ReRendered = 0
-            foreach ($SubDir in @(Get-ChildItem -LiteralPath $OutputDirectory -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue))
+            foreach ($SubDir in @($ReconstructedDirs | ForEach-Object { Get-Item -LiteralPath $_ }))
             {
                 $InvJson = Get-ChildItem -LiteralPath $SubDir.FullName -Filter 'Inventory_*.json' -File -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($null -eq $InvJson) { continue }
@@ -665,20 +767,32 @@ function New-RdaAllSubHtmlSummaryFromZip
         }
     }
 
-    # Build the summary against the reconstructed folder (links resolve on disk).
+    # Build the summary against the reconstructed folder (links resolve on disk),
+    # listing only the folders reconstructed from -InputZip: -OutputDirectory may
+    # already hold other ResourcesReport* folders, which are not in this zip.
+    $ReconstructedNames = @($ReconstructedDirs | ForEach-Object { Split-Path -Path $_ -Leaf } | Sort-Object -Unique)
     New-RdaAllSubHtmlSummary -RunOutputDirectory $OutputDirectory -HtmlFile $HtmlFile -Detailed:$Detailed `
-        -TenantId $TenantId -Version $Version -PlatOS $PlatOS
+        -ReportFolders $ReconstructedNames -TenantId $TenantId -Version $Version -PlatOS $PlatOS
 
     Write-Host ("Reconstructed {0} per-subscription report(s) into: {1}" -f $Reconstructed, $OutputDirectory) -ForegroundColor Green
     Write-Host ("Open this summary (links resolve from here): {0}" -f $HtmlFile) -ForegroundColor Green
 
-    # Optional portable bundle: zip the reconstructed folder so the summary and
-    # its per-sub reports travel together with working links.
+    # Optional portable bundle: the summary and the per-sub folders this call
+    # reconstructed, so they travel together with working links. Only those:
+    # -OutputDirectory may already hold other files (other bundles' reports, a
+    # dictionary, the wrapper's .resume-state-*.json), and a wildcard over the
+    # folder takes them too; on Windows a leading dot does not hide a file.
     if ($PackageZip)
     {
         $PackageZipPath = $OutputDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar) + '.zip'
         if (Test-Path -LiteralPath $PackageZipPath) { Remove-Item -LiteralPath $PackageZipPath -Force -ErrorAction SilentlyContinue }
-        Compress-Archive -Path (Join-Path $OutputDirectory '*') -DestinationPath $PackageZipPath -Force
+        $PackageItems = @($ReconstructedDirs)
+        $HtmlFullPath = (Resolve-Path -LiteralPath $HtmlFile).Path
+        if ((Split-Path -Path $HtmlFullPath -Parent) -eq $OutputDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar))
+        {
+            $PackageItems = @($HtmlFullPath) + $PackageItems
+        }
+        Compress-Archive -LiteralPath @(Get-RdaPackageZipItem -Path $PackageItems) -DestinationPath $PackageZipPath -Force
         Write-Host ("Portable summary bundle (links survive extraction): {0}" -f $PackageZipPath) -ForegroundColor Green
     }
 

@@ -82,7 +82,7 @@ $Global:LASTEXITCODE = 0
     $StartupText = (@($Top[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
     # The sequential loop: the body of `if ($ParallelStreams -le 1)`.
-    $SeqIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' }, $true))
+    $SeqIf = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] -and $args[0].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' -and $args[0].Parent -is [System.Management.Automation.Language.NamedBlockAst] }, $true))
     if ($SeqIf.Count -ne 1) { throw "Expected one 'if (`$ParallelStreams -le 1)' in the wrapper, found $($SeqIf.Count)." }
     $SeqText = $SeqIf[0].Clauses[0].Item2.Extent.Text -replace '\$PSScriptRoot', '$FakeScriptRoot'
 
@@ -119,11 +119,12 @@ $Global:LASTEXITCODE = 0
     if ($MergeStart -lt 0) { throw 'Expected the end-of-run merge of per-stream state in the wrapper.' }
     $MergeText = (@($Body[$MergeStart..($Body.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
-    $Prelude = "param(`$FakeScriptRoot, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Subscriptions, `$Resume)`n" +
+    $Prelude = "param(`$FakeScriptRoot, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Subscriptions, `$Resume)`n`$ResumeScope = `$TenantID`n" +
     "`$ResumeFailedOnly = `$false; `$FailedSubscriptions = @()`n" +
     $StartupText + "`n" + $SetupText + "`n"
     $script:SequentialRun = [scriptblock]::Create($Prelude + '. ' + $SeqText)
-    $script:FallbackRun = [scriptblock]::Create($Prelude + $OneText)
+    # The fallback takes the pending list, which the wrapper builds just before it.
+    $script:FallbackRun = [scriptblock]::Create($Prelude + "`$PendingSubscriptions = @(`$Subscriptions)`n" + $OneText)
     $script:StreamMergeRun = [scriptblock]::Create($Prelude + $MergeText)
 
     # Run one lifted block against a case folder. Returns the host lines it
@@ -133,7 +134,7 @@ $Global:LASTEXITCODE = 0
         param([scriptblock]$Block, [string]$Root, [object[]]$Subs, [bool]$Resume = $false)
         $Global:RdaIdsTestProcessed = @()
         $Global:RdaIdsTestRoot = $Root
-        $Out = @(& $Block $script:FakeRoot $Root (Join-Path $Root '.resume-state-t.json') 't' $Subs $Resume 6>&1)
+        $Out = @(& $Block $script:FakeRoot $Root (Join-Path $Root '.resume-state-e3b98a4da31a.json') 't' $Subs $Resume 6>&1)
         $Text = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
         $Names = @($Global:RdaIdsTestProcessed | ForEach-Object { $Id = $_; ($script:All | Where-Object { $_.Id -eq $Id }).Name })
         return [pscustomobject]@{ Text = $Text; Processed = ($Names -join ', ') }
@@ -144,7 +145,7 @@ $Global:LASTEXITCODE = 0
     function script:Get-StateIds
     {
         param([string]$Root)
-        $Ids = @((Get-Content -LiteralPath (Join-Path $Root '.resume-state-t.json') -Raw | ConvertFrom-Json).CompletedSubscriptionIds)
+        $Ids = @((Get-Content -LiteralPath (Join-Path $Root '.resume-state-e3b98a4da31a.json') -Raw | ConvertFrom-Json).CompletedSubscriptionIds)
         $Labels = @($Ids | ForEach-Object {
                 $Id = $_
                 $Sub = $script:All | Where-Object { $_.Id -eq $Id }
@@ -164,7 +165,7 @@ $Global:LASTEXITCODE = 0
     function script:Save-TestState
     {
         param([string]$Root, [object[]]$Subs)
-        Save-CompletedSubscriptionIds -Path (Join-Path $Root '.resume-state-t.json') -Tenant 't' -Ids @($Subs | ForEach-Object { $_.Id })
+        Save-CompletedSubscriptionIds -Path (Join-Path $Root '.resume-state-e3b98a4da31a.json') -Tenant 't' -Ids @($Subs | ForEach-Object { $_.Id })
     }
 
     # A per-stream state file as Run-AllSubscriptions.Stream.ps1 writes it.
@@ -172,7 +173,7 @@ $Global:LASTEXITCODE = 0
     {
         param([string]$Root, [int]$StreamId, [object[]]$Subs)
         @{ Tenant = 't'; StreamId = [string]$StreamId; Completed = @($Subs | ForEach-Object { $_.Id }); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Root (".resume-state-t-stream-{0}.json" -f $StreamId)) -Encoding utf8
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $Root (".resume-state-e3b98a4da31a-stream-{0}.json" -f $StreamId)) -Encoding utf8
     }
 
     function script:New-CaseRoot
@@ -230,9 +231,11 @@ Describe 'Sequential run: the resume state keeps one id per completed subscripti
     It 'a state file holding a null id, as saved after a failed first subscription, reads as no completed subscriptions' {
         $Failed = @{ Id = $script:A.Id; Name = $script:A.Name; LastFailedAt = (Get-Date).ToString('o'); Reason = 'stand-in failure'; Attempts = 1 }
         @{ TenantID = 't'; CompletedSubscriptionIds = @($null); FailedAttempts = @($Failed); LastUpdated = (Get-Date).ToString('o') } |
-            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t.json') -Encoding utf8
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-e3b98a4da31a.json') -Encoding utf8
         $R = script:Invoke-Wrapper -Block $script:SequentialRun -Root $script:Root -Subs @($script:A) -Resume $true
-        script:Get-ResumeLine -Text $R.Text | Should -Be 'Resume mode: no previous state found; processing all subscriptions.'
+        # A state file is there, so 'no previous state found' is not printed; the
+        # wrapper's start line (outside this block) says 0 subscriptions are done.
+        script:Get-ResumeLine -Text $R.Text | Should -Be ''
         $R.Processed | Should -Be 'Sub A'
         script:Get-StateIds -Root $script:Root | Should -Be '1 id(s): Sub A'
     }
@@ -253,7 +256,8 @@ Describe 'Other places that add to the completed list, starting from one earlier
     }
 
     It 'the one-subscription fallback of -ParallelStreams adds its subscription as a separate id' {
-        $R = script:Invoke-Wrapper -Block $script:FallbackRun -Root $script:Root -Subs @($script:B)
+        # A run that continues the earlier run (a new run starts from an empty list).
+        $R = script:Invoke-Wrapper -Block $script:FallbackRun -Root $script:Root -Subs @($script:B) -Resume $true
         $R.Processed | Should -Be 'Sub B'
         script:Get-StateIds -Root $script:Root | Should -Be '2 id(s): Sub A, Sub B'
     }
@@ -263,6 +267,8 @@ Describe 'Other places that add to the completed list, starting from one earlier
         script:Save-TestStreamState -Root $script:Root -StreamId 1 -Subs @($script:C)
         $null = script:Invoke-Wrapper -Block $script:StreamMergeRun -Root $script:Root -Subs $script:All
         script:Get-StateIds -Root $script:Root | Should -Be '3 id(s): Sub A, Sub B, Sub C'
-        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-t-stream-*.json' -Force).Count | Should -Be 0
+        # The merge deletes the per-stream files it merged once the resume state
+        # holds their records (Invoke-FoldedStreamStateCleanup).
+        @(Get-ChildItem -LiteralPath $script:Root -Filter '.resume-state-e3b98a4da31a-stream-*.json' -Force).Count | Should -Be 0
     }
 }

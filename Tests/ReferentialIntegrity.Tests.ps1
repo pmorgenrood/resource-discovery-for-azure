@@ -3,14 +3,14 @@
 # Run with: Invoke-Pester ./Tests/ReferentialIntegrity.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    $ZipPath = if ($env:TEST_ZIP_PATH) { $env:TEST_ZIP_PATH } else
-    {
-        Get-ChildItem -Path $PSScriptRoot -Filter "ResourcesReport_*.zip" |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # $env:TEST_ZIP_PATH, else the newest Tests/ResourcesReport_*.zip, else a
+    # synthetic report generated offline (Tests/Helpers/SyntheticReportZip.ps1).
+    . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+    $script:Fixture = Get-RdaTestReportZip
+    $ZipPath = $script:Fixture.ZipPath
     if ([string]::IsNullOrEmpty($ZipPath) -or -not (Test-Path $ZipPath))
     {
-        throw "No test zip found. Copy a ResourcesReport_*.zip to Tests/ or set `$env:TEST_ZIP_PATH"
+        throw ("No test zip found, and generating a synthetic one failed (exit {0}):`n{1}" -f $script:Fixture.Exit, $script:Fixture.Console)
     }
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "/tmp" }
     $script:ExtractPath = Join-Path $TmpBase ("RefIntTest_" + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -44,13 +44,21 @@ BeforeAll {
     }
     $script:MetricRows = @($MetricRows)
 
-    # Obfuscation token grammar (same shape used by Obfuscation.Tests.ps1):
-    # prod_/nonprod_ + optional type hint + GUID. Used to prove that a
-    # cross-reference / cached metric value is a real token, never a raw id.
-    $script:TokenPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # Masked resource ID grammar (same shape used by Obfuscation.Tests.ps1):
+    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
+    # Every subscription, resource group and name segment is a prod_/nonprod_
+    # token (name tokens may carry a databricks_/aks_/vmss_ hint); provider and
+    # type segments stay as written. Used to prove that a cross-reference /
+    # cached metric value is a masked ID, never a raw id or a flat token.
+    # Inventory ids and their cross-references: the contract shape only
+    # (Get-RdaContractIdPattern). Metric fallback ids also take the fallback's
+    # own sub_/rg_ tokens (F2), by name.
+    $script:MaskedIdPattern = Get-RdaContractIdPattern
+    $script:MetricFallbackIdPattern = Get-RdaContractIdPattern -AllowMetricFallback
 }
 
 AfterAll {
+    Remove-RdaTestReportZip $script:Fixture
     if (Test-Path $script:ExtractPath) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
 }
 
@@ -124,15 +132,33 @@ Describe "Obfuscated ID Uniqueness" {
 Describe "Consumption to Inventory Cross-Reference" {
     It "Consumption ResourceIds that exist in inventory should use the same obfuscated value" {
         if ($script:ConsumptionCsv.Count -eq 0) { Set-ItResult -Skipped -Because "empty consumption csv"; return }
-        $InventoryIds = $script:AllIds
+        # Which real resource a masked id stands for comes from the run's
+        # dictionary (ResourceIdMap: masked id -> real id). A consumption row
+        # whose real resource is in the inventory must carry the inventory's
+        # masked id for it, string for string.
+        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else { $script:Fixture.DictionaryPath }
+        if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because "no obfuscation dictionary for this zip, so real resources cannot be matched"; return }
+        $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
+        $RealOf = @{}
+        foreach ($P in @($Map.PSObject.Properties)) { $RealOf[$P.Name] = [string]$P.Value }
+        $InventoryByReal = @{}
+        foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id)) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
+        $Checked = 0
+        # Every masked consumption id is in the dictionary: an id the run
+        # did not record would be a second, unjoinable id for its resource.
+        # The parked 'obfuscated' sentinel for an empty resource id is the
+        # one value that is not.
+        $Unknown = @($script:ConsumptionCsv | Where-Object { -not [string]::IsNullOrEmpty($_.ResourceId) -and $_.ResourceId -ne 'obfuscated' -and -not $RealOf.ContainsKey($_.ResourceId) } | ForEach-Object { $_.ResourceId } | Select-Object -Unique)
+        $Unknown | Should -BeNullOrEmpty -Because 'every consumption ResourceId is a masked id the dictionary records'
         foreach ($row in $script:ConsumptionCsv)
         {
-            if (![string]::IsNullOrEmpty($row.ResourceId) -and $row.ResourceId -in $InventoryIds)
-            {
-                # If it's in both, the ID should be identical (same dictionary mapping)
-                $row.ResourceId | Should -BeIn $InventoryIds -Because "Consumption ResourceId should match inventory ID"
-            }
+            if ([string]::IsNullOrEmpty($row.ResourceId) -or -not $RealOf.ContainsKey($row.ResourceId)) { continue }
+            $Real = $RealOf[$row.ResourceId].ToLowerInvariant()
+            if (-not $InventoryByReal.ContainsKey($Real)) { continue }
+            $row.ResourceId | Should -BeExactly $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
+            $Checked++
         }
+        $Checked | Should -BeGreaterThan 0 -Because 'the fixture bills at least one inventoried resource, so the check must look at a row'
     }
 }
 
@@ -285,8 +311,8 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
         # 'obfuscated' sentinel when the target is out of scope (Req 2.3).
         # There is no dedicated Service Fabric collector/inventory bucket, so
         # a Service-Fabric-backed match can't be looked up against a known-ID
-        # allowlist the way AKS can - instead we accept any well-formed
-        # prod_/nonprod_ token, which the AKS-cluster case already satisfies.
+        # allowlist the way AKS can - instead we accept any well-formed masked
+        # ID, which the AKS-cluster case already satisfies.
         $ClusterIds = @(@($script:Inventory.AKS) | Where-Object { $null -ne $_ } | ForEach-Object { $_.ID })
         $Checked = 0
         foreach ($ss in $VmssItems)
@@ -295,7 +321,7 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
             {
                 $IsKnownClusterId = $ss.AKS -in $ClusterIds
                 $IsSentinel = $ss.AKS -eq 'obfuscated'
-                $IsWellFormedToken = $ss.AKS -match $script:TokenPattern
+                $IsWellFormedToken = $ss.AKS -match $script:MaskedIdPattern
                 ($IsKnownClusterId -or $IsSentinel -or $IsWellFormedToken) | Should -BeTrue `
                     -Because "VMSS '$($ss.ID)' related-cluster value should match its cluster's own obfuscated ID (AKS or Service Fabric), or be the out-of-scope sentinel"
                 $Checked++
@@ -324,7 +350,7 @@ Describe "Cross-Reference Out-of-Scope Sentinel (P8)" {
         foreach ($ref in $Refs)
         {
             if ($ref -in $Tolerated) { continue }
-            ($ref -in $script:AllIds -or $ref -match $script:TokenPattern) | Should -BeTrue -Because "cross-reference '$ref' must be a valid target token or the 'obfuscated' sentinel, never a raw identifier"
+            ($ref -in $script:AllIds -or $ref -match $script:MaskedIdPattern) | Should -BeTrue -Because "cross-reference '$ref' must be a valid target token or the 'obfuscated' sentinel, never a raw identifier"
         }
     }
 }
@@ -355,7 +381,7 @@ Describe "Metric Per-Resource Cached Token (P8)" {
         if ($AbsentIds.Count -eq 0) { Set-ItResult -Skipped -Because "fixture does not exercise the metric fallback path (all metric-referenced resources are present in the inventory dictionary)"; return }
         foreach ($id in $AbsentIds)
         {
-            $id | Should -Match $script:TokenPattern -Because "a metric resource absent from the main dictionary should still receive a cached prod_/nonprod_ token, not a raw id"
+            $id | Should -Match $script:MetricFallbackIdPattern -Because "a metric resource absent from the main dictionary should still receive a masked ID with cached prod_/nonprod_ tokens, not a raw id ('$id')"
             $id | Should -Not -Be 'obfuscated' -Because "the metric fallback assigns a correlatable cached token, not the lossy sentinel"
         }
     }

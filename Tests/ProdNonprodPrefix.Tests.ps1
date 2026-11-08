@@ -3,14 +3,14 @@
 # Run with: Invoke-Pester ./Tests/ProdNonprodPrefix.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    $ZipPath = if ($env:TEST_ZIP_PATH) { $env:TEST_ZIP_PATH } else
-    {
-        Get-ChildItem -Path $PSScriptRoot -Filter "ResourcesReport_*.zip" |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # $env:TEST_ZIP_PATH, else the newest Tests/ResourcesReport_*.zip, else a
+    # synthetic report generated offline (Tests/Helpers/SyntheticReportZip.ps1).
+    . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+    $script:Fixture = Get-RdaTestReportZip
+    $ZipPath = $script:Fixture.ZipPath
     if ([string]::IsNullOrEmpty($ZipPath) -or -not (Test-Path $ZipPath))
     {
-        throw "No test zip found."
+        throw ("No test zip found, and generating a synthetic one failed (exit {0}):`n{1}" -f $script:Fixture.Exit, $script:Fixture.Console)
     }
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "/tmp" }
     $script:ExtractPath = Join-Path $TmpBase ("PrefixTest_" + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -20,6 +20,18 @@ BeforeAll {
     $InvFile = Get-ChildItem -Path $script:ExtractPath -Filter "Inventory_*.json" | Select-Object -First 1
     $script:Inventory = Get-Content $InvFile.FullName -Raw | ConvertFrom-Json
 
+    # An ID is a masked ARM id whose last segment is the resource's own name
+    # token (Get-ObfuscatedResourceId); an id that is not an ARM id is one token.
+    $script:ObfuscatedIdPattern = Get-RdaObfuscatedIdPattern
+    function script:Get-IdOwnToken([string]$Id) { if ($Id.StartsWith('/')) { ($Id -split '/')[-1] } else { $Id } }
+    # The subscription and resource group segments of a masked ARM id.
+    function script:Get-IdScopeTokens([string]$Id)
+    {
+        $Parts = $Id -split '/'
+        if ($Parts.Count -lt 3 -or $Parts[1] -ne 'subscriptions') { return @() }
+        @($Parts[2]) + @(if ($Parts.Count -gt 4 -and $Parts[3] -eq 'resourcegroups') { $Parts[4] })
+    }
+
     $script:AllResources = @()
     $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
         @($_.Value) | ForEach-Object { if ($null -ne $_) { $script:AllResources += $_ } }
@@ -27,6 +39,7 @@ BeforeAll {
 }
 
 AfterAll {
+    Remove-RdaTestReportZip $script:Fixture
     if (Test-Path $script:ExtractPath) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
 }
 
@@ -37,7 +50,9 @@ Describe "Prefix Consistency Per Resource" {
             # Only check ID and Name — Subscription/ResourceGroup are shared across
             # resources and their prefix is derived from the subscription/RG name
             # itself, so they may differ from the resource's own prefix in mixed environments.
-            $Fields = @($r.ID, $r.Name) | Where-Object { ![string]::IsNullOrEmpty($_) }
+            # A masked ARM id starts with '/subscriptions/', so its own token is its
+            # last segment, not the start of the string.
+            $Fields = @($(if ($r.ID) { script:Get-IdOwnToken $r.ID }), $r.Name) | Where-Object { ![string]::IsNullOrEmpty($_) }
             $Prefixes = $Fields | ForEach-Object { if ($_ -match '^(prod|nonprod)_') { $Matches[1] } }
             $UniquePrefixes = $Prefixes | Select-Object -Unique
             if ($UniquePrefixes.Count -gt 0)
@@ -49,15 +64,16 @@ Describe "Prefix Consistency Per Resource" {
 }
 
 Describe "Prefix Format Validation" {
-    It "All obfuscated IDs should start with exactly 'prod_' or 'nonprod_'" {
+    It "Every name segment of every obfuscated ID should start with exactly 'prod_' or 'nonprod_'" {
         foreach ($r in $script:AllResources)
         {
             if ($null -ne $r.ID)
             {
-                # Type-tagged variants (databricks_, aks_, vmss_) are legitimate
-                # output for resources whose IDs do not fit the standard ARM shape;
-                # see ResourceInventory.ps1 lines 650-655 and 1030-1034.
-                $r.ID | Should -Match '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-' -Because "ID should have valid prefix format"
+                # A masked ARM id: its subscription, resource group and resource
+                # name segments are prod_/nonprod_ tokens; a resource name token
+                # may carry a type hint (databricks_, aks_, vmss_). An id that is
+                # not an ARM id is one such token.
+                $r.ID | Should -Match $script:ObfuscatedIdPattern -Because "ID should have valid prefix format"
             }
         }
     }
@@ -67,7 +83,7 @@ Describe "Prefix Format Validation" {
         {
             if ($null -ne $r.ID)
             {
-                $r.ID | Should -Not -Match '^_[0-9a-f]{8}-' -Because "ID should not start with bare underscore"
+                $r.ID | Should -Not -Match '(^|/)_[0-9a-f]{8}-' -Because "no ID segment should start with bare underscore"
             }
         }
     }
@@ -81,9 +97,10 @@ Describe "Consumption Prefix Consistency" {
         if ($null -eq $Content -or $Content.Count -le 1) { Set-ItResult -Skipped -Because "empty consumption csv"; return }
         $Csv = Import-Csv $CsvFile.FullName
         # Two valid shapes for an obfuscated consumption ResourceId:
-        #   - legacy flat token: ^(prod|nonprod)_...
-        #   - structure-preserving ARM path: starts with /subscriptions/(prod|nonprod)_sub_...
-        $ValidShape = '^((prod|nonprod)_|/subscriptions/(prod|nonprod)_sub_)'
+        #   - flat token, for an id that is not an ARM id: ^(prod|nonprod)_...
+        #   - structure-preserving ARM path, the same masked id the inventory
+        #     gives the resource: /subscriptions/(prod|nonprod)_<guid>/...
+        $ValidShape = $script:ObfuscatedIdPattern
         foreach ($row in $Csv)
         {
             if (![string]::IsNullOrEmpty($row.ResourceId))
@@ -109,9 +126,10 @@ Describe "Consumption Prefix Consistency" {
 #      used per class in ResourceInventory.ps1 (resource name L639, subscription
 #      L659, resource group L668, tag value L1011), which is Requirement 3.3.
 #   2. Fixture-content assertions that lock the type-hint contract (3.4): the
-#      databricks/aks/vmss hints appear only on the obfuscated NAME, never on the
-#      obfuscated ID (source L643 builds the ID with no hint; L647-654 apply the
-#      hint to the name only).
+#      databricks/aks/vmss hints appear only on resource NAME tokens. An ID is a
+#      masked ARM id whose last segment is the resource's own name token
+#      (Get-ObfuscatedResourceId), so it carries the name's hint there and
+#      nowhere else: never on its subscription or resource group segment.
 # ---------------------------------------------------------------------------
 
 Describe "Classifier Fidelity — non-prod set and prod default (P7)" {
@@ -175,22 +193,34 @@ Describe "Classifier Fidelity — non-prod set and prod default (P7)" {
     }
 }
 
-Describe "Type Hint Fidelity — name only, never ID (P7 / Req 3.4)" {
-    It "obfuscated IDs never carry a databricks/aks/vmss type hint" {
-        # Source L643 builds the ID as '<prefix><guid>' with no type hint; the
-        # hint is only ever appended to the obfuscated NAME (L647-654). Assert
-        # the ID never picks one up. Runs across every resource regardless of
+Describe "Type Hint Fidelity — name tokens only (P7 / Req 3.4)" {
+    It "obfuscated IDs never carry a databricks/aks/vmss type hint outside a resource name segment" {
+        # The hint is only ever put on a resource NAME token (New-ObfuscatedNameToken
+        # and the per-resource loop of RunInventorySetup). A masked ARM id holds
+        # name tokens only in its resource name segments; its subscription and
+        # resource group tokens never carry a hint, and an id masked to one token
+        # (not an ARM id) carries none. Runs across every resource regardless of
         # fixture composition.
         foreach ($r in $script:AllResources)
         {
             if ($null -ne $r.ID)
             {
-                $r.ID | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "type hints belong on the obfuscated Name, not the ID ('$($r.ID)')"
+                if ($r.ID.StartsWith('/'))
+                {
+                    foreach ($Scope in (script:Get-IdScopeTokens $r.ID))
+                    {
+                        $Scope | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "type hints belong on resource name tokens, not the subscription or resource group of '$($r.ID)'"
+                    }
+                }
+                else
+                {
+                    $r.ID | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "type hints belong on the obfuscated Name, not the ID ('$($r.ID)')"
+                }
             }
         }
     }
 
-    It "any databricks/aks/vmss type hint present in the fixture sits on the Name only" {
+    It "any databricks/aks/vmss type hint present in the fixture sits on the Name, and on the ID only as that Name" {
         # Positive check: only meaningful when the fixture actually contains a
         # type-hinted resource. If it does not (prod-only / no databricks/aks/vmss
         # resources), record the fixture limitation instead of asserting on
@@ -205,7 +235,15 @@ Describe "Type Hint Fidelity — name only, never ID (P7 / Req 3.4)" {
         foreach ($r in $HintedNames)
         {
             $r.Name | Should -Match $HintPattern -Because "the type hint must be well-formed on the Name"
-            $r.ID   | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "the same resource's ID must remain hint-free ('$($r.ID)')"
+            $r.ID   | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "the same resource's ID must not be the hinted token itself ('$($r.ID)')"
+            if ($r.ID.StartsWith('/'))
+            {
+                (script:Get-IdOwnToken $r.ID) | Should -BeExactly $r.Name -Because "the masked ID's last segment is the resource's own Name token ('$($r.ID)')"
+                foreach ($Scope in (script:Get-IdScopeTokens $r.ID))
+                {
+                    $Scope | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because "the subscription and resource group segments of '$($r.ID)' stay hint-free"
+                }
+            }
         }
     }
 }

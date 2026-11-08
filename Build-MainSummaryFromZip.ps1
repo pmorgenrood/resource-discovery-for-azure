@@ -29,8 +29,9 @@
     Add run-wide by-service donut/bar charts (parses each per-sub inventory).
 
 .PARAMETER PackageZip
-    Also emit a portable zip of the reconstructed folder whose links survive
-    being moved/emailed.
+    Also emit a portable zip, next to the folder, of MainSummary.html and the
+    per-subscription folders reconstructed from -InputZip, whose links survive
+    being moved/emailed. Other files already in -OutputDirectory are left out.
 
 .PARAMETER KeepOriginalReports
     By default each per-subscription report is re-rendered from its Inventory

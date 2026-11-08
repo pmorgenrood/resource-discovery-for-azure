@@ -28,16 +28,14 @@ BeforeAll {
     }
 
     # Find the zip
-    $ZipPath = if ($env:TEST_ZIP_PATH) { $env:TEST_ZIP_PATH } else
-    {
-        Get-ChildItem -Path $PSScriptRoot -Filter "ResourcesReport_*.zip" |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-    }
-
+    # $env:TEST_ZIP_PATH, else the newest Tests/ResourcesReport_*.zip, else a
+    # synthetic report generated offline (Tests/Helpers/SyntheticReportZip.ps1).
+    . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+    $script:Fixture = Get-RdaTestReportZip
+    $ZipPath = $script:Fixture.ZipPath
     if ([string]::IsNullOrEmpty($ZipPath) -or -not (Test-Path $ZipPath))
     {
-        throw "No test zip found. Copy a ResourcesReport_*.zip to the Tests/ folder or set `$env:TEST_ZIP_PATH"
+        throw ("No test zip found, and generating a synthetic one failed (exit {0}):`n{1}" -f $script:Fixture.Exit, $script:Fixture.Console)
     }
 
     # Extract to temp folder
@@ -73,6 +71,12 @@ BeforeAll {
     # 1030-1034 for where these are produced.
     $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
+    # A resource id (ID, and a cross-reference to another resource's id) is
+    # masked segment by segment and keeps its ARM shape, so ids still join
+    # across files (Get-ObfuscatedResourceId); an id that is not an ARM id is
+    # masked to one token. Get-RdaObfuscatedIdPattern accepts exactly those.
+    $script:ObfuscatedIdPattern = Get-RdaObfuscatedIdPattern
+
     # Helper: get all resources from inventory as flat list
     $script:AllResources = @()
     if ($script:Inventory)
@@ -88,7 +92,8 @@ BeforeAll {
     # Same discovery convention as DictionaryValidation.Tests.ps1: prefer
     # $env:TEST_DICT_PATH, then the Tests/ folder, then next to the zip. The
     # dictionary is LOCAL-ONLY and is never inside the shared zip.
-    $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
+    # A generated report brings the dictionary its own run wrote.
+    $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } elseif ($script:Fixture.Generated) { $script:Fixture.DictionaryPath } else
     {
         $Found = Get-ChildItem -Path $PSScriptRoot -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
@@ -105,6 +110,7 @@ BeforeAll {
 }
 
 AfterAll {
+    Remove-RdaTestReportZip $script:Fixture
     if (Test-Path $script:ExtractPath)
     {
         Remove-Item -Path $script:ExtractPath -Recurse -Force
@@ -192,13 +198,22 @@ Describe "Subscription ID Leak Check" {
 # 5. All inventory resource IDs are obfuscated
 # ============================================================
 Describe "Inventory ID Obfuscation" {
-    It "Should have all resource IDs matching the obfuscation pattern" {
+    It "Should have all resource IDs masked, with the record's own subscription, resource group and name tokens" {
         $script:AllResources.Count | Should -BeGreaterThan 0 -Because "There should be at least one resource in the inventory"
         foreach ($resource in $script:AllResources)
         {
             if ($null -ne $resource.ID)
             {
-                $resource.ID | Should -Match $script:ObfuscationPattern -Because "Resource ID '$($resource.ID)' should be obfuscated"
+                $resource.ID | Should -Match $script:ObfuscatedIdPattern -Because "Resource ID '$($resource.ID)' should be obfuscated"
+                # A masked ARM id carries the same tokens as the record's own
+                # Subscription, ResourceGroup and Name, so it joins with them.
+                $Parts = $resource.ID.Split('/')
+                if ($Parts.Count -gt 2 -and $Parts[1] -eq 'subscriptions')
+                {
+                    if ($null -ne $resource.Subscription) { $Parts[2] | Should -BeExactly $resource.Subscription -Because "the subscription segment of '$($resource.ID)' should be the record's Subscription token" }
+                    if ($Parts.Count -gt 4 -and $Parts[3] -eq 'resourcegroups' -and $null -ne $resource.ResourceGroup) { $Parts[4] | Should -BeExactly $resource.ResourceGroup -Because "the resource group segment of '$($resource.ID)' should be the record's ResourceGroup token" }
+                    if ($null -ne $resource.Name -and $Parts[-1] -ne '$system') { $Parts[-1] | Should -BeExactly $resource.Name -Because "the last segment of '$($resource.ID)' should be the record's Name token" }
+                }
             }
         }
     }
@@ -261,7 +276,7 @@ Describe "Metrics Obfuscation" {
             {
                 if ($null -ne $metric.ID)
                 {
-                    $metric.ID | Should -Match $script:ObfuscationPattern -Because "Metric ID should be obfuscated"
+                    $metric.ID | Should -Match $script:ObfuscatedIdPattern -Because "Metric ID should be obfuscated"
                 }
                 if ($null -ne $metric.Name)
                 {
@@ -285,13 +300,15 @@ Describe "Metrics Obfuscation" {
 # ============================================================
 Describe "Consumption Obfuscation" {
     # NOTE: the consumption ResourceUri shape preserves the ARM path structure
-    # (/subscriptions/<obf-sub>/resourcegroups/<obf-rg>/providers/<rp>/<type>/<obf-name>)
+    # (/subscriptions/<obf-sub>/resourcegroups/<obf-rg>/providers/<rp>/<type>/<obf-name>,
+    # the same masked id the inventory gives the resource, so rows join with it)
     # so the server-side dashboard can categorise rows by resource provider +
     # type. The pre-2026 behaviour replaced the whole URI with a flat token,
     # which broke AKS / VMSS / Container Instance / Container Registry / Kusto
     # detection on the dashboard. Tests must accept BOTH shapes:
     #   - flat: prod_<guid>            (legacy / non-ARM uris like $system)
-    #   - ARM:  /subscriptions/...     (the new structure-preserving shape)
+    #   - ARM:  /subscriptions/...     (the new structure-preserving shape, every
+    #           name segment a token: Get-RdaObfuscatedIdPattern)
     # And separately enforce the no-leak invariants that actually matter.
     #
     # NOTE: this derivation must run at RUN time, not discovery time. It depends
@@ -300,7 +317,7 @@ Describe "Consumption Obfuscation" {
     # (when the pattern is still $null) and crash the whole block, silently
     # dropping the two consumption assertions below. Keep it inside BeforeAll.
     BeforeAll {
-        $script:ConsumptionSafePattern = '^(' + $script:ObfuscationPattern.TrimStart('^').TrimEnd('$') + '|/subscriptions/(prod|nonprod)_sub_)'
+        $script:ConsumptionSafePattern = $script:ObfuscatedIdPattern
     }
 
     It "Should have all consumption ResourceIds matching the obfuscation pattern" {
@@ -417,6 +434,13 @@ Describe "Tenant ID Leak Check" {
 Describe "Non-Obfuscated Mode Safety" {
     BeforeAll {
         $script:NonObfZip = $env:TEST_NOOBF_ZIP_PATH
+        # With a generated report, a run of the same synthetic estate without -Obfuscate.
+        if (-not $script:NonObfZip -and $script:Fixture.Generated)
+        {
+            $script:PlainFixture = New-RdaSyntheticReportZip -RepoRoot (Split-Path -Path $PSScriptRoot -Parent) -TestsRoot $PSScriptRoot -Plain
+            $script:NonObfZip = $script:PlainFixture.ZipPath
+            if ([string]::IsNullOrEmpty($script:NonObfZip)) { throw ("Generating the synthetic report without -Obfuscate failed (exit {0}):`n{1}" -f $script:PlainFixture.Exit, $script:PlainFixture.Console) }
+        }
         if ($script:NonObfZip -and (Test-Path $script:NonObfZip))
         {
             $script:NoObfExtract = Join-Path ([System.IO.Path]::GetTempPath()) "NoObfTest_$([guid]::NewGuid().ToString().Substring(0,8))"
@@ -430,6 +454,7 @@ Describe "Non-Obfuscated Mode Safety" {
     }
 
     AfterAll {
+        Remove-RdaTestReportZip $script:PlainFixture
         if ($script:NoObfExtract -and (Test-Path $script:NoObfExtract))
         {
             Remove-Item -Path $script:NoObfExtract -Recurse -Force
@@ -445,7 +470,14 @@ Describe "Non-Obfuscated Mode Safety" {
         foreach ($file in $script:NoObfContent.Keys)
         {
             if ($file -like "Transcript_*") { continue }
-            $script:NoObfContent[$file] | Should -Not -Match 'obfuscated' -Because "File '$file' should contain real data, not obfuscated placeholders"
+            # The shareable diagnostics log is prose, not report data, and its
+            # header names the run's mode ("non-obfuscated run"); the report
+            # HTML's stylesheet styles both privacy banners
+            # (.privacy-banner.obfuscated). Neither is a placeholder value.
+            if ($file -like "Diagnostics_*.log") { continue }
+            $Text = $script:NoObfContent[$file]
+            if ($file -like "*.html") { $Text = [regex]::Replace($Text, '(?s)<style\b.*?</style>', '') }
+            $Text | Should -Not -Match 'obfuscated' -Because "File '$file' should contain real data, not obfuscated placeholders"
         }
     }
 
@@ -492,7 +524,7 @@ Describe "Cross-Reference Field Obfuscation" {
         {
             if ($null -ne $r -and ![string]::IsNullOrEmpty($r.Set))
             {
-                $r.Set | Should -Match $script:ObfuscationPattern -Because "VMSS Set ID should be obfuscated"
+                $r.Set | Should -Match $script:ObfuscatedIdPattern -Because "VMSS Set ID should be obfuscated"
                 $Checked++
             }
         }

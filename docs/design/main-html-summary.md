@@ -117,8 +117,9 @@ everything" question is answered on the same page:
 
 | Source collection | Meaning | Main summary rendering |
 |---|---|---|
+| the run's subscriptions against the consolidated zip (`Get-RunReportCoverage`) | subscriptions in the run (and visible to the tenant), reports in the zip, and each subscription without a report in the zip with its reason: report missing, skipped by the up-front role check, retry limit reached, earlier report not carried, not enabled or excluded, collection failed, not collected | one line with the numbers; red banner + list (a not-readable subscription by name only, as no zip holds its id; under `-Obfuscate`, a count per reason); the same lines in `RunSummary.log` |
 | `$FailedSubscriptions` | subs whose run failed | red banner + list |
-| `$SubResourceCounts` Count == 0 | subs that returned 0 resources | amber banner + list (often a Reader-permission gap) |
+| report with 0 resources | subs whose report lists no resource (none of the types a collector covers, or none at all; read access was checked before collection) | amber banner (count) |
 | `$Global:ConsumptionFailedSubs` | consumption phase auth issues | amber note (per-sub) |
 | `$Global:MetricsFailedSubs` | metrics phase auth issues | amber note (per-sub) |
 | `$Global:CollectorFailures` | per-(sub, collector) throws | amber note grouped by sub |
@@ -244,7 +245,9 @@ unchanged by default.
 
 ```
 Header:  tenant, version, platform, generated timestamp, privacy banner
-Banners: failed subs (red), empty subs (amber), phase-health notes (amber)
+Numbers: subscriptions in the run (visible to the tenant), reports in this zip
+Banners: subs without a report in this zip, with the reason (red), failed subs
+         (red), empty subs (amber), phase-health notes (amber)
 Totals:  [ total resources ] [ subscriptions processed ] [ empty ] [ failed ]
 Charts:  (Detailed only) run-wide donut (by service) + top-N bar (by service)
 Table:   one row per subscription:
@@ -254,7 +257,16 @@ Footer:  RDA version, generator note
 ```
 
 The per-sub links use relative paths so the main page travels with the report
-folder (matching the self-contained/portable contract).
+folder (matching the self-contained/portable contract). The wrapper passes the
+report folders whose zip went into the consolidated zip, so the table, the
+totals and the HTML copies in the zip hold only those reports.
+
+Health is `ok`, `0 resources`, or `consumption incomplete` when the
+subscription's consumption collection failed or its consumption phase was
+skipped for sign-in (the subscriptions the consumption banner counts, plus
+sign-in skips, which the banner does not count; the row is matched through the
+`ReportFolder` of the failure entry, which also works when names are
+obfuscated).
 
 ## 11. Edge cases & failure handling
 

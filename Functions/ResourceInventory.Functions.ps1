@@ -19,19 +19,23 @@
 # ResourceInventory.ps1 dot-sources Common.Functions.ps1 at startup, so Write-Log
 # is available here exactly as before. Its default behavior is unchanged; it
 # gained additive -NoConsole / -ToDebugLog switches. See that file for detail.
+# Write-InventoryJson moved to Functions/InventoryJson.Functions.ps1, so
+# Functions/RecoveryMerge.Functions.ps1 can load it without this file.
 
 function GetLocalVersion()
 {
-    $VersionJsonPath = "./Version.json"
-    if (Test-Path $VersionJsonPath)
+    # Version.json sits next to ResourceInventory.ps1, one level above this file,
+    # so the run does not depend on the folder it was started from.
+    $VersionJsonPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'Version.json'
+    if (Test-Path -LiteralPath $VersionJsonPath -PathType Leaf)
     {
-        $LocalVersionJson = Get-Content $VersionJsonPath | ConvertFrom-Json
+        $LocalVersionJson = Get-Content -LiteralPath $VersionJsonPath | ConvertFrom-Json
         return ('{0}.{1}.{2}' -f $LocalVersionJson.MajorVersion, $LocalVersionJson.MinorVersion, $LocalVersionJson.BuildVersion)
     }
     else
     {
-        Write-Host "Local Version.json not found. Clone the repo and execute the script from the root. Exiting." -ForegroundColor Red
-        Exit
+        Write-Host ("Local Version.json not found at {0}. Clone the full repo and run the script from it. Exiting." -f $VersionJsonPath) -ForegroundColor Red
+        exit 1
     }
 }
 
@@ -117,98 +121,616 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
     return $Result
 }
 
-# Runs `az graph query` and returns the parsed JSON result. Azure CLI
-# failures (expired auth, throttling, a malformed KQL string, a transient
-# ARM error) print to stderr and exit non-zero, but the previous call sites
-# piped stdout straight into ConvertFrom-Json and read a count field off
-# whatever came out - a failed call and a genuinely empty subscription both
-# produced $null/0 with zero indication anything went wrong (see #22). This
-# wrapper checks the actual exit code and throws with the real Azure CLI
-# error text, so a Resource Graph failure surfaces as a loud, actionable
-# subscription failure instead of a silent "0 resources found". -Lowercase
-# preserves the exact `.tolower()` behavior the original data-fetching call
-# sites relied on (collectors compare against lowercase type strings).
+# Resource Graph (the inventory's data path) through Invoke-AzRestMethod, so
+# the tool needs only the Az PowerShell modules it already loads: no Azure CLI
+# and no Az.ResourceGraph. Invoke-AzRestMethod returns the raw response text,
+# which keeps two things `az graph query` gave the callers: -Lowercase can
+# lowercase the text before it is parsed (the collectors compare against
+# lowercase strings), and a resource whose definition holds an empty-string
+# property key ("": ..., user-authored Logic App / policy / template
+# definitions) can still be returned. PowerShell 7's ConvertFrom-Json refuses
+# such a key, so it is renamed to '_rda_emptykey' before parsing.
+
+# Request one page of a Resource Graph query. Returns a result object instead
+# of throwing, because the production $ErrorActionPreference of
+# 'SilentlyContinue' suppresses a bare `throw`: { Ok; Content; PageSize;
+# Attempts; Error }. Bounded: at most $MaxAttempts transient failures (408,
+# 429, 5xx, a request that throws), waiting Retry-After (capped at
+# $MaxRetryAfterSeconds) or an exponential backoff with jitter between them.
+# 400/401/403/404 and any other non-2xx status fail at once. An answer too
+# large for one page (ResponsePayloadTooLarge) is asked for again with half
+# the page size, down to one row; the smaller size is returned so later
+# pages keep it.
+function Invoke-AzGraphPage
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Query,
+        [Parameter(Mandatory = $true)][string[]]$SubscriptionId,
+        [int]$PageSize = 1000,
+        [string]$SkipToken,
+        [int]$MaxAttempts = 4,
+        [int]$MaxRetryAfterSeconds = 60
+    )
+
+    $GraphPath = '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01'
+    $Transient = 0
+    $Requests = 0
+    $LastError = $null
+    # Every transient attempt plus every halving of the page size down to one row.
+    $RequestCap = $MaxAttempts + [int][math]::Ceiling([math]::Log([math]::Max($PageSize, 1), 2)) + 1
+
+    for ($Try = 1; $Try -le $RequestCap; $Try++)
+    {
+        $Options = [ordered]@{ resultFormat = 'objectArray'; '$top' = $PageSize }
+        if (-not [string]::IsNullOrEmpty($SkipToken)) { $Options['$skipToken'] = $SkipToken }
+        $Body = [ordered]@{ subscriptions = @($SubscriptionId); query = $Query; options = $Options } | ConvertTo-Json -Depth 5 -Compress
+
+        $Requests++
+        $Response = $null
+        $Thrown = $null
+        try { $Response = Invoke-AzRestMethod -Method POST -Path $GraphPath -Payload $Body -ErrorAction Stop }
+        catch { $Thrown = $_.Exception }
+
+        $RetryAfter = $null
+        $Throttled = $false
+        if ($null -eq $Thrown -and $null -ne $Response)
+        {
+            $Status = [int]$Response.StatusCode
+            if ($Status -ge 200 -and $Status -lt 300)
+            {
+                return [pscustomobject]@{ Ok = $true; Content = [string]$Response.Content; PageSize = $PageSize; Attempts = $Requests; Error = $null }
+            }
+
+            $Err = Get-AzGraphErrorInfo -Content ([string]$Response.Content)
+            $Described = 'HTTP {0} {1}: {2}' -f $Status, $Err.Code, $Err.Message
+            if ($Err.Codes -contains 'ResponsePayloadTooLarge')
+            {
+                if ($PageSize -le 1)
+                {
+                    return [pscustomobject]@{ Ok = $false; Content = $null; PageSize = $PageSize; Attempts = $Requests; Error = ('the answer is too large even one row per page (ResponsePayloadTooLarge) after {0} attempt(s): {1}' -f $Requests, $Described) }
+                }
+                $PageSize = [int][math]::Floor($PageSize / 2)
+                continue
+            }
+
+            $IsTransient = $Status -eq 408 -or $Status -eq 429 -or $Status -ge 500
+            if (-not $IsTransient)
+            {
+                return [pscustomobject]@{ Ok = $false; Content = $null; PageSize = $PageSize; Attempts = $Requests; Error = ('{0} after {1} attempt(s)' -f $Described, $Requests) }
+            }
+            $LastError = $Described
+            $Throttled = $Status -eq 429
+            $RetryAfter = Get-AzGraphRetryAfterSeconds -Headers $Response.Headers
+        }
+        else
+        {
+            $LastError = if ($null -ne $Thrown) { 'request failed: ' + $Thrown.Message } else { 'request returned no response' }
+        }
+
+        $Transient++
+        if ($Transient -ge $MaxAttempts) { break }
+
+        if ($null -ne $RetryAfter)
+        {
+            $Wait = [math]::Min([math]::Max([math]::Ceiling($RetryAfter), 1), $MaxRetryAfterSeconds)
+        }
+        else
+        {
+            # Exponential backoff (1, 2, 4 ...) plus jitter so a wave of
+            # throttled calls does not retry in lockstep; throttled calls wait
+            # twice as long.
+            $Backoff = [math]::Min([math]::Pow(2, $Transient - 1), 30)
+            if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, $MaxRetryAfterSeconds) }
+            $Wait = [math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2)
+        }
+        Start-Sleep -Seconds $Wait
+    }
+
+    return [pscustomobject]@{ Ok = $false; Content = $null; PageSize = $PageSize; Attempts = $Requests; Error = ('{0} after {1} attempt(s)' -f $LastError, $Requests) }
+}
+
+# The error code and message of a Resource Graph error answer
+# ({ error: { code, message, details: [{ code, message }] } }), and every code
+# in it (Codes), so a detail code such as ResponsePayloadTooLarge is seen.
+function Get-AzGraphErrorInfo
+{
+    param([string]$Content)
+    $Info = [pscustomobject]@{ Code = 'Unknown'; Message = ''; Codes = @() }
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $Info }
+    try { $Parsed = ConvertFrom-Json -InputObject $Content -ErrorAction Stop }
+    catch { $Info.Message = $Content; return $Info }
+    $ErrorNode = $Parsed.error
+    if ($null -eq $ErrorNode) { $Info.Message = $Content; return $Info }
+    $Codes = [System.Collections.Generic.List[string]]::new()
+    $Messages = [System.Collections.Generic.List[string]]::new()
+    if ($ErrorNode.code) { $Codes.Add([string]$ErrorNode.code) }
+    if ($ErrorNode.message) { $Messages.Add([string]$ErrorNode.message) }
+    foreach ($Detail in @($ErrorNode.details))
+    {
+        if ($null -eq $Detail) { continue }
+        if ($Detail.code) { $Codes.Add([string]$Detail.code) }
+        if ($Detail.message) { $Messages.Add(('{0}: {1}' -f $Detail.code, $Detail.message)) }
+    }
+    if ($Codes.Count -gt 0) { $Info.Code = ($Codes -join '/') }
+    $Info.Message = ($Messages -join ' | ')
+    $Info.Codes = $Codes.ToArray()
+    return $Info
+}
+
+# Best-effort extraction of a SERVER-DIRECTED retry delay (seconds) from a failed Azure cmdlet's error (consumption-retry-after header, else the standard Retry-After) so a throttled caller waits exactly as long as the service asks.
+# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws - a diagnostics aid must not break the retry loop.
+function Get-RdaRetryAfterSeconds
+{
+    param(
+        [Parameter(Mandatory = $true)]$ErrorRecord
+    )
+
+    # Priority order: the consumption/billing-specific header first (that is what
+    # the Cost Management throttle emits), then the standard HTTP Retry-After.
+    $HeaderNames = @('x-ms-ratelimit-microsoft.consumption-retry-after', 'Retry-After')
+
+    try
+    {
+        # PowerShell may surface the CloudException directly as .Exception or nested
+        # under one or more .InnerException levels; walk the chain (bounded).
+        $Ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        $Depth = 0
+        while ($null -ne $Ex -and $Depth -lt 5)
+        {
+            $Headers = $null
+            $ResponseProp = $Ex.PSObject.Properties['Response']
+            if ($ResponseProp -and $null -ne $ResponseProp.Value)
+            {
+                $HeadersProp = $ResponseProp.Value.PSObject.Properties['Headers']
+                if ($HeadersProp) { $Headers = $HeadersProp.Value }
+            }
+
+            if ($null -ne $Headers -and $Headers.Keys)
+            {
+                foreach ($Name in $HeaderNames)
+                {
+                    # Case-insensitive lookup: HTTP header names are
+                    # case-insensitive, but the underlying dictionary is ordinal.
+                    $Raw = $null
+                    foreach ($Key in $Headers.Keys)
+                    {
+                        if ($Key -and $Key.Equals($Name, [System.StringComparison]::OrdinalIgnoreCase))
+                        {
+                            $Raw = @($Headers[$Key])[0]
+                            break
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($Raw)) { continue }
+
+                    $Raw = ([string]$Raw).Trim()
+
+                    # delta-seconds form (what the consumption header uses).
+                    $Seconds = 0
+                    if ([int]::TryParse($Raw, [ref]$Seconds))
+                    {
+                        if ($Seconds -lt 0) { $Seconds = 0 }
+                        return $Seconds
+                    }
+
+                    # HTTP-date form: wait until that instant. Parse with the
+                    # invariant culture and AssumeUniversal - RFC 7231 HTTP-dates are
+                    # English/GMT, so a non-English-culture host must not fail to parse
+                    # them (which would silently degrade to blind backoff).
+                    $When = [datetimeoffset]::MinValue
+                    if ([datetimeoffset]::TryParse($Raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When))
+                    {
+                        $Delta = [int][math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
+                        if ($Delta -lt 0) { $Delta = 0 }
+                        return $Delta
+                    }
+                }
+            }
+
+            $Ex = $Ex.InnerException
+            $Depth++
+        }
+    }
+    catch
+    {
+        # Best-effort only - fall through to 0 so the caller uses its own backoff.
+    }
+
+    return 0
+}
+
+# Seconds Azure asks to wait before a retry, from Retry-After (seconds or an
+# HTTP date) or Resource Graph's x-ms-user-quota-resets-after (hh:mm:ss);
+# $null when neither is present. Accepts the HttpResponseHeaders of an
+# Invoke-AzRestMethod answer or a dictionary.
+function Get-AzGraphRetryAfterSeconds
+{
+    param($Headers)
+    if ($null -eq $Headers) { return $null }
+    if ($Headers -is [System.Net.Http.Headers.HttpResponseHeaders] -and $null -ne $Headers.RetryAfter)
+    {
+        if ($null -ne $Headers.RetryAfter.Delta) { return $Headers.RetryAfter.Delta.TotalSeconds }
+        if ($null -ne $Headers.RetryAfter.Date) { return [math]::Max(0, ($Headers.RetryAfter.Date - [DateTimeOffset]::UtcNow).TotalSeconds) }
+    }
+    foreach ($Name in 'Retry-After', 'x-ms-user-quota-resets-after')
+    {
+        $Value = $null
+        if ($Headers -is [System.Collections.IDictionary])
+        {
+            foreach ($Key in $Headers.Keys) { if ([string]$Key -ieq $Name) { $Value = @($Headers[$Key])[0] } }
+        }
+        elseif ($Headers -is [System.Net.Http.Headers.HttpHeaders])
+        {
+            $Values = $null
+            if ($Headers.TryGetValues($Name, [ref]$Values)) { $Value = @($Values)[0] }
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$Value)) { continue }
+        $Text = ([string]$Value).Trim()
+        $Seconds = 0.0
+        if ([double]::TryParse($Text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Seconds)) { return $Seconds }
+        $Span = [timespan]::Zero
+        if ([timespan]::TryParse($Text, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Span)) { return $Span.TotalSeconds }
+        $When = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($Text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When)) { return [math]::Max(0, ($When - [DateTimeOffset]::UtcNow).TotalSeconds) }
+    }
+    return $null
+}
+
+# Rename every empty-string property KEY ("": ...) in JSON text to
+# "_rda_emptykey". JSON strings are matched whole (escapes included), so an
+# empty string value, or a "": inside a string, is left alone. When the text
+# already holds that name (in any case, since -Lowercase lowercases the text
+# afterwards), a numeric suffix is added until the name is unused, so the
+# renamed key never collides with a real one and no value is dropped.
+function Protect-AzGraphEmptyKey
+{
+    param([string]$Json)
+    if ($Json -notmatch '""\s*:') { return $Json }
+    $Sentinel = '_rda_emptykey'
+    for ($Suffix = 1; $Json.IndexOf($Sentinel, [System.StringComparison]::OrdinalIgnoreCase) -ge 0; $Suffix++) { $Sentinel = '_rda_emptykey' + $Suffix }
+    $Replacement = '"' + $Sentinel + '"'
+    return [regex]::Replace($Json, '"(?:[^"\\]|\\.)*"(?=\s*:)', {
+            param($Match)
+            if ($Match.Value -eq '""') { return $Replacement }
+            return $Match.Value
+        })
+}
+
+# Parse a JSON array of rows (raw text) into PSCustomObjects, rows in order.
+function ConvertFrom-AzGraphRowText
+{
+    param([string]$Json)
+    return @(ConvertFrom-Json -InputObject $Json -NoEnumerate -Depth 1024 -ErrorAction Stop)
+}
+
+# Parse one Resource Graph answer: { Rows; SkipToken; Truncated }. The skip
+# token is read from the untouched text (it is case-sensitive). -Lowercase
+# lowercases the rows' text with invariant-culture rules before parsing, as
+# the az CLI path did to its output; a row whose lowercased text does not
+# parse is kept as returned.
+function ConvertFrom-AzGraphPage
+{
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content, [switch]$Lowercase)
+
+    # Same nesting limit as ConvertFrom-Json (the JsonDocument default is 64).
+    $DocumentOptions = [System.Text.Json.JsonDocumentOptions]::new()
+    $DocumentOptions.MaxDepth = 1024
+    $Document = [System.Text.Json.JsonDocument]::Parse($Content, $DocumentOptions)
+    try
+    {
+        $Root = $Document.RootElement
+        if ($Root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'the answer is not a JSON object' }
+        $Element = [System.Text.Json.JsonElement]::new()
+        $SkipToken = $null
+        if ($Root.TryGetProperty('$skipToken', [ref]$Element) -and $Element.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $SkipToken = $Element.GetString() }
+        $Truncated = $false
+        if ($Root.TryGetProperty('resultTruncated', [ref]$Element))
+        {
+            $Truncated = ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::True) -or ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and $Element.GetString() -ieq 'true')
+        }
+        if (-not $Root.TryGetProperty('data', [ref]$Element) -or $Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { throw 'the answer has no data array' }
+        $RowTexts = @(foreach ($Row in $Element.EnumerateArray()) { $Row.GetRawText() })
+    }
+    finally
+    {
+        $Document.Dispose()
+    }
+
+    $Rows = $null
+    $DataText = Protect-AzGraphEmptyKey -Json ('[' + ($RowTexts -join ',') + ']')
+    if ($Lowercase)
+    {
+        try { $Rows = ConvertFrom-AzGraphRowText -Json $DataText.ToLowerInvariant() }
+        catch
+        {
+            $Rows = @(foreach ($RowText in $RowTexts)
+                {
+                    $Safe = Protect-AzGraphEmptyKey -Json $RowText
+                    try { ConvertFrom-Json -InputObject $Safe.ToLowerInvariant() -NoEnumerate -Depth 1024 -ErrorAction Stop }
+                    catch { ConvertFrom-Json -InputObject $Safe -NoEnumerate -Depth 1024 -ErrorAction Stop }
+                })
+        }
+    }
+    else
+    {
+        $Rows = ConvertFrom-AzGraphRowText -Json $DataText
+    }
+
+    return [pscustomobject]@{ Rows = $Rows; SkipToken = $SkipToken; Truncated = $Truncated }
+}
+
+# Runs a Resource Graph query over the given subscriptions and returns every
+# row, in the shape the inventory read from `az graph query`:
+# { count; data; skip_token; total_records }, .data holding one PSCustomObject
+# per row (none for an empty answer). The subscriptions are always named,
+# in batches of at most 1000 (Resource Graph's limit per request); each batch
+# is read page by page with the skip token, so the rows come back in the
+# query's order within a batch and in batch order across batches. A
+# subscription listed twice is queried once; with no subscription no request
+# is made. A failure (see Invoke-AzGraphPage) or an answer that cannot be
+# parsed throws with the status, the error code and message and the query, so
+# the subscription fails loudly (see #22) and never continues with a partial
+# or empty page; the throw stops the script even under the production
+# 'SilentlyContinue' preference. -Lowercase lowercases each row's text before
+# parsing, culture-invariantly (collectors compare against lowercase strings).
+# A parse error quotes at most the first 500 characters of the page, and none
+# of it with -HideRawOutput (the inventory passes it under -Obfuscate).
 function Invoke-AzGraphQuerySafe
 {
     param(
         [Parameter(Mandatory = $true)][string]$Query,
-        [object[]]$ExtraArgs = @(),
-        [switch]$Lowercase
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$SubscriptionId,
+        [switch]$Lowercase,
+        [switch]$HideRawOutput,
+        [ValidateRange(1, 1000)][int]$PageSize = 1000,
+        [ValidateRange(1, 1000)][int]$BatchSize = 1000
     )
 
-    $AzArgs = @('graph', 'query', '-q', $Query, '--output', 'json', '--only-show-errors') + $ExtraArgs
+    # A throw here must not be suppressed by the caller's preference.
+    $ErrorActionPreference = 'Stop'
+    # How much of an unparseable page a parse error quotes.
+    $RawOutputLimit = 500
 
-    # Bounded retry for TRANSIENT Resource Graph failures (dropped/changed
-    # network mid-run, VPN switch, ARM throttling, 5xx). Without this a single
-    # transient blip during discovery throws and fails the whole subscription
-    # (recorded to FailedAttempts and resumable, but the entire sub restarts).
-    # Mirrors the Get-AzMetric wrapper in Extension/Metrics.ps1: up to 3 retries
-    # (4 attempts total) with exponential backoff + jitter, longer backoff when
-    # throttled. Stable internals, deliberately NOT promoted to script params.
-    # A CLEARLY-PERMANENT failure (authorization denied, malformed KQL / bad
-    # request) is NOT retried - it throws immediately, matching the project's
-    # fail-loud-fast stance for genuine access denial rather than burning ~30s
-    # of backoff on an error a retry cannot fix. On the final failed attempt the
-    # throw is identical to the pre-retry behavior, so the per-subscription
-    # catch -> FailedAttempts -> -Resume path is unchanged (see #22).
-    $GraphMaxRetries = 3
-    $StdOut = $null
-    $ExitCode = 0
-    $StdErr = $null
+    $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $Ids = @($SubscriptionId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $Seen.Add($_) })
 
-    for ($Attempt = 0; ; $Attempt++)
+    $All = [System.Collections.Generic.List[object]]::new()
+    # Far above any real answer (10 million rows at 1000 a page); stops a
+    # service that never stops handing out skip tokens.
+    $MaxPages = 10000
+    for ($Offset = 0; $Offset -lt $Ids.Count; $Offset += $BatchSize)
     {
-        # Capture stdout and stderr separately rather than merging with 2>&1.
-        # Some az CLI versions emit non-suppressible diagnostic text on stderr
-        # (extension auto-install notices, deprecation warnings) even on a
-        # successful (exit 0) call. Merging streams would splice that text into
-        # the JSON payload and cause ConvertFrom-Json to throw a parse error on
-        # a call that actually succeeded - a false failure this must not
-        # introduce. Stdout is only ever used for the JSON payload; stderr is
-        # only used in the error message when the exit code is actually non-zero.
-        $StdErrFile = [System.IO.Path]::GetTempFileName()
-        try
+        $Batch = @($Ids[$Offset..([math]::Min($Offset + $BatchSize, $Ids.Count) - 1)])
+        $Size = $PageSize
+        $Token = $null
+        $UsedTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        for ($PageNumber = 1; $PageNumber -le $MaxPages; $PageNumber++)
         {
-            $StdOut = & az @AzArgs 2>$StdErrFile
-            $ExitCode = $LASTEXITCODE
-            $StdErr = Get-Content -Path $StdErrFile -Raw -ErrorAction SilentlyContinue
+            $Page = Invoke-AzGraphPage -Query $Query -SubscriptionId $Batch -PageSize $Size -SkipToken $Token
+            if (-not $Page.Ok)
+            {
+                throw ("Resource Graph query failed: {0}`nQuery: {1}" -f $Page.Error, $Query)
+            }
+            $Size = $Page.PageSize
+
+            try { $Parsed = ConvertFrom-AzGraphPage -Content $Page.Content -Lowercase:$Lowercase }
+            catch
+            {
+                # The page goes to the log: only its start, and none of it
+                # with -HideRawOutput, since it holds resource names and ids.
+                # The JSON parser quotes the text it failed on, so its
+                # message is shortened (or replaced by the position) too.
+                $Raw = [string]$Page.Content
+                $Cause = $_.Exception
+                while ($null -ne $Cause.InnerException) { $Cause = $Cause.InnerException }
+                if ($HideRawOutput)
+                {
+                    $Reason = if ($Cause -is [System.Text.Json.JsonException]) { 'invalid JSON at line {0}, byte {1}' -f $Cause.LineNumber, $Cause.BytePositionInLine }
+                    elseif ($Cause.Message -like 'the answer *') { $Cause.Message }
+                    else { $Cause.GetType().FullName }
+                    $RawNote = '(not shown: obfuscated run)'
+                }
+                else
+                {
+                    $Reason = [string]$Cause.Message
+                    if ($Reason.Length -gt $RawOutputLimit) { $Reason = $Reason.Substring(0, $RawOutputLimit) + '...' }
+                    $RawNote = if ($Raw.Length -gt $RawOutputLimit) { '{0}... (first {1} of {2} characters)' -f $Raw.Substring(0, $RawOutputLimit), $RawOutputLimit, $Raw.Length } else { $Raw }
+                }
+                throw ("Resource Graph returned output that could not be parsed as JSON: {0}`nQuery: {1}`nRaw output: {2}" -f $Reason, $Query, $RawNote)
+            }
+            foreach ($Row in $Parsed.Rows) { $All.Add($Row) }
+
+            if ([string]::IsNullOrEmpty($Parsed.SkipToken))
+            {
+                if ($Parsed.Truncated) { throw ("Resource Graph truncated the answer and gave no skip token to read the rest; refusing a partial result.`nQuery: {0}" -f $Query) }
+                break
+            }
+            if (-not $UsedTokens.Add($Parsed.SkipToken)) { throw ("Resource Graph handed back a skip token it had already given; stopping instead of reading the same page forever.`nQuery: {0}" -f $Query) }
+            $Token = $Parsed.SkipToken
+            if ($PageNumber -eq $MaxPages) { throw ("Resource Graph answer is longer than {0} pages; stopping.`nQuery: {1}" -f $MaxPages, $Query) }
         }
-        finally
-        {
-            Remove-Item -Path $StdErrFile -Force -ErrorAction SilentlyContinue
-        }
-
-        if ($ExitCode -eq 0) { break }
-
-        # Clearly-permanent failures: a retry cannot help, so surface immediately.
-        $Permanent = $StdErr -match 'AuthorizationFailed|does not have authorization|\bForbidden\b|\bBadRequest\b|SemanticError|SyntaxError|InvalidQuery|Please provide a valid'
-
-        if ($Permanent -or $Attempt -ge $GraphMaxRetries)
-        {
-            throw ("az graph query failed (exit code {0}) after {1} attempt(s): {2}`nQuery: {3}" -f $ExitCode, ($Attempt + 1), $StdErr, $Query)
-        }
-
-        # Transient: exponential backoff (2^attempt, capped) plus jitter so a
-        # wave of throttled calls does not retry in lockstep. Throttled calls
-        # wait a bit longer.
-        $Throttled = $StdErr -match 'TooManyRequests|\b429\b|throttl'
-        $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-        if ($Throttled) { $Backoff = [math]::Min($Backoff * 2, 60) }
-        $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-        Start-Sleep -Seconds ([math]::Round($Backoff + $Jitter, 2))
     }
 
-    $Text = $StdOut -join "`n"
-    if ($Lowercase) { $Text = $Text.ToLower() }
+    return [pscustomobject]@{ count = $All.Count; data = $All.ToArray(); skip_token = $null; total_records = $All.Count }
+}
 
+# The total of a count probe (`... | summarize count()`) across every row of an
+# Invoke-AzGraphQuerySafe result: one row per subscription batch. 0 for none.
+# A count_ that is present but not a whole number of 0 or more ends the function
+# with an error, as a failure in Invoke-AzGraphQuerySafe does, instead of being
+# read as 0, rounded or added as a negative number. 'Stop' here for the same
+# reason as there: the inventory's SilentlyContinue would otherwise let the
+# function go on past the throw.
+function Get-AzGraphCount
+{
+    param([Parameter(Mandatory = $true)]$Result)
+    $ErrorActionPreference = 'Stop'
+    $Total = [long]0
+    foreach ($Row in @($Result.data))
+    {
+        if ($null -eq $Row -or $null -eq $Row.count_) { continue }
+        $Value = [long]0
+        if (-not [long]::TryParse([string]$Row.count_, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Value) -or $Value -lt 0)
+        {
+            throw ("Resource Graph returned a count (count_, a {0}) that is not a whole number of 0 or more." -f $Row.count_.GetType().Name)
+        }
+        $Total += $Value
+    }
+    return $Total
+}
+
+# The network resource types the Resource Graph pull leaves out. No collector
+# reads them (Tests/SkipNetworkResources.Tests.ps1 fails if one ever does),
+# they have no Inventory section, and network costs come from the consumption
+# data, which is fetched apart from this pull. They are the bulk of the rows
+# and of the memory on a large tenant: a virtual network carries every subnet
+# with the ip configuration of every network interface in it.
+# This is the one copy of the list. -IncludeNetworkResources turns the skip off.
+function Get-RdaNetworkSkipList
+{
+    return @(
+        'microsoft.network/virtualnetworks'
+        'microsoft.network/networksecuritygroups'
+        'microsoft.network/networkinterfaces'
+        'microsoft.network/privateendpoints'
+        'microsoft.network/privatednszones'
+        'microsoft.network/privatednszones/virtualnetworklinks'
+        'microsoft.network/routetables'
+        'microsoft.network/networkwatchers'
+        'microsoft.network/networkwatchers/flowlogs'
+        'microsoft.network/applicationsecuritygroups'
+        'microsoft.network/ddosprotectionplans'
+        'microsoft.network/ipgroups'
+        'microsoft.network/connections'
+        'microsoft.network/localnetworkgateways'
+        'microsoft.network/firewallpolicies'
+        'microsoft.network/networkintentpolicies'
+        'microsoft.network/privatelinkservices'
+    )
+}
+
+# The skipped types as a KQL list: ('a', 'b', ...).
+function Get-RdaSkippedNetworkTypeList
+{
+    return '(' + ((Get-RdaNetworkSkipList | ForEach-Object { "'$_'" }) -join ', ') + ')'
+}
+
+# The filter the count query and the page query both carry, so the paging
+# stays in step with the count. Empty with -IncludeNetworkResources.
+function Get-RdaNetworkSkipFilter
+{
+    param([switch]$IncludeNetworkResources)
+    if ($IncludeNetworkResources) { return '' }
+    return ' | where type !in~ ' + (Get-RdaSkippedNetworkTypeList)
+}
+
+# The fields of a resource the -Obfuscate token loop of ResourceInventory.ps1
+# reads: the id (the name hint and the masked id, which Get-ObfuscatedResourceId
+# builds from the id alone), the name (its prod_/nonprod_ prefix), the
+# subscription id (the subscription name's token) and the resource group (its
+# token). Nothing else, so the rows stay small.
+function Get-RdaNetworkTokenField
+{
+    return @('id', 'name', 'resourceGroup', 'subscriptionId')
+}
+
+# The id query for the skipped types under -Obfuscate: the same where clause
+# as the pull, the opposite type filter, so the pull and this query together
+# hold every row the pull held before the skip; only the token loop's fields,
+# sorted by the id in lower case like the pull, so the skip-token paging is
+# stable. $Where is the scope's own where clause, without 'resources |'.
+function Get-RdaNetworkTokenQuery
+{
+    param([Parameter(Mandatory = $true)][string]$Where)
+    return ('resources | where {0} | where type in~ {1} | project {2} | order by tolower(id) asc' -f $Where, (Get-RdaSkippedNetworkTypeList), ((Get-RdaNetworkTokenField) -join ','))
+}
+
+# One cheap query: how many rows of each skipped type the scope holds. It only
+# feeds the log, so a failure warns once and returns $null; it never fails the
+# run and is never retried here (Invoke-AzGraphQuerySafe has its own capped
+# retries). $Where is the scope's own where clause, without 'resources |'.
+# $ExcludeSubscriptionId: the subscriptions the access check skipped, whose
+# rows the pull drops after it is read, so they are not counted either.
+# Returns { Total; ByType } with the types lowercase and summed across
+# subscription batches.
+function Get-RdaSkippedNetworkCount
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$Where,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SubscriptionId,
+        [AllowEmptyCollection()][string[]]$ExcludeSubscriptionId = @(),
+        [switch]$HideRawOutput
+    )
+
+    $Query = 'resources | where {0} | where type in~ {1} | summarize count() by type, subscriptionId' -f $Where, (Get-RdaSkippedNetworkTypeList)
     try
     {
-        return ($Text | ConvertFrom-Json -ErrorAction Stop)
+        $Result = Invoke-AzGraphQuerySafe -Query $Query -SubscriptionId $SubscriptionId -HideRawOutput:$HideRawOutput
     }
     catch
     {
-        throw ("az graph query returned output that could not be parsed as JSON: {0}`nRaw output: {1}" -f $_.Exception.Message, $Text)
+        # The first line only: the rest repeats the query.
+        $Reason = ([string]$_.Exception.Message -split "`r?`n")[0]
+        Write-Log -Message ("Could not count the skipped network resources ({0}). The run carries on; the log just leaves the skipped count out." -f $Reason) -Severity 'Warning'
+        return $null
     }
+
+    $ByType = [ordered]@{}
+    $Total = [long]0
+    foreach ($Row in @($Result.data))
+    {
+        if ($null -eq $Row -or $null -eq $Row.count_ -or [string]::IsNullOrEmpty([string]$Row.type)) { continue }
+        if (@($ExcludeSubscriptionId) -contains [string]$Row.subscriptionId) { continue }
+        $Type = ([string]$Row.type).ToLowerInvariant()
+        if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
+        $ByType[$Type] += [long]$Row.count_
+        $Total += [long]$Row.count_
+    }
+    return [pscustomobject]@{ Total = $Total; ByType = $ByType }
+}
+
+# The resource type an ARM id names, lowercase: the provider namespace after
+# the last /providers/, then every type segment (the 1st, 3rd, ... segment
+# after it). '.../providers/microsoft.network/privatednszones/z/virtualnetworklinks/l'
+# gives 'microsoft.network/privatednszones/virtualnetworklinks'. $null when the
+# id names no provider type.
+function Get-RdaResourceTypeFromId
+{
+    param([AllowEmptyString()][AllowNull()][string]$Id)
+    if ([string]::IsNullOrEmpty($Id)) { return $null }
+    $Lower = $Id.ToLowerInvariant()
+    $At = $Lower.LastIndexOf('/providers/')
+    if ($At -lt 0) { return $null }
+    $Parts = @($Lower.Substring($At + '/providers/'.Length).Trim('/') -split '/' | Where-Object { $_ })
+    if ($Parts.Count -lt 3) { return $null }
+    $Type = [System.Collections.Generic.List[string]]::new()
+    $Type.Add($Parts[0])
+    for ($i = 1; $i -lt $Parts.Count; $i += 2) { $Type.Add($Parts[$i]) }
+    return ($Type -join '/')
+}
+
+# The skipped-network count from the id rows of the -Obfuscate id query, which
+# already holds every skipped row of the scope: the same { Total; ByType } as
+# Get-RdaSkippedNetworkCount, with no extra query. The type comes from the id.
+# $ExcludeSubscriptionId: the subscriptions the access check skipped.
+function Get-RdaSkippedNetworkCountFromRow
+{
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$Row,
+        [AllowEmptyCollection()][string[]]$ExcludeSubscriptionId = @()
+    )
+    $ByType = [ordered]@{}
+    $Total = [long]0
+    foreach ($R in @($Row))
+    {
+        if ($null -eq $R) { continue }
+        if (@($ExcludeSubscriptionId) -contains [string]$R.subscriptionId) { continue }
+        $Type = Get-RdaResourceTypeFromId -Id ([string]$R.id)
+        if ([string]::IsNullOrEmpty($Type)) { continue }
+        if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
+        $ByType[$Type] += 1
+        $Total += 1
+    }
+    return [pscustomobject]@{ Total = $Total; ByType = $ByType }
 }
 
 
@@ -314,7 +836,10 @@ function Write-RdaShareableDiagnosticsLog
         # array (the single $null) that would otherwise render a phantom "failure"
         # line. Filtering nulls yields a genuine "0" when there were none.
         $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ })
-        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ })
+        # Metrics skipped for the sign-in, and metrics left incomplete because Azure
+        # Monitor kept failing (Complete = $false), each with its own count.
+        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) })
+        $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
         $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()
@@ -357,6 +882,12 @@ function Write-RdaShareableDiagnosticsLog
             $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$msItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$msItem.Message) $DiagScrubMap)))
         }
         $DiagLines.Add('')
+        $DiagLines.Add(('Metrics incomplete subscriptions: {0}' -f $MetricsIncomplete.Count))
+        foreach ($miItem in $MetricsIncomplete)
+        {
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$miItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$miItem.Message) $DiagScrubMap)))
+        }
+        $DiagLines.Add('')
         $DiagLines.Add(('Consumption failed/incomplete subscriptions: {0}' -f $ConsumpSkips.Count))
         foreach ($csItem in $ConsumpSkips)
         {
@@ -364,7 +895,7 @@ function Write-RdaShareableDiagnosticsLog
         }
 
         $DiagnosticsFile = ($DefaultPath + "Diagnostics_" + $ReportName + "_" + $RunDateTime + ".log")
-        ($DiagLines -join [Environment]::NewLine) | Out-File -FilePath $DiagnosticsFile -Encoding utf8
+        ($DiagLines -join [Environment]::NewLine) | Out-File -LiteralPath $DiagnosticsFile -Encoding utf8
         Write-Log -Message ('Shareable diagnostics log written: {0}' -f (Split-Path -Path $DiagnosticsFile -Leaf)) -Severity 'Info'
         return $DiagnosticsFile
     }
@@ -372,59 +903,6 @@ function Write-RdaShareableDiagnosticsLog
     {
         Write-Log -Message ('Could not build/write shareable diagnostics log: {0}' -f $_.Exception.Message) -Severity 'Warning'
         return $null
-    }
-}
-
-# Write the inventory object (one NoteProperty per collector) to $Path one property at a time,
-# so the whole document is never built as one string. The output is byte-for-byte what
-# '$InputObject | ConvertTo-Json -Depth 100 -Compress | Out-File $Path' wrote: each value sits
-# one level below the root, hence -Depth 99; -InputObject keeps a one-element array as [ ... ];
-# UTF-8 with no BOM and a trailing newline; a relative path resolves against the PowerShell
-# location, as Out-File does. The file is written under a temporary name in the same folder and
-# moved to $Path only once it is complete, so a failed write never leaves a cut-off file: on any
-# failure the temporary file is closed and removed, and the error is re-thrown.
-function Write-InventoryJson
-{
-    param(
-        [Parameter(Mandatory = $true)]
-        $InputObject,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $FullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    $TempPath = '{0}.{1}.tmp' -f $FullPath, [guid]::NewGuid().ToString('N')
-    $Moved = $false
-    try
-    {
-        $Writer = [System.IO.StreamWriter]::new($TempPath, $false, [System.Text.UTF8Encoding]::new($false))
-        try
-        {
-            $Writer.Write('{')
-            $FirstProperty = $true
-            foreach ($Prop in $InputObject.PSObject.Properties)
-            {
-                if (-not $FirstProperty) { $Writer.Write(',') }
-                $FirstProperty = $false
-                $Writer.Write((ConvertTo-Json -InputObject $Prop.Name -Compress))
-                $Writer.Write(':')
-                $Writer.Write((ConvertTo-Json -InputObject $Prop.Value -Depth 99 -Compress))
-            }
-            $Writer.Write('}')
-            $Writer.Write([Environment]::NewLine)
-        }
-        finally
-        {
-            try { $Writer.Flush() }
-            finally { $Writer.Dispose() }
-        }
-        [System.IO.File]::Move($TempPath, $FullPath, $true)
-        $Moved = $true
-    }
-    finally
-    {
-        if (-not $Moved -and (Test-Path -LiteralPath $TempPath)) { Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue }
     }
 }
 

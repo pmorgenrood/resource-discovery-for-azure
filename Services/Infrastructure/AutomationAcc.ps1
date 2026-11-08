@@ -9,10 +9,27 @@ if ($Task -eq 'Processing')
     {
         $Tmp = [System.Collections.Generic.List[object]]::new()
 
+        # A runbook belongs to the account whose id is the runbook id without its
+        # last '/runbooks/<name>' part. Matching on that id, not on the account
+        # name, keeps runbooks under their own account when two accounts share a
+        # name in different resource groups or subscriptions. Ids are compared
+        # without regard to case: Azure does not keep one case for them.
+        $RunbooksByAccount = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($Rb in $Runbook)
+        {
+            $RbId = $Rb.id
+            if ($RbId -isnot [string]) { continue }
+            $Cut = $RbId.LastIndexOf('/runbooks/', [System.StringComparison]::OrdinalIgnoreCase)
+            if ($Cut -le 0) { continue }
+            $ParentId = $RbId.Substring(0, $Cut)
+            if (-not $RunbooksByAccount.ContainsKey($ParentId)) { $RunbooksByAccount[$ParentId] = [System.Collections.Generic.List[object]]::new() }
+            $RunbooksByAccount[$ParentId].Add($Rb)
+        }
+
         foreach ($0 in $Autacc)
         {
             $Sub1 = $SUB | Where-Object { $_.Id -eq $0.subscriptionId }
-            $Rbs = $Runbook | Where-Object { $_.id.split('/')[8] -eq $0.name }
+            $Rbs = if ($0.id -is [string] -and $RunbooksByAccount.ContainsKey($0.id)) { $RunbooksByAccount[$0.id] } else { $null }
 
             $Data0 = $0.properties
             $Timecreated = $Data0.creationTime
@@ -37,7 +54,7 @@ if ($Task -eq 'Processing')
                         'AutomationAccountCreatedTime'  = $Timecreated;
                         'Location'                      = $0.LOCATION;
                         'RunbookName'                   = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { Protect-FreeTextValue $1.Name } else { $1.Name };
-                        'LastModifiedTime'              = try { if ($null -ne $Data.lastModifiedTime) { ([datetime]::Parse($Data.lastModifiedTime, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal')).ToString("yyyy-MM-dd HH:mm") } else { 'Unknown' } } catch { 'Unknown' };
+                        'LastModifiedTime'              = try { if ($null -ne $Data.lastModifiedTime) { ([datetime]::Parse($Data.lastModifiedTime, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]'AdjustToUniversal, AssumeUniversal')).ToString("yyyy-MM-dd HH:mm") } else { 'Unknown' } } catch { 'Unknown' } ;
                         'RunbookState'                  = $Data.state;
                         'RunbookType'                   = $Data.runbookType;
                         'RunbookDescription'            = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { Protect-FreeTextValue $Data.description } else { $Data.description };

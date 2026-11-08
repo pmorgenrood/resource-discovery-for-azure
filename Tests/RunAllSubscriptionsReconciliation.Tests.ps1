@@ -85,7 +85,7 @@ Describe 'Get-StreamResumeStateFiles' {
         # then a later run using -ParallelStreams 2. All four files must still
         # be discovered so their data is not silently dropped/orphaned.
         0..3 | ForEach-Object {
-            Set-Content -Path (Join-Path $script:CaseDir (".resume-state-$Tenant-stream-$_.json")) -Value '{}'
+            Set-Content -Path (Join-Path $script:CaseDir (".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-$_.json")) -Value '{}'
         }
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 4 -Because 'all four per-stream files (0-3) must be discovered regardless of the current run''s -ParallelStreams value'
@@ -93,20 +93,20 @@ Describe 'Get-StreamResumeStateFiles' {
 
     It 'Does not return resume files belonging to a different tenant' {
         $Tenant = 'tenant-abc'
-        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant-stream-0.json") -Value '{}'
+        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json") -Value '{}'
         Set-Content -Path (Join-Path $script:CaseDir ".resume-state-other-tenant-stream-0.json") -Value '{}'
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 1
-        $Files[0].Name | Should -Be ".resume-state-$Tenant-stream-0.json"
+        $Files[0].Name | Should -Be ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json"
     }
 
     It 'Does not return the unified (non-stream) resume-state file' {
         $Tenant = 'tenant-abc'
         Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant.json") -Value '{}'
-        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$Tenant-stream-0.json") -Value '{}'
+        Set-Content -Path (Join-Path $script:CaseDir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json") -Value '{}'
         $Files = Get-StreamResumeStateFiles -InventoryRoot $script:CaseDir -Tenant $Tenant
         $Files.Count | Should -Be 1
-        $Files[0].Name | Should -Be ".resume-state-$Tenant-stream-0.json"
+        $Files[0].Name | Should -Be ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json"
     }
 
     It 'Returns an empty array (not $null / an error) when no per-stream files exist' {
@@ -179,6 +179,20 @@ Describe 'Get-WrapperExitCode' {
         # problems occurring together must be distinctly detectable by
         # anything that only checks the exit code.
         Get-WrapperExitCode -AuthSkipped $true -CollectorsFailed $true | Should -Be 5 -Because 'neither failure signal may be silently dropped when both occur in the same run'
+    }
+
+    It 'Returns 2 when a subscription failed, whatever else happened (a failed run is never reported as clean)' -ForEach @(
+        @{ Auth = $false; Collectors = $false }
+        @{ Auth = $true; Collectors = $false }
+        @{ Auth = $false; Collectors = $true }
+        @{ Auth = $true; Collectors = $true }
+    ) {
+        Get-WrapperExitCode -AuthSkipped $Auth -CollectorsFailed $Collectors -SubscriptionsFailed $true | Should -Be 2
+    }
+
+    It 'Is 2 when the wrapper lists a failed subscription' {
+        $Text = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Text | Should -Match '\$WrapperExitCode = Get-WrapperExitCode [^\r\n]*-SubscriptionsFailed \(@\(\$FailedSubscriptions'
     }
 }
 
@@ -276,11 +290,11 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
     It 'recovers a failure that lives only in an unmerged per-stream file' {
         $Tenant = 'tenant-f2a'
         @{ Tenant = $Tenant; StreamId = 0; Completed = @('sub-ok'); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-0.json")
+            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json")
         @{ Tenant = $Tenant; StreamId = 1; Completed = @(); FailedAttempts = @(
                 [pscustomobject]@{ Id = 'sub-fail'; Name = 'Sub Fail'; LastFailedAt = '2026-06-01T00:00:00Z'; Reason = 'throttled'; Attempts = 1 }
             )
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-1.json")
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-1.json")
 
         $StrandedCompleted = @()
         $StrandedFailed = @()
@@ -301,11 +315,11 @@ Describe 'Interrupted-parallel-run stream-state fold-in (F2)' {
     It 'prunes a stranded failure when the same sub completed in another stream' {
         $Tenant = 'tenant-f2b'
         @{ Tenant = $Tenant; StreamId = 0; Completed = @('sub-x'); FailedAttempts = @() } |
-            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-0.json")
+            ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-0.json")
         @{ Tenant = $Tenant; StreamId = 1; Completed = @(); FailedAttempts = @(
                 [pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-05-01T00:00:00Z'; Reason = 'transient'; Attempts = 1 }
             )
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$Tenant-stream-1.json")
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $script:F2Dir ".resume-state-$([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())-stream-1.json")
 
         $StrandedCompleted = @()
         $StrandedFailed = @()
@@ -430,6 +444,61 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Text | Should -Match 'Fabrikam-Locked'
         $Text | Should -Match 'StreamAnalytics'
         $Text | Should -Match 'no usable token'
+    }
+
+    It 'names each failed subscription from the lines of text the wrapper collects' {
+        # Run-AllSubscriptions.ps1 collects each failure as text: the subscription
+        # name, '<name> (stream-N: <reason>)' from a stream, or 'stream-N (no summary)'.
+        $Failed = @('Contoso-Prod-Sub', 'Fabrikam-Dev (stream-1: Script exited with code 1)', 'stream-0 (no summary)')
+        $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -FailedSubscriptions $Failed)
+        $Start = [array]::IndexOf($Lines, 'Failed subscriptions (detail):')
+        $Start | Should -BeGreaterOrEqual 0
+        $Lines[($Start + 1)..($Start + 3)] | Should -Be @('  - Contoso-Prod-Sub', '  - Fabrikam-Dev (stream-1: Script exited with code 1)', '  - stream-0 (no summary)')
+        $Lines | Should -Not -Contain '  -  ()'
+    }
+
+    It 'counts the subscriptions whose report is missing, and names them only in a non-obfuscated run' {
+        $Missing = @([pscustomobject]@{ Name = 'Contoso-Prod-Sub'; Id = '12345678-1234-1234-1234-123456789012' })
+        $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing)
+        $Clear | Should -Contain '  Report missing      : 2 (completed, but their report zip is not in this zip; the next run collects them)'
+        $Clear | Should -Contain '  - Contoso-Prod-Sub (12345678-1234-1234-1234-123456789012)'
+        $Obf = (Get-RunSummaryLogContent -Obfuscated -MissingReportCount 2 -MissingReports $Missing) -join "`n"
+        $Obf | Should -Match 'Report missing\s+: 2'
+        $Obf | Should -Not -Match 'Contoso'
+        $Obf | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+        (Get-RunSummaryLogContent) -join "`n" | Should -Not -Match 'Report missing'
+    }
+
+    It 'names a missing report that took its subscription to the retry limit apart, with -Fresh, and not as collected by the next run' {
+        $Missing = @([pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a' }, [pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b' })
+        $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
+        $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing -RetryLimited $Limited)
+        $Clear | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
+        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)'
+        $At = [array]::IndexOf($Clear, 'Report missing (detail; not in this zip, the next run collects them):')
+        $Clear[$At + 1] | Should -Be '  - Sub A (sub-a)'
+        $Clear[$At + 2] | Should -Be '' -Because 'Sub B is not among those the next run collects'
+        $Limit = [array]::IndexOf($Clear, 'Report missing, retry limit reached (detail; not in this zip; to try them again, start a new run with -Fresh):')
+        $Clear[$Limit + 1] | Should -Be '  - Sub B (sub-b)'
+        $Only = @(Get-RunSummaryLogContent -MissingReportCount 1 -MissingReports @($Missing[1]) -RetryLimited $Limited)
+        ($Only -join "`n") | Should -Not -Match 'the next run collects them'
+    }
+
+    It 'gives a missing report that took its subscription to the retry limit the retry-limit reason in the zip coverage' {
+        $Visible = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; State = 'Enabled' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; State = 'Enabled' })
+        $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
+        $Missing = @([pscustomobject]@{ Name = 'Sub A'; Id = 'sub-a' }, [pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b' })
+        $C = Get-RunReportCoverage -Visible $Visible -RunIds @('sub-a', 'sub-b') -MissingReports $Missing -MissingReportCount 2 -RetryLimited $Limited -FailedAttempts $Limited
+        @($C.WithoutReport | ForEach-Object { '{0}: {1}' -f $_.Id, $_.Reason }) | Should -Be @(
+            'sub-a: report missing (collected, but its report zip was not written or is gone; the next run collects it)'
+            'sub-b: retry limit reached (failed 3 runs in a row; to try it again, start a new run with -Fresh)'
+        )
+        $C.UnnamedMissing | Should -Be 0
+    }
+
+    It 'still names a failed subscription given as an object with Name and Id' {
+        $Lines = @(Get-RunSummaryLogContent -FailedSubscriptions $script:Failed)
+        $Lines | Should -Contain '  - Contoso-Prod-Sub (11111111-1111-1111-1111-111111111111)'
     }
 
     It 'drops TenantID / SubscriptionID / InventoryRoot from the parameter list' {

@@ -139,7 +139,7 @@ function Write-RdaProgress
             {
                 $Line = '[{0:dd-MM-yyyy} {0:HH:mm:ss}] {1}: {2}' -f (Get-Date), $Activity, $Status
             }
-            Add-Content -Path $HeartbeatLogFile -Value $Line -ErrorAction Stop
+            Add-Content -LiteralPath $HeartbeatLogFile -Value $Line -ErrorAction Stop
         }
         catch
         {
@@ -225,7 +225,7 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     {
         try
         {
-            ('{0} {1}' -f $DateTime, $Message) | Out-File -FilePath $Global:ErrorLogFile -Append -Encoding utf8
+            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $Global:ErrorLogFile -Append -Encoding utf8
         }
         catch
         {
@@ -244,7 +244,7 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     {
         try
         {
-            ('{0} {1}' -f $DateTime, $Message) | Out-File -FilePath $Global:DebugLogFile -Append -Encoding utf8
+            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $Global:DebugLogFile -Append -Encoding utf8
         }
         catch
         {
@@ -425,9 +425,13 @@ function Get-RoleCheckCountedScopeKinds
 }
 
 # The signed-in identity's object id, from the 'oid' claim of its own Resource
-# Manager token (no directory call). $null when it cannot be read.
+# Manager token (no directory call). The token request has the role check's
+# retry policy (Invoke-ConsumptionCallWithRetry), so a failed token cache check
+# is retried; a sign-in that cannot be used is not. $null when it cannot be
+# read.
 function Get-RoleCheckCallerObjectId
 {
+    param([int]$MaxRetries = 3)
     try
     {
         $ResourceUrl = 'https://management.azure.com/'
@@ -436,7 +440,12 @@ function Get-RoleCheckCallerObjectId
         {
             $ResourceUrl = [string]$Context.Environment.ResourceManagerUrl
         }
-        $Token = Get-AzAccessToken -ResourceUrl $ResourceUrl -WarningAction SilentlyContinue -ErrorAction Stop
+        $Call = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $ResourceUrl -Operation {
+            param($Url)
+            Get-AzAccessToken -ResourceUrl $Url -WarningAction SilentlyContinue -ErrorAction Stop
+        }
+        if ($null -ne $Call.Error) { throw $Call.Error }
+        $Token = $Call.Value
         $Raw = if ($Token.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $Token.Token).Password } else { [string]$Token.Token }
         $Parts = $Raw.Split('.')
         if ($Parts.Count -lt 2) { return $null }
@@ -507,7 +516,8 @@ function Invoke-RoleCheckGet
         {
             $Items += @(@($Body.value) | Where-Object { $null -ne $_ })
         }
-        $Next = if ($null -ne $Body) { [string]$Body.nextLink } else { '' }
+        # A last page has no nextLink at all; read it so Set-StrictMode allows that.
+        $Next = if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['nextLink']) { [string]$Body.nextLink } else { '' }
         $Target = $null
         if (-not [string]::IsNullOrEmpty($Next))
         {
@@ -927,7 +937,7 @@ function Test-SubscriptionRoleAccessAll
         [int]$MaxRetries = 3,
         [int]$ThrottleLimit = 8
     )
-    $CallerObjectId = Get-RoleCheckCallerObjectId
+    $CallerObjectId = Get-RoleCheckCallerObjectId -MaxRetries $MaxRetries
     $Subs = @($Subscriptions | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
     $Arguments = @{
         ResourceGroup   = $ResourceGroup
@@ -939,7 +949,9 @@ function Test-SubscriptionRoleAccessAll
     $RoleRecords = [System.Collections.Generic.List[object]]::new()
     Invoke-SubscriptionCheckInOrder -Items $Subs -Command 'Get-SubscriptionRoleAccess' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
         param($RoleRecord)
-        if ($RoleRecord.Failed)
+        # Only a check that threw carries Failed (Invoke-SubscriptionCheckInOrder);
+        # read it so Set-StrictMode allows a result without it.
+        if ($null -ne $RoleRecord.PSObject.Properties['Failed'] -and $RoleRecord.Failed)
         {
             $FailedId = [string]$RoleRecord.Item.Id
             $RoleRecord = [pscustomobject]@{
@@ -969,24 +981,78 @@ function Test-SubscriptionRoleAccessAll
 # Decide, from the up-front role check records, which subscriptions the run
 # skips and whether it may proceed. Pure (no Azure calls) so the policy is
 # unit-testable. A subscription is not readable unless its State is
-# 'Readable', so a record that is not understood is skipped too. Returns:
+# 'Readable', so a record that is not understood is skipped too.
+# -CompletedCount is the number of in-scope subscriptions that a -Resume run
+# skips because the resume state records them as completed (they are not
+# checked again; an earlier run wrote their reports). Returns:
 #   Inaccessible    - the records the identity cannot (or may not) read; the
 #                     run skips them
 #   InaccessibleIds - their ids, to drop from scope
 #   ReadableCount   - how many checked subscriptions are readable
-#   ShouldBlock     - $true when subscriptions were checked and none is
-#                     readable: the caller must STOP with exit code 1.
+#   CompletedCount  - -CompletedCount as passed
+#   ShouldBlock     - $true when subscriptions were checked, none is readable
+#                     and none was completed earlier: the caller must STOP
+#                     with exit code 1. With completed subscriptions in scope
+#                     the run skips the unreadable ones and finishes.
 function Resolve-AccessPreflight
 {
-    param([object]$Probed)
+    param([object]$Probed, [int]$CompletedCount = 0)
     $Checked = @(@($Probed) | Where-Object { $_ })
     $Inaccessible = @($Checked | Where-Object { $_.State -ne 'Readable' })
     return [pscustomobject]@{
         Inaccessible    = $Inaccessible
         InaccessibleIds = @($Inaccessible | ForEach-Object { $_.Id })
         ReadableCount   = $Checked.Count - $Inaccessible.Count
-        ShouldBlock     = ($Inaccessible.Count -gt 0 -and $Inaccessible.Count -eq $Checked.Count)
+        CompletedCount  = $CompletedCount
+        ShouldBlock     = ($Inaccessible.Count -gt 0 -and $Inaccessible.Count -eq $Checked.Count -and $CompletedCount -le 0)
     }
+}
+
+# Print the fix for each reason the up-front role check found subscriptions
+# not readable ($Inaccessible records, by State): a missing role (NoAccess,
+# including NotFound for a resource group run, and any state not listed
+# here), a check that could not finish (Unknown), or the two answers
+# disagreeing (Disagree). Each fix ends in $ReRun. With one cause the fix
+# follows $Lead on its line; with several, $Lead is a line of its own and each
+# cause gets a line naming its subscriptions. Returns the causes found, in the
+# order printed. Shared by Write-AccessPreflightReport and
+# Write-PendingRetrySkippedSummary so the fixes read the same.
+function Write-AccessRemedyLines
+{
+    param(
+        [object[]]$Inaccessible,
+        [Parameter(Mandatory = $true)][string]$Lead,
+        [string]$ReRun = 're-run',
+        [string]$Colour = 'Yellow',
+        [switch]$ForResourceGroup
+    )
+    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then {0}.' -f $ReRun } else { 'Grant the identity Reader on these subscriptions, then {0}.' -f $ReRun }
+    $Remedies = [ordered]@{
+        NoAccess = $NoAccessText
+        Unknown  = 'The role check could not finish (the reason above says why); {0}.' -f $ReRun
+        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then {0}.' -f $ReRun
+    }
+    $ByCause = [ordered]@{}
+    foreach ($NA in @($Inaccessible | Where-Object { $null -ne $_ }))
+    {
+        $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
+        if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
+        $ByCause[$Cause] += [string]$NA.Name
+    }
+    $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
+    if ($Causes.Count -eq 1)
+    {
+        Write-Host ('{0} {1}' -f $Lead, $Remedies[$Causes[0]]) -ForegroundColor $Colour
+    }
+    else
+    {
+        Write-Host $Lead -ForegroundColor $Colour
+        foreach ($Cause in $Causes)
+        {
+            Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
+        }
+    }
+    return $Causes
 }
 
 # Print the result of the up-front role check. Shared by Run-AllSubscriptions.ps1
@@ -995,13 +1061,17 @@ function Resolve-AccessPreflight
 # for each cause; then says they are skipped, or, when none is readable
 # ($Decision.ShouldBlock), that the run stops. Prints only: the caller skips
 # them or exits with code 1. -ResourceGroup words the lines for that resource
-# group.
+# group. -Resume words a stop of a -Resume run: the fix ends in running
+# -Resume again, and a last line says a run without -Resume checks the same
+# subscriptions (a -Resume run stops only when no subscription is recorded as
+# completed) and, when every cause is a missing role, that it stops too.
 function Write-AccessPreflightReport
 {
     param(
         [Parameter(Mandatory = $true)]$Decision,
         [Parameter(Mandatory = $true)][int]$ScopeCount,
-        [string]$ResourceGroup
+        [string]$ResourceGroup,
+        [switch]$Resume
     )
     $ForResourceGroup = -not [string]::IsNullOrEmpty($ResourceGroup)
     $Inaccessible = @($Decision.Inaccessible)
@@ -1032,43 +1102,40 @@ function Write-AccessPreflightReport
         Write-Host ("    - {0} ({1}) - {2}" -f $NA.Name, $NA.Id, $Label) -ForegroundColor Red
     }
 
-    # The fix depends on why each subscription failed: a missing role
-    # (NoAccess, including NotFound for a resource group run), a check that
-    # could not finish (Unknown), or the two answers disagreeing (Disagree).
-    $NoAccessText = if ($ForResourceGroup) { 'Check the resource group name, or grant the identity Reader on the resource group or its subscription, then re-run.' } else { 'Grant the identity Reader on these subscriptions, then re-run.' }
-    $Remedies = [ordered]@{
-        NoAccess = $NoAccessText
-        Unknown  = 'The role check could not finish (the reason above says why); re-run.'
-        Disagree = 'The role assignments and Azure disagree, which usually means roles changed in the last few minutes; wait 5 minutes, then re-run.'
-    }
-    $ByCause = [ordered]@{}
-    foreach ($NA in $Inaccessible)
-    {
-        $Cause = if ($Remedies.Contains([string]$NA.State)) { [string]$NA.State } else { 'NoAccess' }
-        if (-not $ByCause.Contains($Cause)) { $ByCause[$Cause] = @() }
-        $ByCause[$Cause] += [string]$NA.Name
-    }
-    $Causes = @($Remedies.Keys | Where-Object { $ByCause.Contains($_) })
-    if ($Decision.ShouldBlock)
+    # The fix depends on why each subscription failed (Write-AccessRemedyLines).
+    $Stopping = [bool]$Decision.ShouldBlock
+    $ReRun = if ($Resume -and $Stopping) { 'run -Resume again' } else { 're-run' }
+    if ($Stopping)
     {
         $Lead = '  No subscription is readable. Stopping before any work.'
         $Colour = 'Red'
+    }
+    elseif ($Decision.ReadableCount -eq 0 -and $Decision.CompletedCount -gt 0)
+    {
+        # -Resume with every subscription left to check unreadable: the
+        # subscriptions an earlier run completed are skipped as done.
+        $Lead = '  Skipping them and finishing the run: the other {0} subscription(s) were completed by an earlier run, so nothing is left to collect. To include them:' -f $Decision.CompletedCount
+        $Colour = 'Yellow'
     }
     else
     {
         $Lead = '  Skipping them and continuing with the {0} readable subscription(s). To include them:' -f $Decision.ReadableCount
         $Colour = 'Yellow'
     }
-    if ($Causes.Count -eq 1)
+    $Causes = @(Write-AccessRemedyLines -Inaccessible $Inaccessible -Lead $Lead -ReRun $ReRun -Colour $Colour -ForResourceGroup:$ForResourceGroup)
+    if ($Resume -and $Stopping)
     {
-        Write-Host ('{0} {1}' -f $Lead, $Remedies[$Causes[0]]) -ForegroundColor $Colour
-    }
-    else
-    {
-        Write-Host $Lead -ForegroundColor $Colour
-        foreach ($Cause in $Causes)
+        # With nothing recorded as completed a run without -Resume checks the
+        # same subscriptions. Only a missing role is sure to stop it again: a
+        # check that could not finish, or answers that disagree after a role
+        # change, can pass on the next run.
+        if ($Causes.Count -eq 1 -and $Causes[0] -eq 'NoAccess')
         {
-            Write-Host ('    {0}: {1}' -f ($ByCause[$Cause] -join ', '), $Remedies[$Cause]) -ForegroundColor $Colour
+            Write-Host '  A run without -Resume checks the same subscriptions, so it stops here too.' -ForegroundColor $Colour
+        }
+        else
+        {
+            Write-Host '  A run without -Resume checks the same subscriptions.' -ForegroundColor $Colour
         }
     }
 }
@@ -1090,6 +1157,26 @@ function Write-SkippedSubscriptionSummary
         Write-Host ('  - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
     }
     Write-Host '  To include them, fix the access as the start of the run says, then re-run.' -ForegroundColor Yellow
+}
+
+# Under the end-of-run "Pending Retries" line: the subscriptions on the retry
+# list that this run's role check skipped as not readable, each with its
+# reason, and the fix for each cause (Write-AccessRemedyLines).
+# -ResumeFailedOnly runs the same check before it retries, so it skips them
+# until the cause is fixed. Prints nothing when none of them was skipped.
+function Write-PendingRetrySkippedSummary
+{
+    param($FailedAttempts, $Decision)
+    $RetryIds = @(@($FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    $Skipped = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and $RetryIds -contains [string]$_.Id } })
+    if ($Skipped.Count -eq 0) { return }
+    Write-Host ('  {0} of them were skipped by this run''s role check:' -f $Skipped.Count) -ForegroundColor Yellow
+    foreach ($Sub in $Skipped)
+    {
+        $Label = if (-not [string]::IsNullOrEmpty([string]$Sub.Reason)) { [string]$Sub.Reason } else { 'not readable' }
+        Write-Host ('    - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
+    }
+    $null = Write-AccessRemedyLines -Inaccessible $Skipped -Lead '  To retry them:' -ReRun 'run -ResumeFailedOnly' -Colour Yellow
 }
 
 # After a consumption data check refusal, say per failing subscription what the
@@ -1260,28 +1347,74 @@ function Get-ConsumptionErrorStatusCode
     return $null
 }
 
-# Pure: 'Transient' for throttling, timeouts and server-side errors (worth a
-# bounded retry); 'Permanent' for everything else, including 400 (malformed
-# request) and 401/403 (no permission), which a retry cannot change.
+# Pure: 'Permanent' for the failures a retry cannot change: 400 (malformed
+# request), 401/403 (no permission) and 404 (not found). Otherwise the
+# messages decide, of the exception and of each one in its chain (inner
+# exceptions and an ErrorRecord's exception, at most 10, as
+# Test-MetricBadRequest in Extension/Metrics.ps1 reads them), since a wrapper
+# exception often carries the cause in an inner one: it is permanent when one
+# names a status above (by name or number), says access was denied or that
+# something could not be found, or says the sign-in cannot be used (the same
+# as a 401: a retry signs in no better). A sign-in error code alone (AADSTS...)
+# does not count: some of those are transient. Everything else is 'Transient'
+# (worth a bounded retry): throttling, timeouts, server errors, a transfer cut
+# off part-way, and any error not recognised here.
+# A failed token cache check is 'Transient', although Az reports it as a
+# sign-in to set up ('run Connect-AzAccount'); a status, permission or
+# not-found text elsewhere in the chain still makes it 'Permanent'. On every
+# token request the token cache library (MSAL, in Az.Accounts) writes a test
+# file next to the cache, reads it back and deletes it, so two token requests
+# at the same moment, in this process or in another one that uses the same
+# token cache, can delete each other's test file ('Persistence check failed.
+# Data was written but it could not be read'). A retry usually passes; if every
+# attempt fails (a token cache that cannot be used at all, for example D-Bus
+# not running over SSH, as the error text names), the call gives up after the
+# same 3 retries.
 function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
     $Status = Get-ConsumptionErrorStatusCode -Exception $Exception
-    if ($null -ne $Status)
+    if ($null -ne $Status -and ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404)) { return 'Permanent' }
+    $Chain = [System.Collections.Generic.List[object]]::new()
+    $Pending = [System.Collections.Generic.Queue[object]]::new()
+    $Pending.Enqueue($Exception)
+    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
     {
-        if ($Status -eq 408 -or $Status -eq 429 -or $Status -ge 500) { return 'Transient' }
-        return 'Permanent'
+        $Ex = $Pending.Dequeue()
+        if ($null -eq $Ex) { continue }
+        $Chain.Add($Ex)
+        if ($null -ne $Ex.PSObject.Properties['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
+        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+        {
+            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+        }
     }
-    $Message = [string]$Exception.Message
-    if ($Message -match '(?i)timed? ?out|timeout|throttl|too many requests|\b429\b|\b50[0-4]\b|temporar|service unavailable|task was cancel|connection (was )?(reset|closed|refused)|name could not be resolved|name or service not known')
+    foreach ($Ex in $Chain)
     {
-        return 'Transient'
+        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
+        {
+            return 'Permanent'
+        }
     }
-    return 'Permanent'
+    foreach ($Ex in $Chain)
+    {
+        if ($Ex.GetType().Name -eq 'MsalCachePersistenceException' -or [string]$Ex.Message -match '(?i)persistence check failed') { return 'Transient' }
+    }
+    foreach ($Ex in $Chain)
+    {
+        if ([string]$Ex.Message -match '(?i)connect-azaccount|invalidauthenticationtoken|expiredauthenticationtoken|token (has |is )?expired|interaction (is )?required')
+        {
+            return 'Permanent'
+        }
+    }
+    return 'Transient'
 }
 
 # Runs $Operation (a scriptblock taking one argument) and retries it with
-# exponential backoff (2, 4, 8 s) while the failure is transient. Returns
+# exponential backoff (2, 4, 8 s) unless the failure is one a retry cannot
+# change (Get-ConsumptionErrorKind: 400, 401, 403, 404, access denied, not
+# found, a sign-in that cannot be used; a failed token cache check is
+# retried). Returns
 # { Value; Error; Attempts }; Error is the last exception, or $null on success.
 function Invoke-ConsumptionCallWithRetry
 {
@@ -1456,7 +1589,9 @@ function Get-UsageAggregatesPage
     # The next page is asked for with the token alone, as the cmdlet does, so
     # the request never goes to a host named in the answer.
     $Token = $null
-    $NextLink = [string]$Body.nextLink
+    # A last page has no nextLink (and an empty one may have no value); read
+    # both so Set-StrictMode allows that.
+    $NextLink = if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['nextLink']) { [string]$Body.nextLink } else { '' }
     if (-not [string]::IsNullOrEmpty($NextLink))
     {
         $NextUri = $null
@@ -1464,7 +1599,7 @@ function Get-UsageAggregatesPage
         if ([string]::IsNullOrEmpty($Token)) { throw 'The usage answer''s nextLink has no continuationToken, so the next page cannot be read.' }
     }
     return [pscustomobject]@{
-        UsageAggregations = @(@($Body.value) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Properties = $_.properties } })
+        UsageAggregations = @(@(if ($null -ne $Body -and $null -ne $Body.PSObject.Properties['value']) { $Body.value }) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Properties = $_.properties } })
         ContinuationToken = $Token
     }
 }
@@ -1726,7 +1861,9 @@ function Invoke-ConsumptionDataCheck
     $Arguments = @{ Window = $Window; ResourceGroup = $ResourceGroup; MaxRetries = $MaxRetries }
     Invoke-SubscriptionCheckInOrder -Items $Items -Command 'Get-SubscriptionConsumptionCheck' -Arguments $Arguments -ThrottleLimit $ThrottleLimit -OnResult {
         param($CheckResult)
-        if ($CheckResult.Failed)
+        # Only a check that threw carries Failed (Invoke-SubscriptionCheckInOrder);
+        # read it so Set-StrictMode allows a result without it.
+        if ($null -ne $CheckResult.PSObject.Properties['Failed'] -and $CheckResult.Failed)
         {
             $CheckResult = [pscustomobject]@{
                 Id             = [string]$CheckResult.Item.Id
@@ -1761,6 +1898,80 @@ function Invoke-ConsumptionDataCheck
     return (Resolve-ConsumptionDataCheck -Results $CheckResults.ToArray() -Window $Window -ResourceGroup $ResourceGroup)
 }
 
+# How a person goes on with a changed or added setting ($Switches, for example
+# '-SkipConsumption'), as the command to run next. While a resume state file is
+# or may be left ($StateKept: a run that continues an unfinished run, a new run
+# that has written its state, a run whose end is not known yet, or an early
+# stop with a state file on disk), the next run would continue that run and stop
+# on the changed setting, so it is a new run with -Fresh, which
+# -ResumeFailedOnly does not take. With no state file left, the setting alone.
+# Every 'how to go on' line about a setting uses this, so each command it names
+# runs as stated.
+function Get-RunGoOnCommand
+{
+    param([string]$Switches = '', [bool]$StateKept = $true, [bool]$ResumeFailedOnly)
+    $With = if ($StateKept) { ('-Fresh ' + $Switches).Trim() } else { $Switches.Trim() }
+    if ($ResumeFailedOnly) { return ('run the same command without -ResumeFailedOnly, with {0}' -f $With) }
+    if ($StateKept) { return ('start a new run with {0}' -f $With) }
+    return ('re-run with {0}' -f $With)
+}
+
+# The settings a printed retry or new-run command carries, as command text:
+# ' -Obfuscate -SkipMetrics' for the switches in $Settings that are on, in the
+# order given, or '' when none is. Run-AllSubscriptions.ps1 passes its run
+# settings (Get-RunDataSettings, the names of Get-RunDataSettingNames), so the
+# command runs with the settings a continuing run must keep.
+function Format-RunDataSwitches
+{
+    param([System.Collections.IDictionary]$Settings)
+    if ($null -eq $Settings) { return '' }
+    # SubscriptionID is a value, not a switch: the command that takes it names
+    # it itself (Get-WrapperRunCommand, Get-DirectRunRetryCommand).
+    return (-join @(foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'SubscriptionID' -and $Settings[$Name]) { ' -' + $Name } }))
+}
+
+# A value as a printed command gives it: in single quotes, escaped by
+# PowerShell's own CodeGeneration API (as the Remove-Item commands in
+# Functions/RunAllSubscriptions.Functions.ps1 are), which also doubles the
+# typographic single quotes PowerShell reads as quotes, so a path with spaces,
+# quotes or parentheses is passed as one value.
+function Format-CommandValue
+{
+    param([string]$Value)
+    return ("'{0}'" -f [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value))
+}
+
+# The command that collects one subscription again with a direct
+# ResourceInventory.ps1 run: the tenant when known, the subscription, the
+# resource group when the run had one, the client id (-Appid), the services
+# (-Service), the output folder (-OutputDirectory) and the dictionary
+# (-ObfuscationDictionary) when the run was given them, then the switches of
+# $Settings that are on and that ResourceInventory.ps1 takes (it has no
+# -IncludeDisabled). Values are quoted (Format-CommandValue). No secret is
+# printed: there is no parameter for one. A service principal sign-in
+# (-Appid) also needs -Secret and -TenantID, so the command asks for the
+# secret when it runs (-Secret (Read-Host -AsSecureString)), and for the
+# tenant too when it is not known here.
+function Get-DirectRunRetryCommand
+{
+    param([string]$TenantID, [string]$SubscriptionID, [string]$ResourceGroup, [System.Collections.IDictionary]$Settings,
+        [string]$Appid, [string[]]$Service, [string]$OutputDirectory, [string]$ObfuscationDictionary)
+    $TenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID }
+    elseif (-not [string]::IsNullOrEmpty($Appid)) { " -TenantID (Read-Host -Prompt 'Tenant ID')" }
+    else { '' }
+    $ValueArgs = -join @(
+        if (-not [string]::IsNullOrEmpty($ResourceGroup)) { ' -ResourceGroup ' + (Format-CommandValue $ResourceGroup) }
+        if (-not [string]::IsNullOrEmpty($Appid)) { ' -Appid ' + (Format-CommandValue $Appid) + ' -Secret (Read-Host -AsSecureString)' }
+        $Services = @(@($Service) | Where-Object { -not [string]::IsNullOrEmpty($_) })
+        if ($Services.Count -gt 0) { ' -Service ' + (@($Services | ForEach-Object { Format-CommandValue $_ }) -join ',') }
+        if (-not [string]::IsNullOrEmpty($OutputDirectory)) { ' -OutputDirectory ' + (Format-CommandValue $OutputDirectory) }
+        if (-not [string]::IsNullOrEmpty($ObfuscationDictionary)) { ' -ObfuscationDictionary ' + (Format-CommandValue $ObfuscationDictionary) }
+    )
+    $Direct = [ordered]@{}
+    if ($null -ne $Settings) { foreach ($Name in @($Settings.Keys)) { if ([string]$Name -ne 'IncludeDisabled') { $Direct[$Name] = $Settings[$Name] } } }
+    return ('./ResourceInventory.ps1{0} -SubscriptionID {1}{2}{3}' -f $TenantArg, $SubscriptionID, $ValueArgs, (Format-RunDataSwitches -Settings $Direct))
+}
+
 # Prints the outcome of Invoke-ConsumptionDataCheck. On a refusal it lists
 # every failing subscription with its outcome and the window queried, then the
 # fix. The caller exits with code 1 when $Result.ShouldBlock is $true. A
@@ -1768,7 +1979,12 @@ function Invoke-ConsumptionDataCheck
 # read only: its consumption sheet may still have values.
 function Write-ConsumptionDataCheckReport
 {
-    param([Parameter(Mandatory = $true)]$Result)
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        # The third way to fix a refusal. Run-AllSubscriptions.ps1 passes its own
+        # when the run continues an unfinished run, whose settings it must keep.
+        [string]$SkipConsumptionLine = '  3. Or re-run with -SkipConsumption to inventory without consumption data.'
+    )
     $WindowText = Format-ConsumptionWindow -Window $Result.Window
     $ForRg = Format-ConsumptionCheckTarget -ResourceGroup $Result.ResourceGroup
     $InRg = if ([string]::IsNullOrEmpty($Result.ResourceGroup)) { '' } else { " in resource group '{0}'" -f $Result.ResourceGroup }
@@ -1817,7 +2033,121 @@ function Write-ConsumptionDataCheckReport
     Write-Host 'To fix:' -ForegroundColor Yellow
     Write-Host '  1. Give the signed-in identity Microsoft.Commerce/UsageAggregates/read on each subscription above. The built-in Reader and Billing Reader roles include it; Cost Management Reader does NOT.' -ForegroundColor Yellow
     Write-Host '  2. If the identity already has it: the subscription may be partner-managed (CSP) without cost visibility for this identity, or on an offer the legacy usage API (Get-UsageAggregates) does not serve.' -ForegroundColor Yellow
-    Write-Host '  3. Or re-run with -SkipConsumption to inventory without consumption data.' -ForegroundColor Yellow
+    Write-Host $SkipConsumptionLine -ForegroundColor Yellow
+}
+
+# The consumption failure entries of a run whose billing download failed or
+# stopped part-way, unique by name and id. Leaves out the '(auth)' entry: a
+# consumption phase skipped because the sign-in could not be refreshed is
+# reported by the wrapper's FAILED (auth) banner instead.
+function Get-ConsumptionIncompleteEntries
+{
+    param([object[]]$Entries)
+    @(@($Entries) | Where-Object { $null -ne $_ -and [string]$_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique)
+}
+
+# The subscriptions of a direct ResourceInventory.ps1 run whose consumption is
+# missing or incomplete, unique by name and id: those whose billing download
+# failed or stopped part-way, and, when the consumption phase was skipped for
+# the sign-in (the '(auth)' entry), every subscription of the run
+# (-RunSubscriptions), since the phase collected none of them.
+function Get-ConsumptionMissingEntries
+{
+    param([object[]]$Entries, [object[]]$RunSubscriptions)
+    $Missing = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if (@(@($Entries) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0)
+    {
+        $Missing += @(@($RunSubscriptions) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Id = [string]$_.Id } })
+    }
+    @(Get-ConsumptionIncompleteEntries -Entries $Missing)
+}
+
+# The last lines of a run in which the billing download of one or more
+# subscriptions failed or stopped part-way: each subscription, then $Advice
+# (the command that collects them again). Shared by Run-AllSubscriptions.ps1
+# and direct runs of ResourceInventory.ps1, which then exit 3 (5 with a
+# collector failure). Prints nothing when there are none.
+function Write-ConsumptionFailedBanner
+{
+    param([object[]]$Entries, [string[]]$Advice)
+    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '================= FAILED (consumption) =================' -ForegroundColor Red
+    Write-Host ('Consumption (billing) data is missing or incomplete for {0} subscription(s):' -f $List.Count) -ForegroundColor Red
+    foreach ($Entry in $List)
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Red
+    }
+    foreach ($Line in @($Advice)) { Write-Host $Line -ForegroundColor Red }
+    Write-Host '========================================================' -ForegroundColor Red
+}
+
+# The metrics entries of the subscriptions whose Azure Monitor metric request
+# (grouped or for one metric) still failed after its retries
+# (Extension/Metrics.ps1 records them with Complete = $false), unique by name
+# and id. Leaves out the entries for metrics
+# skipped because the sign-in could not be refreshed, which the wrapper reports
+# in its FAILED (auth) banner.
+function Get-MetricsIncompleteEntries
+{
+    param([object[]]$Entries)
+    @(@($Entries) | Where-Object { Test-MetricsIncompleteEntry -Entry $_ } | Sort-Object Name, Id -Unique)
+}
+
+# True for a metrics entry recorded as incomplete (Complete = $false), false for
+# one recorded because the sign-in could not be refreshed (no Complete field).
+function Test-MetricsIncompleteEntry
+{
+    param([object]$Entry)
+    $null -ne $Entry -and $null -ne $Entry.PSObject.Properties['Complete'] -and $Entry.Complete -eq $false
+}
+
+# The last lines of a run in which the metrics of one or more subscriptions are
+# incomplete because Azure Monitor kept failing: each subscription, then $Advice
+# (the command that collects them again). Run-AllSubscriptions.ps1 and direct
+# runs of ResourceInventory.ps1 then exit 3 (5 with a collector failure).
+# Prints nothing when there are none.
+function Write-MetricsIncompleteBanner
+{
+    param([object[]]$Entries, [string[]]$Advice)
+    $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return }
+    Write-Host ''
+    Write-Host '=================== FAILED (metrics) ===================' -ForegroundColor Red
+    Write-Host ('Metrics are incomplete for {0} subscription(s): Azure Monitor requests still failed after their retries (throttling, timeout or server error):' -f $List.Count) -ForegroundColor Red
+    foreach ($Entry in $List)
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Red
+    }
+    foreach ($Line in @($Advice)) { Write-Host $Line -ForegroundColor Red }
+    Write-Host '========================================================' -ForegroundColor Red
+}
+
+# End of a direct ResourceInventory.ps1 run (Run-AllSubscriptions.ps1 prints its
+# own 'Consumption Failures' block): the subscriptions whose consumption could
+# not be collected or is incomplete, by name and id, and each distinct reason.
+# Without it the only sign is the warning printed when the billing call failed,
+# long before the end of the run.
+function Write-ConsumptionFailureSummary
+{
+    param([object[]]$Failures, [object[]]$RunSubscriptions)
+    $Entries = @(@($Failures) | Where-Object { $null -ne $_ })
+    if ($Entries.Count -eq 0) { return }
+    # The subscriptions whose consumption is missing (Get-ConsumptionMissingEntries):
+    # a sign-in skip ('(auth)') stands for every subscription of the run.
+    $Missing = @(Get-ConsumptionMissingEntries -Entries $Entries -RunSubscriptions $RunSubscriptions)
+    Write-Host ''
+    Write-Host ('Consumption Failures:    {0} subscription(s)' -f $Missing.Count) -ForegroundColor Yellow
+    foreach ($Entry in $Missing)
+    {
+        Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Yellow
+    }
+    foreach ($Message in @($Entries | ForEach-Object { [string]$_.Message } | Where-Object { $_ } | Select-Object -Unique))
+    {
+        Write-Host ('  - {0}' -f $Message) -ForegroundColor Yellow
+    }
+    Write-Host '  Note: the consumption sheet in this report is empty or incomplete for these subscriptions.' -ForegroundColor Yellow
 }
 
 # End-of-run list of the subscriptions the consumption data check passed with
@@ -1855,4 +2185,415 @@ function Write-NoUsageSummary
             Write-Host ('  - {0} ({1})' -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
         }
     }
+}
+
+# Sign-in checks used by Run-AllSubscriptions.ps1 and by a direct run of
+# ResourceInventory.ps1, so both decide the same way whether an existing Az
+# PowerShell sign-in can be reused. The tool signs in with Az PowerShell only.
+
+# $true when a person can answer a prompt in this console.
+function Test-RdaInteractiveSession
+{
+    return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected)
+}
+
+# The subscriptions of tenant $Tenant, as the run lists them: asked from Az
+# PowerShell with -TenantId, so a subscription delegated to the tenant (Azure
+# Lighthouse), whose HomeTenantId is another tenant, is kept. A subscription
+# returned twice is listed once (first one kept, ids compared without case).
+# Every state is kept, as `az account list` listed them; the -RunAllSubs
+# wrapper applies its own Enabled filter. Each entry has the properties
+# callers read: id, name, tenantId (the tenant asked when Az gives none),
+# homeTenantId and state.
+function Get-RdaTenantSubscriptions
+{
+    param([Parameter(Mandatory = $true)][string]$Tenant)
+    $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $List = [System.Collections.Generic.List[object]]::new()
+    foreach ($Sub in @(Get-AzSubscription -TenantId $Tenant -WarningAction SilentlyContinue))
+    {
+        if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
+        if (-not $Seen.Add([string]$Sub.Id)) { continue }
+        $List.Add([pscustomobject][ordered]@{
+                id           = [string]$Sub.Id
+                name         = [string]$Sub.Name
+                tenantId     = $(if ([string]::IsNullOrWhiteSpace([string]$Sub.TenantId)) { $Tenant } else { [string]$Sub.TenantId })
+                homeTenantId = [string]$Sub.HomeTenantId
+                state        = [string]$Sub.State
+            })
+    }
+    return $List.ToArray()
+}
+
+function Get-AzPsSignedInTenant
+{
+    try
+    {
+        $Ctx = Get-AzContext -ErrorAction Stop
+        if ($null -eq $Ctx -or $null -eq $Ctx.Account) { return $null }
+        return $Ctx.Tenant.Id
+    }
+    catch
+    {
+        return $null
+    }
+}
+
+# Probe whether Az PowerShell can silently acquire a token for $TenantID.
+# Get-AzAccessToken in this configuration emits a non-terminating warning
+# instead of throwing on token-acquisition failure, so we capture warnings
+# explicitly and treat any warning as a failure signal in addition to
+# catching outright exceptions. We DO NOT treat the Az.Accounts 4.x
+# deprecation banner as a failure - that warning fires on every successful
+# call now that the SecureString-output cmdlet is the recommended path,
+# and ignoring it lets users on the new module version skip re-auth.
+function Test-AzPsTokenSilent
+{
+    param([Parameter(Mandatory = $true)][string]$Tenant)
+    $Warnings = @()
+    try
+    {
+        $Token = Get-AzAccessToken -TenantId $Tenant -ErrorAction Stop -WarningVariable warnings -WarningAction SilentlyContinue
+        if ($null -eq $Token -or [string]::IsNullOrWhiteSpace($Token.Token)) { return $false }
+        # Filter out known-benign warnings before deciding the call failed.
+        # Az.Accounts >= 4.x emits a deprecation banner about the plain-string
+        # output every time the cmdlet returns successfully; treating that as
+        # failure forces users to re-authenticate every run.
+        $RealWarnings = @($Warnings | Where-Object {
+                $Msg = $_.Message
+                -not (
+                    $Msg -match 'Get-AzAccessToken\s*:?\s*Upcoming breaking changes' -or
+                    $Msg -match 'AsSecureString' -or
+                    $Msg -match 'plain string token output is deprecated'
+                )
+            })
+        if ($RealWarnings.Count -gt 0) { return $false }
+        return $true
+    }
+    catch
+    {
+        return $false
+    }
+}
+
+# The sign-in gate of Run-AllSubscriptions.ps1, before it starts
+# ResourceInventory.ps1 for each subscription. An Az PowerShell sign-in that
+# is on $TenantID and can still acquire a token silently is reused with no
+# prompt (Cloud Shell, a second run). Two things have to be true: the tenant
+# alone is not enough, because a context can persist on disk with the right
+# tenant but an expired or revoked refresh token (typically Conditional
+# Access or MFA), and every data-plane call would then quietly return
+# nothing. Otherwise it signs in once (device code with -DeviceLogin) and
+# checks the token again; when the token still fails it throws, so the
+# wrapper stops instead of prompting a second time or collecting an empty
+# inventory. A usable sign-in is never disconnected.
+function Connect-RdaWrapperSession
+{
+    param([Parameter(Mandatory = $true)][string]$TenantID, [switch]$DeviceLogin)
+
+    $PsTenant = Get-AzPsSignedInTenant
+    if ($PsTenant -eq $TenantID -and (Test-AzPsTokenSilent -Tenant $TenantID))
+    {
+        Write-Host ("Existing session detected for tenant {0} (token probe ok); skipping interactive login." -f $TenantID) -ForegroundColor Green
+        return
+    }
+
+    if ($null -eq $PsTenant)
+    {
+        Write-Host "Az PowerShell is not signed in; authenticating..." -ForegroundColor Cyan
+    }
+    elseif ($PsTenant -ne $TenantID)
+    {
+        Write-Host ("Az PowerShell is signed in to tenant {0}; switching to {1}..." -f $PsTenant, $TenantID) -ForegroundColor Cyan
+    }
+    else
+    {
+        Write-Host ("Az PowerShell session for tenant {0} cannot acquire a token silently (likely expired or CA/MFA-gated); re-authenticating..." -f $TenantID) -ForegroundColor Cyan
+    }
+
+    # As a direct run does: with no console to sign in from (a scheduled task,
+    # CI, stdin redirected), stop instead of opening a browser.
+    if (-not $DeviceLogin -and -not (Test-RdaInteractiveSession))
+    {
+        throw ("Az PowerShell: no usable sign-in for tenant {0}, and this session has no console to sign in from (non-interactive); stopping instead of opening a browser. Run 'Connect-AzAccount -Tenant {0}' before the run, or pass -DeviceLogin." -f $TenantID)
+    }
+    if ($DeviceLogin) { Connect-AzAccount -Tenant $TenantID -UseDeviceAuthentication -ErrorAction Stop | Out-Null }
+    else { Connect-AzAccount -Tenant $TenantID -ErrorAction Stop | Out-Null }
+
+    if (-not (Test-AzPsTokenSilent -Tenant $TenantID))
+    {
+        throw ("Az PowerShell sign-in to tenant {0} did not give a usable token; stopping instead of prompting again. Run 'Connect-AzAccount -Tenant {0}' yourself, complete any MFA or Conditional Access prompt, then re-run (or pass -DeviceLogin)." -f $TenantID)
+    }
+}
+
+# The per-subscription count line, shared by the wrapper, the stream worker and
+# a direct run. $Collected is the rows kept (@($Global:Resources).Count);
+# $Skipped is the network rows left out of the pull ($null when the count
+# query failed, 0 with -IncludeNetworkResources). Kind:
+#   Empty       - nothing collected and nothing known to be skipped. The
+#                 caller keeps its own empty-subscription warning (a
+#                 permission gap or a really empty subscription).
+#   NetworkOnly - nothing collected, but network rows were skipped. Not a
+#                 warning: the subscription only holds skipped types.
+#   Collected   - rows were collected.
+function Get-RdaResourceCountMessage
+{
+    param(
+        [Parameter(Mandatory = $true)][long]$Collected,
+        [AllowNull()]$Skipped,
+        [System.Collections.IDictionary]$SkippedByType
+    )
+
+    $SkippedCount = if ($null -eq $Skipped) { [long]0 } else { [long]$Skipped }
+    $Noun = if ($SkippedCount -eq 1) { 'network resource' } else { 'network resources' }
+
+    if ($Collected -le 0 -and $SkippedCount -le 0)
+    {
+        return [pscustomobject]@{ Kind = 'Empty'; Text = $null }
+    }
+
+    if ($Collected -le 0)
+    {
+        $Parts = @()
+        if ($null -ne $SkippedByType -and $SkippedByType.Count -gt 0)
+        {
+            $Parts = @($SkippedByType.GetEnumerator() |
+                    Sort-Object -Property @{ Expression = { [long]$_.Value }; Descending = $true }, @{ Expression = { [string]$_.Key }; Descending = $false } |
+                    ForEach-Object { '{0:N0} {1}' -f [long]$_.Value, ([string]$_.Key -replace '^(?i)microsoft\.network/', '') })
+        }
+        $Split = if ($Parts.Count -gt 0) { ' (' + ($Parts -join ', ') + ')' } else { '' }
+        $Text = '0 resources collected. {0:N0} {1} skipped{2}. Network costs still come from the consumption data.' -f $SkippedCount, $Noun, $Split
+        return [pscustomobject]@{ Kind = 'NetworkOnly'; Text = $Text }
+    }
+
+    $Text = 'Resources collected: {0:N0}' -f $Collected
+    if ($SkippedCount -gt 0) { $Text += ' ({0:N0} {1} skipped)' -f $SkippedCount, $Noun }
+    return [pscustomobject]@{ Kind = 'Collected'; Text = $Text }
+}
+
+# ---------------------------------------------------------------------------
+# Microsoft.Insights provider check for -UseMetricsBatch.
+#
+# The Azure Monitor batch API (metrics:getBatch) answers 403 on a subscription
+# where the Microsoft.Insights resource provider is not registered. Only with
+# -UseMetricsBatch, the preflight reads the provider's state on every
+# subscription in scope (a read, which Reader allows). When some are not
+# registered it lists them and asks once whether to register them. Only a "y"
+# registers; registering needs the /register/action permission, which the
+# Contributor and Owner roles include (Microsoft docs: Azure resource providers
+# and types). A "n", no answer (no console) or a failed register leaves those
+# subscriptions on the one-call-per-resource metrics path, with the command
+# that registers it printed, so no metrics are lost. The wait for a started
+# registration is bounded by one shared deadline; nothing loops past it.
+# ---------------------------------------------------------------------------
+
+# The ARM API version used to read and register a resource provider.
+function Get-RdaInsightsProviderApiVersion
+{
+    return '2021-04-01'
+}
+
+# The command a person runs to register Microsoft.Insights on one subscription.
+function Get-RdaInsightsRegisterCommand
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+    return ('Set-AzContext -Subscription {0}; Register-AzResourceProvider -ProviderNamespace Microsoft.Insights' -f $SubscriptionId)
+}
+
+# The registration state of Microsoft.Insights on one subscription:
+# 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
+# when the state could not be read (the error is in Error).
+function Get-RdaInsightsProviderState
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3)
+
+    $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
+    try
+    {
+        $Read = Invoke-RoleCheckGet -Path $Path -MaxRetries $MaxRetries
+    }
+    catch
+    {
+        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$_.Exception.Message }
+    }
+    if ($null -ne $Read.Error -or $null -eq $Read.Body)
+    {
+        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$Read.Error }
+    }
+    $State = [string]$Read.Body.registrationState
+    if ([string]::IsNullOrEmpty($State)) { $State = 'Unknown' }
+    return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+}
+
+# Starts the registration of Microsoft.Insights on one subscription. Returns
+# $null when Azure took it, or the error text.
+function Register-RdaInsightsProvider
+{
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+
+    $Path = '/subscriptions/{0}/providers/Microsoft.Insights/register?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
+    try
+    {
+        $Response = Invoke-AzRestMethod -Method POST -Path $Path -ErrorAction Stop
+        $Status = [int]$Response.StatusCode
+        if ($Status -ge 200 -and $Status -lt 300) { return $null }
+        $Code = ''
+        try { $Code = [string](([string]$Response.Content | ConvertFrom-Json -ErrorAction Stop).error.code) } catch { $Code = '' }
+        return ('HTTP {0}{1}' -f $Status, $(if ($Code) { ' ' + $Code } else { '' }))
+    }
+    catch
+    {
+        return [string]$_.Exception.Message
+    }
+}
+
+# The preflight. Reads every subscription's state, asks once for those not
+# registered, registers on "y" and waits for them on one deadline. Returns
+# { Registered; NotRegistered; Asked; Answer }: Registered holds the ids that
+# batch may use (registered, or whose state could not be read, so the batch
+# call decides and falls back on its own), NotRegistered the ids that stay on
+# the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds and
+# $PollSeconds are there for tests.
+function Invoke-RdaInsightsProviderPreflight
+{
+    param(
+        [string[]]$SubscriptionIds,
+        [Nullable[bool]]$Interactive = $null,
+        [scriptblock]$ReadAnswer = { param($Prompt) Read-Host -Prompt $Prompt },
+        [int]$DeadlineSeconds = 60,
+        [int]$PollSeconds = 10
+    )
+
+    $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
+    $Result = [pscustomobject]@{ Registered = [System.Collections.Generic.List[string]]::new(); NotRegistered = [System.Collections.Generic.List[string]]::new(); Asked = $false; Answer = $null }
+    if ($Ids.Count -eq 0) { return $Result }
+    if ($null -eq $Interactive) { $Interactive = Test-RdaInteractiveSession }
+
+    Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
+    $Missing = [System.Collections.Generic.List[object]]::new()
+    # Already being registered (by someone else, or an earlier run): nothing to
+    # ask; it joins the shared wait below.
+    $AlreadyRegistering = [System.Collections.Generic.List[string]]::new()
+    foreach ($Id in $Ids)
+    {
+        $Read = Get-RdaInsightsProviderState -SubscriptionId $Id
+        if ($Read.State -eq 'Registered')
+        {
+            $Result.Registered.Add($Id)
+        }
+        elseif ($Read.State -eq 'Unknown')
+        {
+            # Not readable: the batch call is tried and falls back by itself.
+            Write-Host ('  Could not read the Microsoft.Insights state of subscription {0} ({1}); its metrics batch is tried and falls back to one call per resource if Azure refuses it.' -f $Id, $Read.Error) -ForegroundColor Yellow
+            $Result.Registered.Add($Id)
+        }
+        elseif ($Read.State -eq 'Registering')
+        {
+            $AlreadyRegistering.Add($Id)
+        }
+        else
+        {
+            $Missing.Add($Read)
+        }
+    }
+    if ($Missing.Count -eq 0 -and $AlreadyRegistering.Count -eq 0)
+    {
+        Write-Host '  Microsoft.Insights is registered on every subscription in scope.' -ForegroundColor DarkGray
+        return $Result
+    }
+    $Waiting = [System.Collections.Generic.List[string]]::new()
+    foreach ($Id in $AlreadyRegistering)
+    {
+        Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
+        $Waiting.Add($Id)
+    }
+
+    $Answer = $null
+    $Answered = $false
+    if ($Missing.Count -gt 0)
+    {
+        Write-Host ('  Microsoft.Insights is not registered on {0} subscription(s); the metrics batch API needs it:' -f $Missing.Count) -ForegroundColor Yellow
+        foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
+        if ($Interactive)
+        {
+            $Result.Asked = $true
+            # Under pwsh -NonInteractive with a terminal attached, Read-Host writes an
+            # error instead of asking. With errors stopping here, that is caught and
+            # read as "no one can answer".
+            $SavedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Stop'
+            try
+            {
+                $Answer = [string](& $ReadAnswer ('Register Microsoft.Insights on these {0} subscription(s) now? [Y/N]' -f $Missing.Count))
+                $Answered = $true
+            }
+            catch
+            {
+                $Answer = $null
+            }
+            finally
+            {
+                $ErrorActionPreference = $SavedPreference
+            }
+            $Result.Answer = $Answer
+        }
+    }
+
+    $ToRegister = @()
+    if ($Missing.Count -gt 0 -and $Answer -notmatch '^\s*(y|yes)\s*$')
+    {
+        $Why = if ($Answered) { 'Not registering.' } else { 'No one can answer a prompt in this session, so nothing is registered.' }
+        Write-Host ('  {0} Their metrics are collected with one call per resource, so none are lost. To register it later (needs Contributor or Owner), run per subscription:' -f $Why) -ForegroundColor Yellow
+        foreach ($Entry in $Missing)
+        {
+            Write-Host ('    ' + (Get-RdaInsightsRegisterCommand -SubscriptionId $Entry.SubscriptionId)) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Entry.SubscriptionId)
+        }
+    }
+    else
+    {
+        $ToRegister = @($Missing)
+    }
+
+    # Start every registration first, then wait for all of them on one deadline.
+    foreach ($Entry in $ToRegister)
+    {
+        $RegisterError = Register-RdaInsightsProvider -SubscriptionId $Entry.SubscriptionId
+        if ($null -eq $RegisterError)
+        {
+            $Waiting.Add($Entry.SubscriptionId)
+        }
+        else
+        {
+            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}). Registering needs the /register/action permission, which the Contributor and Owner roles include. Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Entry.SubscriptionId)
+        }
+    }
+
+    $Deadline = (Get-Date).AddSeconds([math]::Max(0, $DeadlineSeconds))
+    # Every read checks the time first, so the wait ends at the deadline however many
+    # subscriptions there are; a read while waiting is not retried (a failed one means
+    # not registered yet).
+    while ($Waiting.Count -gt 0 -and (Get-Date) -lt $Deadline)
+    {
+        for ($Idx = $Waiting.Count - 1; $Idx -ge 0 -and (Get-Date) -lt $Deadline; $Idx--)
+        {
+            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0).State -eq 'Registered')
+            {
+                Write-Host ('  Microsoft.Insights is now registered on subscription {0}.' -f $Waiting[$Idx]) -ForegroundColor Green
+                $Result.Registered.Add($Waiting[$Idx])
+                $Waiting.RemoveAt($Idx)
+            }
+        }
+        $Left = ($Deadline - (Get-Date)).TotalSeconds
+        if ($Waiting.Count -eq 0 -or $Left -le 0) { break }
+        # Never sleep past the deadline.
+        Start-Sleep -Milliseconds ([int]([math]::Max(0, [math]::Min($PollSeconds, $Left)) * 1000))
+    }
+    foreach ($Id in $Waiting)
+    {
+        Write-Host ('  Microsoft.Insights is still not registered on subscription {0} after {1} s; its metrics are collected with one call per resource this run. A later run finds it registered and uses the batch API.' -f $Id, $DeadlineSeconds) -ForegroundColor Yellow
+        $Result.NotRegistered.Add($Id)
+    }
+    return $Result
 }

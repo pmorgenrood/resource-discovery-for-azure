@@ -325,20 +325,59 @@ function Invoke-RdaReveal
         Write-Warning "One or more subscriptions had no friendly name in the dictionary (older -Obfuscate run); revealed the subscription GUID instead. Re-run the inventory with a current version to capture SubscriptionNameMap."
     }
 
-    if ($Replacements.Count -eq 0 -and $PathReplacements.Count -eq 0)
-    {
-        throw "Nothing to reveal: the selected field(s) [$($Fields -join ', ')] produced no token mappings from this dictionary."
-    }
-
-    Write-Host ("Tokens to reveal: {0}" -f $Replacements.Count)
-
-    # ---- Extract, rewrite, re-zip ------------------------------------------
     # Token shapes: plain prod_/nonprod_<guid> and type-hinted name tokens
     # (prod_aks_<guid>, etc.) - the regex matches both; the callback only
     # substitutes tokens present in $Replacements, so non-selected dimensions
     # are left masked.
     # One or more hint words are allowed (prod_aks_<guid>, prod_rg_mc_<guid>).
     $TokenPattern = '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+    if ($Replacements.Count -eq 0 -and $PathReplacements.Count -eq 0)
+    {
+        # The report of a subscription with no resources carries no masked
+        # values, and its dictionary is empty. It has nothing to reveal and is
+        # not a failure: write an unchanged copy, so the revealed bundle keeps
+        # every subscription. A report that does carry masked values with no
+        # mapping for the selected fields is still an error (wrong dictionary
+        # or wrong -Fields).
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $InputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputZip)
+        $OutputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
+        $HasToken = $false
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZipFull)
+        try
+        {
+            foreach ($Entry in $Archive.Entries)
+            {
+                $Reader = [System.IO.StreamReader]::new($Entry.Open())
+                try { $HasToken = [regex]::IsMatch($Reader.ReadToEnd(), $TokenPattern) }
+                finally { $Reader.Dispose() }
+                if ($HasToken) { break }
+            }
+        }
+        finally
+        {
+            $Archive.Dispose()
+        }
+
+        if ($HasToken)
+        {
+            throw "Nothing to reveal: the selected field(s) [$($Fields -join ', ')] produced no token mappings from this dictionary."
+        }
+
+        # Same atomic swap as a revealed zip below: copy to .partial.zip, then move.
+        $OutputZipPartial = ($OutputZipFull -replace '\.zip$', '') + '.partial.zip'
+        [System.IO.File]::Copy($InputZipFull, $OutputZipPartial, $true)
+        [System.IO.File]::Move($OutputZipPartial, $OutputZipFull, $true)
+        Write-Host ""
+        Write-Host "Nothing to reveal: this report carries no masked values (for example a subscription with no resources). Wrote an unchanged copy." -ForegroundColor Yellow
+        Write-Host ("Output: {0}" -f $OutputZip) -ForegroundColor Green
+        return
+    }
+
+    Write-Host ("Tokens to reveal: {0}" -f $Replacements.Count)
+
+    # ---- Extract, rewrite, re-zip ------------------------------------------
 
     # The report's privacy banner says the report holds no real identifiers.
     # After a reveal it does, so the banner says what was restored instead.

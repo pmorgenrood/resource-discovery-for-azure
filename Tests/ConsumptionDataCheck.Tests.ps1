@@ -14,6 +14,7 @@
 # =============================================================================
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
@@ -299,6 +300,259 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @($Global:ConsumptionFailedSubs).Count | Should -Be 0
     }
 
+    # A direct run over several subscriptions: the first one's second page
+    # fails on every attempt, after its first page handed out a paging token.
+    It 'starts the next subscription''s pull with no paging token after one failed part-way' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:SubscriptionID = $null
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' })
+        $script:ContextSub = $null
+        $script:UsageCalls = [System.Collections.Generic.List[string]]::new()
+        Mock Set-AzContext { $script:ContextSub = $Subscription; [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $Subscription } } }
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = $script:ContextSub } } }
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:UsageCalls.Add(('{0} [{1}]' -f $script:ContextSub, $ContinuationToken))
+            if ($script:ContextSub -eq 'sub-a' -and $ContinuationToken -eq 'token-a-page-2') { throw 'stand-in: the usage service returned an error for this page' }
+            $Next = if ($script:ContextSub -eq 'sub-a') { 'token-a-page-2' } else { $null }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ('/subscriptions/{0}/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1' -f $script:ContextSub)); ContinuationToken = $Next }
+        }
+        GetResorceConsumption
+        @($script:UsageCalls | Where-Object { $_ -like 'sub-b *' }) | Should -Be @('sub-b []') -Because 'a token handed out for Alpha must not be sent with Beta''s first request'
+        @($Global:ConsumptionFailedSubs).Id | Should -Be @('sub-a')
+        $Global:ConsumptionRecordCount | Should -Be 2
+    }
+
+    It 'logs the other subscriptions of a -SubscriptionID run once, as a count in the debug log only' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:SubscriptionID = 'sub-b'
+        $Global:Subscriptions = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' },
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' },
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'Gamma' })
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'sub-b' } } }
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-b/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        GetResorceConsumption
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { -not $NoConsole -and $Message -match 'Alpha|Gamma|Skipping' }
+        Should -Invoke Write-Log -Times 1 -Exactly -ParameterFilter { $NoConsole -and $ToDebugLog -and $Message -match '\b2 other subscription\(s\)' -and $Message -notmatch 'Alpha|Gamma' }
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'counts the rows written to the consumption file, not the rows read' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        Mock Get-UsageAggregates {
+            $Rows = @(
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-2')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-two/providers/Microsoft.Network/networkSecurityGroups/nsg-3')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'says how many rows were written when a later page fails' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            if ($ContinuationToken -eq 'page-2') { throw (New-StatusException -Message 'stand-in: the usage request was refused' -Status Forbidden) }
+            $Rows = @(
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1')
+                (New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-2')
+            )
+            [pscustomobject]@{ UsageAggregations = $Rows; ContinuationToken = 'page-2' }
+        }
+        GetResorceConsumption
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 2
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 2, after 2 record\(s\)'
+        $Global:ConsumptionRecordCount | Should -Be 2
+    }
+
+    It 'does not retry a billing call that fails with <Status>, and records the subscription as incomplete' -ForEach @(
+        @{ Status = 'Unauthorized'; Shape = 'cloud' }
+        @{ Status = 'Forbidden'; Shape = 'cloud' }
+        @{ Status = 'BadRequest'; Shape = 'http' }
+        @{ Status = 'NotFound'; Shape = 'http' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailStatus = $Status
+        $script:FailShape = $Shape
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            if ($script:FailShape -eq 'cloud') { throw (New-CloudShapedException -Message 'stand-in: the usage request failed' -Status $script:FailStatus) }
+            throw (New-StatusException -Message 'stand-in: the usage request failed' -Status $script:FailStatus)
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stand-in: the usage request failed \(stopped at consumption page 1, after 0 record\(s\)'
+    }
+
+    It 'retries a billing call that fails with <Case>, waiting 2 then 4 seconds, and collects the subscription' -ForEach @(
+        @{ Case = 'throttling (429)'; Status = 'TooManyRequests' }
+        @{ Case = 'a server error (503)'; Status = 'ServiceUnavailable' }
+        @{ Case = 'a transfer cut off part-way'; Status = 'Dropped' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailStatus = $Status
+        $script:Calls = 0
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -le 2 -and $script:FailStatus -eq 'Dropped') { throw ([System.IO.IOException]::new('Error while copying content to a stream.')) }
+            if ($script:Calls -le 2) { throw (New-CloudShapedException -Message 'stand-in: try again later' -Status $script:FailStatus) }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 4 }
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'stops retrying a throttled billing call after 3 retries' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates { throw (New-StatusException -Message 'stand-in: too many requests' -Status TooManyRequests) }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 4 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+    }
+
+    It 'retries a billing call that fails with an error it does not recognise (<Case>), and collects the subscription' -ForEach @(
+        @{ Case = 'a request that could not be sent'; Shape = 'http' }
+        @{ Case = 'a message only'; Shape = 'text' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailShape = $Shape
+        $script:Calls = 0
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -eq 1 -and $script:FailShape -eq 'http') { throw ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) }
+            if ($script:Calls -eq 1) { throw 'stand-in: the usage service returned an error for this page' }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null }
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 1
+    }
+
+    It 'does not retry a billing call whose error has no status code and says <Case>' -ForEach @(
+        @{ Case = 'access denied'; Message = 'Access denied.' }
+        @{ Case = 'AuthorizationFailed'; Message = "AuthorizationFailed: The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'." }
+        @{ Case = 'Forbidden'; Message = "Operation returned an invalid status code 'Forbidden'" }
+        @{ Case = 'Unauthorized'; Message = 'Unauthorized' }
+        @{ Case = 'BadRequest'; Message = 'BadRequest: the request is not valid.' }
+        @{ Case = '404 (Not Found)'; Message = 'Response status code does not indicate success: 404 (Not Found).' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:FailMessage = $Message
+        Mock Start-Sleep { }
+        Mock Get-UsageAggregates { throw ([System.Net.Http.HttpRequestException]::new($script:FailMessage)) }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+    }
+
+    It 'stops a subscription''s pull at the page limit and reports it incomplete, naming the limit' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            # Ends a loop with no limit, so the test fails instead of running on.
+            if ($script:Calls -gt 50) { throw 'stand-in: the pages did not stop' }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ('/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-{0}' -f $script:Calls)); ContinuationToken = ('page-{0}' -f ($script:Calls + 1)) }
+        }
+        GetResorceConsumption -MaxPages 3
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 3
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'the limit of 3 usage pages for one subscription'
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 4, after 3 record\(s\); this subscription''s consumption is INCOMPLETE'
+        $Global:ConsumptionFailedSubs[0].Complete | Should -BeFalse
+        $Global:ConsumptionFailedSubs[0].PageAtFailure | Should -Be 4
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 3
+    }
+
+    It 'collects a subscription whose last page is the page limit' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            $Next = if ($script:Calls -lt 3) { 'page-{0}' -f ($script:Calls + 1) } else { $null }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $Next }
+        }
+        GetResorceConsumption -MaxPages 3
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 3
+    }
+
+    It 'reads at most 10,000 usage pages for one subscription unless told otherwise' {
+        $Limit = @($script:CollectionAst.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'MaxPages' })
+        $Limit.Count | Should -Be 1
+        $Limit[0].DefaultValue.Extent.Text | Should -Be '10000'
+    }
+
+    # The up-front check reads such a row as having no resource URI
+    # (Get-ConsumptionRowResourceUri); the billing phase keeps its cost.
+    It 'keeps a usage row whose InstanceData is <Case>, with blank resource fields, and collects the rest of the subscription' -ForEach @(
+        @{ Case = 'missing'; Value = $null }
+        @{ Case = 'empty'; Value = '' }
+        @{ Case = 'not JSON'; Value = '{"Microsoft.Resources": {' }
+        @{ Case = 'JSON without Microsoft.Resources'; Value = '{}' }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:BadInstance = $Value
+        Mock Get-UsageAggregates {
+            if ($ContinuationToken -eq 'page-2')
+            {
+                return [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-3'); ContinuationToken = $null }
+            }
+            $Bad = New-UsageRow -ResourceUri 'placeholder' -Quantity 7.25
+            $Bad.Properties.InstanceData = $script:BadInstance
+            $Bad.Properties.MeterCategory = 'Support'
+            [pscustomobject]@{ UsageAggregations = @((New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'), $Bad); ContinuationToken = 'page-2' }
+        }
+        GetResorceConsumption
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        $Rows = @(Import-Csv -Path $Global:ConsumptionFileCsv)
+        $Rows.Count | Should -Be 3
+        $Global:ConsumptionRecordCount | Should -Be 3
+        $Kept = @($Rows | Where-Object { $_.MeterCategory -eq 'Support' })
+        $Kept.Count | Should -Be 1
+        $Kept[0].Quantity | Should -Be '7.25'
+        $Kept[0].ResourceId | Should -BeNullOrEmpty
+        $Kept[0].ResourceLocation | Should -BeNullOrEmpty
+        # Every field keeps the type it has in the other rows: blank text, not null.
+        $Instance = $Kept[0].InstanceData | ConvertFrom-Json
+        $Instance.'Microsoft.Resources'.ResourceUri | Should -BeExactly ''
+        $Instance.'Microsoft.Resources'.Location | Should -BeExactly ''
+        $Instance.'Microsoft.Resources'.additionalInfo.vCores | Should -Be 0
+        $Instance.'Microsoft.Resources'.additionalInfo.ServiceType | Should -BeExactly ''
+    }
+
+    It 'does not say a -ResourceGroup run cannot filter consumption by resource group, since it does' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ResourceGroup = 'rg-one'
+        $Global:Subscriptions = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Beta' })
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        GetResorceConsumption
+        Should -Invoke Write-Log -Times 0 -ParameterFilter { $Message -match 'Cannot filter consumption' }
+        @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 1
+    }
+
     # On an ICU host (Linux, macOS) the en-US time pattern has U+202F before
     # AM/PM, so the culture's default date text is not the same on every host.
     It 'writes UsageStartTime and UsageEndTime as M/d/yyyy h:mm:ss tt with a plain space, in ASCII' {
@@ -416,6 +670,29 @@ Describe 'Invoke-ConsumptionValueProbe and Get-ConsumptionCheckVerdict' {
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
+    It 'passes when an error it does not recognise is followed by success' {
+        $script:Calls = 0
+        Mock Get-UsageAggregatesPage {
+            $script:Calls++
+            if ($script:Calls -eq 1) { throw ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) }
+            New-UsagePage -Quantities @(1)
+        }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Outcome | Should -Be 'Pass'
+        $Probe.Attempts | Should -Be 2
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+    }
+
+    It 'refuses an access-denied error that has no status code without retrying it' {
+        Mock Get-UsageAggregatesPage { throw ([System.Net.Http.HttpRequestException]::new('Access denied.')) }
+        $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window
+        (Get-ConsumptionCheckVerdict -Probe $Probe -ResourceCount 5).Passed | Should -BeFalse
+        $Probe.Attempts | Should -Be 1
+        Should -Invoke Get-UsageAggregatesPage -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
     It 'refuses a transient failure that persists after the bounded retries' {
         Mock Get-UsageAggregatesPage { throw (New-StatusException -Message 'Service unavailable' -Status ServiceUnavailable) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -MaxRetries 3
@@ -502,19 +779,21 @@ Describe 'Get-UsageAggregatesPage (the usage API Get-UsageAggregates wraps)' {
         $Verdict.Detail | Should -Be 'query failed (HTTP 403, 1 attempt(s)): the usage API answered HTTP 403'
     }
 
-    It 'stops the subscription (Error), without retrying, on a malformed answer: <Case>' -TestCases @(
+    It 'stops the subscription (Error) after the bounded retries on a malformed answer: <Case>' -TestCases @(
         @{ Case = 'a 200 that is not JSON'; Raw = '{"value": [' ; NextLink = $null }
         @{ Case = 'a nextLink that is not a URL'; Raw = $null; NextLink = 'not a url' }
         @{ Case = 'a nextLink without a continuationToken'; Raw = $null; NextLink = 'https://management.azure.com/subscriptions/sub-a/providers/Microsoft.Commerce/UsageAggregates?api-version=2015-06-01-preview' }
     ) {
         param($Case, $Raw, $NextLink)
-        $Answer = if ($Raw) { New-RestAnswer -Raw $Raw } else { New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $NextLink } }
-        $script:Answers.Enqueue($Answer)
+        1..4 | ForEach-Object {
+            $Answer = if ($Raw) { New-RestAnswer -Raw $Raw } else { New-RestAnswer -Body @{ value = @(@{ properties = @{ quantity = 0 } }); nextLink = $NextLink } }
+            $script:Answers.Enqueue($Answer)
+        }
         $Verdict = Get-ConsumptionCheckVerdict -Probe (Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window) -ResourceCount 5
         $Verdict.Outcome | Should -Be 'Error'
         $Verdict.Passed | Should -BeFalse
-        $script:Paths.Count | Should -Be 1
-        Should -Invoke Start-Sleep -Times 0 -Exactly
+        $script:Paths.Count | Should -Be 4
+        Should -Invoke Start-Sleep -Times 3 -Exactly
     }
 }
 
@@ -930,11 +1209,113 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.TimeoutException]::new('The operation has timed out.')) | Should -Be 'Transient'
     }
 
-    It 'treats 400, 401, 403 and unclassified errors as permanent' {
+    It 'treats a transfer cut off part-way (Error while copying content to a stream) as transient' {
+        Get-ConsumptionErrorKind -Exception ([System.IO.IOException]::new('Error while copying content to a stream.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('Error while copying content to a stream.', [System.IO.IOException]::new('Unable to read data from the transport connection.'))) | Should -Be 'Transient'
+    }
+
+    It 'treats 400, 401, 403, 404, and a message without a status code that names one of them or access denied, as permanent' {
         Get-ConsumptionErrorKind -Exception (New-CloudShapedException -Message 'InvalidInput' -Status BadRequest) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Unauthorized) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Forbidden) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status NotFound) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Subscription not found')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Access denied.')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('AuthorizationFailed')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new("The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'")) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status code does not indicate success: 401.')) | Should -Be 'Permanent'
+    }
+
+    It 'treats a sign-in that cannot be used, without a status code, as permanent, as a 401 is: <Text>' -ForEach @(
+        @{ Text = 'Run Connect-AzAccount to login.' }
+        @{ Text = 'AADSTS700082: The refresh token has expired due to inactivity.' }
+        @{ Text = "The access token is invalid. Code: 'InvalidAuthenticationToken'" }
+        @{ Text = "The token has expired. Code: 'ExpiredAuthenticationToken'" }
+        @{ Text = 'The access token has expired.' }
+        @{ Text = 'Interaction required: the sign-in needs the user.' }
+        @{ Text = "The subscription 'sub-a' could not be found." }
+    ) {
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text)) | Should -Be 'Permanent'
+    }
+
+    It 'still retries an unrecognised error once sign-in and not-found texts are known' {
+        # Near the new texts, but none of them.
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The remote name could not be resolved.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The token request was cancelled.')) | Should -Be 'Transient'
+    }
+
+    It 'retries a sign-in service error that names only its code: <Text>' -ForEach @(
+        @{ Text = 'AADSTS50000: There was an error issuing a token or an issue with our sign-in service.' }
+        @{ Text = 'AADSTS90033: A transient error has occurred. Please try again.' }
+        @{ Text = 'AADSTS90055: TenantThrottlingError: There are too many incoming requests.' }
+    ) {
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text)) | Should -Be 'Transient'
+    }
+
+    It 'reads the messages inside a wrapper: a sign-in that cannot be used, wrapped in a generic error, is not retried' {
+        $Inner = [System.Exception]::new("The access token is invalid. Code: 'InvalidAuthenticationToken'")
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('One or more errors occurred.', $Inner)) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Management.Automation.PSInvalidOperationException]::new('Operation failed.', ([System.Exception]::new('wrapped', ([System.Exception]::new('Run Connect-AzAccount to login.')))))) | Should -Be 'Permanent'
+        # The error of an ErrorRecord the outer exception carries is read too.
+        $Record = [System.Management.Automation.ErrorRecord]::new([System.Exception]::new('The access token has expired.'), 'TokenExpired', 'AuthenticationError', $null)
+        Get-ConsumptionErrorKind -Exception ([System.Management.Automation.RuntimeException]::new('Operation failed.', $null, $Record)) | Should -Be 'Permanent'
+        # A wrapper around an error not recognised is retried.
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('One or more errors occurred.', [System.Exception]::new('An error occurred while sending the request.'))) | Should -Be 'Transient'
+    }
+
+    It 'reads the chain to at most 10 errors' {
+        $Ex = [System.Exception]::new('Run Connect-AzAccount to login.')
+        foreach ($Level in 1..10) { $Ex = [System.Exception]::new('wrapped', $Ex) }
+        Get-ConsumptionErrorKind -Exception $Ex | Should -Be 'Transient'
+        $Near = [System.Exception]::new('Run Connect-AzAccount to login.')
+        foreach ($Level in 1..9) { $Near = [System.Exception]::new('wrapped', $Near) }
+        Get-ConsumptionErrorKind -Exception $Near | Should -Be 'Permanent'
+    }
+
+    It 'retries a failed token cache check, although Az reports it as a sign-in to set up' {
+        # The shape Az gives when two token requests delete each other's
+        # token cache test file: its sign-in text, with the cache library's
+        # error inside, by message and by type.
+        if (-not ('RdaTestFakes.MsalCachePersistenceException' -as [type]))
+        {
+            Add-Type -TypeDefinition 'namespace RdaTestFakes { public class MsalCachePersistenceException : System.Exception { public MsalCachePersistenceException(string m) : base(m) { } } }'
+        }
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        $Check = 'Persistence check failed. Data was written but it could not be read. Possible cause: on Linux, LibSecret is installed but D-Bus isn''t running because it cannot be started over SSH.'
+        $Library = [RdaTestFakes.MsalCachePersistenceException]::new($Check)
+        $Credential = [System.Exception]::new('SharedTokenCacheCredential authentication failed: ' + $Check, $Library)
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Credential)) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn + [Environment]::NewLine + 'SharedTokenCacheCredential authentication failed: ' + $Check)) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [RdaTestFakes.MsalCachePersistenceException]::new('stand-in: other text'))) | Should -Be 'Transient'
+    }
+
+    It 'does not retry a failed token cache check when the same error also names a refusal, a bad request or not found: <Text>' -ForEach @(
+        @{ Text = "The client does not have authorization to perform action 'Microsoft.Commerce/UsageAggregates/read'" }
+        @{ Text = 'Access denied.' }
+        @{ Text = 'Response status code does not indicate success: 403 (Forbidden).' }
+        @{ Text = 'BadRequest: the request is not valid.' }
+        @{ Text = "The subscription 'sub-a' could not be found." }
+    ) {
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        $Cache = [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.', [System.Exception]::new('Persistence check failed. Data was written but it could not be read.'))
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new($Text, [System.ArgumentException]::new($SignIn, $Cache))) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [System.Exception]::new($Text, $Cache))) | Should -Be 'Permanent'
+    }
+
+    It 'still does not retry the same sign-in text without a failed token cache check' {
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn)) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [System.Exception]::new('AADSTS700082: The refresh token has expired due to inactivity.'))) | Should -Be 'Permanent'
+        # A failed token cache check further down than the 10 errors read is not seen.
+        $Deep = [System.Exception]::new('Persistence check failed.')
+        foreach ($Level in 1..9) { $Deep = [System.Exception]::new('wrapped', $Deep) }
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Deep)) | Should -Be 'Permanent'
+    }
+
+    It 'treats an error it does not recognise, and any other status code, as transient' {
+        Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Conflict) | Should -Be 'Transient'
     }
 }
 
@@ -992,6 +1373,24 @@ Describe 'Invoke-ConsumptionDataCheck across subscriptions' {
         $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
         $Result.Exempt.Count | Should -Be 0
         Should -Invoke Get-UsageAggregatesPage -Times 3 -Exactly
+    }
+
+    It 'retries a usage query that fails with a failed token cache check, and passes on the answer' {
+        Mock Invoke-AzRestMethod { New-ResourceCountResponse -Counts @{ 'sub-a' = 1; 'sub-b' = 1; 'sub-c' = 1 } }
+        $script:CacheCheckFailed = $false
+        Mock Get-UsageAggregatesPage {
+            if ($SubscriptionId -eq 'sub-b' -and -not $script:CacheCheckFailed)
+            {
+                $script:CacheCheckFailed = $true
+                throw [System.ArgumentException]::new('Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.', [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.'))
+            }
+            New-UsagePage -Quantities @(1)
+        }
+        $Result = Invoke-ConsumptionDataCheck -Subscriptions $script:Subs -Window $script:Window
+        $Result.ShouldBlock | Should -BeFalse
+        @($Result.Results | ForEach-Object { $_.Outcome }) | Should -Be @('Pass', 'Pass', 'Pass')
+        Should -Invoke Get-UsageAggregatesPage -Times 2 -Exactly -ParameterFilter { $SubscriptionId -eq 'sub-b' }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
     }
 
     It 'passes when every subscription returns a positive quantity, and leaves the Azure context alone' {
@@ -1130,7 +1529,7 @@ $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
 $Global:PlatformOS = 'PowerShell Unix'
 $TestSub = '12345678-1234-1234-1234-123456789012'
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
@@ -1159,6 +1558,8 @@ function global:Invoke-AzRestMethod
     }
     [pscustomobject]@{ StatusCode = 200; Content = ('{{"data":[{{"subscriptionId":"{0}","ResourceCount":4}}]}}' -f $TestSub) }
 }
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $env:RDA_TEST_MODE = $Mode
 $Extra = @{}
 if ($SkipConsumption) { $Extra.SkipConsumption = $true }
@@ -1176,7 +1577,10 @@ exit $LASTEXITCODE
             $env:RDA_TEST_ROLES = $Roles
             $PwshArgs = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Root', $script:RepoRoot, '-Out', $Out, '-Mode', $Mode)
             if ($SkipConsumption) { $PwshArgs += '-SkipConsumption' }
-            $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String
+            # ResourceInventory.ps1 reads ./Version.json from the current folder.
+            Push-Location $script:RepoRoot
+            try { $Output = & (Join-Path $PSHOME 'pwsh') @PwshArgs 2>&1 | Out-String }
+            finally { Pop-Location }
             [pscustomobject]@{
                 ExitCode          = $LASTEXITCODE
                 Output            = $Output

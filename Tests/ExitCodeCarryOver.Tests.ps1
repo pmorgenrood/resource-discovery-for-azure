@@ -1,0 +1,409 @@
+# =============================================================================
+# ExitCodeCarryOver.Tests.ps1
+#
+# Offline tests that Run-AllSubscriptions.ps1 reports a subscription as failed
+# only when ResourceInventory.ps1 failed for that subscription.
+#
+# WHY THIS TEST EXISTS
+# --------------------
+# The wrapper's sequential loop, its one-subscription path and the stream
+# worker call ResourceInventory.ps1 with `&` and treat a non-zero
+# $LASTEXITCODE afterwards as a failed subscription. The script ends with
+# `exit 1` when it stops, and with no `exit` at all when it succeeds, which
+# leaves $LASTEXITCODE as it was. With no native command in the run to reset
+# it, the `exit 1` of one subscription marked every later subscription of the
+# same loop or stream as failed with "Script exited with code 1", even though
+# its report was written; a native command that failed in the session before
+# the wrapper started did the same to every subscription.
+#
+# A clean run also has to set the code itself: inside a PowerShell session a
+# run with two or more streams calls no inventory in the session, so without
+# its own `exit 0` the session read the code it held before the run.
+#
+# HOW
+# ---
+# The tool is copied to a temp dir and the REAL Run-AllSubscriptions.ps1 runs
+# as its own pwsh process (stdin closed), calling the REAL
+# Run-AllSubscriptions.Stream.ps1 and ResourceInventory.ps1. Azure is a set of
+# stand-in Az modules found first on PSModulePath; no az command is used. The
+# stand-in Az.Compute does not load when the ResourceInventory.ps1 importing it
+# was started for the failing subscription, so for that subscription the real
+# script takes its "module present on disk but failed to load" path and ends
+# with exit 1; the next subscription loads it. The run's home is a scratch
+# folder, so the run writes its inventory root under it. On Windows the
+# wrapper writes to C:\InventoryReports instead, so these tests do not run
+# there. Placeholder ids only. No live Azure.
+#
+# The same runs check the Eligible and Processed counts of the summary and of
+# RunSummary.log: under pwsh -File the wrapper's $Subscriptions is the global
+# one, which ResourceInventory.ps1 replaces with every subscription of the tenant.
+#
+# Run with: Invoke-Pester ./Tests/ExitCodeCarryOver.Tests.ps1 -Output Detailed
+# =============================================================================
+
+Describe 'Run-AllSubscriptions.ps1 reports only the subscriptions that failed' -Skip:$IsWindows {
+    BeforeAll {
+        $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
+        $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ExitCodeCarryOver_' + [guid]::NewGuid().ToString('N'))
+        $script:Tenant = '12345678-1234-1234-1234-123456789012'
+        # ResourceInventory.ps1 takes only a GUID as -SubscriptionID. The stand-in
+        # ids are built here from 32 hex digits, so the file holds no id but the
+        # documentation placeholder.
+        $script:SubA = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'a').ToString(); Name = 'Sub A' }
+        $script:SubB = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'b').ToString(); Name = 'Sub B' }
+        $script:SubC = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'c').ToString(); Name = 'Sub C' }
+
+        $script:Tool = Join-Path $script:WorkDir 'tool'
+        New-Item -ItemType Directory -Path $script:Tool -Force | Out-Null
+        foreach ($Item in @('Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1', 'ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
+        {
+            Copy-Item -LiteralPath (Join-Path $script:RepoRoot $Item) -Destination $script:Tool -Recurse -Force
+        }
+        $script:Wrapper = Join-Path $script:Tool 'Run-AllSubscriptions.ps1'
+
+        # Az.Accounts answers the sign-in, context, token and subscription
+        # calls, the role checks, the per-subscription resource count and
+        # Resource Graph discovery (one public IP per subscription).
+        $Accounts = @'
+# Every process that runs the tool loads this stand-in first (the wrapper and
+# each stream), so it skips ResourceInventory.ps1's online version check there,
+# as Tests/SetupStop.Tests.ps1 does in its harness. The platform is set because
+# the same flag also skips the environment check that sets it.
+$Global:RdaSessionInitialized = $true
+$Global:PlatformOS = 'PowerShell Unix'
+function Get-RdaStandInScenario { Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json }
+function Get-RdaStandInContext
+{
+    [pscustomobject]@{
+        Account      = [pscustomobject]@{ Id = 'operator@example.com'; Type = 'User' }
+        Tenant       = [pscustomobject]@{ Id = (Get-RdaStandInScenario).Tenant }
+        Subscription = [pscustomobject]@{ Id = $script:ContextSub; Name = 'stand-in' }
+        Environment  = [pscustomobject]@{ Name = 'AzureCloud'; ResourceManagerUrl = 'https://management.azure.com/' }
+    }
+}
+$script:ContextSub = $null
+function Get-AzContext { [CmdletBinding()] param([switch]$ListAvailable) Get-RdaStandInContext }
+function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context, $Scope) if ($Subscription) { $script:ContextSub = [string]$Subscription }; Get-RdaStandInContext }
+function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
+function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
+function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
+function Get-AzContextAutosaveSetting { [CmdletBinding()] param($Scope) [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
+function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
+function Get-AzAccessToken
+{
+    [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString, $ResourceTypeName)
+    $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"stand-in-caller"}')).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $Tenant = if ($TenantId) { [string]$TenantId } else { (Get-RdaStandInScenario).Tenant }
+    [pscustomobject]@{ Token = ('e30.{0}.c2ln' -f $Claims); Type = 'Bearer'; ExpiresOn = (Get-Date).AddHours(1); TenantId = $Tenant }
+}
+function Get-AzSubscription
+{
+    [CmdletBinding()] param($TenantId, $SubscriptionId, $SubscriptionName)
+    $Scenario = Get-RdaStandInScenario
+    @($Scenario.Subscriptions | Where-Object { -not $SubscriptionId -or $_.Id -eq $SubscriptionId } | ForEach-Object { [pscustomobject]@{ Id = $_.Id; SubscriptionId = $_.Id; Name = $_.Name; State = $(if ($_.State) { [string]$_.State } else { 'Enabled' }); TenantId = $Scenario.Tenant; HomeTenantId = $Scenario.Tenant } })
+}
+function Invoke-AzRestMethod
+{
+    [CmdletBinding()] param([string]$Method = 'GET', [string]$Path, [string]$Payload, [string]$Uri)
+    if (-not $Path) { $Path = $Uri }
+    $Answer = { param([int]$Status, $Body) [pscustomobject]@{ StatusCode = $Status; Content = (ConvertTo-Json -InputObject $Body -Depth 10 -Compress); Headers = @{} } }
+    if ($Path -match '/subscriptions/([^/?]+)/resourcegroups\?') { return & $Answer 200 @{ value = @() } }
+    if ($Path -match '/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/roleAssignments\?')
+    {
+        $Id = $Matches[1]
+        return & $Answer 200 @{ value = @(@{ properties = @{ scope = "/subscriptions/$Id"; principalId = 'stand-in-caller'; roleDefinitionId = "/subscriptions/$Id/providers/Microsoft.Authorization/roleDefinitions/stand-in-reader" } }) }
+    }
+    if ($Path -match '/providers/Microsoft\.Authorization/roleDefinitions/[^/?]+\?') { return & $Answer 200 @{ properties = @{ roleName = 'Reader'; type = 'BuiltInRole'; permissions = @(@{ actions = @('*/read'); notActions = @() }) } } }
+    if ($Path -match '/subscriptions/([^/?]+)/providers/Microsoft\.Authorization/permissions\?') { return & $Answer 200 @{ value = @(@{ actions = @('*/read'); notActions = @() }) } }
+    if ($Path -like '*Microsoft.ResourceGraph/resources*')
+    {
+        $Request = $Payload | ConvertFrom-Json
+        $Ids = @($Request.subscriptions | ForEach-Object { [string]$_ })
+        $Query = [string]$Request.query
+        if ($Query -match 'ResourceCount = count\(\) by subscriptionId') { return & $Answer 200 @{ data = @($Ids | ForEach-Object { @{ subscriptionId = $_; ResourceCount = 1 } }) } }
+        if ($Query -match 'desktopvirtualizationresources') { return & $Answer 200 @{ data = @(@{ count_ = 0 }) } }
+        if ($Query -match 'summarize count\(\)') { return & $Answer 200 @{ data = @(@{ count_ = $Ids.Count }) } }
+        if ($Query -match '^\s*resources\b')
+        {
+            $Rows = @($Ids | ForEach-Object { @{ id = "/subscriptions/$_/resourceGroups/rg-demo/providers/Microsoft.Network/publicIPAddresses/pip-demo"; name = 'pip-demo'; type = 'microsoft.network/publicipaddresses'; location = 'eastus'; subscriptionId = $_; resourceGroup = 'rg-demo'; sku = @{ name = 'Standard' }; properties = @{ publicIPAllocationMethod = 'Static'; publicIPAddressVersion = 'IPv4'; provisioningState = 'Succeeded' } } })
+            return & $Answer 200 @{ data = $Rows; count = $Rows.Count; totalRecords = $Rows.Count }
+        }
+        return & $Answer 200 @{ data = @(); count = 0; totalRecords = 0 }
+    }
+    return & $Answer 404 @{ error = @{ code = 'NotFound'; message = 'stand-in: no answer for this path' } }
+}
+'@
+        # Throws while it loads when the ResourceInventory.ps1 importing it was
+        # started for the scenario's failing subscription.
+        $Compute = @'
+$FailSub = (Get-Content -LiteralPath $env:RDA_STANDIN_AZURE -Raw | ConvertFrom-Json).FailSub
+if ($FailSub)
+{
+    foreach ($Frame in @(Get-PSCallStack))
+    {
+        $Bound = $Frame.InvocationInfo.BoundParameters
+        if ($Frame.ScriptName -like '*ResourceInventory.ps1' -and $null -ne $Bound -and $Bound.ContainsKey('SubscriptionID') -and [string]$Bound['SubscriptionID'] -eq $FailSub)
+        {
+            throw 'stand-in: Az.Compute could not load one of its assemblies'
+        }
+    }
+}
+'@
+        $script:Modules = Join-Path $script:WorkDir 'modules'
+        foreach ($Module in @(@{ Name = 'Az.Accounts'; Body = $Accounts }, @{ Name = 'Az.Compute'; Body = $Compute }, @{ Name = 'Az.Monitor'; Body = '' }, @{ Name = 'Az.Billing'; Body = '' }))
+        {
+            $Dir = Join-Path $script:Modules (Join-Path $Module.Name '99.0.0')
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psm1')) -Value $Module.Body -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $Dir ($Module.Name + '.psd1')) -Value ("@{{ ModuleVersion = '99.0.0'; RootModule = '{0}.psm1'; FunctionsToExport = '*' }}" -f $Module.Name) -Encoding utf8
+        }
+
+        # One run of the wrapper as its own process with a fresh home: its exit
+        # code, the lines it printed and the resume state it left. -PriorExitCode
+        # starts it from a pwsh session whose $LASTEXITCODE already holds that
+        # value, as when a native command failed at the prompt before the run.
+        function script:Invoke-CarryOverRun
+        {
+            param([object[]]$Subs, [string]$FailSub = '', [int]$Streams = 1, [int]$PriorExitCode = -1)
+            $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
+            $CaseHome = Join-Path $CaseDir 'home'
+            New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
+            $Scenario = Join-Path $CaseDir 'scenario.json'
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = $FailSub } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+
+            $WrapperArgs = @('-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams)
+            if ($PriorExitCode -ge 0)
+            {
+                $Launcher = Join-Path $CaseDir 'launcher.ps1'
+                @(
+                    ('$global:LASTEXITCODE = {0}' -f $PriorExitCode)
+                    ("& '{0}' {1}" -f $script:Wrapper, (($WrapperArgs | ForEach-Object { if ($_ -like '-*') { $_ } else { "'$_'" } }) -join ' '))
+                    'exit $LASTEXITCODE'
+                ) | Set-Content -LiteralPath $Launcher -Encoding utf8
+                $Entry = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Launcher)
+            }
+            else
+            {
+                $Entry = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $script:Wrapper) + $WrapperArgs
+            }
+
+            $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
+            foreach ($Arg in $Entry) { $Info.ArgumentList.Add($Arg) }
+            $Info.UseShellExecute = $false
+            $Info.RedirectStandardInput = $true
+            $Info.RedirectStandardOutput = $true
+            $Info.RedirectStandardError = $true
+            $Info.WorkingDirectory = $script:Tool
+            $Info.Environment['HOME'] = $CaseHome
+            $Info.Environment['PSModulePath'] = $script:Modules
+            $Info.Environment['RDA_STANDIN_AZURE'] = $Scenario
+            $Info.Environment['NO_COLOR'] = '1'
+            $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+            $Proc = [System.Diagnostics.Process]::Start($Info)
+            $Proc.StandardInput.Close()
+            $Out = $Proc.StandardOutput.ReadToEndAsync()
+            $Err = $Proc.StandardError.ReadToEndAsync()
+            if (-not $Proc.WaitForExit(300000))
+            {
+                $Proc.Kill($true)
+                throw 'The wrapper run did not end within 300 seconds.'
+            }
+            $Proc.WaitForExit()
+            $StateFile = Join-Path $CaseHome ('InventoryReports/.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
+            $State = if (Test-Path -LiteralPath $StateFile) { Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } else { $null }
+            # RunSummary.log from the run's consolidated zip, when it wrote one.
+            $RunSummary = $null
+            $OuterZip = Get-ChildItem -Path (Join-Path $CaseHome 'InventoryReports') -Filter 'AllSubscriptions_*.zip' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $OuterZip)
+            {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $Archive = [System.IO.Compression.ZipFile]::OpenRead($OuterZip.FullName)
+                try
+                {
+                    $Entry = $Archive.Entries | Where-Object { $_.FullName -eq 'RunSummary.log' } | Select-Object -First 1
+                    if ($null -ne $Entry)
+                    {
+                        $Reader = [System.IO.StreamReader]::new($Entry.Open())
+                        try { $RunSummary = $Reader.ReadToEnd() } finally { $Reader.Dispose() }
+                    }
+                }
+                finally { $Archive.Dispose() }
+            }
+            return [pscustomobject]@{
+                ExitCode   = $Proc.ExitCode
+                Console    = ($Out.Result + $Err.Result)
+                RunSummary = $RunSummary
+                FailedIds  = @(if ($null -ne $State) { @($State.FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } })
+            }
+        }
+
+        # One pwsh session (`pwsh -Command -`, its lines on stdin, as typed at a
+        # prompt) with a fresh home. {Run} in a line becomes the wrapper call
+        # with -ParallelStreams $Streams; {Fail} and {Clean} become scenario
+        # files where the first subscription fails or none does (the session
+        # starts with {Clean}). Returns the session's exit code and the lines
+        # it printed.
+        function script:Invoke-SessionRun
+        {
+            param([object[]]$Subs, [string[]]$Lines, [int]$Streams = 2)
+            $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
+            $CaseHome = Join-Path $CaseDir 'home'
+            New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
+            $Scenario = Join-Path $CaseDir 'scenario.json'
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = '' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            $FailScenario = Join-Path $CaseDir 'scenario-fail.json'
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = [string]$Subs[0].Id } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $FailScenario -Encoding utf8
+            $Call = "& '{0}' -TenantID '{1}' -SkipMetrics -SkipConsumption -ParallelStreams {2}" -f ($script:Wrapper -replace "'", "''"), $script:Tenant, $Streams
+
+            $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
+            foreach ($Arg in @('-NoLogo', '-NoProfile', '-Command', '-')) { $Info.ArgumentList.Add($Arg) }
+            $Info.UseShellExecute = $false
+            $Info.RedirectStandardInput = $true
+            $Info.RedirectStandardOutput = $true
+            $Info.RedirectStandardError = $true
+            $Info.WorkingDirectory = $script:Tool
+            $Info.Environment['HOME'] = $CaseHome
+            $Info.Environment['PSModulePath'] = $script:Modules
+            $Info.Environment['RDA_STANDIN_AZURE'] = $Scenario
+            $Info.Environment['NO_COLOR'] = '1'
+            $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+            $Proc = [System.Diagnostics.Process]::Start($Info)
+            foreach ($Line in $Lines) { $Proc.StandardInput.WriteLine($Line.Replace('{Run}', $Call).Replace('{Fail}', $FailScenario).Replace('{Clean}', $Scenario)) }
+            $Proc.StandardInput.Close()
+            $Out = $Proc.StandardOutput.ReadToEndAsync()
+            $Err = $Proc.StandardError.ReadToEndAsync()
+            if (-not $Proc.WaitForExit(300000))
+            {
+                $Proc.Kill($true)
+                throw 'The session did not end within 300 seconds.'
+            }
+            $Proc.WaitForExit()
+            $Text = @(($Out.Result + $Err.Result) -split "`r?`n" | ForEach-Object { $_.Trim() })
+            return [pscustomobject]@{
+                ExitCode = $Proc.ExitCode
+                Console  = ($Text -join "`n")
+                After    = @($Text | Where-Object { $_ -match '^after\d?: ' })
+                Open     = @($Text | Where-Object { $_ -eq 'session still open' }).Count -eq 1
+            }
+        }
+    }
+
+    AfterAll {
+        if ($script:WorkDir -and (Test-Path -LiteralPath $script:WorkDir))
+        {
+            Remove-Item -LiteralPath $script:WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'sequential: the subscription after one that ended with exit 1 completes and is not listed as failed' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -FailSub $script:SubA.Id
+        $Run.Console | Should -Match 'ERROR processing subscription Sub A: Script exited with code 1'
+        $Run.Console | Should -Not -Match 'ERROR processing subscription Sub B' -Because $Run.Console
+        $Run.Console | Should -Match 'Completed subscription: Sub B'
+        $Run.FailedIds | Should -Be @($script:SubA.Id)
+    }
+
+    It 'one stream: the subscription after one that ended with exit 1 in the same stream is not listed as failed' {
+        # Three subscriptions over two streams: stream-0 holds Sub A then Sub C.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -FailSub $script:SubA.Id -Streams 2
+        $Run.Console | Should -Match '\[stream-0\] queued: 2 subscription\(s\)'
+        $Run.Console | Should -Match '\[stream-0\] ERROR processing Sub A: Script exited with code 1'
+        $Run.Console | Should -Not -Match 'ERROR processing Sub C' -Because $Run.Console
+        $Run.Console | Should -Match '\[stream-0\] done: Sub C'
+        $Run.Console | Should -Match '\[stream-1\] done: Sub B'
+        $Run.FailedIds | Should -Be @($script:SubA.Id)
+    }
+
+    It 'sequential: a non-zero $LASTEXITCODE left in the session before the run fails no subscription' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -PriorExitCode 1
+        $Run.Console | Should -Not -Match 'ERROR processing subscription' -Because $Run.Console
+        $Run.Console | Should -Match 'Completed subscription: Sub A'
+        $Run.Console | Should -Match 'Completed subscription: Sub B'
+        $Run.FailedIds.Count | Should -Be 0
+        $Run.ExitCode | Should -Be 0
+    }
+
+    It 'one subscription with -ParallelStreams: a non-zero $LASTEXITCODE left in the session before the run does not fail it' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA) -Streams 2 -PriorExitCode 1
+        $Run.Console | Should -Match 'Only one'
+        $Run.Console | Should -Not -Match 'ERROR processing subscription' -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0
+        $Run.ExitCode | Should -Be 0
+    }
+
+    It 'one subscription with -ParallelStreams: a subscription that ends with exit 1 is still listed as failed' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA) -Streams 2 -FailSub $script:SubA.Id
+        $Run.Console | Should -Match 'ERROR processing subscription Sub A: Script exited with code 1'
+        $Run.FailedIds | Should -Be @($script:SubA.Id)
+    }
+
+    # With two streams the session runs no inventory itself, so only the
+    # wrapper's own exit sets $LASTEXITCODE there.
+    It 'inside a PowerShell session: a clean run with 2 streams sets $LASTEXITCODE to 0 where the session held 1, and the session stays open' {
+        $Session = Invoke-SessionRun -Subs @($script:SubA, $script:SubB) -Lines @('$global:LASTEXITCODE = 1', '{Run}', '"after: $LASTEXITCODE"', '"session still open"', 'exit 0')
+        $Session.Console | Should -Match '2 subscription\(s\), 2 total resource\(s\), 0 empty, 0 failed'
+        $Session.After | Should -Be @('after: 0') -Because $Session.Console
+        $Session.Open | Should -BeTrue
+        $Session.ExitCode | Should -Be 0
+    }
+
+    It 'inside a PowerShell session: after a run that stopped with exit 1, the next clean run with 2 streams reads 0' {
+        # The first run finds no Az modules on the session's module path and
+        # stops with exit 1 at the wrapper's module check.
+        $Session = Invoke-SessionRun -Subs @($script:SubA, $script:SubB) -Lines @(
+            '$Saved = $env:PSModulePath'
+            '$env:PSModulePath = (New-Item -ItemType Directory -Force -Path (Join-Path $HOME "no-modules")).FullName'
+            '{Run}'
+            '"after1: $LASTEXITCODE"'
+            '$env:PSModulePath = $Saved'
+            '{Run}'
+            '"after2: $LASTEXITCODE"'
+            '"session still open"'
+            'exit 0'
+        )
+        $Session.Console | Should -Match 'Required Az submodule\(s\) not found'
+        $Session.After | Should -Be @('after1: 1', 'after2: 0') -Because $Session.Console
+        $Session.Open | Should -BeTrue
+    }
+
+    It 'inside a PowerShell session: after a run that exited 2, the next clean -Fresh run with 2 streams reads 0' {
+        # The first run fails Sub A and exits 2; -Fresh then collects both
+        # subscriptions again, so the run goes through the streams.
+        $Session = Invoke-SessionRun -Subs @($script:SubA, $script:SubB) -Lines @(
+            '$env:RDA_STANDIN_AZURE = "{Fail}"'
+            '{Run}'
+            '"after1: $LASTEXITCODE"'
+            '$env:RDA_STANDIN_AZURE = "{Clean}"'
+            '{Run} -Fresh'
+            '"after2: $LASTEXITCODE"'
+            '"session still open"'
+            'exit 0'
+        )
+        $Session.Console | Should -Match 'ERROR processing Sub A: Script exited with code 1'
+        $Session.After | Should -Be @('after1: 2', 'after2: 0') -Because $Session.Console
+        $Session.Open | Should -BeTrue
+    }
+
+    # ResourceInventory.ps1 sets $Global:Subscriptions to every subscription of
+    # the tenant, and under pwsh -File the wrapper's top level is the global
+    # scope, so its own $Subscriptions is that list after the first subscription.
+    It 'pwsh -File, sequential: Eligible and Processed count the subscriptions of the run, not every subscription of the tenant' {
+        $SubD = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'd').ToString(); Name = 'Sub D'; State = 'Disabled' }
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $SubD)
+        $Lines = @($Run.Console -split "`r?`n")
+        $Lines | Should -Contain 'Subscriptions to process: 2'
+        $Lines | Should -Contain 'Subscriptions Eligible:  2'
+        $Lines | Should -Contain 'Subscriptions Processed: 2'
+        $Summary = @($Run.RunSummary -split "`r?`n")
+        $Summary | Should -Contain '  Eligible  : 2'
+        $Summary | Should -Contain '  Processed : 2'
+        $Run.ExitCode | Should -Be 0
+    }
+
+    It 'pwsh -File: a clean run with 2 streams exits 0' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2
+        $Run.Console | Should -Match '\[stream-1\] done: Sub B'
+        $Run.FailedIds.Count | Should -Be 0
+        $Run.ExitCode | Should -Be 0
+    }
+}
