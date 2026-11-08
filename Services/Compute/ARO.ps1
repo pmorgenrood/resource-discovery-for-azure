@@ -12,6 +12,28 @@ if ($Task -eq 'Processing')
             $Sub1 = $SUB | Where-Object { $_.id -eq $1.subscriptionId }
             $Data = $1.PROPERTIES
 
+            # Each worker profile is a pool with its own node count, so the total
+            # is the sum of the pools' 'count' values, not the number of pools.
+            # No pools is 0. A pool whose count is missing or not a whole number
+            # makes the total unknown (empty) rather than a number that is too low.
+            $WorkerNodes = 0
+            foreach ($Pool in @($Data.workerProfiles | Where-Object { $null -ne $_ }))
+            {
+                # Read the property itself: on an object without one, .count is
+                # PowerShell's own item count (1), not a node count.
+                $PoolCount = $Pool.PSObject.Properties['count'].Value
+                if ($PoolCount -is [string] -and $PoolCount -match '^\s*\d+\s*$') { $PoolCount = [long]$PoolCount.Trim() }
+                if (($PoolCount -is [int] -or $PoolCount -is [long]) -and $PoolCount -ge 0)
+                {
+                    $WorkerNodes += $PoolCount
+                }
+                else
+                {
+                    $WorkerNodes = $null
+                    break
+                }
+            }
+
             $Obj = @{
                 'ID'                   = $1.id;
                 'Subscription'         = $Sub1.Name;
@@ -24,7 +46,7 @@ if ($Task -eq 'Processing')
                 'MasterSKU'            = $Data.masterProfile.vmSize;
                 'WorkerSKU'            = $Data.workerProfiles.vmSize | Select-Object -Unique;
                 'WorkerDiskSize'       = $Data.workerProfiles.diskSizeGB | Select-Object -Unique;
-                'TotalWorkerNodes'     = $Data.workerProfiles.count;
+                'TotalWorkerNodes'     = $WorkerNodes;
             }
 
             [void]$Tmp.Add($Obj)

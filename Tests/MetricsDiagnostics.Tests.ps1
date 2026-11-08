@@ -9,11 +9,12 @@
 # The stand-in is a small module put first on PSModulePath, so the parallel
 # workers and their thread jobs load it instead of Az.Monitor. No Azure call is
 # made. Every result is derived from the inputs. The disk name selects one
-# behaviour for every request that includes 'Composite Disk Read Operations/sec'
-# for that disk, whether alone or with the disk's other metrics:
+# behaviour for the 'Composite Disk Read Operations/sec' call of that disk:
 #   -throttled   429 error on every attempt (outcome Throttled)
-#   -badmetric   invalid metric name error on every attempt (outcome Error)
-#   -empty       no data points for that metric (outcome Success)
+#   -badmetric   invalid metric name error on every attempt, as Get-AzMetric
+#                throws it: a PSInvalidOperationException whose message holds
+#                the HTTP 400 BadRequest status (outcome Error)
+#   -empty       no data points (outcome Success)
 #   -slow<ms>    succeeds after the given delay
 # Durations are measured by the script, so the seconds are masked when lines
 # are compared and the slowest-first order is checked on the parsed values.
@@ -30,7 +31,9 @@ BeforeAll {
     $script:SubId = '12345678-1234-1234-1234-123456789012'
     $script:ReadOps = 'Composite Disk Read Operations/sec'
     $script:ThrottleMessage = "Operation returned an invalid status code 'TooManyRequests' (429)"
-    $script:BadMetricMessage = 'Failed to find metric configuration for provider: Microsoft.Compute, resource Type: disks, metric: {0}' -f $script:ReadOps
+    # Get-AzMetric's outer error for a metric name Azure rejects: it has no
+    # status code of its own, and its message names the 400 BadRequest answer.
+    $script:BadMetricMessage = "Exception type: ErrorResponseException, Message: Microsoft.Azure.Management.Monitor.Models.ErrorResponseException: Operation returned an invalid status code 'BadRequest'. Failed to find metric configuration for provider: Microsoft.Compute, resource Type: disks, metric: {0}" -f $script:ReadOps
 
     $StubModuleDir = Join-Path $TestDrive 'Modules/RdaMetricStub'
     New-Item -ItemType Directory -Path $StubModuleDir -Force | Out-Null
@@ -39,29 +42,32 @@ function Get-AzMetric
 {
     param($ResourceId, $MetricName, $StartTime, $EndTime, $TimeGrain, $AggregationType, $DefaultProfile)
 
-    # Like the real cmdlet, a request for several names fails as a whole, or
-    # returns one metric per name with the name in Name.Value.
-    $Names = @($MetricName)
+    # One request can name several metrics (grouped requests) and is answered
+    # with one result per name. A grouped answer leaves out the read-operations
+    # metric of a disk with a behaviour, so the script requests that metric on
+    # its own, and the behaviour applies to that single-metric request only:
+    # the disk's other metrics are not delayed or failed with it.
     $DiskName = ($ResourceId -split '/')[-1]
-    if ($Names -contains '__READOPS__')
+    $Names = @($MetricName)
+    $Special = $DiskName -match '-(throttled|badmetric|empty|slow\d+)$'
+    if ($Names.Count -eq 1 -and $Names[0] -eq '__READOPS__')
     {
         if ($DiskName -like '*-throttled') { throw "__THROTTLE__" }
-        if ($DiskName -like '*-badmetric') { throw "__BADMETRIC__" }
+        if ($DiskName -like '*-badmetric') { throw [System.Management.Automation.PSInvalidOperationException]::new("__BADMETRIC__") }
         if ($DiskName -match '-slow(\d+)$') { Start-Sleep -Milliseconds ([int]$Matches[1]) }
     }
 
     $Seed = [int]($DiskName -replace '^disk-(\d+).*$', '$1')
     foreach ($Name in $Names)
     {
-        $Data = if ($Name -eq '__READOPS__' -and $DiskName -like '*-empty') { @() } else
+        if ($Name -eq '__READOPS__' -and $Special -and $Names.Count -gt 1) { continue }
+        if ($Name -eq '__READOPS__' -and $DiskName -like '*-empty') { [pscustomobject]@{ Id = $ResourceId; Name = [pscustomobject]@{ Value = $Name }; Data = @() }; continue }
+        $Data = foreach ($Hour in 0..2)
         {
-            foreach ($Hour in 0..2)
-            {
-                $Value = ($Seed % 50) + $Hour + ($Name.Length / 10)
-                [pscustomobject]@{ TimeStamp = ([datetime]$StartTime).AddHours($Hour); Average = $Value; Maximum = $Value; Minimum = $Value; Total = $Value; Count = 1 }
-            }
+            $Value = ($Seed % 50) + $Hour + ($Name.Length / 10)
+            [pscustomobject]@{ TimeStamp = ([datetime]$StartTime).AddHours($Hour); Average = $Value; Maximum = $Value; Minimum = $Value; Total = $Value; Count = 1 }
         }
-        [pscustomobject]@{ Id = $ResourceId; Name = [pscustomobject]@{ Value = $Name; LocalizedValue = $Name }; Data = @($Data) }
+        [pscustomobject]@{ Id = $ResourceId; Name = [pscustomobject]@{ Value = $Name }; Data = @($Data) }
     }
 }
 Export-ModuleMember -Function Get-AzMetric
@@ -166,25 +172,20 @@ AfterAll {
 Describe 'Metrics phase diagnostics across several batches' {
 
     BeforeAll {
-        # 200 attached disks x 4 metrics = 800 definitions. A disk's four metrics
-        # share one request, and a batch holds whole disks: 63, 63, 63 and 11
-        # disks (252, 252, 252 and 44 definitions), 200 requests in all.
-        # A disk's read-operations call has MetricIndex 4 * disk + 1.
-        # A failed shared request is retried with backoff (at least 7 s, 14 s when
-        # throttled), then each metric of the disk is requested on its own, and a
-        # metric's time includes the shared request. So the throttled call (two
-        # throttled requests, at least 28 s) is the slowest by several seconds.
-        # The next four come from the two -badmetric calls (two failed requests,
-        # about 14 s to 21 s) and the throttled disk's three other metrics (one
-        # throttled request, about 14 s to 18 s), in either order. Both -badmetric
-        # disks are after batch 1, so at least one later-batch call is always among
-        # them. Every other call takes about 11 s or less, the 6 s and 7 s disks
-        # included.
+        # 200 attached disks x 4 metrics = 800 metric definitions. A disk's 4
+        # metrics share one grouped request, so 200 requests; a batch takes whole
+        # groups until it holds at least 250 definitions: 63, 63, 63 and 11
+        # requests (252, 252, 252 and 44 definitions). The read-operations metric
+        # of each of the 7 disks below is then requested on its own (7 fallback
+        # requests). A disk's read-operations call has MetricIndex 4 * disk + 1.
+        # A failed call takes at least 7 s of retry backoff (122 s when throttled),
+        # so the five slowest are the three failures and the 6 s and 7 s calls,
+        # several seconds clear of the 1 s call and of every other call.
         $Special = @{
             10  = '-throttled'   # idx 41, batch 1: the only Throttled call
+            20  = '-badmetric'   # idx 81, batch 1
             30  = '-slow1000'    # idx 121, batch 1: pushed out of the slowest five by later batches
             100 = '-empty'       # idx 401, batch 2
-            120 = '-badmetric'   # idx 481, batch 2
             150 = '-badmetric'   # idx 601, batch 3
             160 = '-slow7000'    # idx 641, batch 3
             195 = '-slow6000'    # idx 781, batch 4
@@ -194,13 +195,10 @@ Describe 'Metrics phase diagnostics across several batches' {
 
         $CallPrefix = 'idx={0} Managed Disk/{1}/' + $script:ReadOps + ' interval=1:00:00'
         $script:Throttled = $CallPrefix -f 41, 'disk-0010-throttled'
-        $script:BadMetricA = $CallPrefix -f 481, 'disk-0120-badmetric'
+        $script:BadMetricA = $CallPrefix -f 81, 'disk-0020-badmetric'
         $script:BadMetricB = $CallPrefix -f 601, 'disk-0150-badmetric'
-        $script:ThrottledDiskOthers = @(
-            'idx=42 Managed Disk/disk-0010-throttled/Composite Disk Write Operations/sec interval=1:00:00'
-            'idx=43 Managed Disk/disk-0010-throttled/Composite Disk Read Bytes/sec interval=1:00:00'
-            'idx=44 Managed Disk/disk-0010-throttled/Composite Disk Write Bytes/sec interval=1:00:00'
-        )
+        $script:Slow7000 = $CallPrefix -f 641, 'disk-0160-slow7000'
+        $script:Slow6000 = $CallPrefix -f 781, 'disk-0195-slow6000'
     }
 
     It 'writes every result to one file per batch' {
@@ -229,23 +227,27 @@ Describe 'Metrics phase diagnostics across several batches' {
 
     It 'writes the summary sections in order' {
         $Log = $script:Run.Log
-        $Log.Count | Should -Be 14
-        $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
+        # 14 summary lines, then the metrics-incomplete line (the next case).
+        $Log.Count | Should -Be 15
+        $Log[0] | Should -Be '[Metrics] Starting metrics collection: 800 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, throttle retries=6 (honours Retry-After up to 120s), lookback=31 day(s).'
         $Log[1] | Should -Be '[Metrics] ===== Metrics phase summary ====='
+        $Log[3] | Should -Be '[Metrics] Azure Monitor requests: 207 for 800 metric definition(s), of which 7 single-metric fallback request(s); retries not counted'
         $Log[4] | Should -Be '[Metrics] Non-success calls (where it got stuck):'
         $Log[8] | Should -Be '[Metrics] Slowest 5 calls:'
     }
 
+    It 'marks the subscription metrics incomplete for the single-metric request that kept failing without BadRequest (the throttled one) only, not for the metric names Azure rejected with BadRequest' {
+        $script:Run.Log[14] | Should -Be '[Metrics] Metrics incomplete for 1 subscription(s): Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+    }
+
     It 'counts every call by outcome, including a status seen only in the first batch' {
-        Hide-Seconds $script:Run.Log[2] | Should -Be '[Metrics] Total calls: 800 | Success: 797 | Timeout: 0 | Throttled: 1 | Error: 2 | Elapsed: <s>s'
-        # One request per disk, then one request per metric of the three disks whose shared request failed.
-        $script:Run.Log[3] | Should -Be '[Metrics] Azure Monitor requests: 212 for 800 metric definition(s), of which 12 single-metric fallback request(s); retries not counted'
+        Hide-Seconds $script:Run.Log[2] | Should -Be '[Metrics] Metric definitions: 800 | Success: 797 | Timeout: 0 | Throttled: 1 | Error: 2 | Elapsed: <s>s'
     }
 
     It 'lists every non-success call from every batch, slowest first' {
         $Lines = $script:Run.Log[5..7]
         $Expected = @(
-            ('[Metrics]   Throttled {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:Throttled, $script:ThrottleMessage)
+            ('[Metrics]   Throttled {0} attempts=7 <s>s Get-AzMetric failed after 7 attempt(s): {1}' -f $script:Throttled, $script:ThrottleMessage)
             ('[Metrics]   Error {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:BadMetricA, $script:BadMetricMessage)
             ('[Metrics]   Error {0} attempts=4 <s>s Get-AzMetric failed after 4 attempt(s): {1}' -f $script:BadMetricB, $script:BadMetricMessage)
         )
@@ -255,39 +257,28 @@ Describe 'Metrics phase diagnostics across several batches' {
     }
 
     It 'lists the five slowest calls across all batches, slowest first' {
-        $Lines = @($script:Run.Log[9..13] | ForEach-Object { Hide-Seconds $_ })
-        $Candidates = @(
+        $Lines = $script:Run.Log[9..13]
+        $Expected = @(
             ('[Metrics]   <s>s {0} (Throttled)' -f $script:Throttled)
             ('[Metrics]   <s>s {0} (Error)' -f $script:BadMetricA)
             ('[Metrics]   <s>s {0} (Error)' -f $script:BadMetricB)
-            $script:ThrottledDiskOthers | ForEach-Object { '[Metrics]   <s>s {0} (Success)' -f $_ }
+            ('[Metrics]   <s>s {0} (Success)' -f $script:Slow7000)
+            ('[Metrics]   <s>s {0} (Success)' -f $script:Slow6000)
         )
-        $Lines[0] | Should -Be $Candidates[0]
-        @($Lines | Sort-Object -Unique).Count | Should -Be 5
-        @($Lines | Where-Object { $Candidates -notcontains $_ }) | Should -BeNullOrEmpty
-        @($Lines | Where-Object { $_ -eq $Candidates[1] -or $_ -eq $Candidates[2] }).Count | Should -BeGreaterOrEqual 1 -Because 'a call from a later batch is among the five slowest'
-        $Seconds = @($script:Run.Log[9..13] | ForEach-Object { Get-Seconds $_ })
+        @($Lines | ForEach-Object { Hide-Seconds $_ } | Sort-Object) | Should -Be @($Expected | Sort-Object)
+        $Seconds = @($Lines | ForEach-Object { Get-Seconds $_ })
         $Seconds | Should -Be @($Seconds | Sort-Object -Descending)
     }
 
     It 'gives each failed call the same duration in both lists' {
-        # A -badmetric call can be just outside the five slowest, behind the
-        # throttled disk's other metrics; the throttled call and at least one
-        # -badmetric call are always in both lists.
-        $InBoth = 0
         foreach ($Prefix in @($script:Throttled, $script:BadMetricA, $script:BadMetricB))
         {
             $InNonSuccess = @($script:Run.Log[5..7] | Where-Object { $_.Contains(' ' + $Prefix + ' attempts=') })
             $InSlowest = @($script:Run.Log[9..13] | Where-Object { $_.Contains('s ' + $Prefix + ' (') })
             $InNonSuccess.Count | Should -Be 1
-            $InSlowest.Count | Should -BeLessOrEqual 1
-            if ($InSlowest.Count -eq 1)
-            {
-                Get-Seconds $InSlowest[0] | Should -Be (Get-Seconds $InNonSuccess[0])
-                $InBoth++
-            }
+            $InSlowest.Count | Should -Be 1
+            Get-Seconds $InSlowest[0] | Should -Be (Get-Seconds $InNonSuccess[0])
         }
-        $InBoth | Should -BeGreaterOrEqual 2
     }
 
     It 'does not keep every call record until the end of the phase' {
@@ -304,9 +295,9 @@ Describe 'Metrics phase diagnostics with no metric definitions' {
         $Run.Output.Count | Should -Be 0
         $Run.Verbose.Count | Should -Be 0
         @($Run.Log | ForEach-Object { Hide-Seconds $_ }) | Should -Be @(
-            '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, lookback=31 day(s).'
+            '[Metrics] Starting metrics collection: 0 metric definition(s), ThrottleLimit=16, per-call timeout=120s, max retries=3, throttle retries=6 (honours Retry-After up to 120s), lookback=31 day(s).'
             '[Metrics] ===== Metrics phase summary ====='
-            '[Metrics] Total calls: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
+            '[Metrics] Metric definitions: 0 | Success: 0 | Timeout: 0 | Throttled: 0 | Error: 0 | Elapsed: <s>s'
             '[Metrics] Azure Monitor requests: 0 for 0 metric definition(s), of which 0 single-metric fallback request(s); retries not counted'
         )
     }

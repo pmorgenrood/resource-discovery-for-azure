@@ -16,7 +16,7 @@
 #
 # HOW
 # ---
-# Write-InventoryJson is dot-sourced from Functions/ResourceInventory.Functions.ps1
+# Write-InventoryJson is dot-sourced from Functions/InventoryJson.Functions.ps1
 # and tested directly. ResourceInventory.ps1 runs login and collection when
 # invoked, so its parts are lifted out with the PowerShell parser: the functions
 # it defines, the top-level statements of RunInventorySetup and
@@ -32,12 +32,21 @@
 # Run with: Invoke-Pester ./Tests/InventoryWrite.Tests.ps1 -Output Detailed
 # =============================================================================
 
+BeforeDiscovery {
+    # The behaviour test for the Azure session read needs the real Az.Accounts module. It keeps the
+    # child process away from the user's Azure profile by pointing HOME at a temporary folder, which
+    # Az.Accounts follows on Linux and macOS only, so the test is skipped on Windows.
+    $script:HasAzAccounts = [bool](Get-Module -ListAvailable -Name Az.Accounts)
+    $script:CanIsolateAzProfile = -not $IsWindows
+}
+
 BeforeAll {
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     $script:InventoryScript = Join-Path $script:RepoRoot 'ResourceInventory.ps1'
     $script:CommonFunctions = Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1'
     $script:InventoryFunctions = Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1'
-    foreach ($Required in @($script:InventoryScript, $script:CommonFunctions, $script:InventoryFunctions))
+    $script:InventoryJsonFunctions = Join-Path $script:RepoRoot 'Functions/InventoryJson.Functions.ps1'
+    foreach ($Required in @($script:InventoryScript, $script:CommonFunctions, $script:InventoryFunctions, $script:InventoryJsonFunctions))
     {
         if (-not (Test-Path -LiteralPath $Required -PathType Leaf)) { throw "Required file not found: $Required" }
     }
@@ -184,7 +193,12 @@ BeforeAll {
 
     # Extension/Summary.ps1 stand-ins, placed beside the harness where FinalizeOutputs looks.
     $script:SummaryParams = 'param($JsonFile, $HtmlFile, $Title, $TenantId, $Version, $ExtractionRunTime, $ReportingRunTime, $PhaseTimings, $PlatOS, $ConsumptionFile)'
-    $script:SummaryWrites = $script:SummaryParams + [Environment]::NewLine + 'Set-Content -LiteralPath $HtmlFile -Value ''<html></html>'''
+    # Like the real one, it stops when the inventory is not there, so it writes no HTML then.
+    $script:SummaryWrites = @(
+        $script:SummaryParams
+        'if (-not (Test-Path -LiteralPath $JsonFile -PathType Leaf)) { throw "Summary.ps1: Inventory JSON not found at ''$JsonFile''." }'
+        'Set-Content -LiteralPath $HtmlFile -Value ''<html></html>'''
+    ) -join [Environment]::NewLine
 
     # Stand-ins for the Azure-facing steps of a full run: discovery returns two disks and
     # one AVD host pool, and the collector step turns the disks into one collector.
@@ -215,6 +229,8 @@ function CreateResourceJobs
     $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Disks' -Value $Disks
 }
 function GetResorceConsumption { }
+function Get-AzContext { }
+function Test-SubscriptionRoleAccessAll { }
 '@
 
     # Summary.ps1 stand-in that also records whether the collector data is still held
@@ -228,9 +244,13 @@ function GetResorceConsumption { }
     # all in ONE child pwsh process and in-process (`&`), as the wrappers call
     # ResourceInventory.ps1. Each entry is script text that may override the stubs above.
     # Returns, per run, the exit code, any error that escaped, and the globals left behind.
+    # With -Direct each run is instead its own `pwsh -File` process, as an operator starts the
+    # script: no caller holds a try block, so a throw under the script's 'silentlycontinue'
+    # preference does not stop the script. Each run then also returns its console output and
+    # the names of the files left in its output folder; the globals are not readable.
     function Invoke-InventoryRun
     {
-        param([string]$Name, [string[]]$Runs)
+        param([string]$Name, [string[]]$Runs, [switch]$Direct)
 
         $CaseDir = Join-Path $script:TmpRoot $Name
         $Q = { param($s) "'" + $s.Replace("'", "''") + "'" }
@@ -245,6 +265,7 @@ function GetResorceConsumption { }
                 '$ErrorActionPreference = ''silentlycontinue'''
                 ('. {0}' -f (& $Q $script:CommonFunctions))
                 ('. {0}' -f (& $Q $script:InventoryFunctions))
+                ('. {0}' -f (& $Q $script:InventoryJsonFunctions))
                 'function GetLocalVersion { ''1.2.3'' }'
                 'function Write-RdaShareableDiagnosticsLog { $null }'
                 ('$Global:DefaultPath = {0}' -f (& $Q ($RunDir + [IO.Path]::DirectorySeparatorChar)))
@@ -277,18 +298,30 @@ function GetResorceConsumption { }
             '{'
             '    $global:LASTEXITCODE = 0'
             '    $Escaped = $null'
-            '    try { & $RunFile *> $null } catch { $Escaped = $_.Exception.Message }'
+            '    $Output = $null'
+            $(if ($Direct)
+                {
+                    '    $Output = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $RunFile *>&1 | Out-String'
+                }
+                else
+                {
+                    '    try { & $RunFile *> $null } catch { $Escaped = $_.Exception.Message }'
+                })
             '    $RunDir = Split-Path -Parent $RunFile'
             '    $Inventory = Join-Path $RunDir ''Inventory_ResourcesReport_test.json'''
             '    $ReportState = Join-Path $RunDir ''report-state.json'''
             '    [pscustomobject]@{'
             '        ExitCode             = $LASTEXITCODE'
+            '        AzAccountsLoaded     = [bool](Get-Module -Name Az.Accounts)'
             '        Escaped              = $Escaped'
             '        ResourceCount        = $Global:ResourceCount'
             '        ResourcesReleased    = ($null -eq $Global:Resources)'
             '        SmaResourcesReleased = ($null -eq $Global:SmaResources)'
             '        Inventory            = if (Test-Path -LiteralPath $Inventory) { Get-Content -LiteralPath $Inventory -Raw | ConvertFrom-Json } else { $null }'
             '        ReportState          = if (Test-Path -LiteralPath $ReportState) { Get-Content -LiteralPath $ReportState -Raw | ConvertFrom-Json } else { $null }'
+            '        Output               = $Output'
+            '        ErrorLog             = if (Test-Path -LiteralPath (Join-Path $RunDir ''ErrorLog_ResourcesReport_test.log'')) { Get-Content -LiteralPath (Join-Path $RunDir ''ErrorLog_ResourcesReport_test.log'') -Raw } else { $null }'
+            '        Files                = @(Get-ChildItem -LiteralPath $RunDir -Force | ForEach-Object { $_.Name } | Sort-Object)'
             '    }'
             '}'
             ('ConvertTo-Json -InputObject @($Results) -Depth 6 | Set-Content -LiteralPath {0}' -f (& $Q $ResultsFile))
@@ -373,10 +406,10 @@ AfterAll {
 Describe 'Write-InventoryJson' {
 
     BeforeAll {
-        . $script:InventoryFunctions
+        . $script:InventoryJsonFunctions
         if (-not (Get-Command -Name 'Write-InventoryJson' -CommandType Function -ErrorAction SilentlyContinue))
         {
-            throw "Expected function 'Write-InventoryJson' to be defined by $script:InventoryFunctions, but it was not."
+            throw "Expected function 'Write-InventoryJson' to be defined by $script:InventoryJsonFunctions, but it was not."
         }
 
         # An empty folder of its own, so a test can check every file the writer left behind.
@@ -521,6 +554,180 @@ Describe 'Write-InventoryJson' {
         [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) | Should -BeExactly ([Convert]::ToBase64String((Get-ReferenceBytes $Inventory)))
         Get-WriterCaseFiles $Dir | Should -Be @('Inventory_test.json')
     }
+
+    # A dictionary's PSObject properties are Keys, Values, Count and so on, not its entries,
+    # so writing one property at a time would give the wrong shape with no error.
+    It 'refuses a <Kind> input with a clear error and writes nothing' -ForEach @(
+        @{ Kind = 'hashtable'; Make = { @{ VirtualMachines = @(); Version = '1.2.3' } } }
+        @{ Kind = 'ordered dictionary'; Make = { [ordered]@{ VirtualMachines = @(); Version = '1.2.3' } } }
+    ) {
+        $Dir = New-WriterCaseDir
+        $Path = Join-Path $Dir 'Inventory_test.json'
+
+        { Write-InventoryJson -InputObject (& $Make) -Path $Path 3>$null } | Should -Throw '*-InputObject is a dictionary*'
+
+        Get-WriterCaseFiles $Dir | Should -BeNullOrEmpty -Because 'nothing is written for a refused input'
+    }
+
+    It 'refuses a dictionary without touching an existing file at the path' {
+        $Dir = New-WriterCaseDir
+        $Path = Join-Path $Dir 'Inventory_test.json'
+        [System.IO.File]::WriteAllText($Path, '{"old":1}')
+        $Before = [System.IO.File]::ReadAllBytes($Path)
+
+        { Write-InventoryJson -InputObject @{ Version = '1.2.3' } -Path $Path 3>$null } | Should -Throw '*-InputObject is a dictionary*'
+
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) | Should -BeExactly ([Convert]::ToBase64String($Before))
+        Get-WriterCaseFiles $Dir | Should -Be @('Inventory_test.json')
+    }
+
+    # Pester runs each test inside a try, and a throw inside a try always stops. So the
+    # caller here is a child pwsh with no try at all, as a script run on its own would be.
+    # The third case passes -ErrorAction SilentlyContinue at the call site instead, with the
+    # caller's own preference left at Continue.
+    It 'refuses a dictionary under <Label> with no enclosing try, writing nothing' -ForEach @(
+        @{ Label = 'ErrorActionPreference SilentlyContinue'; Preference = 'SilentlyContinue'; CallSite = '' }
+        @{ Label = 'ErrorActionPreference Ignore'; Preference = 'Ignore'; CallSite = '' }
+        @{ Label = 'call-site -ErrorAction SilentlyContinue'; Preference = 'Continue'; CallSite = ' -ErrorAction SilentlyContinue' }
+    ) {
+        $EmptyDir = New-WriterCaseDir
+        $EmptyPath = Join-Path $EmptyDir 'Inventory_test.json'
+        $ExistingDir = New-WriterCaseDir
+        $ExistingPath = Join-Path $ExistingDir 'Inventory_test.json'
+        [System.IO.File]::WriteAllText($ExistingPath, '{"old":1}')
+        $Before = [System.IO.File]::ReadAllBytes($ExistingPath)
+
+        $Q = { param($s) "'" + $s.Replace("'", "''") + "'" }
+        $ChildFile = Join-Path $script:TmpRoot ('silent_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+        Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value @(
+            ('$ErrorActionPreference = {0}' -f (& $Q $Preference))
+            ('. {0}' -f (& $Q $script:InventoryJsonFunctions))
+            ('Write-InventoryJson -InputObject @{{ VirtualMachines = @(); Version = ''1.2.3'' }} -Path {0}{1}' -f (& $Q $EmptyPath), $CallSite)
+            'Write-Output ''AFTER_FIRST'''
+            ('Write-InventoryJson -InputObject ([ordered]@{{ Version = ''1.2.3'' }}) -Path {0}{1}' -f (& $Q $ExistingPath), $CallSite)
+            'Write-Output ''AFTER_SECOND'''
+        )
+        $Pwsh = (Get-Process -Id $PID).Path
+        $Output = @(& $Pwsh -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+
+        # The child gets past both calls (its own preference lets it go on); the writer must not.
+        $Output | Should -Contain 'AFTER_SECOND' -Because ($Output -join [Environment]::NewLine)
+        Get-WriterCaseFiles $EmptyDir | Should -BeNullOrEmpty -Because 'no inventory and no temporary file is written for a dictionary'
+        Get-WriterCaseFiles $ExistingDir | Should -Be @('Inventory_test.json') -Because 'no temporary file is left'
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ExistingPath)) | Should -BeExactly ([Convert]::ToBase64String($Before)) -Because 'an existing inventory is left unchanged'
+    }
+
+    # A serialiser error the caller's preference lets pass returns nothing instead of
+    # throwing. The mock stands in for that on one collector's value only. Pester runs
+    # this inside its own try; the next test covers a caller with no try.
+    It 'stops and writes nothing when ConvertTo-Json returns nothing for a value (ErrorActionPreference <Preference>, inside a try)' -ForEach @(
+        @{ Preference = 'Continue' }
+        @{ Preference = 'SilentlyContinue' }
+    ) {
+        $Dir = New-WriterCaseDir
+        $Path = Join-Path $Dir 'Inventory_test.json'
+        $ExistingDir = New-WriterCaseDir
+        $ExistingPath = Join-Path $ExistingDir 'Inventory_test.json'
+        [System.IO.File]::WriteAllText($ExistingPath, '{"old":1}')
+        $Before = [System.IO.File]::ReadAllBytes($ExistingPath)
+        $Inventory = [pscustomobject][ordered]@{ Disks = @([ordered]@{ Name = 'disk-01' }); Broken = 'serialiser-returns-nothing'; Version = '1.2.3' }
+        Mock -CommandName ConvertTo-Json -MockWith { } -ParameterFilter { $InputObject -is [string] -and $InputObject -eq 'serialiser-returns-nothing' }
+        $ErrorActionPreference = $Preference
+
+        { Write-InventoryJson -InputObject $Inventory -Path $Path 3>$null } | Should -Throw "*returned nothing for the 'Broken' property*"
+        { Write-InventoryJson -InputObject $Inventory -Path $ExistingPath 3>$null } | Should -Throw "*returned nothing for the 'Broken' property*"
+
+        $ErrorActionPreference = 'Continue'
+        Get-WriterCaseFiles $Dir | Should -BeNullOrEmpty -Because 'an inventory with a property and no value must not be written'
+        Get-WriterCaseFiles $ExistingDir | Should -Be @('Inventory_test.json') -Because 'no temporary file is left'
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ExistingPath)) | Should -BeExactly ([Convert]::ToBase64String($Before)) -Because 'an existing inventory is left unchanged'
+    }
+
+    # The same case from a child pwsh with no try at all, as a script run on its own would
+    # be. A ConvertTo-Json function in the child stands in for the serialiser error.
+    It 'stops and writes nothing when ConvertTo-Json returns nothing for a value under ErrorActionPreference SilentlyContinue with no enclosing try' {
+        $EmptyDir = New-WriterCaseDir
+        $EmptyPath = Join-Path $EmptyDir 'Inventory_test.json'
+        $ExistingDir = New-WriterCaseDir
+        $ExistingPath = Join-Path $ExistingDir 'Inventory_test.json'
+        [System.IO.File]::WriteAllText($ExistingPath, '{"old":1}')
+        $Before = [System.IO.File]::ReadAllBytes($ExistingPath)
+
+        $Q = { param($s) "'" + $s.Replace("'", "''") + "'" }
+        $ChildFile = Join-Path $script:TmpRoot ('silent_empty_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+        Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value @(
+            '$ErrorActionPreference = ''SilentlyContinue'''
+            ('. {0}' -f (& $Q $script:InventoryJsonFunctions))
+            'function ConvertTo-Json { param($InputObject, $Depth, [switch]$Compress) if ($InputObject -is [string] -and $InputObject -eq ''serialiser-returns-nothing'') { return }; Microsoft.PowerShell.Utility\ConvertTo-Json @PSBoundParameters }'
+            '$Inventory = [pscustomobject][ordered]@{ Disks = @([ordered]@{ Name = ''disk-01'' }); Broken = ''serialiser-returns-nothing''; Version = ''1.2.3'' }'
+            ('Write-InventoryJson -InputObject $Inventory -Path {0}' -f (& $Q $EmptyPath))
+            'Write-Output ''AFTER_FIRST'''
+            ('Write-InventoryJson -InputObject $Inventory -Path {0}' -f (& $Q $ExistingPath))
+            'Write-Output ''AFTER_SECOND'''
+        )
+        $Output = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+
+        $Output | Should -Contain 'AFTER_SECOND' -Because ($Output -join [Environment]::NewLine)
+        Get-WriterCaseFiles $EmptyDir | Should -BeNullOrEmpty -Because 'an inventory with a property and no value must not be written'
+        Get-WriterCaseFiles $ExistingDir | Should -Be @('Inventory_test.json') -Because 'no temporary file is left'
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($ExistingPath)) | Should -BeExactly ([Convert]::ToBase64String($Before)) -Because 'an existing inventory is left unchanged'
+    }
+
+    It 'still writes null and empty collectors, which ConvertTo-Json returns as text' {
+        $Dir = New-WriterCaseDir
+        $Path = Join-Path $Dir 'Inventory_test.json'
+        $Inventory = [pscustomobject][ordered]@{ Empty = @(); Nothing = $null; Text = ''; Version = '1.2.3' }
+
+        Write-InventoryJson -InputObject $Inventory -Path $Path 3>$null
+
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) | Should -BeExactly ([Convert]::ToBase64String((Get-ReferenceBytes $Inventory)))
+    }
+
+    It 'still writes a [pscustomobject] built from an ordered dictionary' {
+        $Dir = New-WriterCaseDir
+        $Path = Join-Path $Dir 'Inventory_test.json'
+        $Inventory = [pscustomobject][ordered]@{ VirtualMachines = @([ordered]@{ Name = 'vm-01' }); Version = '1.2.3' }
+
+        Write-InventoryJson -InputObject $Inventory -Path $Path 3>$null
+
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) | Should -BeExactly ([Convert]::ToBase64String((Get-ReferenceBytes $Inventory)))
+    }
+}
+
+Describe 'ResourceInventory.ps1 start-up loads Write-InventoryJson' {
+
+    It 'defines Write-InventoryJson after the start-up load statements run in a fresh pwsh' {
+        # The top-level statements before the debug-mode setup (the '$DebugMode = ...'
+        # line, or an older '$Debug.IsPresent' check) are the functions-file loads. Run
+        # them in a child pwsh with $PSScriptRoot set to the repo.
+        $Tokens = $null
+        $ParseErrors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:InventoryScript, [ref]$Tokens, [ref]$ParseErrors)
+        $Load = @()
+        $FoundEnd = $false
+        foreach ($Statement in $Ast.EndBlock.Statements)
+        {
+            if ($Statement.Extent.Text -match '^\s*(\$DebugMode\s*=|if\s*\(\s*\$Debug(Mode\b|\.IsPresent))') { $FoundEnd = $true; break }
+            $Load += $Statement.Extent.Text
+        }
+        # Without the end marker $Load would hold the whole script, and the child would
+        # run a full inventory against whatever Azure sign-in the host has.
+        $FoundEnd | Should -BeTrue -Because 'the start-up loads must end at the debug-mode setup'
+        $Load.Count | Should -BeGreaterThan 0
+
+        $Q = { param($s) "'" + $s.Replace("'", "''") + "'" }
+        $ChildFile = Join-Path $script:TmpRoot ('startup_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+        Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value @(
+            ('$RepoRoot = {0}' -f (& $Q $script:RepoRoot))
+            (($Load -join [Environment]::NewLine) -replace '\$PSScriptRoot', '$RepoRoot')
+            'Write-Output (''HAS_WRITER='' + [bool](Get-Command -Name ''Write-InventoryJson'' -CommandType Function -ErrorAction SilentlyContinue))'
+        )
+        $Pwsh = (Get-Process -Id $PID).Path
+        $Output = @(& $Pwsh -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+
+        $LASTEXITCODE | Should -Be 0 -Because ($Output -join [Environment]::NewLine)
+        $Output | Should -Contain 'HAS_WRITER=True'
+    }
 }
 
 Describe 'ProcessResourceResult' {
@@ -528,6 +735,7 @@ Describe 'ProcessResourceResult' {
     BeforeAll {
         . $script:CommonFunctions
         . $script:InventoryFunctions
+        . $script:InventoryJsonFunctions
         . ([scriptblock]::Create($script:ProcessResourceResultText))
         $Global:ErrorLogFile = $null
         $Global:Version = '1.2.3'
@@ -552,6 +760,273 @@ Describe 'ProcessResourceResult' {
     }
 }
 
+Describe 'A failed inventory write' {
+
+    BeforeAll {
+        # Two ways the write can fail: the real writer meets a collector ConvertTo-Json rejects
+        # (a dictionary key that is not a string) part-way through the file, and a stand-in
+        # writer throws the out-of-memory error a large estate can hit.
+        $script:WriteFailures = @{
+            'collector ConvertTo-Json rejects' = @{
+                Stub   = @'
+function CreateResourceJobs
+{
+    $Global:SmaResources = New-Object PSObject
+    $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Disks' -Value @([ordered]@{ Name = 'disk-01' })
+    $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Broken' -Value @(@{ 1 = 'not a string key' })
+}
+'@
+                Expect = '*Keys must be strings*'
+            }
+            'out of memory (stand-in writer)'  = @{
+                Stub   = 'function Write-InventoryJson { param($InputObject, $Path) throw [System.OutOfMemoryException]::new(''stand-in: out of memory while writing'') }'
+                Expect = '*stand-in: out of memory while writing*'
+            }
+        }
+    }
+
+    It 'logs the real cause and does not report a zip it did not write on a direct run (<Case>)' -ForEach @(
+        @{ Case = 'collector ConvertTo-Json rejects' }
+        @{ Case = 'out of memory (stand-in writer)' }
+    ) {
+        $Failure = $script:WriteFailures[$Case]
+        $R = @(Invoke-InventoryRun -Name ('write-fail-direct-{0}' -f $Case.Split(' ')[0]) -Runs @($Failure.Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $ErrorLine = @($Output -split '\r?\n' | Where-Object { $_ -like 'Inventory write FAILED*' })
+        $ErrorLine.Count | Should -Be 1 -Because "the real cause is shown once on the console. Output:`n$Output"
+        $ErrorLine[0] | Should -BeLike '*Inventory_ResourcesReport_test.json*' -Because 'the line names the inventory file'
+        $ErrorLine[0] | Should -BeLike $Failure.Expect -Because 'the line carries the exception the write failed with'
+        $R[0].ErrorLog | Should -BeLike ('*Inventory write FAILED*' + $Failure.Expect.Trim('*') + '*') -Because 'the error log the run keeps gets the same line'
+        $Output | Should -Not -Match 'Resource Reporting Phase Done' -Because 'the reporting phase did not finish'
+        $Output | Should -Not -Match 'Inventory/Metrics/Consumption data files were still written' -Because 'the inventory was not written, so the run must not say it was'
+        $Output | Should -Not -Match 'Please zip the output files manually' -Because 'without the inventory there is nothing worth zipping by hand'
+        $Output | Should -Match 'There is no report to zip'
+        $Output | Should -Not -Match 'Compressing Resources Output' -Because 'there is nothing to compress'
+        $Output | Should -Not -Match 'excluded from zip' -Because 'no zip is made'
+        $Output | Should -Match 'No HTML report: the inventory .*Inventory_ResourcesReport_test\.json was not written'
+        $Output | Should -Not -Match 'HTML report generation FAILED' -Because 'the report step is not run without the inventory, so it does not fail as a second fault'
+        $Output | Should -Not -Match 'Creating Summary Report|Starting Summary Report Processing Job' -Because 'the report step does not start'
+        $Output | Should -Not -Match 'Error Compressing Output File' -Because 'the zip step is not tried, so it cannot fail'
+        $Output | Should -Match 'Reporting Time: not measured' -Because 'the processing step stopped before its time was taken'
+        $Output | Should -Not -Match 'Reporting Data File' -Because "no zip was written, so none may be reported. Output:`n$Output"
+        $Output | Should -Match 'No report was written' -Because 'the run says plainly that there is no zip'
+        @($R[0].Files | Where-Object { $_ -like 'Inventory_*' -or $_ -like '*.tmp' -or $_ -like '*.zip' }) | Should -BeNullOrEmpty -Because 'a failed write leaves no inventory, no cut-off or temporary file and no zip'
+    }
+
+    It 'stops a wrapper run with the real cause, not with the missing-file error of the report step' {
+        $Failure = $script:WriteFailures['out of memory (stand-in writer)']
+        $R = @(Invoke-InventoryRun -Name 'write-fail-wrapper' -Runs @($Failure.Stub))
+
+        $R[0].Escaped | Should -BeLike $Failure.Expect -Because 'the wrapper records the subscription as failed with this message'
+        $R[0].ErrorLog | Should -BeLike '*Inventory write FAILED*Inventory_ResourcesReport_test.json*'
+        $R[0].ErrorLog | Should -Not -BeLike '*HTML report generation FAILED*' -Because 'the run stops at the write, so the report step never runs'
+    }
+
+    It 'keeps the real cause when the Azure session read after the failed write fails too' {
+        $Failure = $script:WriteFailures['out of memory (stand-in writer)']
+        $Stub = $Failure.Stub + [Environment]::NewLine + 'function Get-AzContext { [CmdletBinding()] param() throw ''stand-in: context store unreadable'' }'
+        $R = @(Invoke-InventoryRun -Name 'write-fail-read-fail' -Runs @($Stub))
+
+        $R[0].Escaped | Should -BeLike $Failure.Expect -Because 'the wrapper must see the write error, not the read error'
+        $R[0].SmaResourcesReleased | Should -BeTrue
+    }
+
+    It 'leaves nothing behind that changes the next two runs in the same process' {
+        $Failure = $script:WriteFailures['out of memory (stand-in writer)']
+        $R = @(Invoke-InventoryRun -Name 'write-fail-then-ok' -Runs @($Failure.Stub, '', ''))
+
+        $R[0].Escaped | Should -BeLike $Failure.Expect
+        $R[0].SmaResourcesReleased | Should -BeTrue -Because 'the collector output is freed even though the write failed'
+        $R[0].ResourcesReleased | Should -BeTrue -Because 'the discovery rows are freed even though the write failed'
+        foreach ($i in 1, 2)
+        {
+            $R[$i].Escaped | Should -BeNullOrEmpty -Because "run $i has a writer that works"
+            @($R[$i].Inventory.Disks).Count | Should -Be 2 -Because "run $i writes its inventory as usual"
+            $R[$i].Files | Should -Contain 'ResourcesReport_test.zip'
+            $R[$i].ErrorLog | Should -BeNullOrEmpty -Because "run $i logs no error"
+            $R[$i].ResourceCount | Should -Be 3
+        }
+    }
+
+    It 'shows why the zip failed and does not report it on a direct run' {
+        $R = @(Invoke-InventoryRun -Name 'zip-fail-direct' -Runs @('function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }') -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Error Compressing Output File: .*ResourcesReport_test\.zip: stand-in: no space left on device' -Because "the cause is shown, not hidden by 'silentlycontinue'. Output:`n$Output"
+        $R[0].ErrorLog | Should -BeLike '*Error Compressing Output File*stand-in: no space left on device*'
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+        $R[0].Files | Should -Contain 'Inventory_ResourcesReport_test.json' -Because 'only the zip step failed'
+        $Output | Should -Match 'Please zip the output files manually: .*Inventory_ResourcesReport_test\.json' -Because 'the inventory and the HTML report are there to zip by hand, and the run names the files'
+        $Output | Should -Match 'Please zip the output files manually: .*Consumption_ResourcesReport_test\.csv'
+        $Output | Should -Not -Match 'Add only those files' -Because 'that warning is for -Obfuscate runs'
+    }
+
+    It 'removes a zip the failed zip step left cut off and does not report it' {
+        $Stub = 'function Compress-RdaReportArchive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4)); throw ''stand-in: stopped part-way'' }'
+        $R = @(Invoke-InventoryRun -Name 'zip-cut-direct' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a cut-off zip must not be left to be shared'
+        $Output | Should -Not -Match 'Reporting Data File' -Because "Output:`n$Output"
+        $Output | Should -Match 'stand-in: stopped part-way' -Because 'the stand-in zip step ran and its own error is shown'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'names only this run''s files in the manual-zip advice when the output folder holds an earlier run' {
+        $Stub = @(
+            'Set-Content -LiteralPath ($Global:DefaultPath + ''Inventory_ResourcesReport_earlier.json'') -Value ''{}'''
+            'function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'zip-fail-reused-folder' -Runs @($Stub) -Direct)
+
+        $Line = @(([string]$R[0].Output) -split '\r?\n' | Where-Object { $_ -like 'Please zip the output files manually*' })
+        $Line.Count | Should -Be 1 -Because "Output:`n$($R[0].Output)"
+        $Line[0] | Should -Match 'Inventory_ResourcesReport_test\.json'
+        $Line[0] | Should -Not -Match 'Inventory_ResourcesReport_earlier\.json' -Because 'an earlier run''s file is not part of this report'
+    }
+
+    It 'does not name a zip that was already at the path as the report of this run' {
+        # Compress-RdaReportArchive refuses to overwrite it, so it is not this run's report.
+        $R = @(Invoke-InventoryRun -Name 'zip-exists-direct' -Runs @('Set-Content -LiteralPath ($Global:DefaultPath + ''ResourcesReport_test.zip'') -Value ''older file''') -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Error Compressing Output File' -Because "Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+        $R[0].Files | Should -Contain 'ResourcesReport_test.zip' -Because 'a zip that was there before is not removed'
+    }
+
+    It 'says so when the unfinished zip cannot be removed' {
+        $Stub = @'
+function Compress-RdaReportArchive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4)); throw 'stand-in: stopped part-way' }
+function Remove-Item
+{
+    [CmdletBinding()]
+    param([string[]]$LiteralPath, [switch]$Force, [string[]]$Path, [switch]$Recurse)
+    if (@($LiteralPath) -like '*.zip') { throw 'stand-in: file is locked' }
+    Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+}
+'@
+        $R = @(Invoke-InventoryRun -Name 'zip-locked-direct' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Could not remove the unfinished zip .*ResourcesReport_test\.zip: stand-in: file is locked' -Because "Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'shows the run times as a success only when the zip was written (<Case>)' -ForEach @(
+        @{ Case = 'zip written'; Stub = ''; Expect = 'Success' }
+        @{ Case = 'inventory write failed'; Stub = 'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'; Expect = 'Info' }
+    ) {
+        # Write-Log stand-in that prints the severity, so the console shows which one each line used.
+        $Show = 'function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsole, [switch]$ToDebugLog) { if (-not $NoConsole) { Write-Host (''[{0}] {1}'' -f $Severity, $Message) } }'
+        $R = @(Invoke-InventoryRun -Name ('times-{0}' -f $Case.Split(' ')[1]) -Runs @(($Show + [Environment]::NewLine + $Stub)) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match ('\[{0}\] Execution Time: ' -f $Expect) -Because "Output:`n$Output"
+        $Output | Should -Match ('\[{0}\] Reporting Time: ' -f $Expect)
+    }
+
+    It 'does not report a zip the zip step made with a hidden error (<Case>)' -ForEach @(
+        @{ Case = 'zip left behind'; Write = $true }
+        @{ Case = 'no zip'; Write = $false }
+    ) {
+        # An archive step that reports an input it cannot read with a non-terminating error and goes on.
+        $Stub = @(
+            'function Compress-RdaReportArchive'
+            '{'
+            '    [CmdletBinding()]'
+            '    param($Path, $CompressionLevel, $DestinationPath)'
+            $(if ($Write) { '    [System.IO.File]::WriteAllBytes($DestinationPath, [byte[]](80, 75, 3, 4))' } else { '' })
+            '    Write-Error ''stand-in: cannot read Consumption_ResourcesReport_test.csv'''
+            '}'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name ('zip-hidden-error-{0}' -f $Case.Split(' ')[0]) -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Error Compressing Output File: .*stand-in: cannot read' -Because "the error is not hidden. Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a zip made without one of its files is removed'
+    }
+
+    It 'says the zip is safe to share under -Obfuscate only when the zip was written (<Case>)' -ForEach @(
+        @{ Case = 'zip written'; Stub = '$Obfuscate = [switch]$true'; Expect = $true }
+        @{ Case = 'zip step failed'; Stub = '$Obfuscate = [switch]$true' + [Environment]::NewLine + 'function Compress-RdaReportArchive { throw ''stand-in: no space left on device'' }'; Expect = $false }
+        @{ Case = 'inventory write failed'; Stub = '$Obfuscate = [switch]$true' + [Environment]::NewLine + 'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'; Expect = $false }
+    ) {
+        $R = @(Invoke-InventoryRun -Name ('obfuscate-notice-{0}' -f ($Case -replace ' ', '-')) -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'OBFUSCATION NOTICE' -Because "the run took the -Obfuscate path. Output:`n$Output"
+        ($Output -match 'The ZIP file is safe to share') | Should -Be $Expect -Because "Output:`n$Output"
+        ($R[0].Files -contains 'ResourcesReport_test.zip') | Should -Be $Expect
+        ($Output -match 'transcript log excluded from zip') | Should -Be $Expect
+        ($Output -match 'Add only those files: the obfuscation dictionary') | Should -Be ($Case -eq 'zip step failed') -Because 'a hand-made zip under -Obfuscate must leave out the files with real names'
+    }
+
+    It 'makes no zip from an HTML report that has no inventory next to it' {
+        # A writer that writes nothing and does not fail, and an HTML file already there.
+        $Stub = @(
+            'function Write-InventoryJson { param($InputObject, $Path) }'
+            'Set-Content -LiteralPath ($Global:DefaultPath + ''ResourcesReport_test.html'') -Value ''<html></html>'''
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'html-without-inventory' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because "a zip without the inventory fails the whole upload. Output:`n$Output"
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'makes no zip from an HTML file the report step left when it failed' {
+        # Summary.ps1 stand-in that writes the HTML file and then fails.
+        $Stub = @(
+            '$SummaryFailsAfterWrite = @('
+            '    ''param($JsonFile, $HtmlFile, $Title, $TenantId, $Version, $ExtractionRunTime, $ReportingRunTime, $PhaseTimings, $PlatOS, $ConsumptionFile)'''
+            '    ''Set-Content -LiteralPath $HtmlFile -Value ''''<html>cut off'''''''
+            '    ''throw ''''stand-in: disk full after the HTML write'''''''
+            ') -join [Environment]::NewLine'
+            'Set-Content -LiteralPath (Join-Path $PSScriptRoot ''Extension/Summary.ps1'') -Value $SummaryFailsAfterWrite'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'html-cut-off' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'HTML report generation FAILED: stand-in: disk full after the HTML write' -Because "the stand-in ran. Output:`n$Output"
+        $R[0].Files | Should -Contain 'ResourcesReport_test.html' -Because 'the stand-in left its HTML file'
+        $R[0].Files | Should -Not -Contain 'ResourcesReport_test.zip' -Because 'a report step that failed did not make a report to share'
+        $Output | Should -Not -Match 'Reporting Data File'
+        $Output | Should -Match 'No report was written'
+    }
+
+    It 'does not show the processing time of an earlier run in the same session' {
+        # The time an earlier run left behind, then a run whose inventory write fails.
+        $Stub = @(
+            '$Global:ReportingRunTime = [timespan]::FromSeconds(4242)'
+            'function Write-InventoryJson { param($InputObject, $Path) throw ''stand-in: out of memory while writing'' }'
+        ) -join [Environment]::NewLine
+        $R = @(Invoke-InventoryRun -Name 'stale-time' -Runs @($Stub) -Direct)
+
+        $Output = [string]$R[0].Output
+        $Output | Should -Match 'Reporting Time: not measured' -Because "Output:`n$Output"
+        $Output | Should -Not -Match '01:10:42'
+    }
+
+    It 'reports the zip on a direct run that wrote it' {
+        $R = @(Invoke-InventoryRun -Name 'write-ok-direct' -Runs @('') -Direct)
+
+        $Output = [string]$R[0].Output
+        $R[0].ExitCode | Should -Be 0
+        $R[0].Files | Should -Contain 'ResourcesReport_test.zip'
+        $Output | Should -Match 'Reporting Data File: .*ResourcesReport_test\.zip' -Because "Output:`n$Output"
+        $Output | Should -Match 'Compressing Resources Output: .*ResourcesReport_test\.zip'
+        $Output | Should -Not -Match 'No report was written'
+    }
+}
+
 Describe 'Collector data is released once the inventory is written' {
 
     It 'keeps the discovered resource count after a normal run' {
@@ -560,6 +1035,7 @@ Describe 'Collector data is released once the inventory is written' {
         $R[0].Escaped | Should -BeNullOrEmpty
         $R[0].ExitCode | Should -Be 0
         $R[0].ResourceCount | Should -Be 3 -Because 'two disks and one AVD host pool were discovered'
+        $R[0].AzAccountsLoaded | Should -BeFalse -Because 'the run harness stubs every Az cmdlet, so it never loads Az.Accounts or reaches the network'
     }
 
     It 'releases the collector output and the discovery rows after the write and before the report step' {
@@ -596,6 +1072,327 @@ function CreateResourceJobs { throw 'collector step failed' }
         $R[0].ResourceCount | Should -Be 3
         $R[1].Escaped | Should -Match 'collector step failed'
         $R[1].ResourceCount | Should -Be 1 -Because 'the count belongs to the run that just stopped, not the one before it'
+    }
+
+    Context 'Azure session read after the release' {
+
+        BeforeAll {
+            # Offsets in ResourceInventory.ps1. Every search starts at the release line inside
+            # ExecuteInventoryProcessing, so the billing function's definition above it is never matched.
+            $script:ScriptText = [System.IO.File]::ReadAllText($script:InventoryScript)
+            $Tokens = $null
+            $ParseErrors = $null
+            $script:ScriptAst = [System.Management.Automation.Language.Parser]::ParseInput($script:ScriptText, [ref]$Tokens, [ref]$ParseErrors)
+            $Fn = $script:ScriptAst.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'ExecuteInventoryProcessing'
+                }, $false) | Select-Object -First 1
+            if ($null -eq $Fn) { throw 'ExecuteInventoryProcessing was not found in ResourceInventory.ps1.' }
+
+            # From the ProcessResourceResult call, so the nested function's own failure-path release is not matched.
+            $Call = [regex]::new('(?m)^[ \t]*ProcessResourceResult[ \t]*\r?$').Match($script:ScriptText, $Fn.Extent.StartOffset)
+            if (-not $Call.Success -or $Call.Index -ge $Fn.Extent.EndOffset) { throw 'The ProcessResourceResult call was not found in ExecuteInventoryProcessing.' }
+            $Release = [regex]::new('(?m)^[ \t]*\$Global:Resources = \$null[ \t]*\r?$').Match($script:ScriptText, $Call.Index)
+            if (-not $Release.Success -or $Release.Index -ge $Fn.Extent.EndOffset) { throw 'The release line ($Global:Resources = $null) was not found in ExecuteInventoryProcessing.' }
+            $script:ReleaseStart = $Release.Index
+            $script:ReleaseEnd = $Release.Index + $Release.Length
+
+            $Billing = [regex]::new('(?m)^[ \t]*GetResorceConsumption[ \t]*\r?$').Match($script:ScriptText, $script:ReleaseEnd)
+            if (-not $Billing.Success -or $Billing.Index -ge $Fn.Extent.EndOffset) { throw 'The billing call (GetResorceConsumption) was not found after the release line.' }
+            $script:BillingStart = $Billing.Index
+
+            $script:FirstCollect = $script:ScriptText.IndexOf('[System.GC]::Collect()', $script:ReleaseEnd, [System.StringComparison]::Ordinal)
+            $script:ReadPattern = [regex]::new('(?m)^[ \t]*\$null = Get-AzContext -ErrorAction Stop[ \t]*\r?$')
+            # The shipped try block around the read, lifted out of ResourceInventory.ps1.
+            $script:ReadTryBlocks = @($script:ScriptAst.FindAll({
+                        param($Node)
+                        $Node -is [System.Management.Automation.Language.TryStatementAst] -and
+                        $Node.Extent.StartOffset -gt $script:ReleaseEnd -and $Node.Extent.EndOffset -lt $script:BillingStart
+                    }, $true))
+        }
+
+        It 'reads the Azure context after the release and before the release collects and before the billing step' {
+            $Read = $script:ReadPattern.Match($script:ScriptText, $script:ReleaseEnd)
+
+            $Read.Success | Should -BeTrue -Because 'the release frees nothing until an Az cmdlet replaces the stream handlers the last collector left in the Azure session'
+            $script:FirstCollect | Should -BeGreaterThan $script:ReleaseEnd -Because 'the release collects after setting the globals to $null'
+            $Read.Index | Should -BeLessThan $script:FirstCollect -Because 'the read must come before the release collects, or the rows are still held when it runs'
+            $Read.Index | Should -BeLessThan $script:BillingStart -Because 'the read must not depend on the billing step, which -SkipConsumption leaves out'
+        }
+
+        It 'reads the Azure context exactly once between the release and the billing step' {
+            $Between = $script:ScriptText.Substring($script:ReleaseEnd, $script:BillingStart - $script:ReleaseEnd)
+
+            $script:ReadPattern.Matches($Between).Count | Should -Be 1
+        }
+
+        # The run's own preference is 'silentlycontinue'; a failed read must still reach the
+        # debug log and must never stop the run.
+        It 'logs a <Kind> of the read to the debug log only and goes on' -ForEach @(
+            @{ Kind = 'non-terminating error'; Stub = 'function Get-AzContext { [CmdletBinding()] param() Write-Error ''context store unreadable'' }'; Expect = '*context store unreadable*' }
+            @{ Kind = 'terminating error'; Stub = 'function Get-AzContext { [CmdletBinding()] param() throw ''context store unreadable'' }'; Expect = '*context store unreadable*' }
+            @{ Kind = 'missing cmdlet'; Stub = ''; Expect = '*Get-AzContext*' }
+        ) {
+            $script:ReadTryBlocks.Count | Should -Be 1 -Because 'one guarded Azure session read follows the release'
+            $Block = $script:ReadTryBlocks[0].Extent.Text
+
+            $Result = & {
+                $ErrorActionPreference = 'silentlycontinue'
+                $Logged = [System.Collections.Generic.List[object]]::new()
+                # Stand-in for the script's Write-Log (Functions/Common.Functions.ps1), defined from text
+                # like the other stand-ins in this file.
+                . ([scriptblock]::Create('function Write-Log { param($Message, $Severity, [switch]$NoConsole, [switch]$ToDebugLog) $Logged.Add([pscustomobject]@{ Message = $Message; Severity = $Severity; NoConsole = [bool]$NoConsole; ToDebugLog = [bool]$ToDebugLog }) }'))
+                # The missing-cmdlet case is stood in by the error PowerShell raises for it, so a
+                # real Az.Accounts on the machine is never loaded.
+                if ($Stub) { . ([scriptblock]::Create($Stub)) } else { function Get-AzContext { throw [System.Management.Automation.CommandNotFoundException]::new("The term 'Get-AzContext' is not recognized as a name of a cmdlet.") } }
+                . ([scriptblock]::Create($Block))
+                [pscustomobject]@{ Logged = @($Logged); After = 'went on' }
+            }
+
+            $Result.After | Should -Be 'went on' -Because 'the read can never stop the run'
+            @($Result.Logged).Count | Should -Be 1 -Because 'one debug-log line per failed read'
+            $Result.Logged[0].Message | Should -BeLike $Expect
+            $Result.Logged[0].ToDebugLog | Should -BeTrue
+            $Result.Logged[0].NoConsole | Should -BeTrue -Because 'a failed read is not shown on the console'
+            $Result.Logged[0].Severity | Should -BeNullOrEmpty
+        }
+
+        It 'frees the rows a piped Az call in a collector kept, where a call that is not an Az cmdlet does not' -Skip:(-not $script:HasAzAccounts -or -not $script:CanIsolateAzProfile) {
+            $Tries = $script:ReadTryBlocks
+            $Tries.Count | Should -Be 1 -Because 'one guarded Azure session read follows the release'
+
+            $CaseDir = Join-Path $script:TmpRoot ('session-read_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $ChildHome = Join-Path $CaseDir 'home'
+            New-Item -ItemType Directory -Path (Join-Path $ChildHome '.Azure') -Force | Out-Null
+            # Az usage data collection off, so the child sends nothing.
+            Set-Content -LiteralPath (Join-Path $ChildHome '.Azure/AzurePSDataCollectionProfile.json') -Value '{"enableAzureDataCollection":false}' -Encoding ascii
+            $BlockFile = Join-Path $CaseDir 'block.ps1'
+            Set-Content -LiteralPath $BlockFile -Value $Tries[0].Extent.Text -Encoding utf8
+            $ResultFile = Join-Path $CaseDir 'result.json'
+
+            # Runs in its own process: a fresh Azure session with no context, autosave off.
+            # The fake collector keeps the real four-parameter contract and pipes its Az call
+            # into a script-block filter, as the VM and scale set size lookups do. It pipes
+            # Get-AzContext rather than Get-AzComputeResourceSku: the hold comes from any Az
+            # cmdlet's handlers plus the downstream filter, and Get-AzContext needs no extra
+            # module and no sign-in.
+            $Child = @'
+param([string]$BlockFile, [string]$ResultFile)
+$ErrorActionPreference = 'silentlycontinue'
+Import-Module -Name Az.Accounts -ErrorAction Stop -WarningAction SilentlyContinue
+$null = Disable-AzContextAutosave -Scope Process
+function Write-Log { param($Message, [switch]$NoConsole, [switch]$ToDebugLog) }
+function Invoke-Plain { $null = 1 }
+$Block = [scriptblock]::Create([System.IO.File]::ReadAllText($BlockFile))
+$Settle = { [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect() }
+$Collector = {
+    param($Sub, $Resources, $Task, $ResourceIdDictionary)
+    $VirtualMachines = $Resources | Where-Object { $_.TYPE -eq 'microsoft.compute/virtualmachines' }
+    if ($Task -eq 'Processing' -and $VirtualMachines)
+    {
+        $null = Get-AzContext -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ }
+    }
+    @($VirtualMachines).Count
+}
+function New-CollectorRound
+{
+    $List = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 2000; $i++)
+    {
+        $List.Add([pscustomobject]@{ TYPE = 'microsoft.compute/virtualmachines'; location = 'westeurope'; Blob = ('{0:d6}' -f $i).PadRight(20000, [char](65 + ($i % 26))) })
+    }
+    $List.Add([pscustomobject]@{ TYPE = 'microsoft.compute/disks'; location = 'westeurope'; Blob = 'disk' })
+    $Rows = $List.ToArray()
+    $List = $null
+    $null = & $Collector -Sub @() -Resources $Rows -Task 'Processing' -ResourceIdDictionary $null
+    [WeakReference]::new($Rows[0])
+}
+# A fresh profile's first Az cmdlet can stay referenced for a moment; a real run signs in first.
+$null = Get-AzContext -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 3
+$Rounds = foreach ($Round in 1..3)
+{
+    $Weak = New-CollectorRound
+    Invoke-Plain
+    & $Settle
+    $HeldAfterPlain = $Weak.IsAlive
+    $null = Get-Date
+    & $Settle
+    $HeldAfterNonAz = $Weak.IsAlive
+    & $Block
+    $Watch = [System.Diagnostics.Stopwatch]::StartNew()
+    & $Settle
+    while ($Weak.IsAlive -and $Watch.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 250; & $Settle }
+    [pscustomobject]@{ Round = $Round; HeldAfterPlain = $HeldAfterPlain; HeldAfterNonAz = $HeldAfterNonAz; HeldAfterBlock = $Weak.IsAlive }
+}
+[pscustomobject]@{ AzAccountsLoaded = [bool](Get-Module -Name Az.Accounts); Rounds = @($Rounds) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ResultFile
+'@
+            $ChildFile = Join-Path $CaseDir 'child.ps1'
+            Set-Content -LiteralPath $ChildFile -Value $Child -Encoding utf8
+
+            # A local port with nothing listening, so any web request the child makes fails at once.
+            $Listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $Listener.Start()
+            $ClosedPort = $Listener.LocalEndpoint.Port
+            $Listener.Stop()
+            $AzModule = Get-Module -ListAvailable -Name Az.Accounts | Sort-Object Version -Descending | Select-Object -First 1
+            $ModuleRoot = Split-Path (Split-Path $AzModule.ModuleBase -Parent) -Parent
+            $ChildEnv = @{
+                HOME         = $ChildHome
+                USERPROFILE  = $ChildHome
+                PSModulePath = ($ModuleRoot, (Join-Path $PSHOME 'Modules')) -join [System.IO.Path]::PathSeparator
+                HTTPS_PROXY  = ('http://127.0.0.1:{0}' -f $ClosedPort)
+                HTTP_PROXY   = ('http://127.0.0.1:{0}' -f $ClosedPort)
+            }
+            $SavedEnv = @{}
+            foreach ($Key in $ChildEnv.Keys) { $SavedEnv[$Key] = [Environment]::GetEnvironmentVariable($Key) }
+            try
+            {
+                foreach ($Key in $ChildEnv.Keys) { [Environment]::SetEnvironmentVariable($Key, $ChildEnv[$Key]) }
+                $Output = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile -BlockFile $BlockFile -ResultFile $ResultFile 2>&1 | Out-String
+            }
+            finally
+            {
+                foreach ($Key in $SavedEnv.Keys) { [Environment]::SetEnvironmentVariable($Key, $SavedEnv[$Key]) }
+            }
+            Test-Path -LiteralPath $ResultFile | Should -BeTrue -Because "the child process writes its result. Output:`n$Output"
+            $Result = Get-Content -LiteralPath $ResultFile -Raw | ConvertFrom-Json
+
+            $Result.AzAccountsLoaded | Should -BeTrue
+            @($Result.Rounds).Count | Should -Be 3
+            foreach ($Round in $Result.Rounds)
+            {
+                $Round.HeldAfterPlain | Should -BeTrue -Because "round $($Round.Round): the piped Az call keeps the collector's rows, or this test proves nothing"
+                $Round.HeldAfterNonAz | Should -BeTrue -Because "round $($Round.Round): a statement that is not an Az cmdlet does not free them"
+                $Round.HeldAfterBlock | Should -BeFalse -Because "round $($Round.Round): the session read after the release frees them"
+            }
+        }
+
+        It 'reads the Azure context and removes the handler after a failed inventory write too' {
+            # The failure path throws past the release, so it lets go of the rows the Azure session holds itself.
+            $Fn = $script:ScriptAst.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'ProcessResourceResult'
+                }, $true) | Select-Object -First 1
+            $Catch = @($Fn.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.TryStatementAst] }, $true))[0].CatchClauses[0].Body.Extent.Text
+
+            $script:ReadPattern.Match($Catch).Success | Should -BeTrue
+            $Catch | Should -Match 'ClientFactory\.RemoveHandler\(\[Microsoft\.Azure\.Commands\.Common\.Authentication\.Models\.RPRegistrationDelegatingHandler\]\)'
+            $Catch.IndexOf('RemoveHandler') | Should -BeLessThan $Catch.LastIndexOf('throw') -Because 'both run before the error is thrown on'
+        }
+
+        It 'removes the provider-registration handler right after the read, in the same guarded block' {
+            $script:ReadTryBlocks.Count | Should -Be 1 -Because 'one guarded Azure session read follows the release'
+            $Body = $script:ReadTryBlocks[0].Body.Extent.Text
+            $Read = $script:ReadPattern.Match($Body)
+            $Remove = [regex]::new('ClientFactory\.RemoveHandler\(\[Microsoft\.Azure\.Commands\.Common\.Authentication\.Models\.RPRegistrationDelegatingHandler\]\)').Match($Body)
+
+            $Read.Success | Should -BeTrue
+            $Remove.Success | Should -BeTrue -Because 'the read does not always remove the handler the size lookup added, and that handler keeps the collector''s rows'
+            $Remove.Index | Should -BeGreaterThan $Read.Index -Because 'a failed read goes to the catch before the removal, so it is logged once'
+        }
+
+        It 'frees the rows a provider-registration handler kept when the read leaves that handler in place' -Skip:(-not $script:HasAzAccounts -or -not $script:CanIsolateAzProfile) {
+            $Tries = $script:ReadTryBlocks
+            $Tries.Count | Should -Be 1 -Because 'one guarded Azure session read follows the release'
+
+            $CaseDir = Join-Path $script:TmpRoot ('rp-handler_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $ChildHome = Join-Path $CaseDir 'home'
+            New-Item -ItemType Directory -Path (Join-Path $ChildHome '.Azure') -Force | Out-Null
+            # Az usage data collection off, so the child sends nothing.
+            Set-Content -LiteralPath (Join-Path $ChildHome '.Azure/AzurePSDataCollectionProfile.json') -Value '{"enableAzureDataCollection":false}' -Encoding ascii
+            $BlockFile = Join-Path $CaseDir 'block.ps1'
+            Set-Content -LiteralPath $BlockFile -Value $Tries[0].Extent.Text -Encoding utf8
+            $ResultFile = Join-Path $CaseDir 'result.json'
+
+            # Runs in its own process: a fresh Azure session with no context, autosave off.
+            # Get-AzContext is replaced by a function that does nothing, which is what the read did to
+            # this handler on some live runs. The handler is built with a closure over the rows, as the
+            # one the size lookup adds closes over that cmdlet and, through it, the collector's rows.
+            $Child = @'
+param([string]$BlockFile, [string]$ResultFile)
+$ErrorActionPreference = 'silentlycontinue'
+Import-Module -Name Az.Accounts -ErrorAction Stop -WarningAction SilentlyContinue
+$null = Disable-AzContextAutosave -Scope Process
+$script:Logged = 0
+function Write-Log { param($Message, [switch]$NoConsole, [switch]$ToDebugLog) $script:Logged++ }
+$Block = [scriptblock]::Create([System.IO.File]::ReadAllText($BlockFile))
+$Settle = { [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect() }
+$Factory = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.ClientFactory
+$HandlerType = [Microsoft.Azure.Commands.Common.Authentication.Models.RPRegistrationDelegatingHandler]
+$FuncType = $HandlerType.GetConstructors()[0].GetParameters()[0].ParameterType
+function Get-AzContext { [CmdletBinding()] param() }
+function New-HandlerRound
+{
+    $List = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt 2000; $i++)
+    {
+        $List.Add([pscustomobject]@{ Id = $i; Blob = ('{0:d6}' -f $i).PadRight(20000, [char](65 + ($i % 26))) })
+    }
+    $Rows = $List.ToArray()
+    $List = $null
+    $Make = { $null = $Rows.Count; $null }.GetNewClosure()
+    $Factory.AddHandler($HandlerType::new(($Make -as $FuncType), [System.Action[string]] { param($Message) }))
+    [WeakReference]::new($Rows[0])
+}
+$Factory.RemoveHandler($HandlerType)
+$Rounds = foreach ($Round in 1..3)
+{
+    $Weak = New-HandlerRound
+    & $Settle
+    $HeldBefore = $Weak.IsAlive
+    $null = Get-Date
+    & $Settle
+    $HeldAfterNonAz = $Weak.IsAlive
+    & $Block
+    $Watch = [System.Diagnostics.Stopwatch]::StartNew()
+    & $Settle
+    while ($Weak.IsAlive -and $Watch.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 250; & $Settle }
+    [pscustomobject]@{ Round = $Round; HeldBefore = $HeldBefore; HeldAfterNonAz = $HeldAfterNonAz; HeldAfterBlock = $Weak.IsAlive; HandlersAfterBlock = @($Factory.GetCustomHandlers() | Where-Object { $_ -is $HandlerType }).Count }
+}
+[pscustomobject]@{ Logged = $script:Logged; Rounds = @($Rounds) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ResultFile
+'@
+            $ChildFile = Join-Path $CaseDir 'child.ps1'
+            Set-Content -LiteralPath $ChildFile -Value $Child -Encoding utf8
+
+            # A local port with nothing listening, so any web request the child makes fails at once.
+            $Listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $Listener.Start()
+            $ClosedPort = $Listener.LocalEndpoint.Port
+            $Listener.Stop()
+            $AzModule = Get-Module -ListAvailable -Name Az.Accounts | Sort-Object Version -Descending | Select-Object -First 1
+            $ModuleRoot = Split-Path (Split-Path $AzModule.ModuleBase -Parent) -Parent
+            $ChildEnv = @{
+                HOME         = $ChildHome
+                USERPROFILE  = $ChildHome
+                PSModulePath = ($ModuleRoot, (Join-Path $PSHOME 'Modules')) -join [System.IO.Path]::PathSeparator
+                HTTPS_PROXY  = ('http://127.0.0.1:{0}' -f $ClosedPort)
+                HTTP_PROXY   = ('http://127.0.0.1:{0}' -f $ClosedPort)
+            }
+            $SavedEnv = @{}
+            foreach ($Key in $ChildEnv.Keys) { $SavedEnv[$Key] = [Environment]::GetEnvironmentVariable($Key) }
+            try
+            {
+                foreach ($Key in $ChildEnv.Keys) { [Environment]::SetEnvironmentVariable($Key, $ChildEnv[$Key]) }
+                $Output = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile -BlockFile $BlockFile -ResultFile $ResultFile 2>&1 | Out-String
+            }
+            finally
+            {
+                foreach ($Key in $SavedEnv.Keys) { [Environment]::SetEnvironmentVariable($Key, $SavedEnv[$Key]) }
+            }
+            Test-Path -LiteralPath $ResultFile | Should -BeTrue -Because "the child process writes its result. Output:`n$Output"
+            $Result = Get-Content -LiteralPath $ResultFile -Raw | ConvertFrom-Json
+
+            $Result.Logged | Should -Be 0 -Because 'the read and the removal both succeed, so nothing is logged'
+            @($Result.Rounds).Count | Should -Be 3
+            foreach ($Round in $Result.Rounds)
+            {
+                $Round.HeldBefore | Should -BeTrue -Because "round $($Round.Round): the handler keeps the rows, or this test proves nothing"
+                $Round.HeldAfterNonAz | Should -BeTrue -Because "round $($Round.Round): a statement that does not remove the handler does not free them"
+                $Round.HeldAfterBlock | Should -BeFalse -Because "round $($Round.Round): the block removes the handler even when the read leaves it in place"
+                $Round.HandlersAfterBlock | Should -Be 0 -Because "round $($Round.Round): no provider-registration handler is left in the client factory"
+            }
+        }
     }
 }
 

@@ -6,10 +6,11 @@
 # Each instance of this worker:
 #   - Runs as a separate `pwsh` background job (fresh process, fresh AppDomain).
 #   - Owns its own slice of the subscription list.
-#   - Owns its own resume-state file (.resume-state-<TenantID>-stream-<N>.json),
+#   - Owns its own resume-state file (.resume-state-<tenant key>-stream-<N>.json),
 #     so the streams cannot race on a shared file.
-#   - Imports an Az PowerShell context from a shared snapshot file written by
-#     the parent wrapper, so authentication is not re-prompted per stream.
+#   - Imports an Az PowerShell context from its own snapshot file written by
+#     the parent wrapper, so authentication is not re-prompted per stream,
+#     and deletes that file once read.
 #   - Calls ResourceInventory.ps1 once per subscription in its slice.
 #   - Emits structured progress lines to stdout (prefixed [stream-N]) so the
 #     parent wrapper can collate output across streams.
@@ -39,6 +40,10 @@ param (
     # worker's binding. Default to @() and guard the body explicitly.
     [string[]] $SubscriptionIds = @(),
     [string[]] $SubscriptionNames = @(),
+    # The parent's retry-list entries for this slice ({ Id, Name, LastFailedAt,
+    # Reason, Attempts }). [object] for the same single-element collapse as
+    # Add-FailedAttempt's -Existing.
+    [object] $PriorFailedAttempts = @(),
 
     [switch] $Resume,
     # The parent already narrowed $SubscriptionIds to just the failed subs
@@ -50,11 +55,23 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
+    [switch] $IncludeNetworkResources,
+    [switch] $UseMetricsBatch,
     [int]    $ConcurrencyLimit = 6,
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
     [string] $ConsumptionWindowStart,
-    [string] $ConsumptionWindowEnd
+    [string] $ConsumptionWindowEnd,
+    # The parent run's id: written into this stream's state file, and an
+    # existing file is read on -Resume only when it carries the same id.
+    [string] $RunId = '',
+    # The parent run's record (start time, settings, cost window) as JSON:
+    # written into this stream's state file with its lists (Write-StreamState).
+    [string] $RunRecordJson = '',
+    # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
+    # on the per-resource path this run (Microsoft.Insights not registered).
+    # Last, so the position of every earlier parameter stays as it was.
+    [string[]] $MetricsBatchPerCallSubscriptionIds = @()
 )
 
 # ---------------------------------------------------------------------------
@@ -71,6 +88,33 @@ if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
 }
 . $FunctionsFile
 
+# The per-subscription count line (Get-RdaResourceCountMessage) is shared with
+# the wrapper and the inner script.
+$CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
+if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
+{
+    Write-Host "ERROR: Required functions file not found: $CommonFunctionsFile" -ForegroundColor Red
+    Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
+    exit 1
+}
+. $CommonFunctionsFile
+
+# The supported Az.Accounts version (Get-RdaAzAccountsMinimumVersion). The
+# wrapper already stopped when this file is missing; it only defines functions.
+$AzModulesFunctionsFile = Join-Path $PSScriptRoot 'Functions/AzModules.Functions.ps1'
+if (Test-Path -LiteralPath $AzModulesFunctionsFile -PathType Leaf)
+{
+    . $AzModulesFunctionsFile
+}
+
+# The parent run's record for Write-StreamState; a stream started without one
+# writes none.
+$StreamRunRecord = $null
+if (-not [string]::IsNullOrWhiteSpace($RunRecordJson))
+{
+    try { $StreamRunRecord = $RunRecordJson | ConvertFrom-Json -ErrorAction Stop } catch { $StreamRunRecord = $null }
+}
+
 # Tag used to prefix all stdout lines so the parent wrapper can demultiplex
 # interleaved output across streams.
 $Tag = "[stream-$StreamId]"
@@ -82,6 +126,11 @@ $Tag = "[stream-$StreamId]"
 if ($SubscriptionIds.Count -eq 0)
 {
     Write-Stream "no subscriptions in slice; exiting cleanly" 'Yellow'
+    # This stream never imports its Az context snapshot, so delete it now.
+    foreach ($Failure in @(Remove-AzContextSnapshot -Path $AzContextPath))
+    {
+        Write-Stream ("WARNING: could not remove Az context snapshot at {0}: {1}. It holds an Azure token cache; remove it with: {2}" -f $Failure.Path, $Failure.Message, (Get-RemoveFileCommand -Path $Failure.Path)) 'Yellow'
+    }
     @{
         StreamId              = $StreamId
         Tenant                = $TenantID
@@ -102,46 +151,94 @@ Write-Stream ("starting; subs in slice: {0}" -f $SubscriptionIds.Count) 'Cyan'
 # ---- Az context import -------------------------------------------------------
 #
 # The parent wrapper called Save-AzContext on its already-authenticated session
-# and passed us the path. Importing it gives this child process a working Az
-# context without prompting for sign-in. Import-AzContext is idempotent.
+# and passed us the path of this stream's own copy. Importing it gives this
+# child process a working Az context without prompting for sign-in. The file
+# holds a token cache and nothing reads it again, so it is deleted in the
+# `finally`, whether the import worked or not.
+$ImportStep = 'module'
 try
 {
-    Import-Module Az.Accounts -ErrorAction Stop -Force | Out-Null
-    # Prevent the imported context from being persisted to the user's on-disk
-    # AzureRmContext.json. Without this, every parallel worker writes its
-    # token cache to the same shared profile and the streams race on disk
-    # state. Process-scope auto-save is per-process, so calling it here
-    # confines this worker's context to in-memory.
+    # -MinimumVersion, as in the wrapper: a plain import takes the first copy
+    # in PSModulePath order, which can be older than the supported one.
+    # Without Functions/AzModules.Functions.ps1 (the wrapper stops before it
+    # starts a stream then) any version is taken, as before.
+    $AzAccountsMinimum = [version]'0.0'
+    if (Get-Command -Name Get-RdaAzAccountsMinimumVersion -CommandType Function -ErrorAction SilentlyContinue)
+    {
+        $AzAccountsMinimum = Get-RdaAzAccountsMinimumVersion
+    }
+    Import-Module Az.Accounts -MinimumVersion $AzAccountsMinimum -ErrorAction Stop -Force | Out-Null
+    # The imported context and its token cache must stay in this process's
+    # memory. With autosave on, Import-AzContext also writes them to the user's
+    # Az profile files (AzureRmContext.json and the token cache file), where
+    # they outlive this stream's snapshot and every stream writes to the same
+    # files. So the snapshot is imported only once autosave is confirmed off
+    # for this process.
+    $ImportStep = 'autosave'
+    $AutosaveError = $null
     try { Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null }
-    catch { Write-Stream ("WARNING: could not disable AzContext autosave: {0}" -f $_.Exception.Message) 'Yellow' }
+    catch { $AutosaveError = $_.Exception.Message }
+    $AutosaveCheck = Get-AzContextAutosaveCheck
+    if (-not $AutosaveCheck.Disabled)
+    {
+        $Detail = if ($AutosaveError) { 'Disable-AzContextAutosave failed: {0}; {1}' -f $AutosaveError, $AutosaveCheck.Detail } else { $AutosaveCheck.Detail }
+        throw ("Az context autosave could not be turned off for this stream ({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user's Az profile files." -f $Detail)
+    }
+    $ImportStep = 'import'
     Import-AzContext -Path $AzContextPath -ErrorAction Stop | Out-Null
-    Write-Stream "Az context imported from shared snapshot" 'Green'
+    Write-Stream "Az context imported from snapshot" 'Green'
 }
 catch
 {
-    Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $_.Exception.Message) 'Red'
+    $Reason = $_.Exception.Message
+    if ($ImportStep -eq 'autosave')
+    {
+        Write-Stream ("FATAL: {0} Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers." -f $Reason) 'Red'
+        $SubReason = 'stream did not start: Az context autosave could not be turned off'
+    }
+    elseif ($ImportStep -eq 'module')
+    {
+        Write-Stream ("FATAL: could not load the Az.Accounts module: {0}" -f $Reason) 'Red'
+        $SubReason = 'stream did not start: the Az.Accounts module could not be loaded'
+    }
+    else
+    {
+        Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $Reason) 'Red'
+        $SubReason = 'stream did not start: Az context import failed'
+    }
     # Write a minimum stream summary so the parent doesn't think the stream
     # disappeared silently.
     @{
         StreamId      = $StreamId
         Tenant        = $TenantID
         Status        = 'failed-to-start'
-        Reason        = $_.Exception.Message
+        Reason        = $Reason
+        # The step that stopped the stream: 'module' (Az.Accounts did not
+        # load), 'autosave' or 'import' (its Az context snapshot was not
+        # loaded). The parent counts no failed run for the last two.
+        FailedStep    = $ImportStep
         Completed     = @()
         Failed        = @(0..([Math]::Max($SubscriptionIds.Count, $SubscriptionNames.Count) - 1) | ForEach-Object {
                 $Name = if ($_ -lt $SubscriptionNames.Count) { $SubscriptionNames[$_] } else { '<unknown>' }
                 $Id = if ($_ -lt $SubscriptionIds.Count) { $SubscriptionIds[$_] }   else { '<unknown>' }
-                [pscustomobject]@{ Id = $Id; Name = $Name; Reason = 'stream did not start: Az context import failed' }
+                [pscustomobject]@{ Id = $Id; Name = $Name; Reason = $SubReason }
             })
         ResourceCounts = @()
     } | ConvertTo-Json -Depth 5 | Set-Content -Path $StreamSummaryPath -Encoding utf8
     exit 1
 }
+finally
+{
+    foreach ($Failure in @(Remove-AzContextSnapshot -Path $AzContextPath))
+    {
+        Write-Stream ("WARNING: could not remove Az context snapshot at {0}: {1}. It holds an Azure token cache; remove it with: {2}" -f $Failure.Path, $Failure.Message, (Get-RemoveFileCommand -Path $Failure.Path)) 'Yellow'
+    }
+}
 
 # ---- Per-stream resume state -------------------------------------------------
 #
 # Each stream owns a separate file. No races, no locking, simple semantics.
-$StreamStateFile = Join-Path $InventoryRoot (".resume-state-{0}-stream-{1}.json" -f $TenantID, $StreamId)
+$StreamStateFile = Get-ResumeStatePath -InventoryRoot $InventoryRoot -Tenant $TenantID -Stream $StreamId
 
 
 
@@ -154,18 +251,29 @@ $FailedAttempts = @()
 $Reports = @()
 if ($Resume -or $ResumeFailedOnly)
 {
-    $State = Read-StreamState -Path $StreamStateFile
+    $State = Read-StreamState -Path $StreamStateFile -RunId $RunId
     $CompletedIds = $State.Completed
     $FailedAttempts = $State.Failed
     $Reports = @($State.Reports)
-    if ($CompletedIds.Count -gt 0)
+    # The parent leaves completed subscriptions out of the slices, so this file
+    # usually lists none of this slice; count only those that are in it.
+    $CompletedInSlice = @($CompletedIds | Where-Object { $SubscriptionIds -contains $_ })
+    if ($CompletedInSlice.Count -gt 0)
     {
-        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedIds.Count) 'DarkGray'
+        Write-Stream ("resume: skipping {0} previously-completed subs in this slice" -f $CompletedInSlice.Count) 'DarkGray'
     }
     if ($ResumeFailedOnly -and $FailedAttempts.Count -gt 0)
     {
         Write-Stream ("resume-failed-only: prior FailedAttempts list has {0} entry(ies) for this stream" -f $FailedAttempts.Count) 'DarkGray'
     }
+}
+# Start from the parent's retry-list entries, so a failure here counts one more
+# run on top of the earlier ones instead of starting again at one. The newer
+# entry wins where this stream's own state file has the same subscription.
+$Prior = @(@($PriorFailedAttempts) | Where-Object { $null -ne $_ })
+if ($Prior.Count -gt 0)
+{
+    $FailedAttempts = @(Merge-FailedAttempts -ExistingFailedAttempts $Prior -StreamFailedAttempts $FailedAttempts -CompletedIds @())
 }
 
 # ---- Build the inner-script passthrough --------------------------------------
@@ -174,6 +282,9 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($IncludeNetworkResources) { $InventoryPassthrough['IncludeNetworkResources'] = $true }
+if ($UseMetricsBatch) { $InventoryPassthrough['UseMetricsBatch'] = $true }
+if ($UseMetricsBatch -and @($MetricsBatchPerCallSubscriptionIds).Count -gt 0) { $InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]$MetricsBatchPerCallSubscriptionIds }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart)) { $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowStart }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowEnd)) { $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowEnd }
@@ -196,6 +307,13 @@ $SkippedSubs = @()
 # Subs this stream collected without a zip being written; reported in the
 # summary so the parent takes them off the unified completed list.
 $NoReportSubs = @()
+# The report zip of every subscription this stream collected that wrote one,
+# complete or not: the parent builds the consolidated zip from these.
+$RunReports = @()
+# Subs this stream collected with metrics or consumption left incomplete; they
+# are in the retry list, and the summary names them so the parent also takes
+# them off the unified completed list.
+$IncompleteSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -239,6 +357,13 @@ for ($i = 0; $i -lt $PairCount; $i++)
     {
         # Cleared first so a stale path from the previous sub is never recorded as this one's.
         $Global:ZipOutputFile = $null
+        # Counted before the call, so Get-IncompleteDataReason sees only what this call appends.
+        $MetricsGapsBefore = @($Global:MetricsFailedSubs | Where-Object { $null -ne $_ }).Count
+        $ConsumptionGapsBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
+        # ResourceInventory.ps1 ends without `exit` when it succeeds, and that
+        # leaves $LASTEXITCODE as it was: the `exit 1` of an earlier
+        # subscription in this stream would mark this one failed.
+        $global:LASTEXITCODE = 0
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -251,15 +376,23 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # in this stream worker's scope. The inner script resets $Global:ResourceCount
         # to 0 at the start of every invocation.
         $ResCount = if ($null -ne $Global:ResourceCount) { $Global:ResourceCount } else { 0 }
-        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount }
+        # Network rows the inner script left out of the pull (reset by it on
+        # every run; $null when its count query failed).
+        # Read with Get-Variable: an inner run that stopped before it set them
+        # leaves them unset, which strict mode would stop on.
+        $SkipRaw = Get-Variable -Name SkippedResourceCount -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $SkipTypes = Get-Variable -Name SkippedResourceTypes -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $SkipCount = if ($null -ne $SkipRaw) { [long]$SkipRaw } else { [long]0 }
+        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount }
 
-        if ($ResCount -eq 0)
+        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $SkipRaw -SkippedByType $SkipTypes
+        if ($CountMessage.Kind -eq 'Empty')
         {
-            Write-Stream ("WARNING: '{0}' returned 0 resources (likely permission gap or empty sub)" -f $SubName) 'Yellow'
+            Write-Stream ("WARNING: '{0}' returned 0 resources (it passed the up-front role check, so it is an empty subscription)" -f $SubName) 'Yellow'
         }
         else
         {
-            Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
+            Write-Stream ("done: {0} - {1}" -f $SubName, $CountMessage.Text) 'Green'
         }
 
         # Record the zip this run wrote, replacing any earlier record for the sub.
@@ -267,20 +400,33 @@ for ($i = 0; $i -lt $PairCount; $i++)
         if ($null -ne $NewReport)
         {
             $Reports = @(@($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId }) + $NewReport)
+            $RunReports = @(@($RunReports) + $NewReport)
         }
+        $IncompleteReason = Get-IncompleteDataReason -MetricsEntries $Global:MetricsFailedSubs -MetricsBefore $MetricsGapsBefore -ConsumptionEntries $Global:ConsumptionFailedSubs -ConsumptionBefore $ConsumptionGapsBefore
 
         if ($null -eq $NewReport)
         {
             # The run left no zip, so there is no report a later -Resume could
             # carry: the sub is not completed. Named in the summary so the parent
             # also ends an earlier run's completion of it in the unified state.
+            # It goes on the retry list as a failed run, as in the parent.
             $NoReportSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
-            if ($Completed -contains $SubId)
-            {
-                $Completed = @($Completed | Where-Object { $_ -ne $SubId })
-                $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
-                Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
-            }
+            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+            $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason 'the run wrote no report zip (see the errors above)'
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
+        }
+        elseif ($null -ne $IncompleteReason)
+        {
+            # Same as the parent's sequential branch: the report was written
+            # without some of its metrics or consumption, so the sub goes into
+            # the retry list instead of the completed list.
+            Write-Stream ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $SubName) 'Yellow'
+            $IncompleteSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
+            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+            $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason $IncompleteReason
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
         elseif (-not ($Completed -contains $SubId))
         {
@@ -371,9 +517,13 @@ $Summary = [pscustomobject]@{
     Failed                 = $FailedSubs
     Skipped                = @($SkippedSubs)
     NoReport               = @($NoReportSubs)
+    Incomplete             = @($IncompleteSubs)
+    RunReports             = @($RunReports)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
-    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
+    # Every entry (one per subscription). Not Select-Object -Unique: it treats any
+    # two of these objects as equal, which would keep only the first.
+    ConsumptionFailedSubs  = @($ConsumptionFailedSubs)
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
 }
@@ -387,5 +537,8 @@ catch
     exit 1
 }
 
-Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $Completed.Count, $PairCount, $FailedSubs.Count) 'Green'
+# Count only this slice's subscriptions, as the resume line above does: on
+# -Resume the state file can list completions of earlier slices too.
+$SucceededInSlice = @($Completed | Where-Object { $SubscriptionIds -contains $_ }).Count
+Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $SucceededInSlice, $PairCount, $FailedSubs.Count) 'Green'
 exit 0

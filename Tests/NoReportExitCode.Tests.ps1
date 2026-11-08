@@ -6,12 +6,19 @@
 # A direct ResourceInventory.ps1 run (no -RunAllSubs) can reach its last line
 # without having written the report zip: when 5 collectors fail in a row the
 # collection phase stops before the inventory is written, and when the HTML
-# report cannot be built Compress-Archive writes no zip. Such a run used to
+# report cannot be built no zip is made. Such a run used to
 # print the missing zip on its 'Reporting Data File:' line and exit 0. It now
 # ends with a red 'No report was written' line and exits 2. A run that writes
 # its zip, including one over a subscription with no resources, still exits 0.
 # Under -RunAllSubs the exit code is unchanged; the wrapper checks each
-# subscription's zip itself.
+# subscription's zip itself. Its last line also says 'No report was written'
+# and names no zip.
+#
+# A run that stops during setup (output folder not writable, Azure CLI not
+# installed, service principal sign-in without a secret, -ResourceGroup without
+# -SubscriptionID, Version.json missing) exits 1, also under -RunAllSubs, where
+# the wrapper then records a failed subscription. Version.json is read from the
+# script's own folder, so a run started from another folder writes its report.
 #
 # This test is SELF-CONTAINED: it copies the script and its folders to a temp
 # dir, adds small collectors there (one returns a record, the others throw),
@@ -21,18 +28,22 @@
 # subscription id only.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("NoReportExitCode_" + [guid]::NewGuid().ToString('N'))
 
     # Copies the script and its folders into a new tree with the stand-in
-    # collectors; -BrokenSummary replaces Extension/Summary.ps1 with one that throws.
+    # collectors; -BrokenSummary replaces Extension/Summary.ps1 with one that throws,
+    # -NoVersionJson leaves Version.json out.
     function New-StandInTree
     {
-        param([string]$Name, [switch]$BrokenSummary)
+        param([string]$Name, [switch]$BrokenSummary, [switch]$NoVersionJson)
 
         $Tree = Join-Path $script:WorkDir $Name
         New-Item -ItemType Directory -Path $Tree -Force | Out-Null
-        foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services'))
+        $Items = @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services')
+        if ($NoVersionJson) { $Items = @($Items | Where-Object { $_ -ne 'Version.json' }) }
+        foreach ($Item in $Items)
         {
             Copy-Item -Path (Join-Path $script:RepoRoot $Item) -Destination $Tree -Recurse -Force
         }
@@ -68,26 +79,43 @@ if ($Task -eq 'Processing')
 
     $script:Tree = New-StandInTree -Name 'tree'
     $script:BrokenSummaryTree = New-StandInTree -Name 'tree-broken-summary' -BrokenSummary
+    $script:NoVersionJsonTree = New-StandInTree -Name 'tree-no-version-json' -NoVersionJson
 
     # Child-process harness: stand-ins for the az CLI and Az cmdlets, then the
     # real script. -Service arrives as one comma-separated string because
     # pwsh -File does not bind arrays. -NoResources makes Resource Graph report
-    # an empty subscription.
+    # an empty subscription. -Cwd starts the script from another folder,
+    # -SignedOut means no saved sign-in, and -NoAzModules makes the required Az
+    # PowerShell modules look not installed, so the script's own module check runs.
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
-param([string]$Tree, [string]$Out, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources, [string]$StateFile)
+param([string]$Tree, [string]$Out, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources, [string]$StateFile,
+    [string]$Cwd, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid, [switch]$SignedOut, [switch]$NoAzModules)
 $PSStyle.OutputRendering = 'PlainText'
 $Global:RdaSessionInitialized = $true
-$Global:AzPowerShellLoaded = $true
+$Global:AzPowerShellLoaded = -not $NoAzModules.IsPresent
 $Global:PlatformOS = 'PowerShell Unix'
 $Global:StandInNoResources = $NoResources.IsPresent
+$Global:StandInSignedOut = $SignedOut.IsPresent
 $SubId = '12345678-1234-1234-1234-123456789012'
 $Global:StandInSubs = @([pscustomobject]@{ id = $SubId; name = 'Demo Subscription'; tenantId = 'tenant-demo'; state = 'Enabled' })
-function global:az
+if ($NoAzModules)
+{
+    # Get-Module -ListAvailable finds no Az module; every other use is the real one.
+    function global:Get-Module
+    {
+        [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Name, [switch]$ListAvailable)
+        if ($ListAvailable -and @($Name | Where-Object { $_ -like 'Az.*' }).Count -gt 0) { return }
+        Microsoft.PowerShell.Core\Get-Module @PSBoundParameters
+    }
+}
+else
+{
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
-    if ($Joined -like 'account show*') { return '{"user":{"name":"tester"},"tenantId":"tenant-demo"}' }
+    if ($Joined -like 'account show*') { if ($Global:StandInSignedOut) { return $null }; return '{"user":{"name":"tester"},"tenantId":"tenant-demo"}' }
     if ($Joined -like 'account list*') { return (ConvertTo-Json -InputObject @($Global:StandInSubs) -Compress) }
     if ($Joined -like 'graph*')
     {
@@ -102,6 +130,7 @@ function global:az
         return (@{ data = @($Row); count = 1 } | ConvertTo-Json -Depth 5 -Compress)
     }
     return $null
+}
 }
 function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'tenant-demo' }; Subscription = [pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012'; Name = 'Demo Subscription' }; Account = [pscustomobject]@{ Id = 'tester' } } }
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
@@ -131,10 +160,16 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
-$Params = @{ SubscriptionID = $SubId; SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out }
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
+$Params = @{ SkipMetrics = $true; SkipConsumption = $true; OutputDirectory = $Out }
+if (-not $NoSubscriptionID) { $Params.SubscriptionID = $SubId }
 if ($Service) { $Params.Service = @($Service -split ',') }
 if ($RunAllSubs) { $Params.RunAllSubs = $true }
-Set-Location $Tree
+if ($ResourceGroup) { $Params.ResourceGroup = $ResourceGroup }
+if ($TenantID) { $Params.TenantID = $TenantID }
+if ($Appid) { $Params.Appid = $Appid }
+Set-Location $(if ($Cwd) { $Cwd } else { $Tree })
 $global:LASTEXITCODE = 0
 & (Join-Path $Tree 'ResourceInventory.ps1') @Params
 $Code = $LASTEXITCODE
@@ -144,19 +179,44 @@ exit $Code
 
     # Runs one run in a child pwsh and returns its process exit code, what the
     # harness saw inside, the console lines and the files written.
+    # -UnwritableOut points -OutputDirectory below a file, so the folder cannot
+    # be created or written on any OS.
     function Invoke-StandInRun
     {
-        param([string]$Tree = $script:Tree, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources)
+        param([string]$Tree = $script:Tree, [string]$Service, [switch]$RunAllSubs, [switch]$NoResources,
+            [switch]$FromOtherFolder, [string]$ResourceGroup, [switch]$NoSubscriptionID, [string]$TenantID, [string]$Appid,
+            [switch]$SignedOut, [switch]$NoAzModules, [switch]$UnwritableOut)
 
         $Name = [guid]::NewGuid().ToString('N')
         $Out = Join-Path $script:WorkDir ('out_' + $Name)
-        New-Item -ItemType Directory -Path $Out -Force | Out-Null
+        if ($UnwritableOut)
+        {
+            $Blocker = Join-Path $script:WorkDir ('file_' + $Name)
+            Set-Content -LiteralPath $Blocker -Value 'not a folder'
+            $Out = Join-Path $Blocker 'out'
+        }
+        else
+        {
+            New-Item -ItemType Directory -Path $Out -Force | Out-Null
+        }
         $StateFile = Join-Path $script:WorkDir ('state_' + $Name + '.json')
 
         $ArgList = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Tree', $Tree, '-Out', $Out, '-StateFile', $StateFile)
         if ($Service) { $ArgList += @('-Service', $Service) }
         if ($RunAllSubs) { $ArgList += '-RunAllSubs' }
         if ($NoResources) { $ArgList += '-NoResources' }
+        if ($FromOtherFolder)
+        {
+            $Cwd = Join-Path $script:WorkDir ('cwd_' + $Name)
+            New-Item -ItemType Directory -Path $Cwd -Force | Out-Null
+            $ArgList += @('-Cwd', $Cwd)
+        }
+        if ($ResourceGroup) { $ArgList += @('-ResourceGroup', $ResourceGroup) }
+        if ($NoSubscriptionID) { $ArgList += '-NoSubscriptionID' }
+        if ($TenantID) { $ArgList += @('-TenantID', $TenantID) }
+        if ($Appid) { $ArgList += @('-Appid', $Appid) }
+        if ($SignedOut) { $ArgList += '-SignedOut' }
+        if ($NoAzModules) { $ArgList += '-NoAzModules' }
 
         $Console = @(& pwsh @ArgList 2>&1 | ForEach-Object { [string]$_ })
         $ProcessExit = $LASTEXITCODE
@@ -168,7 +228,7 @@ exit $Code
             Console     = ($Console -join "`n")
             Lines       = $Lines
             LastLine    = $(if ($Lines.Count -gt 0) { $Lines[-1] } else { '' })
-            Zip         = @(Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File)
+            Zip         = @(Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File -ErrorAction SilentlyContinue)
         }
     }
 
@@ -234,12 +294,77 @@ Describe 'Direct run that writes its report' {
 }
 
 Describe 'Run under -RunAllSubs stopped by the collector circuit breaker' {
-    It 'keeps its exit code 0 and its last line; the wrapper checks the zip' {
+    # The exit code stays 0 (the wrapper checks each zip itself), but the last line
+    # never names a zip the run did not write.
+    It 'keeps its exit code 0, says no report was written and names no zip; the wrapper checks the zip' {
         $Run = Invoke-StandInRun -Service $script:BreakerServices -RunAllSubs
         $Run.Zip.Count | Should -Be 0
-        $Run.Console | Should -Not -Match 'No report was written'
-        $Run.LastLine | Should -Match 'Reporting Data File: '
+        $Run.Console | Should -Not -Match 'Reporting Data File: '
+        $Run.LastLine | Should -Match 'No report was written: .*ResourcesReport_.*\.zip was not created'
         $Run.State.ExitCode | Should -Be 0
         $Run.ProcessExit | Should -Be 0
+    }
+}
+
+Describe 'Direct run that stops during setup' {
+    It 'exits 1 before signing in when the output folder cannot be written' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -UnwritableOut
+        $Run.Console | Should -Match 'ERROR: Pre-flight: cannot write to '
+        $Run.Console | Should -Not -Match 'Pre-flight checks passed'
+        $Run.Console | Should -Not -Match 'Extracting Resources'
+        $Run.ProcessExit | Should -Be 1
+    }
+
+    It 'exits 1 when a required Az PowerShell module is not installed' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -NoAzModules
+        $Run.Console | Should -Match 'Required Azure PowerShell module\(s\) not found'
+        $Run.Zip.Count | Should -Be 0
+        $Run.ProcessExit | Should -Be 1
+    }
+
+    It 'exits 1 when the service principal sign-in has no secret' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -SignedOut -TenantID 'tenant-other' -Appid 'app-demo'
+        $Run.Console | Should -Match 'Service Principal Authentication Method in a wrong way'
+        $Run.Zip.Count | Should -Be 0
+        $Run.ProcessExit | Should -Be 1
+    }
+
+    It 'exits 1 when -ResourceGroup is given without -SubscriptionID' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -ResourceGroup 'rg-demo' -NoSubscriptionID
+        $Run.Console | Should -Match 'Resource Group Name present, but missing Subscription ID'
+        $Run.Zip.Count | Should -Be 0
+        $Run.ProcessExit | Should -Be 1
+    }
+
+    It 'exits 1 when Version.json is missing' {
+        $Run = Invoke-StandInRun -Tree $script:NoVersionJsonTree -Service 'StandInWorking'
+        $Run.Console | Should -Match 'Local Version.json not found'
+        $Run.Zip.Count | Should -Be 0
+        $Run.ProcessExit | Should -Be 1
+    }
+}
+
+Describe 'Run started from another folder' {
+    It 'finds Version.json next to the script and writes its report' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -FromOtherFolder
+        $Run.Console | Should -Not -Match 'Version.json not found'
+        $Run.Zip.Count | Should -Be 1
+        $Run.LastLine | Should -Match 'Reporting Data File: '
+        $Run.ProcessExit | Should -Be 0
+    }
+
+    It 'writes its report under -RunAllSubs too' {
+        $Run = Invoke-StandInRun -Service 'StandInWorking' -FromOtherFolder -RunAllSubs
+        $Run.Console | Should -Not -Match 'Version.json not found'
+        $Run.Zip.Count | Should -Be 1
+        $Run.State.ExitCode | Should -Be 0
+    }
+}
+
+Describe 'Setup failure under -RunAllSubs' {
+    It 'returns 1 to the caller, so the wrapper records a failed subscription' {
+        $Run = Invoke-StandInRun -Tree $script:NoVersionJsonTree -Service 'StandInWorking' -RunAllSubs
+        $Run.Console | Should -Match 'Local Version.json not found'
+        $Run.State.ExitCode | Should -Be 1
     }
 }

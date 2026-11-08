@@ -25,10 +25,29 @@
 # match the gap bundle's tokens exactly, so the recovered rows can be spliced in
 # with no remapping. This function performs that splice + re-package.
 #
-# Definitions only - dot-source this file, then call Merge-RecoveryData. It has
-# no dependency on ResourceInventory.ps1's globals; it only reads/writes files
-# and re-invokes Extension/Summary.ps1 to regenerate the HTML report.
+# Dot-source this file, then call Merge-RecoveryData. On load it runs one step:
+# it checks that Functions/InventoryJson.Functions.ps1 is next to it (throws if
+# not, and the throw stops the caller under any $ErrorActionPreference) and
+# dot-sources it, which defines Write-InventoryJson. So it works when
+# dot-sourced on its own. The rest is definitions. Merge-RecoveryData has no
+# dependency on ResourceInventory.ps1's globals; it only reads/writes files and
+# re-invokes Extension/Summary.ps1 to regenerate the HTML report.
 # =============================================================================
+
+# InventoryJson.Functions.ps1 defines only Write-InventoryJson, so loading it
+# sets no variable and leaves the caller's other functions as they were.
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'InventoryJson.Functions.ps1') -PathType Leaf))
+{
+    # A plain throw here, even one re-thrown from a catch, is skipped when the caller
+    # runs with $ErrorActionPreference = 'SilentlyContinue' or 'Ignore'. Thrown from a
+    # child scope set to Stop, it stops the caller under any preference. The child
+    # scope ends here, so the caller's own preference is left as it was.
+    & {
+        $ErrorActionPreference = 'Stop'
+        throw ("RecoveryMerge.Functions.ps1: required file not found: {0}. Keep the Functions folder together." -f (Join-Path $PSScriptRoot 'InventoryJson.Functions.ps1'))
+    }
+}
+. (Join-Path $PSScriptRoot 'InventoryJson.Functions.ps1')
 
 function Merge-RecoveryData
 {
@@ -128,10 +147,15 @@ function Merge-RecoveryData
         }
 
         # Collect the DISTINCT obfuscation tokens present in the inventory text.
-        # The pattern matches only flat per-resource tokens (prod_/nonprod_<guid>),
-        # which are what the inventory ID/Name fields carry and what the dictionary
-        # maps key on. Consumption-style tokens (prod_sub_/prod_rg_...) live in the
-        # CSV, not the inventory JSON, so they never enter this scan.
+        # The pattern matches single prod_/nonprod_<guid> tokens. Inventory IDs are not
+        # flat tokens: they are ARM-shaped paths
+        # (/subscriptions/<token>/resourcegroups/<token>/providers/<type>/<token>),
+        # so the pattern finds the subscription, resource-group and name tokens inside
+        # each path, and the Name/Subscription/ResourceGroup fields carry the same
+        # tokens. Those single tokens are keys of the name, subscription and
+        # resource-group maps, so they are what this check counts. Consumption-style
+        # tokens (prod_sub_/prod_rg_...) live in the CSV, not the inventory JSON, so
+        # they never enter this scan.
         $InventoryText = Get-Content -Path $InventoryPath -Raw
         $InventoryTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($TokenMatch in [regex]::Matches($InventoryText, '(?i)\b(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'))
@@ -171,12 +195,93 @@ function Merge-RecoveryData
 
     if (-not (Test-Path -Path $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
     if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
+    # Full path with every link (symbolic link or junction) on it followed,
+    # so a link and its target compare equal. Parts that do not exist yet are
+    # kept as written. Read against the PowerShell location, '~' expanded.
+    function Resolve-MergeRealPath([string]$Path)
+    {
+        $Sep = [System.IO.Path]::DirectorySeparatorChar
+        $Full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        for ($Hop = 0; $Hop -lt 40; $Hop++)
+        {
+            $Root = [System.IO.Path]::GetPathRoot($Full)
+            $Parts = @($Full.Substring($Root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries))
+            $Current = $Root
+            $Followed = $false
+            for ($i = 0; $i -lt $Parts.Count; $i++)
+            {
+                $Current = [System.IO.Path]::Combine($Current, $Parts[$i])
+                $Item = Get-Item -LiteralPath $Current -Force -ErrorAction SilentlyContinue
+                if ($null -eq $Item) { $Current = [System.IO.Path]::Combine([string[]](@($Current) + @($Parts | Select-Object -Skip ($i + 1)))); break }
+                if ($Item.LinkType -in @('SymbolicLink', 'Junction'))
+                {
+                    $LinkTarget = [string](@($Item.Target)[0])
+                    if (-not [System.IO.Path]::IsPathRooted($LinkTarget)) { $LinkTarget = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($Current), $LinkTarget) }
+                    $Full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine([string[]](@($LinkTarget) + @($Parts | Select-Object -Skip ($i + 1)))))
+                    $Followed = $true
+                    break
+                }
+            }
+            if (-not $Followed)
+            {
+                $Real = [System.IO.Path]::GetFullPath($Current)
+                if ($Real.Length -gt [System.IO.Path]::GetPathRoot($Real).Length) { $Real = $Real.TrimEnd($Sep, [System.IO.Path]::AltDirectorySeparatorChar) }
+                return $Real
+            }
+        }
+        throw ("Merge-RecoveryData: too many links on path '{0}'." -f $Path)
+    }
+
+    # The merge writes a new bundle; written into a source folder it would
+    # replace that bundle's own files. A new empty folder is the way out.
+    # Relative, absolute, '~' and linked forms of one folder compare equal.
+    $OutFull = Resolve-MergeRealPath $OutputPath
+    foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
+    {
+        $SourceFull = Resolve-MergeRealPath $Source
+        if ([string]::Equals($OutFull, $SourceFull, [System.StringComparison]::OrdinalIgnoreCase))
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath)
+        }
+    }
 
     $GapInventoryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Inventory_*.json'
     $RecoveryInventoryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Inventory_*.json'
     $GapConsumptionFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Consumption_*.csv'  -Optional
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
+
+    # Some paths reach a source folder in ways the path text does not show
+    # (bind mounts, mapped or substituted drives, short names). So when the
+    # output folder already exists, a file with a new random name is made in
+    # it and looked for in each source folder; it is removed straight after.
+    # A copy of a source bundle is a different folder and is not refused.
+    if (Test-Path -LiteralPath $OutputPath -PathType Container)
+    {
+        $ProbeName = '.rda-merge-probe-' + [guid]::NewGuid().ToString('N')
+        $Probe = Join-Path $OutputPath $ProbeName
+        $SharedSource = $null
+        try
+        {
+            $null = New-Item -ItemType File -Path $Probe -ErrorAction Stop
+            foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
+            {
+                if (Test-Path -LiteralPath (Join-Path $Source $ProbeName)) { $SharedSource = $Source; break }
+            }
+        }
+        catch
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' cannot be written: {1} Nothing was written." -f $OutputPath, $_.Exception.Message)
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $Probe -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $SharedSource)
+        {
+            throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder ('{1}'). Use a new empty folder. Nothing was written." -f $OutputPath, $SharedSource)
+        }
+    }
 
     # -- Guard: obfuscation-dictionary compatibility --------------------------
     # The whole "recovered rows splice in cleanly" guarantee rests on the recovery
@@ -320,6 +425,33 @@ function Merge-RecoveryData
     # "<ReportName>_<stamp>" base so the rebuilt bundle keeps the run's identity.
     $BundleBase = $GapInventoryFile.BaseName -replace '^Inventory_', ''
 
+    # -- Every requested recovery source is checked before anything is
+    #    written, so a stop never leaves a partial output folder.
+    #    Each is looked up once here and used below.
+    $RecoveryConsumptionFile = $null
+    if ($RecoverConsumption)
+    {
+        $RecoveryConsumptionFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional
+        if (-not $RecoveryConsumptionFile)
+        {
+            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption. Nothing was written." -f $RecoveryBundlePath)
+        }
+    }
+    $RecoveryMetricsFiles = @()
+    if ($RecoverMetrics)
+    {
+        $RecoveryMetricsFiles = @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
+        if ($RecoveryMetricsFiles.Count -eq 0)
+        {
+            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
+        }
+    }
+    $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
+    if (-not (Test-Path -Path $SummaryScript -PathType Leaf))
+    {
+        throw ("Merge-RecoveryData: report generator not found at '{0}'. Keep the Extension folder with the Functions folder. Nothing was written." -f $SummaryScript)
+    }
+
     if (-not (Test-Path -Path $OutputPath -PathType Container))
     {
         New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
@@ -332,31 +464,34 @@ function Merge-RecoveryData
     $OutZipFile = Join-Path $OutputPath ("{0}.zip" -f $BundleBase)
     $OutDictionaryFile = Join-Path $OutputPath ("ObfuscationDictionary_{0}.json" -f $BundleBase)
 
-    # -- Write the merged inventory (depth 100 + compressed, matching the
-    #    original serialization in ResourceInventory.ps1) ----------------------
-    $GapInventory | ConvertTo-Json -Depth 100 -Compress | Out-File -FilePath $OutInventoryFile
+    # -- Write the merged inventory with Write-InventoryJson, as
+    #    ResourceInventory.ps1 does: one collector at a time, so the whole
+    #    document is never one string, and the same bytes as
+    #    'ConvertTo-Json -Depth 100 -Compress | Out-File'. A failed write stops
+    #    the merge and leaves no new, empty or partial inventory; an inventory
+    #    already at $OutInventoryFile is left unchanged. -------------------------
+    Write-InventoryJson -InputObject $GapInventory -Path $OutInventoryFile
 
     # -- Consumption source. By default carry the gap bundle's CSV forward: an
     #    inventory gap does not affect the whole-subscription consumption file.
     #    With -RecoverConsumption, whole-file REPLACE it with the recovery
     #    bundle's CSV instead (used when the gap run's consumption is missing or
     #    incomplete - e.g. truncated by a transient "copying content to a stream"
-    #    error). Consumption ResourceUris are obfuscated with a per-run scheme
-    #    that is independent of the inventory dictionary (it preserves the ARM
-    #    path structure for categorisation but mints its own sub/rg/name tokens),
-    #    so a replaced consumption file is internally consistent and categorises
-    #    correctly even though its tokens differ from the gap run's. If the chosen
+    #    error). Consumption ResourceUris keep the ARM path structure for
+    #    categorisation. A ResourceUri that matches an inventory id exactly
+    #    takes that resource's whole masked path from the run's ResourceIdMap;
+    #    any other ResourceUri gets subscription, resource group and name
+    #    tokens minted for that run's consumption file. So a replaced
+    #    consumption file categorises correctly, but its tokens can differ
+    #    from the gap run's, and a resource that is not in the inventory can
+    #    carry subscription and resource group tokens different from the
+    #    inventory's for the same real values. If the chosen
     #    source has none, write a canonical empty file so the bundle is
     #    structurally complete. --------------------------------------------------
     $ConsumptionSource = 'gap'
     $ConsumptionSourceFile = $GapConsumptionFile
     if ($RecoverConsumption)
     {
-        $RecoveryConsumptionFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional
-        if (-not $RecoveryConsumptionFile)
-        {
-            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption." -f $RecoveryBundlePath)
-        }
         $ConsumptionSource = 'recovery'
         $ConsumptionSourceFile = $RecoveryConsumptionFile
 
@@ -405,13 +540,9 @@ function Merge-RecoveryData
     #    via the seeded ResourceIdMap, so a recovery run seeded with the gap
     #    dictionary yields metrics tokens that match the merged inventory. Write a
     #    canonical empty file only if the chosen source has none.
+    $OutMetricsFiles = [System.Collections.Generic.List[string]]::new()
     if ($RecoverMetrics)
     {
-        $RecoveryMetricsFiles = @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
-        if ($RecoveryMetricsFiles.Count -eq 0)
-        {
-            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics." -f $RecoveryBundlePath)
-        }
         # Recovery metrics carry the recovery run's base; rebase to $BundleBase.
         $RecoveryBase = $RecoveryInventoryFile.BaseName -replace '^Inventory_', ''
         foreach ($MetricsFile in $RecoveryMetricsFiles)
@@ -419,6 +550,7 @@ function Merge-RecoveryData
             $Suffix = $MetricsFile.BaseName -replace ('^Metrics_' + [regex]::Escape($RecoveryBase)), ''
             $RebasedName = 'Metrics_' + $BundleBase + $Suffix + '.json'
             Copy-Item -Path $MetricsFile.FullName -Destination (Join-Path $OutputPath $RebasedName) -Force
+            $OutMetricsFiles.Add((Join-Path $OutputPath $RebasedName))
         }
         $MetricsSource = 'recovery'
         # Advisory: the regenerated HTML does not render metrics (Summary.ps1
@@ -436,11 +568,13 @@ function Merge-RecoveryData
             foreach ($MetricsFile in $GapMetricsFiles)
             {
                 Copy-Item -Path $MetricsFile.FullName -Destination (Join-Path $OutputPath $MetricsFile.Name) -Force
+                $OutMetricsFiles.Add((Join-Path $OutputPath $MetricsFile.Name))
             }
         }
         else
         {
             @{ Metrics = @() } | ConvertTo-Json -Depth 5 -Compress | Out-File -FilePath $OutMetricsFile -Encoding utf8
+            $OutMetricsFiles.Add($OutMetricsFile)
         }
         $MetricsSource = 'gap'
     }
@@ -480,22 +614,17 @@ function Merge-RecoveryData
     }
 
     # -- Regenerate the HTML report from the merged inventory via Summary.ps1.
-    #    Located relative to this functions file (Functions/ -> ../Extension). --
-    $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
-    if (-not (Test-Path -Path $SummaryScript -PathType Leaf))
-    {
-        throw ("Merge-RecoveryData: report generator not found at '{0}'." -f $SummaryScript)
-    }
+    #    Located relative to this functions file (Functions/ -> ../Extension);
+    #    checked before anything was written (above). --
     $ReportVersion = if ($GapInventory.PSObject.Properties.Name -contains 'Version') { $GapInventory.Version } else { $null }
     & $SummaryScript -JsonFile $OutInventoryFile -HtmlFile $OutHtmlFile -Title 'Azure Resource Inventory' -Version $ReportVersion -ConsumptionFile $OutConsumptionFile | Out-Null
 
-    # -- Re-zip, mirroring ResourceInventory.ps1's packaging filter: HTML +
-    #    Consumption CSV + every *.json EXCEPT the local-only dictionary/Full/
-    #    Heartbeat/ErrorLog files. The dictionary is deliberately NOT zipped. ---
-    $ZipJsonFiles = Get-ChildItem -Path $OutputPath -Filter '*.json' |
-        Where-Object { $_.Name -notlike 'ObfuscationDictionary_*' -and $_.Name -notlike 'Full_*' -and $_.Name -notlike 'Heartbeat_*' -and $_.Name -notlike 'ErrorLog_*' } |
-        Select-Object -ExpandProperty FullName
-    $ZipPaths = @($OutHtmlFile, $OutConsumptionFile) + $ZipJsonFiles
+    # -- Re-zip only the files this call wrote: HTML + consumption CSV + merged
+    #    inventory + metrics. An existing -OutputPath can hold another bundle's
+    #    files (another report's inventory, or an earlier merge's metrics
+    #    batches), and those must not ship in this zip. The dictionary is
+    #    deliberately NOT zipped. ---
+    $ZipPaths = @($OutHtmlFile, $OutConsumptionFile, $OutInventoryFile) + @($OutMetricsFiles)
     if (Test-Path -Path $OutZipFile) { Remove-Item -Path $OutZipFile -Force }
     Compress-Archive -Path $ZipPaths -CompressionLevel Fastest -DestinationPath $OutZipFile
 

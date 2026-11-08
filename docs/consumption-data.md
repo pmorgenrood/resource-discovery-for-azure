@@ -57,22 +57,41 @@ records when the token is missing, which would otherwise leave an empty
 consumption sheet that looks like "this tenant has no billing data." If the
 check fails, RDA attempts **one** reconnect; if that still fails it logs a loud
 error, records the subscription in the run health, and skips only the
-consumption phase (the rest of the inventory continues).
+consumption phase (the rest of the inventory continues). In a
+`Run-AllSubscriptions.ps1` run, the main summary marks that subscription's row
+**consumption incomplete** (see below).
 
 ### Transient-failure retry
 
-Each page request is wrapped in a bounded retry (**3 attempts, exponential
-backoff**). A single transient HTTP error — e.g. `Error while copying content to
-a stream`, a timeout, or 429/503 throttling — retries the **same** page (the
-previous page's `ContinuationToken` is preserved), so no rows are duplicated or
-skipped. A permanent error exhausts the retries and is handled by the
-per-subscription failure path (see [Recovering from a consumption
-crash](#recovering-from-a-consumption-crash)).
+Each page request is retried up to **3 times, with exponential backoff (2, 4
+and 8 seconds)**, unless the failure is one a retry cannot change: access
+refused (401, 403, or an error that says access was denied), a sign-in that
+cannot be used (an expired or invalid token, one that needs the user, or an
+error that says to run `Connect-AzAccount`), a bad request (400) or not found
+(404, or an error that says it could not be found), named by the error or by
+an error inside it. Every other failure is retried, for example 429
+throttling, a timeout, a server error (5xx), a transfer cut off part-way
+(`Error while copying content to a stream`), a sign-in service error that
+names only its code, or an error that is not recognised. The **same** page is retried (the previous page's
+`ContinuationToken` is preserved), so no rows are duplicated or skipped. This
+is the rule the up-front consumption data check uses. Either way
+a page that still fails is handled by the per-subscription failure path (see
+[Recovering from a consumption crash](#recovering-from-a-consumption-crash)).
+
+### Page limit
+
+One subscription's pull reads at most 10,000 pages (about 10 million rows at the
+usage API's page size of up to 1,000 rows). If the API still offers more, the
+pull stops there, keeps the rows written so far, and reports that subscription's
+consumption INCOMPLETE with a message naming the limit, so a paging token that
+never runs out cannot keep a run going without end.
 
 ## The columns
 
 The CSV has 15 columns. Ten come straight from each usage-aggregation record;
-five are derived from the `InstanceData` JSON on each record.
+five are derived from the `InstanceData` JSON on each record. A record whose
+`InstanceData` is missing or is not JSON is kept: its other columns are as
+returned and these five are empty.
 
 | Column | Source | Meaning |
 |--------|--------|---------|
@@ -135,7 +154,15 @@ recorded (in `$Global:ConsumptionFailedSubs`) with:
 - `Complete = $false`
 - `PageAtFailure` — the paged `Get-UsageAggregates` call it stopped on
 - `RecordsCollected` — how many rows were written before it stopped
+- `ReportFolder` — the name of the report folder the run writes to
 - a message ending `… this subscription's consumption is INCOMPLETE`
+
+In a `Run-AllSubscriptions.ps1` run, the main summary marks that
+subscription's row **consumption incomplete** (found through `ReportFolder`),
+so the obfuscated main summary also says which subscription it is. Both
+`Run-AllSubscriptions.ps1` and a direct run of `ResourceInventory.ps1` list
+these subscriptions by name and id under **Consumption Failures** at the end
+of the run.
 
 On an obfuscated run this is surfaced in the shareable
 `Diagnostics_<ReportName>_<timestamp>.log` under **"Consumption

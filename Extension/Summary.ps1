@@ -80,7 +80,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ([string]::IsNullOrWhiteSpace($JsonFile) -or -not (Test-Path -Path $JsonFile -PathType Leaf))
+if ([string]::IsNullOrWhiteSpace($JsonFile) -or -not (Test-Path -LiteralPath $JsonFile -PathType Leaf))
 {
     throw "Summary.ps1: Inventory JSON not found at '$JsonFile'."
 }
@@ -97,7 +97,7 @@ if ([string]::IsNullOrWhiteSpace($HtmlFile))
 # branch) rather than loaded into every entry point. This script sits in
 # Extension/, so resolve the sibling Functions/ folder from the repo root.
 $RenderFunctionsFile = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Functions/AllSubHtmlSummary.Functions.ps1'
-if (-not (Test-Path -Path $RenderFunctionsFile -PathType Leaf))
+if (-not (Test-Path -LiteralPath $RenderFunctionsFile -PathType Leaf))
 {
     throw "Summary.ps1: shared render helpers not found at '$RenderFunctionsFile'."
 }
@@ -113,7 +113,7 @@ $RenderStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 # Read input JSON. Top-level keys are service-type names; values are arrays of
 # resource records. No schema validation - a new field simply appears as a new
 # column in that service's table.
-$RawJson = Get-Content -Path $JsonFile -Raw -Encoding utf8
+$RawJson = Get-Content -LiteralPath $JsonFile -Raw -Encoding utf8
 $Inventory = $RawJson | ConvertFrom-Json
 
 # Compute summary stats. Every array-valued key becomes a (service, count)
@@ -172,7 +172,7 @@ if ($Samples.Count -gt 0)
 # resource ids through different dictionaries, so a per-VM join is impossible in
 # an obfuscated report. Counts of distinct tokens are preserved either way.
 $VmBilling = $null
-if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $ConsumptionFile -PathType Leaf))
+if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -LiteralPath $ConsumptionFile -PathType Leaf))
 {
     $RunningVmCount = 0
     $VmRecords = $Inventory.VirtualMachines
@@ -191,9 +191,22 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
     $HasConsumptionData = $false
     try
     {
-        $Consumption = @(Import-Csv -Path $ConsumptionFile -ErrorAction Stop)
-        $HasConsumptionData = ($Consumption.Count -gt 0)
-        $BilledVmCount = (@($Consumption | Where-Object { $_.MeterCategory -eq 'Virtual Machines' }).ResourceId | Sort-Object -Unique).Count
+        # One row at a time, keeping only the distinct VM ResourceIds: loaded as
+        # objects, a large billing file takes several times its size on disk.
+        # The set ignores case, as Sort-Object -Unique does.
+        $ConsumptionRowCount = 0
+        $BilledVmIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        Import-Csv -LiteralPath $ConsumptionFile -ErrorAction Stop | ForEach-Object {
+            $ConsumptionRowCount++
+            # Import-Csv reads an empty field as '', not $null: a row without a
+            # ResourceId names no VM.
+            if ($_.MeterCategory -eq 'Virtual Machines' -and -not [string]::IsNullOrWhiteSpace([string]$_.ResourceId))
+            {
+                [void]$BilledVmIds.Add([string]$_.ResourceId)
+            }
+        }
+        $HasConsumptionData = ($ConsumptionRowCount -gt 0)
+        $BilledVmCount = $BilledVmIds.Count
     }
     catch
     {
@@ -921,10 +934,10 @@ $Js
 </html>
 "@
 
-Set-Content -Path $HtmlFile -Value $Html -Encoding utf8
+Set-Content -LiteralPath $HtmlFile -Value $Html -Encoding utf8
 Write-Host ("HTML report written: {0}" -f $HtmlFile) -ForegroundColor Green
 Write-Host ("  Total resources: {0:N0} across {1} service type(s)" -f $TotalResources, $ServiceSummary.Count) -ForegroundColor Green
-$FileSize = (Get-Item $HtmlFile).Length
+$FileSize = (Get-Item -LiteralPath $HtmlFile).Length
 Write-Host ("  File size: {0:N0} bytes ({1:N1} KB)" -f $FileSize, ($FileSize / 1KB)) -ForegroundColor Green
 if ($ObfuscationStatus -eq 'obfuscated')
 {

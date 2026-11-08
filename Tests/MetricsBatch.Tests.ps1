@@ -1,0 +1,1199 @@
+# Requires -Modules Pester
+# =============================================================================
+# MetricsBatch.Tests.ps1
+#
+# Tests for -UseMetricsBatch in Extension/Metrics.ps1 (the Azure Monitor batch
+# API, metrics:getBatch) and for the Microsoft.Insights provider preflight in
+# Functions/Common.Functions.ps1:
+#   - work items: grouped by subscription, region, namespace, metric names,
+#     time window, time grain and aggregation, at most 50 resources each;
+#     what the batch call cannot express keeps the per-resource path;
+#   - the switch off: no batch request, no provider read, no token;
+#   - the records are the same as the per-resource path's on the same data,
+#     with and without -Obfuscate;
+#   - answers map back to resources whatever the case of the returned id;
+#   - a metric with an errorCode other than Success, a resource missing from
+#     the answer, a failed request and a refused request (403) all fall back
+#     to the per-resource path, never dropped;
+#   - a subscription where Microsoft.Insights is not registered is not batched;
+#   - the preflight registers only on a "y", says what to run otherwise, and
+#     waits on one bounded deadline.
+#
+# The batch requests run inside ForEach-Object -Parallel runspaces, which
+# Pester mocks do not reach, so the batch endpoint is a local HttpListener
+# (Metrics.ps1's internal -MetricsBatchEndpointFormat points at it). It writes
+# every request to a file and answers from the same deterministic data as the
+# stand-in Get-AzMetric, so the two paths can be compared record by record. It
+# answers the way the live API does (seen on the sandbox, 2026-11-05): no
+# errorCode on an answered metric, and only the asked aggregation in a point.
+#
+# No live Azure. Run with:
+#   Invoke-Pester ./Tests/MetricsBatch.Tests.ps1 -Output Detailed
+# =============================================================================
+
+BeforeAll {
+    $script:RepoRoot = Split-Path $PSScriptRoot -Parent
+    $script:MetricsScript = Join-Path $script:RepoRoot 'Extension/Metrics.ps1'
+    . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
+
+    $script:SubscriptionId = '12345678-1234-1234-1234-123456789012'
+    $script:OtherSubscriptionId = '87654321-4321-4321-4321-210987654321'
+    $script:TenantId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    $script:Subscriptions = @(
+        [PSCustomObject]@{ id = $script:SubscriptionId; Name = 'test-subscription'; tenantId = $script:TenantId },
+        [PSCustomObject]@{ id = $script:OtherSubscriptionId; Name = 'other-subscription'; tenantId = $script:TenantId }
+    )
+
+    # The data both paths return for a resource id and metric name: 30 points,
+    # every 7th one without a value. Seeded on the lower-case id, since the
+    # batch body carries ids in lower case. Some values are whole numbers, which
+    # JSON carries without a fraction.
+    $script:PointSource = @'
+function Get-TestPoints([string]$ResourceId, [string]$Name)
+{
+    $Seed = 0
+    foreach ($Char in ($ResourceId.ToLowerInvariant() + '|' + $Name).ToCharArray()) { $Seed = ($Seed * 31 + [int]$Char) % 100003 }
+    for ($P = 0; $P -lt 30; $P++)
+    {
+        $Value = if ($P % 7 -eq 3) { $null } else { [double](($Seed + $P * 37) % 1000) / 10 }
+        [ordered]@{
+            Average = $Value
+            Minimum = if ($null -ne $Value) { $Value - 0.5 } else { $null }
+            Maximum = if ($null -ne $Value) { [math]::Floor($Value) } else { $null }
+            Total   = if ($null -ne $Value) { $Value * 3 } else { $null }
+            Count   = if ($null -ne $Value) { [double](($Seed + $P) % 50) } else { $null }
+        }
+    }
+}
+'@
+
+    $script:ModuleRoot = Join-Path $TestDrive 'modules'
+    $FakeModuleDir = Join-Path $script:ModuleRoot 'Az.Monitor'
+    New-Item -ItemType Directory -Path $FakeModuleDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $FakeModuleDir 'Az.Monitor.psm1') -Encoding utf8 -Value ($script:PointSource + @'
+
+function Get-AzMetric
+{
+    [CmdletBinding()]
+    param([string]$ResourceId, [string[]]$MetricName, [datetime]$StartTime, [datetime]$EndTime, [timespan]$TimeGrain, [string]$AggregationType, $DefaultProfile)
+
+    $Names = @($MetricName)
+    $CallFile = Join-Path $env:RDA_TEST_METRIC_CALL_DIR ([guid]::NewGuid().ToString() + '.json')
+    [ordered]@{ ResourceId = $ResourceId; MetricName = $Names; AggregationType = $AggregationType } | ConvertTo-Json -Compress | Set-Content -LiteralPath $CallFile -Encoding utf8
+    # RDA_TEST_METRIC_NOTFOUND lists resource names (';') Azure Monitor answers with 404, as Get-AzMetric reports it.
+    if (@($env:RDA_TEST_METRIC_NOTFOUND -split ';' | Where-Object { $_ }) -contains ($ResourceId -split '/')[-1]) { throw "Operation returned an invalid status code 'NotFound'" }
+    foreach ($Name in $Names)
+    {
+        $Start = $StartTime
+        $Data = [System.Collections.Generic.List[object]]::new()
+        $Hour = 0
+        foreach ($Fields in (Get-TestPoints -ResourceId $ResourceId -Name $Name))
+        {
+            $Point = [ordered]@{ TimeStamp = $Start.AddHours($Hour++) }
+            foreach ($Key in $Fields.Keys) { $Point[$Key] = $Fields[$Key] }
+            $Data.Add([PSCustomObject]$Point)
+        }
+        [PSCustomObject]@{ Id = $ResourceId + '/providers/Microsoft.Insights/metrics/' + $Name; Name = [PSCustomObject]@{ Value = $Name; LocalizedValue = $Name }; Data = $Data }
+    }
+}
+Export-ModuleMember -Function Get-AzMetric
+'@)
+
+    $script:OriginalModulePath = $env:PSModulePath
+    $script:OriginalDebugLogFile = $Global:DebugLogFile
+    $env:PSModulePath = $script:ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
+
+    # The batch endpoint: a local HttpListener in a thread job. Control.json says
+    # how to answer: Status (an HTTP status for every request), FailFirst (fail
+    # the first N requests with Status), OmitNames (resource names left out of
+    # every answer), ErrorMetrics ('name|metric' answered with an error code),
+    # UpperIds (return resource ids in upper case).
+    $script:ServerDir = Join-Path $TestDrive 'server'
+    New-Item -ItemType Directory -Path (Join-Path $script:ServerDir 'calls') -Force | Out-Null
+    $script:ControlFile = Join-Path $script:ServerDir 'control.json'
+    '{}' | Set-Content -LiteralPath $script:ControlFile -Encoding utf8
+    $Probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $Probe.Start(); $script:Port = $Probe.LocalEndpoint.Port; $Probe.Stop()
+    $script:Endpoint = 'http://127.0.0.1:{0}/{{0}}' -f $script:Port
+    $script:Listener = Start-ThreadJob -ArgumentList $script:Port, $script:ServerDir, $script:PointSource -ScriptBlock {
+        param($Port, $ServerDir, $PointSource)
+        . ([scriptblock]::Create($PointSource))
+        $Http = [System.Net.HttpListener]::new()
+        $Http.Prefixes.Add(('http://127.0.0.1:{0}/' -f $Port))
+        $Http.Start()
+        $Seen = 0
+        $LastControlText = ''
+        while ($Http.IsListening)
+        {
+            $Context = $Http.GetContext()
+            $Request = $Context.Request
+            if ($Request.Url.AbsolutePath -eq '/stop') { $Context.Response.Close(); $Http.Stop(); break }
+            $Reader = [System.IO.StreamReader]::new($Request.InputStream)
+            $BodyText = $Reader.ReadToEnd()
+            $ControlText = Get-Content -LiteralPath (Join-Path $ServerDir 'control.json') -Raw
+            # Each run writes its own control (with a run id), so FailFirst counts that run's requests.
+            if ($ControlText -ne $LastControlText) { $Seen = 0; $LastControlText = $ControlText }
+            $Control = $ControlText | ConvertFrom-Json -AsHashtable
+            $Query = [System.Web.HttpUtility]::ParseQueryString($Request.Url.Query)
+            $Record = [ordered]@{ Path = $Request.Url.AbsolutePath; Names = [string]$Query['metricnames']; Namespace = [string]$Query['metricnamespace']; Aggregation = [string]$Query['aggregation']; Interval = [string]$Query['interval']; Authorization = [string]$Request.Headers['Authorization']; Body = $BodyText }
+            $Record | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $ServerDir ('calls/{0}.json' -f [guid]::NewGuid())) -Encoding utf8
+            $Seen++
+            $Status = 200
+            $Out = $null
+            $FailFirst = if ($Control.ContainsKey('FailFirst')) { [int]$Control['FailFirst'] } else { [int]::MaxValue }
+            $Sequence = @($Control['StatusSequence'])
+            if ($Control.ContainsKey('StatusSequence') -and $Seen -le $Sequence.Count -and [int]$Sequence[$Seen - 1] -ne 0)
+            {
+                # StatusSequence: the status of the run's nth request (0: answer it).
+                $Status = [int]$Sequence[$Seen - 1]
+                $Out = @{ error = @{ code = 'TestError'; message = 'test failure' } }
+            }
+            elseif ($Control.ContainsKey('Status') -and $Seen -le $FailFirst)
+            {
+                $Status = [int]$Control['Status']
+                $Out = @{ error = @{ code = 'TestError'; message = 'test failure' } }
+            }
+            else
+            {
+                $Ids = @(($BodyText | ConvertFrom-Json).resourceids)
+                $Names = @(([string]$Query['metricnames']) -split ',' | ForEach-Object { [uri]::UnescapeDataString($_) })
+                $Values = foreach ($Id in $Ids)
+                {
+                    $ResName = ($Id -split '/')[-1]
+                    if (@($Control['OmitNames']) -contains $ResName) { continue }
+                    $Metrics = foreach ($Name in $Names)
+                    {
+                        if (@($Control['ErrorMetrics']) -contains ($ResName + '|' + $Name))
+                        {
+                            @{ name = @{ value = $Name; localizedValue = $Name }; errorCode = 'InvalidMetric'; errorMessage = 'not supported'; timeseries = @() }
+                            continue
+                        }
+                        $Points = foreach ($Fields in (Get-TestPoints -ResourceId $Id -Name $Name))
+                        {
+                            $Json = [ordered]@{ timeStamp = '2026-01-01T00:00:00Z' }
+                            # As the live API answers: only the asked aggregation, and no field for a point without a value.
+                            $Asked = [string]$Query['aggregation']
+                            foreach ($Key in $Fields.Keys) { if ($null -ne $Fields[$Key] -and $Key -eq $Asked) { $Json[$Key.ToLowerInvariant()] = $Fields[$Key] } }
+                            $Json
+                        }
+                        $Answer = @{ name = @{ value = $Name; localizedValue = $Name }; unit = 'Count'; timeseries = @(@{ metadatavalues = @(); data = @($Points) }) }
+                        # The live API leaves errorCode out of an answered metric; the doc's sample has 'Success'.
+                        if ($Control['WithErrorCode']) { $Answer['errorCode'] = 'Success' }
+                        $Answer
+                    }
+                    $ReturnId = if ($Control['UpperIds']) { $Id.ToUpperInvariant() } else { $Id }
+                    @{ resourceid = $ReturnId; resourceregion = 'westeurope'; namespace = [string]$Query['metricnamespace']; value = @($Metrics) }
+                }
+                $Out = @{ values = @($Values) }
+            }
+            $Text = if ($Control['BadJson'] -and $Status -eq 200) { '{"values":[ not json' } else { $Out | ConvertTo-Json -Depth 12 -Compress }
+            if ($Control['DuplicateMaximum'])
+            {
+                # A second "Maximum" key after each "maximum", with another value: the first must win.
+                $Text = [regex]::Replace($Text, '"maximum":(-?[0-9.Ee+-]+)', { param($M) '"maximum":' + $M.Groups[1].Value + ',"Maximum":-1' })
+            }
+            if ($Control['PascalKeys'])
+            {
+                # Keys in another case than the doc's, to show they are read without case.
+                $Text = [regex]::Replace($Text, '"(values|resourceid|value|name|errorCode|timeseries|data|average|minimum|maximum|total|count)":', { param($M) '"' + $M.Groups[1].Value.Substring(0, 1).ToUpperInvariant() + $M.Groups[1].Value.Substring(1) + '":' })
+            }
+            $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+            $Context.Response.StatusCode = $Status
+            if ($Status -eq 429 -and $Control.ContainsKey('RetryAfter')) { $Context.Response.AddHeader('Retry-After', [string]$Control['RetryAfter']) }
+            if ($Status -eq 429 -and $Control.ContainsKey('RetryAfterDateSeconds')) { $Context.Response.AddHeader('Retry-After', [DateTimeOffset]::UtcNow.AddSeconds([int]$Control['RetryAfterDateSeconds']).ToString('r')) }
+            $Context.Response.ContentType = 'application/json'
+            if ($Control['StallBodySeconds'])
+            {
+                # Headers and half the body, then a stall: only a timeout on the whole request ends it.
+                $Context.Response.ContentLength64 = $Bytes.Length
+                $Half = [int]($Bytes.Length / 2)
+                $Context.Response.OutputStream.Write($Bytes, 0, $Half)
+                $Context.Response.OutputStream.Flush()
+                Start-Sleep -Seconds ([int]$Control['StallBodySeconds'])
+                try { $Context.Response.OutputStream.Write($Bytes, $Half, $Bytes.Length - $Half) } catch { }
+            }
+            else
+            {
+                $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
+            }
+            try { $Context.Response.Close() } catch { }
+        }
+    }
+    # Wait for the listener to answer.
+    $Ready = $false
+    for ($Try = 0; $Try -lt 50 -and -not $Ready; $Try++)
+    {
+        try { $null = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/ping' -f $script:Port) -Method Post -Body '{"resourceids":[]}' -SkipHttpErrorCheck -TimeoutSec 2; $Ready = $true } catch { Start-Sleep -Milliseconds 100 }
+    }
+    if (-not $Ready) { throw 'the test listener did not start' }
+
+    # Main-thread stand-ins: the Az context (AzureCloud), the data plane token,
+    # and the ARM reads and writes of the provider state.
+    $Global:RdaTestBatchEnvironment = 'AzureCloud'
+    function Get-AzContext { return [PSCustomObject]@{ Environment = [PSCustomObject]@{ Name = $Global:RdaTestBatchEnvironment } } }
+    $Global:RdaTestBatchTokenCalls = [System.Collections.Generic.List[object]]::new()
+    # Token options: RdaTestBatchTokenMinutes (lifetime), RdaTestBatchTokenSecure (a SecureString, as Az.Accounts 5 gives).
+    $Global:RdaTestBatchTokenMinutes = 60
+    $Global:RdaTestBatchTokenSecure = $false
+    function Get-AzAccessToken
+    {
+        param([string]$ResourceUrl, [string]$TenantId)
+        $Global:RdaTestBatchTokenCalls.Add([PSCustomObject]@{ ResourceUrl = $ResourceUrl; TenantId = $TenantId })
+        $Value = if ($Global:RdaTestBatchTokenSecure) { ConvertTo-SecureString -String 'test-token' -AsPlainText -Force } else { 'test-token' }
+        return [PSCustomObject]@{ Token = $Value; ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes($Global:RdaTestBatchTokenMinutes) }
+    }
+    $Global:RdaTestBatchProviderStates = @{}
+    $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
+    function Invoke-AzRestMethod
+    {
+        param([string]$Method, [string]$Path, [string]$Payload)
+        $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path })
+        $Sub = ($Path -split '/')[2]
+        $State = if ($Global:RdaTestBatchProviderStates.ContainsKey($Sub)) { $Global:RdaTestBatchProviderStates[$Sub] } else { 'Registered' }
+        return [PSCustomObject]@{ StatusCode = 200; Content = (@{ namespace = 'Microsoft.Insights'; registrationState = $State } | ConvertTo-Json) }
+    }
+
+    function New-TestResource
+    {
+        param([string]$Type, [string]$Provider, [string]$Name, [string]$Kind = '', [string]$ManagedBy = '', [string]$SubscriptionId = $script:SubscriptionId, [string]$Location = 'westeurope')
+
+        return [PSCustomObject]@{
+            TYPE           = $Type
+            Id             = '/subscriptions/{0}/resourceGroups/RG-Metrics-Test/providers/{1}/{2}' -f $SubscriptionId, $Provider, $Name
+            subscriptionId = $SubscriptionId
+            ResourceGroup  = 'RG-Metrics-Test'
+            Name           = $Name
+            Location       = $Location
+            kind           = $Kind
+            ManagedBy      = $ManagedBy
+        }
+    }
+
+    function New-TestDisk
+    {
+        param([string]$Name, [string]$SubscriptionId = $script:SubscriptionId, [string]$Location = 'westeurope')
+        return New-TestResource -Type 'microsoft.compute/disks' -Provider 'Microsoft.Compute/disks' -Name $Name -SubscriptionId $SubscriptionId -Location $Location -ManagedBy '/subscriptions/x/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-owner'
+    }
+
+    function Get-MixedResources
+    {
+        return @(
+            (New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'VM-01'),
+            (New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-02'),
+            (New-TestDisk -Name 'Disk-01'),
+            (New-TestDisk -Name 'disk-02'),
+            (New-TestResource -Type 'microsoft.sql/servers/databases' -Provider 'Microsoft.Sql/servers/sql-test/databases' -Name 'db-dtu' -Kind 'v12.0,user'),
+            (New-TestResource -Type 'microsoft.sql/servers/databases' -Provider 'Microsoft.Sql/servers/sql-test/databases' -Name 'db-vcore' -Kind 'v12.0,user,vcore,serverless'),
+            (New-TestResource -Type 'microsoft.web/sites' -Provider 'Microsoft.Web/sites' -Name 'func-01' -Kind 'functionapp,linux'),
+            (New-TestResource -Type 'microsoft.compute/virtualmachinescalesets' -Provider 'Microsoft.Compute/virtualMachineScaleSets' -Name 'vmss-01'),
+            (New-TestResource -Type 'microsoft.documentdb/databaseaccounts' -Provider 'Microsoft.DocumentDB/databaseAccounts' -Name 'cosmos-01'),
+            (New-TestResource -Type 'microsoft.containerregistry/registries' -Provider 'Microsoft.ContainerRegistry/registries' -Name 'acr01')
+        )
+    }
+
+    # Runs Metrics.ps1 and returns the Get-AzMetric calls, the batch requests,
+    # the records and the debug log lines.
+    function Invoke-MetricsRun
+    {
+        param([object[]]$Resources, [string]$RunName, [switch]$Batch, [hashtable]$Control = @{}, [int]$Concurrency = 16, [switch]$Obfuscate, [hashtable]$Dictionaries, [string[]]$PerCallSubscriptions = @(), [object[]]$Subscriptions = $script:Subscriptions, [int]$CallTimeout = 120)
+
+        $RunDir = Join-Path $TestDrive $RunName
+        $CallDir = Join-Path $RunDir 'calls'
+        New-Item -ItemType Directory -Path $CallDir -Force | Out-Null
+        Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -File | Remove-Item -Force
+        $RunControl = @{ RunId = $RunName } + $Control
+        ($RunControl | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $script:ControlFile -Encoding utf8
+        $env:RDA_TEST_METRIC_CALL_DIR = $CallDir
+        $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
+        $Global:RdaTestBatchTokenCalls.Clear()
+        $Global:RdaTestBatchArmCalls.Clear()
+
+        $Arguments = @{
+            Subscriptions              = $Subscriptions
+            Resources                  = $Resources
+            Task                       = 'Processing'
+            ConcurrencyLimit           = $Concurrency
+            FilePath                   = (Join-Path $RunDir 'Metrics_test')
+            Obfuscate                  = [bool]$Obfuscate
+            UseMetricsBatch            = [bool]$Batch
+            MetricsBatchEndpointFormat = $script:Endpoint
+            MetricsCallTimeoutSeconds  = $CallTimeout
+        }
+        if ($PerCallSubscriptions.Count -gt 0) { $Arguments['MetricsBatchPerCallSubscriptionIds'] = $PerCallSubscriptions }
+        if ($Obfuscate)
+        {
+            $Arguments['ResourceIdDictionary'] = $Dictionaries.Id
+            $Arguments['ResourceNameDictionary'] = $Dictionaries.Name
+            $Arguments['ResourceSubDictionary'] = $Dictionaries.Sub
+            $Arguments['ResourceGroupDictionary'] = $Dictionaries.Rg
+        }
+        $Global:MetricsFailedSubs = @()
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        try
+        {
+            $null = & $script:MetricsScript @Arguments *>&1
+        }
+        finally
+        {
+            $Global:DebugLogFile = $script:OriginalDebugLogFile
+        }
+
+        $Files = @(Get-ChildItem -LiteralPath $RunDir -Filter 'Metrics_test_*.json')
+        return [PSCustomObject]@{
+            Calls        = @(Get-ChildItem -LiteralPath $CallDir -Filter '*.json' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+            Posts        = @(Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -Filter '*.json' | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+            Records      = @($Files | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Metrics })
+            RawJson      = @($Files | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw })
+            DebugLines   = @(if (Test-Path -LiteralPath (Join-Path $RunDir 'debug.log')) { Get-Content -LiteralPath (Join-Path $RunDir 'debug.log') })
+            TokenCalls   = @($Global:RdaTestBatchTokenCalls)
+            ArmCalls     = @($Global:RdaTestBatchArmCalls)
+            FailedSubs   = @($Global:MetricsFailedSubs)
+            Seconds      = $Clock.Elapsed.TotalSeconds
+        }
+    }
+
+    # 'ID|Metric' -> the record as canonical JSON (sorted names), types kept.
+    function ConvertTo-RecordMap
+    {
+        param([object[]]$Records)
+        $Map = @{}
+        foreach ($Record in $Records)
+        {
+            $Sorted = [ordered]@{}
+            foreach ($Property in ($Record.PSObject.Properties | Sort-Object Name)) { $Sorted[$Property.Name] = $Property.Value }
+            $Map[('{0}|{1}' -f $Record.ID, $Record.Metric)] = ($Sorted | ConvertTo-Json -Depth 5 -Compress)
+        }
+        return $Map
+    }
+
+    function Assert-SameRecords
+    {
+        param($Expected, $Actual)
+        $Want = ConvertTo-RecordMap -Records $Expected.Records
+        $Got = ConvertTo-RecordMap -Records $Actual.Records
+        $Got.Count | Should -Be $Want.Count
+        @($Got.Keys | Sort-Object) | Should -Be @($Want.Keys | Sort-Object)
+        foreach ($Key in $Want.Keys) { $Got[$Key] | Should -Be $Want[$Key] -Because $Key }
+    }
+}
+
+AfterAll {
+    try { $null = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/stop' -f $script:Port) -TimeoutSec 5 } catch { }
+    $script:Listener | Stop-Job -ErrorAction SilentlyContinue
+    $script:Listener | Remove-Job -Force -ErrorAction SilentlyContinue
+    $env:PSModulePath = $script:OriginalModulePath
+    $Global:DebugLogFile = $script:OriginalDebugLogFile
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_NOTFOUND' -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure -ErrorAction SilentlyContinue
+}
+
+Describe 'Metrics.ps1 batch work items' {
+
+    BeforeAll {
+        # With no -Task the script only defines its functions.
+        . $script:MetricsScript
+        $script:Start = (Get-Date).AddDays(-31)
+        $script:End = Get-Date
+        function New-Def([string]$Id, [string]$Name = 'm1', [string]$Location = 'westeurope', [string]$Aggregation = 'Maximum', [string]$Interval = '1:00:00')
+        {
+            [PSCustomObject]@{ MetricName = $Name; Id = $Id; StartTime = $script:Start; EndTime = $script:End; Interval = $Interval; Aggregation = $Aggregation; Location = $Location }
+        }
+        function Get-DiskId([int]$N, [string]$Sub = $script:SubscriptionId) { '/subscriptions/{0}/resourceGroups/rg/providers/Microsoft.Compute/disks/disk-{1:d3}' -f $Sub, $N }
+    }
+
+    It 'reads the subscription and the namespace of a nested resource id' {
+        $Target = Get-MetricBatchTarget -Id '/subscriptions/ABC/resourceGroups/rg/providers/Microsoft.Sql/servers/s1/databases/db1'
+        $Target.SubscriptionId | Should -Be 'abc'
+        $Target.Namespace | Should -Be 'microsoft.sql/servers/databases'
+    }
+
+    It 'gives no target for ids the batch call cannot express' {
+        Get-MetricBatchTarget -Id '/subscriptions/abc/providers/Microsoft.Capacity/reservationOrders/x' | Should -BeNullOrEmpty
+        Get-MetricBatchTarget -Id '/subscriptions/abc/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm/providers/Microsoft.Insights/x/y' | Should -BeNullOrEmpty
+        Get-MetricBatchTarget -Id '/subscriptions/abc/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines' | Should -BeNullOrEmpty
+        Get-MetricBatchTarget -Id '' | Should -BeNullOrEmpty
+    }
+
+    It 'writes time grains the ISO 8601 way' {
+        ConvertTo-MetricBatchInterval -Interval '1:00:00' | Should -Be 'PT1H'
+        ConvertTo-MetricBatchInterval -Interval '01:00:00' | Should -Be 'PT1H'
+        ConvertTo-MetricBatchInterval -Interval '1.00:00:00' | Should -Be 'P1D'
+        ConvertTo-MetricBatchInterval -Interval '00:01:00' | Should -Be 'PT1M'
+        ConvertTo-MetricBatchInterval -Interval 'soon' | Should -BeNullOrEmpty
+    }
+
+    It 'puts at most 50 resources in one request and keeps their order' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        foreach ($N in 1..120) { $Groups.Add([object[]]@(New-Def -Id (Get-DiskId $N))) }
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        $Items.Count | Should -Be 3
+        @($Items | ForEach-Object { $_.ResourceIds.Count }) | Should -Be @(50, 50, 20)
+        $Items[0].ResourceIds[0] | Should -Be (Get-DiskId 1).ToLowerInvariant()
+        $Items[2].ResourceIds[19] | Should -Be (Get-DiskId 120).ToLowerInvariant()
+        @($Items | ForEach-Object { $_.DefCount }) | Should -Be @(50, 50, 20)
+    }
+
+    It 'splits by subscription, region, metric names, time grain and aggregation' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1)))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 2 $script:OtherSubscriptionId)))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 3) -Location 'eastus'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 4) -Name 'm2'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 5) -Aggregation 'Minimum'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 6) -Interval '1.00:00:00'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 7)))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId, $script:OtherSubscriptionId)
+
+        $Items.Count | Should -Be 6
+        $Items[0].ResourceIds.Count | Should -Be 2
+        $Items[0].Groups.Count | Should -Be 2
+        @($Items | ForEach-Object { $_.Aggregation }) | Should -Be @('Maximum', 'Maximum', 'Maximum', 'Maximum', 'Minimum', 'Maximum')
+        $Items[5].Interval | Should -Be 'P1D'
+        $Items[2].Region | Should -Be 'eastus'
+    }
+
+    It 'joins a resource whose id differs only in case to the same request' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1)))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1).ToUpperInvariant().Replace('SUBSCRIPTIONS', 'subscriptions')))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        $Items.Count | Should -Be 1
+        $Items[0].ResourceIds.Count | Should -Be 1
+        $Items[0].Groups.Count | Should -Be 2
+    }
+
+    It 'keeps a global resource on the per-resource path' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1) -Location 'global'))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        $Items[0] -is [System.Array] | Should -BeTrue
+    }
+
+    It 'asks for a metric name once when two definitions differ only in its case' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@((New-Def -Id (Get-DiskId 1) -Name 'cpu_percent'), (New-Def -Id (Get-DiskId 1) -Name 'CPU_Percent')))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        @($Items[0].MetricNames) | Should -Be @('cpu_percent')
+    }
+
+    It 'keeps the per-resource path for what it cannot express or may not batch' {
+        $Groups = [System.Collections.Generic.List[object]]::new()
+        $Groups.Add([object[]]@(New-Def -Id '/subscriptions/abc/providers/Microsoft.Capacity/reservationOrders/x'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 1 $script:OtherSubscriptionId)))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 2) -Location ''))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 3) -Location 'East US'))
+        $Groups.Add([object[]]@(New-Def -Id (Get-DiskId 4)))
+
+        $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
+
+        $Items.Count | Should -Be 5
+        @($Items | Where-Object { $_ -is [System.Array] }).Count | Should -Be 4
+        $Items[4].RdaBatchUnit | Should -BeTrue
+    }
+}
+
+Describe 'Metrics.ps1 without -UseMetricsBatch' {
+
+    It 'makes no batch request, reads no provider state and gets no token' {
+        $Run = Invoke-MetricsRun -Resources (Get-MixedResources) -RunName 'off'
+
+        $Run.Posts.Count | Should -Be 0
+        $Run.ArmCalls.Count | Should -Be 0
+        $Run.TokenCalls.Count | Should -Be 0
+        $Run.Calls.Count | Should -BeGreaterThan 0
+        @($Run.DebugLines | Where-Object { $_ -match 'Metrics batch|\[batch\]' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Metrics.ps1 with -UseMetricsBatch' {
+
+    BeforeAll {
+        $script:Mixed = Get-MixedResources
+        $script:PerResource = Invoke-MetricsRun -Resources $script:Mixed -RunName 'per-resource'
+    }
+
+    It 'writes the same records as the per-resource path, with no Get-AzMetric call' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-same' -Batch
+
+        $Run.Calls.Count | Should -Be 0
+        $Run.Posts.Count | Should -BeGreaterThan 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'also takes an answer that carries errorCode Success, as the doc shows it' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-doc-shape' -Batch -Control @{ WithErrorCode = $true }
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'keeps whole numbers as JSON numbers with a fraction, as the per-resource path writes them' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-numbers' -Batch
+        $PerCall = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'per-numbers'
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
+
+        $Strip = { param($Text) ([regex]::Matches(($Text -join ''), '"MetricSeries":\[[^\]]*\]') | ForEach-Object { $_.Value } | Sort-Object) -join ';' }
+        (& $Strip $Run.RawJson) | Should -Be (& $Strip $PerCall.RawJson)
+    }
+
+    It 'asks for lower-case ids, the namespace and one aggregation per request, with the token' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-shape' -Batch
+
+        foreach ($Post in $Run.Posts)
+        {
+            $Ids = @(($Post.Body | ConvertFrom-Json).resourceids)
+            foreach ($Id in $Ids) { $Id | Should -BeExactly $Id.ToLowerInvariant() }
+            $Post.Aggregation | Should -Not -Match ','
+            $Post.Authorization | Should -Be 'Bearer test-token'
+            $Post.Path | Should -Match '^/westeurope/subscriptions/12345678-1234-1234-1234-123456789012/metrics:getBatch$'
+        }
+        @($Run.Posts | Where-Object { $_.Namespace -eq 'microsoft.sql/servers/databases' }).Count | Should -BeGreaterThan 0
+        $Run.TokenCalls.Count | Should -Be 1
+        $Run.TokenCalls[0].ResourceUrl | Should -Be 'https://metrics.monitor.azure.com'
+        $Run.TokenCalls[0].TenantId | Should -Be $script:TenantId
+    }
+
+    It 'sends 120 disks in 3 requests of at most 50' {
+        $Disks = @(1..120 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-120' -Batch
+
+        $Run.Posts.Count | Should -Be 3
+        @($Run.Posts | ForEach-Object { @(($_.Body | ConvertFrom-Json).resourceids).Count } | Sort-Object) | Should -Be @(20, 50, 50)
+        $Run.Records.Count | Should -Be 480
+        $Run.Calls.Count | Should -Be 0
+    }
+
+    It 'maps answers back whatever the case of the returned id, and keeps the original id' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-upper' -Batch -Control @{ UpperIds = $true }
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.Records | Where-Object { $_.ID -cmatch 'VM-01' }).Count | Should -Be 2
+    }
+
+    It 'asks Get-AzMetric for one metric the answer marks with an error, and keeps the rest' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-metric-error' -Batch -Control @{ ErrorMetrics = @('disk-02|Composite Disk Read Bytes/sec') }
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName) | Should -Be @('Composite Disk Read Bytes/sec')
+        $Run.Calls[0].ResourceId | Should -Match 'disk-02$'
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'asks Get-AzMetric for a resource missing from the answer, as one grouped call' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-missing' -Batch -Control @{ OmitNames = @('disk-02') }
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName).Count | Should -Be 4
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'falls back to Get-AzMetric after the retries of a failing request, and loses nothing' {
+        $Disks = @(1..3 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-fail'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-fail' -Batch -Control @{ Status = 500 }
+
+        $Run.Posts.Count | Should -Be 4
+        $Run.Calls.Count | Should -Be 3
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        $Run.FailedSubs.Count | Should -Be 0
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt' }).Count | Should -Be 1
+    }
+
+    It 'gives a 404 batch request 1 attempt and its Get-AzMetric fallback 1 attempt too (<Case>)' -ForEach @(
+        @{ Case = 'the batch request answers 404'; Tag = 'status404'; Control = @{ Status = 404 }; Posts = 1 }
+        @{ Case = 'the batch answer leaves the gone resource out'; Tag = 'omitted'; Control = @{ OmitNames = @('disk-002') }; Posts = 1 }
+    ) {
+        $Disks = @(1..3 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $env:RDA_TEST_METRIC_NOTFOUND = 'disk-002'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName ('batch-notfound-' + $Tag) -Batch -Control $Control
+        }
+        finally
+        {
+            Remove-Item -Path 'Env:RDA_TEST_METRIC_NOTFOUND' -ErrorAction SilentlyContinue
+        }
+
+        $Run.Posts.Count | Should -Be $Posts -Because 'a 404 batch request is not retried'
+        # The gone disk's 4 metrics go to Get-AzMetric as one grouped request: 1 attempt, not 4.
+        @($Run.Calls | Where-Object { $_.ResourceId -like '*/disk-002' }).Count | Should -Be 1
+        $Gone = @($Run.Records | Where-Object { $_.ID -like '*/disk-002' })
+        $Gone.Count | Should -Be 4
+        foreach ($Record in $Gone)
+        {
+            $Record.MetricError | Should -BeTrue
+            $Record.MetricValue | Should -Be 0
+            $Record.MetricCount | Should -Be 0
+            $Record.MetricPercentile | Should -Be 0
+        }
+        @($Run.Records | Where-Object { $_.ID -notlike '*/disk-002' -and $_.MetricError }).Count | Should -Be 0
+        # Still counted as incomplete, as before.
+        $Run.FailedSubs.Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'disk-002/.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' }).Count | Should -Be 4
+    }
+
+    It 'retries a throttled request and then uses its answer' {
+        $Disks = @(New-TestDisk -Name 'disk-001')
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-throttle' -Batch -Control @{ Status = 429; FailFirst = 1 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+    }
+
+    It 'turns batch off for a subscription that refuses it (403) and uses Get-AzMetric for all of it' {
+        $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-403'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-403' -Batch -Control @{ Status = 403 } -Concurrency 1
+
+        # One refused request, no retry; the second request of the subscription is not sent.
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 60
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 1
+    }
+
+    It 'does not batch a subscription where Microsoft.Insights is not registered' {
+        $Global:RdaTestBatchProviderStates[$script:SubscriptionId] = 'NotRegistered'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-unregistered' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchProviderStates.Remove($script:SubscriptionId)
+        }
+
+        $Run.Posts.Count | Should -Be 0
+        @($Run.ArmCalls | Where-Object { $_.Method -ne 'GET' }).Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match "Microsoft.Insights is 'NotRegistered'" }).Count | Should -Be 1
+    }
+
+    It 'sends no token to an endpoint that is not Azure Monitor' {
+        $Saved = $script:Endpoint
+        $script:Endpoint = 'https://{0}.example.com'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-bad-endpoint' -Batch
+        }
+        finally
+        {
+            $script:Endpoint = $Saved
+        }
+
+        $Run.TokenCalls.Count | Should -Be 0
+        $Run.Calls.Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'not the Azure Monitor one' }).Count | Should -Be 1
+    }
+
+    It 'uses the per-resource path outside AzureCloud' {
+        $Global:RdaTestBatchEnvironment = 'AzureUSGovernment'
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-gov' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchEnvironment = 'AzureCloud'
+        }
+
+        $Run.Posts.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'keeps a subscription the preflight left unregistered on the per-resource path, even once registered' {
+        # The provider reads Registered now, but the preflight decided per call for this run.
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-preflight-percall' -Batch -PerCallSubscriptions @($script:SubscriptionId)
+
+        $Run.Posts.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'was left without Microsoft.Insights at the start of the run' }).Count | Should -Be 1
+    }
+
+    It 'renews a token that ends within 10 minutes before a batch' {
+        $Global:RdaTestBatchTokenMinutes = 5
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-renew' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenMinutes = 60
+        }
+
+        $Run.TokenCalls.Count | Should -Be 2
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
+    }
+
+    It 'sends a SecureString token as plain text in the header' {
+        $Global:RdaTestBatchTokenSecure = $true
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-secure' -Batch
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenSecure = $false
+        }
+
+        $Run.Posts[0].Authorization | Should -Be 'Bearer test-token'
+        $Run.Calls.Count | Should -Be 0
+    }
+
+    It 'gets one token per tenant' {
+        $Subs = @(
+            [PSCustomObject]@{ id = $script:SubscriptionId; Name = 'a'; tenantId = 'tenant-a' },
+            [PSCustomObject]@{ id = $script:OtherSubscriptionId; Name = 'b'; tenantId = 'tenant-b' }
+        )
+        $Resources = @((New-TestDisk -Name 'disk-a'), (New-TestDisk -Name 'disk-b' -SubscriptionId $script:OtherSubscriptionId))
+        $Run = Invoke-MetricsRun -Resources $Resources -RunName 'batch-tenants' -Batch -Subscriptions $Subs
+
+        @($Run.TokenCalls | ForEach-Object { $_.TenantId } | Sort-Object) | Should -Be @('tenant-a', 'tenant-b')
+        $Run.Posts.Count | Should -Be 2
+    }
+
+    It 'renews a refused token (401) once, then stops batching that tenant' {
+        $Disks = @(1..130 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-401'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-401' -Batch -Control @{ Status = 401 }
+
+        # First Metrics file batch: 2 requests refused; the token is renewed once and both
+        # are sent again, refused again, and batch stops for the tenant: the second file
+        # batch sends nothing.
+        $Run.Posts.Count | Should -Be 4
+        $Run.TokenCalls.Count | Should -Be 2
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'renewing the token of 1 tenant' }).Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
+    }
+
+    It 'renews a refused token at once and uses the answer of the request sent again' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-once' -Batch -Control @{ Status = 401; FailFirst = 1 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.TokenCalls.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+    }
+
+    It 'gives a token renewed before a batch its own renewal on a 401' {
+        # File batch 1: both requests refused (401), the token renewed, both sent again
+        # and failing (500, 4 attempts each) so the renewal never worked. File batch 2:
+        # the near-expiry renewal makes a new token; its 401 is renewed again and the
+        # request sent again works.
+        $Disks = @(1..130 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Sequence = @(401, 401) + @(500) * 8 + @(401, 0)
+        $Global:RdaTestBatchTokenMinutes = 5
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-401-generation' -Batch -Control @{ StatusSequence = $Sequence } -Concurrency 1
+        }
+        finally
+        {
+            $Global:RdaTestBatchTokenMinutes = 60
+        }
+
+        $Run.Posts.Count | Should -Be 12
+        # Only the 100 disks of the first file batch go per call.
+        @($Run.Calls | ForEach-Object { $_.ResourceId } | Sort-Object -Unique).Count | Should -Be 100
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 0
+    }
+
+    It 'counts a request sent again after a 401 once' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-401-count' -Batch -Control @{ Status = 401; FailFirst = 1 }
+
+        @($Run.DebugLines | Where-Object { $_ -match 'Metrics batch \(-UseMetricsBatch\): 1 getBatch request\(s\) \(2 attempt\(s\)\) for 1 resource\(s\)' }).Count | Should -Be 1
+    }
+
+    It 'reads the answer''s keys without regard to case' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-pascal' -Batch -Control @{ PascalKeys = $true }
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'reads an error code in another key case as an error, not as an answer' {
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-pascal-error' -Batch -Control @{ PascalKeys = $true; ErrorMetrics = @('disk-02|Composite Disk Read Bytes/sec') }
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Calls[0].MetricName) | Should -Be @('Composite Disk Read Bytes/sec')
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+    }
+
+    It 'takes the first of two point keys that differ only in case' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-dup-keys' -Batch -Control @{ DuplicateMaximum = $true }
+        $PerCall = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'per-dup-keys'
+
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $PerCall -Actual $Run
+    }
+
+    It 'uses the per-resource path when the batch point type cannot be loaded' {
+        # A fresh process, where the type is not loaded yet, with Add-Type failing as it
+        # does under Constrained Language Mode.
+        $Child = Join-Path $TestDrive 'no-add-type.ps1'
+        Set-Content -LiteralPath $Child -Encoding utf8 -Value @'
+param($RepoRoot, $ModuleRoot, $Endpoint, $Out)
+$env:PSModulePath = $ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
+. (Join-Path $RepoRoot 'Functions/Common.Functions.ps1')
+function Get-AzContext { [pscustomobject]@{ Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function Get-AzAccessToken { [pscustomobject]@{ Token = 'test-token'; ExpiresOn = [DateTimeOffset]::UtcNow.AddHours(1) } }
+function Invoke-AzRestMethod { [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' } }
+function Add-Type { throw 'Cannot add type. Definition of new types is not supported in this language mode.' }
+$env:RDA_TEST_METRIC_CALL_DIR = Join-Path $Out 'calls'
+New-Item -ItemType Directory -Path $env:RDA_TEST_METRIC_CALL_DIR -Force | Out-Null
+$Global:DebugLogFile = Join-Path $Out 'debug.log'
+$Disk = [pscustomobject]@{ TYPE = 'microsoft.compute/disks'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg/providers/Microsoft.Compute/disks/disk-x'; subscriptionId = '12345678-1234-1234-1234-123456789012'; ResourceGroup = 'rg'; Name = 'disk-x'; Location = 'westeurope'; ManagedBy = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm' }
+$null = & (Join-Path $RepoRoot 'Extension/Metrics.ps1') -Subscriptions @([pscustomobject]@{ id = '12345678-1234-1234-1234-123456789012'; Name = 's'; tenantId = 't' }) -Resources @($Disk) -Task 'Processing' -ConcurrencyLimit 4 -FilePath (Join-Path $Out 'Metrics_test') -Obfuscate $false -UseMetricsBatch -MetricsBatchEndpointFormat $Endpoint *>&1
+'@
+        $Out = Join-Path $TestDrive 'no-add-type'
+        New-Item -ItemType Directory -Path $Out -Force | Out-Null
+        Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -File | Remove-Item -Force
+        $Pwsh = (Get-Process -Id $PID).Path
+        & $Pwsh -NoProfile -NonInteractive -File $Child -RepoRoot $script:RepoRoot -ModuleRoot $script:ModuleRoot -Endpoint $script:Endpoint -Out $Out | Out-Null
+
+        @(Get-ChildItem -LiteralPath (Join-Path $script:ServerDir 'calls') -File).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath (Join-Path $Out 'calls') -File).Count | Should -Be 1
+        @((Get-Content -LiteralPath (Join-Path $Out 'Metrics_test_1.json') -Raw | ConvertFrom-Json).Metrics).Count | Should -Be 4
+        @(Get-Content -LiteralPath (Join-Path $Out 'debug.log') | Where-Object { $_ -match 'could not load the batch point type' }).Count | Should -Be 1
+    }
+
+    It 'asks Get-AzMetric for every resource of an answer that is not readable JSON' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2], $script:Mixed[3]) -RunName 'batch-bad-json' -Batch -Control @{ BadJson = $true }
+
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 2
+        $Run.Records.Count | Should -Be 8
+        @($Run.DebugLines | Where-Object { $_ -match 'could not be read' }).Count | Should -Be 1
+    }
+
+    It 'times out a batch answer whose body stalls, and falls back' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-stall' -Batch -Control @{ StallBodySeconds = 4 } -CallTimeout 2
+
+        $Run.Calls.Count | Should -Be 1
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt\(s\) \(Timed out after 2s\)' }).Count | Should -Be 1
+    }
+
+    It 'does not retry a request Azure rejects (400) and does not turn batch off' {
+        $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-400'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-400' -Batch -Control @{ Status = 400 } -Concurrency 1
+
+        $Run.Posts.Count | Should -Be 2
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
+    }
+
+    It 'waits at least what Retry-After asks before retrying a throttled request' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfter = 6 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Seconds | Should -BeGreaterOrEqual 6
+    }
+
+    It 'waits until a Retry-After date before retrying a throttled request' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after-date' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfterDateSeconds = 7 }
+
+        $Run.Posts.Count | Should -Be 2
+        $Run.Calls.Count | Should -Be 0
+        $Run.Seconds | Should -BeGreaterOrEqual 5
+    }
+
+    It 'writes the same masked records under -Obfuscate' {
+        $Dict = {
+            $D = @{ Id = @{}; Name = @{}; Sub = @{}; Rg = @{} }
+            $N = 0
+            foreach ($R in $script:Mixed)
+            {
+                $N++
+                $D.Id[$R.Id] = '/subscriptions/prod_sub_t/resourcegroups/prod_rg_t/providers/x/y/prod_{0}' -f $N
+                $D.Name[$R.Id] = 'prod_{0}' -f $N
+                $D.Sub[$R.Id] = 'prod_sub_t'
+                $D.Rg[$R.Id] = 'prod_rg_t'
+            }
+            $D
+        }
+        $Plain = Invoke-MetricsRun -Resources $script:Mixed -RunName 'per-masked' -Obfuscate -Dictionaries (& $Dict)
+        $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-masked' -Batch -Obfuscate -Dictionaries (& $Dict)
+
+        $Run.Posts.Count | Should -BeGreaterThan 0
+        $Run.Calls.Count | Should -Be 0
+        Assert-SameRecords -Expected $Plain -Actual $Run
+        @($Run.Records | Where-Object { $_.ID -notmatch '/prod_\d+$' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Invoke-RdaInsightsProviderPreflight' {
+
+    BeforeEach {
+        $script:States = @{ 'sub-a' = 'Registered'; 'sub-b' = 'NotRegistered'; 'sub-c' = 'NotRegistered' }
+        $script:Registered = [System.Collections.Generic.List[string]]::new()
+        $script:Prompts = [System.Collections.Generic.List[string]]::new()
+        Mock Get-RdaInsightsProviderState { [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $script:States[$SubscriptionId]; Error = $null } }
+        Mock Register-RdaInsightsProvider { $script:Registered.Add($SubscriptionId); $script:States[$SubscriptionId] = 'Registered'; $null }
+        Mock Write-Host { }
+        Mock Start-Sleep { }
+    }
+
+    It 'asks nothing and registers nothing when every subscription is registered' {
+        $script:States['sub-b'] = 'Registered'; $script:States['sub-c'] = 'Registered'
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.Registered) | Should -Be @('sub-a', 'sub-b', 'sub-c')
+    }
+
+    It 'registers the missing ones on y, after one prompt that names their count' {
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'Y' }
+
+        @($script:Prompts) | Should -Be @('Register Microsoft.Insights on these 2 subscription(s) now? [Y/N]')
+        @($script:Registered | Sort-Object) | Should -Be @('sub-b', 'sub-c')
+        @($Result.Registered | Sort-Object) | Should -Be @('sub-a', 'sub-b', 'sub-c')
+        $Result.NotRegistered.Count | Should -Be 0
+    }
+
+    It 'registers nothing on n and prints the register command per subscription' {
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) 'n' }
+
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.NotRegistered | Sort-Object) | Should -Be @('sub-b', 'sub-c')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Set-AzContext -Subscription sub-b; Register-AzResourceProvider -ProviderNamespace Microsoft.Insights*' } -Times 1 -Exactly
+    }
+
+    It 'registers nothing and does not prompt when no one can answer' {
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b' -Interactive $false -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        $Result.Asked | Should -BeFalse
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Register-AzResourceProvider -ProviderNamespace Microsoft.Insights*' } -Times 1 -Exactly
+    }
+
+    It 'names the permission needed when a register is refused, and keeps that subscription per call' {
+        Mock Register-RdaInsightsProvider { 'HTTP 403 AuthorizationFailed' } -ParameterFilter { $SubscriptionId -eq 'sub-b' }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) 'y' }
+
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        @($Result.Registered | Sort-Object) | Should -Be @('sub-a', 'sub-c')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*sub-b*/register/action*Contributor and Owner*' } -Times 1 -Exactly
+    }
+
+    It 'stops waiting at the deadline for a registration that never completes' {
+        Mock Register-RdaInsightsProvider { $null }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -DeadlineSeconds 0 -PollSeconds 0
+
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        $Result.Registered.Count | Should -Be 0
+        # One read before asking, and no poll once the deadline has passed.
+        Should -Invoke Get-RdaInsightsProviderState -Times 1 -Exactly
+    }
+
+    It 'shares one wait between several registrations' {
+        $script:Polls = 0
+        Mock Register-RdaInsightsProvider { $null }
+        Mock Get-RdaInsightsProviderState {
+            $State = $script:States[$SubscriptionId]
+            if ($script:Registered.Count -eq 0 -and $State -eq 'NotRegistered' -and $script:Polls -ge 2) { $State = 'Registered' }
+            if ($script:Prompts.Count -gt 0) { $script:Polls++ }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+        }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' } -DeadlineSeconds 60 -PollSeconds 10
+
+        @($Result.Registered | Sort-Object) | Should -Be @('sub-b', 'sub-c')
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+    }
+
+    It 'on the next run, finds them registered and does not ask again' {
+        $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+        $Second = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 1
+        $Second.NotRegistered.Count | Should -Be 0
+        Should -Invoke Register-RdaInsightsProvider -Times 2 -Exactly
+    }
+
+    It 'ends the wait at the deadline even when each read is slow' {
+        $Subs = @(1..6 | ForEach-Object { 'sub-slow-{0}' -f $_ })
+        foreach ($Sub in $Subs) { $script:States[$Sub] = 'NotRegistered' }
+        Mock Register-RdaInsightsProvider { $null }
+        $script:PollReads = 0
+        $script:Answered = $false
+        Mock Get-RdaInsightsProviderState {
+            # The reads after the answer (the wait) are slow.
+            if ($script:Answered) { $script:PollReads++; [System.Threading.Thread]::Sleep(400) }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'NotRegistered'; Error = $null }
+        }
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds $Subs -Interactive $true -ReadAnswer { param($P) $script:Answered = $true; 'y' } -DeadlineSeconds 1 -PollSeconds 10
+        $Clock.Stop()
+
+        @($Result.NotRegistered).Count | Should -Be 6
+        # 6 reads of 0.4 s would take 2.4 s; the deadline stops them after 1 s.
+        $script:PollReads | Should -BeLessOrEqual 3
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 2
+    }
+
+    It 'never sleeps past the deadline' {
+        $script:Slept = [System.Collections.Generic.List[double]]::new()
+        Mock Register-RdaInsightsProvider { $null }
+        Mock Start-Sleep { $script:Slept.Add([double]$Milliseconds + 1000 * [double]$Seconds) }
+        $null = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -DeadlineSeconds 1 -PollSeconds 10
+
+        $script:Slept.Count | Should -BeGreaterThan 0
+        foreach ($Ms in $script:Slept) { $Ms | Should -BeLessOrEqual 1000 }
+    }
+
+    It 'reads a prompt that cannot be shown (pwsh -NonInteractive) as no one there to answer' {
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) Write-Error 'PowerShell is in NonInteractive mode. Read and Prompt functionality is not available.' }
+
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*No one can answer a prompt*' } -Times 1 -Exactly
+    }
+
+    It 'waits for a subscription already being registered, without asking' {
+        $script:States['sub-b'] = 'Registering'
+        $script:Reads = 0
+        Mock Get-RdaInsightsProviderState { $script:Reads++; $State = if ($script:Reads -gt 1) { 'Registered' } else { $script:States[$SubscriptionId] }; [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null } }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        @($Result.Registered) | Should -Be @('sub-b')
+    }
+
+    It 'lets the batch call decide for a subscription whose state cannot be read' {
+        $script:States['sub-b'] = 'Unknown'
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+        $script:Prompts.Count | Should -Be 0
+        @($Result.Registered) | Should -Be @('sub-b')
+    }
+}
+
+Describe 'A direct run hands its preflight result to the metrics phase' -Skip:$IsWindows {
+
+    It 'keeps a subscription answered no (no console) on the per-resource path, though registered meanwhile' {
+        $Harness = Join-Path $PSScriptRoot 'Helpers/InnerRunHarness.ps1'
+        $Work = Join-Path $TestDrive 'direct-run'
+        $Tree = Join-Path $Work 'tree'
+        $Out = Join-Path $Work 'out'
+        New-Item -ItemType Directory -Path $Tree, $Out -Force | Out-Null
+        foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services')) { Copy-Item -LiteralPath (Join-Path $script:RepoRoot $Item) -Destination $Tree -Recurse -Force }
+        $Pwsh = (Get-Process -Id $PID).Path
+
+        $Console = @(& $Pwsh -NoProfile -NonInteractive -File $Harness -Tree $Tree -Out $Out -UseMetricsBatch -DebugOutput 2>&1 | ForEach-Object { [string]$_ })
+        $Debug = @(Get-ChildItem -LiteralPath $Out -Recurse -Filter 'DebugLog_*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName })
+
+        ($Console -join "`n") | Should -Match 'No one can answer a prompt in this session'
+        @($Debug | Where-Object { $_ -match 'was left without Microsoft.Insights at the start of the run' }).Count | Should -Be 1
+        # Without the hand-off the metrics phase would read Registered and ask for a token.
+        @($Debug | Where-Object { $_ -match 'could not get a metrics data plane token' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a y' {
+
+    BeforeAll {
+        $script:ProductFiles = @(Get-ChildItem -LiteralPath $script:RepoRoot -Recurse -Filter '*.ps1' | Where-Object { $_.FullName -notmatch '[\\/]Tests[\\/]' })
+        $script:Calls = foreach ($File in $script:ProductFiles)
+        {
+            $Ast = [System.Management.Automation.Language.Parser]::ParseFile($File.FullName, [ref]$null, [ref]$null)
+            foreach ($Command in $Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] }, $true))
+            {
+                [pscustomobject]@{ File = $File.Name; Name = $Command.GetCommandName(); Ast = $Command }
+            }
+        }
+    }
+
+    It 'registers only through Register-RdaInsightsProvider, called only after the y check in the preflight' {
+        @($script:Calls | Where-Object { $_.Name -eq 'Register-AzResourceProvider' }).Count | Should -Be 0
+        $Register = @($script:Calls | Where-Object { $_.Name -eq 'Register-RdaInsightsProvider' })
+        $Register.Count | Should -Be 1
+        $Function = $Register[0].Ast.Parent
+        while ($Function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $Function = $Function.Parent }
+        $Function.Name | Should -Be 'Invoke-RdaInsightsProviderPreflight'
+        $Body = $Function.Body.Extent.Text
+        $Guard = $Body.IndexOf("`$Answer -notmatch '^\s*(y|yes)\s*$'")
+        $Guard | Should -BeGreaterOrEqual 0
+        $Guard | Should -BeLessThan $Body.IndexOf('Register-RdaInsightsProvider -SubscriptionId')
+        # Only the "y" branch fills the list of subscriptions to register.
+        $Body | Should -Match 'else\r?\n\s*\{\r?\n\s*\$ToRegister = @\(\$Missing\)\r?\n\s*\}'
+        @($script:Calls | Where-Object { $_.Ast.Extent.Text -match '/register\?' }).Count | Should -Be 0
+    }
+
+    It 'forwards -UseMetricsBatch and the per-call list to every inner run and to Metrics.ps1' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Stream = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1') -Raw
+        $Inner = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$InventoryPassthrough['UseMetricsBatch'] = `$true }"))
+        $Wrapper | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$WorkerArgs.UseMetricsBatch = `$true }"))
+        $Wrapper | Should -Match ([regex]::Escape("`$InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]`$MetricsBatchPerCallIds"))
+        $Wrapper | Should -Match ([regex]::Escape("`$WorkerArgs.MetricsBatchPerCallSubscriptionIds = [string[]]`$MetricsBatchPerCallIds"))
+        $Stream | Should -Match ([regex]::Escape("if (`$UseMetricsBatch) { `$InventoryPassthrough['UseMetricsBatch'] = `$true }"))
+        $Stream | Should -Match ([regex]::Escape("`$InventoryPassthrough['MetricsBatchPerCallSubscriptionIds'] = [string[]]`$MetricsBatchPerCallSubscriptionIds"))
+        $Inner | Should -Match ([regex]::Escape('-UseMetricsBatch:$UseMetricsBatch.IsPresent -MetricsBatchPerCallSubscriptionIds'))
+    }
+
+    It 'keeps a direct run''s preflight result where the metrics phase reads it (script scope)' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Assignments = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $N.Left.VariablePath.UserPath -match 'MetricsBatchPerCallSubscriptionIds$' }, $true))
+        $Assignments.Count | Should -Be 1
+        # Set inside a function (RunInventorySetup), read in another: only script scope reaches it.
+        $Assignments[0].Left.VariablePath.IsScript | Should -BeTrue
+    }
+
+    It 'asks only for subscriptions this run collects (not those a resumed run already completed)' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })'))
+        $Wrapper | Should -Match ([regex]::Escape('Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope'))
+    }
+
+    It 'keeps the position of every earlier parameter of the scripts it adds parameters to' {
+        $Base = 'd90882f5f871b7c8e0c119de5260afa0059d41ba'
+        $HasBase = $null -ne (git -C $script:RepoRoot cat-file -t $Base 2>$null)
+        if (-not $HasBase) { Set-ItResult -Skipped -Because 'the base commit is not in this clone' ; return }
+        foreach ($File in 'ResourceInventory.ps1', 'Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1', 'Extension/Metrics.ps1')
+        {
+            $Positional = {
+                param([string]$Text)
+                $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
+                @($Ast.ParamBlock.Parameters | Where-Object { $_.StaticType -ne [switch] -and $_.StaticType -ne [System.Management.Automation.SwitchParameter] } | ForEach-Object { $_.Name.VariablePath.UserPath })
+            }
+            $Old = & $Positional ((git -C $script:RepoRoot show ('{0}:{1}' -f $Base, $File)) -join "`n")
+            $New = & $Positional (Get-Content -LiteralPath (Join-Path $script:RepoRoot $File) -Raw)
+            @($New | Select-Object -First $Old.Count) | Should -Be $Old -Because $File
+        }
+    }
+
+    It 'runs the preflight only under -UseMetricsBatch' {
+        $Preflight = @($script:Calls | Where-Object { $_.Name -eq 'Invoke-RdaInsightsProviderPreflight' })
+        @($Preflight | ForEach-Object { $_.File } | Sort-Object) | Should -Be @('ResourceInventory.ps1', 'Run-AllSubscriptions.ps1')
+        foreach ($Call in $Preflight)
+        {
+            $Node = $Call.Ast.Parent
+            while ($null -ne $Node -and $Node -isnot [System.Management.Automation.Language.IfStatementAst]) { $Node = $Node.Parent }
+            $Node.Clauses[0].Item1.Extent.Text | Should -Match 'UseMetricsBatch'
+        }
+    }
+}

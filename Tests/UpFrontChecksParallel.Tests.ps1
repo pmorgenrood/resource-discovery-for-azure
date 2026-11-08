@@ -51,6 +51,18 @@ function Invoke-AzRestMethod
     $Start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $Delay = if ($Sub -and $Sub -eq $env:RDA_TEST_SLOW_SUB) { [int]$env:RDA_TEST_SLOW_MS } else { [int]$env:RDA_TEST_DELAY_MS }
     if ($Delay -gt 0) { Start-Sleep -Milliseconds $Delay }
+    # Mode cachecheck: the first usage request fails as Az reports a failed
+    # token cache check (its sign-in text, the cache library's error inside);
+    # the marker file (not .json) records that it did.
+    if ($Kind -eq 'usage' -and $Mode -eq 'cachecheck' -and $env:RDA_TEST_CALL_DIR)
+    {
+        $Marker = Join-Path $env:RDA_TEST_CALL_DIR ('cachecheck-' + $Sub)
+        if (-not (Test-Path -LiteralPath $Marker))
+        {
+            Set-Content -LiteralPath $Marker -Value 'failed once'
+            throw [System.ArgumentException]::new('Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.', [System.Exception]::new('SharedTokenCacheCredential authentication failed: Persistence check failed. Data was written but it could not be read.'))
+        }
+    }
     $Body = switch ($Kind)
     {
         'roles'
@@ -175,6 +187,22 @@ Describe 'Up-front checks in parallel' {
         # sub-01 answers 2 rows and sub-02 3 rows, so each result came from its own subscription.
         $Check.Results[0].Detail | Should -Be 'usage values found (2 row(s) read over 1 page(s))'
         $Check.Results[1].Detail | Should -Be 'usage values found (3 row(s) read over 1 page(s))'
+    }
+
+    It 'retries, 8 at a time, a usage request that fails with a failed token cache check, and keeps its own answer' {
+        $env:RDA_TEST_MODES = 'sub-02=cachecheck'
+        $Three = @($script:Subs[0..2])
+        $Roles = @(Test-SubscriptionRoleAccessAll -Subscriptions $Three -IncludeUsage -ThrottleLimit 8)
+        Reset-Calls
+        $Check = Invoke-ConsumptionDataCheck -Subscriptions $Three -Window $script:Window -RoleCheck $Roles -ThrottleLimit 8
+        Test-Path -LiteralPath (Join-Path $env:RDA_TEST_CALL_DIR 'cachecheck-sub-02') | Should -BeTrue -Because 'the first usage request of sub-02 failed'
+        @(Get-Calls | Where-Object { $_.Kind -eq 'usage' -and $_.Sub -eq 'sub-02' }).Count | Should -Be 1 -Because 'the retry answered'
+        @($Check.Results | ForEach-Object { '{0}|{1}|{2}' -f $_.Id, $_.Outcome, $_.Detail }) | Should -Be @(
+            'sub-01|Pass|usage values found (2 row(s) read over 1 page(s))'
+            'sub-02|Pass|usage values found (3 row(s) read over 1 page(s))'
+            'sub-03|Pass|usage values found (4 row(s) read over 1 page(s))'
+        )
+        $Check.ShouldBlock | Should -BeFalse
     }
 
     It 'prints in the order given when an earlier subscription finishes last' {
