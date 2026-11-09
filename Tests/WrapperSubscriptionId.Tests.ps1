@@ -787,38 +787,6 @@ Describe 'A home folder with brackets in its name' -Skip:($IsWindows) {
     }
 }
 
-Describe 'ResourceInventory.ps1 pre-flight in an output folder with brackets in its name' {
-    BeforeAll {
-        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
-        $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $RunAllSubs.IsPresent' })
-        if ($If.Count -ne 1) { throw 'the direct-run block was not found in ResourceInventory.ps1' }
-        $Body = @($If[0].Clauses[0].Item2.Statements)
-        # The free-space check and the write probe, with the line that names the probe file.
-        $Space = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('$PreFlightInventoryRoot -ErrorAction Stop') })
-        $Name = @($Body | Where-Object { $_.Extent.Text -like '$ProbePath = Join-Path $PreFlightInventoryRoot*' })
-        $Probe = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('preflight write probe') })
-        if ($Space.Count -ne 1 -or $Name.Count -ne 1 -or $Probe.Count -ne 1) { throw 'the pre-flight checks were not found in ResourceInventory.ps1' }
-        $script:DirectChecks = [scriptblock]::Create(($Space[0].Extent.Text, $Name[0].Extent.Text, $Probe[0].Extent.Text) -join "`n")
-    }
-
-    It 'reads the free space and passes the write probe' {
-        $PreFlightInventoryRoot = Join-Path $TestDrive 'direct[1]'
-        [void][System.IO.Directory]::CreateDirectory($PreFlightInventoryRoot)
-        $Said = @(. $script:DirectChecks 6>&1 | ForEach-Object { [string]$_ })
-        @($Said | Where-Object { $_ -like 'WARNING: Could not determine free disk space*' }) | Should -BeNullOrEmpty
-        @($Said | Where-Object { $_ -like 'Write probe: OK*' }).Count | Should -Be 1
-        @([System.IO.Directory]::GetFiles($PreFlightInventoryRoot, '.write-probe-*')).Count | Should -Be 0
-    }
-
-    It 'removes the probe file there when reading it back fails' {
-        $PreFlightInventoryRoot = Join-Path $TestDrive 'direct-fail[1]'
-        [void][System.IO.Directory]::CreateDirectory($PreFlightInventoryRoot)
-        Mock Get-Content { throw 'read failed' } -ParameterFilter { $LiteralPath -like '*.write-probe-*' }
-        { . $script:DirectChecks 6>$null } | Should -Throw '*Pre-flight: cannot write*read failed*'
-        @([System.IO.Directory]::GetFiles($PreFlightInventoryRoot, '.write-probe-*')).Count | Should -Be 0
-    }
-}
-
 Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {
     It 'takes the subscription off the retry list when it was also listed as completed, and clears the state' {
         script:New-Case

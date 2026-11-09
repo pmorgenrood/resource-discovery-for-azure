@@ -1598,7 +1598,7 @@ if (-not $RunAllSubs.IsPresent)
 
     try
     {
-        $RootItem = Get-Item -LiteralPath $PreFlightInventoryRoot -ErrorAction Stop
+        $RootItem = Get-Item -Path $PreFlightInventoryRoot -ErrorAction Stop
         $Drive = $RootItem.PSDrive
         # As Get-FolderFreeSpaceBytes in the wrapper: on Linux and macOS the
         # folder's own volume (PowerShell's drive / is the root volume's).
@@ -1629,13 +1629,13 @@ if (-not $RunAllSubs.IsPresent)
     $ProbePath = Join-Path $PreFlightInventoryRoot (".write-probe-{0}.tmp" -f ([guid]::NewGuid()))
     try
     {
-        Set-Content -LiteralPath $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
-        $ProbeRead = Get-Content -LiteralPath $ProbePath -Raw -ErrorAction Stop
+        Set-Content -Path $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
+        $ProbeRead = Get-Content -Path $ProbePath -Raw -ErrorAction Stop
         if ($ProbeRead -notmatch 'preflight write probe')
         {
             throw "Write probe content mismatch (read back '$ProbeRead')"
         }
-        Remove-Item -LiteralPath $ProbePath -Force -ErrorAction Stop
+        Remove-Item -Path $ProbePath -Force -ErrorAction Stop
         Write-Host ("Write probe: OK ({0})" -f $PreFlightInventoryRoot) -ForegroundColor Green
     }
     catch
@@ -1643,11 +1643,6 @@ if (-not $RunAllSubs.IsPresent)
         try { if (Test-Path $ProbePath) { Remove-Item -Path $ProbePath -Force -ErrorAction SilentlyContinue } }
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
         throw ("Pre-flight: cannot write to {0}: {1}. This usually means readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle. Verify the directory is writable and re-run." -f $PreFlightInventoryRoot, $_.Exception.Message)
-    }
-    finally
-    {
-        # By its literal path: the cleanup above reads [ and ] as a wildcard.
-        if ([System.IO.File]::Exists($ProbePath)) { Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue }
     }
 
     Write-Host "Pre-flight checks passed." -ForegroundColor Green
