@@ -2164,8 +2164,8 @@ if ($AuthSkippedPhases.Count -gt 0)
 }
 
 # A subscription whose Azure Monitor metric request (grouped or for one
-# metric) still failed after its retries (throttling, timeout, server error)
-# has incomplete metrics: listed
+# metric) still failed after its retries (throttling, a timeout, a server
+# error or an error with no status) has incomplete metrics: listed
 # with the command that collects it again, with the switches this run forwards,
 # and exit 3 (5 with collector failures), as for a data phase skipped for the
 # sign-in.

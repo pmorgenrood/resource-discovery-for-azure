@@ -44,6 +44,7 @@ Describe 'Write-MetricsIncompleteBanner' {
     It 'names each incomplete subscription and the advice' {
         Write-MetricsIncompleteBanner -Entries @($script:SignIn, $script:Incomplete) -Advice @('To collect one again, run:', '  cmd')
         $script:Lines | Should -Contain '=================== FAILED (metrics) ==================='
+        $script:Lines | Should -Contain 'Metrics are incomplete for 1 subscription(s): Azure Monitor requests still failed after their retries (throttling, a timeout, a server error or an error with no status):'
         $script:Lines | Should -Contain '  - sub-two (id-2)'
         $script:Lines | Should -Not -Contain '  - sub-one (id-1)'
         $script:Lines | Should -Contain '  cmd'

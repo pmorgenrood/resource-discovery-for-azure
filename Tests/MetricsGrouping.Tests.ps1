@@ -657,7 +657,7 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $Entries[0].Complete | Should -BeOfType [bool]
         $Entries[0].Complete | Should -BeFalse
         $Entries[0].ReportFolder | Should -Be 'ResourcesReport_incomplete'
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
         @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
 
         # The grouped request is kept: no request for one metric is made.
@@ -704,8 +704,8 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $Second.Count | Should -Be 1
         $First[0].Name | Should -Be 'test-subscription'
         $Second[0].Name | Should -Be 'second-subscription'
-        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
-        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
         # The phase line covers the whole run.
         @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 2 subscription(s): Azure Monitor requests for 3 resource(s) still failed after their retries*' }).Count | Should -Be 1
     }
@@ -737,7 +737,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Entries[0].Complete | Should -BeOfType [bool]
         $Entries[0].Complete | Should -BeFalse
         $Entries[0].ReportFolder | Should -Be 'ResourcesReport_single'
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
         @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
 
         # Each request keeps its retries: 4 attempts for each of the 2 metrics.
@@ -754,7 +754,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Entries.Count | Should -Be 1
         $Entries[0].Id | Should -Be $script:SubscriptionId
         $Entries[0].Complete | Should -BeFalse
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
 
         # One rejected grouped request, then 4 attempts for each of the 4 metrics.
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1

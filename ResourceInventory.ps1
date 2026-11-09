@@ -1843,7 +1843,7 @@ Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severi
 
 # A direct run whose metrics are incomplete because an Azure Monitor metric
 # request (grouped or for one metric) still failed after its retries
-# (throttling, timeout, server error)
+# (throttling, a timeout, a server error or an error with no status)
 # names each subscription with the command that collects it again, with this
 # run's switches, and exits 3 when its zip was written. Under -RunAllSubs the
 # wrapper does this for the whole run.

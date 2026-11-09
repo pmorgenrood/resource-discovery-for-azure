@@ -370,11 +370,11 @@ function New-RdaAllSubHtmlSummary
     {
         if ($IsObfuscated)
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for those subscriptions.</div>', $MetricsIncompleteList.Count)
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, a timeout, a server error or an error with no status) for those subscriptions.</div>', $MetricsIncompleteList.Count)
         }
         else
         {
-            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, timeout or server error) for: {1}</div>', $MetricsIncompleteList.Count, (ConvertTo-HtmlSafe (($MetricsIncompleteList | ForEach-Object { [string]$_.Name }) -join ', ')))
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>Metrics incomplete: {0} subscription(s).</b> Azure Monitor requests still failed after their retries (throttling, a timeout, a server error or an error with no status) for: {1}</div>', $MetricsIncompleteList.Count, (ConvertTo-HtmlSafe (($MetricsIncompleteList | ForEach-Object { [string]$_.Name }) -join ', ')))
         }
     }
     if ($CollectorList.Count -gt 0)

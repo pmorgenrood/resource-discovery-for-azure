@@ -1040,7 +1040,7 @@ if ($Task -eq 'Processing')
                         elseif (-not $Request.Succeeded -and -not $Request.BadRequest)
                         {
                             # The group failed after its retries for a reason that does not depend
-                            # on the metric names (throttling, timeout, server error). Requesting
+                            # on the metric names (any error other than BadRequest). Requesting
                             # each metric again would repeat the same failure once per metric, so
                             # every metric of the group records the group request's outcome.
                             Add-MetricRecord -Def $Def -Request $Request -MetricQuery $null -ExtraSeconds $GroupSeconds
@@ -1168,7 +1168,7 @@ if ($Task -eq 'Processing')
         $FailedResources = @($Resources | Where-Object { $null -ne $_ -and $FailedIdSet.Contains([string]$_.Id) })
         $FailedSubIds = @($FailedResources | ForEach-Object { [string]$_.subscriptionId } | Select-Object -Unique)
         $MetricsReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
-        $IncompleteFormat = 'Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, timeout or server error); their metrics are recorded as errors.'
+        $IncompleteFormat = 'Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
         $IncompleteMsg = ($IncompleteFormat -f $FailedIdSet.Count)
         if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
         foreach ($FailedSubId in $FailedSubIds)
