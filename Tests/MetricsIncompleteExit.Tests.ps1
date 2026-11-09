@@ -782,29 +782,29 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         # the run sets, runs the lifted statements and returns the zip's entries.
         function script:Invoke-ZipFiles
         {
-            param([string]$Folder, [string]$Stamp, [switch]$Obfuscate)
+            param([string]$Folder, [string]$Stamp, [switch]$Obfuscate, [string]$ReportName = 'ResourcesReport')
             New-Item -ItemType Directory -Path $Folder -Force | Out-Null
             $Global:DefaultPath = $Folder.TrimEnd('/') + '/'
-            $Global:ReportName = 'ResourcesReport'
+            $Global:ReportName = $ReportName
             $Global:CurrentDateTime = $Stamp
-            $Global:HtmlFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.html'
-            $Global:ConsumptionFileCsv = $Global:DefaultPath + 'Consumption_ResourcesReport_' + $Stamp + '.csv'
-            $Global:ZipOutputFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.zip'
+            $Global:HtmlFile = $Global:DefaultPath + $ReportName + '_' + $Stamp + '.html'
+            $Global:ConsumptionFileCsv = $Global:DefaultPath + 'Consumption_' + $ReportName + '_' + $Stamp + '.csv'
+            $Global:ZipOutputFile = $Global:DefaultPath + $ReportName + '_' + $Stamp + '.zip'
             $Global:MetricsFailedSubs = @()
             foreach ($Name in @(
-                    ('ResourcesReport_{0}.html' -f $Stamp)
-                    ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)
-                    ('Inventory_ResourcesReport_{0}.json' -f $Stamp)
-                    ('Metrics_ResourcesReport_{0}_1.json' -f $Stamp)
-                    ('Metrics_ResourcesReport_{0}_2.json' -f $Stamp)
-                    ('Transcript_Log_ResourcesReport_{0}.txt' -f $Stamp)))
+                    ('{1}_{0}.html' -f $Stamp, $ReportName)
+                    ('Consumption_{1}_{0}.csv' -f $Stamp, $ReportName)
+                    ('Inventory_{1}_{0}.json' -f $Stamp, $ReportName)
+                    ('Metrics_{1}_{0}_1.json' -f $Stamp, $ReportName)
+                    ('Metrics_{1}_{0}_2.json' -f $Stamp, $ReportName)
+                    ('Transcript_Log_{1}_{0}.txt' -f $Stamp, $ReportName)))
             {
                 # A Metrics file holds a Metrics list and the Inventory file
                 # an object, as the run writes them.
                 $Content = if ($Name -like 'Metrics_*') { '{"Metrics":[]}' } elseif ($Name -like 'Inventory_*') { '{}' } else { $Name }
                 Set-Content -LiteralPath ($Global:DefaultPath + $Name) -Value $Content
             }
-            if ($Obfuscate) { Set-Content -LiteralPath ($Global:DefaultPath + ('ObfuscationDictionary_ResourcesReport_{0}.json' -f $Stamp)) -Value '{}' }
+            if ($Obfuscate) { Set-Content -LiteralPath ($Global:DefaultPath + ('ObfuscationDictionary_{1}_{0}.json' -f $Stamp, $ReportName)) -Value '{}' }
             $Arguments = @{ TenantID = 'tenant-1' }
             if ($Obfuscate) { $Arguments['Obfuscate'] = $true }
             $null = & $script:ZipFiles @Arguments *>&1
@@ -866,6 +866,48 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $Entries = Invoke-ZipFiles -Folder $Folder -Stamp $Stamp -Obfuscate:($Mode -eq 'masked')
 
         $Entries | Should -Be (Get-CleanZipEntries -Stamp $Stamp)
+    }
+
+    It 'takes the files of a report name with a wildcard character literally, not another run''s files' -Skip:($IsWindows) {
+        # Windows file names cannot hold '*'.
+        $Folder = Join-Path $TestDrive 'wildcard-name'
+        $Stamp = '20261109120000000d001'
+        New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        foreach ($Name in @(('ResourcesReportB_{0}.html' -f $Stamp), ('Inventory_ResourcesReportB_{0}.json' -f $Stamp), ('Metrics_ResourcesReportB_{0}_1.json' -f $Stamp)))
+        {
+            Set-Content -LiteralPath (Join-Path $Folder $Name) -Value '{"Metrics":[]}'
+        }
+        $Entries = Invoke-ZipFiles -Folder $Folder -Stamp $Stamp -ReportName 'ResourcesReport*'
+
+        @($Entries | Where-Object { $_ -like '*ResourcesReportB_*' }) | Should -BeNullOrEmpty
+        $Entries | Should -Contain ('Inventory_ResourcesReport*_{0}.json' -f $Stamp)
+        $Entries | Should -Contain ('Metrics_ResourcesReport*_{0}_1.json' -f $Stamp)
+        $Entries | Should -Contain ('Metrics_ResourcesReport*_{0}_2.json' -f $Stamp)
+    }
+}
+
+Describe 'Get-RdaReportJsonFiles' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
+    }
+
+    It 'matches the report name <Name> literally' -Skip:($IsWindows) -ForEach @(
+        @{ Name = 'A*'; Other = 'AB' }
+        @{ Name = 'A?'; Other = 'AB' }
+        @{ Name = 'A[B]'; Other = 'AB' }
+    ) {
+        $Folder = Join-Path $TestDrive ('literal-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        $Stamp = '20261109120000000e001'
+        foreach ($Report in @($Name, $Other))
+        {
+            Set-Content -LiteralPath (Join-Path $Folder ('Inventory_{0}_{1}.json' -f $Report, $Stamp)) -Value '{}'
+            Set-Content -LiteralPath (Join-Path $Folder ('Metrics_{0}_{1}_1.json' -f $Report, $Stamp)) -Value '{"Metrics":[]}'
+        }
+
+        $Found = @(Get-RdaReportJsonFiles -DefaultPath ($Folder + '/') -ReportName $Name -RunDateTime $Stamp | ForEach-Object { Split-Path -Path $_ -Leaf })
+
+        $Found | Should -Be @(('Inventory_{0}_{1}.json' -f $Name, $Stamp), ('Metrics_{0}_{1}_1.json' -f $Name, $Stamp))
     }
 }
 

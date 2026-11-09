@@ -1797,8 +1797,7 @@ if ($SkipMetrics.IsPresent)
 }
 else
 {
-    $MetricsPattern = ('Metrics_{0}_{1}*.json' -f $Global:ReportName, $CurrentDateTime)
-    $MetricsAny = @(Get-ChildItem -Path $DefaultPath -Filter $MetricsPattern -ErrorAction SilentlyContinue)
+    $MetricsAny = @(Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $CurrentDateTime | Where-Object { (Split-Path -Path $_ -Leaf).StartsWith('Metrics_') })
     if ($MetricsAny.Count -eq 0)
     {
         @{ Metrics = @() } | ConvertTo-Json -depth 5 -compress | Out-File $Global:MetricsJsonFile -Encoding utf8
@@ -1845,7 +1844,7 @@ if ($Obfuscate.IsPresent)
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
     $CompressionOutput = @{
-        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles
+        LiteralPath = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $ShareableExtras + $JsonFiles
         CompressionLevel = 'Fastest'
         DestinationPath = $Global:ZipOutputFile
     }
@@ -1858,7 +1857,7 @@ else
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
 
     $CompressionOutput = @{
-        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $JsonFiles + $ShareableExtras
+        LiteralPath = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $JsonFiles + $ShareableExtras
         CompressionLevel = 'Fastest'
         DestinationPath = $Global:ZipOutputFile
     }

@@ -412,8 +412,11 @@ function Get-RdaReportJsonFiles
     $Files = [System.Collections.Generic.List[string]]::new()
     $InventoryFile = $DefaultPath + 'Inventory_' + $ReportName + '_' + $RunDateTime + '.json'
     if (Test-Path -LiteralPath $InventoryFile -PathType Leaf) { $Files.Add($InventoryFile) }
-    $MetricsPattern = ('Metrics_{0}_{1}*.json' -f $ReportName, $RunDateTime)
-    foreach ($MetricsFile in @(Get-ChildItem -LiteralPath $DefaultPath -Filter $MetricsPattern -File -ErrorAction SilentlyContinue | Sort-Object Name))
+    # The report name is matched as text, so a '*' or '?' in it never picks up
+    # another run's files.
+    $MetricsPrefix = ('Metrics_{0}_{1}' -f $ReportName, $RunDateTime)
+    foreach ($MetricsFile in @(Get-ChildItem -LiteralPath $DefaultPath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name.StartsWith($MetricsPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and $_.Name.EndsWith('.json', [System.StringComparison]::OrdinalIgnoreCase) } | Sort-Object Name))
     {
         $Files.Add($MetricsFile.FullName)
     }
