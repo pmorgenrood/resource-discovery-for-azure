@@ -374,8 +374,9 @@ function Merge-RecoveryData
     # tokens and the recovered service's cross-references to OTHER services'
     # resources will not join - silent referential corruption in a bundle that
     # otherwise looks complete. We cannot repair that here, but we CAN detect the
-    # tell-tale: a seeded recovery's ResourceIdMap shares (almost) all of the gap's
-    # tokens, whereas an unseeded one shares none. Zero overlap STOPS the merge.
+    # tell-tale: a seeded recovery's ResourceIdMap holds every one of the gap's
+    # tokens (and may add its own), whereas an unseeded one shares none. Any gap
+    # token missing from the recovery map STOPS the merge.
     # Every guard in this block runs before the output folder is created, so a
     # stopped merge writes, zips and leaves nothing; the way out is to fix the
     # named bundle and run the same merge again. Both dictionaries are read and
@@ -389,21 +390,26 @@ function Merge-RecoveryData
         # the check below is skipped instead of stopping a merge that no
         # re-run could ever get past. A bundle with an empty map must then give
         # the merge no resource; that is checked once the sources are known.
-        $SharedIdKeyCount = $null
+        $MissingGapKeyCount = 0
         $GapIdKeys = @($GapDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
         $RecoveryIdKeys = @($RecoveryDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
         if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
         {
-            # A set lookup per recovery key, stopping at the first shared one,
-            # so maps of many thousand ids are compared in well under a second.
-            $GapIdKeySet = [System.Collections.Generic.HashSet[string]]::new([string[]]$GapIdKeys, [System.StringComparer]::OrdinalIgnoreCase)
-            $SharedIdKeyCount = 0
-            foreach ($RecoveryIdKey in $RecoveryIdKeys)
+            # A seeded recovery preloads every gap mapping and writes each one
+            # back, so every gap ResourceIdMap key must be in the recovery map.
+            # One set lookup per gap key, so maps of many thousand ids are
+            # compared in well under a second.
+            $RecoveryIdKeySet = [System.Collections.Generic.HashSet[string]]::new([string[]]$RecoveryIdKeys, [System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($GapIdKey in $GapIdKeys)
             {
-                if ($GapIdKeySet.Contains($RecoveryIdKey)) { $SharedIdKeyCount = 1; break }
+                if (-not $RecoveryIdKeySet.Contains($GapIdKey)) { $MissingGapKeyCount++ }
             }
         }
-        if ($SharedIdKeyCount -eq 0)
+        if ($MissingGapKeyCount -gt 0 -and $MissingGapKeyCount -lt @($GapIdKeys).Count)
+        {
+            throw ("Merge-RecoveryData: the recovery bundle's dictionary '{0}' lacks {1} of the {2} ResourceIdMap token(s) in the gap bundle's dictionary '{3}'. A recovery seeded with the gap dictionary keeps every gap token, so this recovery was not seeded with it (or with an older or partial copy), and the same resource could carry different tokens in different files of the merged bundle. Nothing was written to '{4}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{5}' into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it." -f $RecoveryDictionaryFile.Name, $MissingGapKeyCount, @($GapIdKeys).Count, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
+        }
+        if ($MissingGapKeyCount -gt 0)
         {
             throw ("Merge-RecoveryData: the recovery bundle's dictionary '{0}' and the gap bundle's dictionary '{1}' share no ResourceIdMap token. The recovery run was almost certainly not seeded with the gap dictionary, so the same resource would carry different tokens in different files of the merged bundle. Nothing was written to '{2}'. Re-run the recovery with -Obfuscate -ObfuscationDictionary '{3}' into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it." -f $RecoveryDictionaryFile.Name, $GapDictionaryFile.Name, $OutputPath, $GapDictionaryFile.FullName)
         }
