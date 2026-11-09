@@ -1288,13 +1288,17 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('One or more errors occurred.', [System.Exception]::new('An error occurred while sending the request.'))) | Should -Be 'Transient'
     }
 
-    It 'reads the chain to at most 10 errors' {
+    It 'reads the whole chain, inner exceptions of an AggregateException too, and ends a chain that loops' {
         $Ex = [System.Exception]::new('Run Connect-AzAccount to login.')
-        foreach ($Level in 1..10) { $Ex = [System.Exception]::new('wrapped', $Ex) }
-        Get-ConsumptionErrorKind -Exception $Ex | Should -Be 'Transient'
-        $Near = [System.Exception]::new('Run Connect-AzAccount to login.')
-        foreach ($Level in 1..9) { $Near = [System.Exception]::new('wrapped', $Near) }
-        Get-ConsumptionErrorKind -Exception $Near | Should -Be 'Permanent'
+        foreach ($Level in 1..15) { $Ex = [System.Exception]::new('wrapped', $Ex) }
+        Get-ConsumptionErrorKind -Exception $Ex | Should -Be 'Permanent'
+        $Http = [System.Net.Http.HttpRequestException]::new('denied', $null, [System.Net.HttpStatusCode]::Forbidden)
+        $Aggregate = [System.AggregateException]::new([System.Exception]::new('One or more errors occurred.'), $Http)
+        Get-ConsumptionErrorStatusCode -Exception $Aggregate | Should -Be 403
+        Get-ConsumptionErrorKind -Exception $Aggregate | Should -Be 'Permanent'
+        $Loop = [pscustomobject]@{ Message = 'stand-in: something went wrong' }
+        $Loop | Add-Member -NotePropertyName InnerException -NotePropertyValue $Loop
+        Get-ConsumptionErrorKind -Exception $Loop | Should -Be 'Transient'
     }
 
     It 'retries a failed token cache check, although Az reports it as a sign-in to set up' {
@@ -1331,10 +1335,13 @@ Describe 'Get-ConsumptionErrorKind' {
         $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
         Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn)) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, [System.Exception]::new('AADSTS700082: The refresh token has expired due to inactivity.'))) | Should -Be 'Permanent'
-        # A failed token cache check further down than the 10 errors read is not seen.
+    }
+
+    It 'sees a failed token cache check however deep it is in the chain' {
+        $SignIn = 'Your Azure credentials have not been set up or have expired, please run Connect-AzAccount to set up your Azure credentials.'
         $Deep = [System.Exception]::new('Persistence check failed.')
-        foreach ($Level in 1..9) { $Deep = [System.Exception]::new('wrapped', $Deep) }
-        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Deep)) | Should -Be 'Permanent'
+        foreach ($Level in 1..20) { $Deep = [System.Exception]::new('wrapped', $Deep) }
+        Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Deep)) | Should -Be 'Transient'
     }
 
     It 'treats an error it does not recognise, and a conflict (409), as transient' {
@@ -1372,6 +1379,9 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Request failed. StatusCode: 401')) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTPStatusCode=403')) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('StatusCode: 503')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status is 403')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP status was 404')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP code 401')) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP/1.1 503 Service Unavailable; the resource could not be found right now.')) | Should -Be 'Transient'
     }
 }
