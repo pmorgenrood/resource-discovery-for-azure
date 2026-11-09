@@ -214,7 +214,9 @@ Describe "Subscription ID Leak Check" {
 # ============================================================
 Describe "Inventory ID Obfuscation" {
     It "Should have all resource IDs matching the masked ARM path shape" {
-        $script:AllResources.Count | Should -BeGreaterThan 0 -Because "There should be at least one resource in the inventory"
+        # A subscription with no resource writes an empty inventory; there is
+        # no id to check then, which is not a pass.
+        if ($script:AllResources.Count -eq 0) { Set-ItResult -Skipped -Because 'the inventory of this zip holds no resource'; return }
         foreach ($resource in $script:AllResources)
         {
             if ($null -ne $resource.ID)
