@@ -446,6 +446,37 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
         $Result.Lines | Should -Contain "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
     }
 
+    It 'still reads an entry as incomplete and exits 3 after it went through a stream summary file' {
+        # A parallel stream writes its entries to a JSON summary file and the
+        # wrapper reads it back with ConvertFrom-Json. The statements that do
+        # that are run as written.
+        $StreamTop = @((Get-ScriptAst -File 'Run-AllSubscriptions.Stream.ps1').EndBlock.Statements)
+        $Write = @($StreamTop | Where-Object { $_.Extent.Text -match '^\$MetricsFailedSubs = ' -or $_.Extent.Text -match '^\$Summary = \[pscustomobject\]' -or ($_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text -match '\$Summary \| ConvertTo-Json') })
+        $Write.Count | Should -Be 3
+        $WrapperAst = Get-ScriptAst -File 'Run-AllSubscriptions.ps1'
+        $Read = @($WrapperAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Extent.Text -match '^\$StreamSummary = Get-Content' }, $true))
+        $Merge = @($WrapperAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Extent.Text -match '^if \(\$StreamSummary\.MetricsFailedSubs' }, $true))
+        $Read.Count | Should -Be 1
+        $Merge.Count | Should -Be 1
+
+        # The entry as Extension/Metrics.ps1 records it.
+        $Global:MetricsFailedSubs = @([pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Message = 'still failed'; ReportFolder = 'ResourcesReport_x'; Complete = $false })
+        $StreamSummaryPath = Join-Path $TestDrive 'stream-1-summary.json'
+        . ([scriptblock]::Create((@($Write | ForEach-Object { $_.Extent.Text }) -join "`n")))
+        Test-Path -LiteralPath $StreamSummaryPath | Should -BeTrue
+
+        $S = [pscustomobject]@{ SummaryPath = $StreamSummaryPath }
+        $Global:MetricsFailedSubs = @()
+        . ([scriptblock]::Create($Read[0].Extent.Text + "`n" + $Merge[0].Extent.Text))
+        $StreamSummary | Should -Not -BeNullOrEmpty -Because $S.SummaryPath
+
+        @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
+        $Result = Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 }
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+        $Result.Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
+    }
+
     It 'exits 5 with a collector failure too' {
         $Global:MetricsFailedSubs = @($script:Incomplete)
         $Result = Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 } -CollectorFailures @([pscustomobject]@{ Id = 'id-2'; Module = 'Compute'; Message = 'failed' })
