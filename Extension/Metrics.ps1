@@ -1550,7 +1550,8 @@ function Add-MetricRecord
                 # metric name is not valid for the resource. The status code of the exception
                 # and of every exception it wraps is read first, because an outer exception can
                 # report a different status than the 400 it wraps. Only when no exception in the
-                # chain carries a status are the messages of the same chain read.
+                # chain carries a status are the messages of the same chain read, for Az's
+                # "invalid status code 'BadRequest'" (quotes optional).
                 function Test-MetricBadRequest
                 {
                     param([System.Exception]$Exception)
@@ -1569,7 +1570,8 @@ function Add-MetricRecord
                     if ($SawStatus) { return $false }
                     foreach ($Ex in $Chain)
                     {
-                        if ([string]$Ex.Message -match 'BadRequest') { return $true }
+                        # Only Az's own form, so a name such as vm-BadRequest-01 is not taken for one.
+                        if ([string]$Ex.Message -match "(?i)invalid status code\s*'?BadRequest'?") { return $true }
                     }
                     return $false
                 }
