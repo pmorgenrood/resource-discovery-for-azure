@@ -115,9 +115,29 @@ Describe "SQL VM to VM Cross-Reference" {
 }
 
 Describe "Obfuscated ID Uniqueness" {
-    It "Every obfuscated ID should be unique across all resources" {
-        $IdCounts = $script:AllIds | Group-Object | Where-Object { $_.Count -gt 1 }
-        $IdCounts | Should -BeNullOrEmpty -Because "No two resources should share the same obfuscated ID"
+    # Some collectors write one row per part of a resource, all with the
+    # resource's id (a container cluster per node pool, an availability set
+    # per member VM), so an id may repeat within a section. Two different
+    # resources must never share a masked id: rows of one id in a section
+    # share one Name, and one id belongs to one section.
+    It "Rows that share a masked ID in a section are rows of one resource" {
+        foreach ($Section in @($script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' }))
+        {
+            $Groups = @(@($Section.Value) | Where-Object { $null -ne $_ -and $null -ne $_.ID } | Group-Object -Property ID | Where-Object { $_.Count -gt 1 })
+            foreach ($G in $Groups)
+            {
+                @($G.Group | ForEach-Object { [string]$_.Name } | Select-Object -Unique).Count | Should -Be 1 -Because "rows of masked id '$($G.Name)' in $($Section.Name) are one resource, so they share one Name"
+            }
+        }
+    }
+
+    It "A masked ID belongs to one inventory section" {
+        $SectionsOf = @{}
+        foreach ($Section in @($script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' }))
+        {
+            foreach ($Row in @($Section.Value)) { if ($null -ne $Row -and $null -ne $Row.ID) { if (-not $SectionsOf.ContainsKey($Row.ID)) { $SectionsOf[$Row.ID] = @{} }; $SectionsOf[$Row.ID][$Section.Name] = $true } }
+        }
+        @($SectionsOf.Keys | Where-Object { $SectionsOf[$_].Count -gt 1 }) | Should -BeNullOrEmpty -Because 'two different resources never share a masked id'
     }
 }
 
