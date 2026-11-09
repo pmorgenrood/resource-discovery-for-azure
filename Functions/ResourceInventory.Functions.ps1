@@ -564,9 +564,9 @@ function Get-RdaNetworkTokenQuery
 }
 
 # One cheap query: how many rows of each skipped type the scope holds. It only
-# feeds the log, so a failure warns once and returns $null; it never fails the
-# run and is never retried here (Invoke-AzGraphQuerySafe has its own capped
-# retries). $Where is the scope's own where clause, without 'resources |'.
+# feeds the log, so a failure or a bad answer warns once and returns $null
+# (unknown); it never fails the run and is never retried here
+# (Invoke-AzGraphQuerySafe has its own capped retries). $Where is the scope's own where clause, without 'resources |'.
 # Returns { Total; ByType } with the types lowercase and summed across
 # subscription batches.
 function Get-RdaSkippedNetworkCount
@@ -581,6 +581,31 @@ function Get-RdaSkippedNetworkCount
     try
     {
         $Result = Invoke-AzGraphQuerySafe -Query $Query -SubscriptionId $SubscriptionId -HideRawOutput:$HideRawOutput
+        if ($null -eq $Result -or $null -eq $Result.PSObject.Properties['data']) { throw 'Resource Graph gave no answer' }
+
+        # Every row must hold a type and a whole count of 0 or more, and the
+        # total must fit a whole number. One bad row makes the count unknown,
+        # never a partial total (a partial 0 would show a network-only
+        # subscription as empty).
+        $ByType = [ordered]@{}
+        $Total = [long]0
+        $RowAt = 0
+        foreach ($Row in @($Result.data))
+        {
+            $RowAt++
+            $Type = if ($null -ne $Row) { [string]$Row.type } else { '' }
+            $CountText = if ($null -ne $Row) { [string]$Row.count_ } else { '' }
+            $RowCount = [long]0
+            if ([string]::IsNullOrEmpty($Type) -or $CountText -notmatch '^[0-9]+$' -or -not [long]::TryParse($CountText, [ref]$RowCount))
+            {
+                throw ('row {0} of the answer has no type or no whole count' -f $RowAt)
+            }
+            if ($RowCount -gt ([long]::MaxValue - $Total)) { throw 'the total is too large' }
+            $Type = $Type.ToLowerInvariant()
+            if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
+            $ByType[$Type] = [long]$ByType[$Type] + $RowCount
+            $Total += $RowCount
+        }
     }
     catch
     {
@@ -588,17 +613,6 @@ function Get-RdaSkippedNetworkCount
         $Reason = ([string]$_.Exception.Message -split "`r?`n")[0]
         Write-Log -Message ("Could not count the skipped network resources ({0}). The run carries on; the log just leaves the skipped count out." -f $Reason) -Severity 'Warning'
         return $null
-    }
-
-    $ByType = [ordered]@{}
-    $Total = [long]0
-    foreach ($Row in @($Result.data))
-    {
-        if ($null -eq $Row -or $null -eq $Row.count_ -or [string]::IsNullOrEmpty([string]$Row.type)) { continue }
-        $Type = ([string]$Row.type).ToLowerInvariant()
-        if (-not $ByType.Contains($Type)) { $ByType[$Type] = [long]0 }
-        $ByType[$Type] += [long]$Row.count_
-        $Total += [long]$Row.count_
     }
     return [pscustomobject]@{ Total = $Total; ByType = $ByType }
 }

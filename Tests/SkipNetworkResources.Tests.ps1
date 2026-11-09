@@ -294,6 +294,50 @@ Describe 'Skipped-count query failure' {
         $Global:SkippedResourceCount | Should -BeNullOrEmpty
         Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { $Severity -eq 'Warning' }
     }
+
+    It 'reads a bad count answer (<Label>) as unknown: one warning, never a partial total' -TestCases @(
+        @{ Label = 'a count that is not a number'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 3 }, @{ type = 'microsoft.network/routetables'; count_ = 'abc' }) }
+        @{ Label = 'a row with no type'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 3 }, @{ count_ = 4 }) }
+        @{ Label = 'a row with no count'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 3 }, @{ type = 'microsoft.network/routetables' }) }
+        @{ Label = 'a fraction'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 2.5 }) }
+        @{ Label = 'a negative count'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 3 }, @{ type = 'microsoft.network/routetables'; count_ = -1 }) }
+        @{ Label = 'a count too large for a whole number'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = '99999999999999999999' }) }
+        @{ Label = 'a total too large for a whole number'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = [long]::MaxValue }, @{ type = 'microsoft.network/routetables'; count_ = 1 }) }
+        @{ Label = 'an empty row'; Rows = @(@{ type = 'microsoft.network/virtualnetworks'; count_ = 3 }, $null) }
+    ) {
+        param($Label, $Rows)
+        $script:BadRows = @($Rows | ForEach-Object { if ($null -eq $_) { $null } else { [pscustomobject]$_ } })
+        Mock -CommandName Invoke-AzGraphQuerySafe -MockWith { [pscustomobject]@{ data = $script:BadRows } }
+        Mock -CommandName Write-Log -MockWith { }
+        # The inner script runs with this preference, which hides a failed cast.
+        $Preference = $ErrorActionPreference
+        try
+        {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $Result = Get-RdaSkippedNetworkCount -Where 'true' -SubscriptionId @($script:Sub)
+        }
+        finally { $ErrorActionPreference = $Preference }
+        $Result | Should -BeNullOrEmpty -Because "$Label makes the count unknown"
+        Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { $Severity -eq 'Warning' }
+    }
+
+    It 'reads no answer at all as unknown, not as 0 skipped' {
+        Mock -CommandName Invoke-AzGraphQuerySafe -MockWith { $null }
+        Mock -CommandName Write-Log -MockWith { }
+        Get-RdaSkippedNetworkCount -Where 'true' -SubscriptionId @($script:Sub) | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Write-Log -Times 1 -Exactly -ParameterFilter { $Severity -eq 'Warning' }
+    }
+
+    It 'adds up good rows, a whole count given as text too' {
+        $script:GoodRows = @([pscustomobject]@{ type = 'Microsoft.Network/VirtualNetworks'; count_ = 3 }, [pscustomobject]@{ type = 'microsoft.network/virtualnetworks'; count_ = '4' }, [pscustomobject]@{ type = 'microsoft.network/routetables'; count_ = 0 })
+        Mock -CommandName Invoke-AzGraphQuerySafe -MockWith { [pscustomobject]@{ data = $script:GoodRows } }
+        Mock -CommandName Write-Log -MockWith { }
+        $Result = Get-RdaSkippedNetworkCount -Where 'true' -SubscriptionId @($script:Sub)
+        $Result.Total | Should -Be 7
+        $Result.ByType['microsoft.network/virtualnetworks'] | Should -Be 7
+        $Result.ByType['microsoft.network/routetables'] | Should -Be 0
+        Should -Invoke -CommandName Write-Log -Times 0 -Exactly
+    }
 }
 
 Describe 'Per-subscription count message' {
