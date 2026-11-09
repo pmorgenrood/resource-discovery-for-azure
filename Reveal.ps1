@@ -446,6 +446,36 @@ function Get-RevealMarkerShapeProblem
     return $null
 }
 
+# Why a mark read by Read-RevealStagingMarker from the folder $Folder is not
+# Reveal's own mark of this inventory root, or $null when it is. This is the
+# one check of ownership: a mark counts only when its InventoryRoot is this
+# root, its top level has the whole shape Save-RevealStagingMarker writes
+# (Get-RevealMarkerShapeProblem) and every output record in it does too
+# (Get-RevealBadOutputRecord, against $Folder). Kind says which part failed,
+# so a refusal can name it: Root (no Reveal mark, or one for another root),
+# NoFields (a mark of an older Reveal, which did not record its fields),
+# Shape (the top level) or Record (an output record).
+function Get-RevealOwnMarkerProblem
+{
+    param($Marker, [string]$Folder)
+    if (-not (Test-RevealMarkerForThisRoot $Marker)) { return [pscustomobject]@{ Kind = 'Root'; Text = 'it is not a Reveal mark for this inventory root' } }
+    if ($null -eq $Marker.Data['Fields']) { return [pscustomobject]@{ Kind = 'NoFields'; Text = 'it does not record which fields that reveal used' } }
+    $Shape = Get-RevealMarkerShapeProblem -Data $Marker.Data
+    if ($null -ne $Shape) { return [pscustomobject]@{ Kind = 'Shape'; Text = $Shape } }
+    $Bad = Get-RevealBadOutputRecord -Outputs $Marker.Data['Outputs'] -StagingDirectory $Folder -PathComparison $PathComparison
+    if ($null -ne $Bad) { return [pscustomobject]@{ Kind = 'Record'; Text = $Bad } }
+    return $null
+}
+
+# Whether a mark read from $Folder is Reveal's own mark of this inventory
+# root (see Get-RevealOwnMarkerProblem). Used wherever a mark is taken as
+# evidence that a folder is Reveal's staging folder.
+function Test-RevealOwnMarker
+{
+    param($Marker, [string]$Folder)
+    return ($null -eq (Get-RevealOwnMarkerProblem -Marker $Marker -Folder $Folder))
+}
+
 # The lock below is opened with a .NET file call, which reads a relative path
 # against the process folder, so make staging a full path against the
 # PowerShell location first, taken as written (as is done for -OutputZip).
@@ -522,15 +552,51 @@ try
     $Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
     $MarkerData = $Marker.Data
     $MarkedRoot = $Marker.Root
-    $MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
+    # A mark is taken as this folder's ownership evidence only through the one
+    # whole check (Get-RevealOwnMarkerProblem): this root, the whole top level
+    # and every output record in the shape Reveal writes. Anything less is not
+    # Reveal's, so a folder that holds files is refused before anything in it
+    # changes (its permissions, its mark or its .reveal-tmp), on a fresh run
+    # and under -Resume alike.
+    $OwnMarkProblem = Get-RevealOwnMarkerProblem -Marker $Marker -Folder $StagingDirectory
+    $MarkedForThisRoot = $null -eq $OwnMarkProblem
     if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
     {
-        if ($Resume)
+        if ($OwnMarkProblem.Kind -eq 'Root')
         {
-            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
-            Stop-RevealStagingRefused (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
+            if ($Resume)
+            {
+                $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
+                Stop-RevealStagingRefused (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
+            }
+            Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
         }
-        Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
+        if (-not $Resume)
+        {
+            Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}: its Reveal mark {2} is not one Reveal wrote ({3}). Its files could be stale or unrelated, so Reveal will not use the folder and has changed nothing. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $OwnMarkProblem.Text)
+        }
+        switch ($OwnMarkProblem.Kind)
+        {
+            # A resumed run must reveal the same fields as the run it
+            # continues, or one bundle would mix reports revealed for
+            # different fields.
+            'NoFields'
+            {
+                Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
+            }
+            'Shape'
+            {
+                Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $OwnMarkProblem.Text)
+            }
+            # The recorded outputs are read from a file anyone who can write
+            # to staging can change, and -RemoveStaging deletes each one whose
+            # bytes match its record. So one bad record refuses the whole mark,
+            # before anything is written or deleted.
+            default
+            {
+                Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $OwnMarkProblem.Text)
+            }
+        }
     }
     if (-not $Resume -and $MarkedForThisRoot)
     {
@@ -547,42 +613,15 @@ try
     }
     if ($Resume -and $MarkedForThisRoot)
     {
-        # A resumed run must reveal the same fields as the run it continues, or
-        # one bundle would mix reports revealed for different fields.
-        $MarkedFields = $MarkerData['Fields']
-        if ($null -eq $MarkedFields)
-        {
-            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
-        }
-        # The rest of the mark must have the shape Reveal writes, or it is not
-        # Reveal's, and the folder is refused before anything in it changes.
-        $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
-        if ($null -ne $ShapeProblem)
-        {
-            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
-        }
-        $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
+        # The mark passed the whole check above; its fields must also be the
+        # ones this run asks for.
+        $MarkedFieldsKey = (@($MarkerData['Fields'] | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
         if ($MarkedFieldsKey -cne $FieldsKey)
         {
             Stop-RevealStagingRefused ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
         }
-        # The recorded outputs are read from a file anyone who can write to
-        # staging can change, and -RemoveStaging deletes each one whose bytes
-        # match its record. So every record is checked before any is used: its
-        # name is a plain file name directly in staging (no folder part, not
-        # '.' or '..', not a rooted path), and its fields have the types Reveal
-        # writes, with each SHA-256 as 64 hex characters. One bad record
-        # refuses the whole mark, before anything is written or deleted.
         $RecordedOutputs = $MarkerData['Outputs']
-        $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
-        if ($null -ne $BadRecord)
-        {
-            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
-        }
-        if ($RecordedOutputs -is [System.Collections.IDictionary])
-        {
-            foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
-        }
+        foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
     }
     New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
     # Canonicalize staging too, so the per-folder exclusion compare below matches
@@ -730,10 +769,11 @@ try
         # is known by the Reveal mark it holds for this root, never by its name
         # or by a file of the mark's name alone: a report folder named
         # RevealedStaging_* is still read. The mark must also have the whole
-        # shape Reveal writes (see Get-RevealMarkerShapeProblem); a partial
-        # look-alike is not Reveal's, so its folder is read as a report folder.
+        # shape Reveal writes, top level and every output record (see
+        # Test-RevealOwnMarker); a partial look-alike is not Reveal's, so its
+        # folder is read as a report folder.
         $FolderMarker = Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)
-        if ((Test-RevealMarkerForThisRoot $FolderMarker) -and $null -eq (Get-RevealMarkerShapeProblem -Data $FolderMarker.Data))
+        if (Test-RevealOwnMarker -Marker $FolderMarker -Folder $Folder.FullName)
         {
             $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
             continue
