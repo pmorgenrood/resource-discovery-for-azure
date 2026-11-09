@@ -1016,7 +1016,7 @@ if ($ParallelStreams -le 1)
                 # proves no more than the listing: a role without Reader, a role on
                 # some resource groups only, or an Azure CLI (which runs the query)
                 # signed in as another account can still return 0 resources.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. The up-front role check (Az PowerShell sign-in) only showed that the identity can list its resource groups. So it is an empty subscription, one that holds only resources the discovery query leaves out, or one whose resources the identity cannot read (a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1} (it runs as the Az PowerShell account; check the Azure CLI's account apart)" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. The up-front role check (Az PowerShell sign-in) only showed that the identity can list its resource groups. So it is an empty subscription, one that holds only resources the discovery query leaves out, or one whose resources the identity cannot read (a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account). Verify with: (Invoke-AzRestMethod -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Payload '{{""subscriptions"":[""{1}""],""query"":""resources | summarize count()""}}').Content (it runs as the Az PowerShell account; check the Azure CLI's account apart)" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {
