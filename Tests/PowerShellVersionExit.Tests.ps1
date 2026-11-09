@@ -3,11 +3,13 @@
 #
 # WHY THIS TEST EXISTS
 # --------------------
-# On Windows PowerShell 5.1 the script prints 'You must use Powershell 7 to
-# run the inventory script.' and stops, but it stopped with a bare 'Exit',
-# which ends the process with exit code 0. A scheduled task or a wrapper then
-# saw a success with no report. It now ends with exit 1, as the other setup
-# stops do.
+# CheckPowerShell stops the run when the PowerShell version is below 7, but
+# it stopped with a bare 'Exit', which ends the process with exit code 0. A
+# scheduled task or a wrapper then saw a success with no report. It now ends
+# with exit 1. This test proves only that CheckPowerShell ends with exit 1
+# when the version is below 7; on real Windows PowerShell 5.1 the files the
+# script loads carry #Requires -Version 7.0, so the run may stop before
+# CheckPowerShell is reached.
 #
 # PowerShell 5.1 is not available to the test, and $PSVersionTable cannot be
 # replaced, so the test lifts the REAL CheckPowerShell function from
