@@ -816,9 +816,10 @@ else
 # VM billing-coverage banner. Rendered only when the inventory shows materially
 # more running VMs than the consumption data billed for (see the $VmBilling
 # detection above). Frames the inventory as authoritative and points at
-# consumption-collection completeness, not at the report being inaccurate. In
-# an obfuscated report the per-VM identities cannot be joined (separate
-# dictionaries), so this is a count-level signal; the wording reflects that.
+# consumption-collection completeness, not at the report being inaccurate.
+# When the inventory and consumption ids never meet (in an obfuscated report
+# whose two files were masked apart) it is a count-level signal, and the
+# wording says the VMs cannot be named.
 $CoverageBanner = ''
 if ($null -ne $VmBilling)
 {
