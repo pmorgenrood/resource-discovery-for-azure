@@ -42,7 +42,7 @@ BeforeAll {
 
     $script:Harness = Join-Path $script:WorkDir 'run.ps1'
     @'
-param([string]$Tree, [string]$Out, [string]$FailIds = '', [switch]$SignInLapse)
+param([string]$Tree, [string]$Out, [string]$FailIds = '', [switch]$SignInLapse, [switch]$Twice)
 $PSStyle.OutputRendering = 'PlainText'
 $Global:RdaSessionInitialized = $true
 $Global:AzPowerShellLoaded = $true
@@ -137,12 +137,22 @@ function global:az
 Set-Location $Tree
 $global:LASTEXITCODE = 0
 & (Join-Path $Tree 'ResourceInventory.ps1') -TenantID $Tenant -SkipMetrics -OutputDirectory $Out -Service PublicIP
+# -Twice: a second, clean run in the same PowerShell process, as after fixing
+# the cause and running the same command again in the same window.
+if ($Twice)
+{
+    Write-Host ('=== FIRST RUN EXIT {0} ===' -f $LASTEXITCODE)
+    $Global:StandInFailIds = @()
+    $global:LASTEXITCODE = 0
+    [System.Threading.Thread]::Sleep(1100)
+    & (Join-Path $Tree 'ResourceInventory.ps1') -TenantID $Tenant -SkipMetrics -OutputDirectory $Out -Service PublicIP
+}
 exit $LASTEXITCODE
 '@ | Set-Content -Path $script:Harness -Encoding utf8
 
     function Invoke-DirectRun
     {
-        param([string]$FailIds = '', [switch]$SignInLapse)
+        param([string]$FailIds = '', [switch]$SignInLapse, [switch]$Twice)
         $CaseHome = Join-Path $script:WorkDir ('home_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $Out = Join-Path $CaseHome 'out'
         New-Item -ItemType Directory -Path $Out -Force | Out-Null
@@ -150,7 +160,7 @@ exit $LASTEXITCODE
         try
         {
             $env:HOME = $CaseHome
-            $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Harness -Tree $script:Tree -Out $Out -FailIds $FailIds -SignInLapse:$SignInLapse 2>&1 | ForEach-Object { [string]$_ })
+            $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Harness -Tree $script:Tree -Out $Out -FailIds $FailIds -SignInLapse:$SignInLapse -Twice:$Twice 2>&1 | ForEach-Object { [string]$_ })
             $ExitCode = $LASTEXITCODE
         }
         finally
@@ -252,5 +262,16 @@ Describe 'Direct run whose billing pull succeeded for every subscription' -Skip:
         $Clean.End | Should -Not -Match 'Consumption Failures'
         $Clean.Console | Should -Not -Match 'FAILED \(consumption\)'
         $Clean.Exit | Should -Be 0
+    }
+}
+
+Describe 'A clean direct run after a failed one in the same PowerShell window' -Skip:$script:SkipReason {
+    It 'reports no consumption failure of the earlier run and exits 0' {
+        $Run = Invoke-DirectRun -FailIds '12345678-1234-1234-1234-123456789012' -Twice
+        $Run.Console | Should -Match '=== FIRST RUN EXIT 3 ===' -Because $Run.Console
+        $Second = $Run.Console.Substring($Run.Console.IndexOf('=== FIRST RUN EXIT'))
+        $Second | Should -Not -Match 'Consumption Failures'
+        $Second | Should -Not -Match 'FAILED \(consumption\)'
+        $Run.Exit | Should -Be 0
     }
 }
