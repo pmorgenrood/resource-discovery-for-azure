@@ -836,6 +836,35 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $C.Output | Should -BeFalse
     }
 
+    It 'stops when the recovery ResourceIdMap holds only some of the gap tokens, naming how many are missing' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        # A partial seed: two of the gap's three ids are gone from the recovery map.
+        foreach ($Record in @($Masked.Records | Select-Object -First 2)) { $Seeded.Dictionary.ResourceIdMap.Remove($Record.ID) }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+        $GapDictPath = (Get-ChildItem -LiteralPath $C.Gap -Filter 'ObfuscationDictionary_*.json').FullName
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage ("*lacks 2 of the 3 ResourceIdMap token(s)*Nothing was written*-Obfuscate -ObfuscationDictionary '{0}' into a new folder*" -f $GapDictPath)
+        Test-Path -LiteralPath $C.Output | Should -BeFalse
+    }
+
+    It 'merges when the recovery ResourceIdMap holds every gap token and tokens of its own' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        @($Seeded.Dictionary.ResourceIdMap.Keys).Count | Should -Be 5 -Because 'a seeded recovery holds the 3 gap ids and adds its own 2'
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        ($Result.Warnings -join "`n") | Should -Not -Match 'ResourceIdMap'
+    }
+
     It 'stops when only the gap bundle has a dictionary, naming the recovery bundle' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }

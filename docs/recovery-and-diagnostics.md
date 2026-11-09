@@ -126,7 +126,9 @@ Behaviour:
   when only one of the two bundles has an `ObfuscationDictionary_*.json`
   (one run was masked and the other was not), or when the two dictionaries
   share no `ResourceIdMap` token (the recovery run was not seeded with the gap
-  dictionary). An empty `ResourceIdMap` (a masked run that found no resources)
+  dictionary), or when any gap `ResourceIdMap` token is missing from the
+  recovery's map (a seeded recovery keeps every gap token and may add its
+  own). An empty `ResourceIdMap` (a masked run that found no resources)
   skips the shared-token check, but then that bundle must give the merge no
   inventory record, consumption row or metric; otherwise the merge stops,
   because those were not masked with that dictionary (for example a plain run
