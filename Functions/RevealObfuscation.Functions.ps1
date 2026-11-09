@@ -37,6 +37,17 @@ function Get-SubGuidFromResourceId
     return $null
 }
 
+# A folder path in one form for comparing: full, with no trailing separator
+# (a root such as '/' or 'C:\' keeps its own). 'root/' and 'root' compare equal.
+function ConvertTo-RevealComparablePath
+{
+    param([string]$Path)
+    $Full = [System.IO.Path]::GetFullPath($Path)
+    $Trimmed = $Full.TrimEnd('\', '/')
+    if ($Trimmed.Length -eq 0 -or $Trimmed -match '^[A-Za-z]:$') { return $Full }
+    return $Trimmed
+}
+
 function Get-JsonEscaped
 {
     # Return the input string escaped for placement INSIDE a JSON string literal
