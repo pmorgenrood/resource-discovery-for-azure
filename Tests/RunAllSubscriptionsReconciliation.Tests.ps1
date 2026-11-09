@@ -38,6 +38,8 @@ BeforeAll {
         throw "Could not find shared functions file at $script:FunctionsPath"
     }
     . $script:FunctionsPath
+    # Get-RunSummaryLogContent reads the metrics-incomplete helpers in Common.Functions.ps1.
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
 
     # Guard: the functions under test must be defined by the shared file. If a
     # future change renames or removes one, fail loudly here rather than with a
