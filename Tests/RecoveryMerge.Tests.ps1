@@ -519,7 +519,10 @@ Describe 'Merge-RecoveryData consumption handling' {
     It 'stops before writing anything when the <Which> consumption file it would zip lacks <Missing>' -ForEach @(
         @{ Which = 'gap'; Missing = 'MeterId'; Header = 'InstanceData,MeterCategory,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId' },
         @{ Which = 'recovery'; Missing = 'ResourceId'; Header = 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceUri' },
-        @{ Which = 'gap'; Missing = 'any header'; Header = '' }
+        @{ Which = 'gap'; Missing = 'any header'; Header = '' },
+        @{ Which = 'gap'; Missing = 'Quantity'; Header = 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Unit,UsageStartTime,UsageEndTime,ResourceId' },
+        @{ Which = 'recovery'; Missing = 'UsageStartTime'; Header = 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageEndTime,ResourceId' },
+        @{ Which = 'gap'; Missing = 'UsageEndTime'; Header = 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,ResourceId' }
     ) {
         $C = New-Case
         $Bad = if ($Header) { "$Header`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id" } else { '' }
@@ -537,7 +540,6 @@ Describe 'Merge-RecoveryData consumption handling' {
     It 'stops before writing anything when the <Which> consumption file it would zip has <Case>' -ForEach @(
         @{ Which = 'gap'; Case = 'a Quantity with a decimal comma'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,"1,5",Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of '1,5'*" },
         @{ Which = 'recovery'; Case = 'a Quantity with a thousands mark'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,"1,000.5",Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of '1,000.5'*" },
-        @{ Which = 'gap'; Case = 'a negative Quantity'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,-1,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = '*row 2 has a negative Quantity*' },
         @{ Which = 'recovery'; Case = 'a Quantity that is text'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,one,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of 'one'*" },
         @{ Which = 'gap'; Case = 'a Quantity that is not a finite number'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,NaN,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of 'NaN'*" },
         @{ Which = 'gap'; Case = 'a UsageStartTime that is not a date'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,1,Hours,soon,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a UsageStartTime of 'soon'*" },
@@ -582,6 +584,36 @@ Describe 'Merge-RecoveryData consumption handling' {
 
         (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash |
             Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase))).Hash
+    }
+
+    It 'merges the <Which> consumption file with rows downstream drops one by one, and warns once with their count' -ForEach @(
+        @{ Which = 'gap' },
+        @{ Which = 'recovery' }
+    ) {
+        # The tool's own run writes such rows, so stopping on them would stop
+        # the gap, the recovery and every re-run alike.
+        $C = New-Case
+        $Csv = @(
+            $script:CsvHeader,
+            '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,',
+            '{},Compute,m1,MET,eastus,vm,-1,Hours,2026-01-01,2026-01-02,/id,eastus,,,',
+            '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,,eastus,,,',
+            '{},Compute,,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,'
+        ) -join "`n"
+        $GapCsv = if ($Which -eq 'gap') { $Csv } else { $script:CsvHeader }
+        $RecCsv = if ($Which -eq 'recovery') { $Csv } else { $script:CsvHeader }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $GapCsv
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -ConsumptionCsv $RecCsv
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Which -eq 'recovery') { $Splat.RecoverConsumption = $true }
+        $Source = if ($Which -eq 'gap') { Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase) } else { Join-Path $C.Recovery ('Consumption_{0}.csv' -f $script:RecBase) }
+
+        $Result = Merge-RecoveryData @Splat
+
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash | Should -Be (Get-FileHash -LiteralPath $Source).Hash
+        $Drop = @($Result.Warnings | Where-Object { $_ -like '*downstream drops each such row*' })
+        $Drop.Count | Should -Be 1
+        $Drop[0] | Should -BeLike ("*the $Which bundle's consumption file '{0}' has 3 row(s)*" -f (Split-Path -Leaf $Source))
     }
 
     It 'carries a consumption file with quoted headers forward byte for byte' {

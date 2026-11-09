@@ -564,7 +564,9 @@ function Merge-RecoveryData
         {
             $HeaderNames = @()
         }
-        $MissingColumns = @('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $_ -notin $HeaderNames })
+        # Downstream finds its columns by header name. Without one of these it
+        # loses the rows, or cannot read the Quantity and dates of any row.
+        $MissingColumns = @('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId', 'Quantity', 'UsageStartTime', 'UsageEndTime' | Where-Object { $_ -notin $HeaderNames })
         if ($MissingColumns.Count -gt 0)
         {
             $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
@@ -576,17 +578,22 @@ function Merge-RecoveryData
         # where those columns exist, does not parse; a file cut mid-row by a
         # failed pull ends in such a row. Numbers are read with the invariant
         # culture (a dot, no thousands mark), as the tool writes them. A row
-        # with an empty ResourceId or MeterId is only dropped by itself, so
-        # that is not checked here.
+        # with an empty ResourceId or MeterId, or a negative Quantity, is only
+        # dropped by itself, and the tool's own run writes such rows, so they
+        # do not stop the merge (the gap, the recovery and a re-run would all
+        # carry the same row, so a stop would never clear); one warning gives
+        # their count instead.
         $ConsumptionRows = @(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop)
         $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
         $NumberColumns = @('Quantity', 'Cost', 'UnitPrice' | Where-Object { $_ -in $HeaderNames })
-        $DateColumns = @('UsageStartTime', 'UsageEndTime' | Where-Object { $_ -in $HeaderNames })
+        $DateColumns = @('UsageStartTime', 'UsageEndTime')
         $BadCell = $null
         $RowIndex = 0
+        $DroppedRowCount = 0
         foreach ($Row in $ConsumptionRows)
         {
             $RowIndex++
+            $RowDropped = ([string]::IsNullOrWhiteSpace([string]$Row.ResourceId) -or [string]::IsNullOrWhiteSpace([string]$Row.MeterId))
             foreach ($Column in $NumberColumns)
             {
                 $Cell = $Row.$Column
@@ -597,10 +604,11 @@ function Merge-RecoveryData
                 }
                 elseif ($Column -eq 'Quantity' -and $Number -lt 0)
                 {
-                    $BadCell = ("row {0} has a negative Quantity ('{1}')" -f $RowIndex, $Cell)
+                    $RowDropped = $true
                 }
                 if ($null -ne $BadCell) { break }
             }
+            if ($RowDropped) { $DroppedRowCount++ }
             if ($null -eq $BadCell)
             {
                 foreach ($Column in $DateColumns)
@@ -620,6 +628,10 @@ function Merge-RecoveryData
         {
             $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
             throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' cannot be used: {2}. Downstream would drop the whole file, and with it every cost. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, $BadCell, $OutputPath, $Hint)
+        }
+        if ($DroppedRowCount -gt 0)
+        {
+            Add-MergeWarning ("the {0} bundle's consumption file '{1}' has {2} row(s) with an empty ResourceId or MeterId or a negative Quantity. Downstream drops each such row by itself; the rest of the file is used." -f $ConsumptionSource, $ConsumptionSourceFile.Name, $DroppedRowCount)
         }
     }
     $MetricsSourceLabel = if ($RecoverMetrics) { 'recovery' } else { 'gap' }
