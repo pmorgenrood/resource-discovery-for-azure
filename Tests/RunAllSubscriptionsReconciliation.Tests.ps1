@@ -554,6 +554,13 @@ Describe 'Test-AzPsTokenSilent retries a failed token cache check' {
         $script:TokenCalls | Should -Be 2
     }
 
+    It 'retries a first request that only warns and gives no token' {
+        $script:TokenCalls = 0
+        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
+        Test-AzPsTokenSilent -Tenant 'tenant-1' | Should -BeTrue
+        $script:TokenCalls | Should -Be 2
+    }
+
     It 'fails at once on a sign-in that cannot be used' {
         $script:TokenCalls = 0
         Mock Get-AzAccessToken { $script:TokenCalls++; throw 'Run Connect-AzAccount to login.' }

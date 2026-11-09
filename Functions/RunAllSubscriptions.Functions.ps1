@@ -729,12 +729,7 @@ function Test-AzPsTokenSilent
         # Common.Functions.ps1): a failed token cache check, when two token
         # requests run at once, passes on a retry; a sign-in that cannot be used
         # is not retried.
-        $Call = Invoke-ConsumptionCallWithRetry -Argument $Tenant -Operation {
-            param($ForTenant)
-            $Seen = @()
-            $Value = Get-AzAccessToken -TenantId $ForTenant -ErrorAction Stop -WarningVariable Seen -WarningAction SilentlyContinue
-            [pscustomobject]@{ Token = $Value; Warnings = @($Seen) }
-        }
+        $Call = Invoke-ConsumptionCallWithRetry -Argument $Tenant -Operation { param($ForTenant) Get-RdaAccessToken -TenantId $ForTenant }
         if ($null -ne $Call.Error) { return $false }
         $Token = $Call.Value.Token
         $Warnings = @($Call.Value.Warnings)
