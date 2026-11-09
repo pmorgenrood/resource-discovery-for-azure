@@ -251,7 +251,7 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
     }
 }
 
-Describe 'Test-MetricThrottled - the status code decides first' {
+Describe 'Get-MetricFailure - the Throttled kind: the status code decides first' {
     BeforeAll {
         $Tokens = $null; $Errors = $null
         $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
@@ -383,17 +383,14 @@ Describe 'Test-MetricThrottled - the status code decides first' {
         Test-MetricThrottled -Exception $Ex | Should -Be $Want
     }
 
-    It 'walks the chain with the same helper as the 404 and 400 checks' {
-        $FnAst = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-MetricFailure' }, $true) | Select-Object -First 1
-        $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionChain -Exception \$Exception'
-        $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionStatus -Ex \$Ex'
-    }
-
-    It 'the retry loop asks it, not a message match, whether an answer was throttled' {
-        $script:MetricsSrc | Should -Match '\$Failure = Get-MetricFailure -Exception \$_\.Exception'
-        $script:MetricsSrc | Should -Match 'elseif \(\$Failure\.Kind -eq ''Throttled''\)'
-        $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'
-    }
+    # The retry loop is tested by what it does, in MetricsGrouping.Tests.ps1.
+    # These show the 429 is read with the same walk as the 404 and 400:
+    #   'reads a 429 that wraps a 400 as a BadRequest: no retry, one request per metric'
+    #   'reads a 403 that wraps a 429 as refused, not throttled: 1 attempt, no request per metric'
+    #   'reads a 5xx that wraps a 404 as a NotFound: 1 attempt, no request per metric'
+    # These show the loop asks Get-MetricFailure, not a message match, whether an answer was throttled:
+    #   'treats a wrapped 429 known only by its status code as throttled and waits its Retry-After'
+    #   'does not read a status-less error as throttled when 429 is only in an id or a name'
 }
 
 Describe 'Retry-After reaches the runspace' {
