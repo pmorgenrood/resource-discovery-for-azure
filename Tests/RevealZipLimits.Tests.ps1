@@ -122,6 +122,27 @@ Describe 'Get-RevealZipLimitProblem' {
         Get-Problem $Path | Should -Match 'whose path is rooted'
     }
 
+    # A drive-qualified or UNC-like name is rooted on Windows, where the server
+    # may read it, whatever host Reveal runs on.
+    It 'refuses the drive or UNC path <Name> on every host' -ForEach @(
+        @{ Name = 'C:/Inventory_x.json' }
+        @{ Name = 'C:\Inventory_x.json' }
+        @{ Name = 'C:Inventory_x.json' }
+        @{ Name = 'd:/sub/Metrics_x.json' }
+        @{ Name = '\\server\x' }
+        @{ Name = '//server/x' }
+    ) {
+        $Path = Join-Path $script:WorkDir 'drive.zip'
+        Write-TestZip -Path $Path -Entries ([ordered]@{ 'Inventory_r.json' = $script:Inventory; $Name = $script:Inventory })
+        Get-Problem $Path | Should -Be ("it holds the file '{0}', whose path is rooted" -f $Name)
+    }
+
+    It 'passes a name with a colon that is not a drive' {
+        $Path = Join-Path $script:WorkDir 'colon.zip'
+        Write-TestZip -Path $Path -Entries ([ordered]@{ 'Inventory_r.json' = $script:Inventory; 'sub/a:b.json' = '{}' })
+        Get-Problem $Path | Should -BeNullOrEmpty
+    }
+
     It 'refuses a file over the one-file limit' {
         $Path = Join-Path $script:WorkDir 'big.zip'
         Write-TestZip -Path $Path -Entries ([ordered]@{ 'a.json' = ('x' * 300); 'b.json' = 'y' })
