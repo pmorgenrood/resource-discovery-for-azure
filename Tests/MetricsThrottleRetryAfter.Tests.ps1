@@ -232,6 +232,20 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
         (Plan @{ Throttled = $true; ThrottledAttempts = 1; RetryAfterSeconds = $Seconds }).SleepSeconds | Should -Be $script:MaxRetryAfter
     }
 
+    It 'reads an exception reached twice only once: four wrappers whose inner exception and error record are the same still reach the Retry-After' {
+        # Each wrapper holds the next one both as its InnerException and as its error record's
+        # exception, so a walk that does not skip what it has seen spends its 10 places on copies.
+        $Ex = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('7') } })
+        for ($i = 1; $i -le 4; $i++)
+        {
+            $Wrapper = [System.Exception]::new(('wrapper ' + $i), $Ex)
+            $Wrapper | Add-Member -NotePropertyName ErrorRecord -NotePropertyValue ([System.Management.Automation.ErrorRecord]::new($Ex, 'Metric', 'NotSpecified', $null))
+            $Ex = $Wrapper
+        }
+        Get-RdaRetryAfterSeconds -ErrorRecord $Ex | Should -Be 7
+    }
+
     It 'gives 0 when there is no response at all' {
         Get-RdaRetryAfterSeconds -ErrorRecord ([System.Management.Automation.ErrorRecord]::new([System.Exception]::new('TooManyRequests'), 'x', 'NotSpecified', $null)) | Should -Be 0
     }
