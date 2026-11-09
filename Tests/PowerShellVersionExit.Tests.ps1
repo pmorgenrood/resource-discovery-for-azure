@@ -30,7 +30,7 @@ BeforeDiscovery {
 }
 
 BeforeAll {
-    $Source = Join-Path $PSScriptRoot '..' 'ResourceInventory.ps1'
+    $Source = Join-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -ChildPath 'ResourceInventory.ps1'
     $Tokens = $null
     $ParseErrors = $null
     $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$Tokens, [ref]$ParseErrors)
