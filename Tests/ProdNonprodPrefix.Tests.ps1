@@ -43,6 +43,7 @@ AfterAll {
 
 Describe "Prefix Consistency Per Resource" {
     It "ID and Name should have the same prefix for each resource" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         foreach ($r in $script:AllResources)
         {
             # Only check ID and Name: Subscription/ResourceGroup are shared across
@@ -86,6 +87,7 @@ Describe "Name Matches The Id's Name Token" {
 
 Describe "Prefix Format Validation" {
     It "All obfuscated IDs should be masked ARM paths whose every masked segment starts with exactly 'prod_' or 'nonprod_'" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         foreach ($r in $script:AllResources)
         {
             if ($null -ne $r.ID)
@@ -98,6 +100,7 @@ Describe "Prefix Format Validation" {
     }
 
     It "No resource should have an empty prefix (just underscore + GUID)" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         foreach ($r in $script:AllResources)
         {
             if ($null -ne $r.ID)
@@ -110,6 +113,7 @@ Describe "Prefix Format Validation" {
 
 Describe "Consumption Prefix Consistency" {
     It "Consumption ResourceIds should have prod_ or nonprod_ prefix" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         $CsvFile = Get-ChildItem -Path $script:ExtractPath -Filter "Consumption_*.csv" | Select-Object -First 1
         if ($null -eq $CsvFile) { Set-ItResult -Skipped -Because "no consumption csv in fixture"; return }
         $Content = Get-Content $CsvFile.FullName -ErrorAction SilentlyContinue
@@ -136,6 +140,7 @@ Describe "Consumption Prefix Consistency" {
 
 Describe "Type hint fidelity: name token only, never the subscription or resource group token" {
     It "obfuscated IDs never carry a databricks/aks/vmss type hint on the subscription or resource group token" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         # The ID is a masked ARM path whose last segment is the obfuscated NAME,
         # so a hinted name shows up there. The subscription and resource group
         # tokens are built with no type hint. Assert they never pick one up.
@@ -150,6 +155,7 @@ Describe "Type hint fidelity: name token only, never the subscription or resourc
     }
 
     It "any databricks/aks/vmss type hint present in the fixture sits on the Name only" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         # Positive check: only meaningful when the fixture actually contains a
         # type-hinted resource. If it does not (prod-only / no databricks/aks/vmss
         # resources), record the fixture limitation instead of asserting on
