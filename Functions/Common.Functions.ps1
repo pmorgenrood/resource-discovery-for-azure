@@ -313,6 +313,27 @@ function Invoke-RdaBoundedAzRestMethod
     }
 }
 
+# True when an error looks like a network fault or a time-out that may pass:
+# an HttpRequestException, IOException, SocketException or
+# TaskCanceledException anywhere in its chain. Any other error (no Az context,
+# for one) comes back the same way, so it is not worth sending again.
+function Test-RdaTransientException
+{
+    param([System.Exception]$Exception)
+
+    $Depth = 0
+    for ($Current = $Exception; $null -ne $Current -and $Depth -lt 16; $Current = $Current.InnerException)
+    {
+        if ($Current -is [System.Net.Http.HttpRequestException] -or $Current -is [System.IO.IOException] -or
+            $Current -is [System.Net.Sockets.SocketException] -or $Current -is [System.Threading.Tasks.TaskCanceledException])
+        {
+            return $true
+        }
+        $Depth++
+    }
+    return $false
+}
+
 # The registration state of Microsoft.Insights on one subscription:
 # 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
 # when the state could not be read (the error is in Error). With
@@ -324,9 +345,9 @@ function Get-RdaInsightsProviderState
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     # One ARM GET, sent again at most $MaxRetries times (1, 2, 4 s apart) after a
-    # request that throws, a throttle, an HTTP 408 or a server error. Any other
-    # answer that is not a success, or a GET given up on its time limit, reads
-    # as Unknown at once.
+    # network error or time-out (Test-RdaTransientException), a throttle, an
+    # HTTP 408 or a server error. Any other error or answer that is not a
+    # success, or a GET given up on its time limit, reads as Unknown at once.
     $LastError = $null
     for ($Attempt = 0; $Attempt -le $MaxRetries; $Attempt++)
     {
@@ -343,7 +364,8 @@ function Get-RdaInsightsProviderState
         catch
         {
             $LastError = [string]$_.Exception.Message
-            continue
+            if (Test-RdaTransientException -Exception $_.Exception) { continue }
+            break
         }
         $Status = [int]$Response.StatusCode
         if ($Status -ge 200 -and $Status -lt 300)
