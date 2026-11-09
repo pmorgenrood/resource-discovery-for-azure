@@ -851,6 +851,27 @@ Describe 'Callers use the message and the switch' {
     # stream worker and the direct run) is run by the count-line tests above.
     It 'the stream worker loads Common.Functions.ps1' {
         $script:Stream | Should -Match "Functions/Common\.Functions\.ps1"
+        # The real load: at top level, $CommonFunctionsFile is set to that
+        # file and then dot-sourced, both before the first count line.
+        $Top = @($script:StreamAst.EndBlock.Statements)
+        $Set = @($Top | Where-Object {
+                $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$CommonFunctionsFile' -and
+                $_.Right.Extent.Text -match "^Join-Path \`$PSScriptRoot 'Functions/Common\.Functions\.ps1'$"
+            })
+        $Set.Count | Should -Be 1 -Because 'the worker names the file once, at top level, next to itself'
+        $Load = @($Top | Where-Object {
+                $_ -is [System.Management.Automation.Language.PipelineAst] -and $_.PipelineElements.Count -eq 1 -and
+                $_.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and
+                $_.PipelineElements[0].InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot -and
+                $_.PipelineElements[0].CommandElements.Count -eq 1 -and
+                $_.PipelineElements[0].CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $_.PipelineElements[0].CommandElements[0].VariablePath.UserPath -eq 'CommonFunctionsFile'
+            })
+        $Load.Count | Should -Be 1 -Because 'the worker dot-sources $CommonFunctionsFile at top level'
+        $Load[0].Extent.StartOffset | Should -BeGreaterThan $Set[0].Extent.StartOffset
+        $Uses = @($script:StreamAst.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Get-RdaResourceCountMessage' }, $true))
+        $Uses.Count | Should -BeGreaterThan 0
+        $Load[0].Extent.EndOffset | Should -BeLessThan (@($Uses | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum) -Because 'the file is loaded before the first count line'
     }
 
     It 'every per-subscription row (2 in the wrapper, 1 in the stream worker) carries the skipped count, unknown kept as unknown' {
@@ -890,6 +911,13 @@ Describe 'Callers use the message and the switch' {
         foreach ($Text in @($script:Inventory, $script:Wrapper, $script:Stream))
         {
             $Text | Should -Match '\[switch\]\s*\$IncludeNetworkResources'
+        }
+        # The script's own param block declares it, typed [switch].
+        foreach ($Pair in @(@('ResourceInventory.ps1', $script:InventoryAst), @('Run-AllSubscriptions.ps1', $script:WrapperAst), @('Run-AllSubscriptions.Stream.ps1', $script:StreamAst)))
+        {
+            $Param = @($Pair[1].ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'IncludeNetworkResources' })
+            $Param.Count | Should -Be 1 -Because "$($Pair[0]) declares -IncludeNetworkResources in its param block"
+            $Param[0].StaticType | Should -Be ([switch]) -Because "$($Pair[0]) types -IncludeNetworkResources as [switch]"
         }
     }
 
