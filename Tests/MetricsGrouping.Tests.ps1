@@ -1077,6 +1077,29 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricRerunCanFix -TimedOut $false -Exception $Wrapped | Should -BeFalse
     }
 
+    It 'reads a RequestFailedException with Status 0 (no response) as having no status, so its message decides throttling' {
+        if (-not ('RdaTest.RequestFailedException' -as [type]))
+        {
+            Add-Type -TypeDefinition 'namespace RdaTest { public class RequestFailedException : System.Exception { public RequestFailedException(int status, string message, System.Exception inner) : base(message, inner) { Status = status; } public int Status { get; private set; } } }'
+        }
+        $NoResponse = [RdaTest.RequestFailedException]::new(0, 'The request was throttled; rate limit exceeded.', $null)
+        Get-MetricErrorStatus -Exception $NoResponse | Should -BeNullOrEmpty
+        Test-MetricRerunCanFix -TimedOut $false -Exception $NoResponse | Should -BeTrue
+        # Its message is read as for an exception with no status.
+        Get-MetricErrorStatus -Exception ([RdaTest.RequestFailedException]::new(0, "Operation returned an invalid status code 'Forbidden'", $null)) | Should -Be 403
+
+        # The retry loop's own statements, as written, read it as throttled.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:MetricsScript, [ref]$null, [ref]$null)
+        $Classify = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Extent.Text -match '^if \(-not \$BadRequest\)' -and $N.Extent.Text -match '\$Throttled = ' }, $true))
+        $Classify.Count | Should -Be 1
+        $Throttled = $false
+        $BadRequest = Test-MetricBadRequest -Exception $NoResponse
+        $LastError = $NoResponse.Message
+        $BadRequest | Should -BeFalse
+        [pscustomobject]@{ Exception = $NoResponse } | ForEach-Object { . ([scriptblock]::Create($Classify[0].Extent.Text)) }
+        $Throttled | Should -BeTrue
+    }
+
     It 'counts a 503 whose message holds the text of a 404' {
         $Loose = [System.Net.Http.HttpRequestException]::new('The service is unavailable; an earlier step had status code 404.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
         Get-MetricErrorStatus -Exception $Loose | Should -Be 503
