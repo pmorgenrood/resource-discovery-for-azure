@@ -316,7 +316,14 @@ function Merge-RecoveryData
         $RecoveryIdKeys = @($RecoveryDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
         if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
         {
-            $SharedIdKeyCount = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys }).Count
+            # A set lookup per recovery key, stopping at the first shared one,
+            # so maps of many thousand ids are compared in well under a second.
+            $GapIdKeySet = [System.Collections.Generic.HashSet[string]]::new([string[]]$GapIdKeys, [System.StringComparer]::OrdinalIgnoreCase)
+            $SharedIdKeyCount = 0
+            foreach ($RecoveryIdKey in $RecoveryIdKeys)
+            {
+                if ($GapIdKeySet.Contains($RecoveryIdKey)) { $SharedIdKeyCount = 1; break }
+            }
         }
         if ($SharedIdKeyCount -eq 0)
         {
