@@ -127,3 +127,39 @@ Describe 'Reveal.ps1 staging lock' -Skip:$IsWindows {
         @(Get-ChildItem -LiteralPath $Other -Force).Name | Should -Be @('keep.txt')
     }
 }
+
+Describe 'Reveal.ps1 staging lock on a relative staging folder' -Skip:$IsWindows {
+    # The lock is opened with a .NET call, which reads a relative path against
+    # the process folder. After Set-Location the PowerShell location is
+    # another folder, so staging must be made a full path before the lock.
+    It 'takes the lock in the staging folder named from the PowerShell location' {
+        $Case = New-Case -Name 'relative'
+        $ProcessFolder = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath $Case.Dir
+        try
+        {
+            $Text = (& $script:Reveal -All -InventoryRoot 'root' -StagingDirectory 'st' -OutputZip 'out.zip' -FolderTimeoutMinutes 5 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+            $Exit = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+
+        $Exit | Should -Be 0 -Because $Text
+        Test-Path -LiteralPath (Join-Path $Case.Dir 'out.zip') -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Case.Dir 'st/.reveal-lock') -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $ProcessFolder 'st') | Should -BeFalse
+    }
+
+    It 'does not call another error on the lock file a lock held by another run' {
+        $Case = New-Case -Name 'notheld'
+        $null = New-Item -ItemType Directory -Path $Case.Staging -Force
+        # The lock file is a link into a folder that does not exist, so it
+        # cannot be opened, though no run holds it.
+        $null = New-Item -ItemType SymbolicLink -Path (Join-Path $Case.Staging '.reveal-lock') -Target (Join-Path $Case.Dir 'missing/lock')
+
+        $Run = Invoke-Reveal -Root $Case.Root -Staging $Case.Staging -Bundle (Join-Path $Case.Dir 'bundle.zip')
+
+        $Run.Exit | Should -Not -Be 0 -Because $Run.Text
+        ($Run.Text -replace '\s+', ' ') | Should -Not -Match 'is in use by another Reveal run'
+        ($Run.Text -replace '\s+', ' ') | Should -Match 'Could not find'
+    }
+}
