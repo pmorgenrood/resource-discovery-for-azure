@@ -9,6 +9,7 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
     $script:Pattern = Get-MaskedIdPattern
+    $script:ScopePattern = Get-MaskedIdPattern -AllowScopeOnly
     $script:T = 'prod_11111111-2222-4333-8444-555555555555'
     $script:N = 'nonprod_66666666-7777-4888-9999-000000000000'
 }
@@ -18,8 +19,6 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'resource id'; Id = '/subscriptions/{T}/resourcegroups/{N}/providers/microsoft.compute/virtualmachines/{T}' }
         @{ Label = 'child resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/{T}/databases/{N}' }
         @{ Label = 'subscription-level id'; Id = '/subscriptions/{T}/providers/microsoft.security/pricings/{T}' }
-        @{ Label = 'subscription-scope id'; Id = '/subscriptions/{T}' }
-        @{ Label = 'group-scope id'; Id = '/subscriptions/{T}/resourcegroups/{N}' }
         @{ Label = 'tenant-scope reservation id'; Id = '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}' }
         @{ Label = 'tenant-scope management group id'; Id = '/providers/Microsoft.Management/managementGroups/{T}' }
         @{ Label = 'extension resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/{T}' }
@@ -41,8 +40,8 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'a real parent name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/srv-a/databases/{T}' }
         @{ Label = 'a real tenant-scope name'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/reservations/{T}' }
         @{ Label = 'a real name in an extension block'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/ds-a' }
-        @{ Label = 'a real group in a group-scope id'; Id = '/subscriptions/{T}/resourcegroups/rg-demo' }
-        @{ Label = 'a real subscription in a subscription-scope id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012' }
+        @{ Label = 'a resource id cut back to its group'; Id = '/subscriptions/{T}/resourcegroups/{T}' }
+        @{ Label = 'a resource id cut back to its subscription'; Id = '/subscriptions/{T}' }
         @{ Label = 'a real name after an empty segment'; Id = '/providers/microsoft.capacity/reservationorders//reservations/res-a' }
         @{ Label = 'a real name before a trailing slash'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/' }
         @{ Label = 'an empty segment inside the path'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
@@ -51,5 +50,23 @@ Describe 'Get-MaskedIdPattern' {
     ) {
         $Masked = $Id.Replace('{T}', $script:T)
         $Masked | Should -Not -Match $script:Pattern
+    }
+
+    It 'with -AllowScopeOnly accepts a masked <Label>' -ForEach @(
+        @{ Label = 'subscription-scope id'; Id = '/subscriptions/{T}' }
+        @{ Label = 'group-scope id'; Id = '/subscriptions/{T}/resourcegroups/{N}' }
+        @{ Label = 'resource id'; Id = '/subscriptions/{T}/resourcegroups/{N}/providers/microsoft.compute/virtualmachines/{T}' }
+    ) {
+        $Masked = $Id.Replace('{T}', $script:T).Replace('{N}', $script:N)
+        $Masked | Should -Match $script:ScopePattern
+    }
+
+    It 'with -AllowScopeOnly refuses <Label>' -ForEach @(
+        @{ Label = 'a real group in a group-scope id'; Id = '/subscriptions/{T}/resourcegroups/rg-demo' }
+        @{ Label = 'a real subscription in a subscription-scope id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012' }
+        @{ Label = 'a flat token'; Id = '{T}' }
+    ) {
+        $Masked = $Id.Replace('{T}', $script:T)
+        $Masked | Should -Not -Match $script:ScopePattern
     }
 }

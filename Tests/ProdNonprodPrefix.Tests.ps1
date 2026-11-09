@@ -29,6 +29,8 @@ BeforeAll {
     # shape is described in Helpers/MaskedIdPattern.ps1.
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
     $script:MaskedIdPattern = Get-MaskedIdPattern
+    # A consumption row can be billed to a subscription or a group itself.
+    $script:MaskedConsumptionIdPattern = Get-MaskedIdPattern -AllowScopeOnly
 }
 
 AfterAll {
@@ -93,7 +95,7 @@ Describe "Consumption Prefix Consistency" {
         {
             if (![string]::IsNullOrEmpty($row.ResourceId))
             {
-                $row.ResourceId | Should -Match $script:MaskedIdPattern -Because "Consumption ResourceId '$($row.ResourceId)' should be a masked ARM path with prod_/nonprod_ tokens"
+                $row.ResourceId | Should -Match $script:MaskedConsumptionIdPattern -Because "Consumption ResourceId '$($row.ResourceId)' should be a masked ARM path with prod_/nonprod_ tokens"
             }
         }
     }

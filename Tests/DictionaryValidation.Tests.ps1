@@ -39,7 +39,9 @@ BeforeAll {
     # A masked resource ID is an ARM-shaped path, never a flat token; the
     # shape is described in Helpers/MaskedIdPattern.ps1.
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
-    $script:MaskedIdPattern = Get-MaskedIdPattern
+    # The dictionary also holds consumption ids, which can be a subscription or
+    # a group itself.
+    $script:MaskedIdPattern = Get-MaskedIdPattern -AllowScopeOnly
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 }
 

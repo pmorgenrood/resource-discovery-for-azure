@@ -79,6 +79,8 @@ BeforeAll {
     # shape is described in Helpers/MaskedIdPattern.ps1.
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
     $script:MaskedIdPattern = Get-MaskedIdPattern
+    # A consumption row can be billed to a subscription or a group itself.
+    $script:MaskedConsumptionIdPattern = Get-MaskedIdPattern -AllowScopeOnly
 
     # Helper: get all resources from inventory as flat list
     $script:AllResources = @()
@@ -316,7 +318,7 @@ Describe "Consumption Obfuscation" {
     # so rows can be told apart by provider, type and child segments, and joined
     # to the inventory ID with the same tokens. A flat prod_<guid> token loses
     # the subscription, resource group and type, so it fails here.
-    # $script:MaskedIdPattern comes from the top-level BeforeAll.
+    # $script:MaskedConsumptionIdPattern comes from the top-level BeforeAll.
 
     It "Should have all consumption ResourceIds matching the masked ARM path shape" {
         if ($null -eq $script:ConsumptionFile) { Set-ItResult -Skipped -Because "no consumption file in fixture"; return }
@@ -327,7 +329,7 @@ Describe "Consumption Obfuscation" {
         {
             if (![string]::IsNullOrEmpty($row.ResourceId))
             {
-                $row.ResourceId | Should -Match $script:MaskedIdPattern -Because "Consumption ResourceId '$($row.ResourceId)' should be a masked ARM path"
+                $row.ResourceId | Should -Match $script:MaskedConsumptionIdPattern -Because "Consumption ResourceId '$($row.ResourceId)' should be a masked ARM path"
                 $row.ResourceId | Should -Not -Match '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}' -Because "Consumption ResourceId must not contain a real subscription GUID"
             }
         }

@@ -6,7 +6,9 @@
 # - The subscription part is left out only for a tenant-scope id, such as a
 #   reservation order (/providers/microsoft.capacity/reservationorders/...).
 # - A subscription or a group itself, with no provider block, is a masked id
-#   too (a charge billed at that scope).
+#   only with -AllowScopeOnly: a consumption row (and its dictionary key) can be
+#   billed at that scope, but an inventory, metric or link id names a resource,
+#   so one cut back to its scope fails.
 # - An extension resource adds a second /providers/<namespace> block.
 # - Every subscription, resource group and name segment is a prod_/nonprod_
 #   token. Consumption-only tokens carry sub_, rg_ or rg_mc_; a name token may
@@ -17,6 +19,7 @@
 #   fails: there a type cannot be told from a name.
 function Get-MaskedIdPattern
 {
+    param([switch]$AllowScopeOnly)
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     # Tokens are written in lower case, so the token parts match letter for
     # letter ((?-i:...)) even under PowerShell's case-blind -match; Azure's
@@ -24,8 +27,9 @@ function Get-MaskedIdPattern
     $Scope = '/subscriptions/(?-i:(prod|nonprod)_(sub_)?' + $Guid + ')(/resourcegroups/(?-i:(prod|nonprod)_(rg_)?(mc_)?' + $Guid + '))?'
     $Name = '((?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + ')|\$system)'
     $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)'
-    # A subscription or group scope with any number of provider blocks
-    # (none: a charge billed to the subscription or the group itself), or a
-    # tenant-scope id of provider blocks only.
-    return '^(' + $Scope + $Block + '*|' + $Block + '+)/?$'
+    # A subscription or group scope with one or more provider blocks (none,
+    # with -AllowScopeOnly: a charge billed to the subscription or the group
+    # itself), or a tenant-scope id of provider blocks only.
+    $ScopeBlocks = if ($AllowScopeOnly) { '*' } else { '+' }
+    return '^(' + $Scope + $Block + $ScopeBlocks + '|' + $Block + '+)/?$'
 }
