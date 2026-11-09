@@ -472,10 +472,72 @@ Describe 'Callers use the message and the switch' {
         $script:Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $script:Stream = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1') -Raw
         $script:Inventory = Get-Content -Path $script:InventoryScript -Raw
+        $script:WrapperAst = [System.Management.Automation.Language.Parser]::ParseInput($script:Wrapper, [ref]$null, [ref]$null)
+        $script:StreamAst = [System.Management.Automation.Language.Parser]::ParseInput($script:Stream, [ref]$null, [ref]$null)
+
+        # Each per-subscription count line of a script, lifted so the real
+        # code runs: the '$CountMessage = Get-RdaResourceCountMessage ...'
+        # statement and the if after it that writes the line.
+        function script:Get-CountLineBlock
+        {
+            param($Ast)
+            $Assigns = @($Ast.FindAll({
+                        param($Node)
+                        $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq '$CountMessage' -and $Node.Right.Extent.Text -match '^Get-RdaResourceCountMessage\b'
+                    }, $true))
+            foreach ($A in $Assigns)
+            {
+                $Statements = @($A.Parent.Statements)
+                $At = [array]::IndexOf($Statements, $A)
+                [scriptblock]::Create($A.Extent.Text + "`n" + $Statements[$At + 1].Extent.Text)
+            }
+        }
+
+        # The wrapper's run-summary statements, from '$EmptySubs = ...' to the
+        # if that writes the totals, lifted so the real code runs.
+        $Empty = $script:WrapperAst.Find({
+                param($Node)
+                $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq '$EmptySubs'
+            }, $true)
+        if ($null -eq $Empty) { throw 'The $EmptySubs statement was not found in Run-AllSubscriptions.ps1.' }
+        $Statements = @($Empty.Parent.Statements)
+        $From = [array]::IndexOf($Statements, $Empty)
+        $To = -1
+        for ($i = $From; $i -lt $Statements.Count; $i++)
+        {
+            if ($Statements[$i] -is [System.Management.Automation.Language.IfStatementAst] -and $Statements[$i].Clauses[0].Item1.Extent.Text -eq '$SubResourceCounts.Count -gt 0') { $To = $i; break }
+        }
+        if ($To -lt 0) { throw 'The run-summary totals were not found in Run-AllSubscriptions.ps1.' }
+        $script:RunSummary = [scriptblock]::Create((@($Statements[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n"))
     }
 
-    It 'the wrapper builds both per-subscription lines from it' {
-        ([regex]::Matches($script:Wrapper, 'Get-RdaResourceCountMessage')).Count | Should -BeGreaterOrEqual 2
+    It 'every per-subscription count line (2 in the wrapper, 1 in the stream worker) shows <Label>' -TestCases @(
+        @{ Label = 'a network-only subscription as not empty'; Collected = 0; Skipped = 5; Expect = '*0 resources collected. 5 network resources skipped (5 networkinterfaces).*'; Warn = $false }
+        @{ Label = 'an empty subscription as a warning'; Collected = 0; Skipped = 0; Expect = '*WARNING*'; Warn = $true }
+        @{ Label = 'an unknown skipped count with 0 rows as a warning'; Collected = 0; Skipped = $null; Expect = '*WARNING*'; Warn = $true }
+        @{ Label = 'the skipped count next to the collected one'; Collected = 3; Skipped = 2; Expect = '*Resources collected: 3 (2 network resources skipped)'; Warn = $false }
+    ) {
+        param($Label, $Collected, $Skipped, $Expect, $Warn)
+        $Blocks = @{ Wrapper = @(script:Get-CountLineBlock $script:WrapperAst); Stream = @(script:Get-CountLineBlock $script:StreamAst) }
+        $Blocks.Wrapper.Count | Should -Be 2 -Because 'the sequential and the one-subscription branch each write the line'
+        $Blocks.Stream.Count | Should -Be 1
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        function Write-Stream { param($Message, $Color) $script:Out.Add([string]$Message) }
+        # The lifted line reads these through dynamic scope.
+        Set-Variable -Name ResCount -Value $Collected
+        $Sub = [pscustomobject]@{ Name = 'sub-a'; Id = $script:Sub }
+        Set-Variable -Name SubName -Value 'sub-a'
+        $Global:SkippedResourceCount = $Skipped
+        $Global:SkippedResourceTypes = if ($Skipped -gt 0 -and $Collected -eq 0) { [ordered]@{ 'microsoft.network/networkinterfaces' = $Skipped } } else { [ordered]@{} }
+        foreach ($Block in @($Blocks.Wrapper + $Blocks.Stream))
+        {
+            $script:Out.Clear()
+            . $Block
+            $script:Out.Count | Should -Be 1 -Because "one line from: $Block"
+            $script:Out[0] | Should -BeLike $Expect
+            if (-not $Warn) { $script:Out[0] | Should -Not -BeLike '*WARNING*' }
+        }
     }
 
     It 'the stream worker builds its line from it, loads Common.Functions.ps1 and reports the skipped count' {
@@ -509,16 +571,36 @@ Describe 'Callers use the message and the switch' {
         foreach ($Name in $Forwarded) { $Summary.Groups[1].Value | Should -Match ([regex]::Escape("``-$Name``")) -Because "the wrapper forwards -$Name" }
     }
 
-    It 'the inner script clears the skipped count at the start of every run' {
-        $VarFn = $script:InventoryAst.FindAll({
-                param($Node)
-                $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Variables'
-            }, $true) | Select-Object -First 1
-        $VarFn.Extent.Text | Should -Match '\$Global:SkippedResourceCount\s*=\s*0'
+    It 'the run summary lists a network-only subscription apart from the empty ones' {
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        # Collected, empty, network-only, and an older stream summary's row
+        # with no Skipped (read as 0 by the wrapper).
+        # The lifted summary reads this through dynamic scope.
+        Set-Variable -Name SubResourceCounts -Value @(
+            [pscustomobject]@{ Name = 'collected'; Id = 'id-a'; Count = 5; Skipped = 0 }
+            [pscustomobject]@{ Name = 'empty'; Id = 'id-b'; Count = 0; Skipped = 0 }
+            [pscustomobject]@{ Name = 'network-only'; Id = 'id-c'; Count = 0; Skipped = 7 }
+            [pscustomobject]@{ Name = 'older-empty'; Id = 'id-d'; Count = 0; Skipped = [long]0 }
+        )
+        . $script:RunSummary
+        @($EmptySubs.Name) | Should -Be @('empty', 'older-empty')
+        @($NetworkOnlySubs.Name) | Should -Be @('network-only')
+        @($NonEmptySubs.Name) | Should -Be @('collected')
+        $script:Out | Should -Contain 'Total Resources:         5 across 1 subscription(s)'
+        @($script:Out | Where-Object { $_ -like 'Network resources skipped: 7 (*' }).Count | Should -Be 1
+        $script:Out | Should -Contain 'Subscriptions with only skipped network resources: 1'
+        $script:Out | Should -Contain '    - network-only (id-c) - 7 network resources skipped'
     }
 
-    It 'a network-only subscription is not listed as empty in the run summary' {
-        $script:Wrapper | Should -Match '\$EmptySubs = @\(\$SubResourceCounts \| Where-Object \{ \$_\.Count -eq 0 -and -not \(\[long\]\$_\.Skipped -gt 0\) \}\)'
+    It 'the run summary writes no skipped lines when nothing was skipped' {
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        Set-Variable -Name SubResourceCounts -Value @([pscustomobject]@{ Name = 'collected'; Id = 'id-a'; Count = 5; Skipped = 0 }, [pscustomobject]@{ Name = 'empty'; Id = 'id-b'; Count = 0; Skipped = 0 })
+        . $script:RunSummary
+        @($NetworkOnlySubs) | Should -BeNullOrEmpty
+        @($EmptySubs.Name) | Should -Be @('empty')
+        @($script:Out | Where-Object { $_ -match '(?i)skipped' }) | Should -BeNullOrEmpty
     }
 }
 
@@ -769,7 +851,32 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         finally { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
-    It 'its time goes into the phase timings of the diagnostics log' {
-        $script:InventoryAst.Extent.Text | Should -Match "PhaseTimings\['Network id query for masked ids \(-Obfuscate\)'\] = \`$script:NetworkTokenQueryTime"
+    It 'its time goes into the phase timings of the diagnostics log, and only when it ran' {
+        # The statements of ExecuteInventoryProcessing that start the phase
+        # timings, lifted so the real code runs.
+        $Exec = $script:InventoryAst.Find({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'ExecuteInventoryProcessing' }, $true)
+        $Statements = @($Exec.Body.EndBlock.Statements)
+        $Start = @($Statements | Where-Object { $_.Extent.Text -match '^\$script:PhaseTimings\s*=' })
+        $Start.Count | Should -Be 1
+        $At = [array]::IndexOf($Statements, $Start[0])
+        $Timing = [scriptblock]::Create($Statements[$At].Extent.Text + "`n" + $Statements[$At + 1].Extent.Text)
+
+        $script:NetworkTokenQueryTime = [TimeSpan]::FromMilliseconds(1500)
+        . $Timing
+        $script:PhaseTimings['Network id query for masked ids (-Obfuscate)'] | Should -Be ([TimeSpan]::FromMilliseconds(1500))
+
+        $script:NetworkTokenQueryTime = $null
+        . $Timing
+        $script:PhaseTimings.Contains('Network id query for masked ids (-Obfuscate)') | Should -BeFalse
+    }
+
+    It 'Variables clears the last run''s skipped count' {
+        $ReportName = 'ResourcesReport'
+        $Global:SkippedResourceCount = 99
+        $Global:SkippedResourceTypes = [ordered]@{ 'microsoft.network/virtualnetworks' = 99 }
+        Variables
+        $Global:SkippedResourceCount | Should -Be 0
+        $Global:SkippedResourceTypes.Count | Should -Be 0
+        $Global:ReportName | Should -Be $ReportName
     }
 }
