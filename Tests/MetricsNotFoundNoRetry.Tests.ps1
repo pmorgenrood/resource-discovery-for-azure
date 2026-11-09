@@ -1,7 +1,7 @@
 # Requires -Modules Pester
-# Offline coverage for Test-MetricNotFound in Extension/Metrics.ps1: a Get-AzMetric 404 (NotFound)
+# Offline coverage for Get-MetricFailure in Extension/Metrics.ps1: a Get-AzMetric 404 (NotFound)
 # is permanent, so the retry loop gives it one attempt instead of four. Extracted by AST like
-# MetricsThrottleRetryAfter.Tests.ps1 does, because the function lives inside the -Parallel block.
+# MetricsThrottleRetryAfter.Tests.ps1 does, so no other part of the script runs.
 # The end-to-end attempt counts are in MetricsGrouping.Tests.ps1 and MetricsBatch.Tests.ps1.
 
 BeforeAll {
@@ -9,12 +9,16 @@ BeforeAll {
     $script:MetricsSrc = Get-Content -LiteralPath (Join-Path $Repo 'Extension/Metrics.ps1') -Raw
     $Tokens = $null; $Errors = $null
     $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
-    foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricNotFound', 'Test-MetricBadRequest')
+    foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure')
     {
         $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $Name }, $true) | Select-Object -First 1
         if (-not $FnAst) { throw "$Name was not found in Extension/Metrics.ps1" }
         . ([scriptblock]::Create($FnAst.Extent.Text))
     }
+
+    # The yes/no question the retry loop asks of Get-MetricFailure for a 404 and a 400.
+    function Test-MetricNotFound([System.Exception]$Exception) { (Get-MetricFailure -Exception $Exception).Kind -eq 'NotFound' }
+    function Test-MetricBadRequest([System.Exception]$Exception) { (Get-MetricFailure -Exception $Exception).Kind -eq 'BadRequest' }
 }
 
 Describe 'Test-MetricNotFound' {
@@ -155,6 +159,56 @@ Describe 'Test-MetricBadRequest on the shared status helper' {
     ) {
         Test-MetricBadRequest -Exception ([System.Exception]::new($Message)) | Should -BeFalse
         Test-MetricBadRequest -Exception ([System.Exception]::new('The request failed.', ([System.Exception]::new($Message)))) | Should -BeFalse
+    }
+}
+
+Describe 'Get-MetricFailure decides in one order for the whole chain' {
+    BeforeAll {
+        function New-Chain([string[]]$Codes)
+        {
+            # Outermost first; each code wraps the next one.
+            $Ex = $null
+            for ($i = $Codes.Count - 1; $i -ge 0; $i--)
+            {
+                $Ex = [System.Net.Http.HttpRequestException]::new(('status ' + $Codes[$i]), $Ex, [System.Net.HttpStatusCode]$Codes[$i])
+            }
+            return $Ex
+        }
+    }
+
+    It 'reads <Chain> as <Kind> with status <Status>' -ForEach @(
+        @{ Chain = 'TooManyRequests>BadRequest'; Kind = 'BadRequest'; Status = 400 }
+        @{ Chain = 'Forbidden>TooManyRequests'; Kind = 'Refused'; Status = 403 }
+        @{ Chain = 'Unauthorized>TooManyRequests'; Kind = 'Refused'; Status = 401 }
+        @{ Chain = 'InternalServerError>NotFound'; Kind = 'NotFound'; Status = 404 }
+        @{ Chain = 'TooManyRequests>NotFound'; Kind = 'NotFound'; Status = 404 }
+        @{ Chain = 'BadGateway>Conflict'; Kind = 'Refused'; Status = 409 }
+        @{ Chain = 'BadRequest>NotFound'; Kind = 'BadRequest'; Status = 400 }
+        @{ Chain = 'InternalServerError>TooManyRequests'; Kind = 'Throttled'; Status = 429 }
+        @{ Chain = 'RequestTimeout>TooManyRequests'; Kind = 'Throttled'; Status = 429 }
+        @{ Chain = 'RequestTimeout'; Kind = 'Other'; Status = 408 }
+        @{ Chain = 'InternalServerError>ServiceUnavailable'; Kind = 'Other'; Status = 500 }
+    ) {
+        $Failure = Get-MetricFailure -Exception (New-Chain ($Chain -split '>'))
+        $Failure.Kind | Should -Be $Kind
+        $Failure.Status | Should -Be $Status
+    }
+
+    It 'reads Az''s status text the same way when no exception carries a status (<Label>)' -ForEach @(
+        @{ Label = 'a throttled message that wraps a 400'; Outer = "Operation returned an invalid status code 'TooManyRequests'"; Inner = "Operation returned an invalid status code 'BadRequest'"; Kind = 'BadRequest' }
+        @{ Label = 'a 403 message that wraps a throttled one'; Outer = "Operation returned an invalid status code 'Forbidden'"; Inner = 'The request is being throttled.'; Kind = 'Refused' }
+        @{ Label = 'a 500 message that wraps a 404'; Outer = "Operation returned an invalid status code 'InternalServerError'"; Inner = "Operation returned an invalid status code 'NotFound'"; Kind = 'NotFound' }
+        @{ Label = 'a 500 message that wraps a throttled one'; Outer = "Operation returned an invalid status code 'InternalServerError'"; Inner = 'The request is being throttled.'; Kind = 'Throttled' }
+        @{ Label = 'a status name .NET does not know'; Outer = "Operation returned an invalid status code 'Teapot'"; Inner = 'The request failed.'; Kind = 'Other' }
+    ) {
+        $Ex = [System.Exception]::new($Outer, [System.Exception]::new($Inner))
+        (Get-MetricFailure -Exception $Ex).Kind | Should -Be $Kind
+    }
+
+    It 'gives no status for an error with none, and Other' {
+        $Failure = Get-MetricFailure -Exception ([System.Exception]::new('Timed out after 120s'))
+        $Failure.Kind | Should -Be 'Other'
+        $Failure.Status | Should -BeNullOrEmpty
     }
 }
 

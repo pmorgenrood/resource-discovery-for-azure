@@ -134,7 +134,7 @@ function Get-RdaRetryAfterSeconds
     {
         # PowerShell may surface the CloudException directly as .Exception, under
         # .InnerException, or on the ErrorRecord a wrapper carries. Walk them all,
-        # the same bounded way Test-MetricThrottled does (at most 10).
+        # the same bounded way Get-MetricExceptionChain does (at most 10).
         $Start = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
         $Pending = [System.Collections.Generic.Queue[object]]::new()
         $Pending.Enqueue($Start)

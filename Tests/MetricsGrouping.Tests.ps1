@@ -113,6 +113,10 @@ function Get-AzMetric
         'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
         'Status500Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::InternalServerError) }
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
+        # A client status anywhere in the chain wins over a 429 or a 5xx wrapper.
+        'Status429Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('Too many requests.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::TooManyRequests) }
+        'Status403Wrapping429' { throw [System.Net.Http.HttpRequestException]::new('Access denied.', [System.Net.Http.HttpRequestException]::new('Wait.', $null, [System.Net.HttpStatusCode]::TooManyRequests), [System.Net.HttpStatusCode]::Forbidden) }
+        'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
         'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
@@ -547,6 +551,40 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         }
     }
 
+    It 'reads a 429 that wraps a 400 as a BadRequest: no retry, one request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-429-wrapping-400' -MultiError 'Status429Wrapping400'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        @($RunMap.Keys | Sort-Object) | Should -Be @($CleanMap.Keys | Sort-Object)
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
+    }
+
+    It 'reads a 403 that wraps a 429 as refused, not throttled: 1 attempt, no request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'refused-403-wrapping-429' -MultiError 'Status403Wrapping429'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'reads a 5xx that wraps a 404 as a NotFound: 1 attempt, no request per metric' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'notfound-500-wrapping-404' -MultiError 'Status500Wrapping404'
+
+        $Run.Calls.Count | Should -Be 1
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+    }
+
     It 'retries a grouped request when no wrapped exception reports BadRequest' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-wrapped503' -MultiError 'Status500Wrapping503'
 
@@ -638,13 +676,13 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
     It 'does not treat a 403 as throttled when its message holds 429 in an id' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'forbidden-429-in-id' -MultiError 'Status403With429InId'
 
-        # The generic budget: 1 + 3 retries, recorded as an error.
-        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        # A 403 is refused the same way on every retry: 1 attempt, recorded as an error.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
         foreach ($Name in $script:DiskMetricNames)
         {
-            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
         @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
     }
