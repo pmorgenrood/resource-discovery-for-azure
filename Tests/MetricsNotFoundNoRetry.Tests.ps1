@@ -158,6 +158,35 @@ Describe 'Test-MetricBadRequest on the shared status helper' {
     }
 }
 
+Describe 'The status-less status text must end where the status name ends' {
+    It 'does not read <Message> as a BadRequest' -ForEach @(
+        @{ Message = 'Operation returned an invalid status code BadRequestButTransient' }
+        @{ Message = "Operation returned an invalid status code 'BadRequestButTransient'" }
+        @{ Message = 'Operation returned an invalid status code BadRequest-ish' }
+    ) {
+        Test-MetricBadRequest -Exception ([System.Exception]::new($Message)) | Should -BeFalse
+    }
+
+    It 'does not read <Message> as a NotFound' -ForEach @(
+        @{ Message = 'Operation returned an invalid status code NotFoundButTransient' }
+        @{ Message = "Operation returned an invalid status code 'NotFoundButTransient'" }
+        @{ Message = 'Operation returned an invalid status code NotFound-ish' }
+    ) {
+        Test-MetricNotFound -Exception ([System.Exception]::new($Message)) | Should -BeFalse
+    }
+
+    It 'still reads the whole status name, quoted, unquoted or at the end of a sentence (<Message>)' -ForEach @(
+        @{ Message = "Operation returned an invalid status code 'BadRequest'"; Want = 'BadRequest' }
+        @{ Message = 'Operation returned an invalid status code BadRequest.'; Want = 'BadRequest' }
+        @{ Message = "Operation returned an invalid status code 'NotFound', Code: Null"; Want = 'NotFound' }
+        @{ Message = 'Operation returned an invalid status code NotFound'; Want = 'NotFound' }
+    ) {
+        $Ex = [System.Exception]::new($Message)
+        Test-MetricBadRequest -Exception $Ex | Should -Be ($Want -eq 'BadRequest')
+        Test-MetricNotFound -Exception $Ex | Should -Be ($Want -eq 'NotFound')
+    }
+}
+
 Describe 'Get-MetricDeletingState' {
     BeforeAll {
         # With no -Task the script only defines its functions.

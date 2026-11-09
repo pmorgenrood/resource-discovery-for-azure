@@ -1570,8 +1570,9 @@ function Add-MetricRecord
                     if ($SawStatus) { return $false }
                     foreach ($Ex in $Chain)
                     {
-                        # Only Az's own form, so a name such as vm-BadRequest-01 is not taken for one.
-                        if ([string]$Ex.Message -match "(?i)invalid status code\s*'?BadRequest'?") { return $true }
+                        # Only Az's own form, and the whole status name, so a name such as
+                        # vm-BadRequest-01 or a status such as BadRequestButTransient is not taken for one.
+                        if ([string]$Ex.Message -match "(?i)invalid status code\s*(?:'BadRequest'|BadRequest(?![\w-]))") { return $true }
                     }
                     return $false
                 }
@@ -1604,7 +1605,7 @@ function Add-MetricRecord
                     if ($SawStatus) { return $false }
                     foreach ($Ex in $Chain)
                     {
-                        if ([string]$Ex.Message -match "invalid status code '?NotFound\b|^\s*\[ResourceNotFound\]")
+                        if ([string]$Ex.Message -match "invalid status code\s*(?:'NotFound'|NotFound(?![\w-]))|^\s*\[ResourceNotFound\]")
                         {
                             return $true
                         }
