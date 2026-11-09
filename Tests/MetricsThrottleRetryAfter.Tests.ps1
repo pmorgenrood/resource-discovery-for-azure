@@ -298,7 +298,7 @@ Describe 'Test-MetricThrottled - the status code decides first' {
 
     It 'does not read an inner message when an exception in the chain carries a status' {
         $Inner = [System.Exception]::new('The request is being throttled.')
-        $Middle = New-StatusException 'denied' ([System.Net.HttpStatusCode]::Forbidden) $Inner
+        $Middle = New-StatusException -Message 'denied' -StatusCode ([System.Net.HttpStatusCode]::Forbidden) -Inner $Inner
         Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Middle)) | Should -BeFalse
     }
 
