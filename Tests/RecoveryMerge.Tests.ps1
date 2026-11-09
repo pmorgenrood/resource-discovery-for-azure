@@ -1025,6 +1025,66 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'the stop comes before anything is written'
     }
 
+    It 'stops when a masked id keeps a real parent name in its <Where> (<Case>)' -ForEach @(
+        @{ Where = 'consumption ResourceId'; Case = 'a SQL database under a real server'; Path = 'microsoft.sql/servers/sql-real/databases/prod_{0}' },
+        @{ Where = 'consumption ResourceId'; Case = 'a scale set VM under a real scale set'; Path = 'microsoft.compute/virtualmachinescalesets/vmss-real/virtualmachines/prod_{0}' },
+        @{ Where = 'inventory ID'; Case = 'an elastic pool under a real server'; Path = 'microsoft.sql/servers/sql-real/elasticpools/prod_{0}' },
+        @{ Where = 'metric ID'; Case = 'a resource under a real parent behind a nested provider'; Path = 'microsoft.compute/virtualmachines/vm-real/providers/microsoft.insights/diagnosticsettings/prod_{0}' }
+    ) {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $NestedId = '/subscriptions/{0}/resourcegroups/{1}/providers/{2}' -f $Masked.Sub, $Masked.Rg, ($Path -f [guid]::NewGuid())
+        $GapSplat = @{ Dir = $C.Gap; Base = $script:GapBase; Dictionary = $Masked.Dictionary; Inventory = [ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records } }
+        $RecRecords = @($Seeded.Records)
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        $RecSplat = @{ Dir = $C.Recovery; Base = $script:RecBase; Dictionary = $Seeded.Dictionary }
+        switch ($Where)
+        {
+            'consumption ResourceId' { $GapSplat.ConsumptionCsv = "$script:CsvHeader`n{},SQL Database,m1,vCore,eastus,db,1,Hours,2026-01-01,2026-01-02,$NestedId,eastus,,," }
+            'inventory ID' { $RecRecords += [ordered]@{ Name = ('prod_' + [guid]::NewGuid()); Subscription = $Masked.Sub; ResourceGroup = $Masked.Rg; ID = $NestedId } }
+            'metric ID'
+            {
+                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((New-MetricRecord -Id $NestedId)) } | ConvertTo-Json -Depth 5 -Compress) }
+                $Splat.RecoverMetrics = $true
+            }
+        }
+        New-Bundle @GapSplat
+        New-Bundle @RecSplat -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $RecRecords })
+
+        $Message = $null
+        try { $null = Merge-RecoveryData @Splat } catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike '*masked merge, but in the * bundle*not masked*Nothing was written*'
+        $Message | Should -Not -BeLike '*-real*' -Because 'the error names the file and record, never the value'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse
+    }
+
+    It 'merges masked nested ids whose every name is a token, and the flat forms this tool writes today' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $G = { [guid]::NewGuid().ToString() }
+        $Prefix = '/subscriptions/{0}/resourcegroups/{1}/providers/' -f $Masked.Sub, $Masked.Rg
+        $Rows = @(
+            ($Prefix + ('microsoft.sql/servers/prod_{0}/databases/nonprod_{1}' -f (& $G), (& $G))),
+            ($Prefix + ('microsoft.sql/servers/prod_{0}/elasticpools/prod_{1}' -f (& $G), (& $G))),
+            ($Prefix + ('microsoft.compute/virtualmachines/prod_{0}/providers/microsoft.insights/diagnosticsettings/prod_{1}' -f (& $G), (& $G))),
+            ('prod_{0}' -f (& $G)),
+            ('nonprod_{0}' -f (& $G)),
+            'obfuscated',
+            ('obfuscated_{0}' -f (& $G))
+        ) | ForEach-Object { "{},SQL Database,m1,vCore,eastus,db,1,Hours,2026-01-01,2026-01-02,$_,eastus,,," }
+        $Csv = (@($script:CsvHeader) + $Rows) -join "`n"
+        $RecRecords = @($Seeded.Records) + @([ordered]@{ Name = ('prod_' + (& $G)); ID = ($Prefix + ('microsoft.sql/servers/prod_{0}/databases/prod_{1}' -f (& $G), (& $G))) })
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $RecRecords }) -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+    }
+
     It 'merges a masked bundle whose ids take every shape the masked run writes' {
         $C = New-Case
         $Masked = Get-MaskedBundleData -Count 3
