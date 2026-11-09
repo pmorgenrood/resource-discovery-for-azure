@@ -563,13 +563,6 @@ Function RunInventorySetup()
 
     function ResourceInventoryLoop()
     {
-        if (![string]::IsNullOrEmpty($ResourceGroup) -and [string]::IsNullOrEmpty($SubscriptionID))
-        {
-            Write-Log -Message ("Resource Group Name present, but missing Subscription ID.") -Severity 'Error'
-            Write-Log -Message ("If using ResourceGroup parameter you must also put SubscriptionId") -Severity 'Error'
-            Exit
-        }
-
         if (![string]::IsNullOrEmpty($ResourceGroup))
         {
             $ResourceGroup = $ResourceGroup.ToLower()
@@ -691,6 +684,14 @@ Function RunInventorySetup()
     CheckCliRequirements
     CheckPowerShell
     GetSubscriptionsData
+
+    # Refused before the preflight below, so it reads, asks and registers nothing.
+    if (![string]::IsNullOrEmpty($ResourceGroup) -and [string]::IsNullOrEmpty($SubscriptionID))
+    {
+        Write-Log -Message ("Resource Group Name present, but missing Subscription ID.") -Severity 'Error'
+        Write-Log -Message ("If using ResourceGroup parameter you must also put SubscriptionId") -Severity 'Error'
+        Exit
+    }
 
     # -UseMetricsBatch only: offer once to register the Microsoft.Insights
     # resource provider where it is missing (see Run-AllSubscriptions.ps1;
