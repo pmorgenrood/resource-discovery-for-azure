@@ -80,7 +80,8 @@
 .PARAMETER StagingDirectory
     ALL-SUBSCRIPTIONS MODE. Where the individual revealed per-subscription zips
     are written before consolidation. Defaults to
-    <InventoryRoot>/RevealedStaging_<timestamp>. Kept after the run (not
+    <InventoryRoot>/RevealedStaging_<timestamp>_<random>, where the timestamp
+    goes to the millisecond. Kept after the run (not
     auto-deleted) so a partial run is recoverable; pass -RemoveStaging to delete
     it once the outer zip is built. Must be a new or empty folder, or (with
     -Resume) one a reveal of the same -InventoryRoot staged into before (Reveal
@@ -88,7 +89,9 @@
     and each finished output); any other folder is refused. Reveal makes the
     folder readable by its owner only before writing into it, and expands
     each report while it reveals it into a hidden .reveal-tmp folder inside
-    it, which it removes, also after a folder times out. Only the zips
+    it, which it removes, also after a folder times out. Only one run at a
+    time can use a staging folder: a run holds the lock file .reveal-lock in
+    it while it runs, and a second run stops with a plain message. Only the zips
     this run revealed (or, with -Resume, found already revealed and matching
     the record) go in the outer zip.
 
@@ -140,7 +143,7 @@
 .PARAMETER OutputZip
     BOTH MODES. Path for the output zip. Single mode defaults to
     <InputZip>_revealed.zip next to the input; all-mode defaults to
-    <InventoryRoot>/AllSubscriptions_Revealed_<timestamp>.zip.
+    <InventoryRoot>/AllSubscriptions_Revealed_<timestamp>_<random>.zip.
 
 .EXAMPLE
     # Single report: reveal Subscription name + Resource Group
@@ -265,7 +268,10 @@ if (-not (Test-Path -LiteralPath $InventoryRoot -PathType Container))
 # (the staging mark below records it and is compared with it).
 $InventoryRoot = ConvertTo-RevealComparablePath (Resolve-Path -LiteralPath $InventoryRoot).Path
 
-$Timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+# The default staging folder and outer zip are named by the time to the
+# millisecond and a short random part, so two runs started in the same second
+# (or millisecond) never pick the same names.
+$Timestamp = (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0, 6)
 if ([string]::IsNullOrEmpty($StagingDirectory))
 {
     if ($Resume)
@@ -440,78 +446,111 @@ function Get-RevealMarkerShapeProblem
     return $null
 }
 
-if (Test-Path -LiteralPath $StagingDirectory)
+if ((Test-Path -LiteralPath $StagingDirectory) -and -not (Test-Path -LiteralPath $StagingDirectory -PathType Container))
 {
-    if (-not (Test-Path -LiteralPath $StagingDirectory -PathType Container))
+    throw "-StagingDirectory names a file, not a folder: $StagingDirectory. Use a new or empty folder."
+}
+# Only one run at a time may use a staging folder: two runs in one folder
+# would share the mark, the expanded copies and the staged outputs, and could
+# erase each other's work or replace each other's bundle. So a run takes an
+# exclusive lock file in staging (opened with no sharing, held until the run
+# ends) before it reads or writes the mark or any other file there; a second
+# run then stops with a plain message. A lock file left by a run that was
+# killed holds no lock, so it is taken over. A new folder is made first, so
+# the lock can be taken in it.
+$StagingLockName = '.reveal-lock'
+if (-not (Test-Path -LiteralPath $StagingDirectory)) { New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null }
+$StagingLockPath = Join-Path $StagingDirectory $StagingLockName
+$StagingLockExisted = Test-Path -LiteralPath $StagingLockPath
+try
+{
+    $StagingLock = [System.IO.FileStream]::new($StagingLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+}
+catch [System.IO.IOException]
+{
+    throw ("The staging folder {0} is in use by another Reveal run (its lock file {1} is held: {2}). Wait for that run to end, or use another -StagingDirectory." -f $StagingDirectory, $StagingLockPath, $_.Exception.Message)
+}
+# Release the lock and remove the lock file this run made (so a folder Reveal
+# refuses is left as it was), then stop with $Message.
+function Stop-RevealStagingRefused
+{
+    param([string]$Message)
+    $StagingLock.Dispose()
+    if (-not $StagingLockExisted) { Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue }
+    throw $Message
+}
+# Release the lock and remove its file, when staging is about to be removed
+# or the run ends.
+function Remove-RevealStagingLock
+{
+    if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+    Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue
+}
+$StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
+$StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop | Where-Object { $_.Name -ne $StagingLockName }).Count -eq 0
+$Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
+$MarkerData = $Marker.Data
+$MarkedRoot = $Marker.Root
+$MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
+if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
+{
+    if ($Resume)
     {
-        throw "-StagingDirectory names a file, not a folder: $StagingDirectory. Use a new or empty folder."
+        $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
+        Stop-RevealStagingRefused (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
     }
-    $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
-    $StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop).Count -eq 0
-    $Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
-    $MarkerData = $Marker.Data
-    $MarkedRoot = $Marker.Root
-    $MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
-    if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
+    Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
+}
+if (-not $Resume -and $MarkedForThisRoot)
+{
+    # Reveal's own folder from an earlier run, still holding its files. A
+    # fresh run into it would mix with them (and -RemoveStaging would then
+    # leave the earlier files without their mark, so the folder could not
+    # be resumed or reused). Say plainly what to do instead.
+    $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
+            Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') -and $_.Name -ne $RevealTempName -and $_.Name -ne $StagingLockName })
+    if ($Held.Count -gt 0)
     {
-        if ($Resume)
-        {
-            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
-            throw (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
-        }
-        throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
+        Stop-RevealStagingRefused ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
     }
-    if (-not $Resume -and $MarkedForThisRoot)
+}
+if ($Resume -and $MarkedForThisRoot)
+{
+    # A resumed run must reveal the same fields as the run it continues, or
+    # one bundle would mix reports revealed for different fields.
+    $MarkedFields = $MarkerData['Fields']
+    if ($null -eq $MarkedFields)
     {
-        # Reveal's own folder from an earlier run, still holding its files. A
-        # fresh run into it would mix with them (and -RemoveStaging would then
-        # leave the earlier files without their mark, so the folder could not
-        # be resumed or reused). Say plainly what to do instead.
-        $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
-                Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') -and $_.Name -ne $RevealTempName })
-        if ($Held.Count -gt 0)
-        {
-            throw ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
-        }
+        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
     }
-    if ($Resume -and $MarkedForThisRoot)
+    # The rest of the mark must have the shape Reveal writes, or it is not
+    # Reveal's, and the folder is refused before anything in it changes.
+    $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
+    if ($null -ne $ShapeProblem)
     {
-        # A resumed run must reveal the same fields as the run it continues, or
-        # one bundle would mix reports revealed for different fields.
-        $MarkedFields = $MarkerData['Fields']
-        if ($null -eq $MarkedFields)
-        {
-            throw ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
-        }
-        # The rest of the mark must have the shape Reveal writes, or it is not
-        # Reveal's, and the folder is refused before anything in it changes.
-        $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
-        if ($null -ne $ShapeProblem)
-        {
-            throw ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
-        }
-        $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
-        if ($MarkedFieldsKey -cne $FieldsKey)
-        {
-            throw ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
-        }
-        # The recorded outputs are read from a file anyone who can write to
-        # staging can change, and -RemoveStaging deletes each one whose bytes
-        # match its record. So every record is checked before any is used: its
-        # name is a plain file name directly in staging (no folder part, not
-        # '.' or '..', not a rooted path), and its fields have the types Reveal
-        # writes, with each SHA-256 as 64 hex characters. One bad record
-        # refuses the whole mark, before anything is written or deleted.
-        $RecordedOutputs = $MarkerData['Outputs']
-        $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
-        if ($null -ne $BadRecord)
-        {
-            throw ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
-        }
-        if ($RecordedOutputs -is [System.Collections.IDictionary])
-        {
-            foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
-        }
+        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
+    }
+    $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
+    if ($MarkedFieldsKey -cne $FieldsKey)
+    {
+        Stop-RevealStagingRefused ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
+    }
+    # The recorded outputs are read from a file anyone who can write to
+    # staging can change, and -RemoveStaging deletes each one whose bytes
+    # match its record. So every record is checked before any is used: its
+    # name is a plain file name directly in staging (no folder part, not
+    # '.' or '..', not a rooted path), and its fields have the types Reveal
+    # writes, with each SHA-256 as 64 hex characters. One bad record
+    # refuses the whole mark, before anything is written or deleted.
+    $RecordedOutputs = $MarkerData['Outputs']
+    $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
+    if ($null -ne $BadRecord)
+    {
+        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
+    }
+    if ($RecordedOutputs -is [System.Collections.IDictionary])
+    {
+        foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
     }
 }
 New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
@@ -1126,6 +1165,8 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
         }
         Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($StagingMarkerPath + '.tmp') -Force -ErrorAction SilentlyContinue
+        # The run is done with staging, so its lock goes too.
+        Remove-RevealStagingLock
         $Leftover = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop)
         if ($Leftover.Count -eq 0)
         {
@@ -1190,6 +1231,10 @@ else
 {
     Write-Host ("Individual revealed zips kept in: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
 }
+
+# The run is done with staging: release its lock (the lock file stays, holding
+# no lock, unless staging was removed above).
+if ($null -ne $StagingLock) { $StagingLock.Dispose() }
 
 # Non-zero exit if nothing was produced, or if any subscription failed to reveal,
 # so an automated/large run surfaces problems instead of looking clean.
