@@ -1197,6 +1197,11 @@ $StreamsAuto = -not $PSBoundParameters.ContainsKey('ParallelStreams')
 $ConcurrencyAuto = -not $PSBoundParameters.ContainsKey('ConcurrencyLimit')
 if ($StreamsAuto) { $ParallelStreams = $AutoTune.Streams }
 if ($ConcurrencyAuto) { $ConcurrencyLimit = $AutoTune.Concurrency }
+# One subscription (a -SubscriptionID run, or a tenant or retry list of one)
+# runs on the sequential path: it skips a subscription an earlier run
+# completed under -Resume, which the parallel branch's one-subscription
+# fallback does not.
+if ($ParallelStreams -gt 1 -and $Subscriptions.Count -le 1) { $ParallelStreams = 1 }
 
 $RamLabel = if ($AutoTune.RamGB -gt 0) { '{0} GB RAM' -f $AutoTune.RamGB } else { 'RAM undetected' }
 $StreamsSrc = if ($StreamsAuto) { 'auto' } else { 'explicit' }

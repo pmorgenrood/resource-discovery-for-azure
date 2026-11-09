@@ -438,9 +438,9 @@ Describe 'Run-AllSubscriptions.ps1 -SubscriptionID, end to end' -Skip:($IsWindow
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B'
         # With -ParallelStreams 4: one subscription never starts streams, it
-        # runs inline, and that branch's state write uses the run's own key too.
+        # runs on the sequential path, and its state write uses the run's own key.
         $Run = script:Invoke-Wrapper -Streams 4 -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
-        @($Run.Text | Where-Object { $_ -eq 'Only one eligible subscription; running sequentially.' }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like 'Parallel-streams mode*' }) | Should -BeNullOrEmpty
         script:Get-Calls | Should -Be (script:Get-Ids 'B')
         $One = script:Read-StateAt (script:Get-OneState 'B')
         $One | Should -Not -BeNullOrEmpty
@@ -787,7 +787,40 @@ Describe 'A home folder with brackets in its name' -Skip:($IsWindows) {
     }
 }
 
-Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {
+Describe 'A one-subscription -Resume run asked for more than one stream' -Skip:($IsWindows) {
+    AfterEach {
+        if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
+    }
+
+    It 'does not collect again a subscription its state lists as completed (<Label>)' -ForEach @(
+        @{ Label = '-SubscriptionID'; One = $true }
+        @{ Label = 'a tenant of one'; One = $false }
+    ) {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        if ($One)
+        {
+            script:Set-Scenario -Subs 'A', 'B'
+            $StateFile = script:Get-OneState 'B'
+            $Tenant = ('{0}-subscription-{1}' -f $script:Tenant, $script:Subs['B'].Id)
+            $Arguments = @('-SubscriptionID', $script:Subs['B'].Id, '-Resume')
+        }
+        else
+        {
+            script:Set-Scenario -Subs 'B'
+            $StateFile = $script:State
+            $Tenant = $script:Tenant
+            $Arguments = @('-Resume')
+        }
+        # An earlier run completed B; a failure of another kept the state.
+        [pscustomobject]@{ TenantID = $Tenant; CompletedSubscriptionIds = @($script:Subs['B'].Id); FailedAttempts = @([pscustomobject]@{ Id = 'cccccccc-0000-4000-8000-00000000000c'; Name = 'Gone'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 }); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StateFile -Encoding utf8
+        $Run = script:Invoke-Wrapper -Arguments $Arguments -Streams 2
+        script:Get-Calls | Should -BeNullOrEmpty
+        @($Run.Text | Where-Object { $_ -like 'Skipping (already completed): Sub B (*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'A one-subscription retry that succeeds, asked for four streams' -Skip:($IsWindows) {
     It 'takes the subscription off the retry list when it was also listed as completed, and clears the state' {
         script:New-Case
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
