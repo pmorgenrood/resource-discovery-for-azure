@@ -121,3 +121,24 @@ Describe 'Reveal.ps1 and an unmarked old staging folder' -Skip:$IsWindows {
         ($Run.Text -replace '\s+', ' ') | Should -Match 'FAIL: RevealedStaging_2025-01-01_00-00-00 - an obfuscated report zip but no obfuscation dictionary in folder.*If this is a staging folder of an earlier reveal \(it holds no Reveal mark for this inventory root\), move it out of the inventory root'
     }
 }
+
+Describe 'Reveal.ps1 and a partial look-alike mark in a report folder' -Skip:$IsWindows {
+    # A mark with this root's Purpose and InventoryRoot but without the rest
+    # of the shape Reveal writes (Fields, All, Outputs) is not Reveal's, so it
+    # is no evidence that the folder is an old staging folder.
+    It 'reads the folder as a report folder and ships its report' {
+        $Root = Join-Path $script:WorkDir 'partialmark'
+        Add-Report -Folder (Join-Path $Root 'good') -Stamp '20260101000000000aaaa' -N 1
+        Add-Report -Folder (Join-Path $Root 'partial') -Stamp '20260101000000001bbbb' -N 2
+        $Mark = [ordered]@{ Purpose = 'Reveal staging folder'; InventoryRoot = (Resolve-Path -LiteralPath $Root).Path }
+        [System.IO.File]::WriteAllText((Join-Path $Root 'partial/.reveal-staging.json'), ($Mark | ConvertTo-Json -Depth 5))
+
+        $Run = Invoke-Reveal -Root $Root -Name 'partialmark'
+
+        $Run.Exit | Should -Be 0 -Because $Run.Text
+        Get-ZipNames $Run.Bundle | Should -Be @(
+            'ResourcesReport_20260101000000000aaaa.zip'
+            'ResourcesReport_20260101000000001bbbb.zip')
+        $Run.Text | Should -Not -Match 'SKIP: partial'
+    }
+}

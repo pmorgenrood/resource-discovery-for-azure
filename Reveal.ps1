@@ -698,8 +698,11 @@ foreach ($Folder in $Folders)
     # under the report names and no dictionary. It is not a report folder. It
     # is known by the Reveal mark it holds for this root, never by its name
     # or by a file of the mark's name alone: a report folder named
-    # RevealedStaging_* is still read.
-    if (Test-RevealMarkerForThisRoot (Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)))
+    # RevealedStaging_* is still read. The mark must also have the whole
+    # shape Reveal writes (see Get-RevealMarkerShapeProblem); a partial
+    # look-alike is not Reveal's, so its folder is read as a report folder.
+    $FolderMarker = Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)
+    if ((Test-RevealMarkerForThisRoot $FolderMarker) -and $null -eq (Get-RevealMarkerShapeProblem -Data $FolderMarker.Data))
     {
         $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
         continue
