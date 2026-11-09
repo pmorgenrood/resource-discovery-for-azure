@@ -446,6 +446,10 @@ function Get-RevealMarkerShapeProblem
     return $null
 }
 
+# The lock below is opened with a .NET file call, which reads a relative path
+# against the process folder, so make staging a full path against the
+# PowerShell location first, taken as written (as is done for -OutputZip).
+$StagingDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StagingDirectory)
 if ((Test-Path -LiteralPath $StagingDirectory) -and -not (Test-Path -LiteralPath $StagingDirectory -PathType Container))
 {
     throw "-StagingDirectory names a file, not a folder: $StagingDirectory. Use a new or empty folder."
@@ -468,6 +472,14 @@ try
 }
 catch [System.IO.IOException]
 {
+    # Only a held lock means another run: a sharing or lock violation on
+    # Windows, EWOULDBLOCK (11 on Linux, 35 on macOS) elsewhere. Any other
+    # error (a missing folder, no access, a full disk) is thrown as it is.
+    $LockError = $_.Exception
+    if ($LockError -is [System.Management.Automation.MethodInvocationException] -and $null -ne $LockError.InnerException) { $LockError = $LockError.InnerException }
+    $HeldCodes = if ($IsWindows) { @(32, 33) } else { @(11, 35) }
+    $IsHeld = $LockError.GetType() -eq [System.IO.IOException] -and $HeldCodes -contains ($(if ($IsWindows) { $LockError.HResult -band 0xFFFF } else { $LockError.HResult }))
+    if (-not $IsHeld) { throw }
     throw ("The staging folder {0} is in use by another Reveal run (its lock file {1} is held: {2}). Wait for that run to end, or use another -StagingDirectory." -f $StagingDirectory, $StagingLockPath, $_.Exception.Message)
 }
 # Release the lock and remove the lock file this run made (so a folder Reveal
