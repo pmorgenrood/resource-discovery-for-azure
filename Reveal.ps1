@@ -844,24 +844,30 @@ foreach ($Candidate in $Candidates)
 }
 $LeftOutItems = @($LeftOutItems | Sort-Object -Property Report)
 
-# A resumed run keeps a recorded output only when it is one Reveal assigns to
-# a report pair under the root now: its name is the pair's report zip name, or
-# that name with a copy number in front (2_, 3_ and so on, see $UsedOutNames
-# below), and its record names that pair's folder, report zip and dictionary.
-# Any other record (for example one for notes.txt, which Reveal never writes)
-# is dropped from the mark, and its file is kept: -RemoveStaging deletes only
-# recorded outputs, so it never deletes a file Reveal did not write.
+# A resumed run keeps a recorded output only when it is a name Reveal assigns
+# to the report pair the record names: the record's report zip name (a
+# ResourcesReport_<stamp>.zip, as Reveal reads them), or that name with a copy
+# number in front (2_, 3_ and so on, see $UsedOutNames below). When that pair
+# is under the root now (the same folder and report zip name), the record
+# must also name its dictionary. A record of a pair no longer under the root
+# (for example an older report that was moved away) is kept, so a clean
+# -RemoveStaging still removes that older output. Any other record (for
+# example one for notes.txt, which Reveal never writes) is dropped from the
+# mark, and its file is kept: -RemoveStaging deletes only recorded outputs, so
+# it never deletes a file Reveal did not write.
 $DroppedRecords = @()
 foreach ($Name in @($StagingOutputs.Keys | Sort-Object))
 {
     $Record = $StagingOutputs[$Name]
-    $Owners = @($Candidates | Where-Object {
-            [string]$Record['SourceFolder'] -ceq $_.Folder -and
-            [string]$Record['SourceName'] -ceq $_.Zip.Name -and
-            [string]$Record['DictionaryName'] -ceq $_.Dict.Name -and
-            ($Name -ceq $_.Zip.Name -or $Name -cmatch ('\A(?:[2-9]|[1-9][0-9]+)_' + [regex]::Escape($_.Zip.Name) + '\z'))
-        })
-    if ($Owners.Count -eq 0)
+    $SourceName = [string]$Record['SourceName']
+    $Assigned = $SourceName -cmatch '\AResourcesReport_.+\.zip\z' -and $SourceName -cnotlike '*_revealed.zip' -and $SourceName -cnotlike '*.partial.zip' -and
+    ($Name -ceq $SourceName -or $Name -cmatch ('\A(?:[2-9]|[1-9][0-9]+)_' + [regex]::Escape($SourceName) + '\z'))
+    if ($Assigned)
+    {
+        $Pair = @($Candidates | Where-Object { [string]$Record['SourceFolder'] -ceq $_.Folder -and $SourceName -ceq $_.Zip.Name })
+        if ($Pair.Count -gt 0 -and @($Pair | Where-Object { [string]$Record['DictionaryName'] -ceq $_.Dict.Name }).Count -eq 0) { $Assigned = $false }
+    }
+    if (-not $Assigned)
     {
         $DroppedRecords += $Name
         $null = $StagingOutputs.Remove($Name)
