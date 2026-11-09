@@ -154,20 +154,91 @@ function Set-RevealOwnerOnlyPath
     }
 }
 
+# True when .NET can give a new file its Unix mode as it creates it
+# (FileStreamOptions.UnixCreateMode, .NET 7 and later, so PowerShell 7.3 and
+# later). Its own function so a test can take the other path.
+function Test-RevealUnixCreateModeApi
+{
+    $OptionsType = 'System.IO.FileStreamOptions' -as [type]
+    return ($null -ne $OptionsType -and $null -ne $OptionsType.GetProperty('UnixCreateMode'))
+}
+
+# True when .NET can create a file with a given ACL
+# (FileSystemAclExtensions.Create with a FileSecurity). Its own function so a
+# test can take the other path.
+function Test-RevealAclCreateApi
+{
+    $Extensions = 'System.IO.FileSystemAclExtensions' -as [type]
+    if ($null -eq $Extensions) { return $false }
+    return ($null -ne $Extensions.GetMethod('Create', [type[]]@([System.IO.FileInfo], [System.IO.FileMode], [System.Security.AccessControl.FileSystemRights], [System.IO.FileShare], [int], [System.IO.FileOptions], [System.Security.AccessControl.FileSecurity])))
+}
+
 # Make a new, empty file at $Path that only its owner can read (see
-# Set-RevealOwnerOnlyFile), before anything is written into it. A file
-# already at $Path is removed first, so the new one never keeps its
-# permissions. The path must be a full path.
+# Set-RevealOwnerOnlyFile), before anything is written into it. The file is
+# owner-only from the moment it exists, so no other user can open it in
+# between and keep it open while real values are written:
+#  - on Unix with .NET 7 or later it is created with mode 0600;
+#  - on Windows with the ACL create call it is created with the protected
+#    owner-only ACL;
+#  - otherwise it is created inside a new owner-only folder beside $Path (the
+#    same volume), made owner-only there, and then moved to $Path, which keeps
+#    its mode on Unix and its ACL on Windows.
+# It is then checked as owner-only. A file already at $Path is removed first,
+# so the new one never keeps its permissions. The path must be a full path.
 function New-RevealOwnerOnlyFile
 {
     param([Parameter(Mandatory = $true)] [string] $Path)
     if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Delete($Path) }
-    $Stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    $Stream.Dispose()
-    try { Set-RevealOwnerOnlyFile -Path $Path }
+    $Created = $false
+    try
+    {
+        if ($IsWindows -and (Test-RevealAclCreateApi))
+        {
+            $Security = [System.Security.AccessControl.FileSecurity]::new()
+            $Security.SetAccessRuleProtection($true, $false)
+            $Security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                    [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+                    [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    [System.Security.AccessControl.AccessControlType]::Allow))
+            $Stream = [System.IO.FileSystemAclExtensions]::Create([System.IO.FileInfo]::new($Path), [System.IO.FileMode]::CreateNew, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None, $Security)
+            $Created = $true
+            $Stream.Dispose()
+        }
+        elseif (-not $IsWindows -and (Test-RevealUnixCreateModeApi))
+        {
+            $Options = [System.IO.FileStreamOptions]::new()
+            $Options.Mode = [System.IO.FileMode]::CreateNew
+            $Options.Access = [System.IO.FileAccess]::Write
+            $Options.Share = [System.IO.FileShare]::None
+            $Options.UnixCreateMode = [System.IO.UnixFileMode]'UserRead, UserWrite'
+            $Stream = [System.IO.FileStream]::new($Path, $Options)
+            $Created = $true
+            $Stream.Dispose()
+        }
+        else
+        {
+            $Parent = [System.IO.Path]::GetDirectoryName($Path)
+            $Private = Join-Path $Parent ('.reveal-new-' + [guid]::NewGuid().ToString('N'))
+            $null = [System.IO.Directory]::CreateDirectory($Private)
+            try
+            {
+                Set-RevealOwnerOnlyDirectory -Path $Private
+                $Inner = Join-Path $Private 'new'
+                $Stream = [System.IO.FileStream]::new($Inner, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $Stream.Dispose()
+                Set-RevealOwnerOnlyFile -Path $Inner
+                # No overwrite: a file someone put at $Path meanwhile is not
+                # taken over.
+                [System.IO.File]::Move($Inner, $Path)
+                $Created = $true
+            }
+            finally { Remove-Item -LiteralPath $Private -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+        Set-RevealOwnerOnlyFile -Path $Path
+    }
     catch
     {
-        [System.IO.File]::Delete($Path)
+        if ($Created) { [System.IO.File]::Delete($Path) }
         throw ("Reveal will not write real names and ids into {0}: {1}" -f $Path, $_.Exception.Message)
     }
 }
