@@ -1700,7 +1700,6 @@ function Add-MetricRecord
                         while (-not $Succeeded)
                         {
                             $CallAttempts = $Attempt + 1
-                            $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $TimedOut = $false
                             $Throttled = $false
                             $RetryAfterSeconds = 0
@@ -1756,8 +1755,6 @@ function Add-MetricRecord
                                 Stop-Job -Job $Job -ErrorAction SilentlyContinue
                                 Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                             }
-
-                            $AttemptStopwatch.Stop()
 
                             if ($Succeeded)
                             {
