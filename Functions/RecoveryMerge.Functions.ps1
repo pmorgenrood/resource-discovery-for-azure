@@ -195,67 +195,21 @@ function Merge-RecoveryData
 
     if (-not (Test-Path -Path $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
     if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
-    # Full path with every link (symbolic link or junction) on it followed,
-    # so a link and its target compare equal. Parts that do not exist yet are
-    # kept as written. Read against the PowerShell location, '~' expanded.
-    function Resolve-MergeRealPath([string]$Path)
-    {
-        $Sep = [System.IO.Path]::DirectorySeparatorChar
-        $Full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-        for ($Hop = 0; $Hop -lt 40; $Hop++)
-        {
-            $Root = [System.IO.Path]::GetPathRoot($Full)
-            $Parts = @($Full.Substring($Root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries))
-            $Current = $Root
-            $Followed = $false
-            for ($i = 0; $i -lt $Parts.Count; $i++)
-            {
-                $Current = [System.IO.Path]::Combine($Current, $Parts[$i])
-                $Item = Get-Item -LiteralPath $Current -Force -ErrorAction SilentlyContinue
-                if ($null -eq $Item) { $Current = [System.IO.Path]::Combine([string[]](@($Current) + @($Parts | Select-Object -Skip ($i + 1)))); break }
-                if ($Item.LinkType -in @('SymbolicLink', 'Junction'))
-                {
-                    $LinkTarget = [string](@($Item.Target)[0])
-                    if (-not [System.IO.Path]::IsPathRooted($LinkTarget)) { $LinkTarget = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($Current), $LinkTarget) }
-                    $Full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine([string[]](@($LinkTarget) + @($Parts | Select-Object -Skip ($i + 1)))))
-                    $Followed = $true
-                    break
-                }
-            }
-            if (-not $Followed)
-            {
-                $Real = [System.IO.Path]::GetFullPath($Current)
-                if ($Real.Length -gt [System.IO.Path]::GetPathRoot($Real).Length) { $Real = $Real.TrimEnd($Sep, [System.IO.Path]::AltDirectorySeparatorChar) }
-                return $Real
-            }
-        }
-        throw ("Merge-RecoveryData: too many links on path '{0}'." -f $Path)
-    }
-
-    # The merge writes a new bundle; written into a source folder it would
-    # replace that bundle's own files. A new empty folder is the way out.
-    # Relative, absolute, '~' and linked forms of one folder compare equal.
-    $OutFull = Resolve-MergeRealPath $OutputPath
-    foreach ($Source in @($GapBundlePath, $RecoveryBundlePath))
-    {
-        $SourceFull = Resolve-MergeRealPath $Source
-        if ([string]::Equals($OutFull, $SourceFull, [System.StringComparison]::OrdinalIgnoreCase))
-        {
-            throw ("Merge-RecoveryData: -OutputPath '{0}' is a source bundle folder. Use a new empty folder. Nothing was written." -f $OutputPath)
-        }
-    }
-
     $GapInventoryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Inventory_*.json'
     $RecoveryInventoryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Inventory_*.json'
     $GapConsumptionFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Consumption_*.csv'  -Optional
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
 
-    # Some paths reach a source folder in ways the path text does not show
-    # (bind mounts, mapped or substituted drives, short names). So when the
-    # output folder already exists, a file with a new random name is made in
-    # it and looked for in each source folder; it is removed straight after.
-    # A copy of a source bundle is a different folder and is not refused.
+    # The merge writes a new bundle; written into a source folder it would
+    # replace that bundle's own files. An output folder that does not exist
+    # yet cannot be a source folder. When it exists, a file with a new random
+    # name is made in it and looked for in each source folder; it is removed
+    # straight after. That catches every way to reach one folder: relative
+    # paths, '~', links, junctions, bind mounts, mapped or substituted drives
+    # and short names. Two folders whose names differ only in case are one
+    # folder only where the file system says so. A copy of a source bundle is
+    # a different folder and is not refused.
     if (Test-Path -LiteralPath $OutputPath -PathType Container)
     {
         $ProbeName = '.rda-merge-probe-' + [guid]::NewGuid().ToString('N')

@@ -384,6 +384,19 @@ Describe 'Merge-RecoveryData consumption handling' {
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
     }
 
+    It 'merges into a new folder whose name differs from the gap folder only in case, where the file system tells them apart' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $script:CsvHeader
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $Out = Join-Path (Split-Path -Parent $C.Gap) ((Split-Path -Leaf $C.Gap).ToUpperInvariant())
+        if (Test-Path -LiteralPath $Out) { Set-ItResult -Skipped -Because 'this file system does not tell names apart by case'; return }
+        $Before = @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name })
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $Out
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        (Split-Path -Parent $Result.OutputInventory) | Should -BeExactly $Out
+        @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
