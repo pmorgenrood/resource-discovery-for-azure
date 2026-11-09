@@ -48,7 +48,8 @@
     folders) both ship: the later ones by folder name go in the bundle as
     2_ResourcesReport_<stamp>.zip, 3_ResourcesReport_<stamp>.zip and so on.
     Each report's subscriptions are read from the real ids in its dictionary,
-    and from the name of the DebugLog_ or ErrorLog_ file its run wrote into
+    or, when its dictionary names none, from the name of the DebugLog_ or
+    ErrorLog_ file its run wrote into
     the inventory root (DebugLog_ResourcesReport_<stamp>_<subscription id>.log).
     A subscription with no resources has an empty dictionary, so it is
     matched by that log alone. Limit: a report whose dictionary names no
