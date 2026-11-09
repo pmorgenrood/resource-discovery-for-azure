@@ -259,7 +259,9 @@ Describe 'New-RdaAllSubHtmlSummary with no reports under strict mode' {
             $Html = Join-Path $Run 'MainSummary.html'
             try { Set-StrictMode -Version Latest; { New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Html 6>$null } | Should -Not -Throw }
             finally { Set-StrictMode -Off }
-            [System.IO.File]::ReadAllText($Html) | Should -BeLike '*No per-subscription reports*'
+            $Text = [System.IO.File]::ReadAllText($Html)
+            $Text | Should -BeLike '*No per-subscription reports*'
+            $Text | Should -Match '<div class="n">0</div><div class="l">Total resources</div>'
         }
         finally { [System.IO.Directory]::Delete($Run, $true) }
     }
