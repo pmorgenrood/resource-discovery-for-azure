@@ -693,6 +693,9 @@ foreach ($Folder in $Folders)
                 foreach ($LogSubId in $RunLogSubIds[$LogKey]) { $null = $SubIds.Add($LogSubId) }
             }
         }
+        # Every whole pair is counted, also one later left out because its
+        # subscription is in another report.
+        $PairedCount++
         $Candidates.Add([pscustomobject]@{
                 Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp
                 Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
@@ -751,7 +754,6 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
     $Folder = $Candidate.Folder
     $Zip = $Candidate.Zip
     $Dict = $Candidate.Dict
-    $PairedCount++
 
     # Write the revealed copy straight into staging under the ORIGINAL zip name
     # so the consolidated outer zip matches the structure the ingestion server
