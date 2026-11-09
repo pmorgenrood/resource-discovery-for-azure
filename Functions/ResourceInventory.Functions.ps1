@@ -242,7 +242,12 @@ function Write-RdaShareableDiagnosticsLog
         [string]$RunDateTime,
         [string]$Version,
         $PhaseTimings,
-        [switch]$Obfuscated
+        [switch]$Obfuscated,
+        # The subscription of this report. Under -RunAllSubs the metrics entries
+        # of the earlier subscriptions of the run are still in
+        # $Global:MetricsFailedSubs, so only this one's are counted. Empty for a
+        # run over every subscription, which counts them all.
+        [string]$SubscriptionID
     )
 
     try
@@ -318,8 +323,9 @@ function Write-RdaShareableDiagnosticsLog
         # Monitor kept failing, each with its own count. An entry is incomplete when
         # it has a Complete property equal to $false; it is told apart here so this
         # library needs no other file.
-        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
-        $MetricsIncomplete = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
+        $MetricsEntries = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or [string]$_.Id -eq $SubscriptionID) })
+        $MetricsSkips = @($MetricsEntries | Where-Object { -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
+        $MetricsIncomplete = @($MetricsEntries | Where-Object { $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
         $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()

@@ -158,6 +158,35 @@ Describe 'Diagnostics log: metrics incomplete apart from metrics auth-skipped' {
         $IncompleteAt | Should -BeGreaterOrEqual 0
         @($Lines[($IncompleteAt + 1)..($IncompleteAt + 2)]) | Should -Be @("  [sub sub-b] $script:IncompleteTwo", "  [sub sub-c] $script:IncompleteOne")
     }
+
+    It 'counts only the entries of its own subscription when the run''s earlier subscriptions left theirs' {
+        # Under -RunAllSubs each subscription's report is written in the same
+        # session, after the earlier subscriptions added their entries.
+        $Global:MetricsFailedSubs = @($script:Mixed) + @([pscustomobject]@{ Name = 'sub-b'; Id = 'SUB-B'; Message = $script:AuthMessage })
+        $Global:CollectorFailures = @()
+        $Global:ConsumptionFailedSubs = @()
+        $DiagDir = Join-Path $TestDrive 'diagnostics-one-sub'
+        New-Item -ItemType Directory -Path $DiagDir -Force | Out-Null
+
+        $DiagFile = Write-RdaShareableDiagnosticsLog -DefaultPath ($DiagDir + [IO.Path]::DirectorySeparatorChar) -ReportName 'ResourcesReport' -RunDateTime '20261109000000000' -Version '0.0.0' -PhaseTimings $null -SubscriptionID 'sub-b' 6>$null
+        $DiagFile | Should -Not -BeNullOrEmpty
+        $Lines = @(Get-Content -LiteralPath $DiagFile)
+
+        $AuthAt = [array]::IndexOf($Lines, 'Metrics auth-skipped subscriptions: 1')
+        $AuthAt | Should -BeGreaterOrEqual 0
+        $Lines[$AuthAt + 1] | Should -Be "  [sub SUB-B] $script:AuthMessage"
+        $IncompleteAt = [array]::IndexOf($Lines, 'Metrics incomplete subscriptions: 1')
+        $IncompleteAt | Should -BeGreaterOrEqual 0
+        $Lines[$IncompleteAt + 1] | Should -Be "  [sub sub-b] $script:IncompleteTwo"
+        $Lines[$IncompleteAt + 2] | Should -Be ''
+    }
+
+    It 'is given the subscription of the report by both calls in ResourceInventory.ps1' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Write-RdaShareableDiagnosticsLog' }, $true))
+        $Calls.Count | Should -Be 2
+        foreach ($Call in $Calls) { $Call.Extent.Text | Should -Match '-SubscriptionID \$SubscriptionID(\s|$)' }
+    }
 }
 
 Describe 'Main summary: metrics incomplete apart from metrics auth-skipped' {
