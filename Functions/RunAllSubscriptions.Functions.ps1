@@ -463,6 +463,32 @@ function Add-FailedAttempt
     return $List
 }
 
+# The re-run lines at the end of a wrapper run whose retry list is not empty.
+# A subscription on it whose consumption is incomplete is not fixed by -Resume
+# or -ResumeFailedOnly: that run's report holds only the subscriptions it
+# collects, and with the old report some of the billing rows count twice. So
+# then the advice is a full run again, as Get-ConsumptionRetryAdvice says.
+function Get-RetryListAdvice
+{
+    param([object]$FailedAttempts, [switch]$NewFailures)
+    $Incomplete = @(@($FailedAttempts) | Where-Object { $null -ne $_ -and [string]$_.Reason -like 'consumption incomplete:*' })
+    if ($Incomplete.Count -gt 0)
+    {
+        return @(
+            ('{0} subscription(s) on the retry list have incomplete consumption ({1}), which -Resume and -ResumeFailedOnly do not fix.' -f $Incomplete.Count, (@($Incomplete | ForEach-Object { [string]$_.Name }) -join ', '))
+            'Run the same command again, with the same settings and without -Resume or -ResumeFailedOnly, and upload only the new report.'
+        )
+    }
+    if ($NewFailures)
+    {
+        return @(
+            'Re-run with -Resume to retry failed and any unprocessed subscriptions.'
+            'Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions.'
+        )
+    }
+    return @('Re-run with -ResumeFailedOnly to retry them.')
+}
+
 # Remove a sub's FailedAttempts entry once it has succeeded on a retry, so
 # the resume-state file does not grow into a graveyard of historical
 # failures. Caller persists.

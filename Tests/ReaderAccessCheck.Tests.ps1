@@ -1634,7 +1634,7 @@ Describe 'Write-PendingRetrySkippedSummary (skipped subscriptions on the retry l
 
     It 'is called in the wrapper between the Pending Retries line and its advice' {
         $Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
-        $Wrapper | Should -Match ('"Pending Retries: [^\r\n]*\r?\n(\s*#[^\n]*\n)*\s*' + [regex]::Escape('Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision') + '\r?\n\s*' + [regex]::Escape('Write-Host "Re-run with -ResumeFailedOnly to retry them."'))
+        $Wrapper | Should -Match ('"Pending Retries: [^\r\n]*\r?\n(\s*(#|\$\w+ = )[^\n]*\n)*\s*' + [regex]::Escape('Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision -ReRun $SkippedReRun') + '\r?\n\s*' + [regex]::Escape('foreach ($Line in $RetryAdvice) { Write-Host $Line -ForegroundColor Yellow }'))
     }
 }
 
@@ -2555,6 +2555,20 @@ exit 1
         $Run.Text | Should -Contain 'Consumption (billing) data is missing or incomplete for 2 subscription(s):'
         $Run.Text | Should -Contain ('  - {0} ({0})' -f $script:SubA.Id)
         $Run.Text | Should -Contain ('  - {0} ({0})' -f $SubC.Id)
+    }
+
+    It 'gives no -Resume advice for a subscription whose consumption is incomplete (<Label>)' -TestCases @(
+        @{ Label = 'its consumption only'; Fail = @() }
+        @{ Label = 'and another subscription failed'; Fail = @('sub-b') }
+    ) {
+        param($Label, $Fail)
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id) -Fail $Fail
+        $Run = script:Invoke-WrapperRun -Streams 1
+        $Text = $Run.Text -join "`n"
+        $Run.Text | Should -Contain ('1 subscription(s) on the retry list have incomplete consumption ({0}), which -Resume and -ResumeFailedOnly do not fix.' -f $script:SubA.Name) -Because $Text
+        $Run.Text | Should -Contain 'Run the same command again, with the same settings and without -Resume or -ResumeFailedOnly, and upload only the new report.'
+        @($Run.Text | Where-Object { $_ -like 'Re-run with -Resume*' -or $_ -like 'Or re-run with -ResumeFailedOnly*' }) | Should -BeNullOrEmpty -Because $Text
     }
 
     It 'counts each subscription of one stream whose consumption was skipped for the sign-in' {

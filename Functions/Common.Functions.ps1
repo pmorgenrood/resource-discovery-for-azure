@@ -1188,7 +1188,7 @@ function Write-SkippedSubscriptionSummary
 # until the cause is fixed. Prints nothing when none of them was skipped.
 function Write-PendingRetrySkippedSummary
 {
-    param($FailedAttempts, $Decision)
+    param($FailedAttempts, $Decision, [string]$ReRun = 'run -ResumeFailedOnly')
     $RetryIds = @(@($FailedAttempts) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
     $Skipped = @(if ($null -ne $Decision) { @($Decision.Inaccessible) | Where-Object { $null -ne $_ -and $RetryIds -contains [string]$_.Id } })
     if ($Skipped.Count -eq 0) { return }
@@ -1198,7 +1198,7 @@ function Write-PendingRetrySkippedSummary
         $Label = if (-not [string]::IsNullOrEmpty([string]$Sub.Reason)) { [string]$Sub.Reason } else { 'not readable' }
         Write-Host ('    - {0} ({1}) - {2}' -f $Sub.Name, $Sub.Id, $Label) -ForegroundColor Yellow
     }
-    $null = Write-AccessRemedyLines -Inaccessible $Skipped -Lead '  To retry them:' -ReRun 'run -ResumeFailedOnly' -Colour Yellow
+    $null = Write-AccessRemedyLines -Inaccessible $Skipped -Lead '  To retry them:' -ReRun $ReRun -Colour Yellow
 }
 
 # After a consumption data check refusal, say per failing subscription what the

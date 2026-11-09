@@ -2103,8 +2103,7 @@ if ($FailedSubscriptions.Count -gt 0)
 {
     Write-Host ("Subscriptions Failed:    {0} ({1})" -f $FailedSubscriptions.Count, ($FailedSubscriptions -join ', ')) -ForegroundColor Red
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
-    Write-Host "Re-run with -Resume to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
-    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
+    foreach ($Line in @(Get-RetryListAdvice -FailedAttempts $FailedAttempts -NewFailures)) { Write-Host $Line -ForegroundColor Yellow }
     if ($DiagFile -and (Test-Path $DiagFile))
     {
         Write-Host ("Failure Diagnostics:     {0}" -f $DiagFile) -ForegroundColor Red
@@ -2123,8 +2122,10 @@ elseif ($FailedAttempts.Count -gt 0)
     # simply because the most recent run was clean.
     Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $FailedAttempts.Count) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
-    Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
-    Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
+    $RetryAdvice = @(Get-RetryListAdvice -FailedAttempts $FailedAttempts)
+    $SkippedReRun = if (@(@($FailedAttempts) | Where-Object { $null -ne $_ -and [string]$_.Reason -like 'consumption incomplete:*' }).Count -gt 0) { 'run the same command again without -Resume or -ResumeFailedOnly' } else { 'run -ResumeFailedOnly' }
+    Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision -ReRun $SkippedReRun
+    foreach ($Line in $RetryAdvice) { Write-Host $Line -ForegroundColor Yellow }
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($OuterZipFile)
