@@ -1038,7 +1038,7 @@ Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
 
 # ============================================================
 # 20. AKS multi-node-pool Tags: no shared-reference aliasing
-# Regression for a real bug found in this session: Services/Containers/AKS.ps1
+# Regression for a real bug: Services/Containers/AKS.ps1
 # emits one row per node pool for a cluster (foreach ($2 in
 # $data.agentPoolProfiles)). The 'Tags' field must carry each cluster's real
 # tag values into EVERY one of that cluster's rows, but if the Select-Object
