@@ -498,6 +498,15 @@ Describe 'Callers use the message and the switch' {
         $script:Stream | Should -Match "InventoryPassthrough\['IncludeNetworkResources'\]"
     }
 
+    It 'the README''s wrapper summary names every switch the wrapper forwards' {
+        $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
+        $Summary = [regex]::Match($Readme, '(?s)The wrapper forwards (.*?) to the inner')
+        $Summary.Success | Should -BeTrue -Because 'the README has a wrapper-forwarding summary'
+        $Forwarded = @([regex]::Matches($script:Wrapper, "InventoryPassthrough\['(\w+)'\]") | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+        $Forwarded | Should -Contain 'IncludeNetworkResources'
+        foreach ($Name in $Forwarded) { $Summary.Groups[1].Value | Should -Match ([regex]::Escape("``-$Name``")) -Because "the wrapper forwards -$Name" }
+    }
+
     It 'the inner script clears the skipped count at the start of every run' {
         $VarFn = $script:InventoryAst.FindAll({
                 param($Node)
