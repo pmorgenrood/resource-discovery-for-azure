@@ -38,12 +38,24 @@ function Get-MaskedIdPattern
 # checked, and a flat prod_/nonprod_ token also counts, so an ID with a leak
 # or the wrong shape still marks the run as obfuscated and turns the leak
 # scans on. A tenant-scope id (/providers/...) has no subscription to tell by,
-# and a real name there can look like a token, so a run whose IDs are all
-# tenant-scope is told by its dictionary instead: only an -Obfuscate run
-# writes one.
+# and one real name there can look like a token, so a run whose IDs are all
+# tenant-scope is told by its dictionary (only an -Obfuscate run writes one),
+# or, with no dictionary at hand (it is never in the shared zip), when every
+# name of every one of its IDs is a full prod_/nonprod_<guid> token.
 function Test-ObfuscatedRun
 {
     param([string[]]$Ids, [string]$DictionaryPath)
     foreach ($Id in $Ids) { if ($Id -match '^(/subscriptions/)?(prod|nonprod)_') { return $true } }
-    return (-not [string]::IsNullOrEmpty($DictionaryPath) -and (Test-Path -LiteralPath $DictionaryPath))
+    if (-not [string]::IsNullOrEmpty($DictionaryPath) -and (Test-Path -LiteralPath $DictionaryPath)) { return $true }
+    $Ids = @($Ids | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    if ($Ids.Count -eq 0) { return $false }
+    $Token = '^(?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+    foreach ($Id in $Ids)
+    {
+        # /providers/<namespace>/<type>/<name>[/<type>/<name> ...]
+        $Parts = $Id.TrimEnd('/').Split('/')
+        if ($Parts.Count -lt 5 -or $Parts[1] -ne 'providers' -or $Parts.Count % 2 -eq 0) { return $false }
+        for ($i = 4; $i -lt $Parts.Count; $i += 2) { if ($Parts[$i] -notmatch $Token) { return $false } }
+    }
+    return $true
 }

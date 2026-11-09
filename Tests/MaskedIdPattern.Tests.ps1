@@ -91,8 +91,21 @@ Describe 'Test-ObfuscatedRun' {
         Test-ObfuscatedRun -Ids @($script:Tenant) -DictionaryPath $script:Dict | Should -BeTrue
     }
 
-    It 'leaves a run of tenant-scope ids plain with no dictionary, even with a name shaped like a token' {
-        Test-ObfuscatedRun -Ids @($script:Tenant) | Should -BeFalse
+    It 'marks a run of tenant-scope ids obfuscated with no dictionary when every name is a token' {
+        Test-ObfuscatedRun -Ids @($script:Tenant, ('/providers/microsoft.capacity/reservationorders/' + $script:T + '/reservations/' + $script:T)) | Should -BeTrue
+    }
+
+    It 'leaves a run of tenant-scope ids plain with no dictionary when <Case>' -ForEach @(
+        @{ Case = 'one name is real'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}', '/providers/Microsoft.Capacity/reservationOrders/12345678-1234-1234-1234-123456789012') }
+        @{ Case = 'a child name is real'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}/reservations/res-a') }
+        @{ Case = 'an id has a type and no name'; Ids = @('/providers/Microsoft.Capacity/reservationOrders') }
+        @{ Case = 'a token is in upper case'; Ids = @('/providers/microsoft.capacity/reservationorders/PROD_11111111-2222-4333-8444-555555555555') }
+    ) {
+        Test-ObfuscatedRun -Ids @($Ids | ForEach-Object { $_.Replace('{T}', $script:T) }) | Should -BeFalse
+    }
+
+    It 'leaves a run with no ids plain' {
+        Test-ObfuscatedRun -Ids @() | Should -BeFalse
     }
 
     It 'leaves a run of real ids plain' {
