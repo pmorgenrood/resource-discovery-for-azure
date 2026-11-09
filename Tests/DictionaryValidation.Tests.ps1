@@ -38,11 +38,8 @@ BeforeAll {
 
     # A masked resource ID is an ARM-shaped path, never a flat token; the
     # shape is described in Helpers/MaskedIdPattern.ps1.
-    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
     $script:MaskedIdPattern = Get-MaskedIdPattern
-    # Any masked token anywhere in a value; a real Azure ID never holds one.
-    $script:MaskedTokenPattern = '(^|/)(prod|nonprod)_[a-z_]*' + $MaskedGuid + '(/|$)'
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 }
 
@@ -84,7 +81,7 @@ Describe "Dictionary Structure" {
             for ($i = 1; $i -lt $M.Count; $i++)
             {
                 # A token slot of the masked id never holds its real segment.
-                if ($M[$i] -match '^(prod|nonprod)_' -and $R[$i] -ne '') { $M[$i] | Should -Not -BeExactly $R[$i] -Because "masked id '$($P.Name)' keeps a real part"; $Checked++ }
+                if ($M[$i] -match '^(prod|nonprod)_' -and $R[$i] -ne '') { $M[$i] | Should -Not -Be $R[$i] -Because "masked id '$($P.Name)' keeps a real part, letter case aside"; $Checked++ }
             }
         }
         if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no masked path with the same parts as its real id' }
@@ -95,11 +92,11 @@ Describe "Dictionary Structure" {
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
         foreach ($val in $Values)
         {
-            # A real id as Azure or the tool wrote it: never empty and never
-            # holding a masked token. Its form is not checked here, since a row
-            # with no id or an id that is not an ARM path is recorded too.
+            # A real id as Azure or the tool wrote it: never empty. Its form is not
+            # checked here, since a row with no id or an id that is not an ARM
+            # path is recorded too; that it holds no token this run made is
+            # checked below.
             [string]::IsNullOrEmpty([string]$val) | Should -BeFalse -Because 'every masked id stands for a real id'
-            $val | Should -Not -Match $script:MaskedTokenPattern -Because "Dictionary value '$val' should be a real id, not a masked one"
         }
     }
 }
@@ -123,10 +120,14 @@ Describe "Dictionary Completeness" {
 Describe "No Double Obfuscation" {
     It "No obfuscated value should appear as a dictionary value (real ID)" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
-        $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
-        foreach ($val in $Values)
+        # A real name can itself look like a token, so a real id is checked
+        # against the tokens this run made: it holds none of them (letter
+        # case aside), since a real id that held one was masked twice.
+        $RunTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($P in @($script:Dictionary.ResourceIdMap.PSObject.Properties)) { foreach ($Part in ([string]$P.Name).Split('/')) { if ($Part -cmatch '^(prod|nonprod)_') { [void]$RunTokens.Add($Part) } } }
+        foreach ($P in @($script:Dictionary.ResourceIdMap.PSObject.Properties))
         {
-            $val | Should -Not -Match $script:MaskedTokenPattern -Because "Real ID '$val' should not hold an obfuscated token"
+            @(([string]$P.Value).Split('/') | Where-Object { $RunTokens.Contains($_) }) | Should -BeNullOrEmpty -Because "Real ID '$($P.Value)' should not hold a token this run made"
         }
     }
 }
