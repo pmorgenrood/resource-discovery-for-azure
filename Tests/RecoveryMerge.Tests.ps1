@@ -819,16 +819,18 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
 Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
-    It 'does NOT warn about token overlap when the dictionaries share ResourceIdMap tokens (seeded recovery)' {
+    It 'merges with no stop and no token warning when the dictionaries share ResourceIdMap tokens (seeded recovery)' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared' } }
         $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared'; 'prod_recNew' = '/id/new' } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
 
-        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
-
-        ($Result.Warnings -join "`n") | Should -Not -Match 'share NO ResourceIdMap tokens'
+        { $script:SeededResult = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Not -Throw -Because 'a recovery seeded with the gap dictionary shares its tokens, so the shared-token check passes'
+        $Result = $script:SeededResult
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        ($Result.Warnings -join "`n") | Should -Not -Match 'ResourceIdMap'
     }
 
     It 'warns when a replaced inventory key has fewer records than the gap held' {
