@@ -94,15 +94,10 @@ BeforeAll {
     }
 
     # Locate the reverse-lookup dictionary for the determinism checks: the
-    # run's own one, as DictionaryValidation.Tests.ps1 finds it (TEST_DICT_PATH,
-    # else next to TEST_ZIP_PATH, else in Tests/ when no TEST_ZIP_PATH is set).
-    # The dictionary is LOCAL-ONLY and is never inside the shared zip.
-    $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
-    {
-        $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-        Get-ChildItem -Path $DictDir -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # run's own one, found by the test zip's name. The dictionary is
+    # LOCAL-ONLY and is never inside the shared zip.
+    . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
+    $DictPath = Get-RunDictionaryPath -TestsRoot $PSScriptRoot
     $script:DictionaryAvailable = -not [string]::IsNullOrEmpty($DictPath) -and (Test-Path $DictPath)
     $script:Dictionary = if ($script:DictionaryAvailable) { Get-Content $DictPath -Raw | ConvertFrom-Json } else { $null }
 
@@ -348,7 +343,7 @@ Describe "Consumption Obfuscation" {
                 $Uri = $InstanceData.'Microsoft.Resources'.ResourceUri
                 if (![string]::IsNullOrEmpty($Uri))
                 {
-                    $Uri | Should -Match $script:MaskedIdPattern -Because "InstanceData ResourceUri '$Uri' should be a masked ARM path"
+                    $Uri | Should -Match $script:MaskedConsumptionIdPattern -Because "InstanceData ResourceUri '$Uri' should be a masked ARM path"
                     $Uri | Should -Not -Match '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}' -Because "InstanceData ResourceUri must not contain a real subscription GUID"
                 }
             }

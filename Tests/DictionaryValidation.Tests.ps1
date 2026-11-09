@@ -3,16 +3,9 @@
 # Run with: $env:TEST_DICT_PATH = "./path/to/ObfuscationDictionary_*.json"; Invoke-Pester ./Tests/DictionaryValidation.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    # The run's own dictionary: TEST_DICT_PATH, else the newest one next to
-    # TEST_ZIP_PATH, else (no TEST_ZIP_PATH) the newest one in Tests/, where the
-    # zip is found too. A dictionary of another run in Tests/ is never taken for
-    # a zip given by path.
-    $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
-    {
-        $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-        Get-ChildItem -Path $DictDir -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-    }
+    # The run's own dictionary, found by the test zip's name.
+    . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
+    $DictPath = Get-RunDictionaryPath -TestsRoot $PSScriptRoot
     # No dictionary fixture is available when the test zip wasn't produced by an
     # -Obfuscate run. Mark the suite skipped instead of throwing - the rest of
     # the test framework runs in environments without a dictionary on hand.

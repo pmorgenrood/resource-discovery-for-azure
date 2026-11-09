@@ -47,6 +47,7 @@ BeforeAll {
     # A masked resource ID is an ARM-shaped path, never a flat token; the
     # shape is described in Helpers/MaskedIdPattern.ps1.
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
     $script:MaskedIdPattern = Get-MaskedIdPattern
 }
 
@@ -153,16 +154,8 @@ Describe "Consumption to Inventory Cross-Reference" {
         # dictionary (ResourceIdMap: masked id -> real id). A consumption row
         # whose real resource is in the inventory must carry the inventory's
         # masked id for it, string for string.
-        # The run's own dictionary: TEST_DICT_PATH, else the newest
-        # ObfuscationDictionary_*.json next to TEST_ZIP_PATH, else (no
-        # TEST_ZIP_PATH) the newest one in Tests/, where the zip was found too.
-        # A dictionary of another run in Tests/ is never taken for a zip given
-        # by path.
-        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
-        {
-            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-        }
+        # The run's own dictionary, found by the test zip's name.
+        $DictPath = Get-RunDictionaryPath -TestsRoot $PSScriptRoot
         if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because "no obfuscation dictionary for this zip, so real resources cannot be matched"; return }
         $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
         $RealOf = @{}
@@ -195,11 +188,7 @@ Describe "Consumption to Inventory Cross-Reference" {
 
 Describe "Subscription and Resource Group Determinism" {
     It "One real subscription has one subscription token, and one token one real subscription" {
-        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
-        {
-            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-        }
+        $DictPath = Get-RunDictionaryPath -TestsRoot $PSScriptRoot
         if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because 'no obfuscation dictionary for this zip'; return }
         $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
         $TokensOf = @{}; $RealsOf = @{}
@@ -217,11 +206,7 @@ Describe "Subscription and Resource Group Determinism" {
     }
 
     It "One real resource group name has one resource group token" {
-        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
-        {
-            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-        }
+        $DictPath = Get-RunDictionaryPath -TestsRoot $PSScriptRoot
         if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because 'no obfuscation dictionary for this zip'; return }
         $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
         $TokensOf = @{}; $RealsOf = @{}
