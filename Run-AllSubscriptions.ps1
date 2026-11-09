@@ -484,6 +484,12 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# The zip paths of subscriptions whose report zip could not be written this
+# run. ResourceInventory.ps1 adds one and exits 2 (sequential run); a stream
+# worker reports its list in its summary JSON. A partial zip left at such a
+# path is never counted or consolidated.
+$Global:RdaUnwrittenReportZips = @()
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
@@ -1473,6 +1479,11 @@ else
                     $Global:CollectorFailures += @($StreamSummary.CollectorFailures)
                 }
 
+                if ($StreamSummary.UnwrittenReportZips -and @($StreamSummary.UnwrittenReportZips).Count -gt 0)
+                {
+                    $Global:RdaUnwrittenReportZips = @($Global:RdaUnwrittenReportZips) + @($StreamSummary.UnwrittenReportZips)
+                }
+
                 # If a stream wrote a failures log, add it to the wrapper's diag-file
                 # accumulator so the final summary surfaces the path. The wrapper's
                 # existing $DiagFile was nullable; using a single concatenated log
@@ -1641,11 +1652,15 @@ Write-Host "All subscriptions processed!" -ForegroundColor Green
 # both in the sequential branch and after streaming aggregation).
 # Failed subs (in $FailedSubscriptions) are intentionally NOT counted -
 # their zip-or-no-zip state is unreliable and the wrapper already surfaces
-# them via the failure summary.
-$ExpectedZipCount = @($SubResourceCounts).Count
+# them via the failure summary. A sub whose report zip could not be written
+# (in $Global:RdaUnwrittenReportZips) failed too, but it is counted: it ran
+# to the end and its zip is missing, so the run still exits 2 for it. Its
+# partial zip, if one is left, is never counted.
+$ExpectedZipCount = @($SubResourceCounts).Count + @(@($Global:RdaUnwrittenReportZips) | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique).Count
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
-    $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # A partial zip left by a failed compression is not counted.
+    $ActualSubZips = @(Get-RunSubscriptionZips -InventoryRoot $InventoryRoot -Since $RunStartTime -Unwritten $Global:RdaUnwrittenReportZips)
     $ActualZipCount = $ActualSubZips.Count
     if ($ActualZipCount -lt $ExpectedZipCount)
     {
@@ -1667,6 +1682,11 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host "  - Cloud Shell ephemeral storage was evicted between worker exit and wrapper consolidation." -ForegroundColor Yellow
         Write-Host "  - A parallel worker crashed after the inner script logged completion but before flushing the zip to disk." -ForegroundColor Yellow
         Write-Host "  - Out-of-disk-space write that the inner script swallowed silently." -ForegroundColor Yellow
+        $UnwrittenCount = @(@($Global:RdaUnwrittenReportZips) | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique).Count
+        if ($UnwrittenCount -gt 0)
+        {
+            Write-Host ("  - The report zip of {0} subscription(s) could not be written (see its ""No report was written"" line); it is listed as failed." -f $UnwrittenCount) -ForegroundColor Yellow
+        }
         Write-Host ""
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
         Write-Host "Recover by either:" -ForegroundColor Yellow
@@ -1676,6 +1696,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
+        Write-UnwrittenReportZips -Unwritten $Global:RdaUnwrittenReportZips
         # This early exit skips the end of the run, so the FAILED (metrics)
         # lines are printed here too.
         $null = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough -ReportRoot $InventoryRoot
@@ -1689,8 +1710,10 @@ $OuterZipFile = $null
 
 if (Test-Path -Path $InventoryRoot -PathType Container)
 {
-    # Filter ZIPs by current run timestamp only
-    $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # Filter ZIPs by current run timestamp only, without a partial zip left
+    # by a failed compression (named in one line instead).
+    $SubZips = @(Get-RunSubscriptionZips -InventoryRoot $InventoryRoot -Since $RunStartTime -Unwritten $Global:RdaUnwrittenReportZips)
+    Write-UnwrittenReportZips -Unwritten $Global:RdaUnwrittenReportZips
     if ($SubZips.Count -gt 0)
     {
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"

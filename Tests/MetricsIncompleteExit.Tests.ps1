@@ -220,6 +220,9 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
             # The report zip of the run, or none when it could not be written.
             $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
             if (-not $NoZip) { Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip' }
+            # Whether the run wrote its zip, as Write-RdaReportZip returns it;
+            # read by the run's last statement.
+            $ZipWritten = -not $NoZip
             $global:LASTEXITCODE = 0
             $Lines = @(& $script:DirectRun @Arguments 6>&1 | ForEach-Object { [string]$_ })
             [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines }
@@ -341,6 +344,9 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
                 'function Compress-Archive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) Set-Content -LiteralPath $DestinationPath -Value ''part''; if ($env:RDA_TEST_ZIP_FAIL) { throw ''The disk is full.'' } }'
+                # A stand-in Remove-Item that fails as the real one does (an
+                # error, not a throw) when asked.
+                'function Remove-Item { [CmdletBinding()] param([string]$LiteralPath, [string]$Path, [switch]$Force) if ($env:RDA_TEST_REMOVE_FAIL) { Write-Error ''Access to the path is denied.'' } else { Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters } }'
                 '$CompressionOutput = @{ Path = @(''x''); CompressionLevel = ''Fastest''; DestinationPath = $Global:ZipOutputFile }'
                 '$Runtime = ''0:01''; $ReportingRunTime = ''0:01'''
                 @($Top[$From..($Top.Count - 1)] | ForEach-Object { $_.Extent.Text })
@@ -348,9 +354,10 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
 
         function script:Invoke-ZipEnd
         {
-            param([hashtable]$Arguments, [switch]$Fail)
+            param([hashtable]$Arguments, [switch]$Fail, [switch]$RemoveFails)
             $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
             $env:RDA_TEST_ZIP_FAIL = $(if ($Fail) { '1' } else { '' })
+            $env:RDA_TEST_REMOVE_FAIL = $(if ($RemoveFails) { '1' } else { '' })
             try
             {
                 $global:LASTEXITCODE = 0
@@ -360,17 +367,21 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
             finally
             {
                 Remove-Item -Path 'Env:RDA_TEST_ZIP_FAIL' -ErrorAction SilentlyContinue
+                Remove-Item -Path 'Env:RDA_TEST_REMOVE_FAIL' -ErrorAction SilentlyContinue
             }
         }
 
         $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
         $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
         else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
         if ($script:SessionZip) { $Global:ZipOutputFile = $script:SessionZip.Value }
         else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionUnwritten) { $Global:RdaUnwrittenReportZips = $script:SessionUnwritten.Value }
+        else { Remove-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue }
     }
 
     It 'names the zip and exits 0 when it was written' {
@@ -401,14 +412,37 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
         $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
     }
 
-    It 'removes a partial zip under -RunAllSubs and leaves the exit to the wrapper' {
+    It 'removes a partial zip under -RunAllSubs and exits 2, so the wrapper counts that subscription as failed' {
         $Global:MetricsFailedSubs = @()
+        $Global:RdaUnwrittenReportZips = @()
         $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -Fail
 
-        $Result.ExitCode | Should -Be 0
+        $Result.ExitCode | Should -Be 2
         $Result.ZipLeft | Should -BeFalse
         @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
         @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 1
+        $Global:RdaUnwrittenReportZips | Should -Be @($Global:ZipOutputFile)
+    }
+
+    It 'exits 2 and names the partial zip when the zip fails and the partial zip cannot be removed' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1' } -Fail -RemoveFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeTrue
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 1
+        @($Result.Lines | Where-Object { $_ -like ('*The partial zip could not be removed: {0}.*' -f $Global:ZipOutputFile) }).Count | Should -Be 1
+    }
+
+    It 'exits 2 under -RunAllSubs and adds the zip for the wrapper when the partial zip cannot be removed' {
+        $Global:MetricsFailedSubs = @()
+        $Global:RdaUnwrittenReportZips = @('/earlier/ResourcesReport_a.zip')
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -Fail -RemoveFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeTrue
+        $Global:RdaUnwrittenReportZips | Should -Be @('/earlier/ResourcesReport_a.zip', $Global:ZipOutputFile)
     }
 }
 
@@ -540,6 +574,9 @@ Describe 'Two direct ResourceInventory.ps1 runs in one PowerShell session' {
             param([hashtable]$Arguments, [switch]$Gap)
             $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
             Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip'
+            # The zip was written, as Write-RdaReportZip returns it; read by the
+            # run's last statement.
+            $ZipWritten = $true
             $env:RDA_TEST_METRICS_GAP = $(if ($Gap) { '1' } else { '' })
             try
             {
@@ -706,15 +743,14 @@ Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
 
         function script:Invoke-OutputCheck
         {
-            param([hashtable]$InventoryPassthrough)
+            param([hashtable]$InventoryPassthrough, [string]$InventoryRoot = (Join-Path $TestDrive 'check-reports'), [object[]]$Completed = @([pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Count = 3 }))
             # Read by the lifted statements, which run in this scope.
-            $InventoryRoot = Join-Path $TestDrive 'check-reports'
             New-Item -ItemType Directory -Path (Join-Path $InventoryRoot 'ResourcesReport_x') -Force | Out-Null
             Set-Variable -Name TenantID -Value 'tenant-1'
             Set-Variable -Name WrapperTranscriptStarted -Value $false
             Set-Variable -Name ResumeStateFile -Value (Join-Path $InventoryRoot '.resume-state.json')
-            Set-Variable -Name RunStartTime -Value (Get-Date)
-            Set-Variable -Name SubResourceCounts -Value @([pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Count = 3 })
+            Set-Variable -Name RunStartTime -Value (Get-Date).AddMinutes(-5)
+            Set-Variable -Name SubResourceCounts -Value @($Completed)
             function Exit-Wrapper { param([int]$Code) Write-Output ('EXIT=' + $Code); throw 'wrapper exited' }
             $Lines = [System.Collections.Generic.List[string]]::new()
             try { . ([scriptblock]::Create($script:OutputCheck)) 6>&1 | ForEach-Object { $Lines.Add([string]$_) } }
@@ -723,13 +759,17 @@ Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
         }
 
         $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
         else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionUnwritten) { $Global:RdaUnwrittenReportZips = $script:SessionUnwritten.Value }
+        else { Remove-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue }
     }
 
     It 'prints the FAILED (metrics) lines before it exits 2 for a missing zip' {
+        $Global:RdaUnwrittenReportZips = @()
         $Global:MetricsFailedSubs = @($script:Incomplete)
         $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 }
 
@@ -740,10 +780,143 @@ Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
     }
 
     It 'prints no FAILED (metrics) lines when the metrics are complete' {
+        $Global:RdaUnwrittenReportZips = @()
         $Global:MetricsFailedSubs = @()
         $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 }
 
         $Lines | Should -Contain 'EXIT=2'
         $Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+    }
+
+    It 'does not count a partial zip left by a failed compression, names it and exits 2 for the missing zip' {
+        # One subscription ran to completion but its zip is gone; another one's
+        # compression failed and its partial zip could not be removed.
+        $Global:MetricsFailedSubs = @()
+        $Root = Join-Path $TestDrive 'check-partial'
+        $Partial = Join-Path (Join-Path $Root 'ResourcesReport_y') 'ResourcesReport_y.zip'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Partial) -Force | Out-Null
+        Set-Content -LiteralPath $Partial -Value 'part'
+        $Global:RdaUnwrittenReportZips = @($Partial)
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 } -InventoryRoot $Root
+
+        $Lines | Should -Contain 'EXIT=2'
+        $Lines | Should -Contain ('Not consolidated: {0} is a partial zip from a failed compression, not a report; delete it.' -f $Partial)
+    }
+
+    It 'exits 2 when its one subscription''s zip could not be written, also when it was not counted as completed' {
+        $Global:MetricsFailedSubs = @()
+        $Root = Join-Path $TestDrive 'check-only-unwritten'
+        $Global:RdaUnwrittenReportZips = @((Join-Path (Join-Path $Root 'ResourcesReport_y') 'ResourcesReport_y.zip'))
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 } -InventoryRoot $Root -Completed @()
+
+        $Lines | Should -Contain 'EXIT=2'
+        $Lines | Should -Contain '  - The report zip of 1 subscription(s) could not be written (see its "No report was written" line); it is listed as failed.'
+    }
+
+    It 'counts the zip of a subscription that wrote one, but not the partial zip of another, and exits 2 for that one' {
+        $Global:MetricsFailedSubs = @()
+        $Root = Join-Path $TestDrive 'check-good-and-partial'
+        $Good = Join-Path (Join-Path $Root 'ResourcesReport_x') 'ResourcesReport_x.zip'
+        $Partial = Join-Path (Join-Path $Root 'ResourcesReport_y') 'ResourcesReport_y.zip'
+        foreach ($Zip in @($Good, $Partial))
+        {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $Zip) -Force | Out-Null
+            Set-Content -LiteralPath $Zip -Value 'zip'
+        }
+        $Global:RdaUnwrittenReportZips = @($Partial)
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 } -InventoryRoot $Root
+
+        $Lines | Should -Contain 'EXIT=2'
+        $Lines | Should -Contain '  Expected zips: 2 (one per subscription that ran to completion this run)'
+        @($Lines | Where-Object { $_ -like '  Found zips:    1 *' }).Count | Should -Be 1
+        $Lines | Should -Contain ('Not consolidated: {0} is a partial zip from a failed compression, not a report; delete it.' -f $Partial)
+    }
+
+    It 'passes when every subscription wrote its zip' {
+        $Global:MetricsFailedSubs = @()
+        $Global:RdaUnwrittenReportZips = @()
+        $Root = Join-Path $TestDrive 'check-good'
+        $Good = Join-Path (Join-Path $Root 'ResourcesReport_x') 'ResourcesReport_x.zip'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Good) -Force | Out-Null
+        Set-Content -LiteralPath $Good -Value 'zip'
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 } -InventoryRoot $Root
+
+        $Lines | Should -Not -Contain 'EXIT=2'
+        $Lines | Should -Contain 'Per-subscription output verification: OK (1 zip(s) match 1 successful sub(s))'
+    }
+}
+
+Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
+    BeforeAll {
+        # The wrapper's statements that put the per-subscription zips into the
+        # AllSubscriptions zip, as written, with a stand-in Compress-Archive
+        # that records what it was given.
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Top = @((Get-ScriptAst -File 'Run-AllSubscriptions.ps1').EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$OuterZipFile = \$null' })[0]
+        $script:Consolidate = (@($Top[$From..($From + 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionUnwritten) { $Global:RdaUnwrittenReportZips = $script:SessionUnwritten.Value }
+        else { Remove-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'leaves out a partial zip left by a failed compression and names it' {
+        $InventoryRoot = Join-Path $TestDrive 'consolidate'
+        $Good = Join-Path (Join-Path $InventoryRoot 'ResourcesReport_x') 'ResourcesReport_x.zip'
+        $Partial = Join-Path (Join-Path $InventoryRoot 'ResourcesReport_y') 'ResourcesReport_y.zip'
+        foreach ($Zip in @($Good, $Partial))
+        {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $Zip) -Force | Out-Null
+            Set-Content -LiteralPath $Zip -Value 'zip'
+        }
+        $Global:RdaUnwrittenReportZips = @($Partial)
+        $RunStartTime = (Get-Date).AddMinutes(-5)
+        $script:Packed = @()
+        function Compress-Archive { param([string[]]$Path, [string]$DestinationPath, [switch]$Force) $script:Packed = @($Path) }
+        $Lines = @(. ([scriptblock]::Create($script:Consolidate)) 6>&1 | ForEach-Object { [string]$_ })
+
+        $script:Packed | Should -Be @($Good)
+        $Lines | Should -Contain ('Not consolidated: {0} is a partial zip from a failed compression, not a report; delete it.' -f $Partial)
+    }
+
+    It 'takes every zip of the run when no compression failed' {
+        $InventoryRoot = Join-Path $TestDrive 'consolidate-clean'
+        $Zips = @('ResourcesReport_x', 'ResourcesReport_y') | ForEach-Object { Join-Path (Join-Path $InventoryRoot $_) ($_ + '.zip') }
+        foreach ($Zip in $Zips)
+        {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $Zip) -Force | Out-Null
+            Set-Content -LiteralPath $Zip -Value 'zip'
+        }
+        $Global:RdaUnwrittenReportZips = @()
+        $RunStartTime = (Get-Date).AddMinutes(-5)
+        $script:Packed = @()
+        function Compress-Archive { param([string[]]$Path, [string]$DestinationPath, [switch]$Force) $script:Packed = @($Path) }
+        $Lines = @(. ([scriptblock]::Create($script:Consolidate)) 6>&1 | ForEach-Object { [string]$_ })
+
+        @($script:Packed | Sort-Object) | Should -Be @($Zips | Sort-Object)
+        @($Lines | Where-Object { $_ -like 'Not consolidated:*' }).Count | Should -Be 0
+    }
+
+    It 'gets the partial zips of a parallel run from its stream summary files' {
+        # The stream's summary statements and the wrapper's merge statement,
+        # as written.
+        $StreamTop = @((Get-ScriptAst -File 'Run-AllSubscriptions.Stream.ps1').EndBlock.Statements)
+        $Write = @($StreamTop | Where-Object { $_.Extent.Text -match '^\$UnwrittenReportZips = ' -or $_.Extent.Text -match '^\$Summary = \[pscustomobject\]' -or ($_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text -match '\$Summary \| ConvertTo-Json') })
+        $Write.Count | Should -Be 3
+        $WrapperAst = Get-ScriptAst -File 'Run-AllSubscriptions.ps1'
+        $Read = @($WrapperAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Extent.Text -match '^\$StreamSummary = Get-Content' }, $true))
+        $Merge = @($WrapperAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Extent.Text -match '^if \(\$StreamSummary\.UnwrittenReportZips' }, $true))
+        $Merge.Count | Should -Be 1
+
+        $Global:RdaUnwrittenReportZips = @('/reports/ResourcesReport_y/ResourcesReport_y.zip')
+        $StreamSummaryPath = Join-Path $TestDrive 'stream-unwritten-summary.json'
+        . ([scriptblock]::Create((@($Write | ForEach-Object { $_.Extent.Text }) -join "`n")))
+
+        $S = [pscustomobject]@{ SummaryPath = $StreamSummaryPath }
+        $Global:RdaUnwrittenReportZips = @()
+        . ([scriptblock]::Create($Read[0].Extent.Text + "`n" + $Merge[0].Extent.Text))
+        @($Global:RdaUnwrittenReportZips) | Should -Be @('/reports/ResourcesReport_y/ResourcesReport_y.zip')
     }
 }

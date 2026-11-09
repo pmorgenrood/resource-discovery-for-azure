@@ -204,6 +204,11 @@ $Global:MetricsFailedSubs = @()
 # Same reset/aggregate/report lifecycle as $Global:MetricsFailedSubs above.
 $Global:CollectorFailures = @()
 
+# The zip paths of subscriptions whose report zip could not be written.
+# ResourceInventory.ps1 adds one and exits 2; reported in the summary JSON so
+# the wrapper never counts or consolidates a partial zip left there.
+$Global:RdaUnwrittenReportZips = @()
+
 $PairCount = [Math]::Min($SubscriptionIds.Count, $SubscriptionNames.Count)
 for ($i = 0; $i -lt $PairCount; $i++)
 {
@@ -318,6 +323,7 @@ $ConsumptionTotal = if ($null -ne $Global:ConsumptionRecordCount) { [int]$Global
 $ConsumptionFailedSubs = if ($null -ne $Global:ConsumptionFailedSubs) { @($Global:ConsumptionFailedSubs) } else { @() }
 $MetricsFailedSubs = if ($null -ne $Global:MetricsFailedSubs) { @($Global:MetricsFailedSubs) } else { @() }
 $CollectorFailures = if ($null -ne $Global:CollectorFailures) { @($Global:CollectorFailures) } else { @() }
+$UnwrittenReportZips = @(@($Global:RdaUnwrittenReportZips) | Where-Object { -not [string]::IsNullOrEmpty($_) })
 
 $Summary = [pscustomobject]@{
     StreamId               = $StreamId
@@ -331,6 +337,7 @@ $Summary = [pscustomobject]@{
     ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
+    UnwrittenReportZips    = @($UnwrittenReportZips)
 }
 try
 {

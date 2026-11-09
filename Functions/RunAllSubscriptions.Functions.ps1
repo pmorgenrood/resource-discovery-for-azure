@@ -1131,3 +1131,30 @@ function Get-RunSummaryLogContent
 
     return $Lines.ToArray()
 }
+
+# The per-subscription zips of this run (written at or after $Since) under
+# the inventory root, without the zips whose compression failed
+# ($Unwritten): a partial zip that could not be removed is not a report, so
+# it is never counted or consolidated.
+function Get-RunSubscriptionZips
+{
+    param([string]$InventoryRoot, [datetime]$Since, [string[]]$Unwritten)
+
+    $Skip = @(@($Unwritten) | Where-Object { -not [string]::IsNullOrEmpty($_) } | ForEach-Object { [System.IO.Path]::GetFullPath($_) })
+    return @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.zip' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Since } } | Where-Object { $Skip -notcontains $_.FullName })
+}
+
+# One line for each partial zip of this run that is still there after its
+# compression failed, so it is not mistaken for a report.
+function Write-UnwrittenReportZips
+{
+    param([string[]]$Unwritten)
+
+    foreach ($ZipFile in @(@($Unwritten) | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique))
+    {
+        if (Test-Path -LiteralPath $ZipFile)
+        {
+            Write-Host ("Not consolidated: {0} is a partial zip from a failed compression, not a report; delete it." -f $ZipFile) -ForegroundColor Yellow
+        }
+    }
+}

@@ -424,6 +424,8 @@ function Get-RdaReportJsonFiles
 # is there afterwards. When it fails, the error is shown, any partial zip it
 # left is removed (so a half report is never uploaded or counted as written by
 # the wrapper), and a "No report was written" line says where the files are.
+# A partial zip that could not be removed is named; callers decide from the
+# return value, not from whether the file is there.
 function Write-RdaReportZip
 {
     param([hashtable]$CompressionOutput)
@@ -448,6 +450,12 @@ function Write-RdaReportZip
     if (-not [string]::IsNullOrEmpty($ZipFile) -and (Test-Path -LiteralPath $ZipFile))
     {
         Remove-Item -LiteralPath $ZipFile -Force -ErrorAction SilentlyContinue
+        # The removal can fail too. The caller goes by the return value, never
+        # by the file, so the leftover is only named here.
+        if (Test-Path -LiteralPath $ZipFile)
+        {
+            Write-Log -Message ("The partial zip could not be removed: {0}. It is not a report: delete it, do not upload it." -f $ZipFile) -Severity 'Error'
+        }
     }
     $ReportFolder = if ([string]::IsNullOrEmpty($ZipFile)) { '' } else { Split-Path -Path $ZipFile -Parent }
     Write-Log -Message ("No report was written: the report zip could not be made. The report files are still in {0}; zip them by hand or run again." -f $ReportFolder) -Severity 'Error'

@@ -1846,9 +1846,17 @@ if ($ZipWritten)
 # the sign-in could not be refreshed print a short FAILED (auth) line and also
 # exit 3. A direct run whose zip
 # could not be written exits 2. Under -RunAllSubs the wrapper does this for the
-# whole run.
+# whole run; a run there whose zip could not be written exits 2, so the wrapper
+# counts its subscription as failed, and adds its zip path to
+# $Global:RdaUnwrittenReportZips, so a partial zip left there is never
+# counted or consolidated.
 if (-not $RunAllSubs.IsPresent)
 {
-    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipFile $Global:ZipOutputFile -DictionaryFile $Global:DictionaryFile
+    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipWritten $ZipWritten -DictionaryFile $Global:DictionaryFile
     if ($DirectRunExitCode -ne 0) { exit $DirectRunExitCode }
+}
+elseif (-not $ZipWritten)
+{
+    $Global:RdaUnwrittenReportZips = @(@($Global:RdaUnwrittenReportZips) | Where-Object { -not [string]::IsNullOrEmpty($_) }) + @([string]$Global:ZipOutputFile)
+    exit 2
 }
