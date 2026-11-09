@@ -246,6 +246,22 @@ Describe 'Test-MetricThrottled - the status code decides first' {
         Test-MetricThrottled -Exception ([System.Exception]::new("Operation returned an invalid status code 'InternalServerError'")) | Should -BeFalse
     }
 
+    It 'does not read 429 or throttle inside a name in a message with no status as throttled' {
+        Test-MetricThrottled -Exception ([System.Exception]::new("Resource '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-429/providers/Microsoft.Compute/virtualMachines/vm1' was not found.")) | Should -BeFalse
+        Test-MetricThrottled -Exception ([System.Exception]::new("Resource group 'rg-throttle-test' could not be found.")) | Should -BeFalse
+        Test-MetricThrottled -Exception ([System.Exception]::new("Resource group 'rg-throttled-test' could not be found.")) | Should -BeFalse
+        Test-MetricThrottled -Exception ([System.Exception]::new("Resource group 'rg-TooManyRequests' could not be found.")) | Should -BeFalse
+    }
+
+    It 'still reads the real throttling phrases in a message with no status' {
+        Test-MetricThrottled -Exception ([System.Exception]::new('Operation returned an invalid status code TooManyRequests')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('Service request failed. Status: 429 (Too Many Requests)')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('Response status code does not indicate success: 429.')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('HTTP 429 returned.')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('The request is being throttled.')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('Request was throttled, retry later.')) | Should -BeTrue
+    }
+
     It 'the retry loop asks it, not a message match, whether an answer was throttled' {
         $script:MetricsSrc | Should -Match 'if \(Test-MetricThrottled -Exception \$_\.Exception\)'
         $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'

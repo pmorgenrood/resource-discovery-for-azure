@@ -669,7 +669,15 @@ if ($Task -eq 'Processing')
                     }
 
                     if ($SawStatus) { return $false }
-                    return ([string]$Exception.Message -match '429|throttl|TooManyRequests|rate limit')
+                    # No status anywhere: read only clear throttling phrases, so a name
+                    # such as rg-429 or rg-throttle-test is not taken for one.
+                    $Phrases = @(
+                        '(?<![\w-])Too ?Many ?Requests(?![\w-])',
+                        '\b(?:status|code|HTTP|success)\b[\s:''"=(]*429(?![\w-])',
+                        '(?<![\w-])throttl(?:ed|ing)(?![\w-])',
+                        '(?<![\w-])rate limit'
+                    )
+                    return ([string]$Exception.Message -match ($Phrases -join '|'))
                 }
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
