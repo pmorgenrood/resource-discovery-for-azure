@@ -29,9 +29,11 @@ BeforeAll {
     # group and name segments are each a prod_/nonprod_ token; provider and
     # type segments stay as written.
     $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+    $script:MaskedIdPattern = @(
+        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
         '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+    ) -join ''
 
     # Detect whether this zip is from an obfuscated run (the first ID starts
     # with a masked subscription token, or is a flat prod_/nonprod_ token).

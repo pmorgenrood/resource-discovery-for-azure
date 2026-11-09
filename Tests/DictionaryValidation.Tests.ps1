@@ -48,9 +48,11 @@ BeforeAll {
     # token, so a real name left in any of them fails. Name tokens may carry
     # the databricks_/aks_/vmss_ type hint; provider and type segments stay as written.
     $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+    $script:MaskedIdPattern = @(
+        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
         '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+    ) -join ''
     # Any masked token anywhere in a value; a real Azure ID never holds one.
     $script:MaskedTokenPattern = '(^|/)(prod|nonprod)_[a-z_]*' + $MaskedGuid + '(/|$)'
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
