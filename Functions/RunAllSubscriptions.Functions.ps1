@@ -471,17 +471,17 @@ function Add-FailedAttempt
 # Such a subscription is one on the retry list for its consumption, or one this
 # run's consumption entries name ($ConsumptionIncomplete, the FAILED
 # (consumption) lines' entries), also when its run then failed for another cause.
-function Get-ConsumptionIncompleteRetryNames
+function Get-ConsumptionIncompleteRetryLabels
 {
     param([object]$FailedAttempts, [object[]]$ConsumptionIncomplete)
     $ThisRunIds = @(@($ConsumptionIncomplete) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
-    @(@($FailedAttempts) | Where-Object { $null -ne $_ -and ([string]$_.Reason -like 'consumption incomplete:*' -or $ThisRunIds -contains [string]$_.Id) } | ForEach-Object { [string]$_.Name } | Select-Object -Unique)
+    @(@($FailedAttempts) | Where-Object { $null -ne $_ -and ([string]$_.Reason -like 'consumption incomplete:*' -or $ThisRunIds -contains [string]$_.Id) } | Sort-Object -Property { [string]$_.Id } -Unique | ForEach-Object { '{0} ({1})' -f [string]$_.Name, [string]$_.Id })
 }
 
 function Get-RetryListAdvice
 {
     param([object]$FailedAttempts, [switch]$NewFailures, [object[]]$ConsumptionIncomplete)
-    $Incomplete = @(Get-ConsumptionIncompleteRetryNames -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ConsumptionIncomplete)
+    $Incomplete = @(Get-ConsumptionIncompleteRetryLabels -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ConsumptionIncomplete)
     if ($Incomplete.Count -gt 0)
     {
         return @(

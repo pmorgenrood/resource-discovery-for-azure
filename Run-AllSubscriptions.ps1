@@ -2124,7 +2124,7 @@ elseif ($FailedAttempts.Count -gt 0)
     # Any of them the role check skipped as not readable, with the fix.
     $ThisRunIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs)
     $RetryAdvice = @(Get-RetryListAdvice -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ThisRunIncomplete)
-    $SkippedReRun = if (@(Get-ConsumptionIncompleteRetryNames -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ThisRunIncomplete).Count -gt 0) { 'run the same command again without -Resume or -ResumeFailedOnly' } else { 'run -ResumeFailedOnly' }
+    $SkippedReRun = if (@(Get-ConsumptionIncompleteRetryLabels -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ThisRunIncomplete).Count -gt 0) { 'run the same command again without -Resume or -ResumeFailedOnly' } else { 'run -ResumeFailedOnly' }
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision -ReRun $SkippedReRun
     foreach ($Line in $RetryAdvice) { Write-Host $Line -ForegroundColor Yellow }
 }
