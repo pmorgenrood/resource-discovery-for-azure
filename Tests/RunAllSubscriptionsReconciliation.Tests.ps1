@@ -556,9 +556,14 @@ Describe 'Test-AzPsTokenSilent retries a failed token cache check' {
 
     It 'retries a first request that only warns and gives no token' {
         $script:TokenCalls = 0
-        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
+        # A stand-in, not a mock, so its warning reaches the caller's -WarningVariable
+        # as a real cmdlet's does.
+        function Get-AzAccessToken { [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString) $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
         Test-AzPsTokenSilent -Tenant 'tenant-1' | Should -BeTrue
         $script:TokenCalls | Should -Be 2
+        # The retry rule reads the warning's text, as with the real cmdlet.
+        $script:TokenCalls = 0
+        { Get-RdaAccessToken } | Should -Throw '*Persistence check failed*'
     }
 
     It 'does not retry a first request that only warns that the sign-in cannot be used' {
