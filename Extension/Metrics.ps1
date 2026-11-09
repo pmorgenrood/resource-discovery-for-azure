@@ -407,8 +407,20 @@ function Get-MetricExceptionStatus
         $StatusCode = $Ex.Status
     }
     if ($null -eq $StatusCode) { return $null }
-    # A number, a status name ('NotFound') or an HttpStatusCode value.
-    try { $Code = [int][System.Net.HttpStatusCode]$StatusCode } catch { return $null }
+    # An HttpStatusCode (or other enum) value, a number, a number as text, or a
+    # status name such as 'NotFound'. A number .NET has no name for (529) still counts.
+    if ($StatusCode -is [System.Enum] -or $StatusCode -is [int] -or $StatusCode -is [long])
+    {
+        try { $Code = [int]$StatusCode } catch { return $null }
+    }
+    elseif ([string]$StatusCode -match '^\s*\d{3}\s*$')
+    {
+        $Code = [int]([string]$StatusCode).Trim()
+    }
+    else
+    {
+        try { $Code = [int][System.Net.HttpStatusCode][string]$StatusCode } catch { return $null }
+    }
     if ($Code -lt 100 -or $Code -gt 599) { return $null }
     return $Code
 }
@@ -475,6 +487,26 @@ function Get-MetricFailure
     $First = if ($Statuses.Count -gt 0) { $Statuses[0] } else { $null }
     $Kind = if ($ThrottleText) { 'Throttled' } else { 'Other' }
     return [pscustomobject]@{ Kind = $Kind; Status = $First; Statuses = $Statuses }
+}
+
+# Why a getBatch request failed, read by Get-MetricFailure in the same walk and
+# order as one Get-AzMetric request. Kind is 'TokenRefused' (401: the token is
+# renewed once), 'Refused' (403: batch is off for the subscription), 'BadRequest'
+# (400, 404 or any other client status a retry cannot change: this request goes
+# to the per-resource path at once), 'Throttled' (429, or the data plane's 529)
+# or 'Error'. Status is the status that decided, else the outermost one, else $null.
+function Get-MetricBatchFailure
+{
+    param([System.Exception]$Exception)
+
+    $Failure = Get-MetricFailure -Exception $Exception
+    $Kind = if ($Failure.Kind -eq 'Throttled' -or ($Failure.Kind -eq 'Other' -and $Failure.Statuses.Contains(529))) { 'Throttled' }
+    elseif ($Failure.Kind -eq 'Other') { 'Error' }
+    elseif ($Failure.Status -eq 401) { 'TokenRefused' }
+    elseif ($Failure.Status -eq 403) { 'Refused' }
+    else { 'BadRequest' }
+    $Status = if ($Kind -eq 'Throttled' -and $Failure.Kind -eq 'Other') { 529 } else { $Failure.Status }
+    return [pscustomobject]@{ Kind = $Kind; Status = $Status }
 }
 
 if ($Task -eq 'Processing')
@@ -926,7 +958,7 @@ if ($Task -eq 'Processing')
 
     # The text of Get-MetricFailure and its helpers, for the parallel runspaces (a
     # script block cannot be handed over), so every request path reads an error the same way.
-    $MetricFailureSource = (@('Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure') | ForEach-Object {
+    $MetricFailureSource = (@('Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure', 'Get-MetricBatchFailure') | ForEach-Object {
             "function $_`n{`n" + (Get-Item -LiteralPath ('function:' + $_)).ScriptBlock.ToString() + "`n}`n"
         }) -join "`n"
 
@@ -1178,6 +1210,8 @@ function Add-MetricRecord
                         $null = $DiagBag, $MetricBag
                         . ([scriptblock]::Create($using:AddMetricRecordSource))
                         ${function:Get-MetricBatchBackoff} = [scriptblock]::Create($using:BatchBackoffSource)
+                        # Get-MetricBatchFailure and the helpers it reads, from their one copy at the top of this file.
+                        . ([scriptblock]::Create($using:MetricFailureSource))
 
                         function Add-BatchCount([int]$Index, [long]$By)
                         {
@@ -1216,27 +1250,6 @@ function Add-MetricRecord
                             }
                             catch { }
                             return 0
-                        }
-
-                        # The HTTP status of a failed request, or $null.
-                        function Get-BatchStatusCode([System.Exception]$Exception)
-                        {
-                            $Ex = $Exception
-                            $Depth = 0
-                            while ($null -ne $Ex -and $Depth -lt 10)
-                            {
-                                $Depth++
-                                if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                                {
-                                    try { return [int]$Ex.Response.StatusCode } catch { }
-                                }
-                                if ($null -ne $Ex.PSObject.Properties['StatusCode'] -and $null -ne $Ex.StatusCode)
-                                {
-                                    try { return [int]$Ex.StatusCode } catch { }
-                                }
-                                $Ex = $Ex.InnerException
-                            }
-                            return $null
                         }
 
                         # Reads one batch answer with System.Text.Json into small objects: per resource
@@ -1370,8 +1383,9 @@ function Add-MetricRecord
                             # Seconds of waiting between attempts, for the diagnostics record.
                             $WaitedSeconds = 0
                             # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
-                            # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
-                            # at once (the same request is refused the same way again).
+                            # attempts, each bounded by $CallTimeoutSeconds; a 401, 403, 400, 404 or
+                            # other client status a retry cannot change ends at once (the same
+                            # request is refused the same way again).
                             while ($Attempt -le $CallMaxRetries)
                             {
                                 Add-BatchCount 1 1
@@ -1390,13 +1404,11 @@ function Add-MetricRecord
                                         break
                                     }
                                     $LastError = [string]$Failure.Exception.Message
-                                    $Status = Get-BatchStatusCode -Exception $Failure.Exception
+                                    # One reading of the error, in the order one Get-AzMetric request uses.
+                                    $Read = Get-MetricBatchFailure -Exception $Failure.Exception
+                                    $Status = $Read.Status
+                                    $Kind = $Read.Kind
                                     $RetryAfter = Get-BatchRetryAfter -Exception $Failure.Exception
-                                    $Kind = if ($Status -eq 401) { 'TokenRefused' }
-                                    elseif ($Status -eq 403) { 'Refused' }
-                                    elseif ($Status -in 400, 404) { 'BadRequest' }
-                                    elseif ($Status -in 429, 529 -or $LastError -match '(?i)throttl|TooManyRequests|rate limit') { 'Throttled' }
-                                    else { 'Error' }
                                     if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
                                 }
                                 else
@@ -1627,7 +1639,8 @@ function Add-MetricRecord
                     return @{ Retry = $true; SleepSeconds = $SleepSeconds }
                 }
 
-                # Get-MetricFailure and its helpers, from their one copy at the top of this file.
+                # Get-MetricFailure and its helpers, from their one copy at the top of this file
+                # (the batch requests read the same copy).
                 . ([scriptblock]::Create($using:MetricFailureSource))
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
