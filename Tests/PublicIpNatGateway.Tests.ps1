@@ -87,6 +87,14 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResource | Should -BeExactly 'prod_nat-token'
     }
 
+    It 'writes the NIC token for an ipConfiguration id whose NIC is in the dictionary' {
+        $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
+        $Dict = New-Dictionary -Map @{ $NicId = 'prod_nic-token' }
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId }) -NoNatGateway) -Dictionary $Dict)[0]
+        $Row.AssociatedResource | Should -BeExactly 'prod_nic-token'
+        $Row.AssociatedResourceType | Should -BeExactly 'networkInterfaces'
+    }
+
     It 'finds the ipConfiguration token when the id differs only in letter case' {
         $Dict = New-Dictionary -Map @{ $script:NicCfgId = 'prod_cfg-token' }
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId.ToUpperInvariant() }) -NoNatGateway) -Dictionary $Dict)[0]
