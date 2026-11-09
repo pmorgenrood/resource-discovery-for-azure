@@ -470,7 +470,7 @@ What it needs:
   - Nothing is registered without `-UseMetricsBatch` and a `Y`.
 - Azure public cloud (`AzureCloud`). In other clouds the switch has no effect: `Microsoft.Insights` is not checked, nothing is asked or registered, and every metric is collected one resource at a time.
 
-The debug log (`-Debug`) has a `Metrics batch` line in the metrics summary: requests sent, resources answered, and how many metrics went one resource at a time, with the reason for each fallback.
+The local debug log (`DebugLog_<ReportName>_<timestamp>.log`, written on every run) has a `Metrics batch` line in the metrics summary: requests sent, resources answered, and how many metrics went one resource at a time, with the reason for each fallback.
 
 ### Metrics Lookback Window
 

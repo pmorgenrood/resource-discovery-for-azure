@@ -709,8 +709,7 @@ if ($Task -eq 'Processing')
                 # The provider must be registered: the batch API answers 403 otherwise.
                 # The preflight offered to register it; this only reads the state. A read
                 # that stalls is given up and reads as Unknown, so the batch call decides.
-                $ProviderReadSeconds = Get-RdaInsightsCallTimeoutSeconds
-                if ($MetricTimeoutSeconds -gt 0) { $ProviderReadSeconds = [math]::Min($ProviderReadSeconds, $MetricTimeoutSeconds) }
+                $ProviderReadSeconds = [math]::Min((Get-RdaInsightsCallTimeoutSeconds), $MetricTimeoutSeconds)
                 $ProviderRead = Get-RdaInsightsProviderState -SubscriptionId $BatchSub -TimeoutSeconds $ProviderReadSeconds
                 if ($ProviderRead.State -ne 'Registered' -and $ProviderRead.State -ne 'Unknown')
                 {
