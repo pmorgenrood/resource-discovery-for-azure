@@ -34,8 +34,8 @@
     is right (a newer recovery run of one service is not the fuller report).
     When a subscription id named in one report's dictionary is also named in
     another report under the root (for example Run-AllSubscriptions.ps1 run
-    twice into it, or a recovery run of one subscription), or two reports have
-    the same stamp, none of those reports is revealed, whichever other
+    twice into it, or a recovery run of one subscription), none of those
+    reports is revealed, whichever other
     subscriptions they hold: each such subscription is named by its masked
     token with the report folders that hold it, counted as failed, and the run
     exits non-zero. Pass -InventoryRoot pointing at one run's folders, or move
@@ -493,8 +493,8 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 #    repairs. So each report's subscriptions are read from the real ids in its
 #    dictionary's four id maps (the inventory's subscription values are tokens
 #    that resolve through these same maps), and any report that shares a
-#    subscription id with another report, or has the same stamp as another
-#    report, is left out together with that other report, whichever
+#    subscription id with another report is left out together with that
+#    other report, whichever
 #    subscriptions it also holds. Each such subscription is named by its masked
 #    token, with the report folders that hold it, and counted as failed, so
 #    the run exits non-zero. The user passes -InventoryRoot pointing at one
@@ -605,7 +605,7 @@ foreach ($Folder in $Folders)
     }
 }
 
-# Which reports hold each subscription id, and which share a stamp.
+# Which reports hold each subscription id.
 $ReportsBySub = @{}
 foreach ($Candidate in $Candidates)
 {
@@ -629,12 +629,6 @@ foreach ($SubId in @($ReportsBySub.Keys | Sort-Object))
             '{0} in {1}' -f $Tokens, $_.Report
         })
     $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText) }
-}
-foreach ($Group in @($Candidates | Group-Object -Property Stamp | Where-Object { $_.Count -gt 1 } | Sort-Object Name))
-{
-    $Holders = @($Group.Group | Sort-Object -Property Report)
-    foreach ($Holder in $Holders) { $null = $Ambiguous.Add($Holder.Index) }
-    $FailedItems += [pscustomobject]@{ Folder = ('reports with the same stamp ' + $Group.Name + ': ' + (@($Holders.Report) -join ', ')); Reason = ('{0} reports have this stamp. {1}' -f $Holders.Count, $AdviceText) }
 }
 
 $LeftOutItems = @()
@@ -663,9 +657,12 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
     $OutName = $Zip.Name
     if (-not $UsedOutNames.Add($OutName))
     {
-        # Two selected reports with the same file name. Reports that share a
-        # stamp are left out above, so this is only a guard: never let one
-        # overwrite the other.
+        # Two selected reports with the same file name (the same stamp in two
+        # folders, for example a copied folder, with different
+        # subscriptions). Both ship: the later one, by folder name, goes in
+        # under its folder name and its own name, so neither overwrites the
+        # other. Such a name never starts with 'ResourcesReport_', so it
+        # cannot be another report's own name.
         $OutName = $Folder + '_' + $Zip.Name
         $null = $UsedOutNames.Add($OutName)
     }
@@ -866,7 +863,7 @@ foreach ($s in $SkippedItems)
 }
 foreach ($o in $LeftOutItems)
 {
-    Write-Host ("  LEFT OUT: {0} - not revealed with {1}: it shares a subscription or its stamp with another report (see FAIL)" -f $o.Report, $o.Holds) -ForegroundColor Yellow
+    Write-Host ("  LEFT OUT: {0} - not revealed with {1}: it shares a subscription with another report (see FAIL)" -f $o.Report, $o.Holds) -ForegroundColor Yellow
 }
 foreach ($f in $FailedItems)
 {
