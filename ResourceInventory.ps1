@@ -867,8 +867,9 @@ Function RunInventorySetup()
         # dictionary entry stays as before the skip. One id-only query reads
         # them (Get-RdaNetworkTokenQuery): the same scope, where clause, paging
         # and lower-case text as the pull, through Invoke-AzGraphQuerySafe with
-        # its retries. A failed or empty answer stops this run (exit 1, or a
-        # failed subscription under -RunAllSubs); it is never read as 0 rows.
+        # its retries. A failed query or no answer ($null, or no data) stops
+        # this run (exit 1, or a failed subscription under -RunAllSubs); it is
+        # never read as 0 rows. An answer with no rows is a real 0.
         # The rows feed only the token loop, never a collector or the inventory.
         # Not run without -Obfuscate, nor with -IncludeNetworkResources (the
         # pull then holds the rows itself).
