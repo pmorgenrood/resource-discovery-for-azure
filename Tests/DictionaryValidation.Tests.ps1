@@ -74,6 +74,22 @@ Describe "Dictionary Structure" {
         }
     }
 
+    It "No masked id keeps a real subscription, group or name, even one shaped like a token" {
+        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
+        $Checked = 0
+        foreach ($P in @($script:Dictionary.ResourceIdMap.PSObject.Properties))
+        {
+            $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
+            if ($M.Count -ne $R.Count) { continue }
+            for ($i = 1; $i -lt $M.Count; $i++)
+            {
+                # A token slot of the masked id never holds its real segment.
+                if ($M[$i] -match '^(prod|nonprod)_' -and $R[$i] -ne '') { $M[$i] | Should -Not -BeExactly $R[$i] -Because "masked id '$($P.Name)' keeps a real part"; $Checked++ }
+            }
+        }
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no masked path with the same parts as its real id' }
+    }
+
     It "ResourceIdMap values should be real Azure resource IDs" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
