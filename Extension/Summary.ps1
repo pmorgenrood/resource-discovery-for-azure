@@ -124,7 +124,7 @@ foreach ($prop in $Inventory.PSObject.Properties)
         Count   = $Count
     }
 }
-$ServiceSummary = $ServiceSummary | Sort-Object -Property Count -Descending
+$ServiceSummary = @($ServiceSummary | Sort-Object -Property Count -Descending)
 $TotalResources = ($ServiceSummary | Measure-Object -Property Count -Sum).Sum
 
 # Detect obfuscation so the header can carry a privacy-posture banner. Sample

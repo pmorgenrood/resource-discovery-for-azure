@@ -132,6 +132,12 @@ Describe 'VM billing-coverage banner' {
         $Html | Should -Match 'only 4 VMs'
     }
 
+    It 'counts one service type for a report whose inventory holds one service' {
+        $Inv = New-TestInventory -RunningVms 3 -DeallocatedVms 0
+        $Html = Invoke-Summary -Inventory $Inv
+        $Html | Should -Match '<b>Service Types:</b> 1</div>'
+    }
+
     It 'reports the gap percentage' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_pct.csv'
