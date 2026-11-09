@@ -495,6 +495,25 @@ Describe 'Reveal.ps1 -RemoveStaging with two half pairs in one folder' {
     }
 }
 
+# On a case-sensitive file system 'bad' and 'BAD' are two folders, and the
+# count of failed folders must say 2, as the folder compares elsewhere do.
+Describe 'Reveal.ps1 -RemoveStaging with failed folders whose names differ only by case' -Skip:($IsWindows -or $IsMacOS) {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'casefolders'
+        Add-Report -Folder (Join-Path $script:Root 'good') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a')
+        Add-Report -Folder (Join-Path $script:Root 'bad') -Stamp '20260101000000001bbbb' -Subs @(New-Sub -Id $script:SubB -RgName 'rg-b') -NoDictionary
+        Add-Report -Folder (Join-Path $script:Root 'BAD') -Stamp '20260101000000002cccc' -Subs @(New-Sub -Id $script:SubC -RgName 'rg-c') -NoDictionary
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'casefolders' -Extra @('-RemoveStaging')
+    }
+
+    It 'counts the two folders as two' {
+        @($script:Run.Lines | Where-Object { $_ -like '  FAIL: *' }).Count | Should -Be 2 -Because $script:Run.Text
+        $Lines = @($script:Run.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
+        $Lines.Count | Should -Be 1 -Because $script:Run.Text
+        $Lines[0] | Should -BeLike '-RemoveStaging skipped: 2 folder(s) *'
+    }
+}
+
 Describe 'Reveal.ps1 -RemoveStaging with a subscription in two reports' {
     BeforeAll {
         $script:Root = Join-Path $script:WorkDir 'sharedremove'

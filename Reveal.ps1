@@ -1054,7 +1054,11 @@ elseif ($RemoveStaging -and -not $CleanRun)
     # FAIL lines: one folder can have more than one.
     $FolderCount = {
         param([string]$Kind)
-        @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders } | Sort-Object -Unique).Count
+        # Folder names compared as the file system does, as $PathComparison
+        # does: on Linux 'bad' and 'BAD' are two folders.
+        $Distinct = [System.Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
+        foreach ($Name in @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders })) { $null = $Distinct.Add([string]$Name) }
+        $Distinct.Count
     }
     $RevealFailedFolders = & $FolderCount 'reveal'
     $HalfPairFolders = & $FolderCount 'pair'
