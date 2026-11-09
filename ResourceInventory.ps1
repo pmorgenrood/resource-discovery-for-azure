@@ -36,6 +36,14 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
 }
 . $CommonFunctionsFile
 
+# A direct run starts with no metrics entries, so an earlier run in the same
+# PowerShell session cannot leave its own behind for this run's end. Under
+# -RunAllSubs the wrapper owns them for the whole run.
+if (-not $RunAllSubs.IsPresent)
+{
+    $Global:MetricsFailedSubs = @()
+}
+
 if ($Debug.IsPresent) { $DebugPreference = 'Continue' }
 
 if ($Debug.IsPresent) { $ErrorActionPreference = "Continue" }Else { $ErrorActionPreference = "silentlycontinue" }

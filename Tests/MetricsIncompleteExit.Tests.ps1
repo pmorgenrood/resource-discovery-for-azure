@@ -142,6 +142,69 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
     }
 }
 
+Describe 'Two direct ResourceInventory.ps1 runs in one PowerShell session' {
+    BeforeAll {
+        # The run's param block, the top-level statement that clears the metrics
+        # entries at its start, and its last statement, as written. In between, a
+        # stand-in for the collection adds an incomplete entry when asked.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $Start = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match '^if \(-not \$RunAllSubs\.IsPresent\)' -and $_.Extent.Text -match '\$Global:MetricsFailedSubs = @\(\)' })
+        $script:StartCount = $Start.Count
+        $script:TwoRuns = Join-Path $TestDrive 'two-direct-runs.ps1'
+        Set-Content -LiteralPath $script:TwoRuns -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                @($Start | ForEach-Object { $_.Extent.Text })
+                'if ($env:RDA_TEST_METRICS_GAP) { if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }; $Global:MetricsFailedSubs += [pscustomobject]@{ Name = ''sub-two''; Id = ''id-2''; Message = ''still failed''; ReportFolder = ''ResourcesReport_x''; Complete = $false } }'
+                $Top[-1].Extent.Text
+            ) -join "`n")
+
+        function script:Invoke-TwoRunsScript
+        {
+            param([hashtable]$Arguments, [switch]$Gap)
+            $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
+            Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip'
+            $env:RDA_TEST_METRICS_GAP = $(if ($Gap) { '1' } else { '' })
+            try
+            {
+                $global:LASTEXITCODE = 0
+                $null = & $script:TwoRuns @Arguments 6>&1
+                return $global:LASTEXITCODE
+            }
+            finally
+            {
+                Remove-Item -Path 'Env:RDA_TEST_METRICS_GAP' -ErrorAction SilentlyContinue
+            }
+        }
+
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
+        else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionZip) { $Global:ZipOutputFile = $script:SessionZip.Value }
+        else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'clears the metrics entries once at the start of the run' {
+        $script:StartCount | Should -Be 1
+    }
+
+    It 'exits 0 from a clean run after a run with incomplete metrics' {
+        $Global:MetricsFailedSubs = @()
+        Invoke-TwoRunsScript -Arguments @{ TenantID = 'tenant-1' } -Gap | Should -Be 3
+        Invoke-TwoRunsScript -Arguments @{ TenantID = 'tenant-1' } | Should -Be 0
+    }
+
+    It 'keeps the entries of the earlier subscriptions under -RunAllSubs, where the wrapper owns them' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        Invoke-TwoRunsScript -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } | Should -Be 0
+        @($Global:MetricsFailedSubs).Count | Should -Be 1
+    }
+}
+
 Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
     BeforeAll {
         # The wrapper's last statements, from its FAILED (auth) lines to its exit
