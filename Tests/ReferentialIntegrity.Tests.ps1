@@ -130,15 +130,33 @@ Describe "Obfuscated ID Uniqueness" {
 Describe "Consumption to Inventory Cross-Reference" {
     It "Consumption ResourceIds that exist in inventory should use the same obfuscated value" {
         if ($script:ConsumptionCsv.Count -eq 0) { Set-ItResult -Skipped -Because "empty consumption csv"; return }
-        $InventoryIds = $script:AllIds
+        # Which real resource a masked id stands for comes from the run's
+        # dictionary (ResourceIdMap: masked id -> real id). A consumption row
+        # whose real resource is in the inventory must carry the inventory's
+        # masked id for it, string for string.
+        # Found as DictionaryValidation.Tests.ps1 finds it: TEST_DICT_PATH, else the
+        # newest ObfuscationDictionary_*.json in Tests/, else next to the zip.
+        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
+        {
+            $DictDirs = @($PSScriptRoot; if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent })
+            $DictDirs | ForEach-Object { Get-ChildItem -Path $_ -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName } | Select-Object -First 1
+        }
+        if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because "no obfuscation dictionary for this zip, so real resources cannot be matched"; return }
+        $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
+        $RealOf = @{}
+        foreach ($P in @($Map.PSObject.Properties)) { $RealOf[$P.Name] = [string]$P.Value }
+        $InventoryByReal = @{}
+        foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id)) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
+        $Checked = 0
         foreach ($row in $script:ConsumptionCsv)
         {
-            if (![string]::IsNullOrEmpty($row.ResourceId) -and $row.ResourceId -in $InventoryIds)
-            {
-                # If it's in both, the ID should be identical (same dictionary mapping)
-                $row.ResourceId | Should -BeIn $InventoryIds -Because "Consumption ResourceId should match inventory ID"
-            }
+            if ([string]::IsNullOrEmpty($row.ResourceId) -or -not $RealOf.ContainsKey($row.ResourceId)) { continue }
+            $Real = $RealOf[$row.ResourceId].ToLowerInvariant()
+            if (-not $InventoryByReal.ContainsKey($Real)) { continue }
+            $row.ResourceId | Should -BeExactly $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
+            $Checked++
         }
+        $Checked | Should -BeGreaterThan 0 -Because 'the fixture bills at least one inventoried resource, so the check must look at a row'
     }
 }
 
