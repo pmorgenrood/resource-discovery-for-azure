@@ -104,6 +104,8 @@ function Get-AzMetric
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
         'Forbidden' { throw "Operation returned an invalid status code 'Forbidden'" }
+        # A server error whose text holds "BadRequest" in a resource name.
+        'Status503NamedBadRequest' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable for disk-BadRequest-01.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -123,6 +125,8 @@ function Get-AzMetric
         'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The resource is gone.', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
         # A client error whose text holds "429" and "throttl" in a resource name.
         'ForbiddenNamed429' { throw "Operation returned an invalid status code 'Forbidden' for vm-429-throttled" }
+        # A server error whose text holds "BadRequest" in a resource name.
+        'Status503NamedBadRequest' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable for vm-BadRequest-01.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -674,6 +678,19 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 1 subscription(s): Azure Monitor requests for 1 resource(s) still failed after their retries*' }).Count | Should -Be 1
     }
 
+    It 'records it when the grouped request fails on every attempt with a server error whose message holds BadRequest' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-503-named-badrequest' -MultiError 'Status503NamedBadRequest'
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeFalse
+        # Not a BadRequest: the grouped request keeps its retries and no request for one metric is made.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+    }
+
     It 'does not record it when Azure rejects the grouped request with BadRequest and each metric succeeds on its own' {
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'incomplete-badrequest' -MultiError 'BadRequest'
 
@@ -771,7 +788,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
-    It 'records it when a single-metric request fails on every attempt with an error a re-run can fix (<SingleError>)' -ForEach @(@{ SingleError = 'Status503' }, @{ SingleError = 'NoStatus' }) {
+    It 'records it when a single-metric request fails on every attempt with an error a re-run can fix (<SingleError>)' -ForEach @(@{ SingleError = 'Status503' }, @{ SingleError = 'NoStatus' }, @{ SingleError = 'Status503NamedBadRequest' }) {
         # A server error, or an error whose HTTP status cannot be read.
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-fixable-' + $SingleError) -SingleError $SingleError
 
@@ -879,6 +896,18 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status TooManyRequests) | Should -BeTrue
         Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception ([System.Exception]::new('Rate limit reached.')) | Should -BeTrue
         Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status ServiceUnavailable) | Should -BeTrue
+    }
+
+    It 'reads BadRequest from the status, not from a resource name in the message' {
+        $Named = [System.Net.Http.HttpRequestException]::new('The service is unavailable for vm-BadRequest-01.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
+        Test-MetricBadRequest -Exception $Named | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Named | Should -BeTrue
+        # With no status anywhere, only the Az text of a 400 is a BadRequest.
+        Test-MetricBadRequest -Exception ([System.Exception]::new('The connection to vm-BadRequest-01 was closed.')) | Should -BeFalse
+        Test-MetricBadRequest -Exception ([System.Exception]::new("Operation returned an invalid status code 'BadRequest'")) | Should -BeTrue
+        Test-MetricBadRequest -Exception (New-StatusError -Status BadRequest) | Should -BeTrue
+        $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status BadRequest), [System.Net.HttpStatusCode]::InternalServerError)
+        Test-MetricBadRequest -Exception $Wrapped | Should -BeTrue
     }
 
     It 'still counts a server error that wraps another server error, a timeout or throttling' {

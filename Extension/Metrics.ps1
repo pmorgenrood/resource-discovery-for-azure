@@ -585,12 +585,17 @@ if ($Task -eq 'Processing')
                 $ThreadJobLimit = $using:ConcurrencyLimit
 
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
-                # metric name is not valid for the resource. The status code and the message
-                # of the exception and of every exception it wraps are checked, because an
-                # outer exception can report a different status than the 400 it wraps.
+                # metric name is not valid for the resource. The status read from the whole
+                # chain (Get-MetricErrorStatus) decides, because an outer exception can report
+                # a different status than the 400 it wraps. Only when no status can be read
+                # anywhere is the Az text "invalid status code 'BadRequest'" looked for, so a
+                # resource name that holds "BadRequest" never makes a server error a 400.
                 function Test-MetricBadRequest
                 {
                     param([System.Exception]$Exception)
+
+                    $Status = Get-MetricErrorStatus -Exception $Exception
+                    if ($null -ne $Status) { return ($Status -eq 400) }
 
                     $Pending = [System.Collections.Generic.Queue[object]]::new()
                     $Pending.Enqueue($Exception)
@@ -601,20 +606,7 @@ if ($Task -eq 'Processing')
                         if ($null -eq $Ex) { continue }
                         $Checked++
 
-                        $StatusCode = $null
-                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.Response.StatusCode
-                        }
-                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.StatusCode
-                        }
-                        if ($null -ne $StatusCode -and "$StatusCode" -in @('400', 'BadRequest'))
-                        {
-                            return $true
-                        }
-                        if ([string]$Ex.Message -match 'BadRequest')
+                        if ([string]$Ex.Message -match "(?i)invalid status code\s*'?BadRequest'?")
                         {
                             return $true
                         }
