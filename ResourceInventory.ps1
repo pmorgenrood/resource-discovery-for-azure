@@ -311,7 +311,7 @@ Function RunInventorySetup()
                 {
                     Write-Log -Message ("You must use Powershell 7 to run the inventory script.") -Severity 'Error'
                     Write-Log -Message ("https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows?view=powershell-7.3") -Severity 'Error'
-                    # A setup failure: exit 1, as the other setup stops do.
+                    # A setup failure: exit 1, so a caller sees the run did not succeed.
                     exit 1
                 }
             }
