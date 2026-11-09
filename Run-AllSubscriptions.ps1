@@ -1150,6 +1150,28 @@ else
     if ($StreamCount -ge 2)
     {
 
+        # A stream's summary file has a fixed path, so one left by an earlier
+        # run (interrupted, or its stream died before writing) would be read
+        # as this run's when this run's stream writes none. Each is removed
+        # before any stream starts; one that cannot be removed stops the run
+        # here, before anything is collected or any state changes.
+        for ($S = 0; $S -lt $StreamCount; $S++)
+        {
+            $OldSummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-summary.json" -f $S)
+            try
+            {
+                if (Test-Path -LiteralPath $OldSummaryPath -PathType Leaf) { Remove-Item -LiteralPath $OldSummaryPath -Force -ErrorAction Stop }
+                if (Test-Path -LiteralPath $OldSummaryPath) { throw 'it is not a file' }
+            }
+            catch
+            {
+                Write-Host ("ERROR: could not remove the old stream summary {0}: {1}" -f $OldSummaryPath, $_.Exception.Message) -ForegroundColor Red
+                Write-Host "This run could read it as its own stream's summary. Remove it by hand, then run again." -ForegroundColor Yellow
+                Write-Host "Exit code 2: an old stream summary could not be removed; no subscription was collected and no consolidated zip was made." -ForegroundColor Yellow
+                Exit-Wrapper -Code 2
+            }
+        }
+
         # Snapshot the parent's Az context to a shared file so each stream can
         # Import-AzContext without prompting. Save-AzContext writes a JSON file
         # containing a token cache, so it MUST NOT be left on disk after the
@@ -1234,11 +1256,15 @@ else
                     catch { Write-Verbose ("Could not read stream resume file {0}: {1}" -f $StreamStatePath, $_.Exception.Message) }
                 }
 
+                # Its summary must hold a row (ResourceCounts or Failed) for
+                # each of them to be taken as this run's.
+                $ExpectedIds = @($SliceIds | Where-Object { $PriorDone -notcontains $_ })
                 $StreamSummaries += [pscustomobject]@{
                     StreamId     = $S
                     SummaryPath  = $SummaryPath
                     FailuresPath = $FailuresPath
-                    SubCount     = @($SliceIds | Where-Object { $PriorDone -notcontains $_ }).Count
+                    SubCount     = $ExpectedIds.Count
+                    ExpectedIds  = $ExpectedIds
                 }
 
                 Write-Host ("[stream-{0}] queued: {1} subscription(s)" -f $S, $SliceList.Count) -ForegroundColor DarkCyan
@@ -1336,6 +1362,32 @@ else
                 catch
                 {
                     Write-Host ("[stream-{0}] ERROR: could not parse summary file {1}: {2}" -f $S.StreamId, $S.SummaryPath, $_.Exception.Message) -ForegroundColor Red
+                    $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
+                    continue
+                }
+                # Read, but taken as this run's summary of the stream only when
+                # it is a JSON object that names this stream and has a row for
+                # every subscription the stream ran this time. Anything else
+                # ('{}', 'null', a list, another stream's, too few rows) is
+                # treated as a summary that cannot be read: not confirmed.
+                $NotThisRun = $null
+                if ($StreamSummary -isnot [System.Management.Automation.PSCustomObject])
+                {
+                    $NotThisRun = 'it is not a JSON object'
+                }
+                elseif ([string]$StreamSummary.StreamId -ne [string]$S.StreamId)
+                {
+                    $NotThisRun = ("it names stream '{0}'" -f $StreamSummary.StreamId)
+                }
+                else
+                {
+                    $RowIds = @(@($StreamSummary.ResourceCounts) + @($StreamSummary.Failed) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+                    $NoRow = @($S.ExpectedIds | Where-Object { $RowIds -notcontains $_ })
+                    if ($NoRow.Count -gt 0) { $NotThisRun = ('it has no row for {0} of the {1} subscription(s) the stream ran' -f $NoRow.Count, $S.SubCount) }
+                }
+                if ($null -ne $NotThisRun)
+                {
+                    Write-Host ("[stream-{0}] ERROR: summary file {1} is not this run's summary of stream {0}: {2}" -f $S.StreamId, $S.SummaryPath, $NotThisRun) -ForegroundColor Red
                     $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
                     continue
                 }
@@ -1583,9 +1635,13 @@ $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
 # missing one. Failed subs (in $FailedSubscriptions) are intentionally NOT
 # checked - their zip-or-no-zip state is unreliable and the wrapper already
 # surfaces them via the failure summary.
+#
+# An inventory root that is gone (evicted, or a mount that dropped) holds no
+# zip, so it is checked too: every expected zip is then missing.
 $ExpectedZipCount = @($SubResourceCounts).Count
-if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
+if ($ExpectedZipCount -gt 0)
 {
+    $InventoryRootGone = -not (Test-Path -Path $InventoryRoot -PathType Container)
     $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
     $ActualZipCount = $ActualSubZips.Count
     $PathComparer = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
@@ -1600,6 +1656,10 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host ("  Expected zips: {0} (one per subscription that ran to completion this run)" -f $ExpectedZipCount) -ForegroundColor Red
         Write-Host ("  Found zips:    {0} (filter: under {1}, LastWriteTime >= {2:o})" -f $ActualZipCount, $InventoryRoot, $RunStartTime) -ForegroundColor Red
         Write-Host ("  Gap:           {0} missing per-subscription zip(s)." -f $MissingCount) -ForegroundColor Red
+        if ($InventoryRootGone)
+        {
+            Write-Host ("  The inventory folder {0} is gone, so every report under it is lost, with its resume state: the next run collects every subscription again." -f $InventoryRoot) -ForegroundColor Red
+        }
         Write-Host ""
         Write-Host "Subscriptions whose inner script reported success this run but whose zip was not found:" -ForegroundColor Yellow
         foreach ($S in $MissingZipSubs)
@@ -2011,11 +2071,13 @@ elseif ($FailedAttempts.Count -gt 0)
 if ($UnreadableStreamSummaries.Count -gt 0)
 {
     # Not failed subscriptions: the stream's reports may well be in the
-    # consolidated zip, but the run cannot confirm them.
+    # consolidated zip, but the run cannot confirm them. With no zip made,
+    # it says so, as the Exit code lines do.
+    $UnreadableZipText = if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile)) { 'check the consolidated zip' } else { 'no consolidated zip was made' }
     foreach ($U in $UnreadableStreamSummaries)
     {
         $Heading = if ($U.Reason -eq 'Missing') { 'Stream Summary Missing:   ' } else { 'Stream Summary Unreadable:' }
-        Write-Host ("{0} stream-{1} ({2} subscription(s) not confirmed; check the consolidated zip)" -f $Heading, $U.StreamId, $U.SubCount) -ForegroundColor Red
+        Write-Host ("{0} stream-{1} ({2} subscription(s) not confirmed; {3})" -f $Heading, $U.StreamId, $U.SubCount, $UnreadableZipText) -ForegroundColor Red
     }
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     Write-Host "Re-run with -Resume to collect any subscription of that stream that did not complete." -ForegroundColor Yellow
