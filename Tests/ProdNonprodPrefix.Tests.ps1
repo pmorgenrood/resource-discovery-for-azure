@@ -76,7 +76,6 @@ Describe "Name Matches The Id's Name Token" {
         {
             foreach ($r in @($script:Inventory.$Section | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) }))
             {
-                if ($r.ID -like '/providers/rda.noid/ids/*') { continue }
                 $Checked++
                 $r.Name | Should -BeExactly (($r.ID.TrimEnd('/') -split '/')[-1]) -Because "$Section row '$($r.ID)' should carry its ID's name token as Name"
             }

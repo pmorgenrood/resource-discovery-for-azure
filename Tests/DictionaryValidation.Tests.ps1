@@ -87,13 +87,11 @@ Describe "Dictionary Structure" {
         # Rows are found by their path words (/microsoft.compute/disks/, a
         # scale set's /virtualmachines/, an elastic pool), so every segment
         # that is not a token, extension blocks included, is the real id's own
-        # segment, letter case aside. An id the tool cannot mask part by part
-        # has its own stand-in path and is not compared.
+        # segment, letter case aside.
         $Token = '^(?-i:(prod|nonprod)_(sub_|rg_|rg_mc_|mc_|databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
         $Checked = 0
         foreach ($P in @($script:Dictionary.ResourceIdMap.PSObject.Properties))
         {
-            if ([string]$P.Name -like '/providers/rda.noid/ids/*') { continue }
             $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
             $M.Count | Should -Be $R.Count -Because "masked id '$($P.Name)' should keep every segment of its real id"
             for ($i = 1; $i -lt $M.Count; $i++)
