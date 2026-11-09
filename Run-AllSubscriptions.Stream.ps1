@@ -264,8 +264,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # to @() at the start of every invocation.
         $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
         # Network rows the inner script left out of the pull (reset by it on
-        # every run; $null when its count query failed).
-        $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
+        # every run; $null when its count query failed, kept as $null so the
+        # wrapper's run summary does not read it as 0 skipped).
+        $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { $null }
         $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount }
 
         $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent

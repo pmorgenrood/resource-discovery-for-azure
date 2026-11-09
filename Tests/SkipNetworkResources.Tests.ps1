@@ -516,6 +516,23 @@ Describe 'Callers use the message and the switch' {
         }
         if ($To -lt 0) { throw 'The run-summary totals were not found in Run-AllSubscriptions.ps1.' }
         $script:RunSummary = [scriptblock]::Create((@($Statements[$From..$To] | ForEach-Object { $_.Extent.Text }) -join "`n"))
+        # The if after it that probes and labels the 0-resource subscriptions.
+        $Probe = @($Statements[($To + 1)..($Statements.Count - 1)] | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$EmptySubs.Count -gt 0' } | Select-Object -First 1)
+        if ($Probe.Count -eq 0) { throw 'The 0-resource probe was not found in Run-AllSubscriptions.ps1.' }
+        $script:EmptyProbe = [scriptblock]::Create($Probe[0].Extent.Text)
+
+        # Every '$SkipCount = ...' statement (2 in the wrapper, 1 in the
+        # stream worker) and the loop that reads a stream summary's rows.
+        $script:SkipCountBlocks = @(@($script:WrapperAst, $script:StreamAst) | ForEach-Object {
+                $_.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq '$SkipCount' }, $true)
+            } | ForEach-Object { [scriptblock]::Create($_.Extent.Text) })
+        $Rows = $script:WrapperAst.Find({ param($Node) $Node -is [System.Management.Automation.Language.ForEachStatementAst] -and $Node.Condition.Extent.Text -eq '$StreamSummary.ResourceCounts' }, $true)
+        if ($null -eq $Rows) { throw 'The stream-summary row loop was not found in Run-AllSubscriptions.ps1.' }
+        $script:StreamRows = [scriptblock]::Create($Rows.Extent.Text)
+
+        # Something for Mock to replace (the real one is in
+        # RunAllSubscriptions.Functions.ps1 and calls Azure).
+        function Get-SubscriptionAccessState { param([string]$SubscriptionId) }
     }
 
     It 'every per-subscription count line (2 in the wrapper, 1 in the stream worker) shows <Label>' -TestCases @(
@@ -654,6 +671,78 @@ Describe 'Callers use the message and the switch' {
         @($NetworkOnlySubs) | Should -BeNullOrEmpty
         @($EmptySubs.Name) | Should -Be @('empty')
         @($script:Out | Where-Object { $_ -match '(?i)skipped' }) | Should -BeNullOrEmpty
+    }
+
+    It 'every per-subscription skipped count (2 in the wrapper, 1 in the stream worker) keeps a failed count query as unknown' {
+        $script:SkipCountBlocks.Count | Should -Be 3
+        foreach ($Block in $script:SkipCountBlocks)
+        {
+            $Global:SkippedResourceCount = $null
+            . $Block
+            $SkipCount | Should -BeNullOrEmpty -Because "a failed count query is unknown, not 0 skipped: $Block"
+            $Global:SkippedResourceCount = 4
+            . $Block
+            $SkipCount | Should -Be 4
+        }
+    }
+
+    It 'a stream summary keeps an unknown skipped count, and reads a row from an older worker with no Skipped as 0' {
+        $Json = @{ ResourceCounts = @(
+                [pscustomobject]@{ Name = 'known'; Id = 'id-a'; Count = 0; Skipped = 3 }
+                [pscustomobject]@{ Name = 'unknown'; Id = 'id-b'; Count = 0; Skipped = $null }
+                [pscustomobject]@{ Name = 'older'; Id = 'id-c'; Count = 0 }
+            )
+        } | ConvertTo-Json -Depth 6
+        # The lifted loop reads these through dynamic scope.
+        Set-Variable -Name StreamSummary -Value ($Json | ConvertFrom-Json)
+        Set-Variable -Name SubResourceCounts -Value @()
+        . $script:StreamRows
+        $SubResourceCounts.Count | Should -Be 3
+        $SubResourceCounts[0].Skipped | Should -Be 3
+        $null -eq $SubResourceCounts[1].Skipped | Should -BeTrue -Because 'the worker''s count query failed'
+        $SubResourceCounts[2].Skipped | Should -Be 0
+        $null -eq $SubResourceCounts[2].Skipped | Should -BeFalse -Because 'an older worker skipped nothing'
+    }
+
+    It 'the run summary does not call a subscription with an unknown skipped count genuinely empty' {
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        $script:Diag = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        Mock -CommandName Out-File -RemoveParameterType Encoding -MockWith { $script:Diag.Add([string]$InputObject) }
+        Mock -CommandName Get-SubscriptionAccessState -MockWith { 'Empty' }
+        # The lifted summary and probe read these through dynamic scope.
+        Set-Variable -Name InventoryRoot -Value $TestDrive
+        Set-Variable -Name DiagFile -Value $null
+        Set-Variable -Name SubResourceCounts -Value @(
+            [pscustomobject]@{ Name = 'empty'; Id = 'id-b'; Count = 0; Skipped = [long]0 }
+            [pscustomobject]@{ Name = 'unknown'; Id = 'id-e'; Count = 0; Skipped = $null }
+        )
+        . $script:RunSummary
+        . $script:EmptyProbe
+        @($EmptySubs.Name) | Should -Be @('empty', 'unknown') -Because 'both are still probed for access'
+        @($GenuinelyEmptySubs.Name) | Should -Be @('empty')
+        @($SkipUnknownSubs.Name) | Should -Be @('unknown')
+        $Genuine = [array]::IndexOf(@($script:Out), @($script:Out | Where-Object { $_ -like '  GENUINELY EMPTY*' })[0])
+        $script:Out[$Genuine + 1] | Should -Be '    - empty (id-b)'
+        $script:Out[$Genuine + 2] | Should -BeLike '*No action needed*'
+        $script:Out | Should -Contain '  ACCESS CONFIRMED, NETWORK COUNT UNKNOWN (1) - 0 resources collected, but the count of skipped network resources failed, so these may hold only skipped network resources:'
+        $script:Out | Should -Contain '    - unknown (id-e)'
+        @($script:Diag | Where-Object { $_ -like 'EMPTY *' }) | Should -Be @('EMPTY empty (id-b) - access confirmed, no resources; no action needed')
+        @($script:Diag | Where-Object { $_ -like 'NETWORK_COUNT_UNKNOWN unknown (id-e) - *' }).Count | Should -Be 1
+    }
+
+    It 'the run summary still labels a subscription with an unknown skipped count as no access' {
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        Mock -CommandName Out-File -RemoveParameterType Encoding -MockWith { }
+        Mock -CommandName Get-SubscriptionAccessState -MockWith { 'NoAccess' }
+        Set-Variable -Name InventoryRoot -Value $TestDrive
+        Set-Variable -Name DiagFile -Value $null
+        Set-Variable -Name SubResourceCounts -Value @([pscustomobject]@{ Name = 'unknown'; Id = 'id-e'; Count = 0; Skipped = $null })
+        . $script:RunSummary
+        . $script:EmptyProbe
+        @($NoAccessSubs.Name) | Should -Be @('unknown')
+        @($SkipUnknownSubs) | Should -BeNullOrEmpty
     }
 }
 

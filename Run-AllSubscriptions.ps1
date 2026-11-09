@@ -884,8 +884,9 @@ if ($ParallelStreams -le 1)
             # accurately reflects the subscription that just finished.
             $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
             # Network rows the inner script left out of the pull (reset by it
-            # on every run; $null when its count query failed).
-            $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
+            # on every run; $null when its count query failed, kept as $null
+            # so the run summary does not read it as 0 skipped).
+            $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { $null }
             $SubResourceCounts += [pscustomobject]@{
                 Name    = $Sub.Name
                 Id      = $Sub.Id
@@ -1085,7 +1086,7 @@ else
                 # Same null-guard as the sequential branch above.
                 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Script exited with code $LASTEXITCODE" }
                 $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
-                $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
+                $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { $null }
                 $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount; Skipped = $SkipCount }
                 $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
                 if ($CountMessage.Kind -eq 'Empty')
@@ -1335,7 +1336,8 @@ else
                             Id      = $rc.Id
                             Count   = [int]$rc.Count
                             # Missing in a summary from an older worker: 0.
-                            Skipped = if ($null -ne $rc.Skipped) { [long]$rc.Skipped } else { [long]0 }
+                            # Null: the worker's count query failed (unknown).
+                            Skipped = if ($null -eq $rc.PSObject.Properties['Skipped']) { [long]0 } elseif ($null -ne $rc.Skipped) { [long]$rc.Skipped } else { $null }
                         }
                     }
                 }
@@ -1730,7 +1732,9 @@ Write-Host ("Subscriptions Processed: {0}" -f ($Subscriptions.Count - $SkippedCo
 # are shown distinctly because they almost always indicate a permission gap;
 # treating them as "successful" in the summary is misleading.
 # A sub whose only resources are skipped network types (Skipped > 0) is not
-# empty and has access, so it is listed apart and not probed as empty.
+# empty and has access, so it is listed apart and not probed as empty. A sub
+# whose skipped count is unknown ($null: the count query failed) is probed,
+# but never labelled genuinely empty: it may hold only skipped network types.
 $EmptySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and -not ([long]$_.Skipped -gt 0) })
 $NetworkOnlySubs = @($SubResourceCounts | Where-Object { $_.Count -eq 0 -and [long]$_.Skipped -gt 0 })
 $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
@@ -1740,6 +1744,7 @@ $NonEmptySubs = @($SubResourceCounts | Where-Object { $_.Count -gt 0 })
 $NoAccessSubs = @()
 $GenuinelyEmptySubs = @()
 $UnknownSubs = @()
+$SkipUnknownSubs = @()
 if ($SubResourceCounts.Count -gt 0)
 {
     $TotalRes = ($SubResourceCounts | Measure-Object -Property Count -Sum).Sum
@@ -1767,12 +1772,13 @@ if ($EmptySubs.Count -gt 0)
     $NoAccessSubs = @()
     $GenuinelyEmptySubs = @()
     $UnknownSubs = @()
+    $SkipUnknownSubs = @()
     foreach ($e in $EmptySubs)
     {
         switch (Get-SubscriptionAccessState -SubscriptionId $e.Id)
         {
             'NoAccess' { $NoAccessSubs += $e }
-            'Empty' { $GenuinelyEmptySubs += $e }
+            'Empty' { if ($null -eq $e.Skipped) { $SkipUnknownSubs += $e } else { $GenuinelyEmptySubs += $e } }
             default { $UnknownSubs += $e }
         }
     }
@@ -1791,6 +1797,12 @@ if ($EmptySubs.Count -gt 0)
         Write-Host ("  GENUINELY EMPTY ({0}) - access confirmed, the subscription has no resources:" -f $GenuinelyEmptySubs.Count) -ForegroundColor Yellow
         foreach ($e in $GenuinelyEmptySubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Yellow }
         Write-Host "    No action needed - these are expected to be empty in the report." -ForegroundColor DarkGray
+    }
+    if ($SkipUnknownSubs.Count -gt 0)
+    {
+        Write-Host ("  ACCESS CONFIRMED, NETWORK COUNT UNKNOWN ({0}) - 0 resources collected, but the count of skipped network resources failed, so these may hold only skipped network resources:" -f $SkipUnknownSubs.Count) -ForegroundColor Yellow
+        foreach ($e in $SkipUnknownSubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Yellow }
+        Write-Host "    Re-run these with -IncludeNetworkResources to see whether they hold network resources." -ForegroundColor Yellow
     }
     if ($UnknownSubs.Count -gt 0)
     {
@@ -1819,6 +1831,10 @@ if ($EmptySubs.Count -gt 0)
     foreach ($e in $GenuinelyEmptySubs)
     {
         $EmptyDiag += ("EMPTY {0} ({1}) - access confirmed, no resources; no action needed" -f $e.Name, $e.Id)
+    }
+    foreach ($e in $SkipUnknownSubs)
+    {
+        $EmptyDiag += ("NETWORK_COUNT_UNKNOWN {0} ({1}) - access confirmed, 0 resources collected, the skipped network count failed; may hold only skipped network resources" -f $e.Name, $e.Id)
     }
     foreach ($e in $UnknownSubs)
     {
@@ -2022,7 +2038,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -StartTime $RunStartTime -EndTime (Get-Date) `
             -Visible $AllSubscriptions.Count -Excluded $Excluded.Count `
             -Eligible $Subscriptions.Count -Processed ($Subscriptions.Count - $SkippedCount) -Skipped $SkippedCount `
-            -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined $UnknownSubs `
+            -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined @($UnknownSubs + $SkipUnknownSubs) `
             -FailedSubscriptions $FailedSubscriptionDetail `
             -CollectorFailures $Global:CollectorFailures `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
