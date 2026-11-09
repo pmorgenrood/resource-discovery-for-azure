@@ -167,7 +167,10 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
 # value in a data file: a JSON string value equal to it in a .json member, or
 # a CSV cell equal to it in a .csv member. The bare word in other text (the
 # HTML report's privacy banner, a longer string, a key, part of a quoted cell)
-# does not count.
+# does not count. A JSON sentinel string whose closing ',' ']' or '}' came
+# after white space past the end of the scan window was missed: no one window
+# held both. The scan now remembers such a string and checks the first other
+# character after it in the next window.
 Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated sentinel' {
     BeforeAll {
         $script:SentinelGuid = 'obfuscated_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -242,6 +245,56 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated s
         $Text.Length % $script:ChunkLength | Should -Be 0
         $Text | Should -Match ',obfuscated_[0-9a-f-]{36}$'
         Assert-RevealFailure (Build-EntriesZip -Name 's_csv_boundary.zip' -Entries ([ordered]@{ 'Consumption_test.csv' = $Text }))
+    }
+
+    # The scan carries the last 127 characters of each window into the next,
+    # so the carry of the first window starts at ($ChunkLength - 127). A
+    # sentinel that starts there is at the start of the next window, where a
+    # match is skipped as having no context. These place a sentinel's opening
+    # quote (JSON) or its cell start (CSV) exactly there.
+    It 'fails on a JSON sentinel value whose opening quote is the first character of the carry' {
+        $Pre = '{"N":"' + ('a' * ($script:ChunkLength - 127 - 12)) + '","I":'
+        $Pre.Length | Should -Be ($script:ChunkLength - 127)
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_carry.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pre + '"' + $script:SentinelGuid + '"}'
+                }))
+    }
+
+    It 'fails on a JSON sentinel value at the carry start whose closing brace comes after a long run of white space' {
+        # The white space is longer than the carry, so no one window holds both
+        # the sentinel string and the '}' that makes it a value.
+        $Pre = '{"N":"' + ('a' * ($script:ChunkLength - 127 - 12)) + '","I":'
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_carry_ws.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pre + '"' + $script:SentinelGuid + '"' + (' ' * 200) + '}'
+                }))
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_carry_ws_word.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pre + '"obfuscated"' + "`n" + (' ' * 150) + "`n}"
+                }))
+    }
+
+    It 'fails on a JSON sentinel value followed by white space that runs past a whole window' {
+        $Pre = '{"N":"' + ('a' * ($script:ChunkLength - 400)) + '","I":'
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_long_ws.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pre + '"obfuscated"' + (' ' * ($script:ChunkLength + 500)) + ']}'
+                }))
+    }
+
+    It 'copies a JSON key "obfuscated" followed by a long run of white space unchanged' {
+        $Pre = '{"N":"' + ('a' * ($script:ChunkLength - 127 - 12)) + '",'
+        Assert-CopiedUnchanged (Build-EntriesZip -Name 's_json_key_ws.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pre + ' "obfuscated"' + (' ' * 300) + ':1}'
+                }))
+    }
+
+    It 'fails on a CSV sentinel cell that starts at the first character of the carry' {
+        $Pre = "A,B`n/" + ('a' * ($script:ChunkLength - 127 - 6)) + ','
+        $Pre.Length | Should -Be ($script:ChunkLength - 127)
+        Assert-RevealFailure (Build-EntriesZip -Name 's_csv_carry_bare.zip' -Entries ([ordered]@{
+                    'Consumption_test.csv' = $Pre + 'obfuscated,1' + "`n"
+                }))
+        Assert-RevealFailure (Build-EntriesZip -Name 's_csv_carry_quoted.zip' -Entries ([ordered]@{
+                    'Consumption_test.csv' = $Pre + '"' + $script:SentinelGuid + '",1' + "`n"
+                }))
     }
 
     It 'copies a report whose only "obfuscated" is ordinary text unchanged' {
