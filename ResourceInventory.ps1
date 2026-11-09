@@ -2022,8 +2022,8 @@ $ConsumptionIncomplete = @(Get-ConsumptionMissingEntries -Entries $Global:Consum
 if (-not $RunAllSubs.IsPresent -and $ConsumptionIncomplete.Count -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile))
 {
     $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
-    $RetryTenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
     $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
-    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @('To collect one again, run:') + @($ConsumptionIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
+    $RetryDictionary = if ($Obfuscate.IsPresent) { [string]$Global:DictionaryFile } else { $null }
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @(Get-ConsumptionRetryAdvice -Entries $ConsumptionIncomplete -TenantID $TenantID -ResourceGroup $ResourceGroup -Service $Service -SkipMetrics:$SkipMetrics -Obfuscate:$Obfuscate -DictionaryFile $RetryDictionary))
     exit 3
 }

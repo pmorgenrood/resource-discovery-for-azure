@@ -2215,7 +2215,7 @@ if (@($Global:CollectorFailures).Count -gt 0)
 # A subscription whose billing download failed or stopped part-way for a reason
 # other than the sign-in (that one is in FAILED (auth) above) is missing some or
 # all of its cost data: exit 3 below (5 with a collector failure).
-Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -TenantID $TenantID)
+Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -TenantID $TenantID -SkipMetrics:$SkipMetrics -Obfuscate:$Obfuscate)
 
 # Stop the wrapper transcript on the normal-completion path. Error paths take
 # Exit-Wrapper which does the same.
