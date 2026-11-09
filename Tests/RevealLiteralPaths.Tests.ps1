@@ -26,7 +26,7 @@ BeforeAll {
     $script:Token = 'prod_11111111-2222-3333-4444-555555555555'
 
     # A dictionary mapping $script:Token to the resource group $RgName.
-    function New-Dictionary
+    function Write-TestDictionary
     {
         param([string]$Folder, [string]$Name, [string]$RgName)
         $null = New-Item -ItemType Directory -Path $Folder -Force
@@ -47,7 +47,7 @@ BeforeAll {
         'ResourcesReport_1.html'    = '<td>decoy</td>'
     }
 
-    function New-ReportZip
+    function Write-TestReportZip
     {
         param([string]$Path)
         $Archive = [System.IO.Compression.ZipFile]::Open($Path, 'Create')
@@ -111,11 +111,11 @@ AfterAll {
 Describe 'Invoke-RdaReveal with [1] in names next to a neighbour named with 1' {
     It 'reads the named dictionary and rewrites the named members, not their neighbours' {
         $Case = Join-Path $script:WorkDir 'dict'
-        $Dict = New-Dictionary -Folder (Join-Path $Case 'd[1]') -Name 'ObfuscationDictionary_r[1].json' -RgName 'real-rg'
-        $Decoy = New-Dictionary -Folder (Join-Path $Case 'd1') -Name 'ObfuscationDictionary_r1.json' -RgName 'decoy-rg'
+        $Dict = Write-TestDictionary -Folder (Join-Path $Case 'd[1]') -Name 'ObfuscationDictionary_r[1].json' -RgName 'real-rg'
+        $Decoy = Write-TestDictionary -Folder (Join-Path $Case 'd1') -Name 'ObfuscationDictionary_r1.json' -RgName 'decoy-rg'
         $DecoyBefore = [System.IO.File]::ReadAllText($Decoy)
         $InZip = Join-Path $Case 'report[1].zip'
-        New-ReportZip -Path $InZip
+        Write-TestReportZip -Path $InZip
         $OutZip = Join-Path $Case 'out[1].zip'
 
         Invoke-RdaReveal -InputZip $InZip -DictionaryPath $Dict -OutputZip $OutZip 6>$null
@@ -126,10 +126,10 @@ Describe 'Invoke-RdaReveal with [1] in names next to a neighbour named with 1' {
 
     It 'finds the dictionary in a search folder named with [1], not in its neighbour' {
         $Case = Join-Path $script:WorkDir 'search'
-        $null = New-Dictionary -Folder (Join-Path $Case 's[1]') -Name 'ObfuscationDictionary_a.json' -RgName 'real-rg'
-        $null = New-Dictionary -Folder (Join-Path $Case 's1') -Name 'ObfuscationDictionary_b.json' -RgName 'decoy-rg'
+        $null = Write-TestDictionary -Folder (Join-Path $Case 's[1]') -Name 'ObfuscationDictionary_a.json' -RgName 'real-rg'
+        $null = Write-TestDictionary -Folder (Join-Path $Case 's1') -Name 'ObfuscationDictionary_b.json' -RgName 'decoy-rg'
         $InZip = Join-Path $Case 'report.zip'
-        New-ReportZip -Path $InZip
+        Write-TestReportZip -Path $InZip
         $OutZip = Join-Path $Case 'out.zip'
 
         Invoke-RdaReveal -InputZip $InZip -SearchDirectory (Join-Path $Case 's[1]') -OutputZip $OutZip 6>$null
@@ -139,9 +139,9 @@ Describe 'Invoke-RdaReveal with [1] in names next to a neighbour named with 1' {
 
     It 'leaves the neighbour''s .partial.zip alone' {
         $Case = Join-Path $script:WorkDir 'partial'
-        $Dict = New-Dictionary -Folder $Case -Name 'ObfuscationDictionary_p.json' -RgName 'real-rg'
+        $Dict = Write-TestDictionary -Folder $Case -Name 'ObfuscationDictionary_p.json' -RgName 'real-rg'
         $InZip = Join-Path $Case 'report.zip'
-        New-ReportZip -Path $InZip
+        Write-TestReportZip -Path $InZip
         $Decoy = Join-Path $Case 'out1.partial.zip'
         [System.IO.File]::WriteAllText($Decoy, 'neighbour')
         $OutZip = Join-Path $Case 'out[1].zip'
@@ -156,9 +156,9 @@ Describe 'Invoke-RdaReveal with [1] in names next to a neighbour named with 1' {
 
     It 'lists and removes its temp folder under a temp root named with [1]' -Skip:$IsWindows {
         $Case = Join-Path $script:WorkDir 'temp'
-        $Dict = New-Dictionary -Folder $Case -Name 'ObfuscationDictionary_t.json' -RgName 'real-rg'
+        $Dict = Write-TestDictionary -Folder $Case -Name 'ObfuscationDictionary_t.json' -RgName 'real-rg'
         $InZip = Join-Path $Case 'report.zip'
-        New-ReportZip -Path $InZip
+        Write-TestReportZip -Path $InZip
         $OutZip = Join-Path $Case 'out.zip'
         $TempRoot = Join-Path $Case 't[1]'
         $null = New-Item -ItemType Directory -Path $TempRoot -Force

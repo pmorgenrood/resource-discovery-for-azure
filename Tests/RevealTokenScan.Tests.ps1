@@ -191,7 +191,7 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated s
             return $Path
         }
 
-        function Assert-Fails([string]$Zip)
+        function Assert-RevealFailure([string]$Zip)
         {
             $Out = $Zip -replace '\.zip$', '_out.zip'
             { Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null } |
@@ -208,29 +208,29 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated s
     }
 
     It 'fails on a JSON value that is exactly "obfuscated"' {
-        Assert-Fails (Build-EntriesZip -Name 's_json_word.zip' -Entries ([ordered]@{
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_word.zip' -Entries ([ordered]@{
                     'Inventory_test.json' = '{"VMDisk":[{"Name":"disk","AssociatedResource":"obfuscated"}]}'
                 }))
     }
 
     It 'fails on a JSON value that is exactly "obfuscated_<guid>", pretty printed' {
-        Assert-Fails (Build-EntriesZip -Name 's_json_guid.zip' -Entries ([ordered]@{
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_guid.zip' -Entries ([ordered]@{
                     'Inventory_test.json' = "{`n  `"Resources`": [`n    {`n      `"ID`": `"$($script:SentinelGuid)`"`n    }`n  ]`n}"
                 }))
     }
 
     It 'fails on a CSV cell that is exactly obfuscated, unquoted and quoted' {
-        Assert-Fails (Build-EntriesZip -Name 's_csv_bare.zip' -Entries ([ordered]@{
+        Assert-RevealFailure (Build-EntriesZip -Name 's_csv_bare.zip' -Entries ([ordered]@{
                     'Consumption_test.csv' = "ResourceId,ReservationId,Cost`n/x,obfuscated,1.5`n"
                 }))
-        Assert-Fails (Build-EntriesZip -Name 's_csv_quoted.zip' -Entries ([ordered]@{
+        Assert-RevealFailure (Build-EntriesZip -Name 's_csv_quoted.zip' -Entries ([ordered]@{
                     'Consumption_test.csv' = "`"ResourceId`",`"ReservationId`",`"Cost`"`n`"/x`",`"$($script:SentinelGuid)`",`"1.5`""
                 }))
     }
 
     It 'fails on a JSON sentinel value split across two chunks' {
         $Pad = '{"Name":"' + ('a' * ($script:ChunkLength - 20)) + '","ID":"'
-        Assert-Fails (Build-EntriesZip -Name 's_json_straddle.zip' -Entries ([ordered]@{
+        Assert-RevealFailure (Build-EntriesZip -Name 's_json_straddle.zip' -Entries ([ordered]@{
                     'Inventory_test.json' = $Pad + $script:SentinelGuid + '"}'
                 }))
     }
@@ -241,7 +241,7 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated s
         $Text = $Text.Substring($Text.Length % $script:ChunkLength)
         $Text.Length % $script:ChunkLength | Should -Be 0
         $Text | Should -Match ',obfuscated_[0-9a-f-]{36}$'
-        Assert-Fails (Build-EntriesZip -Name 's_csv_boundary.zip' -Entries ([ordered]@{ 'Consumption_test.csv' = $Text }))
+        Assert-RevealFailure (Build-EntriesZip -Name 's_csv_boundary.zip' -Entries ([ordered]@{ 'Consumption_test.csv' = $Text }))
     }
 
     It 'copies a report whose only "obfuscated" is ordinary text unchanged' {
