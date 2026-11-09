@@ -256,6 +256,22 @@ Describe 'VM billing-coverage banner' {
         $Text | Should -Match '2 running VMs were discovered in the inventory, but only 1 VMs have compute-usage records'
     }
 
+    It 'counts a running scale set member billed under its scale set''s id as billed' {
+        $Sub = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg/providers/microsoft.compute'
+        $Set = $Sub + '/virtualmachinescalesets/set1'
+        $Inv = [pscustomobject]@{ VirtualMachines = @(
+                [pscustomobject]@{ ID = $Sub + '/virtualmachines/vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
+                [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_0'; Set = $Set; Name = 'set1_0'; Subscription = 'sub'; PowerState = 'vm running' }) }
+        $InvPath = Join-Path $script:WorkDir 'inv-vmss.json'
+        $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
+        $Csv = Join-Path $script:WorkDir 'cons-vmss.csv'
+        @([pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = $Sub + '/virtualmachines/vm1' }, [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = $Set }) |
+            Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Join-Path $script:WorkDir 'vmss.html'
+        & $script:SummaryScript -JsonFile $InvPath -HtmlFile $Html -ConsumptionFile $Csv -VmBillingGapThreshold 0 *> $null
+        Get-Content -LiteralPath $Html -Raw | Should -Not -Match 'class="coverage-banner"'
+    }
+
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_thresh.csv'

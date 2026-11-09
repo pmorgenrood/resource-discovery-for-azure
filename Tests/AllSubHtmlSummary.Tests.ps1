@@ -244,6 +244,7 @@ Describe 'New-RdaAllSubHtmlSummary unreadable inventory' {
         (Get-Card $Html 'Empty (0 resources)') | Should -Be '1'
         $Html | Should -Match '<b>1 subscription\(s\) have 0 resources in their report\.</b>'
         $Html | Should -Match '<b>1 report\(s\) have an inventory that could not be read\.</b>'
+        $Html | Should -Match 'or the Azure CLI is signed in as an account that cannot read them\.'
     }
 }
 

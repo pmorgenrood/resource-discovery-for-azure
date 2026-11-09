@@ -160,19 +160,20 @@ if ($Samples.Count -gt 0)
 # record in the billing window. A running VM with no compute-usage record is an
 # anomaly - it usually means consumption data was incomplete for that VM's
 # subscription (auth / billing-scope gap), not that the VM is idle. We compare
-# counts, and also the ids when the two files' ids meet: a report whose ids
-# never meet (masked through different dictionaries) is compared by counts only.
+# counts, and also the ids when the two files' ids meet. The output contract
+# gives the inventory ID and the consumption ResourceId the same string, so ids
+# that never meet are an older or broken mask; such a report is compared by
+# counts only.
 $VmBilling = $null
 if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $ConsumptionFile -PathType Leaf))
 {
     $RunningVmCount = 0
-    $RunningVmIds = @()
+    $RunningVms = @()
     $VmRecords = $Inventory.VirtualMachines
     if ($VmRecords)
     {
         $RunningVms = @($VmRecords | Where-Object { $_.PowerState -match 'running' })
         $RunningVmCount = $RunningVms.Count
-        $RunningVmIds = @($RunningVms | Where-Object { $_.PSObject.Properties.Name -contains 'ID' -and -not [string]::IsNullOrWhiteSpace([string]$_.ID) } | ForEach-Object { [string]$_.ID })
     }
 
     # Count distinct VM-meter resources in the consumption CSV. A header-only or
@@ -215,7 +216,12 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
         # billed id, case aside), a running VM is billed only when its own ID
         # is: equal counts can hide a running VM with no charge beside a billed
         # id of another VM. Ids that never meet fall back to the counts.
-        $MatchedVmCount = @($RunningVmIds | Where-Object { $BilledVmIds.Contains($_) }).Count
+        # A scale set member can be billed under its scale set's id (the VM's
+        # Set), so either id counts.
+        $MatchedVmCount = @($RunningVms | Where-Object {
+                $Ids = @(foreach ($Key in 'ID', 'Set') { if ($_.PSObject.Properties.Name -contains $Key -and -not [string]::IsNullOrWhiteSpace([string]$_.$Key)) { [string]$_.$Key } })
+                @($Ids | Where-Object { $BilledVmIds.Contains($_) }).Count -gt 0
+            }).Count
         if ($MatchedVmCount -gt 0)
         {
             $IdGap = $RunningVmCount - $MatchedVmCount
