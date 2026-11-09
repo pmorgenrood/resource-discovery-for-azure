@@ -903,6 +903,7 @@ function Resolve-StreamSummary
     # or a path the output verification can look for.
     $ResourceCounts = @()
     $BadRows = 0
+    $BadSkipped = 0
     foreach ($Row in (& $ListRows $Summary 'ResourceCounts'))
     {
         $Ok = (& $IsObject $Row)
@@ -919,7 +920,8 @@ function Resolve-StreamSummary
             $CountOk = $null -ne $Count -and (& $IsCount $Count.Value)
             $ZipOk = $null -eq $ZipValue -or ((& $IsText $ZipValue) -and ($ZipValue -eq '' -or $(try { $null = [System.IO.Path]::GetFullPath($ZipValue); $true } catch { $false })))
             $SkippedOk = $null -eq $Skipped -or $null -eq $Skipped.Value -or (($Skipped.Value -is [int] -or $Skipped.Value -is [long]) -and $Skipped.Value -ge 0)
-            $Ok = $IdOk -and $NameOk -and $CountOk -and $ZipOk -and $SkippedOk
+            $Ok = $IdOk -and $NameOk -and $CountOk -and $ZipOk
+            if ($Ok -and -not $SkippedOk) { $BadSkipped++; continue }
         }
         if (-not $Ok) { $BadRows++; continue }
         $ResourceCounts += [pscustomobject]@{
@@ -930,7 +932,8 @@ function Resolve-StreamSummary
             Zip     = [string]$ZipValue
         }
     }
-    if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its success row(s) have a Count that is not a whole number of 0 or more, a Zip that is not a path, or a Skipped that is not empty or a whole number of 0 or more' -f $BadRows)) }
+    if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its success row(s) have a Count that is not a whole number of 0 or more, or a Zip that is not a path' -f $BadRows)) }
+    if ($BadSkipped -gt 0) { return (& $NotConfirmed ('{0} of its success row(s) have a Skipped that is not empty or a whole number of 0 or more' -f $BadSkipped)) }
 
     $Failed = @()
     $BadRows = 0

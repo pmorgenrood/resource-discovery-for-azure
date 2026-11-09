@@ -759,13 +759,14 @@ Describe 'Callers use the message and the switch' {
         $script:EmptyProbe = [scriptblock]::Create($Probe[0].Extent.Text)
 
         # Every '$SkipCount = ...' statement (2 in the wrapper, 1 in the
-        # stream worker) and the loop that reads a stream summary's rows.
+        # stream worker). A stream summary's rows are read by
+        # Resolve-StreamSummary (RunAllSubscriptions.Functions.ps1), which the
+        # wrapper calls for every stream.
         $script:SkipCountBlocks = @(@($script:WrapperAst, $script:StreamAst) | ForEach-Object {
                 $_.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq '$SkipCount' }, $true)
             } | ForEach-Object { [scriptblock]::Create($_.Extent.Text) })
-        $Rows = $script:WrapperAst.Find({ param($Node) $Node -is [System.Management.Automation.Language.ForEachStatementAst] -and $Node.Condition.Extent.Text -eq '$StreamSummary.ResourceCounts' }, $true)
-        if ($null -eq $Rows) { throw 'The stream-summary row loop was not found in Run-AllSubscriptions.ps1.' }
-        $script:StreamRows = [scriptblock]::Create($Rows.Extent.Text)
+        @($script:WrapperAst.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Resolve-StreamSummary' }, $true)).Count | Should -BeGreaterThan 0 -Because 'the wrapper reads each stream summary through the reader'
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
 
         # Something for Mock to replace (the real one is in
         # RunAllSubscriptions.Functions.ps1 and calls Azure).
@@ -1032,11 +1033,11 @@ Describe 'Callers use the message and the switch' {
                 [pscustomobject]@{ Name = 'unknown'; Id = 'id-b'; Count = 0; Skipped = $null }
                 [pscustomobject]@{ Name = 'older'; Id = 'id-c'; Count = 0 }
             )
+            RunId = 'run-1'; StreamId = '0'
         } | ConvertTo-Json -Depth 6
-        # The lifted loop reads these through dynamic scope.
-        Set-Variable -Name StreamSummary -Value ($Json | ConvertFrom-Json)
-        Set-Variable -Name SubResourceCounts -Value @()
-        . $script:StreamRows
+        $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId 'run-1' -StreamId '0' -ExpectedIds @('id-a', 'id-b', 'id-c')
+        $Read.Accepted | Should -BeTrue
+        $SubResourceCounts = @($Read.ResourceCounts)
         $SubResourceCounts.Count | Should -Be 3
         $SubResourceCounts[0].Skipped | Should -Be 3
         $null -eq $SubResourceCounts[1].Skipped | Should -BeTrue -Because 'the worker''s count query failed'
