@@ -179,7 +179,7 @@ Describe "Deterministic Mapping" {
         if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run; ResourceGroup is the real name'; return }
         $Rows = @($script:PathRows | Where-Object { $_.Parts.Count -gt 4 -and $_.Parts[3] -ieq 'resourcegroups' -and -not [string]::IsNullOrEmpty([string]$_.Row.ResourceGroup) })
         if ($Rows.Count -eq 0) { Set-ItResult -Skipped -Because 'no row with a masked resource group path and a ResourceGroup value'; return }
-        foreach ($R in $Rows) { [string]$R.Row.ResourceGroup | Should -Be $R.Parts[4] -Because "one resource group has one token in the ID and in the ResourceGroup field ('$($R.Row.ID)')" }
+        foreach ($R in $Rows) { [string]$R.Row.ResourceGroup | Should -BeExactly $R.Parts[4] -Because "one resource group has one token in the ID and in the ResourceGroup field ('$($R.Row.ID)')" }
     }
 }
 
