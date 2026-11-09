@@ -3,7 +3,7 @@ param(
     $Subscriptions,
     $Resources, # The massive list of raw discovered infrastructure items (VMs, Disks, DBs)
     $Task, # String tracking the script task mode (e.g., 'Processing')
-    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit, # Number of concurrent threads allowed to run simultaneously
+    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6, # Number of concurrent threads allowed to run simultaneously
     $FilePath, # Root destination directory path for saving JSON data chunks
     $ResourceIdDictionary, # Map dictionary to replace original Resource IDs with obfuscated GUID values
     $ResourceNameDictionary, # Map dictionary to mask the actual human-readable names of the items
