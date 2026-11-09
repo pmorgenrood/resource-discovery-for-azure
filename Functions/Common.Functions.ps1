@@ -376,9 +376,11 @@ function Get-MetricsRetryCommand
 # zip) that line names the subscription's zip in its report folder instead.
 # After a run that signed in with -Appid, one line says to add -Appid and
 # -Secret, since the commands hold neither; their values are never written.
+# A direct run that wrote no zip ($ZipWritten false) has no first zip to
+# replace, so that line says the new zip is the report instead.
 function Write-MetricsIncompleteRunEnd
 {
-    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot, [switch]$NoAllSubscriptionsZip)
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot, [switch]$NoAllSubscriptionsZip, [bool]$ZipWritten = $true)
 
     $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
     if ($List.Count -eq 0) { return $false }
@@ -438,6 +440,10 @@ function Write-MetricsIncompleteRunEnd
     {
         $Advice.Add("  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice.")
     }
+    elseif (-not $ZipWritten)
+    {
+        $Advice.Add('  This run made no zip, so there is no first zip to replace: the new zip is the report to upload.')
+    }
     elseif ($OneSubscription)
     {
         $Advice.Add("  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice.")
@@ -469,7 +475,7 @@ function Get-DirectRunMetricsExitCode
         Write-Host 'Fix: sign in again (Connect-AzAccount), then run the same command again.' -ForegroundColor Red
         Write-Host '=========================================================' -ForegroundColor Red
     }
-    $Incomplete = Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters -DictionaryFile $DictionaryFile
+    $Incomplete = Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters -DictionaryFile $DictionaryFile -ZipWritten $ZipWritten
     if (-not $ZipWritten) { return 2 }
     if ($Incomplete -or $AuthSkipped.Count -gt 0) { return 3 }
     return 0

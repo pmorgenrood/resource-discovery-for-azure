@@ -165,6 +165,7 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
         $script:InnerZip = "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
         $script:FolderZip = "  Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice."
         $script:SignInLine = '  The first run signed in with -Appid: add -Appid <id> -Secret <secret> to sign in the same way.'
+        $script:NoFirstZip = '  This run made no zip, so there is no first zip to replace: the new zip is the report to upload.'
     }
     BeforeEach {
         $script:Lines = [System.Collections.Generic.List[string]]::new()
@@ -231,6 +232,17 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
         $script:Lines | Should -Contain $script:SignInLine
         @($script:Lines | Where-Object { $_ -like '*./ResourceInventory.ps1*' -and $_ -match 'Appid|Secret' }).Count | Should -Be 0
         ($script:Lines -join "`n") | Should -Not -Match 'app-1|not-a-real-value'
+    }
+
+    It 'says no first zip was made and the new zip is the report after a direct run that wrote no zip (<Kind>)' -ForEach @(
+        @{ Kind = 'one command'; Run = @{} }
+        @{ Kind = 'one command per subscription'; Run = @{ SubscriptionID = 'id-2' } }
+    ) {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters $Run -ZipWritten $false
+
+        $script:Lines | Should -Contain $script:NoFirstZip
+        $script:Lines | Should -Not -Contain $script:WholeZip
+        $script:Lines | Should -Not -Contain $script:SubZip
     }
 
     It 'adds no sign-in line after a run that did not sign in with -Appid' {
@@ -332,6 +344,9 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 2
         $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1'
+        # No first zip was made, so the line says the new zip is the report.
+        $Result.Lines | Should -Contain '  This run made no zip, so there is no first zip to replace: the new zip is the report to upload.'
+        @($Result.Lines | Where-Object { $_ -like '*upload it instead of the first one*' }).Count | Should -Be 0
     }
 
     It 'exits 2 when its zip could not be written and the metrics are complete' {
