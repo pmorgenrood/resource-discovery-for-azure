@@ -12,7 +12,11 @@ BeforeAll {
     {
         param(
             [Parameter(Mandatory)] $Map,
-            [Parameter(Mandatory)] [scriptblock] $RealValueSelector
+            [Parameter(Mandatory)] [scriptblock] $RealValueSelector,
+            # Tag and free-text values are kept apart by letter case in the
+            # product's dictionaries ('Prod' and 'prod' are two values); ids,
+            # groups and subscriptions are not.
+            [switch] $CaseSensitive
         )
 
         $Pairs = foreach ($property in $Map.PSObject.Properties)
@@ -24,7 +28,7 @@ BeforeAll {
             }
         }
 
-        @($Pairs | Group-Object Real | Where-Object { @($_.Group.Token | Sort-Object -Unique).Count -gt 1 })
+        @($Pairs | Group-Object Real -CaseSensitive:$CaseSensitive | Where-Object { @($_.Group.Token | Sort-Object -Unique).Count -gt 1 })
     }
 
     # Find the zip
@@ -377,6 +381,9 @@ Describe "Metrics JSON Structure" {
             $Parsed = $Raw | ConvertFrom-Json
             $Parsed | Should -Not -BeNullOrEmpty -Because "Metrics file should be valid JSON"
             $Parsed.PSObject.Properties.Name | Should -Contain 'Metrics' -Because "Metrics JSON should have a Metrics property"
+            # Downstream drops the whole file unless Metrics is a list (an empty
+            # list is fine).
+            ($Raw -match '"Metrics"\s*:\s*\[') | Should -BeTrue -Because "the Metrics property must be a list in '$($metricsFile.Name)'"
         }
     }
 }
@@ -399,9 +406,12 @@ Describe "Consumption CSV Headers" {
         }
 
         $ExpectedHeaders = @('InstanceData', 'MeterCategory', 'MeterId', 'MeterName', 'MeterRegion', 'MeterSubCategory', 'Quantity', 'Unit', 'UsageStartTime', 'UsageEndTime', 'ResourceId', 'ResourceLocation', 'ConsumptionMeter', 'ReservationId', 'ReservationOrderId')
+        # Downstream finds each column by its exact name, so the header is
+        # parsed and compared name by name.
+        $Columns = @(($FirstLine | ConvertFrom-Csv -Header (1..200 | ForEach-Object { "c$_" })).PSObject.Properties | Where-Object { $null -ne $_.Value } | ForEach-Object { [string]$_.Value })
         foreach ($header in $ExpectedHeaders)
         {
-            $FirstLine | Should -Match $header -Because "CSV should contain header '$header'"
+            $Columns | Should -Contain $header -Because "CSV should contain header '$header' as a column name"
         }
     }
 }
@@ -873,7 +883,7 @@ Describe "Obfuscation Determinism" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
         $Map = $script:Dictionary.TagMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "TagMap absent/empty in this dictionary"; return }
-        $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
+        $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v } -CaseSensitive
         $Violations | Should -BeNullOrEmpty -Because "no real tag value may yield two different tokens within a run"
     }
 
@@ -881,79 +891,8 @@ Describe "Obfuscation Determinism" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
         $Map = $script:Dictionary.FreeTextMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "FreeTextMap absent/empty in this dictionary"; return }
-        $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
+        $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v } -CaseSensitive
         $Violations | Should -BeNullOrEmpty -Because "no real free-text value may yield two different tokens within a run"
-    }
-}
-
-# ============================================================
-# 18. Obfuscation injectivity / no token collisions
-# Distinct real values must produce DISTINCT tokens (a fresh GUID
-# per newly seen value), so one token never stands in for two
-# different real values. Asserted against the reverse-lookup
-# dictionary (token -> real value): because tokens are a map's
-# property names they are unique by construction, so within a map
-# an injectivity failure surfaces as the SAME real value being
-# reachable from MORE THAN ONE distinct token. That is the converse
-# of the determinism check and is exactly what
-# Get-DeterminismViolation detects, so the helper is reused here
-# to express the invariant per map: each real value appears under
-# at most one token (the set of real values has no duplicates).
-# Selectors mirror the determinism block so ResourceName injectivity is keyed
-# on the real resource id (two resources that share a display name in
-# different RGs legitimately get different name tokens). Skips
-# gracefully when no dictionary fixture is available;
-# count-independent (iterates whatever tokens the run produced).
-# ============================================================
-Describe "Obfuscation Injectivity" {
-    It "ResourceGroup: no two tokens share the same real resource group" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.ResourceGroupMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceGroupMap absent/empty in this dictionary"; return }
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/resourceGroups/([^/]+)') { $Matches[1] } }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource groups must map to distinct tokens; no token may cover two real values"
-    }
-
-    It "Subscription: no two tokens share the same real subscription" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.SubscriptionMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "SubscriptionMap absent/empty in this dictionary"; return }
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/subscriptions/([0-9a-fA-F-]+)') { $Matches[1] } }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real subscriptions must map to distinct tokens; no token may cover two real values"
-    }
-
-    It "ResourceId: no two tokens share the same real resource id" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.ResourceIdMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceIdMap absent/empty in this dictionary"; return }
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct tokens; no token may cover two real values"
-    }
-
-    It "ResourceName: no two name tokens share the same real resource id" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.ResourceNameMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceNameMap absent/empty in this dictionary"; return }
-        # Name tokens are keyed per real resource id (mirrors the selector),
-        # so injectivity is asserted against the real resource id, not the name.
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct name tokens; no name token may cover two real values"
-    }
-
-    It "Tag: no two tokens share the same real tag value" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.TagMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "TagMap absent/empty in this dictionary"; return }
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real tag values must map to distinct tokens; no token may cover two real values"
-    }
-
-    It "FreeText: no two tokens share the same real free-text value" {
-        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
-        $Map = $script:Dictionary.FreeTextMap
-        if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "FreeTextMap absent/empty in this dictionary"; return }
-        $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real free-text values must map to distinct tokens; no token may cover two real values"
     }
 }
 
@@ -961,8 +900,8 @@ Describe "Obfuscation Injectivity" {
 # 19. Tag tokenization: keys kept, values masked, determinism,
 #     and the mixed-case tag-key regression.
 #
-# The ZIP-content VM Tags test (above) and the TagMap determinism and
-# injectivity blocks are the
+# The ZIP-content VM Tags test (above) and the TagMap determinism test
+# are the
 # authoritative checks WHEN the fixture carries tagged resources. They are
 # DATA-DEPENDENT: this fixture's in-scope resources carried no tags, so TagMap
 # is empty (those blocks skip) and the VM Tags loop has no rows to assert
