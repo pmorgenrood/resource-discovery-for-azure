@@ -292,11 +292,30 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
     }
 
     It 'exits 0 and prints nothing when the metrics are complete' {
-        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Global:MetricsFailedSubs = @()
         $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
 
         $Result.ExitCode | Should -Be 0
         $Result.Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+        $Result.Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
+    }
+
+    It 'prints a FAILED (auth) line and exits 3 when its metrics were skipped for the sign-in' {
+        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '===================== FAILED (auth) ====================='
+        $Result.Lines | Should -Contain 'Could not collect: Metrics for 1 subscription(s). Reason: no usable Azure context/token (even after one reconnect attempt).'
+        $Result.Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+    }
+
+    It 'still exits 2 when its metrics were skipped for the sign-in and its zip could not be written' {
+        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' } -NoZip
+
+        $Result.ExitCode | Should -Be 2
+        $Result.Lines | Should -Contain '===================== FAILED (auth) ====================='
     }
 
     It 'leaves the end of the run to the wrapper under -RunAllSubs' {

@@ -436,15 +436,25 @@ function Write-MetricsIncompleteRunEnd
 
 # The exit code at the end of a direct ResourceInventory.ps1 run (not under
 # -RunAllSubs, where the wrapper decides): 2 when its report zip ($ZipFile)
-# was not written, which wins; 3 when its metrics are incomplete, after the
-# FAILED (metrics) lines; 0 otherwise. With no zip the lines are still printed,
-# after the run's own "No report was written" line.
+# was not written, which wins; 3 when metrics were skipped because the sign-in
+# could not be refreshed, after a short FAILED (auth) line, or when its metrics
+# are incomplete, after the FAILED (metrics) lines; 0 otherwise. With no zip
+# the lines are still printed, after the run's own "No report was written" line.
 function Get-DirectRunMetricsExitCode
 {
     param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$ZipFile, [string]$DictionaryFile)
 
+    $AuthSkipped = @(@($Entries) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) } | Sort-Object Name, Id -Unique)
+    if ($AuthSkipped.Count -gt 0)
+    {
+        Write-Host ''
+        Write-Host '===================== FAILED (auth) =====================' -ForegroundColor Red
+        Write-Host ('Could not collect: Metrics for {0} subscription(s). Reason: no usable Azure context/token (even after one reconnect attempt).' -f $AuthSkipped.Count) -ForegroundColor Red
+        Write-Host 'Fix: sign in again (Connect-AzAccount), then run the same command again.' -ForegroundColor Red
+        Write-Host '=========================================================' -ForegroundColor Red
+    }
     $Incomplete = Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters -DictionaryFile $DictionaryFile
     if ([string]::IsNullOrEmpty($ZipFile) -or -not (Test-Path -LiteralPath $ZipFile -PathType Leaf)) { return 2 }
-    if ($Incomplete) { return 3 }
+    if ($Incomplete -or $AuthSkipped.Count -gt 0) { return 3 }
     return 0
 }

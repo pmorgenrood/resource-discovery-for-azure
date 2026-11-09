@@ -1842,7 +1842,9 @@ if ($ZipWritten)
 # request (grouped or for one metric) still failed after its retries
 # (throttling, a timeout, a server error or an error with no status)
 # names each subscription with the command that collects it again, with this
-# run's switches, and exits 3 when its zip was written. A direct run whose zip
+# run's switches, and exits 3 when its zip was written. Metrics skipped because
+# the sign-in could not be refreshed print a short FAILED (auth) line and also
+# exit 3. A direct run whose zip
 # could not be written exits 2. Under -RunAllSubs the wrapper does this for the
 # whole run.
 if (-not $RunAllSubs.IsPresent)
