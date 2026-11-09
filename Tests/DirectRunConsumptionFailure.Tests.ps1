@@ -205,8 +205,8 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
         $Lines[($At + 1)..($Lines.Count - 1)] | Should -Be @(
             'Consumption (billing) data is missing or incomplete for 1 subscription(s):'
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
-            'To collect one again, run:'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
+            'To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -Service ''PublicIP'' -SkipMetrics'
             '========================================================'
         )
     }
@@ -242,9 +242,9 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
             '  - Sub B (placeholder-subscription-b)'
             'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.'
-            'To collect one again, run:'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b'
+            'To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -Service ''PublicIP'' -SkipMetrics'
+            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b -Service ''PublicIP'' -SkipMetrics'
             '========================================================'
         )
     }

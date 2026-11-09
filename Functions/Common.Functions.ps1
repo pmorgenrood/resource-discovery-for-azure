@@ -1997,6 +1997,40 @@ function Get-ConsumptionMissingEntries
     @(Get-ConsumptionIncompleteEntries -Entries $Missing)
 }
 
+# The lines under the FAILED (consumption) banner: the ResourceInventory.ps1
+# command that collects each subscription in $Entries again, with the settings
+# that shape its report (-ResourceGroup, -Service, -SkipMetrics, -Obfuscate), so
+# the new report is made the same way. Under -Obfuscate it reuses the run's
+# dictionary (-ObfuscationDictionary $DictionaryFile) so the same resources get
+# the same masked names; without a file it says where to find it. The new
+# report replaces the one the run wrote for that subscription, so only one of
+# them is to be uploaded.
+function Get-ConsumptionRetryAdvice
+{
+    param([object[]]$Entries, [string]$TenantID, [string]$ResourceGroup, [string[]]$Service, [switch]$SkipMetrics, [switch]$Obfuscate, [string]$DictionaryFile)
+    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return @() }
+    $Quote = { param($Value) "'" + ([string]$Value -replace "'", "''") + "'" }
+    $Tail = ''
+    if (-not [string]::IsNullOrEmpty($ResourceGroup)) { $Tail += ' -ResourceGroup ' + (& $Quote $ResourceGroup) }
+    $Services = @(@($Service) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($Services.Count -gt 0) { $Tail += ' -Service ' + (@($Services | ForEach-Object { & $Quote $_ }) -join ',') }
+    if ($SkipMetrics) { $Tail += ' -SkipMetrics' }
+    if ($Obfuscate)
+    {
+        $Tail += ' -Obfuscate'
+        if (-not [string]::IsNullOrEmpty($DictionaryFile)) { $Tail += ' -ObfuscationDictionary ' + (& $Quote $DictionaryFile) }
+    }
+    $TenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
+    $Lines = @('To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.')
+    if ($Obfuscate -and [string]::IsNullOrEmpty($DictionaryFile))
+    {
+        $Lines += 'Add -ObfuscationDictionary with the ObfuscationDictionary_*.json file from that subscription''s report folder, so its masked names stay the same as in this run.'
+    }
+    $Lines += @($List | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}{2}' -f $TenantArg, $_.Id, $Tail })
+    return $Lines
+}
+
 # The last lines of a run in which the billing download of one or more
 # subscriptions failed or stopped part-way: each subscription, then $Advice
 # (the command that collects them again). Shared by Run-AllSubscriptions.ps1

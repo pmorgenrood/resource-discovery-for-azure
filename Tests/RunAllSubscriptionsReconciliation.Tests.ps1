@@ -199,10 +199,22 @@ Describe 'FAILED (consumption) lines of the wrapper' {
 
     It 'names each failed subscription once, without the sign-in entry, with the command that collects it again' {
         Get-ConsumptionFailedAdvice -Entries $script:Failures -TenantID 'tenant-1' | Should -Be @(
-            'To collect one again, run:'
+            'To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.'
             '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-a'
             '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-b'
         )
+    }
+
+    It 'carries the wrapper''s -SkipMetrics and -Obfuscate, and says where the masked run''s dictionary is' {
+        $Lines = @(Get-ConsumptionFailedAdvice -Entries @($script:Failures[1]) -TenantID 'tenant-1' -SkipMetrics -Obfuscate)
+        $Lines[1] | Should -BeLike '*-ObfuscationDictionary*report folder*'
+        $Lines[2] | Should -Be '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-a -SkipMetrics -Obfuscate'
+    }
+
+    It 'gives a direct run''s command its resource group, services and dictionary, quoted' {
+        $Lines = @(Get-ConsumptionRetryAdvice -Entries @($script:Failures[1]) -TenantID 'tenant-1' -ResourceGroup 'rg-one' -Service 'VM', 'Storage' -Obfuscate -DictionaryFile '/out/it''s here/ObfuscationDictionary_x.json')
+        $Lines.Count | Should -Be 2
+        $Lines[1] | Should -Be "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID sub-a -ResourceGroup 'rg-one' -Service 'VM','Storage' -Obfuscate -ObfuscationDictionary '/out/it''s here/ObfuscationDictionary_x.json'"
     }
 
     It 'says nothing when only the sign-in entry is there' {
@@ -211,7 +223,7 @@ Describe 'FAILED (consumption) lines of the wrapper' {
 
     It 'is printed by the wrapper and sets its exit code' {
         $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Wrapper | Should -Match ([regex]::Escape('Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -TenantID $TenantID)'))
+        $Wrapper | Should -Match ([regex]::Escape('Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -TenantID $TenantID -SkipMetrics:$SkipMetrics -Obfuscate:$Obfuscate)'))
         $Wrapper | Should -Match ([regex]::Escape('-ConsumptionFailed (@(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0)'))
     }
 }
