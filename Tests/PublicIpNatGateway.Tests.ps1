@@ -102,6 +102,14 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResourceType | Should -BeExactly 'networkInterfaces'
     }
 
+    It 'writes the masked id of the NIC, not of its ipConfiguration, when the dictionary has both' {
+        $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
+        $Dict = New-Dictionary -Map @{ $NicId = $script:MaskedNic; $script:NicCfgId = "$($script:MaskedNic)/ipConfigurations/prod_eeeeeeee-1111-4222-8333-444444444444" }
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId }) -NoNatGateway) -Dictionary $Dict)[0]
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedNic -Because 'AssociatedResourceType names the NIC, so the link is the NIC'
+        $Row.AssociatedResourceType | Should -BeExactly 'networkInterfaces'
+    }
+
     It 'finds the masked id of the NIC when the ipConfiguration id differs from the NIC key only in letter case' {
         $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
         $Dict = New-Dictionary -Map @{ $NicId = $script:MaskedNic }

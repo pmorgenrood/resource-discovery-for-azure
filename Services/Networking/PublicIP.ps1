@@ -11,16 +11,16 @@ if ($Task -eq 'Processing')
         # The linked resource's masked id from the run's dictionary, which is keyed by
         # resource id as Resource Graph wrote it. An ipConfiguration id is a child
         # id (.../networkInterfaces/<nic>/ipConfigurations/<cfg>), so its parent
-        # resource, the first 9 segments, is looked up too: that is the resource
-        # a plain run names. Azure ids ignore letter case, so an id that misses
+        # resource, the first 9 segments, is looked up first: that is the
+        # resource a plain run names and AssociatedResourceType gives; the child
+        # id itself only after it. Azure ids ignore letter case, so an id that misses
         # is looked up again, ignoring case, in a copy of the dictionary made on
         # the first miss. No masked id is found: 'obfuscated'.
         $IgnoreCase = @{ Map = $null }
         $GetLinkMaskedId = {
             param([string]$Id)
-            $Ids = @($Id)
             $IdParts = $Id.Split('/')
-            if ($IdParts.Count -gt 9) { $Ids += ($IdParts[0..8] -join '/') }
+            $Ids = if ($IdParts.Count -gt 9) { @(($IdParts[0..8] -join '/'), $Id) } else { @($Id) }
             foreach ($Candidate in $Ids) { if ($ResourceIdDictionary.ContainsKey($Candidate)) { return $ResourceIdDictionary[$Candidate] } }
             if ($null -eq $IgnoreCase.Map)
             {
