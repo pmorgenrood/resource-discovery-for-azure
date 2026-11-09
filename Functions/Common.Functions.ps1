@@ -368,9 +368,13 @@ function Get-MetricsRetryCommand
 # in the entry's report folder under $ReportRoot (the wrapper). When it cannot
 # be found a line says so. One line says which zip the new zip replaces in the
 # upload, after a plain run too: uploading both counts the resources twice.
+# With -NoAllSubscriptionsZip (the wrapper exits before it makes its outer
+# zip) that line names the subscription's zip in its report folder instead.
+# After a run that signed in with -Appid, one line says to add -Appid and
+# -Secret, since the commands hold neither; their values are never written.
 function Write-MetricsIncompleteRunEnd
 {
-    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot)
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot, [switch]$NoAllSubscriptionsZip)
 
     $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
     if ($List.Count -eq 0) { return $false }
@@ -418,7 +422,15 @@ function Write-MetricsIncompleteRunEnd
         $Advice.Add('  ' + (Get-MetricsRetryCommand -TenantID $TenantID -SubscriptionId '' -RunParameters $RunParameters -DictionaryFile $Dict))
     }
     foreach ($Line in $NotFound) { $Advice.Add($Line) }
-    if ($Wrapper)
+    if ($null -ne $RunParameters -and @($RunParameters.Keys) -contains 'Appid' -and -not [string]::IsNullOrEmpty([string]$RunParameters['Appid']))
+    {
+        $Advice.Add('  The first run signed in with -Appid: add -Appid <id> -Secret <secret> to sign in the same way.')
+    }
+    if ($Wrapper -and $NoAllSubscriptionsZip)
+    {
+        $Advice.Add("  Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice.")
+    }
+    elseif ($Wrapper)
     {
         $Advice.Add("  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice.")
     }

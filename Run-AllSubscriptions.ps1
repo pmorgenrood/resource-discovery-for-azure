@@ -1698,8 +1698,9 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         }
         Write-UnwrittenReportZips -Unwritten $Global:RdaUnwrittenReportZips
         # This early exit skips the end of the run, so the FAILED (metrics)
-        # lines are printed here too.
-        $null = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough -ReportRoot $InventoryRoot
+        # lines are printed here too. No AllSubscriptions zip is made, so they
+        # name each subscription's zip in its report folder.
+        $null = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough -ReportRoot $InventoryRoot -NoAllSubscriptionsZip
         Exit-Wrapper -Code 2
     }
     Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {0} successful sub(s))" -f $ActualZipCount) -ForegroundColor Green

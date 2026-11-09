@@ -151,6 +151,8 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
         $script:WholeZip = '  The new zip replaces the whole first zip in the upload: upload it instead of the first one, not as well, or every resource is counted twice.'
         $script:SubZip = "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
         $script:InnerZip = "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
+        $script:FolderZip = "  Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice."
+        $script:SignInLine = '  The first run signed in with -Appid: add -Appid <id> -Secret <secret> to sign in the same way.'
     }
     BeforeEach {
         $script:Lines = [System.Collections.Generic.List[string]]::new()
@@ -195,6 +197,33 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
         $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-3 -ConcurrencyLimit 6'
         $script:Lines | Should -Contain $script:InnerZip
         $script:Lines | Should -Not -Contain $script:SubZip
+        $script:Lines | Should -Not -Contain $script:FolderZip
+    }
+
+    It 'says the new zip replaces that subscription''s zip in its report folder when the wrapper made no outer zip' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ ConcurrencyLimit = 6 } -ReportRoot (Join-Path $TestDrive 'no-reports') -NoAllSubscriptionsZip
+
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+        $script:Lines | Should -Contain $script:FolderZip
+        $script:Lines | Should -Not -Contain $script:InnerZip
+    }
+
+    It 'says to add -Appid and -Secret, with neither value, after a run that signed in with them (<Kind>)' -ForEach @(
+        @{ Kind = 'one command'; Run = @{} },
+        @{ Kind = 'one command per subscription'; Run = @{ SubscriptionID = 'id-2' } }
+    ) {
+        $Secret = ConvertTo-SecureString 'not-a-real-value' -AsPlainText -Force
+        $Given = @{ Appid = 'app-1'; Secret = $Secret } + $Run
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters $Given
+
+        $script:Lines | Should -Contain $script:SignInLine
+        @($script:Lines | Where-Object { $_ -like '*./ResourceInventory.ps1*' -and $_ -match 'Appid|Secret' }).Count | Should -Be 0
+        ($script:Lines -join "`n") | Should -Not -Match 'app-1|not-a-real-value'
+    }
+
+    It 'adds no sign-in line after a run that did not sign in with -Appid' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ SubscriptionID = 'id-2' }
+        $script:Lines | Should -Not -Contain $script:SignInLine
     }
 }
 
@@ -270,7 +299,11 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result.ExitCode | Should -Be 3
         $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
         $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
-        ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
+        # It says how to sign in the same way, with neither value.
+        $Result.Lines | Should -Contain '  The first run signed in with -Appid: add -Appid <id> -Secret <secret> to sign in the same way.'
+        ($Result.Lines -join "`n") | Should -Not -Match 'not-a-real-value|app-1'
+        @($Result.Lines | Where-Object { $_ -like '*./ResourceInventory.ps1*' -and $_ -match 'Appid|Secret' }).Count | Should -Be 0
+        @($Result.Lines | Where-Object { $_ -match 'Secret' -and $_ -ne '  The first run signed in with -Appid: add -Appid <id> -Secret <secret> to sign in the same way.' }).Count | Should -Be 0
     }
 
     It 'prints the command with the run''s lookback, resource group, services, report name and output folder' {
@@ -777,6 +810,9 @@ Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
         $Lines | Should -Contain '=================== FAILED (metrics) ==================='
         $Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
         [array]::IndexOf($Lines, '=================== FAILED (metrics) ===================') | Should -BeLessThan ([array]::IndexOf($Lines, 'EXIT=2'))
+        # No AllSubscriptions zip is made on this exit, so it is not named as one to change.
+        $Lines | Should -Contain "  Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice."
+        @($Lines | Where-Object { $_ -like "*inner zip in the AllSubscriptions_ResourcesReport_*" }).Count | Should -Be 0
     }
 
     It 'prints no FAILED (metrics) lines when the metrics are complete' {
