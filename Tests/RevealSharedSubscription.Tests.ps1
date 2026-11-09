@@ -240,9 +240,43 @@ Describe 'Reveal.ps1 with two reports of the same stamp and different subscripti
     }
 
     It 'ships both reports of the stamp under distinct names, each with its own values' {
-        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000dddd.zip', 'ResourcesReport_20260101000000001eeee.zip', 'second_ResourcesReport_20260101000000000dddd.zip')
+        Get-ZipNames $script:Run.Bundle | Should -Be @('2_ResourcesReport_20260101000000000dddd.zip', 'ResourcesReport_20260101000000000dddd.zip', 'ResourcesReport_20260101000000001eeee.zip')
         Get-InnerText (Join-Path $script:Run.Staging 'ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-a'
-        Get-InnerText (Join-Path $script:Run.Staging 'second_ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-b'
+        Get-InnerText (Join-Path $script:Run.Staging '2_ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-b'
+    }
+
+    It 'never puts a source folder''s name in the bundle''s entry names' {
+        foreach ($Entry in (Get-ZipNames $script:Run.Bundle))
+        {
+            foreach ($FolderName in @('first', 'second', 'third')) { $Entry | Should -Not -Match $FolderName }
+        }
+    }
+}
+
+# A folder's name can hold a real customer or resource name, so it must not
+# name an inner zip in the bundle. Three reports of one stamp, in folders named
+# like that, ship under numbered names in folder order.
+Describe 'Reveal.ps1 with three reports of the same stamp in folders with telling names' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'samestampnames'
+        $script:SubD = '00000000-0000-0000-0000-00000000000d'
+        Add-Report -Folder (Join-Path $script:Root 'contoso-copy') -Stamp '20260101000000000dddd' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a')
+        Add-Report -Folder (Join-Path $script:Root 'fabrikam-prod') -Stamp '20260101000000000dddd' -Subs @(New-Sub -Id $script:SubB -RgName 'rg-b')
+        Add-Report -Folder (Join-Path $script:Root 'northwind-db01') -Stamp '20260101000000000dddd' -Subs @(New-Sub -Id $script:SubD -RgName 'rg-d')
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'samestampnames'
+    }
+
+    It 'ships all three under numbered names with no folder name in them' {
+        $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
+        $Names = @(Get-ZipNames $script:Run.Bundle)
+        $Names | Should -Be @('2_ResourcesReport_20260101000000000dddd.zip', '3_ResourcesReport_20260101000000000dddd.zip', 'ResourcesReport_20260101000000000dddd.zip')
+        foreach ($Entry in $Names)
+        {
+            foreach ($Word in @('contoso', 'fabrikam', 'northwind')) { $Entry | Should -Not -Match $Word }
+        }
+        Get-InnerText (Join-Path $script:Run.Staging 'ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-a'
+        Get-InnerText (Join-Path $script:Run.Staging '2_ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-b'
+        Get-InnerText (Join-Path $script:Run.Staging '3_ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-d'
     }
 }
 

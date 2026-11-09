@@ -45,8 +45,8 @@
     pointing at one run's folders, or move the extra report away. Every
     report whose subscriptions are in no other report is still revealed and
     shipped. Two such reports with the same file name (the same stamp in two
-    folders) both ship: the later one by folder name goes in the bundle as
-    <folder>_ResourcesReport_<stamp>.zip.
+    folders) both ship: the later ones by folder name go in the bundle as
+    2_ResourcesReport_<stamp>.zip, 3_ResourcesReport_<stamp>.zip and so on.
     Each report's subscriptions are read from the real ids in its dictionary,
     and from the name of the DebugLog_ or ErrorLog_ file its run wrote into
     the inventory root (DebugLog_ResourcesReport_<stamp>_<subscription id>.log).
@@ -761,12 +761,17 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
     {
         # Two selected reports with the same file name (the same stamp in two
         # folders, for example a copied folder, with different
-        # subscriptions). Both ship: the later one, by folder name, goes in
-        # under its folder name and its own name, so neither overwrites the
-        # other. Such a name never starts with 'ResourcesReport_', so it
-        # cannot be another report's own name.
-        $OutName = $Folder + '_' + $Zip.Name
-        $null = $UsedOutNames.Add($OutName)
+        # subscriptions). Both ship: the later ones, by folder name, go in
+        # as 2_<name>, 3_<name> and so on, so neither overwrites the other.
+        # The number is not taken from the folder's name, which can hold a
+        # real customer or resource name. Such a name never starts with
+        # 'ResourcesReport_', so it cannot be another report's own name.
+        $Copy = 2
+        do
+        {
+            $OutName = ('{0}_{1}' -f $Copy, $Zip.Name)
+            $Copy++
+        } while (-not $UsedOutNames.Add($OutName))
     }
     $OutPath = Join-Path $StagingDirectory $OutName
     $SourceSha256 = Get-RevealFileSha256 $Zip.FullName
