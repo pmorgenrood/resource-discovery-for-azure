@@ -1107,8 +1107,26 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             script:New-Row -Sub $script:SubB -Rg 'test-data' -Type 'microsoft.network/privatednszones' -Name 'privatelink.blob.core.windows.net' -Child '/virtualnetworklinks/link1'
         ) | Sort-Object { $_.id.ToLowerInvariant() }
 
-        # Runs discovery and the token loop once. Resource Graph is a stand-in
-        # that answers from AllRows by the query's type filter.
+        # The resource group a ResourceGroup-scope run reads.
+        $script:ScopeRg = 'prod-app'
+        # The rows of AllRows one scope holds: Tenant is every subscription of
+        # the run, Subscription is SubA (as the wrapper's -SubscriptionID run),
+        # ResourceGroup is ScopeRg in SubA (a direct -ResourceGroup run).
+        function script:Get-ScopeRow
+        {
+            param([string]$Scope)
+            switch ($Scope)
+            {
+                'Tenant' { @($script:AllRows) }
+                'Subscription' { @($script:AllRows | Where-Object { $_.subscriptionId -eq $script:SubA }) }
+                'ResourceGroup' { @($script:AllRows | Where-Object { $_.subscriptionId -eq $script:SubA -and $_.resourceGroup -eq $script:ScopeRg }) }
+                default { throw "Unknown scope $Scope." }
+            }
+        }
+
+        # Runs discovery and the token loop once at the given scope. Resource
+        # Graph is a stand-in that answers from AllRows by the query's type
+        # filter, subscriptions and resourceGroup clause.
         function script:Invoke-Discovery
         {
             # The lifted Variables, ResourceInventoryLoop and RunInventorySetup
@@ -1119,7 +1137,7 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'RunAllSubs', Justification = 'Read by the lifted ResourceInventoryLoop through dynamic scope.')]
             [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ResourceGroup', Justification = 'Read by the lifted ResourceInventoryLoop through dynamic scope.')]
             [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ObfuscationDictionary', Justification = 'Read by the lifted RunInventorySetup statements through dynamic scope.')]
-            param([switch]$Obfuscate, [switch]$Include, [string]$FailToken = '')
+            param([switch]$Obfuscate, [switch]$Include, [string]$FailToken = '', [ValidateSet('Tenant', 'Subscription', 'ResourceGroup')][string]$Scope = 'Tenant')
             $script:Sent = [System.Collections.Generic.List[object]]::new()
             $script:FailTokenMode = $FailToken
             Mock -CommandName Invoke-AzGraphQuerySafe -MockWith {
@@ -1129,6 +1147,7 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
                 elseif ($Query -match ' \| where type in~ \(') { @($script:AllRows | Where-Object { & $IsNet $_ }) }
                 else { @($script:AllRows) }
                 $Rows = @($Rows | Where-Object { @($SubscriptionId) -contains $_.subscriptionId })
+                if ($Query -match "resourceGroup == '([^']*)'") { $Rg = $Matches[1]; $Rows = @($Rows | Where-Object { $_.resourceGroup -eq $Rg }) }
                 if ($Query -match 'summarize count\(\) by type$')
                 {
                     return [pscustomobject]@{ data = @($Rows | Group-Object type | ForEach-Object { [pscustomobject]@{ type = $_.Group[0].type; count_ = $_.Count } }) }
@@ -1147,8 +1166,8 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             $ReportName = 'ResourcesReport'
             $IncludeNetworkResources = [switch]$Include.IsPresent
             $RunAllSubs = [switch]$true
-            $SubscriptionID = ''
-            $ResourceGroup = ''
+            $SubscriptionID = if ($Scope -eq 'Tenant') { '' } else { $script:SubA }
+            $ResourceGroup = if ($Scope -eq 'ResourceGroup') { $script:ScopeRg } else { '' }
             $ObfuscationDictionary = ''
             Variables
             $Global:Subscriptions = @([pscustomobject]@{ id = $script:SubA; name = 'Contoso Prod' }, [pscustomobject]@{ id = $script:SubB; name = 'Contoso Test' })
@@ -1207,9 +1226,19 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         Remove-Variable -Scope Global -Name ResourceIdDictionary, ResourceNameDictionary, ResourceSubscriptionDictionary, ResourceResourceGroupDictionary, TagValueDictionary, FreeTextDictionary, ResourceContainers, ReportName, Version, RawRepo, TableStyle -ErrorAction SilentlyContinue
     }
 
-    It 'gives every id, name, subscription and resource group entry the run without the skip gave, with the same token shapes' {
-        $Before = script:Invoke-Discovery -Obfuscate -Include
-        $After = script:Invoke-Discovery -Obfuscate
+    It 'gives every id, name, subscription and resource group entry the run without the skip gave, with the same token shapes, at <Scope> scope' -TestCases @(
+        @{ Scope = 'ResourceGroup' }
+        @{ Scope = 'Subscription' }
+        @{ Scope = 'Tenant' }
+    ) {
+        $Before = script:Invoke-Discovery -Obfuscate -Include -Scope $Scope
+        $After = script:Invoke-Discovery -Obfuscate -Scope $Scope
+        # Both runs hold exactly the rows of this scope, the skipped network
+        # rows included: none missing and none from outside the scope.
+        $Expected = @(script:Get-ScopeRow -Scope $Scope | ForEach-Object { $_.id } | Sort-Object)
+        @($Expected | Where-Object { $script:NetTypes -contains (Get-RdaResourceTypeFromId -Id $_) }).Count | Should -BeGreaterThan 0 -Because 'the scope holds skipped rows'
+        @($Before.Ids.Keys | Sort-Object) | Should -Be $Expected -Because "the full pull at $Scope scope holds every row of the scope"
+        @($After.Ids.Keys | Sort-Object) | Should -Be $Expected -Because "the id query at $Scope scope gives the skipped rows of the scope, and no others"
         $BeforeIds = script:Get-CanonicalIdMap $Before.Ids
         $AfterIds = script:Get-CanonicalIdMap $After.Ids
         @($AfterIds.Keys) | Should -Be @($BeforeIds.Keys)
@@ -1221,9 +1250,12 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             foreach ($K in $B.Keys) { $A[$K] | Should -Be $B[$K] }
         }
         # The kept child of a skipped parent keeps its masked id, and its
-        # parent's id stays in the dictionary.
-        @($After.Ids.Keys | Where-Object { $_ -like '*/connectionmonitors/cm1' }).Count | Should -Be 1
-        @($After.Ids.Keys | Where-Object { $_ -like '*/networkwatchers/nw-westeurope' }).Count | Should -Be 1
+        # parent's id stays in the dictionary (both are outside ScopeRg).
+        if ($Scope -ne 'ResourceGroup')
+        {
+            @($After.Ids.Keys | Where-Object { $_ -like '*/connectionmonitors/cm1' }).Count | Should -Be 1
+            @($After.Ids.Keys | Where-Object { $_ -like '*/networkwatchers/nw-westeurope' }).Count | Should -Be 1
+        }
     }
 
     It 'leaves the skipped rows out of the pull, the count and everything the collectors read' {
@@ -1238,18 +1270,26 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         $script:InventoryAst.Extent.Text | Should -Not -Match '\$Global:Resources\s*\+=\s*\$TokenResult'
     }
 
-    It 'asks for the id and only the fields the token loop reads, with the pull''s scope, paging order and lower case' {
-        $After = script:Invoke-Discovery -Obfuscate
+    It 'asks for the id and only the fields the token loop reads, with the pull''s scope, paging order and lower case, at <Scope> scope' -TestCases @(
+        @{ Scope = 'ResourceGroup'; Subs = @('11111111-1111-1111-1111-111111111111') }
+        @{ Scope = 'Subscription'; Subs = @('11111111-1111-1111-1111-111111111111') }
+        @{ Scope = 'Tenant'; Subs = @('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222') }
+    ) {
+        $After = script:Invoke-Discovery -Obfuscate -Scope $Scope
         $Token = @($After.Sent | Where-Object { $_.Query -match '\| project id,name,resourceGroup,subscriptionId \|' })
         $Token.Count | Should -Be 1
-        $Page = @($After.Sent | Where-Object { $_.Query -match '\| project id,name,type,' })[0]
+        $Page = @($After.Sent | Where-Object { $_.Query -match '\| project id,name,type,' })
+        $Page.Count | Should -Be 1 -Because "the pull at $Scope scope finds rows"
         $Token[0].Query | Should -Match '\| order by tolower\(id\) asc$'
         $Token[0].Query | Should -Not -Match 'properties \|'
         $Token[0].Lowercase | Should -BeTrue
         $Token[0].HideRawOutput | Should -BeTrue
-        @($Token[0].SubscriptionId) | Should -Be @($Page.SubscriptionId)
+        @($Page[0].SubscriptionId) | Should -Be $Subs -Because "the pull at $Scope scope names these subscriptions"
+        @($Token[0].SubscriptionId) | Should -Be @($Page[0].SubscriptionId)
         # Same where as the pull, the opposite type filter.
-        ($Token[0].Query -replace ' \| where type in~ .*$', '') | Should -Be ($Page.Query -replace ' \| where type !in~ .*$', '')
+        ($Token[0].Query -replace ' \| where type in~ .*$', '') | Should -Be ($Page[0].Query -replace ' \| where type !in~ .*$', '')
+        if ($Scope -eq 'ResourceGroup') { $Token[0].Query | Should -Match ("^resources \| where resourceGroup == '{0}' and " -f $script:ScopeRg) }
+        else { $Token[0].Query | Should -Not -Match 'resourceGroup ==' }
         @(Get-RdaNetworkTokenField) | Should -Be @('id', 'name', 'resourceGroup', 'subscriptionId')
     }
 
