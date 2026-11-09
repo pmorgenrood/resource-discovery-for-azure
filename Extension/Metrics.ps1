@@ -1542,23 +1542,29 @@ function Add-MetricRecord
                 }
 
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
-                # metric name is not valid for the resource. The status code and the message
-                # of the exception and of every exception it wraps are checked, because an
-                # outer exception can report a different status than the 400 it wraps.
+                # metric name is not valid for the resource. The status code of the exception
+                # and of every exception it wraps is read first, because an outer exception can
+                # report a different status than the 400 it wraps. Only when no exception in the
+                # chain carries a status are the messages of the same chain read.
                 function Test-MetricBadRequest
                 {
                     param([System.Exception]$Exception)
 
-                    foreach ($Ex in (Get-MetricExceptionChain -Exception $Exception))
+                    $Chain = Get-MetricExceptionChain -Exception $Exception
+                    $SawStatus = $false
+                    foreach ($Ex in $Chain)
                     {
-                        if ((Get-MetricExceptionStatus -Ex $Ex) -in @('400', 'BadRequest'))
+                        $Status = Get-MetricExceptionStatus -Ex $Ex
+                        if ($null -ne $Status)
                         {
-                            return $true
+                            $SawStatus = $true
+                            if ($Status -in @('400', 'BadRequest')) { return $true }
                         }
-                        if ([string]$Ex.Message -match 'BadRequest')
-                        {
-                            return $true
-                        }
+                    }
+                    if ($SawStatus) { return $false }
+                    foreach ($Ex in $Chain)
+                    {
+                        if ([string]$Ex.Message -match 'BadRequest') { return $true }
                     }
                     return $false
                 }
