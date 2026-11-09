@@ -18,7 +18,7 @@ param ($TenantID,
     # Off by default. Whatever the batch cannot answer is collected with one
     # request per resource, so the records are the same.
     [switch]$UseMetricsBatch,
-    $ConcurrencyLimit = 6,
+    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
     $OutputDirectory,
