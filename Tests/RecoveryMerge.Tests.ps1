@@ -639,6 +639,24 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $C.Output | Should -BeFalse
     }
 
+    It 'advises, when only the recovery has a dictionary, a plain recovery re-run first and a gap re-run seeded with the recovery dictionary second' {
+        $C = New-Case
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+        $RecDictPath = (Get-ChildItem -LiteralPath $C.Recovery -Filter 'ObfuscationDictionary_*.json').FullName
+
+        $Message = $null
+        try { $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue }
+        catch { $Message = $_.Exception.Message }
+
+        $Message | Should -Not -BeNullOrEmpty
+        $Message | Should -BeLike '*re-run the recovery without -Obfuscate into a new folder*'
+        $Message | Should -BeLike ("*re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'*" -f $RecDictPath)
+        $Message.IndexOf('re-run the recovery without -Obfuscate') | Should -BeLessThan $Message.IndexOf('re-run the gap with -Obfuscate')
+        $Message | Should -Not -BeLike '*re-run the gap bundle with -Obfuscate,*' -Because 'a gap re-run with -Obfuscate alone mints new tokens and leads into the shared-token stop'
+    }
+
     It 'merges on the next run once the recovery is re-run without -Obfuscate into a new folder' {
         $C = New-Case
         $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
