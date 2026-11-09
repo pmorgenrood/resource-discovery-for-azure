@@ -513,9 +513,12 @@ function Get-FailedAttempts
     }
 }
 
+# -PassThru returns $true when the file was written and $false when it was
+# not (the warning is printed either way), for a caller that must keep other
+# state until this file holds it.
 function Save-CompletedSubscriptionIds
 {
-    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @())
+    param([string]$Path, [string]$Tenant, [string[]]$Ids, $FailedAttempts = @(), [switch]$PassThru)
 
     $State = [pscustomobject]@{
         TenantID                  = $Tenant
@@ -544,6 +547,7 @@ function Save-CompletedSubscriptionIds
         # move below never puts it over the good state.
         $State | ConvertTo-Json -Depth 4 | Set-Content -Path $TmpPath -Encoding utf8 -ErrorAction Stop
         [System.IO.File]::Move($TmpPath, $Path, $true)
+        if ($PassThru) { return $true }
     }
     catch
     {
@@ -552,7 +556,15 @@ function Save-CompletedSubscriptionIds
         $StateError = $_
         try { Write-Host ('WARNING: Failed to persist resume state to {0}: {1}' -f $Path, $StateError) -ForegroundColor Yellow }
         catch { $null = $_ }
-        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
+        # Only a temp FILE is removed. A folder in the way is left as it is:
+        # Remove-Item on a folder with files asks to confirm, which throws in
+        # a run with no console.
+        if (Test-Path -LiteralPath "$Path.tmp" -PathType Leaf)
+        {
+            try { Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction Stop }
+            catch { $null = $_ }
+        }
+        if ($PassThru) { return $false }
     }
 }
 
@@ -840,10 +852,13 @@ function Write-StreamState
     catch
     {
         # A failed write (the folder is gone) must stop here, or it is a silent
-        # non-terminating error and this warning never runs. A subscription
-        # that worked is then not on file, so the next -Resume runs it again;
-        # one that failed is still in the stream summary's Failed rows, which
-        # the wrapper adds to the resume state for -ResumeFailedOnly.
+        # non-terminating error and this warning never runs. The wrapper then
+        # takes the subscription from the stream summary: one that worked is in
+        # its success rows, which clear its failure entry so -ResumeFailedOnly
+        # does not run it again; one that failed is in its Failed rows, which
+        # the wrapper adds to the resume state for -ResumeFailedOnly. Should
+        # the stream stop before its summary, the next -Resume runs a
+        # subscription that worked again.
         # Its own guard, as in Save-CompletedSubscriptionIds.
         $StateError = $_.Exception.Message
         try { Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $StateError) 'Yellow' }
@@ -869,7 +884,9 @@ function Write-StreamState
 #   ConsumptionRecords     absent, or a whole number of 0 or more
 #   ConsumptionFailedSubs, MetricsFailedSubs, CollectorFailures
 #                          absent, or lists of rows: Id text; Name, Message
-#                          and Module text or empty when present
+#                          and Module text or empty when present;
+#                          SubscriptionId text, not empty, on a sign-in
+#                          ('(auth)') row, else text or empty when present
 #   Status, Reason         absent, or text
 # and it holds a row (ResourceCounts or Failed) for every subscription the
 # stream ran this time (-ExpectedIds). Returns Accepted $true with the checked
@@ -985,7 +1002,10 @@ function Resolve-StreamSummary
         $ConsumptionRecords = [int]$RecordsField.Value
     }
 
-    # The health lists: the wrapper reads Id, Name, Message and Module.
+    # The health lists: the wrapper reads Id, Name, Message, Module and
+    # SubscriptionId (the sign-in skips are counted once per SubscriptionId of
+    # the '(auth)' rows, so a stream's '(auth)' row, made for one
+    # subscription, must name it).
     $Health = @{}
     foreach ($Name in @('ConsumptionFailedSubs', 'MetricsFailedSubs', 'CollectorFailures'))
     {
@@ -1000,9 +1020,15 @@ function Resolve-StreamSummary
                     $Value = & $Field $Row $Text
                     if ($null -ne $Value -and -not (& $IsTextOrEmpty $Value.Value)) { return $true }
                 }
+                $SubscriptionId = & $Field $Row 'SubscriptionId'
+                if ($Id.Value -eq '(auth)')
+                {
+                    if ($null -eq $SubscriptionId -or -not (& $IsText $SubscriptionId.Value) -or $SubscriptionId.Value -eq '') { return $true }
+                }
+                elseif ($null -ne $SubscriptionId -and -not (& $IsTextOrEmpty $SubscriptionId.Value)) { return $true }
                 $false
             }).Count
-        if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its {1} row(s) have no Id, or a Name, Message or Module that is not text' -f $BadRows, $Name)) }
+        if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its {1} row(s) have no Id, a Name, Message, Module or SubscriptionId that is not text, or are a sign-in row with no SubscriptionId' -f $BadRows, $Name)) }
         $Health[$Name] = $Rows
     }
 
