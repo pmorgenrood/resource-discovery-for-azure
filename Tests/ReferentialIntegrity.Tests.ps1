@@ -380,6 +380,40 @@ Describe "Metric Per-Resource Cached Token" {
             if ($Names -gt 1 -or $Subs -gt 1 -or $Rgs -gt 1) { $Violations += $_.Name }
         }
         $Violations | Should -BeNullOrEmpty -Because "each obfuscated resource ID should map to a single Name/Subscription/ResourceGroup across its metric rows"
+        # And the other way: a grouping by ID alone passes when every metric
+        # row gets a new ID (one-row groups), so rows of one Name, group and
+        # subscription must also share one ID.
+        $Split = @()
+        $script:MetricRows | Where-Object { ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) } | Group-Object Name, ResourceGroup, Subscription | ForEach-Object {
+            if (@($_.Group.ID | Sort-Object -Unique).Count -gt 1) { $Split += $_.Name }
+        }
+        $Split | Should -BeNullOrEmpty -Because "metric rows of one Name/ResourceGroup/Subscription should carry one obfuscated resource ID"
+    }
+
+    It "Metric rows of an inventoried resource carry its inventory ID" {
+        if ($script:MetricRows.Count -eq 0) { Set-ItResult -Skipped -Because "no metric rows in this fixture"; return }
+        # A metric attaches by ID, else by Name and ResourceGroup (plus
+        # Subscription), so a metric row whose Name, group and subscription
+        # are an inventory row's must carry that row's ID (one of them, when
+        # rows such as a SQL VM and its VM share those tokens).
+        $IdsOf = @{}
+        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
+            @($_.Value) | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) } | ForEach-Object {
+                $Key = ('{0}|{1}|{2}' -f $_.Name, $_.ResourceGroup, $_.Subscription).ToLowerInvariant()
+                if (-not $IdsOf.ContainsKey($Key)) { $IdsOf[$Key] = @() }
+                $IdsOf[$Key] += [string]$_.ID
+            }
+        }
+        $Checked = 0
+        foreach ($m in $script:MetricRows)
+        {
+            if ([string]::IsNullOrEmpty($m.ID) -or [string]::IsNullOrEmpty($m.Name)) { continue }
+            $Key = ('{0}|{1}|{2}' -f $m.Name, $m.ResourceGroup, $m.Subscription).ToLowerInvariant()
+            if (-not $IdsOf.ContainsKey($Key)) { continue }
+            $Checked++
+            ($IdsOf[$Key] -contains [string]$m.ID) | Should -BeTrue -Because "metric '$($m.Metric)' of '$($m.Name)' should carry its inventory row's ID, not '$($m.ID)'"
+        }
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no metric row names an inventoried resource' }
     }
 
     It "Metric rows for resources absent from the main dictionary still carry a cached per-resource token" {
