@@ -40,10 +40,16 @@
     token with the report folders that hold it, counted as failed, and the run
     exits non-zero. Pass -InventoryRoot pointing at one run's folders, or move
     the extra report away. Every subscription with exactly one report is still
-    revealed and shipped. A report whose dictionary names no subscription (a
-    subscription with no resources has an empty dictionary) cannot be matched,
-    so it is revealed on its own, even beside an older report of the same
-    subscription.
+    revealed and shipped. Each report's subscriptions are read from the real
+    ids in its dictionary, and from the name of the DebugLog_ or ErrorLog_
+    file its run wrote into the inventory root
+    (DebugLog_ResourcesReport_<stamp>_<subscription id>.log). A subscription
+    with no resources has an empty dictionary, so it is matched by that log
+    alone. Limit: a report whose dictionary names no subscription and whose
+    log is not there (a run of ResourceInventory.ps1 without
+    Run-AllSubscriptions.ps1, which names its log by stamp only, or a log
+    that was deleted) cannot be matched, so it is revealed on its own, even
+    beside an older report of the same subscription.
 
     HANDLE WITH CARE. The output contains the real values you chose to reveal.
     Share it only with the party meant to ingest it. Dictionaries and any
@@ -494,11 +500,34 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 #    the run exits non-zero. The user passes -InventoryRoot pointing at one
 #    run's folders, or moves the extra report away. Every subscription with
 #    exactly one report is still revealed and shipped.
-# A report whose dictionary names no subscription (a subscription with no
-# resources has an empty dictionary) cannot be matched to one, so it is
-# revealed on its own. That is a limit: an older non-empty report of the same
-# subscription is then revealed beside it.
+# A report's subscriptions also come from the name of its run's DebugLog_ or
+# ErrorLog_ file in the inventory root (see $RunLogSubIds), so a report of a
+# subscription with no resources, whose dictionary is empty, is matched too.
+# Limit: a report whose dictionary names no subscription and that has no such
+# log (a run without Run-AllSubscriptions.ps1 names its log by stamp only, or
+# the log was deleted) cannot be matched to one, so it is revealed on its own,
+# and an older non-empty report of the same subscription is then revealed
+# beside it. Closing that would need the run to write its subscription
+# somewhere Reveal can read, which is a change to what the tool writes.
 $Candidates = [System.Collections.Generic.List[object]]::new()
+# The subscription each run was for, from the names of the local logs it
+# wrote. Under Run-AllSubscriptions.ps1 (-RunAllSubs) each
+# ResourceInventory.ps1 run writes DebugLog_<report>_<subscription id>.log, and
+# ErrorLog_<report>_<subscription id>.log when it logs an error, into the
+# parent of its report folder (the inventory root), where <report> is the
+# report zip's name without '.zip'. The run writes the debug log for every
+# subscription, also one with no resources, whose dictionary is empty and
+# names none. So an empty report is matched to its subscription when that
+# log is there.
+$RunLogSubIds = [System.Collections.Generic.Dictionary[string, object]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
+foreach ($Log in @(Get-ChildItem -LiteralPath $InventoryRoot -File -ErrorAction SilentlyContinue))
+{
+    if ($Log.Name -notmatch '^(?:DebugLog|ErrorLog)_(?<report>.+)_(?<sub>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.log$') { continue }
+    $ReportBase = $Matches['report']
+    if (-not $RunLogSubIds.ContainsKey($ReportBase)) { $RunLogSubIds[$ReportBase] = [System.Collections.Generic.List[string]]::new() }
+    $LogSubId = $Matches['sub'].ToLowerInvariant()
+    if (-not $RunLogSubIds[$ReportBase].Contains($LogSubId)) { $RunLogSubIds[$ReportBase].Add($LogSubId) }
+}
 foreach ($Folder in $Folders)
 {
     # The obfuscated per-sub reports, excluding any *_revealed.zip or
@@ -562,6 +591,11 @@ foreach ($Folder in $Folders)
         {
             $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message) }
             continue
+        }
+        # And the subscription the run's own logs name (see $RunLogSubIds).
+        if ($RunLogSubIds.ContainsKey($Zip.BaseName))
+        {
+            foreach ($LogSubId in $RunLogSubIds[$Zip.BaseName]) { $null = $SubIds.Add($LogSubId) }
         }
         $Candidates.Add([pscustomobject]@{
                 Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp

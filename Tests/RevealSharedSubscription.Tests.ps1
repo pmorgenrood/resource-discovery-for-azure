@@ -244,7 +244,8 @@ Describe 'Reveal.ps1 with one report per subscription' {
         Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000000aaaa') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a') -Consumption
         Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000001bbbb') -Stamp '20260101000000001bbbb' -Subs @(New-Sub -Id $script:SubB -RgName 'rg-b') -Consumption
         # A subscription with no resources: an empty dictionary names no
-        # subscription, so this report is revealed on its own.
+        # subscription, and here no run log names one either, so this report
+        # cannot be matched and is revealed on its own.
         Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000002cccc') -Stamp '20260101000000002cccc' -Empty
         $script:Run = Invoke-Reveal -Root $script:Root -Name 'clean'
     }
@@ -253,6 +254,64 @@ Describe 'Reveal.ps1 with one report per subscription' {
         $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
         Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001bbbb.zip', 'ResourcesReport_20260101000000002cccc.zip')
         $script:Run.Text | Should -Match 'Left out \(sub in >1 report\)\s+: 0'
+    }
+}
+
+# A subscription with no resources has an empty dictionary, which names no
+# subscription. Under Run-AllSubscriptions.ps1 its run still writes
+# DebugLog_ResourcesReport_<stamp>_<subscription id>.log (and ErrorLog_ the
+# same way when it logs an error) into the inventory root. Reveal read only the
+# dictionary, so a newer empty report of A shipped beside the older full
+# report of A with exit 0. It now reads the subscription from that log name.
+Describe 'Reveal.ps1 with an older report of a subscription and a newer empty report of it' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'emptyshared'
+        $script:AOld = New-Sub -Id $script:SubA -RgName 'rg-a-old'
+        $script:BOne = New-Sub -Id $script:SubB -RgName 'rg-b'
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000000aaaa') -Stamp '20260101000000000aaaa' -Subs @($script:AOld) -Consumption
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000001bbbb') -Stamp '20260101000000001bbbb' -Subs @($script:BOne) -Consumption
+        # The newer run of A found no resources: an empty dictionary, and the
+        # run's debug log in the root names A.
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260303000000000cccc') -Stamp '20260303000000000cccc' -Empty
+        [System.IO.File]::WriteAllText((Join-Path $script:Root ('DebugLog_ResourcesReport_20260303000000000cccc_' + $script:SubA + '.log')), "Service processing started`n")
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'emptyshared'
+    }
+
+    It 'ends with a non-zero exit' {
+        $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
+    }
+
+    It 'fails the subscription and names both reports that hold it' {
+        $Line = @(Get-FailLine $script:Run $script:AOld.SubToken)
+        $Line.Count | Should -Be 1 -Because $script:Run.Text
+        $Line[0] | Should -Match 'ResourcesReport20260101000000000aaaa/ResourcesReport_20260101000000000aaaa\.zip'
+        $Line[0] | Should -Match 'no subscription token in ResourcesReport20260303000000000cccc/ResourcesReport_20260303000000000cccc\.zip'
+    }
+
+    It 'leaves both reports out and still ships the other subscription' {
+        $script:Run.Text | Should -Match 'Left out \(sub in >1 report\)\s+: 2'
+        $script:Run.Text | Should -Match 'LEFT OUT: ResourcesReport20260303000000000cccc/ResourcesReport_20260303000000000cccc\.zip'
+        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000001bbbb.zip')
+    }
+
+    It 'never prints a real subscription id' {
+        $script:Run.Text | Should -Not -Match $script:SubA
+        $script:Run.Text | Should -Not -Match $script:SubB
+    }
+}
+
+Describe 'Reveal.ps1 with an empty report whose run log names a subscription no other report holds' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'emptyalone'
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000000aaaa') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a') -Consumption
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000001cccc') -Stamp '20260101000000001cccc' -Empty
+        [System.IO.File]::WriteAllText((Join-Path $script:Root ('ErrorLog_ResourcesReport_20260101000000001cccc_' + $script:SubC + '.log')), "an error`n")
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'emptyalone'
+    }
+
+    It 'ships both reports and exits 0' {
+        $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
+        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001cccc.zip')
     }
 }
 
