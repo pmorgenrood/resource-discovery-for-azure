@@ -177,6 +177,30 @@ function Convert-RevealString
         })
 }
 
+# The value -Obfuscate writes for an id or name it could not mask: the word
+# 'obfuscated', or 'obfuscated_' + a GUID. It has no dictionary entry.
+function Get-RevealSentinelPattern
+{
+    return 'obfuscated(?:_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?'
+}
+
+# Whether one scan window of a JSON member ends with a whole sentinel string
+# followed only by white space, so the ',' ']' or '}' that would make it a value
+# is not in the window yet. A match at the start of a window that is not the
+# member's start is skipped, as in Test-RevealSentinelInText.
+function Test-RevealJsonSentinelOpenAtEnd
+{
+    param([string] $Text, [bool] $AtStart)
+    if (-not $Text.Contains('obfuscated')) { return $false }
+    $Pattern = '(?<!\\)"' + (Get-RevealSentinelPattern) + '"\s*\z'
+    foreach ($M in [regex]::Matches($Text, $Pattern))
+    {
+        if ($M.Index -eq 0 -and -not $AtStart) { continue }
+        return $true
+    }
+    return $false
+}
+
 # Whether one scan window of a .json or .csv member holds the sentinel as a
 # WHOLE value: a JSON string value exactly equal to it, or a CSV cell exactly
 # equal to it (quoted or not). The bare word in other text (a longer string,
@@ -199,9 +223,7 @@ function Test-RevealSentinelInText
     )
     if (-not $Text.Contains('obfuscated')) { return $false }
 
-    # The value -Obfuscate writes for an id or name it could not mask: the word
-    # 'obfuscated', or 'obfuscated_' + a GUID. It has no dictionary entry.
-    $Sentinel = 'obfuscated(?:_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?'
+    $Sentinel = Get-RevealSentinelPattern
 
     if ($Kind -eq 'Json')
     {
@@ -288,6 +310,12 @@ function Test-RevealZipHasMaskedValue
                 $Kept = 0
                 $AtStart = $true
                 $QuotesBefore = [long]0
+                # JSON only: an earlier window ended with a whole sentinel
+                # string and white space, so whether it is a value depends on
+                # the first other character after it. The carry alone cannot
+                # hold that: white space longer than the carry pushes the
+                # string out of the next window.
+                $JsonOpen = $false
                 while ($true)
                 {
                     $Read = $Reader.ReadBlock($Buffer, $Kept, $ChunkLength)
@@ -300,11 +328,26 @@ function Test-RevealZipHasMaskedValue
                     $AtEnd = $Read -lt $ChunkLength
                     $Text = [string]::new($Buffer, 0, $Filled)
                     if ([regex]::IsMatch($Text, $TokenPattern)) { return $true }
+                    $NewIsBlank = $false
+                    if ($JsonOpen)
+                    {
+                        # The characters this window added after the carry.
+                        $Next = [regex]::Match($Text.Substring($Kept), '\S')
+                        if ($Next.Success)
+                        {
+                            if (@(',', ']', '}') -contains $Next.Value) { return $true }
+                        }
+                        else { $NewIsBlank = $true }
+                    }
                     if ($null -ne $Kind -and (Test-RevealSentinelInText -Text $Text -Kind $Kind -AtStart $AtStart -AtEnd $AtEnd -QuotesBefore $QuotesBefore))
                     {
                         return $true
                     }
                     if ($AtEnd) { break }
+                    if ($Kind -eq 'Json')
+                    {
+                        $JsonOpen = ($JsonOpen -and $NewIsBlank) -or (Test-RevealJsonSentinelOpenAtEnd -Text $Text -AtStart $AtStart)
+                    }
                     $Kept = [Math]::Min($CarryLength, $Filled)
                     if ($Kind -eq 'Csv')
                     {
