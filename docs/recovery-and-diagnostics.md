@@ -138,9 +138,11 @@ Behaviour:
   `ID`. Masked means a flat `prod_`/`nonprod_` token, or `obfuscated` or
   `obfuscated_<guid>` for an id that could not be masked (the flat forms this
   tool writes under `-Obfuscate` today), or an ARM path whose subscription,
-  resource group and every name segment after each provider namespace and
-  type, parent names such as a SQL server or a scale set included, are such
-  tokens (only the literal `$system` name may stay as Azure wrote it). One
+  resource group (when present) and last segment, the resource's own name,
+  are such tokens (the literal `$system` name may stay as Azure wrote it).
+  Parent names, such as the SQL server of a database or the scale set of a
+  scale set VM, are not checked, because the masked run masks only the last
+  name of an inventory id and keeps parent names as Azure wrote them. One
   plain id stops the merge, as does a bundle whose inventory records hold no
   token at all; the error names the file and the record, never the value. It
   also stops when a dictionary cannot be read. The error names the bundle to fix.

@@ -190,12 +190,15 @@ function Merge-RecoveryData
     #   'obfuscated' or 'obfuscated_<guid>' for an id that could not be
     #   masked. These are what this tool writes under -Obfuscate today (the
     #   owner kept these flat forms); keep accepting them.
-    # - an ARM path, the masked form an ARM-path masking writes: the
-    #   subscription, the resource group when present, and EVERY name segment
-    #   after each provider namespace/type pair (parent names such as a SQL
-    #   server or a scale set too, and the names after a nested '/providers/')
-    #   must each be a token. Namespace and type segments, and the literal
-    #   '$system' name, stay as Azure wrote them.
+    # - an ARM path whose subscription, resource group when present, and LAST
+    #   segment (the resource's own name) are each a token. That is the shape
+    #   this base's masked run writes for an inventory ID: it swaps in the
+    #   subscription and resource group tokens and replaces only the last
+    #   segment with the name token. Namespace and type segments, and the
+    #   literal '$system' name, stay as Azure wrote them.
+    #   shortcut: parent names are not checked because this base's masked run
+    #   keeps them real (ResourceInventory.ps1 masking of the inventory ID);
+    #   check every name once PR #53 lands.
     function Test-MergeMaskedId([string]$Value)
     {
         if ($Value -match $MergeWholeTokenPattern) { return $true }
@@ -206,16 +209,8 @@ function Merge-RecoveryData
         if ($IdRg -and $IdRg -notmatch $MergeWholeTokenPattern) { return $false }
         if ($IdProviders)
         {
-            # Each '/providers/' part is namespace/type/name[/type/name...]:
-            # the names sit at the even places from 2 on.
-            foreach ($ProviderPart in ($IdProviders.TrimEnd('/') -split '(?i)/providers/'))
-            {
-                $Parts = $ProviderPart -split '/'
-                for ($NameIndex = 2; $NameIndex -lt $Parts.Count; $NameIndex += 2)
-                {
-                    if ($Parts[$NameIndex] -ne '$system' -and $Parts[$NameIndex] -notmatch $MergeWholeTokenPattern) { return $false }
-                }
-            }
+            $LastName = ($IdProviders.TrimEnd('/') -split '/')[-1]
+            if ($LastName -ne '$system' -and $LastName -notmatch $MergeWholeTokenPattern) { return $false }
         }
         return $true
     }
@@ -745,9 +740,8 @@ function Merge-RecoveryData
         #    metric's ID. Masked means what Test-MergeMaskedId accepts: one
         #    flat token or 'obfuscated' (with or without a GUID), as this tool
         #    writes under -Obfuscate today, or an ARM path whose subscription,
-        #    resource group and every name segment, parents included, are
-        #    tokens. A side
-        #    whose inventory records hold no token at all is plain too. The
+        #    resource group and last name are tokens (parent names are not
+        #    checked; see Test-MergeMaskedId). A side whose inventory records hold no token at all is plain too. The
         #    error names the file and the record, never the value. ------------
         foreach ($Side in @(
                 @{ Label = 'gap'; Inventory = $GapInventory; Keys = $GapKeptKeys; InventoryFile = $GapInventoryFile },
