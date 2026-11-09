@@ -758,3 +758,31 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         @($Lines | Where-Object { $_ -like 'Free disk space: * MB at *' }).Count | Should -Be 1
     }
 }
+
+Describe 'Every resume state read and write of the wrapper uses the run''s own key' {
+    # A -SubscriptionID run keeps its own resume state, keyed by $ResumeKey. A
+    # state helper called with -Tenant $TenantID would read a one-subscription
+    # run's file as another tenant's (and write the tenant back into it). This
+    # also catches such a call that a later merge brings in.
+    It 'passes -Tenant $ResumeKey to every helper of Functions/RunAllSubscriptions.Functions.ps1 that reads or writes a state file' {
+        $Root = Split-Path $PSScriptRoot -Parent
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Functions/RunAllSubscriptions.Functions.ps1'), [ref]$null, [ref]$null)
+        $StateHelpers = @($FnAst.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object {
+                $Names = @($_.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+                $Names -contains 'Tenant' -and ($Names -contains 'Path' -or $Names -contains 'InventoryRoot')
+            } | ForEach-Object { $_.Name })
+        $StateHelpers | Should -Contain 'Get-CompletedSubscriptionIds'
+        $StateHelpers | Should -Contain 'Save-CompletedSubscriptionIds'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Calls = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $StateHelpers -contains $args[0].GetCommandName() }, $true))
+        $Calls.Count | Should -BeGreaterThan 5
+        $Wrong = foreach ($Call in $Calls)
+        {
+            $E = @($Call.CommandElements)
+            $Arg = $null
+            for ($i = 0; $i -lt $E.Count; $i++) { if ($E[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $E[$i].ParameterName -eq 'Tenant') { $Arg = if ($E[$i].Argument) { $E[$i].Argument.Extent.Text } elseif ($i + 1 -lt $E.Count) { $E[$i + 1].Extent.Text } } }
+            if ($Arg -ne '$ResumeKey') { '{0} (line {1}): -Tenant {2}' -f $Call.GetCommandName(), $Call.Extent.StartLineNumber, $Arg }
+        }
+        @($Wrong) | Should -BeNullOrEmpty
+    }
+}
