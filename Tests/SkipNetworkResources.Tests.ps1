@@ -1484,6 +1484,9 @@ Describe 'The wrapper reads each stream row''s skipped count through its summary
         @{ Label = 'a fraction'; Json = '1.5' }
     ) {
         param($Json)
-        (script:Read-RowSkipped $Json).Accepted | Should -BeFalse
+        $Read = script:Read-RowSkipped $Json
+        $Read.Accepted | Should -BeFalse
+        # Its own reason, not the one for a bad Count or Zip.
+        $Read.Reason | Should -Be '1 of its success row(s) have a Skipped that is not empty or a whole number of 0 or more'
     }
 }
