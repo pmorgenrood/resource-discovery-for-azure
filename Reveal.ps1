@@ -228,7 +228,9 @@ if (-not (Test-Path -LiteralPath $InventoryRoot -PathType Container))
 }
 # Canonicalize to an absolute path so the staging-directory exclusion compare
 # below is airtight even when the caller passes a relative -InventoryRoot.
-$InventoryRoot = (Resolve-Path -LiteralPath $InventoryRoot).Path
+# Also drop a trailing separator, so 'root/' and 'root' name the same root
+# (the staging mark below records it and is compared with it).
+$InventoryRoot = ConvertTo-RevealComparablePath (Resolve-Path -LiteralPath $InventoryRoot).Path
 
 $Timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 if ([string]::IsNullOrEmpty($StagingDirectory))
@@ -284,9 +286,19 @@ if (Test-Path -LiteralPath $StagingDirectory)
         try { $MarkedRoot = [string](Get-Content -LiteralPath $StagingMarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).InventoryRoot }
         catch { $MarkedRoot = $null }
     }
-    $MarkedForThisRoot = -not [string]::IsNullOrEmpty($MarkedRoot) -and [string]::Equals($MarkedRoot, $InventoryRoot, $PathComparison)
+    $MarkedForThisRoot = $false
+    if (-not [string]::IsNullOrEmpty($MarkedRoot))
+    {
+        try { $MarkedForThisRoot = [string]::Equals((ConvertTo-RevealComparablePath $MarkedRoot), $InventoryRoot, $PathComparison) }
+        catch { $MarkedForThisRoot = $false }
+    }
     if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
     {
+        if ($Resume)
+        {
+            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
+            throw (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
+        }
         throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
     }
 }
