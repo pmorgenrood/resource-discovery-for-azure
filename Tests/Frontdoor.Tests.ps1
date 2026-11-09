@@ -22,7 +22,14 @@ BeforeAll {
     $script:Inventory = if ($InvFile) { Get-Content $InvFile.FullName -Raw | ConvertFrom-Json } else { $null }
     $script:FrontDoors = @($script:Inventory.FRONTDOOR) | Where-Object { $null -ne $_ }
 
-    $script:ObfuscationPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # The tokens a masked row holds, letter for letter ((?-i:...)): tokens are
+    # written in lower case. A name token may carry a databricks_, aks_ or
+    # vmss_ hint, a resource group token the older mc_ one, a subscription
+    # token none.
+    $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $script:NameTokenPattern = '^(?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + ')$'
+    $script:SubTokenPattern = '^(?-i:(prod|nonprod)_' + $Guid + ')$'
+    $script:RgTokenPattern = '^(?-i:(prod|nonprod)_(mc_)?' + $Guid + ')$'
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 
     # A masked resource ID is an ARM-shaped path, never a flat token; the
@@ -170,7 +177,7 @@ Describe "Front Door Obfuscation in Obfuscated Mode" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.Name | Should -Match $script:ObfuscationPattern -Because "Obfuscated mode: Name must be masked"
+            $fd.Name | Should -Match $script:NameTokenPattern -Because "Obfuscated mode: Name must be masked"
         }
     }
 
@@ -178,7 +185,7 @@ Describe "Front Door Obfuscation in Obfuscated Mode" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.Subscription | Should -Match $script:ObfuscationPattern -Because "Obfuscated mode: Subscription must be masked"
+            $fd.Subscription | Should -Match $script:SubTokenPattern -Because "Obfuscated mode: Subscription must be masked"
         }
     }
 
@@ -186,7 +193,7 @@ Describe "Front Door Obfuscation in Obfuscated Mode" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.ResourceGroup | Should -Match $script:ObfuscationPattern -Because "Obfuscated mode: ResourceGroup must be masked"
+            $fd.ResourceGroup | Should -Match $script:RgTokenPattern -Because "Obfuscated mode: ResourceGroup must be masked"
         }
     }
 }
