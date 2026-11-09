@@ -1442,3 +1442,47 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         $Global:ReportName | Should -Be $ReportName
     }
 }
+
+Describe 'The wrapper reads each stream row''s skipped count through its summary reader' {
+
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        # A summary as the stream worker writes it, with one success row whose
+        # Skipped is given as JSON text (absent when $SkippedJson is empty).
+        function script:Read-RowSkipped
+        {
+            param([string]$SkippedJson)
+            $SkipPart = if ($SkippedJson) { ', "Skipped": ' + $SkippedJson } else { '' }
+            $Json = '{{"RunId":"run-1","StreamId":"0","ResourceCounts":[{{"Id":"sub-a","Name":"A","Count":0,"Zip":""{0}}}]}}' -f $SkipPart
+            Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId 'run-1' -StreamId '0' -ExpectedIds @('sub-a')
+        }
+    }
+
+    It 'keeps a whole-number skipped count, so a network-only subscription is not listed as empty' {
+        $Read = script:Read-RowSkipped '12'
+        $Read.Accepted | Should -BeTrue
+        $Read.ResourceCounts[0].Skipped | Should -Be 12
+    }
+
+    It 'keeps an unknown (null) skipped count unknown' {
+        $Read = script:Read-RowSkipped 'null'
+        $Read.Accepted | Should -BeTrue
+        $Read.ResourceCounts[0].PSObject.Properties['Skipped'] | Should -Not -BeNullOrEmpty
+        $Read.ResourceCounts[0].Skipped | Should -BeNullOrEmpty
+    }
+
+    It 'reads a row from an older worker with no Skipped as 0' {
+        $Read = script:Read-RowSkipped ''
+        $Read.Accepted | Should -BeTrue
+        $Read.ResourceCounts[0].Skipped | Should -Be 0
+    }
+
+    It 'does not confirm a summary whose Skipped is <Label>' -TestCases @(
+        @{ Label = 'negative'; Json = '-1' }
+        @{ Label = 'text'; Json = '"many"' }
+        @{ Label = 'a fraction'; Json = '1.5' }
+    ) {
+        param($Json)
+        (script:Read-RowSkipped $Json).Accepted | Should -BeFalse
+    }
+}
