@@ -1025,6 +1025,44 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricBadRequest -Exception $Wrapped | Should -BeTrue
     }
 
+    It 'does not count a <Code> with the integer Status of a RequestFailedException' -ForEach @(@{ Code = 401 }, @{ Code = 403 }, @{ Code = 404 }) {
+        # Azure.Core's RequestFailedException gives its status as an integer
+        # Status, and its message has no "status code" text.
+        if (-not ('RdaTest.RequestFailedException' -as [type]))
+        {
+            Add-Type -TypeDefinition 'namespace RdaTest { public class RequestFailedException : System.Exception { public RequestFailedException(int status, string message, System.Exception inner) : base(message, inner) { Status = status; } public int Status { get; private set; } } }'
+        }
+        $Failed = [RdaTest.RequestFailedException]::new($Code, ("Service request failed.`nStatus: {0}" -f $Code), $null)
+        Get-MetricErrorStatus -Exception $Failed | Should -Be $Code
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Failed | Should -BeFalse
+        # Also when another exception wraps it.
+        $Wrapped = [System.Exception]::new('Get-AzMetric failed.', $Failed)
+        Get-MetricErrorStatus -Exception $Wrapped | Should -Be $Code
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Wrapped | Should -BeFalse
+    }
+
+    It 'counts a 503 whose message holds the text of a 404' {
+        $Loose = [System.Net.Http.HttpRequestException]::new('The service is unavailable; an earlier step had status code 404.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
+        Get-MetricErrorStatus -Exception $Loose | Should -Be 503
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Loose | Should -BeTrue
+        # The message of an exception that has a status of its own is not read.
+        $Strict = [System.Net.Http.HttpRequestException]::new("Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
+        Get-MetricErrorStatus -Exception $Strict | Should -Be 503
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Strict | Should -BeTrue
+        # With no status anywhere, only the Az form of the text is read.
+        Get-MetricErrorStatus -Exception ([System.Exception]::new('The request had status code 404 once.')) | Should -BeNullOrEmpty
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new('The request had status code 404 once.')) | Should -BeTrue
+    }
+
+    It 'reads each exception of a chain once' {
+        # An error record that points back at an exception already read ends the walk.
+        $Inner = [System.Exception]::new('Retry failed.')
+        $Outer = [System.Exception]::new('Get-AzMetric failed.', $Inner)
+        $Inner | Add-Member -NotePropertyName ErrorRecord -NotePropertyValue ([pscustomobject]@{ Exception = $Outer })
+        Get-MetricErrorStatus -Exception $Outer | Should -BeNullOrEmpty
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Outer | Should -BeTrue
+    }
+
     It 'still counts a server error that wraps another server error, a timeout or throttling' {
         foreach ($Inner in @('ServiceUnavailable', 'RequestTimeout', 'TooManyRequests'))
         {

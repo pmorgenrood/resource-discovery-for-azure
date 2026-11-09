@@ -621,24 +621,30 @@ if ($Task -eq 'Processing')
                     return $false
                 }
 
-                # The HTTP status Azure answered with, as a number: its status code, or
-                # the "status code 'Forbidden'" text of the Az message. The whole chain
-                # is read. A client error (4xx other than 408 and 429) anywhere in it
-                # wins, because an outer server error can wrap it; else the first
-                # status found. $null when none can be read.
+                # The HTTP status Azure answered with, as a number. The whole chain is
+                # read, each exception once. Each exception's own status comes first:
+                # Response.StatusCode, StatusCode, or the integer Status of Azure.Core's
+                # RequestFailedException. Only an exception with none of these has its
+                # message read, and then only Az's form "invalid status code 'Forbidden'",
+                # so text in a message never overrides a real status. A client error
+                # (4xx other than 408 and 429) anywhere wins, because an outer server
+                # error can wrap it; else the first status read from a property, else
+                # the first read from a message. $null when none can be read.
                 function Get-MetricErrorStatus
                 {
                     param([System.Exception]$Exception)
 
                     $FirstStatus = $null
+                    $FirstTextStatus = $null
+                    $Seen = [System.Collections.Generic.List[object]]::new()
                     $Pending = [System.Collections.Generic.Queue[object]]::new()
                     $Pending.Enqueue($Exception)
-                    $Checked = 0
-                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    while ($Pending.Count -gt 0 -and $Seen.Count -lt 10)
                     {
                         $Ex = $Pending.Dequeue()
                         if ($null -eq $Ex) { continue }
-                        $Checked++
+                        if (@($Seen | Where-Object { [object]::ReferenceEquals($_, $Ex) }).Count -gt 0) { continue }
+                        $Seen.Add($Ex)
 
                         $Found = @()
                         if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
@@ -649,9 +655,15 @@ if ($Task -eq 'Processing')
                         {
                             $Found += $Ex.StatusCode
                         }
-                        if ([string]$Ex.Message -match "(?i)status code\s*'?([A-Za-z]+|\d{3})'?")
+                        if ($null -ne $Ex.PSObject.Properties['Status'] -and ($Ex.Status -is [int] -or $Ex.Status -is [long]))
+                        {
+                            $Found += $Ex.Status
+                        }
+                        $FromText = $false
+                        if (@($Found | Where-Object { $null -ne $_ }).Count -eq 0 -and [string]$Ex.Message -match "(?i)invalid status code\s*'([A-Za-z]+|\d{3})'")
                         {
                             $Found += $Matches[1]
+                            $FromText = $true
                         }
                         foreach ($Value in $Found)
                         {
@@ -663,17 +675,19 @@ if ($Task -eq 'Processing')
                             elseif ([System.Enum]::TryParse([System.Net.HttpStatusCode], $Text, $true, [ref]$Parsed)) { $Status = [int]$Parsed }
                             if ($null -eq $Status) { continue }
                             if ($Status -ge 400 -and $Status -lt 500 -and $Status -notin @(408, 429)) { return $Status }
-                            if ($null -eq $FirstStatus) { $FirstStatus = $Status }
+                            if ($FromText) { if ($null -eq $FirstTextStatus) { $FirstTextStatus = $Status } }
+                            elseif ($null -eq $FirstStatus) { $FirstStatus = $Status }
                         }
 
                         $Pending.Enqueue($Ex.InnerException)
-                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord)
                         {
                             $Pending.Enqueue($Ex.ErrorRecord.Exception)
                         }
                     }
 
-                    return $FirstStatus
+                    if ($null -ne $FirstStatus) { return $FirstStatus }
+                    return $FirstTextStatus
                 }
 
                 # True when a request that still failed after its retries can work on a
