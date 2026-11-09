@@ -35,7 +35,10 @@ Describe 'The 0-resources warning of a collected subscription' {
         @($Warnings | Where-Object { $_ -match 'permission gap' }) | Should -BeNullOrEmpty
         # The discovery query leaves some resources out on purpose, so 0 means
         # it returned none, not that Resource Graph holds none.
-        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'the discovery query returned no resource' }) | Should -BeNullOrEmpty
+        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'the discovery query.*returned no resource' }) | Should -BeNullOrEmpty
         @($Warnings | Where-Object { $_ -match 'Resource Graph lists no resource' }) | Should -BeNullOrEmpty
+        # The role check uses the Az PowerShell sign-in, the query the Azure
+        # CLI's, so the warning names a CLI signed in as another account.
+        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'Azure CLI' }) | Should -BeNullOrEmpty
     }
 }

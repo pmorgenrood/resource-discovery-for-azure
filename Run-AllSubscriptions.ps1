@@ -1014,8 +1014,9 @@ if ($ParallelStreams -le 1)
                 # subscription the identity cannot read stops the run at the
                 # up-front role check (or is skipped there with -AllowPartialAccess)
                 # before it is collected, so the discovery query returned no
-                # resource for this one.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check, so the discovery query returned no resource for it (an empty subscription, or one that holds only resources the query leaves out). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                # resource for this one. The check uses the Az PowerShell sign-in
+                # and the query the Azure CLI's, so the warning names that case.
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check (Az PowerShell sign-in), so the discovery query (Azure CLI sign-in) returned no resource for it: an empty subscription, one that holds only resources the query leaves out, or one the Azure CLI's identity cannot read when it is signed in as another account. Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {
