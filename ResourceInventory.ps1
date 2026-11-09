@@ -1644,6 +1644,11 @@ if (-not $RunAllSubs.IsPresent)
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
         throw ("Pre-flight: cannot write to {0}: {1}. This usually means readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle. Verify the directory is writable and re-run." -f $PreFlightInventoryRoot, $_.Exception.Message)
     }
+    finally
+    {
+        # By its literal path: the cleanup above reads [ and ] as a wildcard.
+        if ([System.IO.File]::Exists($ProbePath)) { Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue }
+    }
 
     Write-Host "Pre-flight checks passed." -ForegroundColor Green
     Write-Host ""

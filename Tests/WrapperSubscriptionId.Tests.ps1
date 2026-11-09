@@ -809,6 +809,14 @@ Describe 'ResourceInventory.ps1 pre-flight in an output folder with brackets in 
         @($Said | Where-Object { $_ -like 'Write probe: OK*' }).Count | Should -Be 1
         @([System.IO.Directory]::GetFiles($PreFlightInventoryRoot, '.write-probe-*')).Count | Should -Be 0
     }
+
+    It 'removes the probe file there when reading it back fails' {
+        $PreFlightInventoryRoot = Join-Path $TestDrive 'direct-fail[1]'
+        [void][System.IO.Directory]::CreateDirectory($PreFlightInventoryRoot)
+        Mock Get-Content { throw 'read failed' } -ParameterFilter { $LiteralPath -like '*.write-probe-*' }
+        { . $script:DirectChecks 6>$null } | Should -Throw '*Pre-flight: cannot write*read failed*'
+        @([System.IO.Directory]::GetFiles($PreFlightInventoryRoot, '.write-probe-*')).Count | Should -Be 0
+    }
 }
 
 Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {
