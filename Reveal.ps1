@@ -453,13 +453,12 @@ function Get-RevealMarkerShapeProblem
 # (Get-RevealMarkerShapeProblem) and every output record in it does too
 # (Get-RevealBadOutputRecord, against $Folder). Kind says which part failed,
 # so a refusal can name it: Root (no Reveal mark, or one for another root),
-# NoFields (a mark of an older Reveal, which did not record its fields),
-# Shape (the top level) or Record (an output record).
+# Shape (the top level, also a mark that does not record its fields) or
+# Record (an output record).
 function Get-RevealOwnMarkerProblem
 {
     param($Marker, [string]$Folder)
     if (-not (Test-RevealMarkerForThisRoot $Marker)) { return [pscustomobject]@{ Kind = 'Root'; Text = 'it is not a Reveal mark for this inventory root' } }
-    if ($null -eq $Marker.Data['Fields']) { return [pscustomobject]@{ Kind = 'NoFields'; Text = 'it does not record which fields that reveal used' } }
     $Shape = Get-RevealMarkerShapeProblem -Data $Marker.Data
     if ($null -ne $Shape) { return [pscustomobject]@{ Kind = 'Shape'; Text = $Shape } }
     $Bad = Get-RevealBadOutputRecord -Outputs $Marker.Data['Outputs'] -StagingDirectory $Folder -PathComparison $PathComparison
@@ -577,13 +576,8 @@ try
         }
         switch ($OwnMarkProblem.Kind)
         {
-            # A resumed run must reveal the same fields as the run it
-            # continues, or one bundle would mix reports revealed for
-            # different fields.
-            'NoFields'
-            {
-                Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
-            }
+            # A mark that does not record its fields is refused here too: a
+            # resumed run must reveal the same fields as the run it continues.
             'Shape'
             {
                 Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $OwnMarkProblem.Text)
