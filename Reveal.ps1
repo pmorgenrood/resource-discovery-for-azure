@@ -575,7 +575,7 @@ foreach ($Folder in $Folders)
     if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
     {
         $Reason = if ($Zips.Count -eq 0) { 'an obfuscation dictionary but no obfuscated report zip (ResourcesReport_<stamp>.zip) in folder, so its report is not in the bundle' } else { 'an obfuscated report zip but no obfuscation dictionary in folder, so it cannot be revealed and is not in the bundle (a report made without -Obfuscate does not belong under this inventory root)' }
-        $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason }
+        $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
         continue
     }
     # The dictionaries some report zip of this folder pairs with.
@@ -593,7 +593,7 @@ foreach ($Folder in $Folders)
         if ($Matched.Count -ne 1)
         {
             $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0])), so it cannot be revealed and is not in the bundle" } else { 'more than one dictionary with the same stamp, so it is not revealed and is not in the bundle' }
-            $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason }
+            $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
             continue
         }
         $Dict = $Matched[0]
@@ -627,7 +627,7 @@ foreach ($Folder in $Folders)
         }
         catch
         {
-            $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message) }
+            $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message); Kind = 'pair'; Folders = @($Folder.Name) }
             continue
         }
         # A dictionary that names no subscription: the subscription the run's
@@ -653,7 +653,7 @@ foreach ($Folder in $Folders)
     # missing from the folder.
     foreach ($Lone in @($Dicts | Where-Object { -not $PairedDictNames.Contains($_.Name) } | Sort-Object Name))
     {
-        $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Lone.Name); Reason = 'an obfuscation dictionary with no report zip of the same stamp in its folder, so its report is not in the bundle' }
+        $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Lone.Name); Reason = 'an obfuscation dictionary with no report zip of the same stamp in its folder, so its report is not in the bundle'; Kind = 'pair'; Folders = @($Folder.Name) }
     }
 }
 
@@ -680,7 +680,7 @@ foreach ($SubId in @($ReportsBySub.Keys | Sort-Object))
             $Tokens = if ($_.SubTokens.ContainsKey($SubId)) { @($_.SubTokens[$SubId]) -join ', ' } else { 'no subscription token' }
             '{0} in {1}' -f $Tokens, $_.Report
         })
-    $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText) }
+    $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText); Kind = 'shared'; Folders = @($Holders | ForEach-Object { $_.Folder }) }
 }
 
 $LeftOutItems = @()
@@ -817,7 +817,7 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 }
                 else
                 {
-                    $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = 'reveal completed but produced no output zip' }
+                    $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = 'reveal completed but produced no output zip'; Kind = 'reveal'; Folders = @($R.Item.Folder) }
                 }
             }
             catch
@@ -826,7 +826,7 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 # nor treated as done by a later -Resume.
                 Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
-                $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = $_.Exception.Message }
+                $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = $_.Exception.Message; Kind = 'reveal'; Folders = @($R.Item.Folder) }
             }
             Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -843,7 +843,7 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
             Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
-            $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = ("timed out after {0:0.##} minutes" -f ($RevealTimeoutSeconds / 60)) }
+            $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = ("timed out after {0:0.##} minutes" -f ($RevealTimeoutSeconds / 60)); Kind = 'reveal'; Folders = @($R.Item.Folder) }
             $DoneCount++
         }
         else
@@ -907,7 +907,7 @@ Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -Foregro
 Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
 Write-Host ("Skipped (not a report folder)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Left out (sub in >1 report)      : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host ("Failed during reveal             : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host ("Failed (see FAIL lines)          : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
 
 foreach ($s in $SkippedItems)
 {
@@ -989,10 +989,31 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
 }
 elseif ($RemoveStaging -and -not $CleanRun)
 {
-    # Name each cause: failed folders, the outer zip, or both.
-    if ($FailedItems.Count -gt 0)
+    # Name each cause, with the way out for it: folders whose reveal failed
+    # or timed out (-Resume redoes them), half report pairs or unreadable
+    # dictionaries (the missing or broken file must be put back first), a
+    # subscription in more than one report (the extra report must be moved
+    # away first), and the outer zip. Each count is of distinct folders, not of
+    # FAIL lines: one folder can have more than one.
+    $FolderCount = {
+        param([string]$Kind)
+        @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders } | Sort-Object -Unique).Count
+    }
+    $RevealFailedFolders = & $FolderCount 'reveal'
+    $HalfPairFolders = & $FolderCount 'pair'
+    $SharedSubs = @($FailedItems | Where-Object { $_.Kind -eq 'shared' }).Count
+    $SharedFolders = & $FolderCount 'shared'
+    if ($RevealFailedFolders -gt 0)
     {
-        Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out. Staging kept so you can recover them with -Resume:" -f $FailedItems.Count) -ForegroundColor Yellow
+        Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out. Staging kept so you can recover them with -Resume:" -f $RevealFailedFolders) -ForegroundColor Yellow
+    }
+    if ($HalfPairFolders -gt 0)
+    {
+        Write-Host ("-RemoveStaging skipped: {0} folder(s) hold half a report pair or a dictionary that cannot be read (see FAIL). Staging kept: put back the missing or broken report zip or dictionary, then re-run with -Resume:" -f $HalfPairFolders) -ForegroundColor Yellow
+    }
+    if ($SharedSubs -gt 0)
+    {
+        Write-Host ("-RemoveStaging skipped: {0} subscription(s) are in more than one report, in {1} folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume with -InventoryRoot pointing at one run's folders):" -f $SharedSubs, $SharedFolders) -ForegroundColor Yellow
     }
     if ($null -ne $ConsolidationError)
     {
