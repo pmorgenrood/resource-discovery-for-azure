@@ -25,6 +25,9 @@
 
 param (
     [Parameter(Mandatory = $true)] [string]   $TenantID,
+    # The wrapper run's id, written in the summary so the wrapper accepts only
+    # its own run's summaries.
+    [Parameter(Mandatory = $true)] [string]   $RunId,
     [Parameter(Mandatory = $true)] [string]   $StreamId,
     [Parameter(Mandatory = $true)] [string]   $InventoryRoot,
     [Parameter(Mandatory = $true)] [string]   $ScriptRoot,
@@ -103,6 +106,7 @@ if ($SubscriptionIds.Count -eq 0)
 {
     Write-Stream "no subscriptions in slice; exiting cleanly" 'Yellow'
     @{
+        RunId                 = $RunId
         StreamId              = $StreamId
         Tenant                = $TenantID
         Status                = 'ok'
@@ -155,6 +159,7 @@ catch
     # Write a minimum stream summary so the parent doesn't think the stream
     # disappeared silently.
     @{
+        RunId         = $RunId
         StreamId      = $StreamId
         Tenant        = $TenantID
         Status        = 'failed-to-start'
@@ -284,14 +289,26 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # verification looks for.
         $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount; Zip = $Global:ZipOutputFile }
 
-        $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
-        if ($CountMessage.Kind -eq 'Empty')
+        # Narration only, as in the wrapper: a failed write must not turn the
+        # success into a failure (the subscription would be listed as both).
+        try
         {
-            Write-Stream ("WARNING: '{0}' returned 0 resources (likely permission gap or empty sub)" -f $SubName) 'Yellow'
+            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
+            if ($CountMessage.Kind -eq 'Empty')
+            {
+                Write-Stream ("WARNING: '{0}' returned 0 resources (likely permission gap or empty sub)" -f $SubName) 'Yellow'
+            }
+            else
+            {
+                Write-Stream ("done: {0} - {1}" -f $SubName, $CountMessage.Text) 'Green'
+            }
         }
-        else
+        catch
         {
-            Write-Stream ("done: {0} - {1}" -f $SubName, $CountMessage.Text) 'Green'
+            # Its own guard, as in the wrapper.
+            $NarrationError = $_.Exception.Message
+            try { Write-Verbose ("Could not write the completion line: {0}" -f $NarrationError) }
+            catch { $null = $_ }
         }
 
         if (-not ($Completed -contains $SubId))
@@ -371,6 +388,7 @@ $MetricsFailedSubs = if ($null -ne $Global:MetricsFailedSubs) { @($Global:Metric
 $CollectorFailures = if ($null -ne $Global:CollectorFailures) { @($Global:CollectorFailures) } else { @() }
 
 $Summary = [pscustomobject]@{
+    RunId                  = $RunId
     StreamId               = $StreamId
     Tenant                 = $TenantID
     Status                 = if ($FailedSubs.Count -eq 0) { 'ok' } else { 'partial-failure' }
