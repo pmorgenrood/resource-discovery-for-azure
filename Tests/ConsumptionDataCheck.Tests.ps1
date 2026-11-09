@@ -1281,10 +1281,23 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.ArgumentException]::new($SignIn, $Deep)) | Should -Be 'Permanent'
     }
 
-    It 'treats an error it does not recognise, and any other status code, as transient' {
+    It 'treats an error it does not recognise, and a conflict (409), as transient' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('An error occurred while sending the request.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('stand-in: something went wrong')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message 'x' -Status Conflict) | Should -Be 'Transient'
+    }
+
+    It 'lets a known status decide before the message: <Case>' -ForEach @(
+        @{ Case = 'a 405 is not retried'; Status = 'MethodNotAllowed'; Message = 'x'; Kind = 'Permanent' }
+        @{ Case = 'a 429 whose text says not found is retried'; Status = 'TooManyRequests'; Message = 'The resource could not be found right now, try again.'; Kind = 'Transient' }
+        @{ Case = 'a 503 whose text names a bad request is retried'; Status = 'ServiceUnavailable'; Message = 'Bad request queue is full.'; Kind = 'Transient' }
+    ) {
+        Get-ConsumptionErrorKind -Exception (New-StatusException -Message $Message -Status $Status) | Should -Be $Kind
+    }
+
+    It 'reads 400, 401, 403 or 404 in a message without a status only after status or HTTP' {
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Too busy, retry after 400 milliseconds.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP 403 returned by the usage API.')) | Should -Be 'Permanent'
     }
 }
 
