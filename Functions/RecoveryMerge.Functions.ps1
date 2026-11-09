@@ -461,6 +461,73 @@ function Merge-RecoveryData
             throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
         }
     }
+    # The gap bundle's metrics files, carried forward when -RecoverMetrics is not set.
+    $GapMetricsFiles = @()
+    if (-not $RecoverMetrics)
+    {
+        $GapMetricsFiles = @(Get-ChildItem -LiteralPath $GapBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
+    }
+
+    # -- The consumption and metrics files that will be zipped are checked
+    #    here, before anything is written. Downstream drops a consumption file
+    #    without the columns it needs, and every metric in a zip when one
+    #    Metrics file is not an object with a Metrics list, both without an
+    #    error, so such a file stops the merge instead. ------------------------
+    $ConsumptionSource = if ($RecoverConsumption) { 'recovery' } else { 'gap' }
+    $ConsumptionSourceFile = if ($RecoverConsumption) { $RecoveryConsumptionFile } else { $GapConsumptionFile }
+    if ($ConsumptionSourceFile)
+    {
+        $HeaderNames = @()
+        try
+        {
+            $HeaderLine = Get-Content -LiteralPath $ConsumptionSourceFile.FullName -TotalCount 1 -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($HeaderLine))
+            {
+                # Two copies of the header line read as a header and one row,
+                # so the CSV reader parses the names, quotes included.
+                $HeaderNames = @((@($HeaderLine, $HeaderLine) | ConvertFrom-Csv -ErrorAction Stop | Select-Object -First 1).PSObject.Properties.Name)
+            }
+        }
+        catch
+        {
+            $HeaderNames = @()
+        }
+        $MissingColumns = @('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $_ -notin $HeaderNames })
+        if ($MissingColumns.Count -gt 0)
+        {
+            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
+            throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' has no {2} column, which downstream needs to read its rows, so they would be dropped. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, ($MissingColumns -join ', '), $OutputPath, $Hint)
+        }
+    }
+    $MetricsSourceLabel = if ($RecoverMetrics) { 'recovery' } else { 'gap' }
+    $SelectedMetricsCount = 0
+    foreach ($MetricsFile in @(if ($RecoverMetrics) { $RecoveryMetricsFiles } else { $GapMetricsFiles }))
+    {
+        $Problem = $null
+        try
+        {
+            $MetricsText = Get-Content -LiteralPath $MetricsFile.FullName -Raw -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($MetricsText)) { $Problem = 'the file is empty' }
+            else
+            {
+                $MetricsDoc = ConvertFrom-Json -InputObject $MetricsText -NoEnumerate -ErrorAction Stop
+                if ($MetricsDoc -isnot [System.Management.Automation.PSCustomObject]) { $Problem = 'it is not a JSON object' }
+                elseif ($MetricsDoc.PSObject.Properties.Name -notcontains 'Metrics') { $Problem = 'it has no Metrics list' }
+                elseif ($MetricsDoc.Metrics -isnot [System.Array]) { $Problem = 'its Metrics is not a list' }
+                else { $SelectedMetricsCount += $MetricsDoc.Metrics.Count }
+            }
+        }
+        catch
+        {
+            $Problem = $_.Exception.Message
+        }
+        if ($null -ne $Problem)
+        {
+            $Hint = if ($MetricsSourceLabel -eq 'gap') { 'Run this merge with -RecoverMetrics and a recovery bundle whose metrics are whole.' } else { 'Re-run the recovery WITHOUT -SkipMetrics into a new folder, then run this merge again pointed at it.' }
+            throw ("Merge-RecoveryData: the {0} bundle's metrics file '{1}' cannot be used: {2}. Downstream would drop every metric in the zip. Nothing was written to '{3}'. {4}" -f $MetricsSourceLabel, $MetricsFile.FullName, $Problem, $OutputPath, $Hint)
+        }
+    }
+
     $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
     if (-not (Test-Path -LiteralPath $SummaryScript -PathType Leaf))
     {
@@ -503,12 +570,8 @@ function Merge-RecoveryData
     #    inventory's for the same real values. If the chosen
     #    source has none, write a canonical empty file so the bundle is
     #    structurally complete. --------------------------------------------------
-    $ConsumptionSource = 'gap'
-    $ConsumptionSourceFile = $GapConsumptionFile
     if ($RecoverConsumption)
     {
-        $ConsumptionSource = 'recovery'
-        $ConsumptionSourceFile = $RecoveryConsumptionFile
 
         # Guard: consumption row-shrink and billing-window drift. The recovery run
         # pulls a NOW-relative billing window, so a recovery done later than the
@@ -575,7 +638,6 @@ function Merge-RecoveryData
     }
     else
     {
-        $GapMetricsFiles = @(Get-ChildItem -LiteralPath $GapBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
         if ($GapMetricsFiles.Count -gt 0)
         {
             foreach ($MetricsFile in $GapMetricsFiles)
