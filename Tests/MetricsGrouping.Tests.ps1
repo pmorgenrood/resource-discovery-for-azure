@@ -682,6 +682,71 @@ Describe 'Metrics.ps1 batches' {
     }
 }
 
+Describe 'Metrics.ps1 a Metrics file that cannot be written' {
+    BeforeAll {
+        # A stand-in Out-File that, for the second Metrics file, writes part of
+        # it and then fails as a full disk does (an error, not a throw). Every
+        # other file is written as the real one writes it.
+        function Out-File
+        {
+            [CmdletBinding()]
+            param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject)
+            begin { $Items = [System.Collections.Generic.List[object]]::new() }
+            process { $Items.Add($InputObject) }
+            end
+            {
+                if ($env:RDA_TEST_METRICS_CHUNK_FAIL -and (Split-Path -Path $FilePath -Leaf) -eq $env:RDA_TEST_METRICS_CHUNK_FAIL)
+                {
+                    $Text = ($Items -join '')
+                    Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -Encoding utf8 -InputObject $Text.Substring(0, [math]::Min(40, $Text.Length))
+                    Write-Error 'There is not enough space on the disk.'
+                }
+                else
+                {
+                    $Items | Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -Encoding utf8 -Append:$Append
+                }
+            }
+        }
+        $script:SessionWriteFailures = Get-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        Remove-Item -Path 'Env:RDA_TEST_METRICS_CHUNK_FAIL' -ErrorAction SilentlyContinue
+        if ($script:SessionWriteFailures) { $Global:RdaMetricsWriteFailures = $script:SessionWriteFailures.Value }
+        else { Remove-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'removes the partial file and names it as failed when one of three writes fails, also when errors are silenced' {
+        # 160 disks x 4 metrics = 640 definitions: three Metrics files.
+        $Disks = @(1..160 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Global:RdaMetricsWriteFailures = @()
+        $env:RDA_TEST_METRICS_CHUNK_FAIL = 'Metrics_test_2.json'
+        $SavedPreference = $ErrorActionPreference
+        try
+        {
+            # The run itself sets SilentlyContinue unless -Debug.
+            $ErrorActionPreference = 'SilentlyContinue'
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName 'chunk-write-fails'
+        }
+        finally
+        {
+            $ErrorActionPreference = $SavedPreference
+            Remove-Item -Path 'Env:RDA_TEST_METRICS_CHUNK_FAIL' -ErrorAction SilentlyContinue
+        }
+
+        @($Run.Files | ForEach-Object { $_.Name }) | Should -Be @('Metrics_test_1.json', 'Metrics_test_3.json')
+        @($Global:RdaMetricsWriteFailures) | Should -Be @('Metrics_test_2.json')
+    }
+
+    It 'names no file when every write works' {
+        $Disks = @(1..160 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Global:RdaMetricsWriteFailures = @()
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'chunk-write-works'
+
+        $Run.Files.Count | Should -Be 3
+        @($Global:RdaMetricsWriteFailures).Count | Should -Be 0
+    }
+}
+
 Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its retries' {
     BeforeAll {
         $script:IncompleteDisk = New-TestDisk -Name 'disk-incomplete'

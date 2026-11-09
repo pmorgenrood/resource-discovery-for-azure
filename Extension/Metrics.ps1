@@ -1110,8 +1110,21 @@ if ($Task -eq 'Processing')
                 }
             }
 
+            # A write that fails stops here also when the run's error preference
+            # is SilentlyContinue. The chunk is named in $Global:RdaMetricsWriteFailures,
+            # so the run makes no zip, and a partial file is removed: a cut-short
+            # Metrics file makes downstream drop every metric of the zip.
             $OutputPath = $FilePath + "_" + $RangeIdx + ".json"
-            $Tmp | ConvertTo-Json -depth 5 -compress | Out-File $OutputPath -Encoding utf8
+            try
+            {
+                $Tmp | ConvertTo-Json -depth 5 -compress | Out-File $OutputPath -Encoding utf8 -ErrorAction Stop
+            }
+            catch
+            {
+                Write-Log -Message ('The metrics file could not be written: {0}: {1}' -f (Split-Path -Path $OutputPath -Leaf), $_.Exception.Message) -Severity 'Error'
+                if (Test-Path -LiteralPath $OutputPath) { Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue }
+                $Global:RdaMetricsWriteFailures = @(@($Global:RdaMetricsWriteFailures) | Where-Object { -not [string]::IsNullOrEmpty($_) }) + @(Split-Path -Path $OutputPath -Leaf)
+            }
             $Tmp.Metrics.Clear()
 
             $RangeIdx++

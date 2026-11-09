@@ -420,32 +420,37 @@ function Get-RdaReportJsonFiles
     return @($Files)
 }
 
-# True when at least one of this run's Metrics files can be read as a JSON
-# object with a Metrics list (the empty fallback file counts). $JsonFiles is
-# the list Get-RdaReportJsonFiles returns. The smallest file is read first, and
-# the check stops at the first good one, so a large run reads little.
+# True when this run has at least one Metrics file and every one of them can
+# be read as a JSON object with a Metrics list (the empty fallback file
+# counts). Downstream drops every metric of a zip when one Metrics file is bad.
+# $JsonFiles is the list Get-RdaReportJsonFiles returns. The smallest file is
+# read first, and the check stops at the first bad one.
 function Test-RdaReportMetricsWritten
 {
     param([string[]]$JsonFiles)
 
     $MetricsFiles = @(@($JsonFiles) | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Split-Path -Path $_ -Leaf) -like 'Metrics_*.json' } |
             ForEach-Object { Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue } | Where-Object { $null -ne $_ } | Sort-Object Length)
+    if ($MetricsFiles.Count -eq 0) { return $false }
     foreach ($MetricsFile in $MetricsFiles)
     {
+        $Reason = 'it is not a JSON object with a Metrics list'
         try
         {
             $Parsed = Get-Content -LiteralPath $MetricsFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
             if ($Parsed -is [System.Management.Automation.PSCustomObject] -and $null -ne $Parsed.PSObject.Properties['Metrics'] -and $Parsed.Metrics -is [array])
             {
-                return $true
+                continue
             }
         }
         catch
         {
-            Write-Log -Message ('The metrics file could not be read: {0}: {1}' -f $MetricsFile.Name, $_.Exception.Message) -Severity 'Warning'
+            $Reason = $_.Exception.Message
         }
+        Write-Log -Message ('The metrics file could not be read: {0}: {1}' -f $MetricsFile.Name, $Reason) -Severity 'Warning'
+        return $false
     }
-    return $false
+    return $true
 }
 
 # Writes the report zip with Compress-Archive. Returns $true only when the zip

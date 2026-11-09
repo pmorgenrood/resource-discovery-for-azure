@@ -44,6 +44,11 @@ if (-not $RunAllSubs.IsPresent)
     $Global:MetricsFailedSubs = @()
 }
 
+# The Metrics files this run could not write, named by Extension/Metrics.ps1.
+# Cleared for every run, under -RunAllSubs too, so one subscription's failed
+# write never fails the next one.
+$Global:RdaMetricsWriteFailures = @()
+
 if ($Debug.IsPresent) { $DebugPreference = 'Continue' }
 
 if ($Debug.IsPresent) { $ErrorActionPreference = "Continue" }Else { $ErrorActionPreference = "silentlycontinue" }
@@ -1800,10 +1805,11 @@ if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 # with -OutputDirectory can also hold another run's files.
 $JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime
 
-# A zip with no readable Metrics file would read as a run with no metrics. So
-# unless the run had -SkipMetrics, no zip is made and the run counts as having
-# written no report (exit 2; under the wrapper, that subscription failed).
-$MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles)
+# One unreadable Metrics file makes downstream drop every metric of the zip, and
+# a Metrics file that could not be written loses its metrics. So unless the run
+# had -SkipMetrics, a run with either makes no zip and counts as having written
+# no report (exit 2; under the wrapper, that subscription failed).
+$MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and ((@($Global:RdaMetricsWriteFailures | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -gt 0) -or -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles))
 
 if ($Obfuscate.IsPresent)
 {

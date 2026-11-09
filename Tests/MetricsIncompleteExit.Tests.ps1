@@ -514,7 +514,7 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         # the lifted statements and returns the exit code, the lines and the zip.
         function script:Invoke-MetricsEnd
         {
-            param([hashtable]$Arguments, [switch]$WriteFails, [string]$MetricsContent)
+            param([hashtable]$Arguments, [switch]$WriteFails, [string]$MetricsContent, [string[]]$MetricsContents, [string[]]$WriteFailures = @())
             $Stamp = '20261109130000000' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
             $Folder = Join-Path $TestDrive ('run-' + $Stamp)
             New-Item -ItemType Directory -Path $Folder -Force | Out-Null
@@ -530,6 +530,15 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
             Set-Content -LiteralPath $Global:ConsumptionFileCsv -Value 'InstanceData,MeterCategory'
             Set-Content -LiteralPath ($Global:DefaultPath + 'Inventory_ResourcesReport_' + $Stamp + '.json') -Value '{}'
             if ($PSBoundParameters.ContainsKey('MetricsContent')) { Set-Content -LiteralPath ($Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '_1.json') -Value $MetricsContent }
+            # One Metrics file per content, _1 to _n, as the batches write them.
+            $Index = 0
+            foreach ($Content in @($MetricsContents | Where-Object { $null -ne $_ }))
+            {
+                $Index++
+                Set-Content -LiteralPath ($Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '_' + $Index + '.json') -Value $Content
+            }
+            # The Metrics files that Metrics.ps1 could not write, as it names them.
+            $Global:RdaMetricsWriteFailures = @($WriteFailures)
             $env:RDA_TEST_METRICS_WRITE_FAIL = $(if ($WriteFails) { '1' } else { '' })
             try
             {
@@ -550,7 +559,7 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         }
 
         $script:SessionValues = @{}
-        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips'))
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures'))
         {
             $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
         }
@@ -590,6 +599,46 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
 
         $Result.ExitCode | Should -Be 2
         $Result.ZipLeft | Should -BeFalse
+    }
+
+    It 'makes no zip and exits 2 when one of three Metrics files of the run is cut short' {
+        $Good = '{"Metrics":[{"ID":"a","MetricSeries":[1]}]}'
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContents @($Good, '{"Metrics":[{"ID":"b"', $Good)
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the metrics output was not written*' }).Count | Should -Be 1
+    }
+
+    It 'makes no zip and exits 2 when one of three Metrics files could not be written and was removed' {
+        $Good = '{"Metrics":[{"ID":"a","MetricSeries":[1]}]}'
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContents @($Good, $Good) -WriteFailures @('Metrics_x_2.json')
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+    }
+
+    It 'makes no zip and exits 2 when every Metrics file could not be written, and not the empty one in their place' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -WriteFailures @('Metrics_x_1.json')
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+    }
+
+    It 'exits 2 under -RunAllSubs when a Metrics file could not be written, so that subscription counts as failed' {
+        $Global:RdaUnwrittenReportZips = @()
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -MetricsContents @('{"Metrics":[]}') -WriteFailures @('Metrics_x_2.json')
+
+        $Result.ExitCode | Should -Be 2
+        $Global:RdaUnwrittenReportZips | Should -Be @($Global:ZipOutputFile)
+    }
+
+    It 'zips all three Metrics files and exits 0 when each one reads well' {
+        $Good = '{"Metrics":[{"ID":"a","MetricSeries":[1]}]}'
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContents @($Good, $Good, $Good)
+
+        $Result.ExitCode | Should -Be 0
+        @($Result.Entries | Where-Object { $_ -like 'Metrics_*.json' }).Count | Should -Be 3
     }
 
     It 'zips the empty Metrics file and exits 0 when the run collected no metrics' {
@@ -771,6 +820,39 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $Entries = Invoke-ZipFiles -Folder $Folder -Stamp $Stamp -Obfuscate:($Mode -eq 'masked')
 
         $Entries | Should -Be (Get-CleanZipEntries -Stamp $Stamp)
+    }
+}
+
+Describe 'The Metrics files an earlier ResourceInventory.ps1 run could not write' {
+    BeforeAll {
+        # The run's param block and its top-level statements before the
+        # collection that name the Metrics write failures, as written. Under
+        # -RunAllSubs the wrapper runs each subscription in the same session, so
+        # one subscription's failed write must not fail the next one.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $Before = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^if \(\$SkipMetrics\.IsPresent\)' })[-1]
+        $script:Clears = @($Top[0..($Before - 1)] | Where-Object { $_.Extent.Text -match 'RdaMetricsWriteFailures' })
+        $script:StartClears = Join-Path $TestDrive 'start-clears.ps1'
+        Set-Content -LiteralPath $script:StartClears -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                @($script:Clears | ForEach-Object { $_.Extent.Text })
+            ) -join "`n")
+        $script:SessionWriteFailures = Get-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionWriteFailures) { $Global:RdaMetricsWriteFailures = $script:SessionWriteFailures.Value }
+        else { Remove-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'are cleared at the start of the run (<Kind>)' -ForEach @(
+        @{ Kind = 'direct run'; Arguments = @{ TenantID = 'tenant-1' } }
+        @{ Kind = 'under -RunAllSubs'; Arguments = @{ TenantID = 'tenant-1'; RunAllSubs = $true } }
+    ) {
+        $Global:RdaMetricsWriteFailures = @('Metrics_ResourcesReport_earlier_2.json')
+        $null = & $script:StartClears @Arguments
+
+        @($Global:RdaMetricsWriteFailures).Count | Should -Be 0
     }
 }
 
