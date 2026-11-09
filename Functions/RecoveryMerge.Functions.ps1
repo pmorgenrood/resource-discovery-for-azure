@@ -618,6 +618,8 @@ function Merge-RecoveryData
         $BadCell = $null
         $RowIndex = 0
         $DroppedRowCount = 0
+        $ConsumptionMinStart = $null
+        $ConsumptionMaxEnd = $null
         Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop | ForEach-Object {
             # After a bad cell the file stops the merge, so the rest is not checked.
             if ($null -ne $BadCell) { return }
@@ -625,6 +627,12 @@ function Merge-RecoveryData
             $RowIndex++
             $RowId = [string]$Row.ResourceId
             $RowDropped = ([string]::IsNullOrWhiteSpace($RowId) -or [string]::IsNullOrWhiteSpace([string]$Row.MeterId))
+            # The billing window, compared as Get-ConsumptionCsvStats compares
+            # it, so -RecoverConsumption does not read this file a second time.
+            $Start = $Row.UsageStartTime
+            $End = $Row.UsageEndTime
+            if ($Start -and ($null -eq $ConsumptionMinStart -or [string]::Compare($Start, $ConsumptionMinStart, [System.StringComparison]::CurrentCultureIgnoreCase) -lt 0)) { $ConsumptionMinStart = $Start }
+            if ($End -and ($null -eq $ConsumptionMaxEnd -or [string]::Compare($End, $ConsumptionMaxEnd, [System.StringComparison]::CurrentCultureIgnoreCase) -gt 0)) { $ConsumptionMaxEnd = $End }
             foreach ($Column in $NumberColumns)
             {
                 $Cell = $Row.$Column
@@ -861,7 +869,8 @@ function Merge-RecoveryData
             try
             {
                 $GapConsumptionStats = Get-ConsumptionCsvStats -Path $GapConsumptionFile.FullName
-                $RecoveryConsumptionStats = Get-ConsumptionCsvStats -Path $RecoveryConsumptionFile.FullName
+                # Gathered in the one checking pass over the recovery file above.
+                $RecoveryConsumptionStats = [PSCustomObject]@{ RowCount = $RowIndex; MinStart = $ConsumptionMinStart; MaxEnd = $ConsumptionMaxEnd }
                 if ($GapConsumptionStats.RowCount -gt 0 -and $RecoveryConsumptionStats.RowCount -lt $GapConsumptionStats.RowCount)
                 {
                     Add-MergeWarning ('the recovery consumption CSV has FEWER rows than the gap CSV ({0} vs {1}). -RecoverConsumption whole-file-replaces, so the extra gap rows will be dropped. Confirm the recovery consumption pull completed fully before shipping.' -f $RecoveryConsumptionStats.RowCount, $GapConsumptionStats.RowCount)
