@@ -1508,7 +1508,6 @@ function Add-MetricRecord
                         while (-not $Succeeded -and $Attempt -le $CallMaxRetries)
                         {
                             $CallAttempts = $Attempt + 1
-                            $AttemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $TimedOut = $false
                             $Throttled = $false
                             $BadRequest = $false
@@ -1552,7 +1551,6 @@ function Add-MetricRecord
                                 Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                             }
 
-                            $AttemptStopwatch.Stop()
 
                             if ($Succeeded)
                             {
