@@ -509,9 +509,9 @@ if ($PreflightOnly)
     Write-Host ('  PowerShell {0}, az, and the Az modules ({1}) with Az.Accounts loaded: ok.' -f $PSVersionTable.PSVersion, ($RequiredAzSubModules -join ', ')) -ForegroundColor Green
 }
 
-# Read by Exit-Wrapper at every exit, so it is set before the first one (the
-# -SubscriptionID check below exits before the transcript is started), and a
-# run under Set-StrictMode never reads it unset.
+# Read by Exit-Wrapper at every exit, so it is set before the first one (a
+# check below can exit before the transcript is started), and a run under
+# Set-StrictMode never reads it unset.
 $WrapperTranscriptStarted = $false
 
 # -SubscriptionID was checked at the start (a GUID); from here on it is the

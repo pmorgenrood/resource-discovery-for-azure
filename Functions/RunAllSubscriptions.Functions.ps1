@@ -292,20 +292,6 @@ function Resolve-AccessPreflight
     }
 }
 
-# === Pre-flight checks ===
-#
-# Detect the most common environment problems that make a long run pointless,
-# before authentication, tenant resolution, or any per-subscription work.
-# Each check is one of:
-#   - Hard fail: print a clear message + remediation, call Exit-Wrapper.
-#   - Warn:      print a clear message and continue (the run will still
-#                produce useful output, just with a known caveat).
-#
-# NOTE: Run-AllSubscriptions.ps1 dot-sources this function from the shared
-# Functions folder. ResourceInventory.ps1 keeps its OWN inline variant of the
-# same checks (it deliberately differs: it honors -OutputDirectory, throws
-# instead of calling Exit-Wrapper, and is gated on -not $RunAllSubs). Keep the
-# two behaviorally in sync - if you change a check here, mirror it there.
 # Free bytes on the volume that holds the folder $Path, or $null when they
 # cannot be read. On Linux and macOS PowerShell has one file system drive, /,
 # whose free space is the root volume's, so the folder's own volume is read
@@ -320,6 +306,20 @@ function Get-FolderFreeSpaceBytes
     return [System.IO.DriveInfo]::new($Path).AvailableFreeSpace
 }
 
+# === Pre-flight checks ===
+#
+# Detect the most common environment problems that make a long run pointless,
+# before authentication, tenant resolution, or any per-subscription work.
+# Each check is one of:
+#   - Hard fail: print a clear message + remediation, call Exit-Wrapper.
+#   - Warn:      print a clear message and continue (the run will still
+#                produce useful output, just with a known caveat).
+#
+# NOTE: Run-AllSubscriptions.ps1 dot-sources this function from the shared
+# Functions folder. ResourceInventory.ps1 keeps its OWN inline variant of the
+# same checks (it deliberately differs: it honors -OutputDirectory, throws
+# instead of calling Exit-Wrapper, and is gated on -not $RunAllSubs). Keep the
+# two behaviorally in sync - if you change a check here, mirror it there.
 function Invoke-PreFlightChecks
 {
     param(

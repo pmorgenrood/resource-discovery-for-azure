@@ -862,3 +862,11 @@ Describe 'Get-FolderFreeSpaceBytes' {
         Should -Invoke Get-Item -Times 0 -Exactly
     }
 }
+
+Describe 'ResourceInventory.ps1 reads free space as the wrapper does' {
+    It 'reads the folder''s own volume on Linux and macOS in its own pre-flight copy' {
+        $Text = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1') -Raw
+        $Text | Should -Match '\[System\.IO\.DriveInfo\]::new\(\$RootItem\.FullName\)\.AvailableFreeSpace'
+        $Text | Should -Not -Match '\[math\]::Round\(\$Drive\.Free / 1MB, 0\)'
+    }
+}

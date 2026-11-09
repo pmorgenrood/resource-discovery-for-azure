@@ -1600,9 +1600,12 @@ if (-not $RunAllSubs.IsPresent)
     {
         $RootItem = Get-Item -Path $PreFlightInventoryRoot -ErrorAction Stop
         $Drive = $RootItem.PSDrive
-        if ($null -ne $Drive -and $null -ne $Drive.Free)
+        # As Get-FolderFreeSpaceBytes in the wrapper: on Linux and macOS the
+        # folder's own volume (PowerShell's drive / is the root volume's).
+        $FreeBytes = if ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6) { $Drive.Free } else { [System.IO.DriveInfo]::new($RootItem.FullName).AvailableFreeSpace }
+        if ($null -ne $FreeBytes)
         {
-            $FreeMB = [math]::Round($Drive.Free / 1MB, 0)
+            $FreeMB = [math]::Round($FreeBytes / 1MB, 0)
             if ($FreeMB -lt 100)
             {
                 throw ("Pre-flight: free disk space at {0} is {1} MB; the script needs at least 100 MB to start. Free space and re-run." -f $PreFlightInventoryRoot, $FreeMB)
