@@ -146,9 +146,12 @@ Two logs help diagnose partial failures (also summarised in the README):
   per-collector heartbeat (start/finish/failure) plus metrics-phase diagnostics
   that previously scrolled past on the terminal. **Local-only**, never added to
   the ZIP (it can contain real names and raw exception text).
-- **`Diagnostics_<ReportName>_<timestamp>.log`** — **shareable**, human-readable,
-  scrubbed diagnostics. Built on `-Obfuscate` runs and **included in the ZIP**.
-  Subscriptions appear as obfuscated tokens; identifiers are masked. It lists
+- **`Diagnostics_<ReportName>_<timestamp>.log`** — human-readable diagnostics,
+  written on **every** run and **included in the ZIP**. Only an `-Obfuscate`
+  run's copy is scrubbed for sharing: its subscriptions appear as obfuscated
+  tokens and identifiers are masked. A plain run's copy masks GUIDs and e-mail
+  addresses, but the bundle holds real names, so treat it as sensitive. It
+  counts only the entries of its own run. It lists
   phase timings and one-line health entries for collector failures, metrics
   auth-skips, and **consumption failures — including exactly where a consumption
   pull stopped** (`PageAtFailure` / `RecordsCollected`), so a truncated billing
