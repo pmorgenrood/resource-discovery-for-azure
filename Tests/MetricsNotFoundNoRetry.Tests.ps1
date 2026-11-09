@@ -117,6 +117,18 @@ Describe 'Test-MetricBadRequest on the shared status helper' {
         $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $null })
         Test-MetricBadRequest -Exception $Ex | Should -Be $Want
     }
+
+    It 'lets a status code decide over BadRequest text: a 503 that names BadRequest is not a BadRequest' {
+        Test-MetricBadRequest -Exception ([System.Net.Http.HttpRequestException]::new("upstream said: Operation returned an invalid status code 'BadRequest'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)) | Should -BeFalse
+        $Inner = [System.Exception]::new("Operation returned an invalid status code 'BadRequest'")
+        Test-MetricBadRequest -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Inner, [System.Net.HttpStatusCode]::InternalServerError)) | Should -BeFalse
+    }
+
+    It 'reads the BadRequest text when no exception in the chain carries a status' {
+        Test-MetricBadRequest -Exception ([System.Exception]::new("Operation returned an invalid status code 'BadRequest'")) | Should -BeTrue
+        $Inner = [System.Exception]::new("Operation returned an invalid status code 'BadRequest'")
+        Test-MetricBadRequest -Exception ([System.Exception]::new('The request failed.', $Inner)) | Should -BeTrue
+    }
 }
 
 Describe 'Get-MetricDeletingState' {
