@@ -101,8 +101,8 @@ Describe 'Reveal -RemoveStaging under <Culture>: <Name>' -ForEach $script:Cases 
     }
 
     It 'blames failed folders only when a folder failed' {
-        $Lines = @($script:Run.Console | Where-Object { $_ -like '-RemoveStaging skipped: * folder(s) failed or timed out.*' })
-        if ($BadFolder) { $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) failed or timed out. Staging kept so you can recover them with -Resume:') }
+        $Lines = @($script:Run.Console | Where-Object { $_ -like '-RemoveStaging skipped: * folder(s) failed or timed out*' })
+        if ($BadFolder) { $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) failed or timed out (see FAIL). Staging kept: fix the cause each FAIL line names (for a timeout, raise -FolderTimeoutMinutes), then re-run with -Resume:') }
         else { $Lines.Count | Should -Be 0 -Because ($Lines -join "`n") }
     }
 
