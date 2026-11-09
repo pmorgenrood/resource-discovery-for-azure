@@ -655,7 +655,8 @@ if ($Task -eq 'Processing')
                         {
                             $Found += $Ex.StatusCode
                         }
-                        if ($null -ne $Ex.PSObject.Properties['Status'] -and ($Ex.Status -is [int] -or $Ex.Status -is [long]))
+                        # Azure.Core gives Status 0 when no response came: that is no status.
+                        if ($null -ne $Ex.PSObject.Properties['Status'] -and ($Ex.Status -is [int] -or $Ex.Status -is [long]) -and $Ex.Status -ge 100 -and $Ex.Status -le 599)
                         {
                             $Found += $Ex.Status
                         }
@@ -673,7 +674,8 @@ if ($Task -eq 'Processing')
                             $Parsed = [System.Net.HttpStatusCode]::OK
                             if ($Text -match '^\d{3}$') { $Status = [int]$Text }
                             elseif ([System.Enum]::TryParse([System.Net.HttpStatusCode], $Text, $true, [ref]$Parsed)) { $Status = [int]$Parsed }
-                            if ($null -eq $Status) { continue }
+                            # A value outside 100-599 is not an HTTP status.
+                            if ($null -eq $Status -or $Status -lt 100 -or $Status -gt 599) { continue }
                             if ($Status -ge 400 -and $Status -lt 500 -and $Status -notin @(408, 429)) { return $Status }
                             if ($FromText) { if ($null -eq $FirstTextStatus) { $FirstTextStatus = $Status } }
                             elseif ($null -eq $FirstStatus) { $FirstStatus = $Status }
