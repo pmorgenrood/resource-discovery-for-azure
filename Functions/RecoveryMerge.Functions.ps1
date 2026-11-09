@@ -110,13 +110,22 @@ function Merge-RecoveryData
     #    without needing culture-aware date parsing. -----------------------------
     function Get-ConsumptionCsvStats([string]$Path)
     {
-        $Rows = @(Import-Csv -LiteralPath $Path -ErrorAction Stop)
-        $Starts = @($Rows | ForEach-Object { $_.UsageStartTime } | Where-Object { $_ } | Sort-Object -Unique)
-        $Ends = @($Rows | ForEach-Object { $_.UsageEndTime } | Where-Object { $_ } | Sort-Object -Unique)
+        # One pass, keeping no row: the count and the lowest start and highest
+        # end, compared as Sort-Object compares strings.
+        $RowCount = 0
+        $MinStart = $null
+        $MaxEnd = $null
+        Import-Csv -LiteralPath $Path -ErrorAction Stop | ForEach-Object {
+            $RowCount++
+            $Start = $_.UsageStartTime
+            $End = $_.UsageEndTime
+            if ($Start -and ($null -eq $MinStart -or [string]::Compare($Start, $MinStart, [System.StringComparison]::CurrentCultureIgnoreCase) -lt 0)) { $MinStart = $Start }
+            if ($End -and ($null -eq $MaxEnd -or [string]::Compare($End, $MaxEnd, [System.StringComparison]::CurrentCultureIgnoreCase) -gt 0)) { $MaxEnd = $End }
+        }
         [PSCustomObject]@{
-            RowCount = @($Rows).Count
-            MinStart = ($Starts | Select-Object -First 1)
-            MaxEnd   = ($Ends | Select-Object -Last 1)
+            RowCount = $RowCount
+            MinStart = $MinStart
+            MaxEnd   = $MaxEnd
         }
     }
 
@@ -544,7 +553,9 @@ function Merge-RecoveryData
     #    without the columns it needs, and every metric in a zip when one
     #    Metrics file is not an object with a Metrics list, both without an
     #    error, so such a file stops the merge instead. ------------------------
-    $ConsumptionRows = @()
+    # Set by the one pass over the consumption file below.
+    $ConsumptionHasRows = $false
+    $ConsumptionUnmaskedRow = 0
     $ConsumptionSource = if ($RecoverConsumption) { 'recovery' } else { 'gap' }
     $ConsumptionSourceFile = if ($RecoverConsumption) { $RecoveryConsumptionFile } else { $GapConsumptionFile }
     if ($ConsumptionSourceFile)
@@ -583,17 +594,26 @@ function Merge-RecoveryData
         # do not stop the merge (the gap, the recovery and a re-run would all
         # carry the same row, so a stop would never clear); one warning gives
         # their count instead.
-        $ConsumptionRows = @(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop)
+        # One streaming pass reads the file row by row and keeps no row, so a
+        # large file is never held in memory: it checks the cells, counts the
+        # rows downstream drops one by one, notes whether there are rows and,
+        # in a masked merge, the first row whose ResourceId is not masked (the
+        # masking guard below reports it, after its own earlier checks).
         $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
         $NumberColumns = @('Quantity', 'Cost', 'UnitPrice' | Where-Object { $_ -in $HeaderNames })
         $DateColumns = @('UsageStartTime', 'UsageEndTime')
+        $CheckMaskedRows = [bool]($GapDictionaryFile -and $RecoveryDictionaryFile)
         $BadCell = $null
         $RowIndex = 0
         $DroppedRowCount = 0
-        foreach ($Row in $ConsumptionRows)
-        {
+        Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop | ForEach-Object {
+            # After a bad cell the file stops the merge, so the rest is not checked.
+            if ($null -ne $BadCell) { return }
+            $Row = $_
             $RowIndex++
-            $RowDropped = ([string]::IsNullOrWhiteSpace([string]$Row.ResourceId) -or [string]::IsNullOrWhiteSpace([string]$Row.MeterId))
+            $ConsumptionHasRows = $true
+            $RowId = [string]$Row.ResourceId
+            $RowDropped = ([string]::IsNullOrWhiteSpace($RowId) -or [string]::IsNullOrWhiteSpace([string]$Row.MeterId))
             foreach ($Column in $NumberColumns)
             {
                 $Cell = $Row.$Column
@@ -601,12 +621,9 @@ function Merge-RecoveryData
                 if (-not [double]::TryParse([string]$Cell, [System.Globalization.NumberStyles]::Float, $Invariant, [ref]$Number) -or [double]::IsNaN($Number) -or [double]::IsInfinity($Number))
                 {
                     $BadCell = ("row {0} has a {1} of '{2}', which is not a number written with a dot and no thousands mark" -f $RowIndex, $Column, $Cell)
+                    break
                 }
-                elseif ($Column -eq 'Quantity' -and $Number -lt 0)
-                {
-                    $RowDropped = $true
-                }
-                if ($null -ne $BadCell) { break }
+                if ($Column -eq 'Quantity' -and $Number -lt 0) { $RowDropped = $true }
             }
             if ($RowDropped) { $DroppedRowCount++ }
             if ($null -eq $BadCell)
@@ -622,7 +639,11 @@ function Merge-RecoveryData
                     }
                 }
             }
-            if ($null -ne $BadCell) { break }
+            # A row with an empty ResourceId is dropped downstream and names nothing.
+            if ($CheckMaskedRows -and $ConsumptionUnmaskedRow -eq 0 -and -not [string]::IsNullOrEmpty($RowId) -and -not (Test-MergeMaskedId $RowId))
+            {
+                $ConsumptionUnmaskedRow = $RowIndex
+            }
         }
         if ($null -ne $BadCell)
         {
@@ -687,8 +708,6 @@ function Merge-RecoveryData
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
         $GapKeptKeys = @($GapInventory.PSObject.Properties.Name | Where-Object { $_ -ne 'Version' -and $_ -notin $MergeKeys })
-        # Read once with the cell checks above.
-        $ConsumptionHasRows = ($ConsumptionRows.Count -gt 0)
         foreach ($Side in @(
                 @{ Label = 'gap'; IdKeys = $GapIdKeys; Dict = $GapDictionaryFile; Inventory = $GapInventory; Keys = $GapKeptKeys },
                 @{ Label = 'recovery'; IdKeys = $RecoveryIdKeys; Dict = $RecoveryDictionaryFile; Inventory = $RecoveryInventory; Keys = $MergeKeys }
@@ -753,15 +772,8 @@ function Merge-RecoveryData
             }
             if ($null -eq $Found -and $ConsumptionSource -eq $Side.Label -and $ConsumptionSourceFile)
             {
-                $RowIndex = 0
-                foreach ($Row in $ConsumptionRows)
-                {
-                    $RowIndex++
-                    $RowId = $Row.ResourceId
-                    # A row with an empty ResourceId is dropped downstream and names nothing.
-                    if ([string]::IsNullOrEmpty($RowId)) { continue }
-                    if (-not (Test-MergeMaskedId $RowId)) { $Found = ("row {0} of the consumption file '{1}' has a ResourceId that is not masked" -f $RowIndex, $ConsumptionSourceFile.Name); break }
-                }
+                # Found in the one pass over the file with the cell checks above.
+                if ($ConsumptionUnmaskedRow -gt 0) { $Found = ("row {0} of the consumption file '{1}' has a ResourceId that is not masked" -f $ConsumptionUnmaskedRow, $ConsumptionSourceFile.Name) }
             }
             if ($null -eq $Found -and $MetricsSourceLabel -eq $Side.Label)
             {

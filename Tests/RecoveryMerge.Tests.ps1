@@ -616,6 +616,51 @@ Describe 'Merge-RecoveryData consumption handling' {
         $Drop[0] | Should -BeLike ("*the $Which bundle's consumption file '{0}' has 3 row(s)*" -f (Split-Path -Leaf $Source))
     }
 
+    It 'reads each consumption file in one streaming pass that keeps no row' {
+        # Every Import-Csv in the merge must feed a ForEach-Object straight away;
+        # @(Import-Csv ...) or $x = Import-Csv ... would hold the whole file.
+        $Source = Join-Path (Split-Path -Parent $PSScriptRoot) 'Functions/RecoveryMerge.Functions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$null, [ref]$null)
+        $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Import-Csv' }, $true))
+        $Calls.Count | Should -BeGreaterThan 0
+        foreach ($Call in $Calls)
+        {
+            $Pipeline = $Call.Parent
+            $Pipeline | Should -BeOfType ([System.Management.Automation.Language.PipelineAst])
+            $Pipeline.PipelineElements.Count | Should -BeGreaterThan 1 -Because ('line {0} must stream into ForEach-Object' -f $Call.Extent.StartLineNumber)
+            $Pipeline.PipelineElements[0] | Should -Be $Call
+            $Pipeline.PipelineElements[1].GetCommandName() | Should -Be 'ForEach-Object'
+            $Pipeline.Parent | Should -Not -BeOfType ([System.Management.Automation.Language.AssignmentStatementAst]) -Because ('line {0} must not keep the rows' -f $Call.Extent.StartLineNumber)
+        }
+    }
+
+    It 'merges a large masked consumption file and still finds a plain id in its last row' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $Id = $Masked.Records[0].ID
+        $Builder = [System.Text.StringBuilder]::new()
+        [void]$Builder.AppendLine($script:CsvHeader)
+        for ($i = 0; $i -lt 30000; $i++) { [void]$Builder.AppendLine("{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$Id,eastus,,,") }
+        $Csv = $Builder.ToString().TrimEnd()
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash |
+            Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase))).Hash
+
+        $C2 = New-Case
+        $RealId = '/subscriptions/{0}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk-real' -f $script:DocsGuid
+        New-Bundle -Dir $C2.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv ("$Csv`n{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$RealId,eastus,,,") -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C2.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+        { Merge-RecoveryData -GapBundlePath $C2.Gap -RecoveryBundlePath $C2.Recovery -OutputPath $C2.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*row 30001 of the consumption file*has a ResourceId that is not masked*'
+        Test-Path -LiteralPath $C2.Output | Should -BeFalse
+    }
+
     It 'carries a consumption file with quoted headers forward byte for byte' {
         $C = New-Case
         $Quoted = '"' + ($script:CsvHeader -replace ',', '","') + '"' + "`n" + '"{}","Compute","m1","MET","eastus","vm","1","Hours","2026-01-01","2026-01-02","/id","eastus","","",""'
