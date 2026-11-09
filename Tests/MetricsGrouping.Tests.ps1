@@ -157,6 +157,10 @@ function Get-AzMetric
         # A 5xx that wraps a 404 is a 404: a client status anywhere in the chain wins over a 5xx wrapper.
         'Status503WithNotFoundText' { throw [System.Net.Http.HttpRequestException]::new("upstream: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
         'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
+        # Client statuses a retry cannot change, known by their status code.
+        'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
+        'Status401' { throw [System.Net.Http.HttpRequestException]::new('The token was refused.', $null, [System.Net.HttpStatusCode]::Unauthorized) }
+        'Status403' { throw [System.Net.Http.HttpRequestException]::new('Access denied.', $null, [System.Net.HttpStatusCode]::Forbidden) }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -518,8 +522,8 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         $Single = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 1 })
         $Grouped = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 4 })
         $Grouped.Count | Should -Be 1
-        # A single-metric request keeps the full retry ladder (4 attempts), BadRequest included.
-        @($Single | Where-Object { $_.MetricName -eq 'Composite Disk Write Bytes/sec' }).Count | Should -Be 4
+        # A single-metric request rejected with BadRequest is rejected the same way again: 1 attempt.
+        @($Single | Where-Object { $_.MetricName -eq 'Composite Disk Write Bytes/sec' }).Count | Should -Be 1
         @($Single | Where-Object { $_.MetricName -ne 'Composite Disk Write Bytes/sec' }).Count | Should -Be 3
     }
 
@@ -881,6 +885,23 @@ Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
         $Dropping | Add-Member -NotePropertyName properties -NotePropertyValue ([PSCustomObject]@{ state = 'Dropping' })
         $Run = Invoke-MetricsRun -Resources @($Dropping) -RunName 'notfound-dropping-5xx' -SingleError 'ServiceUnavailable'
         @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
+    }
+
+    It 'makes 1 attempt, not 4, for a single-metric request Azure refuses with <SingleError>, with the same records' -ForEach @(@{ SingleError = 'BadRequest' }, @{ SingleError = 'Status400' }, @{ SingleError = 'Status401' }, @{ SingleError = 'Status403' }) {
+        $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('refused-single-' + $SingleError) -SingleError $SingleError
+        $Retried = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('refused-single-retried-' + $SingleError) -SingleError 'ServiceUnavailable'
+
+        $Run.Calls.Count | Should -Be 2 -Because 'one attempt for each of the 2 metrics'
+        foreach ($Name in 'Percentage CPU', 'Available Memory Bytes')
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        # A refusal is not a 404: no deleting note, and no throttled outcome.
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=|being deleted' }).Count | Should -Be 0
+        $Want = ConvertTo-RecordMap -Records $Retried.Records
+        $Got = ConvertTo-RecordMap -Records $Run.Records
+        @($Got.Keys | Sort-Object) | Should -Be @($Want.Keys | Sort-Object)
+        foreach ($Key in $Want.Keys) { $Got[$Key] | Should -Be $Want[$Key] -Because $Key }
     }
 
     It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }, @{ SingleError = 'Status503WithNotFoundText'; Calls = 8 }) {

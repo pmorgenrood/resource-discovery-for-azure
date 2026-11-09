@@ -1627,7 +1627,8 @@ function Add-MetricRecord
                 # Returns the outcome rather than throwing, so the caller decides how a
                 # failure is recorded for each definition. With -StopOnBadRequest a
                 # BadRequest answer ends the request at once: the same name set is
-                # rejected the same way on every retry.
+                # rejected the same way on every retry. Without it a BadRequest, like a
+                # 404 or a refusal, gets one attempt and is recorded as an Error.
                 function Invoke-MetricRequest
                 {
                     param($Def, $MetricNames, [string]$Kind, [switch]$StopOnBadRequest)
@@ -1706,9 +1707,10 @@ function Add-MetricRecord
                                     {
                                         $NotFound = $true
                                     }
-                                    elseif ($Failure.Kind -eq 'Refused')
+                                    elseif ($Failure.Kind -eq 'Refused' -or ($Failure.Kind -eq 'BadRequest' -and -not $StopOnBadRequest))
                                     {
-                                        # A 401, 403 or other such 4xx: refused the same way on every retry.
+                                        # A 401, 403 or other such 4xx, or a 400 for a request that has no
+                                        # one-request-per-metric fallback: refused the same way on every retry.
                                         $Refused = $true
                                     }
                                     elseif ($Failure.Kind -eq 'Throttled')
