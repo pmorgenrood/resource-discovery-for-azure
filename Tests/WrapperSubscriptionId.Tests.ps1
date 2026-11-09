@@ -662,6 +662,18 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Pf.ExitCode | Should -Be 0
     }
 
+    It 'with -Resume and -ResumeFailedOnly, leaves a retry that an earlier run completed out of the read check, as the run does' {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Failed = @('A', 'B' | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = ('Sub ' + $_); LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 } })
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = $Failed; LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'A'
+        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-ResumeFailedOnly')
+        $Run = script:Invoke-Wrapper -Arguments @('-Resume', '-ResumeFailedOnly')
+        $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight checks what the run checks'
+        $Pf.ExitCode | Should -Be 0
+    }
+
     It 'ends as the run does when no subscription of the tenant is Enabled' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B' -Disabled 'A', 'B'
@@ -748,11 +760,14 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $PreflightOnly' -and $_.Extent.Text.Contains('Invoke-PreFlightChecks') })
         if ($If.Count -ne 1 -or $null -eq $If[0].ElseClause) { throw 'the -PreflightOnly else block was not found in Run-AllSubscriptions.ps1' }
         $script:DiskBlock = [scriptblock]::Create((@($If[0].ElseClause.Statements | ForEach-Object { $_.Extent.Text }) -join "`n"))
+        # Invoke-PreFlightChecks, which the block calls with -ReadOnly.
+        . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1')
         function script:Invoke-DiskCheck
         {
             param([long]$FreeBytes)
             $script:Exited = $null
             Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = $FreeBytes } } }
+            Mock Set-Content { throw 'a preflight must write nothing' }
             Mock Exit-Wrapper { param($Code) $script:Exited = $Code }
             @(. $script:DiskBlock 6>&1 | ForEach-Object { [string]$_ })
         }
@@ -763,14 +778,16 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         $Lines = Invoke-DiskCheck -FreeBytes (50MB)
         $script:Exited | Should -Be 1
         $script:PreflightCheck | Should -Be 'free disk space'
-        @($Lines | Where-Object { $_ -like 'ERROR: Free disk space at * is 50 MB. A run needs at least 100 MB to start.' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like 'ERROR: Free disk space at * is 50 MB. The script needs at least 100 MB to start.*' }).Count | Should -Be 1
         Should -Invoke Get-Item -Times 1 -Exactly
+        Should -Invoke Set-Content -Times 0 -Exactly
     }
 
     It 'passes with enough free space' {
         $Lines = Invoke-DiskCheck -FreeBytes (2GB)
         $script:Exited | Should -BeNullOrEmpty
         @($Lines | Where-Object { $_ -like 'Free disk space: * MB at *' }).Count | Should -Be 1
+        Should -Invoke Set-Content -Times 0 -Exactly
     }
 }
 

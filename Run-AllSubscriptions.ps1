@@ -550,8 +550,9 @@ $Global:MetricsFailedSubs = @()
 $Global:CollectorFailures = @()
 
 # A -PreflightOnly run skips all of this: it creates no inventory folder, starts
-# no transcript, and does not run Invoke-PreFlightChecks (its write probe writes
-# a file there). Nothing on its path below uses $InventoryRoot.
+# no transcript, and runs only the read-only checks of Invoke-PreFlightChecks
+# (its write probe writes a file there). Nothing on its path below uses
+# $InventoryRoot.
 if (-not $PreflightOnly)
 {
     # Inventory root (used for resume state, consolidated output, and the wrapper
@@ -602,42 +603,12 @@ if (-not $PreflightOnly)
 }
 else
 {
-    # The free-space check of Invoke-PreFlightChecks, read only: on the
-    # inventory folder, or the nearest folder above it that is there (a
-    # preflight creates nothing). The write probe is left out (it writes).
+    # The read-only checks of Invoke-PreFlightChecks (Cloud Shell storage, free
+    # disk space on the inventory folder or the nearest folder above it); the
+    # write probe is left out, because it writes. A preflight creates nothing.
     $script:PreflightCheck = 'free disk space'
-    $PfDiskPath = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
-    while (-not [string]::IsNullOrEmpty($PfDiskPath) -and -not (Test-Path -LiteralPath $PfDiskPath -PathType Container))
-    {
-        $PfDiskParent = Split-Path -Path $PfDiskPath -Parent
-        $PfDiskPath = if ($PfDiskParent -eq $PfDiskPath) { $null } else { $PfDiskParent }
-    }
-    try
-    {
-        $PfDrive = if ($PfDiskPath) { (Get-Item -LiteralPath $PfDiskPath -ErrorAction Stop).PSDrive } else { $null }
-        if ($null -ne $PfDrive -and $null -ne $PfDrive.Free)
-        {
-            $PfFreeMB = [math]::Round($PfDrive.Free / 1MB, 0)
-            if ($PfFreeMB -lt 100)
-            {
-                Write-Host ("ERROR: Free disk space at {0} is {1} MB. A run needs at least 100 MB to start." -f $PfDiskPath, $PfFreeMB) -ForegroundColor Red
-                Exit-Wrapper -Code 1
-            }
-            elseif ($PfFreeMB -lt 500)
-            {
-                Write-Host ("WARNING: Free disk space at {0} is {1} MB. A large multi-subscription run can exceed this." -f $PfDiskPath, $PfFreeMB) -ForegroundColor Yellow
-            }
-            else
-            {
-                Write-Host ("Free disk space: {0:N0} MB at {1}" -f $PfFreeMB, $PfDiskPath) -ForegroundColor Green
-            }
-        }
-    }
-    catch
-    {
-        # As in a run: free space that cannot be read is a warning, not a stop.
-        Write-Host ("WARNING: Could not determine free disk space at {0}: {1}" -f $PfDiskPath, $_.Exception.Message) -ForegroundColor Yellow
-    }
+    $PfDiskRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+    Invoke-PreFlightChecks -InventoryRoot $PfDiskRoot -ReadOnly
 }
 
 
@@ -885,11 +856,12 @@ if ($PreflightOnly)
     # eligible list, even when -Resume leaves some out of the access check,
     # so the preflight does the same, also when nothing is left to collect.
     $PfEligible = @($Subscriptions)
+    $PfRetryList = @()
     $PfConsumptionCheck = {
         if ($SkipConsumption) { return }
         $script:PreflightCheck = 'consumption access'
         # -ResumeFailedOnly probes the first subscription of its retry list, as the run does.
-        $PfProbeSub = if ($ResumeFailedOnly) { $Subscriptions[0] } else { $PfEligible[0] }
+        $PfProbeSub = if ($ResumeFailedOnly) { $PfRetryList[0] } else { $PfEligible[0] }
         Write-Host ("Verifying consumption (billing) access using subscription '{0}'..." -f $PfProbeSub.Name) -ForegroundColor Cyan
         $PfConsumption = Test-ConsumptionAccess -SubscriptionId $PfProbeSub.Id
         if ($PfConsumption.Outcome -eq 'Denied')
@@ -946,6 +918,11 @@ if ($PreflightOnly)
         {
             $PfFailedIds = @($PfFailed | ForEach-Object { [string]$_.Id })
             $Subscriptions = @($Subscriptions | Where-Object { $PfFailedIds -contains [string]$_.Id })
+            # The run's consumption gate probes the first of the retry list.
+            $PfRetryList = @($Subscriptions)
+            # With -Resume too, the run also leaves out what an earlier run
+            # completed, from its access check and its collection.
+            if ($Resume) { $Subscriptions = @($Subscriptions | Where-Object { $PfCompleted -notcontains [string]$_.Id }) }
         }
         else
         {
@@ -956,8 +933,9 @@ if ($PreflightOnly)
         {
             Write-Host '  Nothing is left for the run to collect, so no read access check is needed.' -ForegroundColor Green
             # A -ResumeFailedOnly run with nothing to retry stops before its
-            # consumption gate; a -Resume run still reaches it.
-            if (-not $ResumeFailedOnly) { & $PfConsumptionCheck }
+            # consumption gate; a -Resume run still reaches it, and so does a
+            # -ResumeFailedOnly -Resume run whose retries were all completed.
+            if (-not $ResumeFailedOnly -or $PfRetryList.Count -gt 0) { & $PfConsumptionCheck }
             Write-Host 'Every check passed.' -ForegroundColor Green
             Exit-Wrapper -Code 0
         }

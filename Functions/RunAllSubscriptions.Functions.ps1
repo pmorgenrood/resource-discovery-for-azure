@@ -309,7 +309,11 @@ function Resolve-AccessPreflight
 function Invoke-PreFlightChecks
 {
     param(
-        [Parameter(Mandatory = $true)] [string] $InventoryRoot
+        [Parameter(Mandatory = $true)] [string] $InventoryRoot,
+        # -PreflightOnly: the read-only checks only. The free space is read on
+        # the inventory folder or the nearest folder above it that is there
+        # (nothing is created), and the write probe, which writes, is skipped.
+        [switch] $ReadOnly
     )
 
     Write-Host "Running pre-flight checks..." -ForegroundColor Cyan
@@ -356,25 +360,34 @@ function Invoke-PreFlightChecks
     # is filling the home directory) the run will fail late with a confusing
     # "There is not enough space" during report generation or zip packaging.
     # Catch it now.
+    $SpacePath = $InventoryRoot
+    if ($ReadOnly)
+    {
+        while (-not [string]::IsNullOrEmpty($SpacePath) -and -not (Test-Path -LiteralPath $SpacePath -PathType Container))
+        {
+            $SpaceParent = Split-Path -Path $SpacePath -Parent
+            $SpacePath = if ($SpaceParent -eq $SpacePath) { $null } else { $SpaceParent }
+        }
+    }
     try
     {
-        $RootItem = Get-Item -Path $InventoryRoot -ErrorAction Stop
+        $RootItem = Get-Item -LiteralPath $SpacePath -ErrorAction Stop
         $Drive = $RootItem.PSDrive
         if ($null -ne $Drive -and $null -ne $Drive.Free)
         {
             $FreeMB = [math]::Round($Drive.Free / 1MB, 0)
             if ($FreeMB -lt 100)
             {
-                Write-Host ("ERROR: Free disk space at {0} is {1} MB. The script needs at least 100 MB to start. Free space and re-run." -f $InventoryRoot, $FreeMB) -ForegroundColor Red
+                Write-Host ("ERROR: Free disk space at {0} is {1} MB. The script needs at least 100 MB to start. Free space and re-run." -f $SpacePath, $FreeMB) -ForegroundColor Red
                 Exit-Wrapper -Code 1
             }
             elseif ($FreeMB -lt 500)
             {
-                Write-Host ("WARNING: Free disk space at {0} is {1} MB. A large multi-subscription run can exceed this. Consider freeing space before running." -f $InventoryRoot, $FreeMB) -ForegroundColor Yellow
+                Write-Host ("WARNING: Free disk space at {0} is {1} MB. A large multi-subscription run can exceed this. Consider freeing space before running." -f $SpacePath, $FreeMB) -ForegroundColor Yellow
             }
             else
             {
-                Write-Host ("Free disk space: {0:N0} MB at {1}" -f $FreeMB, $InventoryRoot) -ForegroundColor Green
+                Write-Host ("Free disk space: {0:N0} MB at {1}" -f $FreeMB, $SpacePath) -ForegroundColor Green
             }
         }
     }
@@ -383,8 +396,9 @@ function Invoke-PreFlightChecks
         # If we cannot read free space (uncommon - usually means the inventory
         # root is on an exotic filesystem), warn but do not fail. The write
         # probe below is the real correctness gate.
-        Write-Host ("WARNING: Could not determine free disk space at {0}: {1}" -f $InventoryRoot, $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host ("WARNING: Could not determine free disk space at {0}: {1}" -f $SpacePath, $_.Exception.Message) -ForegroundColor Yellow
     }
+    if ($ReadOnly) { return }
 
     # 3. Write probe.
     #
