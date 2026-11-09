@@ -872,8 +872,10 @@ if ($PreflightOnly)
 {
     if ($Subscriptions.Count -eq 0)
     {
-        Write-Host ("ERROR: None of the {0} subscription(s) the tenant lists is Enabled. To check them anyway, run the same command with -IncludeDisabled." -f $AllSubscriptions.Count) -ForegroundColor Red
-        Exit-Wrapper -Code 1
+        # As in a run, which then collects nothing and ends with exit 0.
+        Write-Host ("WARNING: None of the {0} subscription(s) the tenant lists is Enabled, so a run would collect nothing. To check them anyway, run the same command with -IncludeDisabled." -f $AllSubscriptions.Count) -ForegroundColor Yellow
+        Write-Host 'Every check passed.' -ForegroundColor Green
+        Exit-Wrapper -Code 0
     }
     # The run checks access only for the subscriptions it would collect:
     # -Resume leaves out those it completed, -ResumeFailedOnly takes only the

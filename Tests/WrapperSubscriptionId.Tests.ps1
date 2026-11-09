@@ -657,6 +657,16 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Pf.ExitCode | Should -Be 0
     }
 
+    It 'ends as the run does when no subscription of the tenant is Enabled' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Disabled 'A', 'B'
+        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly')
+        $Run = script:Invoke-Wrapper
+        $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight ends as the run does'
+        @($Pf.Text | Where-Object { $_ -like 'WARNING: None of the 2 subscription(s) the tenant lists is Enabled, so a run would collect nothing.*' }).Count | Should -Be 1
+        script:Get-Calls | Should -BeNullOrEmpty
+    }
+
     It 'checks a -ResumeFailedOnly retry that is also listed as completed when no per-stream state is there, as the run collects it' {
         script:New-Case
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
