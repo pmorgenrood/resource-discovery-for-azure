@@ -360,6 +360,116 @@ function Get-MetricBatchBackoff
     return $Backoff
 }
 
+# The exception and the ones it wraps (inner exceptions and a wrapped error
+# record's exception), outermost first, at most 10.
+function Get-MetricExceptionChain
+{
+    param([System.Exception]$Exception)
+
+    $Chain = [System.Collections.Generic.List[object]]::new()
+    $Pending = [System.Collections.Generic.Queue[object]]::new()
+    $Pending.Enqueue($Exception)
+    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
+    {
+        $Ex = $Pending.Dequeue()
+        if ($null -eq $Ex) { continue }
+        $Chain.Add($Ex)
+        $Pending.Enqueue($Ex.InnerException)
+        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+        {
+            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+        }
+    }
+    return , $Chain
+}
+
+# The HTTP status an exception carries itself (its response's, else its own) as a
+# number, or $null when it carries none. Only 100 to 599 counts as a status.
+function Get-MetricExceptionStatus
+{
+    param($Ex)
+
+    $StatusCode = $null
+    if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+    {
+        $StatusCode = $Ex.Response.StatusCode
+    }
+    # A response with no status value does not hide the exception's own status.
+    if ($null -eq $StatusCode -and $null -ne $Ex.PSObject.Properties['StatusCode'])
+    {
+        $StatusCode = $Ex.StatusCode
+    }
+    if ($null -eq $StatusCode) { return $null }
+    # A number, a status name ('NotFound') or an HttpStatusCode value.
+    try { $Code = [int][System.Net.HttpStatusCode]$StatusCode } catch { return $null }
+    if ($Code -lt 100 -or $Code -gt 599) { return $null }
+    return $Code
+}
+
+# Why an Azure Monitor request failed, read in one walk of the exception and every
+# exception it wraps. Kind is 'NotFound' (404), 'BadRequest' (400), 'Refused' (any
+# other 4xx but 408 and 429), 'Throttled' (429) or 'Other' (a 5xx, a 408, no status).
+# Status is the status that decided, else the outermost one, else $null; Statuses
+# lists every status found, outermost first.
+# The order: a client status that a retry cannot change, anywhere in the chain, wins
+# (the outermost one when there are several), so a 429 or a 5xx that wraps a 400 is
+# a 400, and a 403 that wraps a 429 is refused. Then a 429 anywhere is throttled.
+# Only when no exception in the chain carries a status is the text read, in strict
+# forms only, so a name such as vm-NotFound-01 or rg-429 is not taken for a status:
+# Az's "invalid status code 'X'" (quotes optional, X a whole status name), the newer
+# SDK's error code 'ResourceNotFound' (a 404), and clear throttling phrases.
+function Get-MetricFailure
+{
+    param([System.Exception]$Exception)
+
+    $Chain = Get-MetricExceptionChain -Exception $Exception
+    $Statuses = [System.Collections.Generic.List[int]]::new()
+    foreach ($Ex in $Chain)
+    {
+        $Status = Get-MetricExceptionStatus -Ex $Ex
+        if ($null -ne $Status) { $Statuses.Add($Status) }
+    }
+
+    $ThrottleText = $false
+    if ($Statuses.Count -eq 0)
+    {
+        $Phrases = @(
+            '(?<![\w-])Too ?Many ?Requests(?![\w-])',
+            '\b(?:status|code|HTTP|success)\b[\s:''"=(]*429(?![\w-])',
+            '(?<![\w-])throttl(?:ed|ing)(?![\w-])',
+            '(?<![\w-])rate limit'
+        )
+        $ThrottlePattern = $Phrases -join '|'
+        foreach ($Ex in $Chain)
+        {
+            $Message = [string]$Ex.Message
+            foreach ($Match in [regex]::Matches($Message, "(?i)invalid status code\s*(?:'(?<Name>[a-z]+)'|(?<Name>[a-z]+)(?![\w-]))"))
+            {
+                # Only a status name .NET knows, such as NotFound or TooManyRequests.
+                $Code = $null
+                try { $Code = [int][System.Net.HttpStatusCode]$Match.Groups['Name'].Value } catch { $Code = $null }
+                if ($null -ne $Code -and $Code -ge 100 -and $Code -le 599) { $Statuses.Add($Code) }
+            }
+            $BodyCode = if ($null -ne $Ex.PSObject.Properties['Body'] -and $null -ne $Ex.Body -and $null -ne $Ex.Body.PSObject.Properties['Code']) { [string]$Ex.Body.Code } else { '' }
+            if ($Message -match '^\s*\[ResourceNotFound\]' -or $BodyCode -eq 'ResourceNotFound') { $Statuses.Add(404) }
+            if ($Message -match $ThrottlePattern) { $ThrottleText = $true }
+        }
+    }
+
+    foreach ($Code in $Statuses)
+    {
+        if ($Code -ge 400 -and $Code -le 499 -and $Code -ne 408 -and $Code -ne 429)
+        {
+            $Kind = if ($Code -eq 404) { 'NotFound' } elseif ($Code -eq 400) { 'BadRequest' } else { 'Refused' }
+            return [pscustomobject]@{ Kind = $Kind; Status = $Code; Statuses = $Statuses }
+        }
+    }
+    if ($Statuses.Contains(429)) { return [pscustomobject]@{ Kind = 'Throttled'; Status = 429; Statuses = $Statuses } }
+    $First = if ($Statuses.Count -gt 0) { $Statuses[0] } else { $null }
+    $Kind = if ($ThrottleText) { 'Throttled' } else { 'Other' }
+    return [pscustomobject]@{ Kind = $Kind; Status = $First; Statuses = $Statuses }
+}
+
 if ($Task -eq 'Processing')
 {
     function Write-MetricsDiag([string]$Line)
@@ -806,6 +916,12 @@ if ($Task -eq 'Processing')
             }
         }
     }
+
+    # The text of Get-MetricFailure and its helpers, for the parallel runspaces (a
+    # script block cannot be handed over), so every request path reads an error the same way.
+    $MetricFailureSource = (@('Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure') | ForEach-Object {
+            "function $_`n{`n" + (Get-Item -LiteralPath ('function:' + $_)).ScriptBlock.ToString() + "`n}`n"
+        }) -join "`n"
 
     # The one copy of Add-MetricRecord, defined in each parallel runspace that builds
     # records (the per-resource requests and, with -UseMetricsBatch, the batch
@@ -1477,7 +1593,8 @@ function Add-MetricRecord
                 # other failure uses the generic budget and 2^(failures-1) backoff. Each count includes the current
                 # failure, and one kind never spends the other's budget. A throttled retry is not made when its sleep
                 # would take the request's total throttle wait past MaxThrottleWaitSeconds.
-                # A permanent failure (a 404: the resource is not there) is never retried.
+                # A permanent failure (a 404: the resource is not there; a 401, 403 or other such
+                # client status: refused the same way again) is never retried.
                 # Returns @{ Retry; SleepSeconds }; SleepSeconds includes the given jitter.
                 function Get-RdaMetricRetryPlan
                 {
@@ -1503,159 +1620,8 @@ function Add-MetricRecord
                     return @{ Retry = $true; SleepSeconds = $SleepSeconds }
                 }
 
-                # The exception and the ones it wraps (inner exceptions and a wrapped error
-                # record's exception), outermost first, at most 10.
-                function Get-MetricExceptionChain
-                {
-                    param([System.Exception]$Exception)
-
-                    $Chain = [System.Collections.Generic.List[object]]::new()
-                    $Pending = [System.Collections.Generic.Queue[object]]::new()
-                    $Pending.Enqueue($Exception)
-                    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
-                    {
-                        $Ex = $Pending.Dequeue()
-                        if ($null -eq $Ex) { continue }
-                        $Chain.Add($Ex)
-                        $Pending.Enqueue($Ex.InnerException)
-                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-                        {
-                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
-                        }
-                    }
-                    return , $Chain
-                }
-
-                # The HTTP status an exception carries itself (its response's, else its own), as
-                # text ('404' or 'NotFound' style), or $null when it carries none.
-                function Get-MetricExceptionStatus
-                {
-                    param($Ex)
-
-                    $StatusCode = $null
-                    if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                    {
-                        $StatusCode = $Ex.Response.StatusCode
-                    }
-                    # A response with no status value does not hide the exception's own status.
-                    if ($null -eq $StatusCode -and $null -ne $Ex.PSObject.Properties['StatusCode'])
-                    {
-                        $StatusCode = $Ex.StatusCode
-                    }
-                    if ($null -eq $StatusCode) { return $null }
-                    return [string]$StatusCode
-                }
-
-                # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
-                # metric name is not valid for the resource. The status code of the exception
-                # and of every exception it wraps is read first, because an outer exception can
-                # report a different status than the 400 it wraps. Only when no exception in the
-                # chain carries a status are the messages of the same chain read, for Az's
-                # "invalid status code 'BadRequest'" (quotes optional).
-                function Test-MetricBadRequest
-                {
-                    param([System.Exception]$Exception)
-
-                    $Chain = Get-MetricExceptionChain -Exception $Exception
-                    $SawStatus = $false
-                    foreach ($Ex in $Chain)
-                    {
-                        $Status = Get-MetricExceptionStatus -Ex $Ex
-                        if ($null -ne $Status)
-                        {
-                            $SawStatus = $true
-                            if ($Status -in @('400', 'BadRequest')) { return $true }
-                        }
-                    }
-                    if ($SawStatus) { return $false }
-                    foreach ($Ex in $Chain)
-                    {
-                        # Only Az's own form, and the whole status name, so a name such as
-                        # vm-BadRequest-01 or a status such as BadRequestButTransient is not taken for one.
-                        if ([string]$Ex.Message -match "(?i)invalid status code\s*(?:'BadRequest'|BadRequest(?![\w-]))") { return $true }
-                    }
-                    return $false
-                }
-
-                # True when Azure answered HTTP 404 (NotFound): the resource is not there any more
-                # (deleted, or being deleted, after discovery) or is not in this subscription. The
-                # same request is refused the same way on every retry, so it gets one attempt.
-                # A status code decides: a 404 on any exception in the chain makes it a 404, so a
-                # 5xx that wraps a 404 is one too (a client status wins over a 5xx wrapper). A
-                # chain whose statuses are all something else is not a 404, even when its text
-                # quotes one. Only when no exception carries a status is the text read: Get-AzMetric reports a 404 as
-                # "invalid status code 'NotFound'" with no status code on the exception (quotes
-                # optional, the literal 'invalid status code ' prefix is the anchor), and a newer
-                # SDK may give the error code 'ResourceNotFound' instead.
-                function Test-MetricNotFound
-                {
-                    param([System.Exception]$Exception)
-
-                    $Chain = Get-MetricExceptionChain -Exception $Exception
-                    $SawStatus = $false
-                    foreach ($Ex in $Chain)
-                    {
-                        $Status = Get-MetricExceptionStatus -Ex $Ex
-                        if ($null -ne $Status)
-                        {
-                            $SawStatus = $true
-                            if ($Status -in @('404', 'NotFound')) { return $true }
-                        }
-                    }
-                    if ($SawStatus) { return $false }
-                    foreach ($Ex in $Chain)
-                    {
-                        if ([string]$Ex.Message -match "invalid status code\s*(?:'NotFound'|NotFound(?![\w-]))|^\s*\[ResourceNotFound\]")
-                        {
-                            return $true
-                        }
-                        if ($null -ne $Ex.PSObject.Properties['Body'] -and $null -ne $Ex.Body -and $null -ne $Ex.Body.PSObject.Properties['Code'] -and [string]$Ex.Body.Code -eq 'ResourceNotFound')
-                        {
-                            return $true
-                        }
-                    }
-                    return $false
-                }
-
-                # True when Azure answered HTTP 429 (TooManyRequests). The status code is read first,
-                # from the exception and every exception it wraps, because the outer message may not
-                # name it. Only when no exception in the chain carries a status are the messages of
-                # the same chain matched, so an id holding '429' does not make another error count as throttled.
-                # The chain and each status are read as for Test-MetricNotFound and Test-MetricBadRequest.
-                function Test-MetricThrottled
-                {
-                    param([System.Exception]$Exception)
-
-                    $Chain = Get-MetricExceptionChain -Exception $Exception
-                    $SawStatus = $false
-                    $Messages = [System.Collections.Generic.List[string]]::new()
-                    foreach ($Ex in $Chain)
-                    {
-                        $Messages.Add([string]$Ex.Message)
-                        $Status = Get-MetricExceptionStatus -Ex $Ex
-                        if ($null -ne $Status)
-                        {
-                            $SawStatus = $true
-                            if ($Status -in @('429', 'TooManyRequests')) { return $true }
-                        }
-                    }
-
-                    if ($SawStatus) { return $false }
-                    # No status anywhere: read only clear throttling phrases, in each message
-                    # of the chain, so a name such as rg-429 or rg-throttle-test is not taken for one.
-                    $Phrases = @(
-                        '(?<![\w-])Too ?Many ?Requests(?![\w-])',
-                        '\b(?:status|code|HTTP|success)\b[\s:''"=(]*429(?![\w-])',
-                        '(?<![\w-])throttl(?:ed|ing)(?![\w-])',
-                        '(?<![\w-])rate limit'
-                    )
-                    $Pattern = $Phrases -join '|'
-                    foreach ($Message in $Messages)
-                    {
-                        if ($Message -match $Pattern) { return $true }
-                    }
-                    return $false
-                }
+                # Get-MetricFailure and its helpers, from their one copy at the top of this file.
+                . ([scriptblock]::Create($using:MetricFailureSource))
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
@@ -1715,6 +1681,7 @@ function Add-MetricRecord
                             $RetryAfterSeconds = 0
                             $BadRequest = $false
                             $NotFound = $false
+                            $Refused = $false
 
                             # -ThrottleLimit sets the ThreadJob limit for the whole session; it stays at -ConcurrencyLimit after the run.
                             $Job = Start-ThreadJob -ScriptBlock {
@@ -1732,12 +1699,19 @@ function Add-MetricRecord
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    # NotFound first: a 404 is permanent, so it is not retried as throttled.
-                                    if (Test-MetricNotFound -Exception $_.Exception)
+                                    # One reading of the error decides: a client status a retry cannot
+                                    # change wins over a 429 or a 5xx anywhere in the chain.
+                                    $Failure = Get-MetricFailure -Exception $_.Exception
+                                    if ($Failure.Kind -eq 'NotFound')
                                     {
                                         $NotFound = $true
                                     }
-                                    elseif (Test-MetricThrottled -Exception $_.Exception)
+                                    elseif ($Failure.Kind -eq 'Refused')
+                                    {
+                                        # A 401, 403 or other such 4xx: refused the same way on every retry.
+                                        $Refused = $true
+                                    }
+                                    elseif ($Failure.Kind -eq 'Throttled')
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++
@@ -1747,9 +1721,9 @@ function Add-MetricRecord
                                             try { $RetryAfterSeconds = [double](Get-RdaRetryAfterSeconds -ErrorRecord $_) } catch { $RetryAfterSeconds = 0 }
                                         }
                                     }
-                                    elseif ($StopOnBadRequest)
+                                    elseif ($StopOnBadRequest -and $Failure.Kind -eq 'BadRequest')
                                     {
-                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
+                                        $BadRequest = $true
                                     }
                                 }
                                 finally
@@ -1779,13 +1753,14 @@ function Add-MetricRecord
                             }
 
                             # A BadRequest under -StopOnBadRequest has already left the loop above. A
-                            # NotFound (404) is permanent: no retry can find the resource, so it ends
-                            # after this attempt and is recorded as an Error, as before.
+                            # NotFound (404) or a refusal (401, 403 and the like) is permanent: no retry
+                            # changes the answer, so it ends after this attempt and is recorded as an
+                            # Error, as before.
                             # Timeouts and other errors count against the generic budget; throttled answers do not.
                             if (-not $Throttled) { $GenericFailures++ }
                             # Jitter so a wave of throttled calls does not retry in lockstep.
                             $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-                            $Plan = Get-RdaMetricRetryPlan -GenericFailures $GenericFailures -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $NotFound `
+                            $Plan = Get-RdaMetricRetryPlan -GenericFailures $GenericFailures -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent ($NotFound -or $Refused) `
                                 -ThrottleWaitedSeconds $ThrottleWaitedSeconds -Jitter $Jitter `
                                 -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds -MaxThrottleWaitSeconds $CallMaxThrottleWaitSeconds
                             if ($Plan.Retry)
@@ -1871,7 +1846,8 @@ function Add-MetricRecord
                         elseif (-not $Request.Succeeded -and -not $Request.BadRequest)
                         {
                             # The group failed after its retries for a reason that does not depend
-                            # on the metric names (throttling, timeout, server error). Requesting
+                            # on the metric names (throttling, timeout, server error, a 404 or a
+                            # refusal such as 403). Requesting
                             # each metric again would repeat the same failure once per metric, so
                             # every metric of the group records the group request's outcome.
                             Add-MetricRecord -Def $Def -Request $Request -MetricQuery $null -ExtraSeconds $GroupSeconds

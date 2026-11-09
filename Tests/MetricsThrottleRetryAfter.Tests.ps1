@@ -241,13 +241,16 @@ Describe 'Test-MetricThrottled - the status code decides first' {
     BeforeAll {
         $Tokens = $null; $Errors = $null
         $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
-        # Test-MetricThrottled walks the chain with the helpers Test-MetricNotFound uses.
-        foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricThrottled')
+        # Get-MetricFailure reads the 429 with the same walk as the 404 and 400.
+        foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure')
         {
             $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $Name }, $true) | Select-Object -First 1
             if (-not $FnAst) { throw "$Name was not found in Extension/Metrics.ps1" }
             . ([scriptblock]::Create($FnAst.Extent.Text))
         }
+
+        # The yes/no question the retry loop asks of Get-MetricFailure for a 429.
+        function Test-MetricThrottled([System.Exception]$Exception) { (Get-MetricFailure -Exception $Exception).Kind -eq 'Throttled' }
 
         function New-StatusException([string]$Message, $StatusCode, $Inner = $null)
         {
@@ -287,6 +290,23 @@ Describe 'Test-MetricThrottled - the status code decides first' {
     It 'does not treat a wrapped 403 as throttled when the outer message names 429' {
         $Inner = New-StatusException 'denied' ([System.Net.HttpStatusCode]::Forbidden)
         Test-MetricThrottled -Exception ([System.Exception]::new('Request for vm-429 failed.', $Inner)) | Should -BeFalse
+    }
+
+    It 'does not treat a 429 as throttled when a client status a retry cannot change is in the chain (<Label>)' -ForEach @(
+        @{ Label = 'a 403 that wraps a 429'; Outer = 'Forbidden'; Inner = 'TooManyRequests' }
+        @{ Label = 'a 401 that wraps a 429'; Outer = 'Unauthorized'; Inner = 'TooManyRequests' }
+        @{ Label = 'a 429 that wraps a 400'; Outer = 'TooManyRequests'; Inner = 'BadRequest' }
+        @{ Label = 'a 429 that wraps a 404'; Outer = 'TooManyRequests'; Inner = 'NotFound' }
+    ) {
+        $InnerEx = [System.Net.Http.HttpRequestException]::new('inner', $null, [System.Net.HttpStatusCode]$Inner)
+        Test-MetricThrottled -Exception ([System.Net.Http.HttpRequestException]::new('outer', $InnerEx, [System.Net.HttpStatusCode]$Outer)) | Should -BeFalse
+    }
+
+    It 'still treats a 429 as throttled when the rest of the chain is a 5xx or a 408' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('wait', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        Test-MetricThrottled -Exception ([System.Net.Http.HttpRequestException]::new('timed out', $Inner, [System.Net.HttpStatusCode]::RequestTimeout)) | Should -BeTrue
+        $Inner = [System.Net.Http.HttpRequestException]::new('timed out', $null, [System.Net.HttpStatusCode]::RequestTimeout)
+        Test-MetricThrottled -Exception ([System.Net.Http.HttpRequestException]::new('wait', $Inner, [System.Net.HttpStatusCode]::TooManyRequests)) | Should -BeTrue
     }
 
     It 'matches the message only when no exception in the chain carries a status' {
@@ -350,13 +370,14 @@ Describe 'Test-MetricThrottled - the status code decides first' {
     }
 
     It 'walks the chain with the same helper as the 404 and 400 checks' {
-        $FnAst = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Test-MetricThrottled' }, $true) | Select-Object -First 1
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Get-MetricFailure' }, $true) | Select-Object -First 1
         $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionChain -Exception \$Exception'
         $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionStatus -Ex \$Ex'
     }
 
     It 'the retry loop asks it, not a message match, whether an answer was throttled' {
-        $script:MetricsSrc | Should -Match 'if \(Test-MetricThrottled -Exception \$_\.Exception\)'
+        $script:MetricsSrc | Should -Match '\$Failure = Get-MetricFailure -Exception \$_\.Exception'
+        $script:MetricsSrc | Should -Match 'elseif \(\$Failure\.Kind -eq ''Throttled''\)'
         $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'
     }
 }
