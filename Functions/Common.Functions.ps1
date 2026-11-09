@@ -282,53 +282,90 @@ function Get-RdaInsightsRegisterCommand
     return ('Set-AzContext -Subscription {0}; Register-AzResourceProvider -ProviderNamespace Microsoft.Insights' -f $SubscriptionId)
 }
 
+# The seconds one read or register of Microsoft.Insights may take before it is given up.
+function Get-RdaInsightsCallTimeoutSeconds
+{
+    return 30
+}
+
+# One Invoke-AzRestMethod call. With $TimeoutSeconds above 0 it runs as a job
+# and is given up after that many seconds: it then throws a TimeoutException,
+# and the job is stopped and removed, so nothing is left running. 0 waits for
+# the answer.
+function Invoke-RdaBoundedAzRestMethod
+{
+    param([Parameter(Mandatory = $true)][string]$Method, [Parameter(Mandatory = $true)][string]$Path, [double]$TimeoutSeconds = 0)
+
+    if ($TimeoutSeconds -le 0) { return Invoke-AzRestMethod -Method $Method -Path $Path -ErrorAction Stop }
+    $Job = Invoke-AzRestMethod -Method $Method -Path $Path -AsJob -ErrorAction Stop
+    try
+    {
+        if (-not $Job.Finished.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)))
+        {
+            throw [System.TimeoutException]::new(('Timed out after {0:0.#} s' -f $TimeoutSeconds))
+        }
+        return Receive-Job -Job $Job -ErrorAction Stop
+    }
+    finally
+    {
+        Stop-Job -Job $Job -ErrorAction SilentlyContinue
+        Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# True when an error looks like a network fault or a time-out that may pass:
+# an HttpRequestException, IOException, SocketException or
+# TaskCanceledException anywhere in its chain. Any other error (no Az context,
+# for one) comes back the same way, so it is not worth sending again.
+function Test-RdaTransientException
+{
+    param([System.Exception]$Exception)
+
+    $Depth = 0
+    for ($Current = $Exception; $null -ne $Current -and $Depth -lt 16; $Current = $Current.InnerException)
+    {
+        if ($Current -is [System.Net.Http.HttpRequestException] -or $Current -is [System.IO.IOException] -or
+            $Current -is [System.Net.Sockets.SocketException] -or $Current -is [System.Threading.Tasks.TaskCanceledException])
+        {
+            return $true
+        }
+        $Depth++
+    }
+    return $false
+}
+
 # The registration state of Microsoft.Insights on one subscription:
 # 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
 # when the state could not be read (the error is in Error). With
-# $TimeoutSeconds above 0, each GET runs as a job and is given up after that
-# many seconds (a GET that stalls reads as Unknown); 0 waits for the answer.
+# $TimeoutSeconds above 0, each GET is given up after that many seconds (a GET
+# that stalls reads as Unknown, and is not sent again); 0 waits for the answer.
 function Get-RdaInsightsProviderState
 {
     param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3, [double]$TimeoutSeconds = 0)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     # One ARM GET, sent again at most $MaxRetries times (1, 2, 4 s apart) after a
-    # request that throws, a throttle, a timeout or a server error. Any other
-    # answer that is not a success reads as Unknown at once.
+    # network error or time-out (Test-RdaTransientException), a throttle, an
+    # HTTP 408 or a server error. Any other error or answer that is not a
+    # success, or a GET given up on its time limit, reads as Unknown at once.
     $LastError = $null
     for ($Attempt = 0; $Attempt -le $MaxRetries; $Attempt++)
     {
         if ($Attempt -gt 0) { Start-Sleep -Seconds ([math]::Min([math]::Pow(2, $Attempt - 1), 4)) }
         try
         {
-            if ($TimeoutSeconds -gt 0)
-            {
-                $Job = Invoke-AzRestMethod -Method GET -Path $Path -AsJob -ErrorAction Stop
-                try
-                {
-                    if (-not $Job.Finished.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)))
-                    {
-                        $LastError = 'Timed out after {0:0.#} s' -f $TimeoutSeconds
-                        continue
-                    }
-                    $Response = Receive-Job -Job $Job -ErrorAction Stop
-                }
-                finally
-                {
-                    # A job that is still running is stopped, so nothing is left behind.
-                    Stop-Job -Job $Job -ErrorAction SilentlyContinue
-                    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
-                }
-            }
-            else
-            {
-                $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
-            }
+            $Response = Invoke-RdaBoundedAzRestMethod -Method GET -Path $Path -TimeoutSeconds $TimeoutSeconds
+        }
+        catch [System.TimeoutException]
+        {
+            $LastError = [string]$_.Exception.Message
+            break
         }
         catch
         {
             $LastError = [string]$_.Exception.Message
-            continue
+            if (Test-RdaTransientException -Exception $_.Exception) { continue }
+            break
         }
         $Status = [int]$Response.StatusCode
         if ($Status -ge 200 -and $Status -lt 300)
@@ -346,15 +383,16 @@ function Get-RdaInsightsProviderState
 }
 
 # Starts the registration of Microsoft.Insights on one subscription. Returns
-# $null when Azure took it, or the error text.
+# $null when Azure took it, or the error text. With $TimeoutSeconds above 0 a
+# POST that takes longer is given up and reads as a failed register.
 function Register-RdaInsightsProvider
 {
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId)
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [double]$TimeoutSeconds = 0)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights/register?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     try
     {
-        $Response = Invoke-AzRestMethod -Method POST -Path $Path -ErrorAction Stop
+        $Response = Invoke-RdaBoundedAzRestMethod -Method POST -Path $Path -TimeoutSeconds $TimeoutSeconds
         $Status = [int]$Response.StatusCode
         if ($Status -ge 200 -and $Status -lt 300) { return $null }
         $Code = ''
@@ -373,8 +411,9 @@ function Register-RdaInsightsProvider
 # and answered): Registered holds the ids that
 # batch may use (registered, or whose state could not be read, so the batch
 # call decides and falls back on its own), NotRegistered the ids that stay on
-# the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds and
-# $PollSeconds are there for tests.
+# the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds,
+# $PollSeconds and $CallTimeoutSeconds (the limit of each first read and each
+# register) are there for tests.
 function Invoke-RdaInsightsProviderPreflight
 {
     param(
@@ -382,7 +421,8 @@ function Invoke-RdaInsightsProviderPreflight
         [Nullable[bool]]$Interactive = $null,
         [scriptblock]$ReadAnswer = { param($Prompt) Read-Host -Prompt $Prompt },
         [int]$DeadlineSeconds = 60,
-        [int]$PollSeconds = 10
+        [int]$PollSeconds = 10,
+        [double]$CallTimeoutSeconds = (Get-RdaInsightsCallTimeoutSeconds)
     )
 
     $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
@@ -400,11 +440,14 @@ function Invoke-RdaInsightsProviderPreflight
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
     $Missing = [System.Collections.Generic.List[object]]::new()
     # Already being registered (by someone else, or an earlier run): nothing to
-    # ask; it joins the shared wait below.
+    # ask; it joins the shared wait below only after a "y".
     $AlreadyRegistering = [System.Collections.Generic.List[string]]::new()
+    # shortcut: the reads run one after another, one ARM GET per subscription
+    # (well under a second each). Read them in parallel once a tenant with
+    # hundreds of subscriptions makes the preflight take minutes.
     foreach ($Id in $Ids)
     {
-        $Read = Get-RdaInsightsProviderState -SubscriptionId $Id
+        $Read = Get-RdaInsightsProviderState -SubscriptionId $Id -TimeoutSeconds $CallTimeoutSeconds
         if ($Read.State -eq 'Registered')
         {
             $Result.Registered.Add($Id)
@@ -428,12 +471,6 @@ function Invoke-RdaInsightsProviderPreflight
     {
         Write-Host '  Microsoft.Insights is registered on every subscription in scope.' -ForegroundColor DarkGray
         return $Result
-    }
-    $Waiting = [System.Collections.Generic.List[string]]::new()
-    foreach ($Id in $AlreadyRegistering)
-    {
-        Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
-        $Waiting.Add($Id)
     }
 
     $Answer = $null
@@ -483,17 +520,39 @@ function Invoke-RdaInsightsProviderPreflight
         $ToRegister = @($Missing)
     }
 
+    # A subscription already being registered joins the wait only after a "y".
+    # Otherwise (n, no one to answer, or nothing to ask) it uses the per-call
+    # path this run, so a run never pays the wait unasked; a later run reads its
+    # state again.
+    $Waiting = [System.Collections.Generic.List[string]]::new()
+    $SaidYes = $Answer -match '^\s*(y|yes)\s*$'
+    foreach ($Id in $AlreadyRegistering)
+    {
+        if ($SaidYes)
+        {
+            Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
+            $Waiting.Add($Id)
+        }
+        else
+        {
+            Write-Host ('  Microsoft.Insights is being registered on subscription {0}; its metrics are collected with one call per resource this run. A later run finds it registered and uses the batch API.' -f $Id) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Id)
+        }
+    }
+
     # Start every registration first, then wait for all of them on one deadline.
     foreach ($Entry in $ToRegister)
     {
-        $RegisterError = Register-RdaInsightsProvider -SubscriptionId $Entry.SubscriptionId
+        $RegisterError = Register-RdaInsightsProvider -SubscriptionId $Entry.SubscriptionId -TimeoutSeconds $CallTimeoutSeconds
         if ($null -eq $RegisterError)
         {
             $Waiting.Add($Entry.SubscriptionId)
         }
         else
         {
-            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}). Registering needs the /register/action permission, which the Contributor and Owner roles include. Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError) -ForegroundColor Yellow
+            # The right is named only when Azure refused the register for lack of it.
+            $Rights = if ($RegisterError -match '\bHTTP 403\b|AuthorizationFailed') { ' Registering needs the /register/action permission, which the Contributor and Owner roles include.' } else { '' }
+            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}).{2} Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError, $Rights) -ForegroundColor Yellow
             $Result.NotRegistered.Add($Entry.SubscriptionId)
         }
     }

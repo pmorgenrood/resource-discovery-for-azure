@@ -244,13 +244,20 @@ Export-ModuleMember -Function Get-AzMetric
     }
     $Global:RdaTestBatchProviderStates = @{}
     $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
+    # RdaTestBatchArmStallSeconds above 0: every call stalls that long (as a job
+    # with -AsJob, as Az.Accounts does), so only a time limit ends it early.
+    $Global:RdaTestBatchArmStallSeconds = 0
     function Invoke-AzRestMethod
     {
         param([string]$Method, [string]$Path, [string]$Payload, [switch]$AsJob)
-        $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path })
+        $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path; AsJob = [bool]$AsJob })
         $Sub = ($Path -split '/')[2]
         $State = if ($Global:RdaTestBatchProviderStates.ContainsKey($Sub)) { $Global:RdaTestBatchProviderStates[$Sub] } else { 'Registered' }
-        return [PSCustomObject]@{ StatusCode = 200; Content = (@{ namespace = 'Microsoft.Insights'; registrationState = $State } | ConvertTo-Json) }
+        $Response = [PSCustomObject]@{ StatusCode = 200; Content = (@{ namespace = 'Microsoft.Insights'; registrationState = $State } | ConvertTo-Json) }
+        $Stall = [int]$Global:RdaTestBatchArmStallSeconds
+        if ($AsJob) { return Start-ThreadJob -ArgumentList $Response, $Stall -ScriptBlock { param($R, $S) if ($S -gt 0) { Start-Sleep -Seconds $S }; $R } }
+        if ($Stall -gt 0) { [System.Threading.Thread]::Sleep($Stall * 1000) }
+        return $Response
     }
 
     function New-TestResource
@@ -384,7 +391,7 @@ AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
     Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_NOTFOUND' -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure, RdaTestBatchArmStallSeconds -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 batch work items' {
@@ -672,6 +679,10 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run.Calls.Count | Should -Be 60
         Assert-SameRecords -Expected $Expected -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 1
+        # A 403 from the batch API means Microsoft.Insights is not registered there.
+        $Note = @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' })[0]
+        $Note | Should -Match 'A 403 means Microsoft\.Insights is not registered on the subscription'
+        $Note | Should -Not -Match 'Monitoring Reader'
     }
 
     It 'does not batch a subscription where Microsoft.Insights is not registered' {
@@ -689,6 +700,29 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         @($Run.ArmCalls | Where-Object { $_.Method -ne 'GET' }).Count | Should -Be 0
         Assert-SameRecords -Expected $script:PerResource -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match "Microsoft.Insights is 'NotRegistered'" }).Count | Should -Be 1
+    }
+
+    It 'gives up a provider state read that stalls, and lets the batch call decide' {
+        $Disks = @(New-TestDisk -Name 'disk-001')
+        $Quick = Invoke-MetricsRun -Resources $Disks -RunName 'batch-arm-quick' -Batch -CallTimeout 2
+        $Global:RdaTestBatchArmStallSeconds = 10
+        $JobsBefore = @(Get-Job).Count
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-arm-stall' -Batch -CallTimeout 2
+        }
+        finally
+        {
+            $Global:RdaTestBatchArmStallSeconds = 0
+        }
+
+        # The read is given up after the 2 s limit, not held for the 10 s stall.
+        $Run.Seconds | Should -BeLessThan ($Quick.Seconds + 6)
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
     }
 
     It 'sends no token to an endpoint that is not Azure Monitor' {
@@ -788,6 +822,8 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         Assert-SameRecords -Expected $Expected -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match 'renewing the token of 1 tenant' }).Count | Should -Be 1
         @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 1
+        # A 401 that stays after a renewal means the caller has no Monitoring Reader there.
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' })[0] | Should -Match 'Monitoring Reader on the subscription itself'
         @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
     }
 
@@ -1053,6 +1089,24 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         Should -Invoke Write-Host -ParameterFilter { $Object -like '*sub-b*/register/action*Contributor and Owner*' } -Times 1 -Exactly
     }
 
+    It 'names the permission only when a register is refused for lack of rights' {
+        $script:RegisterErrors = @{ 'sub-b' = 'HTTP 403'; 'sub-c' = 'Operation failed: AuthorizationFailed for the client'; 'sub-d' = 'HTTP 500 InternalServerError'; 'sub-e' = 'Timed out after 30 s' }
+        foreach ($Sub in 'sub-d', 'sub-e') { $script:States[$Sub] = 'NotRegistered' }
+        Mock Register-RdaInsightsProvider { $script:RegisterErrors[$SubscriptionId] }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b', 'sub-c', 'sub-d', 'sub-e' -Interactive $true -ReadAnswer { param($P) 'y' }
+
+        @($Result.NotRegistered | Sort-Object) | Should -Be @('sub-b', 'sub-c', 'sub-d', 'sub-e')
+        foreach ($Sub in 'sub-b', 'sub-c')
+        {
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*Could not register*$Sub*/register/action*Contributor and Owner*one call per resource*" } -Times 1 -Exactly
+        }
+        foreach ($Sub in 'sub-d', 'sub-e')
+        {
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*Could not register*$Sub*$($script:RegisterErrors[$Sub])*one call per resource*" } -Times 1 -Exactly
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*$Sub*/register/action*" } -Times 0 -Exactly
+        }
+    }
+
     It 'stops waiting at the deadline for a registration that never completes' {
         Mock Register-RdaInsightsProvider { $null }
         $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -DeadlineSeconds 0 -PollSeconds 0
@@ -1136,15 +1190,41 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         $Shown.Answer | Should -Be 'n'
     }
 
-    It 'waits for a subscription already being registered, without asking' {
+    It 'waits for a subscription already being registered only after a y' {
         $script:States['sub-b'] = 'Registering'
-        $script:Reads = 0
-        Mock Get-RdaInsightsProviderState { $script:Reads++; $State = if ($script:Reads -gt 1) { 'Registered' } else { $script:States[$SubscriptionId] }; [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null } }
-        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+        Mock Get-RdaInsightsProviderState {
+            # Once the question is answered, every read finds the provider registered.
+            $State = if ($script:Prompts.Count -gt 0) { 'Registered' } else { $script:States[$SubscriptionId] }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+        }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
 
-        $script:Prompts.Count | Should -Be 0
+        # The question names only the one not registered.
+        @($script:Prompts) | Should -Be @('Register Microsoft.Insights on these 1 subscription(s) now? [Y/N]')
+        @($script:Registered) | Should -Be @('sub-c')
+        @($Result.Registered | Sort-Object) | Should -Be @('sub-b', 'sub-c')
+        $Result.NotRegistered.Count | Should -Be 0
+    }
+
+    It 'does not wait for a subscription already being registered after n, with no console, or with nothing to ask' {
+        $Cases = @(
+            @{ Subs = @('sub-b', 'sub-c'); Interactive = $true; Answer = 'n' },
+            @{ Subs = @('sub-b', 'sub-c'); Interactive = $false; Answer = 'y' },
+            @{ Subs = @('sub-b'); Interactive = $true; Answer = 'y' }
+        )
+        foreach ($Case in $Cases)
+        {
+            $script:States['sub-b'] = 'Registering'
+            $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds $Case.Subs -Interactive $Case.Interactive -ReadAnswer ([scriptblock]::Create("param(`$P) '$($Case.Answer)'")) -DeadlineSeconds 1 -PollSeconds 10
+
+            @($Result.NotRegistered) | Should -Contain 'sub-b' -Because ($Case | ConvertTo-Json -Compress)
+            @($Result.Registered) | Should -Not -Contain 'sub-b'
+        }
+        # Only the first read per subscription, no wait and no register.
+        Should -Invoke Get-RdaInsightsProviderState -Times 5 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
         Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
-        @($Result.Registered) | Should -Be @('sub-b')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*being registered on subscription sub-b*one call per resource this run*' } -Times 3 -Exactly
     }
 
     It 'reads, asks and registers nothing outside AzureCloud, where the batch API is not used' {
@@ -1179,7 +1259,13 @@ Describe 'The registration wait when one state read stalls' {
         Mock Write-Host { }
         Mock Register-RdaInsightsProvider { $null }
         Mock Invoke-AzRestMethod {
-            if (-not $script:Answered) { return [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' } }
+            if (-not $script:Answered)
+            {
+                # The first read answers at once; with -AsJob as a job, as Az.Accounts gives it.
+                $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+                if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+                return $Read
+            }
             # Every read while waiting stalls far past the deadline.
             $script:WaitReads++
             if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
@@ -1196,6 +1282,58 @@ Describe 'The registration wait when one state read stalls' {
         @($Result.NotRegistered) | Should -Be @('sub-b')
         $Result.Registered.Count | Should -Be 0
         # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
+    }
+}
+
+Describe 'The preflight when a state read or a register stalls' {
+
+    BeforeEach {
+        $script:Answered = $false
+        Mock Write-Host { }
+        Mock Start-Sleep { }
+    }
+
+    It 'gives up a first state read that stalls, and lets the batch call decide' {
+        Mock Invoke-AzRestMethod {
+            # Every read stalls far past the limit.
+            if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+            [System.Threading.Thread]::Sleep(6000)
+            [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' }
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $false -CallTimeoutSeconds 1
+        $Clock.Stop()
+
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3
+        @($Result.Registered) | Should -Be @('sub-b')
+        $Result.NotRegistered.Count | Should -Be 0
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Could not read*sub-b*Timed out*' } -Times 1 -Exactly
+        @(Get-Job).Count | Should -Be $JobsBefore
+    }
+
+    It 'gives up a register that stalls, and keeps that subscription per call' {
+        Mock Invoke-AzRestMethod {
+            if ($Method -eq 'POST')
+            {
+                if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+                [System.Threading.Thread]::Sleep(6000)
+                return [pscustomobject]@{ StatusCode = 200; Content = '{}' }
+            }
+            $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+            if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+            $Read
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -CallTimeoutSeconds 1 -DeadlineSeconds 5
+        $Clock.Stop()
+
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3.5
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        $Result.Registered.Count | Should -Be 0
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Could not register*sub-b*Timed out*' } -Times 1 -Exactly
         @(Get-Job).Count | Should -Be $JobsBefore
     }
 }
@@ -1222,6 +1360,181 @@ Describe 'A direct run hands its preflight result to the metrics phase' {
     }
 }
 
+Describe 'A direct run with -ResourceGroup but no -SubscriptionID' {
+
+    # The run is refused; it must stop before the preflight reads, asks or
+    # registers anything. It runs in its own pwsh, with stand-ins for az, the
+    # Az context, Invoke-AzRestMethod and Read-Host that log each call.
+    It 'stops before the preflight reads, asks or registers anything' {
+        $Work = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-rg-nosub-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Work | Out-Null
+        try
+        {
+            $CallLog = Join-Path $Work 'calls.txt'
+            $Runner = Join-Path $Work 'run.ps1'
+            Set-Content -LiteralPath $Runner -Encoding utf8 -Value @'
+param($Script, $CallLog, $OutDir)
+$Global:RdaSessionInitialized = $true
+$Global:AzPowerShellLoaded = $true
+$Global:PlatformOS = 'PowerShell Unix'
+function global:az
+{
+    $Line = ($args -join ' ')
+    if ($Line -like 'account show*') { return '{"tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","user":{"name":"tester"}}' }
+    if ($Line -like 'account list*') { return '[{"id":"11111111-1111-1111-1111-111111111111","tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},{"id":"22222222-2222-2222-2222-222222222222","tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]' }
+    Add-Content -LiteralPath $CallLog -Value ('az ' + $Line)
+}
+function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function global:Connect-AzAccount { Add-Content -LiteralPath $CallLog -Value 'Connect-AzAccount' }
+function global:Invoke-AzRestMethod
+{
+    param($Method, $Path, [switch]$AsJob)
+    Add-Content -LiteralPath $CallLog -Value ('Invoke-AzRestMethod {0} {1}' -f $Method, $Path)
+    $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+    if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+    $Read
+}
+function global:Read-Host { Add-Content -LiteralPath $CallLog -Value 'Read-Host'; 'y' }
+& $Script -ResourceGroup 'rg-one' -UseMetricsBatch -OutputDirectory $OutDir
+exit $LASTEXITCODE
+'@
+            $Pwsh = Join-Path $PSHOME 'pwsh'
+            $Output = & $Pwsh -NoProfile -NonInteractive -File $Runner -Script (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -CallLog $CallLog -OutDir $Work 2>&1 | Out-String
+            $ExitCode = $LASTEXITCODE
+
+            # The run got as far as the refusal, and the refusal is a failure.
+            $Output | Should -Match 'Resource Group Name present, but missing Subscription ID'
+            $ExitCode | Should -Be 1 -Because $Output
+            $Calls = @(if (Test-Path -LiteralPath $CallLog) { Get-Content -LiteralPath $CallLog })
+            @($Calls | Where-Object { $_ -like 'Invoke-AzRestMethod*' }) | Should -BeNullOrEmpty
+            @($Calls | Where-Object { $_ -eq 'Read-Host' }) | Should -BeNullOrEmpty
+            $Output | Should -Not -Match 'checking the Microsoft\.Insights resource provider'
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'Run-AllSubscriptions.ps1 when the consumption gate stops the run' {
+
+    # The wrapper runs in its own pwsh with a private HOME. Aliases stand in for
+    # the sign-in, the subscription list and the two up-front gates (an alias wins
+    # over the functions the wrapper dot-sources). Invoke-AzRestMethod and
+    # Read-Host stand-ins log each provider read, register and prompt.
+    BeforeAll {
+        function script:Invoke-WrapperUpToRun
+        {
+            param([string]$Consumption)
+            $Work = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-wrap-gate-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $Work | Out-Null
+            try
+            {
+                $CallLog = Join-Path $Work 'calls.txt'
+                $Runner = Join-Path $Work 'run.ps1'
+                Set-Content -LiteralPath $Runner -Encoding utf8 -Value @'
+param($Script, $CallLog, $Consumption)
+$Global:RdaCallLog = $CallLog
+$Global:RdaConsumption = $Consumption
+function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function global:Invoke-AzRestMethod
+{
+    param($Method, $Path, [switch]$AsJob)
+    Add-Content -LiteralPath $Global:RdaCallLog -Value ('Invoke-AzRestMethod {0} {1}' -f $Method, $Path)
+    $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+    if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+    $Read
+}
+function global:Read-Host { Add-Content -LiteralPath $Global:RdaCallLog -Value 'Read-Host'; 'y' }
+function global:RdaStubNothing { }
+function global:RdaStubTenant { 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+function global:RdaStubTrue { $true }
+function global:RdaStubSubscriptions
+{
+    [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'sub-one'; State = 'Enabled'; TenantId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+    [pscustomobject]@{ Id = '22222222-2222-2222-2222-222222222222'; Name = 'sub-two'; State = 'Enabled'; TenantId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+}
+function global:RdaStubAccessDecision { [pscustomobject]@{ Inaccessible = @(); InaccessibleIds = @(); ShouldBlock = $false } }
+function global:RdaStubConsumption
+{
+    Add-Content -LiteralPath $Global:RdaCallLog -Value 'Test-ConsumptionAccess'
+    [pscustomobject]@{ Outcome = $Global:RdaConsumption; Detail = '' }
+}
+# The first subscription of the run: stop here, so nothing is collected.
+function global:RdaStubStop { Add-Content -LiteralPath $Global:RdaCallLog -Value 'run started'; exit 7 }
+Set-Alias -Scope Global -Name Invoke-PreFlightChecks -Value RdaStubNothing
+Set-Alias -Scope Global -Name Get-AzCliSignedInTenant -Value RdaStubTenant
+Set-Alias -Scope Global -Name Get-AzPsSignedInTenant -Value RdaStubTenant
+Set-Alias -Scope Global -Name Test-AzCliTokenSilent -Value RdaStubTrue
+Set-Alias -Scope Global -Name Test-AzPsTokenSilent -Value RdaStubTrue
+Set-Alias -Scope Global -Name Get-AzSubscription -Value RdaStubSubscriptions
+Set-Alias -Scope Global -Name Test-SubscriptionAccessAll -Value RdaStubNothing
+Set-Alias -Scope Global -Name Resolve-AccessPreflight -Value RdaStubAccessDecision
+Set-Alias -Scope Global -Name Test-ConsumptionAccess -Value RdaStubConsumption
+Set-Alias -Scope Global -Name Write-RdaProgress -Value RdaStubStop
+& $Script -TenantID 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' -UseMetricsBatch -ParallelStreams 1
+exit $LASTEXITCODE
+'@
+                # The wrapper looks for an az program on PATH before anything else; the
+                # stand-ins above answer every sign-in question, so it is never run.
+                $Bin = Join-Path $Work 'bin'
+                New-Item -ItemType Directory -Path $Bin | Out-Null
+                Set-Content -LiteralPath (Join-Path $Bin 'az') -Value "#!/bin/sh`nexit 0"
+                Set-Content -LiteralPath (Join-Path $Bin 'az.cmd') -Value '@exit /b 0'
+                if (-not $IsWindows) { & chmod +x (Join-Path $Bin 'az') }
+                $Pwsh = Join-Path $PSHOME 'pwsh'
+                $OldHome = $env:HOME
+                $OldPath = $env:PATH
+                try
+                {
+                    $env:HOME = $Work
+                    $env:PATH = $Bin + [System.IO.Path]::PathSeparator + $env:PATH
+                    $Output = & $Pwsh -NoProfile -NonInteractive -File $Runner -Script (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -CallLog $CallLog -Consumption $Consumption 2>&1 | Out-String
+                    $ExitCode = $LASTEXITCODE
+                }
+                finally
+                {
+                    $env:HOME = $OldHome
+                    $env:PATH = $OldPath
+                }
+                [pscustomobject]@{
+                    Output   = $Output
+                    ExitCode = $ExitCode
+                    Calls    = @(if (Test-Path -LiteralPath $CallLog) { Get-Content -LiteralPath $CallLog })
+                }
+            }
+            finally
+            {
+                Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'stops before the Microsoft.Insights preflight reads, asks or registers anything' {
+        $Run = Invoke-WrapperUpToRun -Consumption 'Denied'
+
+        $Run.ExitCode | Should -Be 1 -Because $Run.Output
+        $Run.Output | Should -Match 'not authorized to read consumption/billing data'
+        $Run.Calls | Should -Contain 'Test-ConsumptionAccess'
+        @($Run.Calls | Where-Object { $_ -like 'Invoke-AzRestMethod*' }) | Should -BeNullOrEmpty
+        @($Run.Calls | Where-Object { $_ -eq 'Read-Host' }) | Should -BeNullOrEmpty
+        $Run.Output | Should -Not -Match 'Microsoft\.Insights'
+    }
+
+    It 'runs the preflight after the consumption gate lets the run go on' {
+        $Run = Invoke-WrapperUpToRun -Consumption 'Allowed'
+
+        $Run.ExitCode | Should -Be 7 -Because $Run.Output
+        $Gate = [array]::IndexOf($Run.Calls, 'Test-ConsumptionAccess')
+        $FirstRead = @(for ($i = 0; $i -lt $Run.Calls.Count; $i++) { if ($Run.Calls[$i] -like 'Invoke-AzRestMethod GET*Microsoft.Insights*') { $i } })
+        $Gate | Should -BeGreaterOrEqual 0
+        $FirstRead.Count | Should -BeGreaterThan 0
+        $FirstRead[0] | Should -BeGreaterThan $Gate
+        $Run.Calls[-1] | Should -Be 'run started'
+    }
+}
+
 Describe 'Get-RdaInsightsProviderState' {
 
     BeforeEach {
@@ -1232,6 +1545,7 @@ Describe 'Get-RdaInsightsProviderState' {
             $script:Paths.Add($Path)
             $Next = $script:Answers.Dequeue()
             if ($Next -is [string]) { throw $Next }
+            if ($Next -is [System.Exception]) { throw $Next }
             $Next
         }
     }
@@ -1246,14 +1560,37 @@ Describe 'Get-RdaInsightsProviderState' {
         $script:Paths[0] | Should -BeLike '/subscriptions/sub-a/providers/Microsoft.Insights?api-version=*'
     }
 
-    It 'sends the GET again after a server error or a request that throws' {
+    It 'sends the GET again after a server error or a request that throws a network error' {
         $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 503; Content = '' })
-        $script:Answers.Enqueue('connection reset')
+        $script:Answers.Enqueue([System.Net.Http.HttpRequestException]::new('connection reset'))
         $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
         $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
 
         $Read.State | Should -Be 'Registered'
         $script:Paths.Count | Should -Be 3
+    }
+
+    It 'sends the GET again after a network error or a time-out found inside another error' {
+        $script:Answers.Enqueue([System.InvalidOperationException]::new('the request failed', [System.IO.IOException]::new('the stream was closed')))
+        $script:Answers.Enqueue([System.Exception]::new('the request failed', [System.Threading.Tasks.TaskCanceledException]::new('the request timed out')))
+        $script:Answers.Enqueue([System.Exception]::new('the request failed', [System.Net.Sockets.SocketException]::new(104)))
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'Registered'
+        $script:Paths.Count | Should -Be 4
+    }
+
+    It 'reads Unknown at once, with no wait, for an error that would come back the same way' {
+        # No Az context: every try fails the same way, so it is not sent again.
+        $script:Answers.Enqueue('Run Connect-AzAccount to login.')
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'Unknown'
+        $Read.Error | Should -Be 'Run Connect-AzAccount to login.'
+        $script:Paths.Count | Should -Be 1
+        Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 
     It 'reads Unknown at once on a refusal, and after the last retry' {
@@ -1353,8 +1690,19 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
     It 'says in the README what a 403 and a 401 do, as the code does' {
         $Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
         $Readme | Should -Not -Match ([regex]::Escape('401/403, batch is turned off for that subscription'))
-        $Readme | Should -Match 'answers 403: batch is turned off for that subscription'
-        $Readme | Should -Match 'A 401 \(token refused\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
+        # Microsoft's batch API guide: a 401 means the token is refused or the caller has
+        # no Monitoring Reader on the subscription itself; a 403 means Microsoft.Insights
+        # is not registered there.
+        $Lines = $Readme -split "`r?`n"
+        $ReaderLine = @($Lines | Where-Object { $_ -match '^- \*\*Monitoring Reader \(or Reader\) on the subscription itself' })
+        $ProviderLine = @($Lines | Where-Object { $_ -match '^- \*\*The `Microsoft\.Insights` resource provider registered' })
+        $ReaderLine.Count | Should -Be 1
+        $ProviderLine.Count | Should -Be 1
+        $ReaderLine[0] | Should -Not -Match '\b403\b'
+        $ReaderLine[0] | Should -Match 'Without it Azure answers 401'
+        $ReaderLine[0] | Should -Match 'A 401 \(token refused, or no Monitoring Reader on the subscription\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
+        $ProviderLine[0] | Should -Not -Match '\b401\b'
+        $ProviderLine[0] | Should -Match 'Without it Azure answers 403: batch is turned off for that subscription'
     }
 
     It 'runs the preflight only under -UseMetricsBatch' {
@@ -1365,6 +1713,19 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
             $Node = $Call.Ast.Parent
             while ($null -ne $Node -and $Node -isnot [System.Management.Automation.Language.IfStatementAst]) { $Node = $Node.Parent }
             $Node.Clauses[0].Item1.Extent.Text | Should -Match 'UseMetricsBatch'
+        }
+    }
+}
+
+Describe 'The batch code runs on PowerShell 7.0' {
+
+    # The scripts accept PowerShell 7.0 (#requires -Version 7.0), which runs on
+    # .NET Core 3.1. ReferenceEqualityComparer came with .NET 5, so 7.0 fails on it.
+    It 'uses no ReferenceEqualityComparer, which .NET Core 3.1 does not have' {
+        foreach ($File in 'Extension/Metrics.ps1', 'Functions/Common.Functions.ps1')
+        {
+            $Lines = @(Select-String -LiteralPath (Join-Path $script:RepoRoot $File) -Pattern 'ReferenceEqualityComparer' | ForEach-Object { $_.LineNumber })
+            $Lines | Should -BeNullOrEmpty -Because $File
         }
     }
 }

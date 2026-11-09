@@ -874,23 +874,6 @@ if ($ScopeForProbe.Count -gt 0)
     }
 }
 
-# -UseMetricsBatch only: the metrics batch API needs the Microsoft.Insights
-# resource provider registered on each subscription. Read its state on every
-# subscription this run collects, and offer once to register it where it is
-# missing (Invoke-RdaInsightsProviderPreflight). Nothing is registered without
-# a "y"; a subscription left unregistered has its metrics collected with one
-# request per resource, so the run goes on either way.
-# The subscriptions left unregistered are handed to every inner run, which keeps
-# them on the per-resource path for this whole run, even if the provider gets
-# registered meanwhile; the next run reads the state again.
-$MetricsBatchPerCallIds = @()
-$RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
-$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })
-if ($UseMetricsBatch -and -not $SkipMetrics -and $InsightsScope.Count -gt 0)
-{
-    $MetricsBatchPerCallIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope).NotRegistered)
-}
-
 # ---------------------------------------------------------------------------
 # Up-front consumption (billing) access gate. Consumption was REQUESTED unless
 # -SkipConsumption was passed. If the signed-in identity is not authorized to
@@ -963,6 +946,25 @@ $StreamsSrc = if ($StreamsAuto) { 'auto' } else { 'explicit' }
 $ConcurrencySrc = if ($ConcurrencyAuto) { 'auto' } else { 'explicit' }
 Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundColor DarkGray
 Write-Host ("Parallelism: -ParallelStreams {0} ({1}), -ConcurrencyLimit {2} ({3}). Pass either flag to override." -f $ParallelStreams, $StreamsSrc, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+
+# -UseMetricsBatch only: the metrics batch API needs the Microsoft.Insights
+# resource provider registered on each subscription. Read its state on every
+# subscription this run collects, and offer once to register it where it is
+# missing (Invoke-RdaInsightsProviderPreflight). Nothing is registered without
+# a "y"; a subscription left unregistered has its metrics collected with one
+# request per resource, so the run goes on either way.
+# The subscriptions left unregistered are handed to every inner run, which keeps
+# them on the per-resource path for this whole run, even if the provider gets
+# registered meanwhile; the next run reads the state again.
+# It runs after the access and consumption gates, so a run they stop asks
+# nothing and registers nothing.
+$MetricsBatchPerCallIds = @()
+$RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })
+if ($UseMetricsBatch -and -not $SkipMetrics -and $InsightsScope.Count -gt 0)
+{
+    $MetricsBatchPerCallIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope).NotRegistered)
+}
 
 # Build passthrough hashtable for optional switches
 $InventoryPassthrough = @{}

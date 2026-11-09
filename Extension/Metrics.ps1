@@ -23,7 +23,8 @@ param(
     # point it at a local listener.
     [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com',
     # Internal: seconds each Azure Monitor request may take. Tests lower it.
-    [int]$MetricsCallTimeoutSeconds = 120
+    # 0 or less would make every request time out at once.
+    [ValidateRange(1, 3600)][int]$MetricsCallTimeoutSeconds = 120
 )
 
 
@@ -696,7 +697,7 @@ if ($Task -eq 'Processing')
     # parallel batch runspaces under a lock (Monitor) on the array itself.
     $MetricBatchCounts = [long[]]::new(6)
     # Subscription id -> why batch was turned off for it during the phase (the
-    # data plane refused the token or the caller: 401 or 403).
+    # data plane answered 403: Microsoft.Insights is not registered there).
     $MetricBatchOffSubs = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $MetricBatchNotes = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     # Tenants whose token was renewed after a 401 and has not worked since: a
@@ -747,8 +748,10 @@ if ($Task -eq 'Processing')
                     continue
                 }
                 # The provider must be registered: the batch API answers 403 otherwise.
-                # The preflight offered to register it; this only reads the state.
-                $ProviderRead = Get-RdaInsightsProviderState -SubscriptionId $BatchSub
+                # The preflight offered to register it; this only reads the state. A read
+                # that stalls is given up and reads as Unknown, so the batch call decides.
+                $ProviderReadSeconds = [math]::Min((Get-RdaInsightsCallTimeoutSeconds), $MetricTimeoutSeconds)
+                $ProviderRead = Get-RdaInsightsProviderState -SubscriptionId $BatchSub -TimeoutSeconds $ProviderReadSeconds
                 if ($ProviderRead.State -ne 'Registered' -and $ProviderRead.State -ne 'Unknown')
                 {
                     Write-MetricsDiag ("[batch] Microsoft.Insights is '{0}' on subscription {1}; its metrics use the per-resource path. Register it to batch: {2}" -f $ProviderRead.State, $BatchSub, (Get-RdaInsightsRegisterCommand -SubscriptionId $BatchSub))
@@ -1060,15 +1063,16 @@ function Add-MetricRecord
                         }
 
                         # The definitions of this unit that have a record or were handed on, so a
-                        # unit that stops part way hands on only the rest.
-                        $Done = [System.Collections.Generic.HashSet[object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+                        # unit that stops part way hands on only the rest. Kept by MetricIndex, which
+                        # is unique per definition.
+                        $Done = [System.Collections.Generic.HashSet[int]]::new()
 
                         # One group (or the rest of one) to the per-resource path, as without -UseMetricsBatch.
                         function Send-GroupOn($Group)
                         {
                             $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
                             Add-BatchCount 5 @($Group).Count
-                            foreach ($Def in $Group) { [void]$Done.Add($Def) }
+                            foreach ($Def in $Group) { [void]$Done.Add([int]$Def.MetricIndex) }
                         }
 
                         # Every group of the unit to the per-resource path.
@@ -1251,6 +1255,7 @@ function Add-MetricRecord
                                 # The whole request, body included, runs in a thread job bounded by Wait-Job, as
                                 # one Get-AzMetric request is: -TimeoutSec alone does not cover reading the body.
                                 $Failure = $null
+                                # -ThrottleLimit sets one limit for the whole process, not for this call: the batch and per-resource paths both pass -ConcurrencyLimit, the number of runspaces that start jobs, so no job waits in a queue against its timeout.
                                 $Job = Start-ThreadJob -ScriptBlock { param($RequestArgs) Invoke-WebRequest @RequestArgs } -ArgumentList @{ Method = 'Post'; Uri = $Uri; Headers = @{ Authorization = 'Bearer ' + $Token }; ContentType = 'application/json'; Body = $Body; TimeoutSec = $CallTimeoutSeconds; ErrorAction = 'Stop' } -ThrottleLimit $ThreadJobLimit
                                 if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                                 {
@@ -1304,12 +1309,12 @@ function Add-MetricRecord
                                     }
                                     if ($Off.TryAdd($TenantKey, 1))
                                     {
-                                        $Notes.Add(('The metrics data plane refused a renewed token (401) for subscription {0}; batch is off for its tenant for the rest of the phase.' -f $Unit.SubscriptionId))
+                                        $Notes.Add(('The metrics data plane refused a renewed token (401) for subscription {0}; batch is off for its tenant for the rest of the phase. A 401 means the token is refused or the caller has no Monitoring Reader on the subscription itself (not only on its resource groups).' -f $Unit.SubscriptionId))
                                     }
                                 }
                                 if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
                                 {
-                                    $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader on the subscription itself (not only on its resource groups) and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
+                                    $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. A 403 means Microsoft.Insights is not registered on the subscription.' -f $Unit.SubscriptionId, $LastError))
                                 }
                                 $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
                                 Send-AllGroupsOn
@@ -1387,7 +1392,7 @@ function Add-MetricRecord
                                 foreach ($Answer in $GroupAnswers)
                                 {
                                     Add-MetricRecord -Def $Answer.Def -Request $Answered -MetricQuery ([pscustomobject]@{ Name = [pscustomobject]@{ Value = $Answer.Metric.Name }; Data = $Answer.Metric.Data }) -ExtraSeconds $Seconds
-                                    [void]$Done.Add($Answer.Def)
+                                    [void]$Done.Add([int]$Answer.Def.MetricIndex)
                                     $AnsweredDefs++
                                 }
                                 foreach ($Def in $Missing)
@@ -1408,7 +1413,7 @@ function Add-MetricRecord
                             foreach ($Group in $Unit.Groups)
                             {
                                 $Rest = [System.Collections.Generic.List[object]]::new()
-                                foreach ($Def in $Group) { if (-not $Done.Contains($Def)) { $Rest.Add($Def) } }
+                                foreach ($Def in $Group) { if (-not $Done.Contains([int]$Def.MetricIndex)) { $Rest.Add($Def) } }
                                 if ($Rest.Count -eq @($Group).Count) { Send-GroupOn $Group }
                                 elseif ($Rest.Count -gt 0) { Send-GroupOn ([object[]]$Rest.ToArray()) }
                             }
