@@ -2034,8 +2034,8 @@ function Get-ConsumptionRetryAdvice
 # The last lines of a run in which the billing download of one or more
 # subscriptions failed or stopped part-way: each subscription, then $Advice
 # (the command that collects them again). Shared by Run-AllSubscriptions.ps1
-# and direct runs of ResourceInventory.ps1, which then exit 3 (5 with a
-# collector failure). Prints nothing when there are none.
+# and direct runs of ResourceInventory.ps1, which then exit 3 (the wrapper
+# exits 5 when a collector failed too). Prints nothing when there are none.
 function Write-ConsumptionFailedBanner
 {
     param([object[]]$Entries, [string[]]$Advice)
