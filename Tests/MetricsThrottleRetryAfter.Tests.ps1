@@ -140,10 +140,9 @@ Describe 'Get-RdaMetricRetryPlan - throttled and generic failures keep separate 
         (Plan @{ Permanent = $true; Throttled = $true; ThrottledAttempts = 1; RetryAfterSeconds = 10 }).Retry | Should -BeFalse
         (Plan @{ Permanent = $false; GenericFailures = 1 }).Retry | Should -BeTrue
     }
-
-    It 'the retry loop passes a 404 to the plan as permanent' {
-        $script:MetricsSrc | Should -Match '-Permanent \$NotFound'
-    }
+    # That the retry loop passes a 404 to the plan as permanent is shown by what it does, in
+    # MetricsGrouping.Tests.ps1: 'makes 1 attempt, not 4, for a single-metric request that
+    # fails with ...' and 'makes 1 attempt for a grouped request that fails with NotFound'.
 }
 
 Describe 'Get-RdaRetryAfterSeconds - offline' {
