@@ -489,9 +489,11 @@ function Merge-RecoveryData
     $ReportVersion = if ($GapInventory.PSObject.Properties.Name -contains 'Version') { $GapInventory.Version } else { $null }
     & $SummaryScript -JsonFile $OutInventoryFile -HtmlFile $OutHtmlFile -Title 'Azure Resource Inventory' -Version $ReportVersion -ConsumptionFile $OutConsumptionFile | Out-Null
 
-    # -- Re-zip, mirroring ResourceInventory.ps1's packaging filter: HTML +
-    #    Consumption CSV + every *.json EXCEPT the local-only dictionary/Full/
-    #    Heartbeat/ErrorLog files. The dictionary is deliberately NOT zipped. ---
+    # -- Re-zip: HTML + Consumption CSV + every *.json of the output folder
+    #    EXCEPT the local-only dictionary/Full/Heartbeat/ErrorLog files. The
+    #    dictionary is deliberately NOT zipped. ResourceInventory.ps1 no longer
+    #    zips every *.json: it takes only its own run's Inventory and Metrics
+    #    files (Get-RdaReportJsonFiles), so this is not the same filter. ------
     $ZipJsonFiles = Get-ChildItem -Path $OutputPath -Filter '*.json' |
         Where-Object { $_.Name -notlike 'ObfuscationDictionary_*' -and $_.Name -notlike 'Full_*' -and $_.Name -notlike 'Heartbeat_*' -and $_.Name -notlike 'ErrorLog_*' } |
         Select-Object -ExpandProperty FullName
