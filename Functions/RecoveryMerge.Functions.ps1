@@ -200,6 +200,40 @@ function Merge-RecoveryData
         return $true
     }
 
+    # -- Check one parsed metric record the way downstream reads it. Returns
+    #    $null when it is fine, else a plain reason. MetricCount, MetricValue
+    #    and MetricPercentile are JSON numbers; MetricError is true or false;
+    #    MetricSeries is a number or a list of numbers. Extension/Metrics.ps1
+    #    writes a null MetricSeries for a metric with no series, so a null or
+    #    absent series is fine; null or text inside a list is not. -------------
+    function Test-MergeJsonNumber($Value)
+    {
+        return ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [System.Numerics.BigInteger])
+    }
+    function Get-MetricRecordProblem($Record)
+    {
+        if ($Record -isnot [System.Management.Automation.PSCustomObject]) { return 'is not a JSON object' }
+        $Names = $Record.PSObject.Properties.Name
+        foreach ($Field in 'MetricCount', 'MetricValue', 'MetricPercentile')
+        {
+            if ($Names -notcontains $Field -or -not (Test-MergeJsonNumber $Record.$Field)) { return ("has a {0} that is not a number" -f $Field) }
+        }
+        if ($Names -notcontains 'MetricError' -or $Record.MetricError -isnot [bool]) { return 'has a MetricError that is not true or false' }
+        if ($Names -contains 'MetricSeries' -and $null -ne $Record.MetricSeries)
+        {
+            $Series = $Record.MetricSeries
+            if ($Series -is [System.Array])
+            {
+                foreach ($Point in $Series)
+                {
+                    if (-not (Test-MergeJsonNumber $Point)) { return 'has a MetricSeries with a value that is not a number' }
+                }
+            }
+            elseif (-not (Test-MergeJsonNumber $Series)) { return 'has a MetricSeries that is not a number or a list of numbers' }
+        }
+        return $null
+    }
+
     # -- Read an ObfuscationDictionary and check its shape: a JSON object whose
     #    properties, GeneratedAt aside, are token maps (JSON objects or null)
     #    holding plain values. Throws a plain message otherwise, so a broken
@@ -510,6 +544,7 @@ function Merge-RecoveryData
     #    without the columns it needs, and every metric in a zip when one
     #    Metrics file is not an object with a Metrics list, both without an
     #    error, so such a file stops the merge instead. ------------------------
+    $ConsumptionRows = @()
     $ConsumptionSource = if ($RecoverConsumption) { 'recovery' } else { 'gap' }
     $ConsumptionSourceFile = if ($RecoverConsumption) { $RecoveryConsumptionFile } else { $GapConsumptionFile }
     if ($ConsumptionSourceFile)
@@ -535,6 +570,57 @@ function Merge-RecoveryData
             $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
             throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' has no {2} column, which downstream needs to read its rows, so they would be dropped. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, ($MissingColumns -join ', '), $OutputPath, $Hint)
         }
+
+        # Downstream drops the whole file in silence when one Quantity,
+        # UsageStartTime or UsageEndTime cell, or one Cost or UnitPrice cell
+        # where those columns exist, does not parse; a file cut mid-row by a
+        # failed pull ends in such a row. Numbers are read with the invariant
+        # culture (a dot, no thousands mark), as the tool writes them. A row
+        # with an empty ResourceId or MeterId is only dropped by itself, so
+        # that is not checked here.
+        $ConsumptionRows = @(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop)
+        $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+        $NumberColumns = @('Quantity', 'Cost', 'UnitPrice' | Where-Object { $_ -in $HeaderNames })
+        $DateColumns = @('UsageStartTime', 'UsageEndTime' | Where-Object { $_ -in $HeaderNames })
+        $BadCell = $null
+        $RowIndex = 0
+        foreach ($Row in $ConsumptionRows)
+        {
+            $RowIndex++
+            foreach ($Column in $NumberColumns)
+            {
+                $Cell = $Row.$Column
+                $Number = 0.0
+                if (-not [double]::TryParse([string]$Cell, [System.Globalization.NumberStyles]::Float, $Invariant, [ref]$Number) -or [double]::IsNaN($Number) -or [double]::IsInfinity($Number))
+                {
+                    $BadCell = ("row {0} has a {1} of '{2}', which is not a number written with a dot and no thousands mark" -f $RowIndex, $Column, $Cell)
+                }
+                elseif ($Column -eq 'Quantity' -and $Number -lt 0)
+                {
+                    $BadCell = ("row {0} has a negative Quantity ('{1}')" -f $RowIndex, $Cell)
+                }
+                if ($null -ne $BadCell) { break }
+            }
+            if ($null -eq $BadCell)
+            {
+                foreach ($Column in $DateColumns)
+                {
+                    $Cell = $Row.$Column
+                    $Date = [datetimeoffset]::MinValue
+                    if ([string]::IsNullOrWhiteSpace([string]$Cell) -or -not [datetimeoffset]::TryParse([string]$Cell, $Invariant, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$Date))
+                    {
+                        $BadCell = ("row {0} has a {1} of '{2}', which is not a date" -f $RowIndex, $Column, $Cell)
+                        break
+                    }
+                }
+            }
+            if ($null -ne $BadCell) { break }
+        }
+        if ($null -ne $BadCell)
+        {
+            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
+            throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' cannot be used: {2}. Downstream would drop the whole file, and with it every cost. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, $BadCell, $OutputPath, $Hint)
+        }
     }
     $MetricsSourceLabel = if ($RecoverMetrics) { 'recovery' } else { 'gap' }
     $SelectedMetricsCount = 0
@@ -559,6 +645,8 @@ function Merge-RecoveryData
                     foreach ($MetricRecord in $MetricsDoc.Metrics)
                     {
                         $MetricIndex++
+                        $Problem = Get-MetricRecordProblem $MetricRecord
+                        if ($null -ne $Problem) { $Problem = ('metric {0} {1}' -f $MetricIndex, $Problem); break }
                         $SelectedMetricRecords.Add([PSCustomObject]@{ File = $MetricsFile.Name; Index = $MetricIndex; Record = $MetricRecord })
                     }
                 }
@@ -587,11 +675,7 @@ function Merge-RecoveryData
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
         $GapKeptKeys = @($GapInventory.PSObject.Properties.Name | Where-Object { $_ -ne 'Version' -and $_ -notin $MergeKeys })
-        $ConsumptionRows = @()
-        if ($ConsumptionSourceFile)
-        {
-            $ConsumptionRows = @(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop)
-        }
+        # Read once with the cell checks above.
         $ConsumptionHasRows = ($ConsumptionRows.Count -gt 0)
         foreach ($Side in @(
                 @{ Label = 'gap'; IdKeys = $GapIdKeys; Dict = $GapDictionaryFile; Inventory = $GapInventory; Keys = $GapKeptKeys },

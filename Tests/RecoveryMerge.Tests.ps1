@@ -118,6 +118,12 @@ BeforeAll {
         }
     }
 
+    # A Metrics file text holding one such record.
+    function New-MetricsJson([string]$Name, [string]$Id = '/id')
+    {
+        @{ Metrics = @((New-MetricRecord -Id $Id -Name $Name)) } | ConvertTo-Json -Depth 5 -Compress
+    }
+
     # Write a bundle folder. Inventory is a hashtable of service-name -> record[].
     function New-Bundle
     {
@@ -473,12 +479,12 @@ Describe 'Merge-RecoveryData consumption handling' {
         {
             $Tmp = Join-Path $script:TmpRoot ('stage_' + [guid]::NewGuid().ToString('N'))
             $Key = if ($Pair[0] -eq $Gap) { 'VirtualMachines' } else { 'AppServices' }
-            New-Bundle -Dir $Tmp -Base $Pair[1] -Inventory ([ordered]@{ Version = '3.2.3'; $Key = @((New-Record $Pair[2])) }) -ConsumptionCsv (& $Csv $Pair[3]) -MetricsFiles @{ '__0' = ('{"Metrics":["' + $Pair[3] + '"]}') }
+            New-Bundle -Dir $Tmp -Base $Pair[1] -Inventory ([ordered]@{ Version = '3.2.3'; $Key = @((New-Record $Pair[2])) }) -ConsumptionCsv (& $Csv $Pair[3]) -MetricsFiles @{ '__0' = (New-MetricsJson $Pair[3]) }
             $null = New-Item -ItemType Directory -Path $Pair[0]
             Get-ChildItem -LiteralPath $Tmp -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Pair[0] $_.Name) }
         }
-        New-Bundle -Dir $GapDecoy -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm-decoy')) }) -ConsumptionCsv (& $Csv 'GAP-DECOY') -MetricsFiles @{ '__0' = '{"Metrics":["GAP-DECOY"]}' }
-        New-Bundle -Dir $RecDecoy -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-decoy')) }) -ConsumptionCsv (& $Csv 'REC-DECOY') -MetricsFiles @{ '__0' = '{"Metrics":["REC-DECOY"]}' }
+        New-Bundle -Dir $GapDecoy -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm-decoy')) }) -ConsumptionCsv (& $Csv 'GAP-DECOY') -MetricsFiles @{ '__0' = (New-MetricsJson 'GAP-DECOY') }
+        New-Bundle -Dir $RecDecoy -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-decoy')) }) -ConsumptionCsv (& $Csv 'REC-DECOY') -MetricsFiles @{ '__0' = (New-MetricsJson 'REC-DECOY') }
         $null = New-Item -ItemType Directory -Path $OutDecoy
 
         $Splat = @{ GapBundlePath = $Gap; RecoveryBundlePath = $Rec; OutputPath = $Out; WarningAction = 'SilentlyContinue' }
@@ -528,6 +534,56 @@ Describe 'Merge-RecoveryData consumption handling' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a consumption file downstream would drop stops the merge before any file is written'
     }
 
+    It 'stops before writing anything when the <Which> consumption file it would zip has <Case>' -ForEach @(
+        @{ Which = 'gap'; Case = 'a Quantity with a decimal comma'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,"1,5",Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of '1,5'*" },
+        @{ Which = 'recovery'; Case = 'a Quantity with a thousands mark'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,"1,000.5",Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of '1,000.5'*" },
+        @{ Which = 'gap'; Case = 'a negative Quantity'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,-1,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = '*row 2 has a negative Quantity*' },
+        @{ Which = 'recovery'; Case = 'a Quantity that is text'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,one,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of 'one'*" },
+        @{ Which = 'gap'; Case = 'a Quantity that is not a finite number'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,NaN,Hours,2026-01-01,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a Quantity of 'NaN'*" },
+        @{ Which = 'gap'; Case = 'a UsageStartTime that is not a date'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,1,Hours,soon,2026-01-02,/id,eastus,,,'; Expect = "*row 2 has a UsageStartTime of 'soon'*" },
+        @{ Which = 'recovery'; Case = 'an empty UsageEndTime'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,,/id,eastus,,,'; Expect = '*row 2 has a UsageEndTime of*not a date*' },
+        @{ Which = 'gap'; Case = 'a last row cut off by a failed pull'; Header = ''; Row = '{},Compute,m1,MET,eastus,vm,1,Ho'; Expect = '*row 2 has a UsageStartTime of*not a date*' },
+        @{ Which = 'gap'; Case = 'a Cost that is not a number'; Header = ',Cost'; Row = '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,n/a'; Expect = "*row 2 has a Cost of 'n/a'*" },
+        @{ Which = 'recovery'; Case = 'an empty UnitPrice'; Header = ',UnitPrice'; Row = '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,'; Expect = "*row 2 has a UnitPrice of ''*" }
+    ) {
+        $C = New-Case
+        $Good = '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,' + $(if ($Header) { ',1.5' } else { '' })
+        $Bad = "$script:CsvHeader$Header`n$Good`n$Row"
+        $GapCsv = if ($Which -eq 'gap') { $Bad } else { $script:CsvHeader }
+        $RecCsv = if ($Which -eq 'recovery') { $Bad } else { $script:CsvHeader }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $GapCsv
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $RecCsv
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Which -eq 'recovery') { $Splat.RecoverConsumption = $true }
+
+        $Message = $null
+        try { $null = Merge-RecoveryData @Splat } catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike "*the $Which bundle's consumption file*cannot be used*"
+        $Message | Should -BeLike $Expect
+        $Message | Should -BeLike '*Downstream would drop the whole file*Nothing was written*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a consumption file downstream would drop stops the merge before any file is written'
+    }
+
+    It 'carries a consumption file forward byte for byte when every cell parses as the tool writes it' {
+        $C = New-Case
+        $Rows = @(
+            # Export-Csv's own form: quoted cells, invariant dates and an exponent.
+            '"{}","Compute","m1","MET","eastus","vm","1E-05","Hours","01/01/2026 00:00:00","01/02/2026 00:00:00","/id","eastus","","","","0.25","12"',
+            '{},Compute,m2,MET,eastus,vm,0,Hours,2026-01-01T00:00:00+00:00,2026-01-02T00:00:00Z,/id,eastus,,,,0,0',
+            # Empty ResourceId and MeterId: downstream drops these rows by themselves, so they do not stop the merge.
+            '{},Compute,,MET,eastus,vm,2.5,Hours,2026-01-01,2026-01-02,,eastus,,,,1.5,3'
+        )
+        $Csv = (@("$script:CsvHeader,Cost,UnitPrice") + $Rows) -join "`n"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash |
+            Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase))).Hash
+    }
+
     It 'carries a consumption file with quoted headers forward byte for byte' {
         $C = New-Case
         $Quoted = '"' + ($script:CsvHeader -replace ',', '","') + '"' + "`n" + '"{}","Compute","m1","MET","eastus","vm","1","Hours","2026-01-01","2026-01-02","/id","eastus","","",""'
@@ -555,7 +611,7 @@ Describe 'Merge-RecoveryData metrics handling' {
 
     It 'carries gap metrics forward verbatim by default (MetricsSource = gap)' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["gap-metric"]}' }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
@@ -568,8 +624,8 @@ Describe 'Merge-RecoveryData metrics handling' {
 
     It 'replaces and rebases metrics to the gap base under -RecoverMetrics (MetricsSource = recovery)' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["gap-metric"]}' }
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["rec-metric"]}' }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'rec-metric') }
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics
 
@@ -596,6 +652,59 @@ Describe 'Merge-RecoveryData metrics handling' {
 
         { Merge-RecoveryData @Splat } | Should -Throw -ExpectedMessage "*the $Which bundle's metrics file*cannot be used*Nothing was written*"
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a metrics file downstream would drop stops the merge before any file is written'
+    }
+
+    It 'stops before writing anything when a <Which> metrics record <Case>' -ForEach @(
+        @{ Which = 'gap'; Case = 'is text, not an object'; Field = $null; Value = 'gap-metric'; Expect = '*metric 2 is not a JSON object*' },
+        @{ Which = 'recovery'; Case = 'is null'; Field = $null; Value = $null; Expect = '*metric 2 is not a JSON object*' },
+        @{ Which = 'gap'; Case = 'has a null MetricValue'; Field = 'MetricValue'; Value = $null; Expect = '*metric 2 has a MetricValue that is not a number*' },
+        @{ Which = 'recovery'; Case = 'has a MetricCount written as text'; Field = 'MetricCount'; Value = '24'; Expect = '*metric 2 has a MetricCount that is not a number*' },
+        @{ Which = 'gap'; Case = 'has no MetricPercentile'; Field = 'MetricPercentile'; Value = 'remove'; Expect = '*metric 2 has a MetricPercentile that is not a number*' },
+        @{ Which = 'recovery'; Case = 'has a MetricError written as text'; Field = 'MetricError'; Value = 'false'; Expect = '*metric 2 has a MetricError that is not true or false*' },
+        @{ Which = 'gap'; Case = 'has text inside MetricSeries'; Field = 'MetricSeries'; Value = @(1, 'two'); Expect = '*metric 2 has a MetricSeries with a value that is not a number*' },
+        @{ Which = 'recovery'; Case = 'has null inside MetricSeries'; Field = 'MetricSeries'; Value = @(1, $null); Expect = '*metric 2 has a MetricSeries with a value that is not a number*' },
+        @{ Which = 'gap'; Case = 'has a MetricSeries that is text'; Field = 'MetricSeries'; Value = '1,2'; Expect = '*metric 2 has a MetricSeries that is not a number or a list of numbers*' }
+    ) {
+        $C = New-Case
+        if ($null -eq $Field) { $BadRecord = $Value }
+        else
+        {
+            $BadRecord = New-MetricRecord -Name 'bad'
+            if ($Value -is [string] -and $Value -eq 'remove') { $BadRecord.Remove($Field) } else { $BadRecord[$Field] = $Value }
+        }
+        $Text = @{ Metrics = @((New-MetricRecord -Name 'good'), $BadRecord) } | ConvertTo-Json -Depth 5 -Compress
+        $GapMetrics = if ($Which -eq 'gap') { @{ '__0' = (New-MetricsJson 'gap-ok'); '__1' = $Text } } else { @{ '__0' = (New-MetricsJson 'gap-ok') } }
+        $RecMetrics = if ($Which -eq 'recovery') { @{ '__0' = $Text } } else { @{ '__0' = (New-MetricsJson 'rec-ok') } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $GapMetrics
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $RecMetrics
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Which -eq 'recovery') { $Splat.RecoverMetrics = $true }
+
+        $Message = $null
+        try { $null = Merge-RecoveryData @Splat } catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike "*the $Which bundle's metrics file*cannot be used*Downstream would drop every metric in the zip*Nothing was written*"
+        $Message | Should -BeLike $Expect
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a metrics file downstream would drop stops the merge before any file is written'
+    }
+
+    It 'carries metrics forward byte for byte when every record is shaped as the tool writes it (series <Case>)' -ForEach @(
+        @{ Case = 'null'; Series = $null },
+        @{ Case = 'one number'; Series = 0 },
+        @{ Case = 'a list of numbers'; Series = @(1, 2.5, 30) },
+        @{ Case = 'a list of one number'; Series = @(4) }
+    ) {
+        $C = New-Case
+        $Record = New-MetricRecord -Series $Series
+        $Record.MetricError = $true
+        $Text = @{ Metrics = @($Record) } | ConvertTo-Json -Depth 5 -Compress
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = $Text }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Metrics_{0}__0.json' -f $script:GapBase))).Hash |
+            Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Metrics_{0}__0.json' -f $script:GapBase))).Hash
     }
 
     It 'throws when -RecoverMetrics is set but the recovery bundle has no metrics' {
@@ -783,7 +892,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
             $RecSplat.Dictionary = $EmptyDict
             if ($Give -eq 'inventory') { $RecInventory['AppServices'] = @((New-Record 'app-real')) }
             if ($Give -eq 'consumption') { $RecSplat.ConsumptionCsv = $PlainCsv }
-            if ($Give -eq 'metrics') { $RecSplat.MetricsFiles = @{ '__0' = ('{"Metrics":[{"ID":"' + $RealId + '","Metric":"Percentage CPU","MetricValue":1}]}') } }
+            if ($Give -eq 'metrics') { $RecSplat.MetricsFiles = @{ '__0' = (New-MetricsJson -Name 'disk-real' -Id $RealId) } }
         }
         New-Bundle @RecSplat -Inventory $RecInventory
         $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
@@ -975,8 +1084,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
     It 'emits the HTML-does-not-render-metrics advisory under -RecoverMetrics' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["gap-metric"]}' }
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = '{"Metrics":["rec-metric"]}' }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'rec-metric') }
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics -WarningAction SilentlyContinue
 
