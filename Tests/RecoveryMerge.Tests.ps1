@@ -96,7 +96,7 @@ BeforeAll {
     }
 
     # One metric record with the fields and value types Extension/Metrics.ps1 writes.
-    function New-MetricRecord([string]$Id = '/id', [string]$Name = 'vm01', $Series = $null)
+    function Get-MetricRecord([string]$Id = '/id', [string]$Name = 'vm01', $Series = $null)
     {
         [ordered]@{
             ID               = $Id
@@ -119,9 +119,9 @@ BeforeAll {
     }
 
     # A Metrics file text holding one such record.
-    function New-MetricsJson([string]$Name, [string]$Id = '/id')
+    function Get-MetricsJson([string]$Name, [string]$Id = '/id')
     {
-        @{ Metrics = @((New-MetricRecord -Id $Id -Name $Name)) } | ConvertTo-Json -Depth 5 -Compress
+        @{ Metrics = @((Get-MetricRecord -Id $Id -Name $Name)) } | ConvertTo-Json -Depth 5 -Compress
     }
 
     # Write a bundle folder. Inventory is a hashtable of service-name -> record[].
@@ -479,12 +479,12 @@ Describe 'Merge-RecoveryData consumption handling' {
         {
             $Tmp = Join-Path $script:TmpRoot ('stage_' + [guid]::NewGuid().ToString('N'))
             $Key = if ($Pair[0] -eq $Gap) { 'VirtualMachines' } else { 'AppServices' }
-            New-Bundle -Dir $Tmp -Base $Pair[1] -Inventory ([ordered]@{ Version = '3.2.3'; $Key = @((New-Record $Pair[2])) }) -ConsumptionCsv (& $Csv $Pair[3]) -MetricsFiles @{ '__0' = (New-MetricsJson $Pair[3]) }
+            New-Bundle -Dir $Tmp -Base $Pair[1] -Inventory ([ordered]@{ Version = '3.2.3'; $Key = @((New-Record $Pair[2])) }) -ConsumptionCsv (& $Csv $Pair[3]) -MetricsFiles @{ '__0' = (Get-MetricsJson $Pair[3]) }
             $null = New-Item -ItemType Directory -Path $Pair[0]
             Get-ChildItem -LiteralPath $Tmp -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Pair[0] $_.Name) }
         }
-        New-Bundle -Dir $GapDecoy -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm-decoy')) }) -ConsumptionCsv (& $Csv 'GAP-DECOY') -MetricsFiles @{ '__0' = (New-MetricsJson 'GAP-DECOY') }
-        New-Bundle -Dir $RecDecoy -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-decoy')) }) -ConsumptionCsv (& $Csv 'REC-DECOY') -MetricsFiles @{ '__0' = (New-MetricsJson 'REC-DECOY') }
+        New-Bundle -Dir $GapDecoy -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm-decoy')) }) -ConsumptionCsv (& $Csv 'GAP-DECOY') -MetricsFiles @{ '__0' = (Get-MetricsJson 'GAP-DECOY') }
+        New-Bundle -Dir $RecDecoy -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-decoy')) }) -ConsumptionCsv (& $Csv 'REC-DECOY') -MetricsFiles @{ '__0' = (Get-MetricsJson 'REC-DECOY') }
         $null = New-Item -ItemType Directory -Path $OutDecoy
 
         $Splat = @{ GapBundlePath = $Gap; RecoveryBundlePath = $Rec; OutputPath = $Out; WarningAction = 'SilentlyContinue' }
@@ -730,7 +730,7 @@ Describe 'Merge-RecoveryData metrics handling' {
 
     It 'carries gap metrics forward verbatim by default (MetricsSource = gap)' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (Get-MetricsJson 'gap-metric') }
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
@@ -743,8 +743,8 @@ Describe 'Merge-RecoveryData metrics handling' {
 
     It 'replaces and rebases metrics to the gap base under -RecoverMetrics (MetricsSource = recovery)' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'rec-metric') }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (Get-MetricsJson 'gap-metric') }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (Get-MetricsJson 'rec-metric') }
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics
 
@@ -788,12 +788,12 @@ Describe 'Merge-RecoveryData metrics handling' {
         if ($null -eq $Field) { $BadRecord = $Value }
         else
         {
-            $BadRecord = New-MetricRecord -Name 'bad'
+            $BadRecord = Get-MetricRecord -Name 'bad'
             if ($Value -is [string] -and $Value -eq 'remove') { $BadRecord.Remove($Field) } else { $BadRecord[$Field] = $Value }
         }
-        $Text = @{ Metrics = @((New-MetricRecord -Name 'good'), $BadRecord) } | ConvertTo-Json -Depth 5 -Compress
-        $GapMetrics = if ($Which -eq 'gap') { @{ '__0' = (New-MetricsJson 'gap-ok'); '__1' = $Text } } else { @{ '__0' = (New-MetricsJson 'gap-ok') } }
-        $RecMetrics = if ($Which -eq 'recovery') { @{ '__0' = $Text } } else { @{ '__0' = (New-MetricsJson 'rec-ok') } }
+        $Text = @{ Metrics = @((Get-MetricRecord -Name 'good'), $BadRecord) } | ConvertTo-Json -Depth 5 -Compress
+        $GapMetrics = if ($Which -eq 'gap') { @{ '__0' = (Get-MetricsJson 'gap-ok'); '__1' = $Text } } else { @{ '__0' = (Get-MetricsJson 'gap-ok') } }
+        $RecMetrics = if ($Which -eq 'recovery') { @{ '__0' = $Text } } else { @{ '__0' = (Get-MetricsJson 'rec-ok') } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $GapMetrics
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $RecMetrics
         $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
@@ -814,7 +814,7 @@ Describe 'Merge-RecoveryData metrics handling' {
         @{ Case = 'a list of one number'; Series = @(4) }
     ) {
         $C = New-Case
-        $Record = New-MetricRecord -Series $Series
+        $Record = Get-MetricRecord -Series $Series
         $Record.MetricError = $true
         $Text = @{ Metrics = @($Record) } | ConvertTo-Json -Depth 5 -Compress
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = $Text }
@@ -1040,7 +1040,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
             $RecSplat.Dictionary = $EmptyDict
             if ($Give -eq 'inventory') { $RecInventory['AppServices'] = @((New-Record 'app-real')) }
             if ($Give -eq 'consumption') { $RecSplat.ConsumptionCsv = $PlainCsv }
-            if ($Give -eq 'metrics') { $RecSplat.MetricsFiles = @{ '__0' = (New-MetricsJson -Name 'disk-real' -Id $RealId) } }
+            if ($Give -eq 'metrics') { $RecSplat.MetricsFiles = @{ '__0' = (Get-MetricsJson -Name 'disk-real' -Id $RealId) } }
         }
         New-Bundle @RecSplat -Inventory $RecInventory
         $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
@@ -1080,7 +1080,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
             }
             'metrics'
             {
-                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((New-MetricRecord -Id $RealId)) } | ConvertTo-Json -Depth 5 -Compress) }
+                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((Get-MetricRecord -Id $RealId)) } | ConvertTo-Json -Depth 5 -Compress) }
                 $Splat.RecoverMetrics = $true
             }
         }
@@ -1118,7 +1118,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
             'inventory ID' { $RecRecords += [ordered]@{ Name = ('prod_' + [guid]::NewGuid()); Subscription = $Masked.Sub; ResourceGroup = $Masked.Rg; ID = $NestedId } }
             'metric ID'
             {
-                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((New-MetricRecord -Id $NestedId)) } | ConvertTo-Json -Depth 5 -Compress) }
+                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((Get-MetricRecord -Id $NestedId)) } | ConvertTo-Json -Depth 5 -Compress) }
                 $Splat.RecoverMetrics = $true
             }
         }
@@ -1152,7 +1152,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         $Seeded.Dictionary.ResourceIdMap[$MaskedId] = $RealId
         $Seeded.Dictionary.ResourceNameMap[$NameToken] = ($Real -split '/')[-1]
         $Csv = "$script:CsvHeader`n{},SQL Database,m1,vCore,eastus,db,1,Hours,2026-01-01,2026-01-02,$MaskedId,eastus,,,"
-        $Metrics = @{ Metrics = @((New-MetricRecord -Id $MaskedId -Name $NameToken)) } | ConvertTo-Json -Depth 5 -Compress
+        $Metrics = @{ Metrics = @((Get-MetricRecord -Id $MaskedId -Name $NameToken)) } | ConvertTo-Json -Depth 5 -Compress
         $RecRecords = @($Seeded.Records) + @([ordered]@{ Name = $NameToken; Subscription = $Masked.Sub; ResourceGroup = $Masked.Rg; Location = 'eastus'; ID = $MaskedId })
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; SQLDB = $RecRecords }) -MetricsFiles @{ '__0' = $Metrics } -Dictionary $Seeded.Dictionary
@@ -1206,7 +1206,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
             ''
         ) | ForEach-Object { "{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$_,eastus,,," }
         $Csv = (@($script:CsvHeader) + $Rows) -join "`n"
-        $Metrics = @{ Metrics = @((New-MetricRecord -Id $Seeded.Records[0].ID), (New-MetricRecord -Id ('obfuscated_' + (& $G)))) } | ConvertTo-Json -Depth 5 -Compress
+        $Metrics = @{ Metrics = @((Get-MetricRecord -Id $Seeded.Records[0].ID), (Get-MetricRecord -Id ('obfuscated_' + (& $G)))) } | ConvertTo-Json -Depth 5 -Compress
         $RecRecords = @($Seeded.Records) + @([ordered]@{ Name = 'obfuscated_x'; ID = ('obfuscated_' + (& $G)) })
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $RecRecords }) -MetricsFiles @{ '__0' = $Metrics } -Dictionary $Seeded.Dictionary
@@ -1325,8 +1325,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
     It 'emits the HTML-does-not-render-metrics advisory under -RecoverMetrics' {
         $C = New-Case
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'gap-metric') }
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (New-MetricsJson 'rec-metric') }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (Get-MetricsJson 'gap-metric') }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles @{ '__0' = (Get-MetricsJson 'rec-metric') }
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics -WarningAction SilentlyContinue
 
