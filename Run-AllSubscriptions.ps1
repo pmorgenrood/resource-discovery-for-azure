@@ -1079,6 +1079,9 @@ if ($ParallelStreams -le 1)
             $StateChanged = $false
             if ($NewConsumptionFailures.Count -gt 0)
             {
+                # A failure in this run wins over a completion an earlier run recorded,
+                # so -Resume does not skip the subscription.
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
                 $StateChanged = $true
             }
@@ -1181,6 +1184,9 @@ if ($ParallelStreams -le 1)
             # -ResumeFailedOnly can target it. Use the exception message as the
             # Reason so the operator can see at a glance why each sub failed
             # without opening the diag log.
+            # A failure in this run wins over a completion an earlier run recorded,
+            # so -Resume does not skip the subscription.
+            $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                 -Id $Sub.Id -Name $Sub.Name `
                 -Reason $ErrRecord.Exception.Message
@@ -1265,12 +1271,17 @@ else
                 $NewConsumptionFailures = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) | Select-Object -Skip $ConsumptionFailuresBefore)
                 if ($NewConsumptionFailures.Count -gt 0)
                 {
+                    # A failure in this run wins over a completion an earlier run recorded,
+                    # so -Resume does not skip the subscription.
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                     $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
                 }
-                elseif (-not ($CompletedIds -contains $Sub.Id))
+                else
                 {
-                    $CompletedIds += $Sub.Id
+                    if (-not ($CompletedIds -contains $Sub.Id)) { $CompletedIds += $Sub.Id }
+                    # A retry that succeeded leaves the retry list, also when an earlier
+                    # run had recorded the subscription as completed.
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
                 }
@@ -1300,6 +1311,9 @@ else
                 # Mirror the sequential branch: persist failure to the
                 # resume-state file so -ResumeFailedOnly works even for the
                 # single-sub-collapses-to-inline corner case.
+                # A failure in this run wins over a completion an earlier run recorded,
+                # so -Resume does not skip the subscription.
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
                     -Id $Sub.Id -Name $Sub.Name `
                     -Reason $ErrRecord.Exception.Message
@@ -1611,6 +1625,14 @@ else
                 {
                     Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
                 }
+            }
+            # A subscription a stream recorded as failed and not as completed failed
+            # in this run: its failure wins over a completion an earlier run
+            # recorded, so Merge-FailedAttempts keeps it and -Resume collects it.
+            $StreamFailedIds = @($AllFailedFromStreams | ForEach-Object { [string]$_.Id } | Where-Object { $_ -and $AllCompletedFromStreams -notcontains $_ })
+            if ($StreamFailedIds.Count -gt 0)
+            {
+                $CompletedIds = @($CompletedIds | Where-Object { $StreamFailedIds -notcontains $_ })
             }
             if ($AllCompletedFromStreams.Count -gt 0)
             {

@@ -263,6 +263,8 @@ for ($i = 0; $i -lt $PairCount; $i++)
         $NewConsumptionFailures = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) | Select-Object -Skip $ConsumptionFailuresBefore)
         if ($NewConsumptionFailures.Count -gt 0)
         {
+            # A failure in this run wins over a completion an earlier run recorded.
+            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
         }
@@ -322,6 +324,8 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # every failure (rather than only at end-of-stream) means a worker
         # that is killed mid-slice still surfaces its partial failure
         # history to the next -ResumeFailedOnly invocation.
+        # A failure in this run wins over a completion an earlier run recorded.
+        $Completed = @($Completed | Where-Object { $_ -ne $SubId })
         $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
             -Id $SubId -Name $SubName -Reason $ErrRecord.Exception.Message
         Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
