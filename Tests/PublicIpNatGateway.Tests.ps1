@@ -48,12 +48,19 @@ BeforeAll {
         }
     }
 
+    # Dictionary values are masked ids, as in an obfuscated run.
+    $script:MaskedRg = '/subscriptions/prod_11111111-2222-4333-8444-555555555555/resourcegroups/prod_66666666-7777-4888-9999-000000000000/providers/Microsoft.Network'
+    $script:MaskedPip = "$($script:MaskedRg)/publicIPAddresses/prod_aaaaaaaa-1111-4222-8333-444444444444"
+    $script:MaskedNat = "$($script:MaskedRg)/natGateways/prod_bbbbbbbb-1111-4222-8333-444444444444"
+    $script:MaskedNic = "$($script:MaskedRg)/networkInterfaces/prod_cccccccc-1111-4222-8333-444444444444"
+    $script:MaskedLb = "$($script:MaskedRg)/loadBalancers/prod_dddddddd-1111-4222-8333-444444444444"
+
     function New-Dictionary
     {
         param([hashtable]$Map = @{})
         $D = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         # A dictionary with an entry, as in an obfuscated run.
-        $D["$($script:Rg)/Microsoft.Network/publicIPAddresses/pip-a"] = 'prod_pip-token'
+        $D["$($script:Rg)/Microsoft.Network/publicIPAddresses/pip-a"] = $script:MaskedPip
         foreach ($K in $Map.Keys) { $D[$K] = $Map[$K] }
         return $D
     }
@@ -68,10 +75,10 @@ Describe 'Public IP on a NAT gateway' {
         $Rows[0].AssociatedResourceType | Should -BeExactly 'natGateways'
     }
 
-    It 'writes the NAT gateway token when the dictionary has the NAT gateway id' {
-        $Dict = New-Dictionary -Map @{ $script:NatId = 'prod_nat-token' }
+    It 'writes the masked id of the NAT gateway when the dictionary has the NAT gateway id' {
+        $Dict = New-Dictionary -Map @{ $script:NatId = $script:MaskedNat }
         $Row = (Invoke-Collector @(New-PublicIp -NoIpConfiguration -NatGateway ([pscustomobject]@{ id = $script:NatId })) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_nat-token'
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedNat
         $Row.AssociatedResourceType | Should -BeExactly 'natGateways'
     }
 
@@ -81,32 +88,32 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResource | Should -Not -Match 'nat-a'
     }
 
-    It 'finds the NAT gateway token when the id differs only in letter case' {
-        $Dict = New-Dictionary -Map @{ $script:NatId = 'prod_nat-token' }
+    It 'finds the masked id of the NAT gateway when the id differs only in letter case' {
+        $Dict = New-Dictionary -Map @{ $script:NatId = $script:MaskedNat }
         $Row = (Invoke-Collector @(New-PublicIp -NoIpConfiguration -NatGateway ([pscustomobject]@{ id = $script:NatId.ToLowerInvariant() })) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_nat-token'
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedNat
     }
 
-    It 'writes the NIC token for an ipConfiguration id whose NIC is in the dictionary' {
+    It 'writes the masked id of the NIC for an ipConfiguration id whose NIC is in the dictionary' {
         $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
-        $Dict = New-Dictionary -Map @{ $NicId = 'prod_nic-token' }
+        $Dict = New-Dictionary -Map @{ $NicId = $script:MaskedNic }
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId }) -NoNatGateway) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_nic-token'
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedNic
         $Row.AssociatedResourceType | Should -BeExactly 'networkInterfaces'
     }
 
-    It 'finds the NIC token when the ipConfiguration id differs from the NIC key only in letter case' {
+    It 'finds the masked id of the NIC when the ipConfiguration id differs from the NIC key only in letter case' {
         $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
-        $Dict = New-Dictionary -Map @{ $NicId = 'prod_nic-token' }
+        $Dict = New-Dictionary -Map @{ $NicId = $script:MaskedNic }
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId.ToUpperInvariant() }) -NoNatGateway) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_nic-token'
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedNic
     }
 
-    It 'writes the load balancer token for a frontend ipConfiguration id' {
+    It 'writes the masked id of the load balancer for a frontend ipConfiguration id' {
         $LbId = "$($script:Rg)/Microsoft.Network/loadBalancers/lb-a"
-        $Dict = New-Dictionary -Map @{ $LbId = 'prod_lb-token' }
+        $Dict = New-Dictionary -Map @{ $LbId = $script:MaskedLb }
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = "$LbId/frontendIPConfigurations/fe-a" }) -NoNatGateway) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_lb-token'
+        $Row.AssociatedResource | Should -BeExactly $script:MaskedLb
         $Row.AssociatedResourceType | Should -BeExactly 'loadBalancers'
     }
 

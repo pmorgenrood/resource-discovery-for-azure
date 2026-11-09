@@ -8,15 +8,15 @@ if ($Task -eq 'Processing')
     {
         $Tmp = @()
 
-        # The linked resource's token from the run's dictionary, which is keyed by
+        # The linked resource's masked id from the run's dictionary, which is keyed by
         # resource id as Resource Graph wrote it. An ipConfiguration id is a child
         # id (.../networkInterfaces/<nic>/ipConfigurations/<cfg>), so its parent
         # resource, the first 9 segments, is looked up too: that is the resource
         # a plain run names. Azure ids ignore letter case, so an id that misses
         # is looked up again, ignoring case, in a copy of the dictionary made on
-        # the first miss. No token is found: 'obfuscated'.
+        # the first miss. No masked id is found: 'obfuscated'.
         $IgnoreCase = @{ Map = $null }
-        $GetLinkToken = {
+        $GetLinkMaskedId = {
             param([string]$Id)
             $Ids = @($Id)
             $IdParts = $Id.Split('/')
@@ -49,16 +49,16 @@ if ($Task -eq 'Processing')
             if (-not [string]::IsNullOrEmpty([string]$Data.ipConfiguration.id))
             {
                 $AssocId = $Data.ipConfiguration.id
-                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
+                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkMaskedId $AssocId } else { $AssocId.split('/')[8] }
                 $AssociatedResourceType = $AssocId.split('/')[7]
             }
             elseif (-not [string]::IsNullOrEmpty([string]$Data.natGateway.id))
             {
                 # Obfuscated the same way as an ipConfiguration id: the NAT gateway's
-                # own token when the dictionary has it (letter case aside), else
+                # own masked id when the dictionary has it (letter case aside), else
                 # 'obfuscated'.
                 $AssocId = [string]$Data.natGateway.id
-                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
+                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkMaskedId $AssocId } else { $AssocId.split('/')[8] }
                 $AssociatedResourceType = $AssocId.split('/')[7]
             }
             elseif ($null -ne $Data.ipConfiguration.id)
