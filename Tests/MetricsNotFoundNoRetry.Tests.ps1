@@ -16,12 +16,13 @@ BeforeAll {
         . ([scriptblock]::Create($FnAst.Extent.Text))
     }
 
-    # The yes/no question the retry loop asks of Get-MetricFailure for a 404 and a 400.
+    # Test helpers: whether Get-MetricFailure gives the Kind NotFound (a 404) or BadRequest (a 400).
+    # The retry loop reads the Kind itself; these only keep the checks short.
     function Test-MetricNotFound([System.Exception]$Exception) { (Get-MetricFailure -Exception $Exception).Kind -eq 'NotFound' }
     function Test-MetricBadRequest([System.Exception]$Exception) { (Get-MetricFailure -Exception $Exception).Kind -eq 'BadRequest' }
 }
 
-Describe 'Test-MetricNotFound' {
+Describe 'Get-MetricFailure gives the Kind NotFound for a 404' {
     It 'matches the message Get-AzMetric gives for a 404 (<Label>)' -ForEach @(
         @{ Label = 'quoted, as Az.Monitor 8 writes it'; Message = "Microsoft.Azure.Management.Monitor.Models.ErrorResponseException: Operation returned an invalid status code 'NotFound'" }
         @{ Label = 'unquoted'; Message = 'Operation returned an invalid status code NotFound' }
@@ -126,7 +127,7 @@ Describe 'Test-MetricNotFound' {
     }
 }
 
-Describe 'Test-MetricBadRequest on the shared status helper' {
+Describe 'Get-MetricFailure gives the Kind BadRequest for a 400' {
     It 'reads the exception''s own status when its response has no status value (<Code>)' -ForEach @(@{ Code = 'BadRequest'; Want = $true }, @{ Code = 'ServiceUnavailable'; Want = $false }) {
         $Ex = [System.Net.Http.HttpRequestException]::new('The request failed.', $null, [System.Net.HttpStatusCode]$Code)
         $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $null })
