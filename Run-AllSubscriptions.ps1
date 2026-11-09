@@ -1013,9 +1013,9 @@ if ($ParallelStreams -le 1)
                 # and in the wrapper transcript. Read access is not the cause: a
                 # subscription the identity cannot read stops the run at the
                 # up-front role check (or is skipped there with -AllowPartialAccess)
-                # before it is collected, so Resource Graph lists no resource in
-                # this one.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check, so Resource Graph lists no resource in it (an empty subscription). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                # before it is collected, so the discovery query returned no
+                # resource for this one.
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check, so the discovery query returned no resource for it (an empty subscription, or one that holds only resources the query leaves out). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {

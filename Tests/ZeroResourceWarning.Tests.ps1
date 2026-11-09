@@ -33,5 +33,9 @@ Describe 'The 0-resources warning of a collected subscription' {
         $Warnings.Count | Should -BeGreaterThan 0
         @($Warnings | Where-Object { $_ -match 'passed the up-front role check' }).Count | Should -Be 1
         @($Warnings | Where-Object { $_ -match 'permission gap' }) | Should -BeNullOrEmpty
+        # The discovery query leaves some resources out on purpose, so 0 means
+        # it returned none, not that Resource Graph holds none.
+        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'the discovery query returned no resource' }) | Should -BeNullOrEmpty
+        @($Warnings | Where-Object { $_ -match 'Resource Graph lists no resource' }) | Should -BeNullOrEmpty
     }
 }
