@@ -73,6 +73,18 @@ BeforeAll {
     # 1030-1034 for where these are produced.
     $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
+    # Masked resource ID (inventory ID, metric ID, consumption ResourceId,
+    # dictionary ResourceIdMap key): an ARM-shaped path, never a flat token.
+    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
+    # Every subscription, resource group and name segment is a prod_/nonprod_
+    # token, so a real name left in any of them fails. Provider and type
+    # segments stay as written. Consumption-only tokens carry sub_ / rg_ / rg_mc_,
+    # and a '$system' child name stays as written.
+    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+
     # Helper: get all resources from inventory as flat list
     $script:AllResources = @()
     if ($script:Inventory)
@@ -192,13 +204,13 @@ Describe "Subscription ID Leak Check" {
 # 5. All inventory resource IDs are obfuscated
 # ============================================================
 Describe "Inventory ID Obfuscation" {
-    It "Should have all resource IDs matching the obfuscation pattern" {
+    It "Should have all resource IDs matching the masked ARM path shape" {
         $script:AllResources.Count | Should -BeGreaterThan 0 -Because "There should be at least one resource in the inventory"
         foreach ($resource in $script:AllResources)
         {
             if ($null -ne $resource.ID)
             {
-                $resource.ID | Should -Match $script:ObfuscationPattern -Because "Resource ID '$($resource.ID)' should be obfuscated"
+                $resource.ID | Should -Match $script:MaskedIdPattern -Because "Resource ID '$($resource.ID)' should be a masked ARM path"
             }
         }
     }
@@ -253,7 +265,7 @@ Describe "Inventory ResourceGroup Obfuscation" {
 # 9. Metrics IDs are obfuscated
 # ============================================================
 Describe "Metrics Obfuscation" {
-    It "Should have all metric IDs and names matching the obfuscation pattern" {
+    It "Should have masked ARM path metric IDs and masked metric names" {
         foreach ($metricsFile in $script:MetricsFiles)
         {
             $MetricsData = Get-Content $metricsFile.FullName -Raw | ConvertFrom-Json
@@ -261,7 +273,7 @@ Describe "Metrics Obfuscation" {
             {
                 if ($null -ne $metric.ID)
                 {
-                    $metric.ID | Should -Match $script:ObfuscationPattern -Because "Metric ID should be obfuscated"
+                    $metric.ID | Should -Match $script:MaskedIdPattern -Because "Metric ID '$($metric.ID)' should be a masked ARM path"
                 }
                 if ($null -ne $metric.Name)
                 {
@@ -284,26 +296,14 @@ Describe "Metrics Obfuscation" {
 # 10. Consumption ResourceIds are obfuscated
 # ============================================================
 Describe "Consumption Obfuscation" {
-    # NOTE: the consumption ResourceUri shape preserves the ARM path structure
+    # NOTE: the consumption ResourceId keeps the ARM path structure
     # (/subscriptions/<obf-sub>/resourcegroups/<obf-rg>/providers/<rp>/<type>/<obf-name>)
-    # so the server-side dashboard can categorise rows by resource provider +
-    # type. The pre-2026 behaviour replaced the whole URI with a flat token,
-    # which broke AKS / VMSS / Container Instance / Container Registry / Kusto
-    # detection on the dashboard. Tests must accept BOTH shapes:
-    #   - flat: prod_<guid>            (legacy / non-ARM uris like $system)
-    #   - ARM:  /subscriptions/...     (the new structure-preserving shape)
-    # And separately enforce the no-leak invariants that actually matter.
-    #
-    # NOTE: this derivation must run at RUN time, not discovery time. It depends
-    # on $script:ObfuscationPattern, which the top-level BeforeAll assigns. A
-    # bare assignment in the Describe body would execute during Pester discovery
-    # (when the pattern is still $null) and crash the whole block, silently
-    # dropping the two consumption assertions below. Keep it inside BeforeAll.
-    BeforeAll {
-        $script:ConsumptionSafePattern = '^(' + $script:ObfuscationPattern.TrimStart('^').TrimEnd('$') + '|/subscriptions/(prod|nonprod)_sub_)'
-    }
+    # so rows can be told apart by provider, type and child segments, and joined
+    # to the inventory ID with the same tokens. A flat prod_<guid> token loses
+    # the subscription, resource group and type, so it fails here.
+    # $script:MaskedIdPattern comes from the top-level BeforeAll.
 
-    It "Should have all consumption ResourceIds matching the obfuscation pattern" {
+    It "Should have all consumption ResourceIds matching the masked ARM path shape" {
         if ($null -eq $script:ConsumptionFile) { Set-ItResult -Skipped -Because "no consumption file in fixture"; return }
         $Csv = Import-Csv $script:ConsumptionFile.FullName
         if ($Csv.Count -eq 0) { Set-ItResult -Skipped -Because "empty consumption csv"; return }
@@ -312,7 +312,7 @@ Describe "Consumption Obfuscation" {
         {
             if (![string]::IsNullOrEmpty($row.ResourceId))
             {
-                $row.ResourceId | Should -Match $script:ConsumptionSafePattern -Because "Consumption ResourceId should be obfuscated (flat token or structure-preserving ARM path)"
+                $row.ResourceId | Should -Match $script:MaskedIdPattern -Because "Consumption ResourceId '$($row.ResourceId)' should be a masked ARM path"
                 $row.ResourceId | Should -Not -Match '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}' -Because "Consumption ResourceId must not contain a real subscription GUID"
             }
         }
@@ -331,7 +331,7 @@ Describe "Consumption Obfuscation" {
                 $Uri = $InstanceData.'Microsoft.Resources'.ResourceUri
                 if (![string]::IsNullOrEmpty($Uri))
                 {
-                    $Uri | Should -Match $script:ConsumptionSafePattern -Because "InstanceData ResourceUri should be obfuscated (flat token or structure-preserving ARM path)"
+                    $Uri | Should -Match $script:MaskedIdPattern -Because "InstanceData ResourceUri '$Uri' should be a masked ARM path"
                     $Uri | Should -Not -Match '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}' -Because "InstanceData ResourceUri must not contain a real subscription GUID"
                 }
             }
@@ -492,7 +492,7 @@ Describe "Cross-Reference Field Obfuscation" {
         {
             if ($null -ne $r -and ![string]::IsNullOrEmpty($r.Set))
             {
-                $r.Set | Should -Match $script:ObfuscationPattern -Because "VMSS Set ID should be obfuscated"
+                $r.Set | Should -Match $script:MaskedIdPattern -Because "VMSS Set ID '$($r.Set)' should be a masked ARM path"
                 $Checked++
             }
         }

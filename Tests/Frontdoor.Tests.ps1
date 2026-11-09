@@ -25,11 +25,22 @@ BeforeAll {
     $script:ObfuscationPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
 
-    # Detect whether this zip is from an obfuscated run (any ID matches the pattern)
+    # A masked resource ID is an ARM-shaped path whose subscription, resource
+    # group and name segments are each a prod_/nonprod_ token; provider and
+    # type segments stay as written.
+    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $script:MaskedIdPattern = '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid +
+        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?' +
+        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
+
+    # Detect whether this zip is from an obfuscated run (the first ID starts
+    # with a masked subscription token, or is a flat prod_/nonprod_ token).
+    # Only the start is checked, so an ID with a leak or the wrong shape still
+    # runs, and fails, the checks below.
     $script:IsObfuscated = $false
     if ($script:FrontDoors.Count -gt 0 -and $null -ne $script:FrontDoors[0].ID)
     {
-        $script:IsObfuscated = $script:FrontDoors[0].ID -match $script:ObfuscationPattern
+        $script:IsObfuscated = $script:FrontDoors[0].ID -match '^(/subscriptions/)?(prod|nonprod)_'
     }
 }
 
@@ -150,11 +161,11 @@ Describe "Front Door Non-Sensitive Field Preservation" {
 }
 
 Describe "Front Door Obfuscation in Obfuscated Mode" {
-    It "ID should match obfuscation pattern" {
+    It "ID should be a masked ARM path" {
         if (-not $script:IsObfuscated -or $script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "non-obfuscated run or no Front Doors"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            $fd.ID | Should -Match $script:ObfuscationPattern -Because "Obfuscated mode: ID must be masked"
+            $fd.ID | Should -Match $script:MaskedIdPattern -Because "Obfuscated mode: ID must be a masked ARM path"
         }
     }
 

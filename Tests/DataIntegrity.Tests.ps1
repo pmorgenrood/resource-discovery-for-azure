@@ -27,11 +27,16 @@ BeforeAll {
         $script:AllContent[$file.Name] = Get-Content $file.FullName -Raw
     }
 
-    $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # A masked resource ID is an ARM-shaped path that starts with a masked
+    # subscription token (/subscriptions/prod_... or /subscriptions/nonprod_...).
+    # Only the start is checked here, and a flat prod_/nonprod_ token also
+    # counts: this pattern just tells an obfuscated run from a plain one, so an
+    # ID with a leak or the wrong shape still turns the leak scans below on.
+    # Obfuscation.Tests.ps1 checks the full shape.
+    $script:ObfuscationPattern = '^(/subscriptions/)?(prod|nonprod)_'
 
-    # Detect obfuscation mode: if any resource ID matches the obfuscation
-    # pattern, treat the run as obfuscated. The PII-leak Describe later
-    # also depends on this signal.
+    # Detect obfuscation mode: if any resource ID is a masked ID, treat the
+    # run as obfuscated. The PII-leak Describe later also depends on this signal.
     $script:IsObfuscated = $false
     if ($null -ne $script:Inventory)
     {
