@@ -95,10 +95,19 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResourceType | Should -BeExactly 'networkInterfaces'
     }
 
-    It 'finds the ipConfiguration token when the id differs only in letter case' {
-        $Dict = New-Dictionary -Map @{ $script:NicCfgId = 'prod_cfg-token' }
+    It 'finds the NIC token when the ipConfiguration id differs from the NIC key only in letter case' {
+        $NicId = ($script:NicCfgId -split '/')[0..8] -join '/'
+        $Dict = New-Dictionary -Map @{ $NicId = 'prod_nic-token' }
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId.ToUpperInvariant() }) -NoNatGateway) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'prod_cfg-token'
+        $Row.AssociatedResource | Should -BeExactly 'prod_nic-token'
+    }
+
+    It 'writes the load balancer token for a frontend ipConfiguration id' {
+        $LbId = "$($script:Rg)/Microsoft.Network/loadBalancers/lb-a"
+        $Dict = New-Dictionary -Map @{ $LbId = 'prod_lb-token' }
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = "$LbId/frontendIPConfigurations/fe-a" }) -NoNatGateway) -Dictionary $Dict)[0]
+        $Row.AssociatedResource | Should -BeExactly 'prod_lb-token'
+        $Row.AssociatedResourceType | Should -BeExactly 'loadBalancers'
     }
 
     It 'prefers ipConfiguration when both are set, as before' {
