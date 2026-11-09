@@ -484,6 +484,12 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# The consumption counterparts, cleared here too: ResourceInventory.ps1 only
+# sets them when they are not set, so an earlier wrapper run in the same
+# session would otherwise leave its entries and its count in this run.
+$Global:ConsumptionFailedSubs = @()
+$Global:ConsumptionRecordCount = 0
+
 # The zip paths of subscriptions whose report zip could not be written this
 # run. ResourceInventory.ps1 adds one and exits 2 (sequential run); a stream
 # worker reports its list in its summary JSON. A partial zip left at such a
