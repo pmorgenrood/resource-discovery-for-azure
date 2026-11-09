@@ -1018,7 +1018,8 @@ Describe 'ResourceInventory.ps1 reads free space as the wrapper does' {
         $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $RunAllSubs.IsPresent' })
         $Space = @($If[0].Clauses[0].Item2.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('$PreFlightInventoryRoot -ErrorAction Stop') })
         $Space.Count | Should -Be 1
-        $PreFlightInventoryRoot = $TestDrive
+        # Set-Variable: read only by the lifted block.
+        Set-Variable -Name PreFlightInventoryRoot -Value $TestDrive
         # A drive whose free figure is 1 byte: read, it would stop the run.
         Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 1 }; FullName = $TestDrive } }
         $Said = @(. ([scriptblock]::Create($Space[0].Extent.Text)) 6>&1 | ForEach-Object { [string]$_ })
