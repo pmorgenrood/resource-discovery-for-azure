@@ -498,8 +498,8 @@ if ($Task -eq 'Processing')
     # lock (Monitor) on the array itself.
     $MetricRequestCounts = [long[]]::new(2)
 
-    # $MetricCount is the number of definitions to send, as it was when the batch
-    # loop counted definitions: with none to send, no group and no call is made.
+    # $MetricCount is $MetricDefs.Count, set above. The guard keeps a run with no
+    # definitions from building groups or making any Get-AzMetric call.
     if ($MetricCount -gt 0)
     {
         $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
@@ -762,7 +762,13 @@ if ($Task -eq 'Processing')
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    if (Test-MetricThrottled -Exception $_.Exception)
+                                    # Check BadRequest first: a 400 message can hold '429'
+                                    # inside an id and must not be retried as throttled.
+                                    if ($StopOnBadRequest)
+                                    {
+                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
+                                    }
+                                    if (-not $BadRequest -and (Test-MetricThrottled -Exception $_.Exception))
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++
@@ -771,10 +777,6 @@ if ($Task -eq 'Processing')
                                         {
                                             try { $RetryAfterSeconds = [double](Get-RdaRetryAfterSeconds -ErrorRecord $_) } catch { $RetryAfterSeconds = 0 }
                                         }
-                                    }
-                                    elseif ($StopOnBadRequest)
-                                    {
-                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
                                     }
                                 }
                                 finally
@@ -1057,7 +1059,7 @@ if ($Task -eq 'Processing')
             $BatchDefCount = 0
 
             $BatchStopwatch.Stop()
-            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} call record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $MetricDiagnostics.Count)
+            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} metric definition record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $MetricDiagnostics.Count)
 
             if ($Obfuscate)
             {
@@ -1123,7 +1125,7 @@ if ($Task -eq 'Processing')
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
-        Write-MetricsDiag ("Non-success calls (where it got stuck):")
+        Write-MetricsDiag ("Non-success metric definitions (where it got stuck):")
         foreach ($rec in ($DiagRecords | Where-Object { $_.Outcome -ne 'Success' } | Sort-Object ElapsedSec -Descending))
         {
             Write-MetricsDiag ("  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s waited={9}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error, $rec.WaitedSec)
@@ -1133,7 +1135,7 @@ if ($Task -eq 'Processing')
     if ($DiagRecords.Count -gt 0)
     {
         $Slowest = $DiagRecords | Sort-Object ElapsedSec -Descending | Select-Object -First 5
-        Write-MetricsDiag ("Slowest 5 calls:")
+        Write-MetricsDiag ("Slowest 5 metric definitions:")
         foreach ($rec in $Slowest)
         {
             Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6}) waited={7}s" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome, $rec.WaitedSec)
