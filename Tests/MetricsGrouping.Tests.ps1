@@ -18,6 +18,10 @@
 #   - a batch written to Metrics_*.json never splits one call's metrics, and
 #     there are no more batches than with one definition at a time.
 #
+# Each run sets RDA_TEST_METRIC_NO_SLEEP, so Metrics.ps1 skips the real wait
+# between retries and the throttled test does not sleep for minutes. A run
+# with -RealSleep leaves it unset, as in a real run.
+#
 # Get-AzMetric runs inside ForEach-Object -Parallel and Start-ThreadJob
 # runspaces, which Pester mocks do not reach. The tests therefore put a stand-in
 # Az.Monitor module first on PSModulePath. It records every call as a file and
@@ -36,6 +40,8 @@ BeforeAll {
     $script:MetricsScript = Join-Path $script:RepoRoot 'Extension/Metrics.ps1'
     if (-not (Test-Path $script:MetricsScript)) { throw "Metrics.ps1 not found at $script:MetricsScript" }
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
+    # Metrics.ps1 ships the Retry-After reader into its runspaces when it is loaded, as in a real run.
+    . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
 
     # Metrics.ps1 reads the current Az context once. Returning none keeps the run
     # offline and independent of any saved login on the machine.
@@ -92,7 +98,16 @@ function Get-AzMetric
         }
     }
     # RDA_TEST_METRIC_MULTI_ERROR makes every multi-name request fail in a chosen way.
-    switch ($(if ($Names.Count -gt 1) { $env:RDA_TEST_METRIC_MULTI_ERROR } else { '' }))
+    $MultiError = if ($Names.Count -gt 1) { $env:RDA_TEST_METRIC_MULTI_ERROR } else { '' }
+    # RDA_TEST_METRIC_MULTI_SEQUENCE lists, comma-separated, how each multi-name request fails in turn
+    # (the n-th call made fails the n-th way); past the end of the list a request succeeds.
+    if ($Names.Count -gt 1 -and $env:RDA_TEST_METRIC_MULTI_SEQUENCE)
+    {
+        $Sequence = @($env:RDA_TEST_METRIC_MULTI_SEQUENCE -split ',')
+        $CallIndex = @(Get-ChildItem -LiteralPath $env:RDA_TEST_METRIC_CALL_DIR -Filter '*.json').Count - 1
+        $MultiError = if ($CallIndex -lt $Sequence.Count) { $Sequence[$CallIndex] } else { '' }
+    }
+    switch ($MultiError)
     {
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
@@ -101,6 +116,13 @@ function Get-AzMetric
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
         'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
+        'ThrottledRetryAfter100'
+        {
+            # A 429 that carries Retry-After: 100 on its Response.Headers, as the Az cmdlets expose it.
+            $Ex = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+            $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('100') } })
+            throw $Ex
+        }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -207,7 +229,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [string]$SingleError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [switch]$RealSleep, [string[]]$MultiSequence = @())
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -226,14 +248,18 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_SINGLE_ERROR = $SingleError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $env:RDA_TEST_METRIC_POINTS = $PointsFile
+        $env:RDA_TEST_METRIC_MULTI_SEQUENCE = $MultiSequence -join ','
+        $env:RDA_TEST_METRIC_NO_SLEEP = $(if ($RealSleep) { '' } else { '1' })
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
+        $RunStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         try
         {
             $null = & $script:MetricsScript -Subscriptions $script:Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
         }
         finally
         {
+            $RunStopwatch.Stop()
             $Global:DebugLogFile = $script:OriginalDebugLogFile
         }
 
@@ -246,6 +272,7 @@ Export-ModuleMember -Function Get-AzMetric
             Files      = $Files
             Records    = @($Files | ForEach-Object { $_.Records })
             DebugLines = @(if (Test-Path -LiteralPath (Join-Path $RunDir 'debug.log')) { Get-Content -LiteralPath (Join-Path $RunDir 'debug.log') })
+            Seconds    = $RunStopwatch.Elapsed.TotalSeconds
         }
     }
 
@@ -268,7 +295,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_METRIC_SINGLE_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_METRIC_SINGLE_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS', 'Env:RDA_TEST_METRIC_NO_SLEEP', 'Env:RDA_TEST_METRIC_MULTI_SEQUENCE' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -532,17 +559,78 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         @($Run.DebugLines | Where-Object { $_ -match 'Azure Monitor requests: 1 for 4 metric definition\(s\), of which 0 single-metric fallback request\(s\)' }).Count | Should -Be 1
     }
 
+    It 'still sleeps between retries when the test hook is unset' {
+        # A server error waits 1 + 2 + 4 seconds (plus jitter) over its 3 retries.
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-real-sleep' -MultiError 'ServerError' -RealSleep
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        $Run.Seconds | Should -BeGreaterOrEqual 7
+        @($Run.DebugLines | Where-Object { $_ -match '  Error idx=[0-9]+ .* waited=([7-9]|10)(\.[0-9]+)?s ' }).Count | Should -Be 4
+    }
+
     It 'retries a throttled grouped request and does not fall back to one request per metric' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-throttled' -MultiError 'Throttled'
 
         # Throttled attempts have their own budget: 1 + 6 retries.
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 7
+        # The test hook skips the real waits, which add up to about two minutes.
+        $Run.Seconds | Should -BeLessThan 30
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         $Run.Records.Count | Should -Be 4
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
         foreach ($Name in $script:DiskMetricNames)
         {
             @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+            # The line shows the time spent waiting between attempts: 2 + 4 + 8 + 16 + 32 + 60 = 122 s plus under 1 s of jitter each.
+            $Line = @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=' -f [regex]::Escape($Name)) })[0]
+            $Line -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 122
+            [double]$Matches['Waited'] | Should -BeLessThan 128
+        }
+    }
+
+    It 'waits the Retry-After the server sends, until the total throttle wait cap stops it' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'throttled-retry-after' -MultiError 'ThrottledRetryAfter100'
+
+        # Two waits of 100 s (plus jitter) reach 200 s; a third would pass the 300 s cap, so 3 attempts in all.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 3
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            $Line = @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=3 ' -f [regex]::Escape($Name)) })
+            $Line.Count | Should -Be 1
+            $Line[0] -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 200
+            [double]$Matches['Waited'] | Should -BeLessThan 202
+        }
+    }
+
+    It 'retries a server error that follows 3 throttled answers' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'throttled-then-error' -MultiSequence @('Throttled', 'Throttled', 'Throttled', 'ServerError')
+
+        # Throttled answers do not spend the generic budget, so the fifth request is made and succeeds.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 5
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'gives throttled answers that follow 3 server errors the whole throttle budget' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'error-then-throttled' -MultiSequence (@('ServerError') * 3 + @('Throttled') * 6)
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 10
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'stops at the fourth server error even when throttled answers came between them' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'error-budget-mixed' -MultiSequence @('ServerError', 'Throttled', 'ServerError', 'Throttled', 'ServerError', 'ServerError')
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 6
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=6 .*InternalServerError' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
     }
 

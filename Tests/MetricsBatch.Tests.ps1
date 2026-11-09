@@ -949,6 +949,21 @@ Export-ModuleMember -Function Start-ThreadJob
         $Run.Seconds | Should -BeGreaterOrEqual 6
     }
 
+    It 'puts the time a batch request waited between attempts in its records'' diagnostics' {
+        $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after-waited' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfter = 6 }
+
+        $Run.Calls.Count | Should -Be 0
+        $Lines = @($Run.DebugLines | Where-Object { $_ -match '\(Success\) waited=[0-9.]+s' })
+        $Lines.Count | Should -BeGreaterThan 0
+        foreach ($Line in $Lines)
+        {
+            # Retry-After 6 plus at most 1 s of jitter.
+            $null = $Line -match '\(Success\) waited=(?<Waited>[0-9]+(\.[0-9]+)?)s'
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 6
+            [double]$Matches['Waited'] | Should -BeLessOrEqual 7
+        }
+    }
+
     It 'waits until a Retry-After date before retrying a throttled request' {
         $Run = Invoke-MetricsRun -Resources @($script:Mixed[2]) -RunName 'batch-retry-after-date' -Batch -Control @{ Status = 429; FailFirst = 1; RetryAfterDateSeconds = 7 }
 

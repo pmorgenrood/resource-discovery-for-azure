@@ -660,6 +660,11 @@ if ($Task -eq 'Processing')
     # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
     $MetricMaxThrottleRetries = 6
     $MetricMaxRetryAfterSeconds = 120
+    # Total wait cap for the throttled retries of one request: a retry whose sleep would take the total past it is not made.
+    $MetricMaxThrottleWaitSeconds = 300
+    # Test hook: offline tests set RDA_TEST_METRIC_NO_SLEEP=1 to skip the real wait between retries.
+    # Real runs never set it, so they wait as planned.
+    $MetricSkipRetrySleep = ($env:RDA_TEST_METRIC_NO_SLEEP -eq '1')
     # Get-RdaRetryAfterSeconds (Functions/ResourceInventory.Functions.ps1) is not visible inside -Parallel runspaces; ship its definition.
     $MetricRetryAfterFnDef = if (Get-Command Get-RdaRetryAfterSeconds -CommandType Function -ErrorAction SilentlyContinue) { ${function:Get-RdaRetryAfterSeconds}.ToString() } else { $null }
 
@@ -808,10 +813,12 @@ if ($Task -eq 'Processing')
 # $MetricQuery is the response for this metric alone, whether it was
 # requested on its own or together with other metrics of the resource.
 # The reported time is $ExtraSeconds plus, when given, the time on
-# $CallStopwatch when the record is added.
+# $CallStopwatch when the record is added. The reported wait between attempts
+# is $Request.WaitedSeconds plus $ExtraWaitedSeconds (a group request's wait
+# before the request of one metric).
 function Add-MetricRecord
 {
-    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
+    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0, [double]$ExtraWaitedSeconds = 0)
 
     $ElapsedSeconds = $ExtraSeconds
     $MetricError = $false
@@ -914,6 +921,7 @@ function Add-MetricRecord
             Outcome     = $CallOutcome
             Attempts    = $Request.Attempts
             ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
+            WaitedSec   = [math]::Round($Request.WaitedSeconds + $ExtraWaitedSeconds, 2)
             Error       = $CallErrorMsg
             # For the summary only: a 404 on a resource Resource Graph lists as being deleted is said so in plain words.
             Id          = $Def.Id
@@ -945,7 +953,7 @@ function Add-MetricRecord
 '@
 
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, throttle retries={5} (honours Retry-After up to {6}s), lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays), $MetricMaxThrottleRetries, $MetricMaxRetryAfterSeconds)
+    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, throttle retries={5} (honours Retry-After up to {6}s, at most {7}s of waiting per request), lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays), $MetricMaxThrottleRetries, $MetricMaxRetryAfterSeconds, $MetricMaxThrottleWaitSeconds)
 
     $RangeBatch = [math]::Min($MetricCount , 250)
     $RangeIdx = 1
@@ -1232,6 +1240,8 @@ function Add-MetricRecord
                             $LastError = $null
                             $Kind = $null
                             $RetryAfter = 0
+                            # Seconds of waiting between attempts, for the diagnostics record.
+                            $WaitedSeconds = 0
                             # Same rules as one Get-AzMetric request: at most 1 + $CallMaxRetries
                             # attempts, each bounded by $CallTimeoutSeconds; 401, 403, 400 and 404 end
                             # at once (the same request is refused the same way again).
@@ -1272,7 +1282,9 @@ function Add-MetricRecord
                                 if ($Attempt -lt $CallMaxRetries)
                                 {
                                     $Backoff = Get-MetricBatchBackoff -Attempt $Attempt -Kind $Kind -RetryAfter $RetryAfter
-                                    Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
+                                    $SleepSeconds = [math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2)
+                                    $WaitedSeconds += $SleepSeconds
+                                    Start-Sleep -Seconds $SleepSeconds
                                 }
                                 $Attempt++
                             }
@@ -1331,7 +1343,7 @@ function Add-MetricRecord
                             $AnsweredIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
                             $AnsweredDefs = 0
                             # The answer of a request that worked, for the records of the definitions it answered.
-                            $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false; NotFound = $false }
+                            $Answered = [PSCustomObject]@{ Succeeded = $true; Query = $null; Outcome = 'Success'; Attempts = $Attempts; ErrorMessage = $null; BadRequest = $false; NotFound = $false; WaitedSeconds = $WaitedSeconds }
                             foreach ($Group in $Unit.Groups)
                             {
                                 $GroupKey = ([string]$Group[0].Id).TrimEnd('/')
@@ -1443,7 +1455,9 @@ function Add-MetricRecord
                 $CallMaxRetries = $using:MetricMaxRetries
                 $CallMaxThrottleRetries = $using:MetricMaxThrottleRetries
                 $CallMaxRetryAfterSeconds = $using:MetricMaxRetryAfterSeconds
+                $CallMaxThrottleWaitSeconds = $using:MetricMaxThrottleWaitSeconds
                 $RetryAfterFnDef = $using:MetricRetryAfterFnDef
+                $SkipRetrySleep = $using:MetricSkipRetrySleep
                 if ($RetryAfterFnDef) { Set-Item -Path function:Get-RdaRetryAfterSeconds -Value ([scriptblock]::Create($RetryAfterFnDef)) }
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
@@ -1451,23 +1465,33 @@ function Add-MetricRecord
 
                 # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
                 # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
-                # other failure uses the generic budget and 2^attempt backoff. Returns @{ Retry; SleepSeconds } (no jitter).
+                # other failure uses the generic budget and 2^(failures-1) backoff. Each count includes the current
+                # failure, and one kind never spends the other's budget. A throttled retry is not made when its sleep
+                # would take the request's total throttle wait past MaxThrottleWaitSeconds.
+                # A permanent failure (a 404: the resource is not there) is never retried.
+                # Returns @{ Retry; SleepSeconds }; SleepSeconds includes the given jitter.
                 function Get-RdaMetricRetryPlan
                 {
+                    [CmdletBinding()]
+                    [OutputType([hashtable])]
                     param(
-                        [int]$Attempt, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds, [bool]$Permanent,
-                        [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds
+                        [int]$GenericFailures, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds, [bool]$Permanent,
+                        [double]$ThrottleWaitedSeconds, [double]$Jitter,
+                        [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds, [double]$MaxThrottleWaitSeconds
                     )
                     if ($Permanent) { return @{ Retry = $false; SleepSeconds = 0 } }
-                    $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $Attempt -lt $MaxRetries }
+                    $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $GenericFailures -le $MaxRetries }
                     if (-not $Retry) { return @{ Retry = $false; SleepSeconds = 0 } }
-                    $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                    $Failures = if ($Throttled) { $ThrottledAttempts } else { $GenericFailures }
+                    $Backoff = [math]::Min([math]::Pow(2, [math]::Max($Failures - 1, 0)), 30)
                     if ($Throttled)
                     {
                         $Backoff = [math]::Min($Backoff * 2, 60)
                         if ($RetryAfterSeconds -gt 0) { $Backoff = [math]::Min([math]::Max($RetryAfterSeconds, $Backoff), $MaxRetryAfterSeconds) }
                     }
-                    return @{ Retry = $true; SleepSeconds = $Backoff }
+                    $SleepSeconds = [math]::Round($Backoff + $Jitter, 2)
+                    if ($Throttled -and ($ThrottleWaitedSeconds + $SleepSeconds) -gt $MaxThrottleWaitSeconds) { return @{ Retry = $false; SleepSeconds = 0 } }
+                    return @{ Retry = $true; SleepSeconds = $SleepSeconds }
                 }
 
                 # The exception and the ones it wraps (inner exceptions and a wrapped error
@@ -1589,7 +1613,7 @@ function Add-MetricRecord
                     }
                     $CallOutcome = 'Success'
                     $CallAttempts = 0
-                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false; NotFound = $false }
+                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false; NotFound = $false; WaitedSeconds = 0 }
 
                     $MetricArgs = @{
                         ResourceId      = $Def.Id
@@ -1610,6 +1634,10 @@ function Add-MetricRecord
                     {
                         $Attempt = 0
                         $ThrottledAttempts = 0
+                        $GenericFailures = 0
+                        # Seconds of waiting between attempts: in all, and for throttled answers only (the capped part).
+                        $WaitedSeconds = 0
+                        $ThrottleWaitedSeconds = 0
                         $Succeeded = $false
                         $LastError = $null
                         $MetricQuery = $null
@@ -1691,14 +1719,20 @@ function Add-MetricRecord
                             # A BadRequest under -StopOnBadRequest has already left the loop above. A
                             # NotFound (404) is permanent: no retry can find the resource, so it ends
                             # after this attempt and is recorded as an Error, as before.
-                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $NotFound `
-                                -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
+                            # Timeouts and other errors count against the generic budget; throttled answers do not.
+                            if (-not $Throttled) { $GenericFailures++ }
+                            # Jitter so a wave of throttled calls does not retry in lockstep.
+                            $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
+                            $Plan = Get-RdaMetricRetryPlan -GenericFailures $GenericFailures -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $NotFound `
+                                -ThrottleWaitedSeconds $ThrottleWaitedSeconds -Jitter $Jitter `
+                                -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds -MaxThrottleWaitSeconds $CallMaxThrottleWaitSeconds
                             if ($Plan.Retry)
                             {
-                                # Jitter so a wave of throttled calls does not retry in lockstep.
-                                $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-                                $SleepSeconds = [math]::Round($Plan.SleepSeconds + $Jitter, 2)
-                                Start-Sleep -Seconds $SleepSeconds
+                                $SleepSeconds = $Plan.SleepSeconds
+                                # The planned wait is counted even when the test hook skips the real sleep.
+                                $WaitedSeconds += $SleepSeconds
+                                if ($Throttled) { $ThrottleWaitedSeconds += $SleepSeconds }
+                                if (-not $SkipRetrySleep) { Start-Sleep -Seconds $SleepSeconds }
                             }
                             else
                             {
@@ -1727,6 +1761,7 @@ function Add-MetricRecord
 
                     $Request.Outcome = $CallOutcome
                     $Request.Attempts = $CallAttempts
+                    $Request.WaitedSeconds = $WaitedSeconds
                     return $Request
                 }
 
@@ -1788,7 +1823,7 @@ function Add-MetricRecord
                             # requested on its own too. Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
-                            Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds
+                            Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds -ExtraWaitedSeconds $Request.WaitedSeconds
                         }
                     }
                 }
@@ -1884,7 +1919,7 @@ function Add-MetricRecord
         $DeletingStates = Get-MetricDeletingState -Resources $Resources -Ids @($DiagNonSuccess | Where-Object { $_.NotFound } | ForEach-Object { [string]$_.Id } | Select-Object -Unique)
         foreach ($rec in ($DiagNonSuccess | Sort-Object ElapsedSec -Descending))
         {
-            $Line = "  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error
+            $Line = "  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s waited={9}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error, $rec.WaitedSec
             if ($rec.NotFound -and $DeletingStates.ContainsKey([string]$rec.Id))
             {
                 $Line += (" - not found because the resource is being deleted (its state is '{0}'); not retried" -f $DeletingStates[[string]$rec.Id])
@@ -1899,7 +1934,7 @@ function Add-MetricRecord
         Write-MetricsDiag ("Slowest 5 calls:")
         foreach ($rec in $Slowest)
         {
-            Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6})" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome)
+            Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6}) waited={7}s" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome, $rec.WaitedSec)
         }
     }
 
