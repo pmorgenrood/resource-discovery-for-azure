@@ -179,6 +179,14 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
         Get-RdaRetryAfterSeconds -ErrorRecord $Outer | Should -Be 12
     }
 
+    It 'finds the header on the ErrorRecord an exception carries' {
+        $Throttled = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+        $Throttled | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('21') } })
+        $Record = [System.Management.Automation.ErrorRecord]::new($Throttled, 'x', 'NotSpecified', $null)
+        $Outer = [System.Management.Automation.RuntimeException]::new('The operation failed.', $null, $Record)
+        Get-RdaRetryAfterSeconds -ErrorRecord $Outer | Should -Be 21
+    }
+
     It 'gives 0 for junk text' {
         Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('soon, maybe') }) | Should -Be 0
     }

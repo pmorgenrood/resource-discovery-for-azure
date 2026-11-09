@@ -132,12 +132,19 @@ function Get-RdaRetryAfterSeconds
 
     try
     {
-        # PowerShell may surface the CloudException directly as .Exception or nested
-        # under one or more .InnerException levels; walk the chain (bounded).
-        $Ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
-        $Depth = 0
-        while ($null -ne $Ex -and $Depth -lt 5)
+        # PowerShell may surface the CloudException directly as .Exception, under
+        # .InnerException, or on the ErrorRecord a wrapper carries. Walk them all,
+        # the same bounded way Test-MetricThrottled does (at most 10).
+        $Start = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        $Pending = [System.Collections.Generic.Queue[object]]::new()
+        $Pending.Enqueue($Start)
+        $Checked = 0
+        while ($Pending.Count -gt 0 -and $Checked -lt 10)
         {
+            $Ex = $Pending.Dequeue()
+            if ($null -eq $Ex) { continue }
+            $Checked++
+
             $Headers = $null
             $ResponseProp = $Ex.PSObject.Properties['Response']
             if ($ResponseProp -and $null -ne $ResponseProp.Value)
@@ -187,8 +194,13 @@ function Get-RdaRetryAfterSeconds
                 }
             }
 
-            $Ex = $Ex.InnerException
-            $Depth++
+            $InnerProp = $Ex.PSObject.Properties['InnerException']
+            if ($InnerProp) { $Pending.Enqueue($InnerProp.Value) }
+            $RecordProp = $Ex.PSObject.Properties['ErrorRecord']
+            if ($RecordProp -and $null -ne $RecordProp.Value -and -not [object]::ReferenceEquals($RecordProp.Value.Exception, $Ex))
+            {
+                $Pending.Enqueue($RecordProp.Value.Exception)
+            }
         }
     }
     catch
