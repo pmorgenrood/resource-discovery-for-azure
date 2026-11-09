@@ -1185,11 +1185,14 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
                 {
                     if ($script:FailTokenMode -eq 'throw') { throw "Resource Graph query failed: status 429 after 5 tries`nQuery: $Query" }
                     if ($script:FailTokenMode -eq 'null') { return $null }
+                    # A real answer with no rows: the scope holds no skipped network rows.
+                    if ($script:FailTokenMode -eq 'empty') { return [pscustomobject]@{ data = @() } }
                     return [pscustomobject]@{ data = @($Rows | Select-Object id, name, resourceGroup, subscriptionId) }
                 }
                 return [pscustomobject]@{ data = @($Rows | ForEach-Object { $_.PSObject.Copy() }) }
             }
-            Mock -CommandName Write-Log -MockWith { }
+            $script:Logged = [System.Collections.Generic.List[string]]::new()
+            Mock -CommandName Write-Log -MockWith { $script:Logged.Add([string]$Message) }
 
             $ReportName = 'ResourcesReport'
             $IncludeNetworkResources = [switch]$Include.IsPresent
@@ -1204,7 +1207,7 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             return [pscustomobject]@{
                 Resources = @($Global:Resources); Count = @($Global:Resources).Count; Sent = @($script:Sent)
                 Ids = $Global:ResourceIdDictionary; Names = $Global:ResourceNameDictionary; Subs = $Global:ResourceSubscriptionDictionary; Rgs = $Global:ResourceResourceGroupDictionary
-                TokenRowsLeft = $script:NetworkTokenRows
+                TokenRowsLeft = $script:NetworkTokenRows; Logged = @($script:Logged)
             }
         }
 
@@ -1359,6 +1362,26 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         $Reason = $null
         try { script:Invoke-Discovery -Obfuscate -FailToken $Mode } catch { $Reason = $_.Exception.Message }
         script:Test-TokenFailureText -Text $Reason
+    }
+
+    It 'an id query that answers with no rows is a real 0: the run goes on, the token loop runs and the skipped count is 0' {
+        { $script:Run = script:Invoke-Discovery -Obfuscate -FailToken 'empty' } | Should -Not -Throw
+        $Run = $script:Run
+        $Token = @($Run.Sent | Where-Object { $_.Query -match '\| project id,name,resourceGroup,subscriptionId \|' })
+        $Token.Count | Should -Be 1 -Because 'the id query was sent'
+        # The id query was read as 0 rows (NetworkTokenRows.Count -eq 0), not as a failure.
+        @($Run.Logged | Where-Object { $_ -like 'Network id query for the masked ids: 0 rows in *' }).Count | Should -Be 1
+        @($Run.Logged | Where-Object { $_ -like 'Resource discovery failed*' }) | Should -BeNullOrEmpty
+        # Counted from the 0 id rows, so no count query is asked.
+        @($Run.Sent | Where-Object { $_.Query -match 'summarize count\(\) by type$' }) | Should -BeNullOrEmpty
+        $Global:SkippedResourceCount | Should -Not -BeNullOrEmpty -Because '0 rows is a known count, not an unknown one'
+        $Global:SkippedResourceCount | Should -Be 0
+        @($Global:SkippedResourceTypes.Keys).Count | Should -Be 0
+        # The token loop ran over the pull's rows only: every kept row has its masked id.
+        $Kept = @($script:AllRows | Where-Object { $script:NetTypes -notcontains $_.type } | ForEach-Object { $_.id } | Sort-Object)
+        $Kept.Count | Should -BeGreaterThan 0
+        @($Run.Ids.Keys | Sort-Object) | Should -Be $Kept
+        $Run.TokenRowsLeft | Should -BeNullOrEmpty -Because 'the id rows are dropped after the token loop'
     }
 
     It 'a failed id query (<Mode>) ends a direct run with exit 1 before the token loop' -TestCases @(@{ Mode = 'throw' }, @{ Mode = 'null' }) {
