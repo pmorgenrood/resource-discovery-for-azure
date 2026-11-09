@@ -135,7 +135,16 @@ function Invoke-RdaReveal
     $ErrorActionPreference = 'Stop'
 
     # ---- Resolve inputs ----------------------------------------------------
-    if (-not (Test-Path -Path $InputZip -PathType Leaf))
+    # The .NET zip and file calls below resolve a relative path against the
+    # process folder, not the PowerShell location, so make both zip paths
+    # full paths against the PowerShell location once, here.
+    $InputZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputZip)
+    if (-not [string]::IsNullOrEmpty($OutputZip))
+    {
+        $OutputZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
+    }
+
+    if (-not (Test-Path -LiteralPath $InputZip -PathType Leaf))
     {
         throw "Input zip not found: $InputZip"
     }
@@ -278,10 +287,8 @@ function Invoke-RdaReveal
         # mapping for the selected fields is still an error (wrong dictionary
         # or wrong -Fields).
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $InputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputZip)
-        $OutputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
         $HasToken = $false
-        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZipFull)
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZip)
         try
         {
             # Line by line, stopping at the first masked value, so a large entry
@@ -311,9 +318,9 @@ function Invoke-RdaReveal
         }
 
         # Same atomic swap as a revealed zip below: copy to .partial.zip, then move.
-        $OutputZipPartial = ($OutputZipFull -replace '\.zip$', '') + '.partial.zip'
-        [System.IO.File]::Copy($InputZipFull, $OutputZipPartial, $true)
-        [System.IO.File]::Move($OutputZipPartial, $OutputZipFull, $true)
+        $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+        [System.IO.File]::Copy($InputZip, $OutputZipPartial, $true)
+        [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
         Write-Host ""
         Write-Host "Nothing to reveal: this report carries no masked values (for example a subscription with no resources). Wrote an unchanged copy." -ForegroundColor Yellow
         Write-Host ("Output: {0}" -f $OutputZip) -ForegroundColor Green
