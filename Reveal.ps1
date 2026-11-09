@@ -792,6 +792,11 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
         elseif ([string]$Record['Sha256'] -cne (Get-RevealFileSha256 $OutPath)) { $Redo = 'its revealed zip does not match the one recorded' }
         elseif ([string]$Record['SourceFolder'] -cne $Folder -or [string]$Record['SourceName'] -cne $Zip.Name -or [string]$Record['SourceSha256'] -cne $SourceSha256) { $Redo = 'its source report changed' }
         elseif ([string]$Record['DictionaryName'] -cne $Dict.Name -or [string]$Record['DictionarySha256'] -cne $DictSha256) { $Redo = 'its dictionary changed' }
+        else
+        {
+            try { Assert-RevealZipWithinLimits -Path $OutPath -What 'revealed zip' }
+            catch { $Redo = 'its revealed zip is over the zip limits' }
+        }
         if ($null -eq $Redo)
         {
             $ResumedCount++
@@ -943,6 +948,9 @@ if ($StagedZips.Count -gt 0)
         # taken as written, so '[' and ']' in a name are not a wildcard.
         $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
         Write-RevealZipFromFiles -Files @($StagedZips.FullName) -Path $OutputZipPartial
+        # A bundle the ingestion server would refuse is not moved into place,
+        # and the run does not say it is ready to upload.
+        Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'outer zip'
         [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
     }
     catch

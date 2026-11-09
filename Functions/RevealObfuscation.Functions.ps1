@@ -302,6 +302,91 @@ function Write-RevealZipFromFiles
     finally { $Stream.Dispose() }
 }
 
+# The zip limits the ingestion server holds every uploaded zip to: at most
+# 2000 files, at most 100 to 1 compression (all files' sizes over the zip's
+# own size), no file over 16 GB, at most 32 GB in all, and no file path that
+# is rooted or has a '..' part. Reveal holds each zip it opens and each zip it
+# writes to the same limits, so it neither expands a report that would fill
+# the disk nor says a bundle is ready that the server must refuse. The limits
+# are parameters so a test can use small ones.
+function Get-RevealZipLimitProblem
+{
+    param(
+        [Parameter(Mandatory = $true)] [System.IO.Compression.ZipArchive] $Archive,
+        [long]   $CompressedLength = 0,
+        [int]    $MaxEntries = 2000,
+        [double] $MaxRatio = 100,
+        [long]   $MaxEntryBytes = 16GB,
+        [long]   $MaxTotalBytes = 32GB
+    )
+    $Entries = $Archive.Entries
+    if ($Entries.Count -gt $MaxEntries) { return ('it holds {0} files, more than the {1} allowed' -f $Entries.Count, $MaxEntries) }
+    $Total = [long]0
+    foreach ($Entry in $Entries)
+    {
+        $Name = $Entry.FullName
+        if (-not [string]::IsNullOrWhiteSpace($Name))
+        {
+            if ([System.IO.Path]::IsPathRooted($Name) -or $Name.StartsWith('/') -or $Name.StartsWith('\'))
+            {
+                return ("it holds the file '{0}', whose path is rooted" -f $Name)
+            }
+            $Normal = $Name.Replace('\', '/')
+            if ($Normal.Contains('../') -or $Normal.Contains('/..') -or $Normal -eq '..')
+            {
+                return ("it holds the file '{0}', whose path has a '..' part" -f $Name)
+            }
+        }
+        if ($Entry.Length -gt $MaxEntryBytes) { return ("it holds the file '{0}' of {1} bytes, more than the {2} bytes allowed for one file" -f $Name, $Entry.Length, $MaxEntryBytes) }
+        $Total += $Entry.Length
+    }
+    if ($Total -gt $MaxTotalBytes) { return ('its files hold {0} bytes in all, more than the {1} bytes allowed' -f $Total, $MaxTotalBytes) }
+    if ($CompressedLength -gt 0 -and $Total -gt 0)
+    {
+        $Ratio = [double]$Total / $CompressedLength
+        if ($Ratio -gt $MaxRatio) { return ('its files are {0:0.#} times the size of the zip, more than the {1} to 1 allowed' -f $Ratio, $MaxRatio) }
+    }
+    return $null
+}
+
+# Throw a plain message when the zip at $Path breaks a limit of
+# Get-RevealZipLimitProblem. $What names the zip in the message.
+function Assert-RevealZipWithinLimits
+{
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [string] $What = 'zip',
+        [hashtable] $Limits = @{}
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try
+    {
+        $Archive = [System.IO.Compression.ZipArchive]::new($Stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+        try { Assert-RevealOpenZipWithinLimits -Archive $Archive -CompressedLength $Stream.Length -Path $Path -What $What -Limits $Limits }
+        finally { $Archive.Dispose() }
+    }
+    finally { $Stream.Dispose() }
+}
+
+# The same check on a zip that is already open, so the archive checked is the
+# one then read.
+function Assert-RevealOpenZipWithinLimits
+{
+    param(
+        [Parameter(Mandatory = $true)] [System.IO.Compression.ZipArchive] $Archive,
+        [long] $CompressedLength,
+        [string] $Path,
+        [string] $What = 'zip',
+        [hashtable] $Limits = @{}
+    )
+    $Problem = Get-RevealZipLimitProblem -Archive $Archive -CompressedLength $CompressedLength @Limits
+    if ($null -ne $Problem)
+    {
+        throw ("The {0} {1} is over the zip limits the ingestion server holds every zip to: {2}. (A zip may hold at most 2000 files, at most 100 to 1 compression, no file over 16 GB, at most 32 GB in all, and no rooted or '..' path.)" -f $What, $Path, $Problem)
+    }
+}
+
 function Get-JsonEscaped
 {
     # Return the input string escaped for placement INSIDE a JSON string literal
@@ -460,6 +545,8 @@ function Test-RevealZipHasMaskedValue
     $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
     try
     {
+        # A zip over the limits is not read at all.
+        Assert-RevealOpenZipWithinLimits -Archive $Archive -CompressedLength ([System.IO.FileInfo]::new($Path).Length) -Path $Path -What 'report zip'
         # Each entry is read in fixed chunks of 64 KB characters, not line by
         # line: Inventory_*.json and Metrics_*.json are written on one line, so a
         # line can be the whole entry. Each chunk is scanned with the last
@@ -578,6 +665,8 @@ function Test-RevealZipHasKnownToken
     $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
     try
     {
+        # A zip over the limits is not read at all.
+        Assert-RevealOpenZipWithinLimits -Archive $Archive -CompressedLength ([System.IO.FileInfo]::new($Path).Length) -Path $Path -What 'report zip'
         $ChunkLength = 65536
         $CarryLength = 127
         $Buffer = [char[]]::new($CarryLength + $ChunkLength)
@@ -693,6 +782,8 @@ function Copy-RevealZipUnchanged
         try { $Source.CopyTo($Target) } finally { $Target.Dispose() }
     }
     finally { $Source.Dispose() }
+    try { Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'revealed zip' }
+    catch { Remove-Item -LiteralPath $OutputZipPartial -Force -ErrorAction SilentlyContinue; throw }
     [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
 }
 
@@ -947,8 +1038,22 @@ function Invoke-RdaReveal
         # ZipArchive (Write-RevealZipFromDirectory) do the same work in a fraction of the time and
         # produce the same flat archive layout. $TmpRoot was just created empty,
         # so extraction has nothing to overwrite.
+        # The report is checked against the zip limits on the same open
+        # archive that is then expanded, so a report that would fill the disk
+        # is never expanded.
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($InputZip, $TmpRoot)
+        $InputStream = [System.IO.FileStream]::new($InputZip, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try
+        {
+            $InputArchive = [System.IO.Compression.ZipArchive]::new($InputStream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+            try
+            {
+                Assert-RevealOpenZipWithinLimits -Archive $InputArchive -CompressedLength $InputStream.Length -Path $InputZip -What 'report zip'
+                [System.IO.Compression.ZipFileExtensions]::ExtractToDirectory($InputArchive, $TmpRoot)
+            }
+            finally { $InputArchive.Dispose() }
+        }
+        finally { $InputStream.Dispose() }
 
         $TotalHits = 0
         $Files = Get-ChildItem -LiteralPath $TmpRoot -Recurse -File
@@ -1045,6 +1150,10 @@ function Invoke-RdaReveal
         # owner-only ACL on Windows), and the move keeps that at the final name:
         # it holds the real values.
         Write-RevealZipFromDirectory -SourceDirectory $TmpRoot -Path $OutputZipPartial
+        # A revealed zip the ingestion server would refuse is not moved into
+        # place.
+        try { Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'revealed zip' }
+        catch { Remove-Item -LiteralPath $OutputZipPartial -Force -ErrorAction SilentlyContinue; throw }
         [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -Completed }
 
