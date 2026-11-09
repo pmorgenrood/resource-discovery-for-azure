@@ -290,21 +290,35 @@ function Get-RdaInsightsProviderState
     param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
-    try
+    # One ARM GET, sent again at most $MaxRetries times (1, 2, 4 s apart) after a
+    # request that throws, a throttle, a timeout or a server error. Any other
+    # answer that is not a success reads as Unknown at once.
+    $LastError = $null
+    for ($Attempt = 0; $Attempt -le $MaxRetries; $Attempt++)
     {
-        $Read = Invoke-RoleCheckGet -Path $Path -MaxRetries $MaxRetries
+        if ($Attempt -gt 0) { Start-Sleep -Seconds ([math]::Min([math]::Pow(2, $Attempt - 1), 4)) }
+        try
+        {
+            $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+        }
+        catch
+        {
+            $LastError = [string]$_.Exception.Message
+            continue
+        }
+        $Status = [int]$Response.StatusCode
+        if ($Status -ge 200 -and $Status -lt 300)
+        {
+            try { $Body = [string]$Response.Content | ConvertFrom-Json -ErrorAction Stop }
+            catch { return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = 'the answer was not valid JSON' } }
+            $State = [string]$Body.registrationState
+            if ([string]::IsNullOrEmpty($State)) { $State = 'Unknown' }
+            return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+        }
+        $LastError = 'HTTP {0}' -f $Status
+        if (-not ($Status -eq 408 -or $Status -eq 429 -or $Status -ge 500)) { break }
     }
-    catch
-    {
-        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$_.Exception.Message }
-    }
-    if ($null -ne $Read.Error -or $null -eq $Read.Body)
-    {
-        return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = [string]$Read.Error }
-    }
-    $State = [string]$Read.Body.registrationState
-    if ([string]::IsNullOrEmpty($State)) { $State = 'Unknown' }
-    return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+    return [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = 'Unknown'; Error = $LastError }
 }
 
 # Starts the registration of Microsoft.Insights on one subscription. Returns
@@ -349,7 +363,7 @@ function Invoke-RdaInsightsProviderPreflight
     $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
     $Result = [pscustomobject]@{ Registered = [System.Collections.Generic.List[string]]::new(); NotRegistered = [System.Collections.Generic.List[string]]::new(); Asked = $false; Answer = $null }
     if ($Ids.Count -eq 0) { return $Result }
-    if ($null -eq $Interactive) { $Interactive = Test-RdaInteractiveSession }
+    if ($null -eq $Interactive) { $Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected }
 
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
     $Missing = [System.Collections.Generic.List[object]]::new()

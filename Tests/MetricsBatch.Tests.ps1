@@ -1056,24 +1056,79 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
     }
 }
 
-Describe 'A direct run hands its preflight result to the metrics phase' -Skip:$IsWindows {
+Describe 'A direct run hands its preflight result to the metrics phase' {
 
-    It 'keeps a subscription answered no (no console) on the per-resource path, though registered meanwhile' {
-        $Harness = Join-Path $PSScriptRoot 'Helpers/InnerRunHarness.ps1'
-        $Work = Join-Path $TestDrive 'direct-run'
-        $Tree = Join-Path $Work 'tree'
-        $Out = Join-Path $Work 'out'
-        New-Item -ItemType Directory -Path $Tree, $Out -Force | Out-Null
-        foreach ($Item in @('ResourceInventory.ps1', 'Version.json', 'Functions', 'Extension', 'Services')) { Copy-Item -LiteralPath (Join-Path $script:RepoRoot $Item) -Destination $Tree -Recurse -Force }
-        $Pwsh = (Get-Process -Id $PID).Path
+    # shortcut: read from the script's syntax tree, because a direct run signs in
+    # and reads Resource Graph with the Azure CLI, which no test here stands in for;
+    # upgrade to a stand-in run once the direct run uses Az PowerShell only.
+    It 'keeps the subscriptions the preflight left unregistered in script scope and hands them to Metrics.ps1' {
+        $Text = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -Raw
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$null)
 
-        $Console = @(& $Pwsh -NoProfile -NonInteractive -File $Harness -Tree $Tree -Out $Out -UseMetricsBatch -DebugOutput 2>&1 | ForEach-Object { [string]$_ })
-        $Debug = @(Get-ChildItem -LiteralPath $Out -Recurse -Filter 'DebugLog_*.log' | ForEach-Object { Get-Content -LiteralPath $_.FullName })
+        @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Should -Contain 'MetricsBatchPerCallSubscriptionIds'
 
-        ($Console -join "`n") | Should -Match 'No one can answer a prompt in this session'
-        @($Debug | Where-Object { $_ -match 'was left without Microsoft.Insights at the start of the run' }).Count | Should -Be 1
-        # Without the hand-off the metrics phase would read Registered and ask for a token.
-        @($Debug | Where-Object { $_ -match 'could not get a metrics data plane token' }).Count | Should -Be 0
+        $Kept = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left.Extent.Text -eq '$script:MetricsBatchPerCallSubscriptionIds' }, $true))
+        $Kept.Count | Should -Be 1
+        $Kept[0].Right.Extent.Text | Should -Match 'Invoke-RdaInsightsProviderPreflight'
+        $Kept[0].Right.Extent.Text | Should -Match '\.NotRegistered\)$'
+
+        $Handed = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.Extent.Text -match '^& \$MetricPath ' }, $true))
+        $Handed.Count | Should -Be 1
+        $Handed[0].Extent.Text | Should -Match ([regex]::Escape('-MetricsBatchPerCallSubscriptionIds @($MetricsBatchPerCallSubscriptionIds | Where-Object { $_ })'))
+    }
+}
+
+Describe 'Get-RdaInsightsProviderState' {
+
+    BeforeEach {
+        $script:Answers = [System.Collections.Generic.Queue[object]]::new()
+        $script:Paths = [System.Collections.Generic.List[string]]::new()
+        Mock Start-Sleep { }
+        Mock Invoke-AzRestMethod {
+            $script:Paths.Add($Path)
+            $Next = $script:Answers.Dequeue()
+            if ($Next -is [string]) { throw $Next }
+            $Next
+        }
+    }
+
+    It 'reads the registration state with one GET' {
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"namespace":"Microsoft.Insights","registrationState":"NotRegistered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'NotRegistered'
+        $Read.Error | Should -BeNullOrEmpty
+        $script:Paths.Count | Should -Be 1
+        $script:Paths[0] | Should -BeLike '/subscriptions/sub-a/providers/Microsoft.Insights?api-version=*'
+    }
+
+    It 'sends the GET again after a server error or a request that throws' {
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 503; Content = '' })
+        $script:Answers.Enqueue('connection reset')
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'Registered'
+        $script:Paths.Count | Should -Be 3
+    }
+
+    It 'reads Unknown at once on a refusal, and after the last retry' {
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 403; Content = '' })
+        $Refused = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+        $Refused.State | Should -Be 'Unknown'
+        $Refused.Error | Should -Be 'HTTP 403'
+        $script:Paths.Count | Should -Be 1
+
+        foreach ($N in 1..2) { $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 429; Content = '' }) }
+        $Throttled = Get-RdaInsightsProviderState -SubscriptionId 'sub-a' -MaxRetries 1
+        $Throttled.State | Should -Be 'Unknown'
+        $Throttled.Error | Should -Be 'HTTP 429'
+        $script:Paths.Count | Should -Be 3
+    }
+
+    It 'reads Unknown for an answer that is not JSON' {
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = 'not json' })
+        (Get-RdaInsightsProviderState -SubscriptionId 'sub-a').State | Should -Be 'Unknown'
     }
 }
 
@@ -1135,7 +1190,7 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
     }
 
     It 'keeps the position of every earlier parameter of the scripts it adds parameters to' {
-        $Base = 'd90882f5f871b7c8e0c119de5260afa0059d41ba'
+        $Base = 'a55dc6a94afab2891acb011a7ad4f077e385d0db'
         $HasBase = $null -ne (git -C $script:RepoRoot cat-file -t $Base 2>$null)
         if (-not $HasBase) { Set-ItResult -Skipped -Because 'the base commit is not in this clone' ; return }
         foreach ($File in 'ResourceInventory.ps1', 'Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1', 'Extension/Metrics.ps1')
