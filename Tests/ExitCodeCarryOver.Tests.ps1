@@ -95,6 +95,36 @@ if ((Get-RdaStandInScenario).RemoveRoot -and -not $Global:RdaStandInRootBreakpoi
         }
     }
 }
+# With NarrationFail, the wrapper's "Resources collected" line cannot be
+# written (as when the transcript's folder is gone), after its subscription
+# worked.
+if ((Get-RdaStandInScenario).NarrationFail)
+{
+    function Write-Host
+    {
+        if (([string]$args[0]) -like 'Resources collected:*' -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1')
+        {
+            $script:NarrationBroken = $true
+            throw 'stand-in: the transcript cannot be written'
+        }
+        Microsoft.PowerShell.Utility\Write-Host @args
+    }
+    # With VerboseFail as well (a run with -Verbose), the wrapper's next
+    # verbose line after that failed write cannot be written either.
+    if ((Get-RdaStandInScenario).VerboseFail)
+    {
+        function Write-Verbose
+        {
+            [CmdletBinding()] param([Parameter(Position = 0, ValueFromPipeline = $true)][string]$Message)
+            if ($script:NarrationBroken -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1')
+            {
+                $script:NarrationBroken = $false
+                throw 'stand-in: the transcript cannot be written (verbose)'
+            }
+            Microsoft.PowerShell.Utility\Write-Verbose -Message $Message
+        }
+    }
+}
 function Start-Transcript
 {
     if ((Get-RdaStandInScenario).RemoveRoot -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1') { throw 'stand-in: the transcript cannot start' }
@@ -115,6 +145,9 @@ function Import-AzContext
     if ($null -ne $Worker)
     {
         $Bound = $Worker.InvocationInfo.BoundParameters
+        # ImportFailStream: that stream cannot import the context, so it
+        # does not start.
+        if ([string](Get-RdaStandInScenario).ImportFailStream -eq [string]$Bound['StreamId']) { throw 'stand-in: the context snapshot cannot be imported' }
         $SummaryPath = [string]$Bound['StreamSummaryPath']
         foreach ($Plant in @((Get-RdaStandInScenario).Plant | Where-Object { $null -ne $_ -and [string]$_.Stream -eq [string]$Bound['StreamId'] }))
         {
@@ -139,6 +172,9 @@ function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDevice
 function Get-AzAccessToken
 {
     [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString, $ResourceTypeName)
+    # With ConsumptionTokenFail, the token check before the consumption phase
+    # gets no token, so that phase is skipped for sign-in (the '(auth)' row).
+    if ((Get-RdaStandInScenario).ConsumptionTokenFail -and @(Get-PSCallStack | Where-Object { $_.FunctionName -eq 'Test-DataPlaneAuthReady' }).Count -gt 0) { throw 'stand-in: no token for the consumption phase' }
     $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"stand-in-caller"}')).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $Tenant = if ($TenantId) { [string]$TenantId } else { (Get-RdaStandInScenario).Tenant }
     [pscustomobject]@{ Token = ('e30.{0}.c2ln' -f $Claims); Type = 'Bearer'; ExpiresOn = (Get-Date).AddHours(1); TenantId = $Tenant }
@@ -209,7 +245,10 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
 '@ | Set-Content -LiteralPath (Join-Path $script:Tool 'Services/Networking/StandInCollector.ps1') -Encoding utf8
 
         $script:Modules = Join-Path $script:WorkDir 'modules'
-        foreach ($Module in @(@{ Name = 'Az.Accounts'; Body = $Accounts }, @{ Name = 'Az.Compute'; Body = $Compute }, @{ Name = 'Az.Monitor'; Body = '' }, @{ Name = 'Az.Billing'; Body = '' }))
+        # Az.Billing answers the wrapper's up-front consumption access check
+        # (runs without -SkipConsumption only): access is confirmed.
+        $Billing = 'function Get-UsageAggregates { [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) }'
+        foreach ($Module in @(@{ Name = 'Az.Accounts'; Body = $Accounts }, @{ Name = 'Az.Compute'; Body = $Compute }, @{ Name = 'Az.Monitor'; Body = '' }, @{ Name = 'Az.Billing'; Body = $Billing }))
         {
             $Dir = Join-Path $script:Modules (Join-Path $Module.Name '99.0.0')
             New-Item -ItemType Directory -Path $Dir -Force | Out-Null
@@ -223,7 +262,7 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun)
+            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail)
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             $CaseHome = Join-Path $CaseDir 'home'
             New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
@@ -280,10 +319,12 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
                 $Plant += [pscustomobject]@{ Stream = '0'; Kind = 'Text'; Text = $StreamSummaryJson }
             }
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             $WrapperArgs = @('-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams)
             if ($Resume) { $WrapperArgs += '-Resume' }
+            # VerboseFail runs the wrapper with -Verbose.
+            if ($VerboseFail) { $WrapperArgs += '-Verbose' }
             if ($PriorExitCode -ge 0)
             {
                 $Launcher = Join-Path $CaseDir 'launcher.ps1'
@@ -361,17 +402,20 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
 
         # One pwsh session (`pwsh -Command -`, its lines on stdin, as typed at a
         # prompt) with a fresh home. {Run} in a line becomes the wrapper call
-        # with -ParallelStreams $Streams. Returns the session's exit code and
-        # the lines it printed.
+        # with -ParallelStreams $Streams; {RunConsumption} is the same call
+        # without -SkipConsumption. With -ConsumptionTokenFail the consumption
+        # phase gets no token (see Get-AzAccessToken in the stand-in). Returns
+        # the session's exit code and the lines it printed.
         function script:Invoke-SessionRun
         {
-            param([object[]]$Subs, [string[]]$Lines, [int]$Streams = 2)
+            param([object[]]$Subs, [string[]]$Lines, [int]$Streams = 2, [switch]$ConsumptionTokenFail)
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             $CaseHome = Join-Path $CaseDir 'home'
             New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = '' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = ''; ConsumptionTokenFail = [bool]$ConsumptionTokenFail } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
             $Call = "& '{0}' -TenantID '{1}' -SkipMetrics -SkipConsumption -ParallelStreams {2}" -f ($script:Wrapper -replace "'", "''"), $script:Tenant, $Streams
+            $ConsumptionCall = "& '{0}' -TenantID '{1}' -SkipMetrics -ParallelStreams {2}" -f ($script:Wrapper -replace "'", "''"), $script:Tenant, $Streams
 
             $Info = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh'))
             foreach ($Arg in @('-NoLogo', '-NoProfile', '-Command', '-')) { $Info.ArgumentList.Add($Arg) }
@@ -386,7 +430,7 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
             $Info.Environment['NO_COLOR'] = '1'
             $Info.Environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
             $Proc = [System.Diagnostics.Process]::Start($Info)
-            foreach ($Line in $Lines) { $Proc.StandardInput.WriteLine($Line.Replace('{Run}', $Call)) }
+            foreach ($Line in $Lines) { $Proc.StandardInput.WriteLine($Line.Replace('{RunConsumption}', $ConsumptionCall).Replace('{Run}', $Call)) }
             $Proc.StandardInput.Close()
             $Out = $Proc.StandardOutput.ReadToEndAsync()
             $Err = $Proc.StandardError.ReadToEndAsync()
@@ -564,6 +608,28 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
+    It 'two streams with -Resume: a stream that cannot start names as failed only the subscriptions it would have run, not those its resume file lists as done' {
+        # Stream-0 holds Sub A then Sub C; its resume file says Sub A is done.
+        # Its context import fails, so it runs nothing.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -ImportFailStream '0'
+        $Run.Console | Should -Match '\[stream-0\] FATAL: could not import Az context' -Because $Run.Console
+        $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^Subscriptions Failed:\s+1 \(Sub C \(stream-0: stream did not start: Az context import failed\)\)\s*$' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^Subscriptions Skipped:\s+1 \(already completed\)' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^Subscriptions Processed: 2\s*$' -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        $Run.RunSummary | Should -Match ('(?m)^  - {0} \({1}\)\s*$' -f [regex]::Escape($script:SubC.Name), [regex]::Escape($script:SubC.Id)) -Because $Run.RunSummary
+        $Run.RunSummary | Should -Not -Match ([regex]::Escape($script:SubA.Id)) -Because 'Sub A was done in an earlier run and was not run or failed this time'
+        $Run.MainSummary | Should -Not -Match ([regex]::Escape($script:SubA.Name)) -Because 'Sub A did not fail this run'
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams without -Resume: a stream that cannot start names every subscription of its slice as failed' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -ImportFailStream '0'
+        $Run.Console | Should -Match '(?m)^Subscriptions Failed:\s+2 \(Sub A \(stream-0: .+\), Sub C \(stream-0: .+\)\)\s*$' -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
     It 'two streams: the zips of a stream whose summary could not be read do not hide the missing zip of a subscription that reported success' {
         # Stream-0 (Sub A, Sub C) writes two zips but its summary cannot be
         # read; stream 1 runs Sub B (one zip) but reports Sub X too, which has
@@ -621,6 +687,34 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
+    It '<Case>: a console line that cannot be written after a subscription worked does not make it failed' -ForEach @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'one subscription with -ParallelStreams'; Streams = 2 }
+    ) {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA) -Streams $Streams -NarrationFail
+        $Run.Console | Should -Not -Match 'ERROR processing subscription' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
+        $Run.Console | Should -Match 'Per-subscription output verification: OK' -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0 -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+    }
+
+    It '<Case> with -Verbose: the note about that failed line cannot make the subscription failed either' -ForEach @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'one subscription with -ParallelStreams'; Streams = 2 }
+    ) {
+        # The verbose note the guard writes about the failed line cannot be
+        # written either (the same broken transcript).
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA) -Streams $Streams -NarrationFail -VerboseFail
+        $Run.Console | Should -Not -Match 'ERROR processing subscription' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
+        $Run.Console | Should -Match 'Per-subscription output verification: OK' -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0 -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+    }
+
     It 'two streams: the verification-gap stop does not count a stream with no summary file as a failed subscription' {
         # Stream 1 (Sub B) reports Sub B and four more subscriptions that
         # worked, with no zip named, so the run stops at the output
@@ -669,6 +763,23 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
+    It 'two streams: a stream summary whose success row has <Case> is not confirmed' -ForEach @(
+        @{ Case = 'a Zip that is not a path'; Row = '"Count":1,"Zip":"{Reports}/bad\u0000name.zip"' }
+        @{ Case = 'a Count below 0'; Row = '"Count":-1' }
+        @{ Case = 'a Count that is not a whole number'; Row = '"Count":1.5' }
+        @{ Case = 'a Count that is text'; Row = '"Count":"many"' }
+    ) {
+        # Stream 0 runs Sub A, and its summary names Sub A with this row.
+        $Json = ('{{"StreamId":"0","Status":"ok","ResourceCounts":[{{"Name":"Sub A","Id":"{0}",{1}}}],"Failed":[]}}' -f $script:SubA.Id, $Row)
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamSummaryJson $Json
+        $Run.Console | Should -Match '\[stream-0\] ERROR: summary file .+ is not this run''s summary of stream 0: 1 of its success row\(s\) have a Count that is not a whole number of 0 or more, or a Zip that is not a path' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.')) -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        $Run.StateKept | Should -BeTrue -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
     It 'two streams with -Resume: a summary that names another stream is not confirmed, though the stream had nothing left to run' {
         # Stream 0 holds Sub A and Sub C, both done in an earlier run.
         $Wrong = '{"StreamId":"1","Status":"ok","ResourceCounts":[],"Failed":[]}'
@@ -692,14 +803,15 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
-    It 'two streams: an old stream summary the wrapper cannot remove stops the run before any stream starts' {
+    It 'two streams: an old stream summary the wrapper cannot remove stops the run with exit 1 before any stream starts' {
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamSummaryFolderBeforeRun
         $Run.Console | Should -Match 'ERROR: could not remove the old stream summary .+\.rda-stream-0-summary\.json' -Because $Run.Console
         $Run.Console | Should -Match 'Remove it by hand, then run again\.' -Because $Run.Console
-        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: an old stream summary could not be removed; no subscription was collected and no consolidated zip was made.')) -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 1: an old stream summary could not be removed; no subscription was collected and no consolidated zip was made.')) -Because $Run.Console
         $Run.Console | Should -Not -Match 'queued:' -Because 'no stream may start while its old summary is still there'
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
-        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        # A setup stop before anything is collected: exit 1, not 2.
+        $Run.ExitCode | Should -Be 1 -Because $Run.Console
     }
 
     It 'sequential: a non-zero $LASTEXITCODE left in the session before the run fails no subscription' {
@@ -752,6 +864,32 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         )
         $Session.Console | Should -Match 'Required Az submodule\(s\) not found'
         $Session.After | Should -Be @('after1: 1', 'after2: 0') -Because $Session.Console
+        $Session.Open | Should -BeTrue
+    }
+
+    It 'inside a PowerShell session: after a run whose consumption was skipped for sign-in, the next clean run reads 0 and names no consumption failure or count' {
+        # The first run's consumption phase gets no token, so it records the
+        # '(auth)' row and ends with exit 3. The record count it leaves is set
+        # by hand to 7, as a run that collected 7 records leaves it (the
+        # stand-in returns no usage rows). The second run skips consumption.
+        $Session = Invoke-SessionRun -Subs @($script:SubA) -Streams 1 -ConsumptionTokenFail -Lines @(
+            '{RunConsumption}'
+            '"after1: $LASTEXITCODE"'
+            '$Global:ConsumptionRecordCount = 7'
+            '"=== second run ==="'
+            '{Run}'
+            '"after2: $LASTEXITCODE"'
+            '"session still open"'
+            'exit 0'
+        )
+        $First, $Second = $Session.Console -split '=== second run ===', 2
+        $First | Should -Match 'Consumption: SKIPPED' -Because $Session.Console
+        $First | Should -Match 'Consumption Failures:' -Because $Session.Console
+        $Second | Should -Match 'Completed subscription: Sub A' -Because $Session.Console
+        $Second | Should -Not -Match 'Consumption Failures:' -Because 'the first run''s consumption failure is not this run''s'
+        $Second | Should -Not -Match 'Consumption Records:' -Because 'the first run''s record count is not this run''s'
+        $Second | Should -Not -Match 'FAILED \(auth\)' -Because $Second
+        $Session.After | Should -Be @('after1: 3', 'after2: 0') -Because $Session.Console
         $Session.Open | Should -BeTrue
     }
 
