@@ -284,10 +284,12 @@ function Get-RdaInsightsRegisterCommand
 
 # The registration state of Microsoft.Insights on one subscription:
 # 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
-# when the state could not be read (the error is in Error).
+# when the state could not be read (the error is in Error). With
+# $TimeoutSeconds above 0, each GET runs as a job and is given up after that
+# many seconds (a GET that stalls reads as Unknown); 0 waits for the answer.
 function Get-RdaInsightsProviderState
 {
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3)
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3, [double]$TimeoutSeconds = 0)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     # One ARM GET, sent again at most $MaxRetries times (1, 2, 4 s apart) after a
@@ -299,7 +301,29 @@ function Get-RdaInsightsProviderState
         if ($Attempt -gt 0) { Start-Sleep -Seconds ([math]::Min([math]::Pow(2, $Attempt - 1), 4)) }
         try
         {
-            $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+            if ($TimeoutSeconds -gt 0)
+            {
+                $Job = Invoke-AzRestMethod -Method GET -Path $Path -AsJob -ErrorAction Stop
+                try
+                {
+                    if (-not $Job.Finished.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)))
+                    {
+                        $LastError = 'Timed out after {0:0.#} s' -f $TimeoutSeconds
+                        continue
+                    }
+                    $Response = Receive-Job -Job $Job -ErrorAction Stop
+                }
+                finally
+                {
+                    # A job that is still running is stopped, so nothing is left behind.
+                    Stop-Job -Job $Job -ErrorAction SilentlyContinue
+                    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else
+            {
+                $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+            }
         }
         catch
         {
@@ -345,7 +369,8 @@ function Register-RdaInsightsProvider
 
 # The preflight. Reads every subscription's state, asks once for those not
 # registered, registers on "y" and waits for them on one deadline. Returns
-# { Registered; NotRegistered; Asked; Answer }: Registered holds the ids that
+# { Registered; NotRegistered; Asked; Answer } (Asked: the question was shown
+# and answered): Registered holds the ids that
 # batch may use (registered, or whose state could not be read, so the batch
 # call decides and falls back on its own), NotRegistered the ids that stay on
 # the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds and
@@ -363,6 +388,13 @@ function Invoke-RdaInsightsProviderPreflight
     $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
     $Result = [pscustomobject]@{ Registered = [System.Collections.Generic.List[string]]::new(); NotRegistered = [System.Collections.Generic.List[string]]::new(); Asked = $false; Answer = $null }
     if ($Ids.Count -eq 0) { return $Result }
+    # Metrics.ps1 batches only in AzureCloud; elsewhere there is nothing to check, ask or register.
+    $Environment = try { [string](Get-AzContext -ErrorAction Stop).Environment.Name } catch { '' }
+    if ($Environment -ne 'AzureCloud')
+    {
+        Write-Host ('-UseMetricsBatch: the Azure environment is ''{0}'', not AzureCloud; the batch API is not used there, so Microsoft.Insights is not checked.' -f $Environment) -ForegroundColor DarkGray
+        return $Result
+    }
     if ($null -eq $Interactive) { $Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected }
 
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
@@ -412,10 +444,9 @@ function Invoke-RdaInsightsProviderPreflight
         foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
         if ($Interactive)
         {
-            $Result.Asked = $true
             # Under pwsh -NonInteractive with a terminal attached, Read-Host writes an
             # error instead of asking. With errors stopping here, that is caught and
-            # read as "no one can answer".
+            # read as "no one can answer", and Asked stays false.
             $SavedPreference = $ErrorActionPreference
             $ErrorActionPreference = 'Stop'
             try
@@ -431,6 +462,7 @@ function Invoke-RdaInsightsProviderPreflight
             {
                 $ErrorActionPreference = $SavedPreference
             }
+            $Result.Asked = $Answered
             $Result.Answer = $Answer
         }
     }
@@ -469,12 +501,14 @@ function Invoke-RdaInsightsProviderPreflight
     $Deadline = (Get-Date).AddSeconds([math]::Max(0, $DeadlineSeconds))
     # Every read checks the time first, so the wait ends at the deadline however many
     # subscriptions there are; a read while waiting is not retried (a failed one means
-    # not registered yet).
+    # not registered yet), and is given up when the time left runs out, so one GET
+    # that stalls cannot hold the wait past the deadline.
     while ($Waiting.Count -gt 0 -and (Get-Date) -lt $Deadline)
     {
         for ($Idx = $Waiting.Count - 1; $Idx -ge 0 -and (Get-Date) -lt $Deadline; $Idx--)
         {
-            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0).State -eq 'Registered')
+            $ReadLeft = [math]::Max(0.001, ($Deadline - (Get-Date)).TotalSeconds)
+            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0 -TimeoutSeconds $ReadLeft).State -eq 'Registered')
             {
                 Write-Host ('  Microsoft.Insights is now registered on subscription {0}.' -f $Waiting[$Idx]) -ForegroundColor Green
                 $Result.Registered.Add($Waiting[$Idx])

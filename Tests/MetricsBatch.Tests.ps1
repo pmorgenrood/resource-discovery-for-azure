@@ -246,7 +246,7 @@ Export-ModuleMember -Function Get-AzMetric
     $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
     function Invoke-AzRestMethod
     {
-        param([string]$Method, [string]$Path, [string]$Payload)
+        param([string]$Method, [string]$Path, [string]$Payload, [switch]$AsJob)
         $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path })
         $Sub = ($Path -split '/')[2]
         $State = if ($Global:RdaTestBatchProviderStates.ContainsKey($Sub)) { $Global:RdaTestBatchProviderStates[$Sub] } else { 'Registered' }
@@ -483,6 +483,17 @@ Describe 'Metrics.ps1 batch work items' {
         $Items = New-MetricBatchPlan -MetricGroups $Groups -AllowedSubscriptionIds @($script:SubscriptionId)
 
         @($Items[0].MetricNames) | Should -Be @('cpu_percent')
+    }
+
+    It 'waits what Retry-After asks before a throttled batch request is sent again, up to 120 s' {
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 90 | Should -Be 90
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 120 | Should -Be 120
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 600 | Should -Be 120
+        # No Retry-After: twice the plain wait.
+        Get-MetricBatchBackoff -Attempt 2 -Kind 'Throttled' | Should -Be 8
+        # Not throttled: 1, 2, 4 ... s, at most 30; Retry-After is not read.
+        Get-MetricBatchBackoff -Attempt 1 -Kind 'Error' -RetryAfter 90 | Should -Be 2
+        Get-MetricBatchBackoff -Attempt 6 -Kind 'Error' | Should -Be 30
     }
 
     It 'keeps the per-resource path for what it cannot express or may not batch' {
@@ -889,6 +900,37 @@ $null = & (Join-Path $RepoRoot 'Extension/Metrics.ps1') -Subscriptions @([pscust
         @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt\(s\) \(Timed out after 2s\)' }).Count | Should -Be 1
     }
 
+    It 'hands every metric of a batch request that stops part way to the per-resource path' {
+        # A stand-in Start-ThreadJob, found first by the parallel runspaces, throws for every
+        # batch request (an error outside the guarded request) and passes every other call on.
+        $Real = (Get-Command -Name 'Start-ThreadJob' -CommandType Cmdlet | Select-Object -First 1).ModuleName
+        $FakeDir = Join-Path $script:ModuleRoot 'RdaTestStopBatch'
+        New-Item -ItemType Directory -Path $FakeDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $FakeDir 'RdaTestStopBatch.psm1') -Encoding utf8 -Value (@'
+function Start-ThreadJob
+{
+    [CmdletBinding()]
+    param([scriptblock]$ScriptBlock, [object[]]$ArgumentList, [int]$ThrottleLimit)
+    $First = if ($ArgumentList) { $ArgumentList[0] }
+    if ($First -is [hashtable] -and [string]$First['Uri'] -match 'metrics:getBatch') { throw 'stopped by the test' }
+    REAL\Start-ThreadJob @PSBoundParameters
+}
+Export-ModuleMember -Function Start-ThreadJob
+'@).Replace('REAL', $Real)
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-unit-stops' -Batch
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $FakeDir -Recurse -Force
+        }
+
+        $Run.Posts.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'stopped \(stopped by the test\)' }).Count | Should -BeGreaterThan 0
+    }
+
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {
         $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
         $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-400'
@@ -1069,6 +1111,16 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         Should -Invoke Write-Host -ParameterFilter { $Object -like '*No one can answer a prompt*' } -Times 1 -Exactly
     }
 
+    It 'says it asked only when the question was shown and answered' {
+        $Failed = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) Write-Error 'PowerShell is in NonInteractive mode. Read and Prompt functionality is not available.' }
+        $Failed.Asked | Should -BeFalse
+        $Failed.Answer | Should -BeNullOrEmpty
+
+        $Shown = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'n' }
+        $Shown.Asked | Should -BeTrue
+        $Shown.Answer | Should -Be 'n'
+    }
+
     It 'waits for a subscription already being registered, without asking' {
         $script:States['sub-b'] = 'Registering'
         $script:Reads = 0
@@ -1080,12 +1132,56 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         @($Result.Registered) | Should -Be @('sub-b')
     }
 
+    It 'reads, asks and registers nothing outside AzureCloud, where the batch API is not used' {
+        foreach ($Cloud in 'AzureChinaCloud', 'AzureUSGovernment', $null)
+        {
+            Mock Get-AzContext { if ($Cloud) { [pscustomobject]@{ Environment = [pscustomobject]@{ Name = $Cloud } } } }
+            $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+            $Result.NotRegistered.Count | Should -Be 0 -Because $Cloud
+            $Result.Registered.Count | Should -Be 0 -Because $Cloud
+        }
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Get-RdaInsightsProviderState -Times 0 -Exactly
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*not AzureCloud*Microsoft.Insights is not checked*' } -Times 3 -Exactly
+    }
+
     It 'lets the batch call decide for a subscription whose state cannot be read' {
         $script:States['sub-b'] = 'Unknown'
         $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
 
         $script:Prompts.Count | Should -Be 0
         @($Result.Registered) | Should -Be @('sub-b')
+    }
+}
+
+Describe 'The registration wait when one state read stalls' {
+
+    It 'ends at the deadline and keeps the subscription per call' {
+        $script:Answered = $false
+        $script:WaitReads = 0
+        Mock Write-Host { }
+        Mock Register-RdaInsightsProvider { $null }
+        Mock Invoke-AzRestMethod {
+            if (-not $script:Answered) { return [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' } }
+            # Every read while waiting stalls far past the deadline.
+            $script:WaitReads++
+            if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+            [System.Threading.Thread]::Sleep(6000)
+            [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registering"}' }
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Answered = $true; 'y' } -DeadlineSeconds 2 -PollSeconds 10
+        $Clock.Stop()
+
+        $script:WaitReads | Should -BeGreaterOrEqual 1
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3.5
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        $Result.Registered.Count | Should -Be 0
+        # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
     }
 }
 
@@ -1237,6 +1333,13 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
             $New = & $Positional (Get-Content -LiteralPath (Join-Path $script:RepoRoot $File) -Raw)
             @($New | Select-Object -First $Old.Count) | Should -Be $Old -Because $File
         }
+    }
+
+    It 'says in the README what a 403 and a 401 do, as the code does' {
+        $Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
+        $Readme | Should -Not -Match ([regex]::Escape('401/403, batch is turned off for that subscription'))
+        $Readme | Should -Match 'answers 403: batch is turned off for that subscription'
+        $Readme | Should -Match 'A 401 \(token refused\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
     }
 
     It 'runs the preflight only under -UseMetricsBatch' {
