@@ -315,9 +315,11 @@ function Write-RdaShareableDiagnosticsLog
         # line. Filtering nulls yields a genuine "0" when there were none.
         $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ })
         # Metrics skipped for the sign-in, and metrics left incomplete because Azure
-        # Monitor kept failing (Complete = $false), each with its own count.
-        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) })
-        $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
+        # Monitor kept failing, each with its own count. An entry is incomplete when
+        # it has a Complete property equal to $false; it is told apart here so this
+        # library needs no other file.
+        $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
+        $MetricsIncomplete = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
         $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()

@@ -23,9 +23,6 @@ BeforeAll {
     $FunctionsFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/AllSubHtmlSummary.Functions.ps1'
     if (-not (Test-Path $FunctionsFile)) { throw "AllSubHtmlSummary.Functions.ps1 not found at $FunctionsFile" }
     . $FunctionsFile
-    # The wrapper loads Common before it passes metrics entries: their two kinds
-    # are told apart by Test-MetricsIncompleteEntry there.
-    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
 
     $script:TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('AllSubHtmlSummaryTest_' + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $script:TmpRoot -Force | Out-Null

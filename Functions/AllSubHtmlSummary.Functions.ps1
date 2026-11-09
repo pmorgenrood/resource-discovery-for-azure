@@ -320,13 +320,12 @@ function New-RdaAllSubHtmlSummary
     $FailedList = @(@($FailedSubscriptions) | Where-Object { $_ })
     $ConsumpList = @(@($ConsumptionFailedSubs) | Where-Object { $_ -and $_.Id -ne '(auth)' })
     # Metrics skipped for the sign-in, and metrics left incomplete because Azure
-    # Monitor kept failing (Complete = $false), each with its own banner and count.
-    # The two are told apart by Functions/Common.Functions.ps1, which the wrapper
-    # (the caller that passes metrics entries) has loaded; with no entries it is
-    # not needed, as for Build-MainSummaryFromZip.ps1.
+    # Monitor kept failing, each with its own banner and count. An entry is
+    # incomplete when it has a Complete property equal to $false; it is told
+    # apart here so this library needs no other file.
     $MetricsEntries = @(@($MetricsFailedSubs) | Where-Object { $_ })
-    $MetricsList = @($MetricsEntries | Where-Object { -not (Test-MetricsIncompleteEntry -Entry $_) })
-    $MetricsIncompleteList = if ($MetricsEntries.Count -gt 0) { @(Get-MetricsIncompleteEntries -Entries $MetricsEntries) } else { @() }
+    $MetricsList = @($MetricsEntries | Where-Object { -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
+    $MetricsIncompleteList = @($MetricsEntries | Where-Object { $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
 
     $Banners = New-Object System.Text.StringBuilder

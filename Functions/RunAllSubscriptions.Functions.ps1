@@ -960,9 +960,11 @@ function Get-RunSummaryLogContent
     $Failed = @(@($FailedSubscriptions) | Where-Object { $null -ne $_ })
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     # Metrics skipped for the sign-in, and metrics left incomplete because Azure
-    # Monitor kept failing (Complete = $false), each with its own count.
-    $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) })
-    $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $MetricsFailedSubs)
+    # Monitor kept failing, each with its own count. An entry is incomplete when
+    # it has a Complete property equal to $false; it is told apart here so this
+    # library needs no other file.
+    $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ -and -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
+    $MetricsIncomplete = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
