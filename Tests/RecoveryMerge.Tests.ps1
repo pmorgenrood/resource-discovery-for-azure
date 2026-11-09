@@ -59,12 +59,20 @@ BeforeAll {
     # Masked disk records shaped as the output contract says
     # (/subscriptions/<prod_ token>/resourcegroups/<prod_ token>/providers/microsoft.compute/disks/<prod_ token>),
     # with the dictionary a masked run writes for them (token -> real value).
-    function Get-MaskedBundleData([int]$Count = 3)
+    # With -Seed (an earlier result), the new records reuse its subscription and
+    # resource group tokens and the dictionary also holds every seed entry, as a
+    # run seeded with -ObfuscationDictionary writes it.
+    function Get-MaskedBundleData([int]$Count = 3, $Seed)
     {
-        $Sub = 'prod_' + [guid]::NewGuid().ToString()
-        $Rg = 'prod_' + [guid]::NewGuid().ToString()
+        $Sub = if ($Seed) { $Seed.Sub } else { 'prod_' + [guid]::NewGuid().ToString() }
+        $Rg = if ($Seed) { $Seed.Rg } else { 'prod_' + [guid]::NewGuid().ToString() }
         $Records = @()
         $IdMap = [ordered]@{}; $NameMap = [ordered]@{}
+        if ($Seed)
+        {
+            foreach ($K in $Seed.Dictionary.ResourceIdMap.Keys) { $IdMap[$K] = $Seed.Dictionary.ResourceIdMap[$K] }
+            foreach ($K in $Seed.Dictionary.ResourceNameMap.Keys) { $NameMap[$K] = $Seed.Dictionary.ResourceNameMap[$K] }
+        }
         for ($i = 0; $i -lt $Count; $i++)
         {
             $Name = 'prod_' + [guid]::NewGuid().ToString()
@@ -74,6 +82,8 @@ BeforeAll {
             $NameMap[$Name] = 'disk' + $i
         }
         [pscustomobject]@{
+            Sub        = $Sub
+            Rg         = $Rg
             Records    = $Records
             Dictionary = [ordered]@{
                 GeneratedAt      = '2026-01-01 00:00:00'
@@ -82,6 +92,29 @@ BeforeAll {
                 SubscriptionMap  = [ordered]@{ $Sub = $script:DocsGuid }
                 ResourceGroupMap = [ordered]@{ $Rg = 'rg-app' }
             }
+        }
+    }
+
+    # One metric record with the fields and value types Extension/Metrics.ps1 writes.
+    function New-MetricRecord([string]$Id = '/id', [string]$Name = 'vm01', $Series = $null)
+    {
+        [ordered]@{
+            ID               = $Id
+            Subscription     = 'prod_sub'
+            ResourceGroup    = 'rg-app'
+            Name             = $Name
+            Location         = 'eastus'
+            Service          = 'VirtualMachines'
+            Metric           = 'Percentage CPU'
+            MetricAggregate  = 'Average'
+            MetricTimeGrain  = '01:00:00'
+            MetricMeasure    = 'Average'
+            MetricPercentile = 12.5
+            MetricValue      = 7.25
+            MetricCount      = 24
+            MetricTotalCount = 24
+            MetricSeries     = $Series
+            MetricError      = $false
         }
     }
 
@@ -683,9 +716,9 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         # a seeded recovery that then finds resources shares no token with it, and no re-run can change that.
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; SubscriptionMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' } }
         if ($null -ne $GapIdMap) { $GapDict['ResourceIdMap'] = $GapIdMap }
-        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recNew' = '/id/new' }; SubscriptionMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' } }
+        $RecMasked = Get-MaskedBundleData -Count 1
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @() }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $RecMasked.Records }) -Dictionary $RecMasked.Dictionary
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
 
@@ -762,6 +795,79 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse
     }
 
+    It 'stops when a bundle beside a dictionary that is not empty gives the merge plain data (<Case>)' -ForEach @(
+        @{ Case = 'plain recovery inventory next to a seeded dictionary'; Plain = 'recovery'; Give = 'inventory' },
+        @{ Case = 'one plain record among masked recovery records'; Plain = 'recovery'; Give = 'mixed' },
+        @{ Case = 'plain gap inventory next to a dictionary'; Plain = 'gap'; Give = 'inventory' },
+        @{ Case = 'plain consumption rows from the masked recovery'; Plain = 'recovery'; Give = 'consumption' },
+        @{ Case = 'plain consumption rows carried from the masked gap'; Plain = 'gap'; Give = 'consumption' },
+        @{ Case = 'plain metrics from the masked recovery'; Plain = 'recovery'; Give = 'metrics' }
+    ) {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $RealId = '/subscriptions/{0}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk-real' -f $script:DocsGuid
+        $PlainCsv = "$script:CsvHeader`n{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$RealId,eastus,,,"
+        $GapInventory = [ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }
+        $RecInventory = [ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }
+        $GapSplat = @{ Dir = $C.Gap; Base = $script:GapBase; Dictionary = $Masked.Dictionary }
+        $RecSplat = @{ Dir = $C.Recovery; Base = $script:RecBase; Dictionary = $Seeded.Dictionary }
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        switch ($Give)
+        {
+            'inventory' { if ($Plain -eq 'gap') { $GapInventory['VirtualMachines'] = @((New-Record 'vm-real')) } else { $RecInventory['AppServices'] = @((New-Record 'app-real')) } }
+            'mixed' { $RecInventory['AppServices'] = @($Seeded.Records) + @((New-Record 'app-real')) }
+            'consumption'
+            {
+                if ($Plain -eq 'gap') { $GapSplat.ConsumptionCsv = $PlainCsv } else { $RecSplat.ConsumptionCsv = $PlainCsv; $Splat.RecoverConsumption = $true }
+            }
+            'metrics'
+            {
+                $RecSplat.MetricsFiles = @{ '__0' = (@{ Metrics = @((New-MetricRecord -Id $RealId)) } | ConvertTo-Json -Depth 5 -Compress) }
+                $Splat.RecoverMetrics = $true
+            }
+        }
+        New-Bundle @GapSplat -Inventory $GapInventory
+        New-Bundle @RecSplat -Inventory $RecInventory
+
+        $Message = $null
+        try { $null = Merge-RecoveryData @Splat } catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike "*masked merge, but in the $Plain bundle*not masked*real names and ids would ship inside a masked bundle*Nothing was written*"
+        $Message | Should -Not -BeLike '*disk-real*' -Because 'the error names the file and record, never the real value'
+        $Message | Should -Not -BeLike '*-real*'
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'the stop comes before anything is written'
+    }
+
+    It 'merges a masked bundle whose ids take every shape the masked run writes' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $G = { [guid]::NewGuid().ToString() }
+        # Shapes the masked run writes: an inventory id, a consumption-only path
+        # with sub_/rg_mc_ hinted tokens and a child name, a '$system' name, a
+        # flat token, 'obfuscated', and an empty ResourceId that downstream drops.
+        $Rows = @(
+            $Masked.Records[0].ID,
+            ('/subscriptions/prod_sub_{0}/resourcegroups/nonprod_rg_mc_{1}/providers/microsoft.compute/virtualmachinescalesets/prod_vmss_{2}/virtualmachines/prod_{3}' -f (& $G), (& $G), (& $G), (& $G)),
+            ('/subscriptions/{0}/resourcegroups/{1}/providers/microsoft.sql/servers/prod_{2}/databases/$system' -f $Masked.Sub, $Masked.Rg, (& $G)),
+            ('prod_{0}' -f (& $G)),
+            'obfuscated',
+            ''
+        ) | ForEach-Object { "{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$_,eastus,,," }
+        $Csv = (@($script:CsvHeader) + $Rows) -join "`n"
+        $Metrics = @{ Metrics = @((New-MetricRecord -Id $Seeded.Records[0].ID), (New-MetricRecord -Id ('obfuscated_' + (& $G)))) } | ConvertTo-Json -Depth 5 -Compress
+        $RecRecords = @($Seeded.Records) + @([ordered]@{ Name = 'obfuscated_x'; ID = ('obfuscated_' + (& $G)) })
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $RecRecords }) -MetricsFiles @{ '__0' = $Metrics } -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash |
+            Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase))).Hash
+    }
+
     It 'merges a masked recovery into a masked gap whose ResourceIdMap is empty and that gives no resource' {
         $C = New-Case
         $RecMasked = Get-MaskedBundleData -Count 3
@@ -790,8 +896,8 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
     It 'leaves an existing output folder untouched when it stops' {
         $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        $Masked = Get-MaskedBundleData -Count 3
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $Masked.Records }) -Dictionary $Masked.Dictionary
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
         New-Item -ItemType Directory -Path $C.Output -Force | Out-Null
 
@@ -802,14 +908,14 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
     It 'merges cleanly on the next run once the recovery is re-run seeded with the gap dictionary' {
         $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
+        $Masked = Get-MaskedBundleData -Count 3
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $Masked.Records }) -Dictionary $Masked.Dictionary
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } | Should -Throw
 
-        # The way out: the seeded recovery re-run writes its dictionary, and the same merge command now passes.
-        $SeededDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap'; 'prod_recNew' = '/id/new' } }
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $SeededDict
+        # The way out: the seeded recovery re-run writes masked records and its dictionary, and the same merge command now passes.
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
 
         @($Result.Warnings).Count | Should -Be 0
@@ -821,10 +927,10 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
     It 'merges with no stop and no token warning when the dictionaries share ResourceIdMap tokens (seeded recovery)' {
         $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared' } }
-        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared'; 'prod_recNew' = '/id/new' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
 
         { $script:SeededResult = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
             Should -Not -Throw -Because 'a recovery seeded with the gap dictionary shares its tokens, so the shared-token check passes'
@@ -935,7 +1041,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
             }
         }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory $GapInv -Dictionary $GoodDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $GoodDict
+        # The recovery re-collected the same machines, seeded with the same dictionary.
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory $GapInv -Dictionary $GoodDict
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
             Should -Not -Throw
@@ -955,7 +1062,7 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
         # Only 1 of 4 tokens present -> 25% coverage -> warn, not throw.
         $PartialDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_11111111-1111-1111-1111-111111111111' = '/id/1' } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory $GapInv -Dictionary $PartialDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $PartialDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory $GapInv -Dictionary $PartialDict
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
 
@@ -964,11 +1071,10 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
 
     It 'reports no warnings for a clean, dictionary-compatible, same-window merge' {
         $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared' } }
-        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared' } }
-        $Csv = "$script:CsvHeader`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,"
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv -Dictionary $RecDict
+        $Masked = Get-MaskedBundleData -Count 3
+        $Csv = "$script:CsvHeader`n{},Storage,m1,MET,eastus,disk,1,Hours,2026-01-01,2026-01-02,$($Masked.Records[0].ID),eastus,,,"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
 
@@ -980,19 +1086,17 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
 
     It 'merges the obfuscation dictionaries as a union and returns its path' {
         $C = New-Case
-        $GapDict = [ordered]@{
-            GeneratedAt         = '2026-01-01 00:00:00'
-            ResourceIdMap       = [ordered]@{ 'prod_tokA' = '/id/a' }
-            SubscriptionNameMap = [ordered]@{ 'prod_subtok' = 'Gap Sub' }
-        }
-        # Seeded recovery: it shares the gap's token and adds one of its own.
-        $RecDict = [ordered]@{
-            GeneratedAt   = '2026-01-02 00:00:00'
-            ResourceIdMap = [ordered]@{ 'prod_tokA' = '/id/a'; 'prod_tokB' = '/id/b' }
-            TagMap        = [ordered]@{ 'prod_tagtok' = 'payments' }
-        }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $RecDict
+        $Masked = Get-MaskedBundleData -Count 1
+        $GapDict = $Masked.Dictionary
+        $GapDict.ResourceIdMap['prod_tokA'] = '/id/a'
+        $GapDict['SubscriptionNameMap'] = [ordered]@{ 'prod_subtok' = 'Gap Sub' }
+        # Seeded recovery: it shares the gap's tokens and adds its own.
+        $Seeded = Get-MaskedBundleData -Count 1 -Seed $Masked
+        $RecDict = $Seeded.Dictionary
+        $RecDict.ResourceIdMap['prod_tokB'] = '/id/b'
+        $RecDict['TagMap'] = [ordered]@{ 'prod_tagtok' = 'payments' }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $Masked.Records }) -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $RecDict
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
 
@@ -1006,9 +1110,10 @@ Describe 'Merge-RecoveryData dictionary merge and packaging' {
 
     It 'never includes the obfuscation dictionary in the output zip' {
         $C = New-Case
-        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_tokA' = '/id/a' } }
-        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $GapDict
-        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $GapDict
+        $Masked = Get-MaskedBundleData -Count 2
+        $Seeded = Get-MaskedBundleData -Count 1 -Seed $Masked
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
 

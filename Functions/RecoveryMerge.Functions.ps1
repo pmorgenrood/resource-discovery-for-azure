@@ -171,6 +171,35 @@ function Merge-RecoveryData
         }
     }
 
+    # -- A masking token as the masked run writes it: prod_ or nonprod_, any
+    #    type hints (sub_, rg_, rg_mc_, aks_, vmss_, databricks_ ...), then a
+    #    GUID. ------------------------------------------------------------------
+    $MergeTokenPattern = '(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $MergeWholeTokenPattern = '(?i)^(?:' + $MergeTokenPattern + ')$'
+    # True when an id is masked the way the masked run writes it: one token,
+    # 'obfuscated' (with or without a GUID; written for an empty or unknown
+    # id), or an ARM path whose subscription, resource group and last name
+    # segment are tokens. Type segments and the literal '$system' name stay as
+    # Azure wrote them.
+    function Test-MergeMaskedId([string]$Value)
+    {
+        if ($Value -match $MergeWholeTokenPattern) { return $true }
+        if ($Value -match '(?i)^obfuscated(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$') { return $true }
+        if ($Value -notmatch '(?i)^/subscriptions/([^/]+)(?:/resourcegroups/([^/]+))?(?:/providers/(.+))?$') { return $false }
+        $IdSub = $Matches[1]; $IdRg = $Matches[2]; $IdProviders = $Matches[3]
+        if ($IdSub -notmatch $MergeWholeTokenPattern) { return $false }
+        if ($IdRg -and $IdRg -notmatch $MergeWholeTokenPattern) { return $false }
+        if ($IdProviders)
+        {
+            # Provider parts are namespace/type/name[/type/name...]; names sit at
+            # the even places from 2 on, and the last one is the resource name.
+            $Parts = $IdProviders.TrimEnd('/') -split '/'
+            $LastNameIndex = if ($Parts.Count -ge 3) { $Parts.Count - 1 - (($Parts.Count - 1) % 2) } else { -1 }
+            if ($LastNameIndex -ge 2 -and $Parts[$LastNameIndex] -ne '$system' -and $Parts[$LastNameIndex] -notmatch $MergeWholeTokenPattern) { return $false }
+        }
+        return $true
+    }
+
     # -- Read an ObfuscationDictionary and check its shape: a JSON object whose
     #    properties, GeneratedAt aside, are token maps (JSON objects or null)
     #    holding plain values. Throws a plain message otherwise, so a broken
@@ -509,6 +538,7 @@ function Merge-RecoveryData
     }
     $MetricsSourceLabel = if ($RecoverMetrics) { 'recovery' } else { 'gap' }
     $SelectedMetricsCount = 0
+    $SelectedMetricRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($MetricsFile in @(if ($RecoverMetrics) { $RecoveryMetricsFiles } else { $GapMetricsFiles }))
     {
         $Problem = $null
@@ -522,7 +552,16 @@ function Merge-RecoveryData
                 if ($MetricsDoc -isnot [System.Management.Automation.PSCustomObject]) { $Problem = 'it is not a JSON object' }
                 elseif ($MetricsDoc.PSObject.Properties.Name -notcontains 'Metrics') { $Problem = 'it has no Metrics list' }
                 elseif ($MetricsDoc.Metrics -isnot [System.Array]) { $Problem = 'its Metrics is not a list' }
-                else { $SelectedMetricsCount += $MetricsDoc.Metrics.Count }
+                else
+                {
+                    $SelectedMetricsCount += $MetricsDoc.Metrics.Count
+                    $MetricIndex = 0
+                    foreach ($MetricRecord in $MetricsDoc.Metrics)
+                    {
+                        $MetricIndex++
+                        $SelectedMetricRecords.Add([PSCustomObject]@{ File = $MetricsFile.Name; Index = $MetricIndex; Record = $MetricRecord })
+                    }
+                }
             }
         }
         catch
@@ -548,11 +587,12 @@ function Merge-RecoveryData
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
         $GapKeptKeys = @($GapInventory.PSObject.Properties.Name | Where-Object { $_ -ne 'Version' -and $_ -notin $MergeKeys })
-        $ConsumptionHasRows = $false
+        $ConsumptionRows = @()
         if ($ConsumptionSourceFile)
         {
-            $ConsumptionHasRows = (@(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop | Select-Object -First 1).Count -gt 0)
+            $ConsumptionRows = @(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop)
         }
+        $ConsumptionHasRows = ($ConsumptionRows.Count -gt 0)
         foreach ($Side in @(
                 @{ Label = 'gap'; IdKeys = $GapIdKeys; Dict = $GapDictionaryFile; Inventory = $GapInventory; Keys = $GapKeptKeys },
                 @{ Label = 'recovery'; IdKeys = $RecoveryIdKeys; Dict = $RecoveryDictionaryFile; Inventory = $RecoveryInventory; Keys = $MergeKeys }
@@ -568,6 +608,79 @@ function Merge-RecoveryData
             if ($Given.Count -eq 0) { continue }
             $Way = if ($Side.Label -eq 'recovery') { "Re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { "Re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'" -f $RecoveryDictionaryFile.FullName }
             throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' has an empty ResourceIdMap, so that run masked no resource, but the {0} bundle gives this merge {2}. They were not masked with that dictionary, so real names and ids would ship inside a masked bundle. Nothing was written to '{3}'. If that run's own dictionary was moved, put it back in that folder. Otherwise {4} into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at it." -f $Side.Label, $Side.Dict.Name, ($Given -join ', '), $OutputPath, $Way)
+        }
+
+        # -- Guard: plain records in a masked merge. A dictionary whose
+        #    ResourceIdMap is not empty says nothing about the files beside it:
+        #    a plain run written into a folder that still holds an old masked
+        #    run's dictionary gives real names and ids next to that dictionary.
+        #    So every id this merge takes from a side must be masked: an
+        #    inventory record's ID, a consumption row's ResourceId and a
+        #    metric's ID. Masked means what the masked run writes: one token,
+        #    'obfuscated' (with or without a GUID), or an ARM path whose
+        #    subscription, resource group and name segments are tokens. A side
+        #    whose inventory records hold no token at all is plain too. The
+        #    error names the file and the record, never the value. ------------
+        foreach ($Side in @(
+                @{ Label = 'gap'; Inventory = $GapInventory; Keys = $GapKeptKeys; InventoryFile = $GapInventoryFile },
+                @{ Label = 'recovery'; Inventory = $RecoveryInventory; Keys = $MergeKeys; InventoryFile = $RecoveryInventoryFile }
+            ))
+        {
+            $Way = if ($Side.Label -eq 'recovery') { "re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { "re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'" -f $RecoveryDictionaryFile.FullName }
+            $Found = $null
+            $RecordCount = 0
+            $SawMasked = $false
+            foreach ($Key in $Side.Keys)
+            {
+                $Index = 0
+                foreach ($Record in @($Side.Inventory.$Key))
+                {
+                    $Index++
+                    if ($null -eq $Record) { continue }
+                    $RecordCount++
+                    $RecordId = if ($Record -is [System.Management.Automation.PSCustomObject] -and $Record.PSObject.Properties.Name -contains 'ID') { $Record.ID } else { $null }
+                    if ($RecordId -is [string] -and $RecordId.Length -gt 0)
+                    {
+                        if (-not (Test-MergeMaskedId $RecordId)) { $Found = ("record {0} of '{1}' in '{2}' has an ID that is not masked" -f $Index, $Key, $Side.InventoryFile.Name); break }
+                        $SawMasked = $true
+                    }
+                    elseif (-not $SawMasked -and [regex]::IsMatch((ConvertTo-Json -InputObject $Record -Depth 100 -Compress), $MergeTokenPattern, 'IgnoreCase'))
+                    {
+                        $SawMasked = $true
+                    }
+                }
+                if ($null -ne $Found) { break }
+            }
+            if ($null -eq $Found -and $RecordCount -gt 0 -and -not $SawMasked)
+            {
+                $Found = ("its {0} inventory record(s) in '{1}' hold no masked token" -f $RecordCount, $Side.InventoryFile.Name)
+            }
+            if ($null -eq $Found -and $ConsumptionSource -eq $Side.Label -and $ConsumptionSourceFile)
+            {
+                $RowIndex = 0
+                foreach ($Row in $ConsumptionRows)
+                {
+                    $RowIndex++
+                    $RowId = $Row.ResourceId
+                    # A row with an empty ResourceId is dropped downstream and names nothing.
+                    if ([string]::IsNullOrEmpty($RowId)) { continue }
+                    if (-not (Test-MergeMaskedId $RowId)) { $Found = ("row {0} of the consumption file '{1}' has a ResourceId that is not masked" -f $RowIndex, $ConsumptionSourceFile.Name); break }
+                }
+            }
+            if ($null -eq $Found -and $MetricsSourceLabel -eq $Side.Label)
+            {
+                foreach ($MetricEntry in $SelectedMetricRecords)
+                {
+                    $MetricId = if ($MetricEntry.Record -is [System.Management.Automation.PSCustomObject] -and $MetricEntry.Record.PSObject.Properties.Name -contains 'ID') { $MetricEntry.Record.ID } else { $null }
+                    if ($MetricId -is [string] -and $MetricId.Length -gt 0 -and -not (Test-MergeMaskedId $MetricId))
+                    {
+                        $Found = ("metric {0} of '{1}' has an ID that is not masked" -f $MetricEntry.Index, $MetricEntry.File)
+                        break
+                    }
+                }
+            }
+            if ($null -eq $Found) { continue }
+            throw ("Merge-RecoveryData: both bundles have a dictionary, so this is a masked merge, but in the {0} bundle {1}. That run was not masked, so real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. If that folder holds a plain run next to an old masked run's dictionary, {3} into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at it." -f $Side.Label, $Found, $OutputPath, $Way)
         }
     }
 
