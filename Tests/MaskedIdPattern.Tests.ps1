@@ -70,3 +70,25 @@ Describe 'Get-MaskedIdPattern' {
         $Masked | Should -Not -Match $script:ScopePattern
     }
 }
+
+Describe 'Get-ObfuscatedRunIdPattern' {
+    BeforeAll { $script:RunPattern = Get-ObfuscatedRunIdPattern }
+
+    It 'marks a run obfuscated by <Label>' -ForEach @(
+        @{ Label = 'a masked resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}' }
+        @{ Label = 'a flat token'; Id = '{T}' }
+        @{ Label = 'a tenant-scope reservation id'; Id = '/providers/microsoft.capacity/reservationorders/{T}' }
+        @{ Label = 'a tenant-scope child id'; Id = '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}' }
+        @{ Label = 'the stand-in path of an id that is not an ARM path'; Id = '/providers/rda.noid/ids/{T}' }
+    ) {
+        $Id.Replace('{T}', $script:T) | Should -Match $script:RunPattern
+    }
+
+    It 'leaves a run plain for <Label>' -ForEach @(
+        @{ Label = 'a real resource id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-demo/providers/Microsoft.Compute/virtualMachines/vm-a' }
+        @{ Label = 'a real tenant-scope id'; Id = '/providers/Microsoft.Capacity/reservationOrders/12345678-1234-1234-1234-123456789012' }
+        @{ Label = 'a real tenant-scope id with a prod_ name'; Id = '/providers/Microsoft.Capacity/reservationOrders/prod_reservations' }
+    ) {
+        $Id | Should -Not -Match $script:RunPattern
+    }
+}

@@ -27,13 +27,10 @@ BeforeAll {
         $script:AllContent[$file.Name] = Get-Content $file.FullName -Raw
     }
 
-    # A masked resource ID is an ARM-shaped path that starts with a masked
-    # subscription token (/subscriptions/prod_... or /subscriptions/nonprod_...).
-    # Only the start is checked here, and a flat prod_/nonprod_ token also
-    # counts: this pattern just tells an obfuscated run from a plain one, so an
-    # ID with a leak or the wrong shape still turns the leak scans below on.
-    # Obfuscation.Tests.ps1 checks the full shape.
-    $script:ObfuscationPattern = '^(/subscriptions/)?(prod|nonprod)_'
+    # Tells an obfuscated run from a plain one by its IDs (see
+    # Helpers/MaskedIdPattern.ps1); Obfuscation.Tests.ps1 checks the full shape.
+    . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    $script:ObfuscationPattern = Get-ObfuscatedRunIdPattern
 
     # Detect obfuscation mode: if any resource ID is a masked ID, treat the
     # run as obfuscated. The PII-leak Describe later also depends on this signal.

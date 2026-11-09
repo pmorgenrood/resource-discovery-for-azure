@@ -33,3 +33,14 @@ function Get-MaskedIdPattern
     $ScopeBlocks = if ($AllowScopeOnly) { '*' } else { '+' }
     return '^(' + $Scope + $Block + $ScopeBlocks + '|' + $Block + '+)/?$'
 }
+
+# Tells an obfuscated run from a plain one by one of its inventory IDs. Only
+# the start of a masked ID is checked, and a flat prod_/nonprod_ token also
+# counts, so an ID with a leak or the wrong shape still marks the run as
+# obfuscated and turns the leak scans on: a masked subscription
+# (/subscriptions/prod_...), a flat token, or a tenant-scope id
+# (/providers/...) with a token as a name segment.
+function Get-ObfuscatedRunIdPattern
+{
+    return '^((/subscriptions/)?(prod|nonprod)_|/providers/[^/]+(/[^/]+/[^/]+)*/[^/]+/(prod|nonprod)_[0-9a-f]{8}-)'
+}
