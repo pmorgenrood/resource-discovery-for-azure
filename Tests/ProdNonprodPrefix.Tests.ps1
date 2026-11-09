@@ -31,6 +31,10 @@ BeforeAll {
     $script:MaskedIdPattern = Get-MaskedIdPattern
     # A consumption row can be billed to a subscription or a group itself.
     $script:MaskedConsumptionIdPattern = Get-MaskedIdPattern -AllowScopeOnly
+
+    # Whether the zip is from an -Obfuscate run (Test-ObfuscatedRun).
+    . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
+    $script:IsObfuscated = Test-ObfuscatedRun -Ids @($script:AllResources | Where-Object { $null -ne $_.ID } | ForEach-Object { [string]$_.ID }) -DictionaryPath (Get-RunDictionaryPath -TestsRoot $PSScriptRoot)
 }
 
 AfterAll {
@@ -60,6 +64,9 @@ Describe "Prefix Consistency Per Resource" {
 
 Describe "Name Matches The Id's Name Token" {
     It "Each joinable row's Name is the last segment of its ID" {
+        # A plain run's Name is the resource's real name, which need not be its
+        # id's last segment as written.
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
         # A billed resource with no ID match is joined by Name, ResourceGroup
         # and Subscription taken from the consumption path, so in the sections
         # that join, a row's Name must be its masked ID's name token itself,
