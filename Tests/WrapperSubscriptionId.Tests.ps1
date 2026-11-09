@@ -834,3 +834,16 @@ Describe 'Select-OneSubscription -Preflight' {
         $Run.Lines[0].Text | Should -BeLike ($Like + ', so this run stopped before collecting anything (exit 1)*')
     }
 }
+
+Describe 'Invoke-PreFlightChecks -ReadOnly in Cloud Shell without storage' {
+    BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
+
+    It 'does not say a preflight continues or writes a zip' {
+        function Get-CloudDrive { $null }
+        Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 2GB } } }
+        $Lines = @(Invoke-PreFlightChecks -InventoryRoot $TestDrive -ReadOnly 6>&1 | ForEach-Object { [string]$_ })
+        @($Lines | Where-Object { $_ -like '*Cloud Shell detected, but no storage account is mounted.*' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like '*Continuing in ephemeral mode*' }) | Should -BeNullOrEmpty
+        @($Lines | Where-Object { $_ -like '*A run here would keep its report ZIP only until the shell closes*' }).Count | Should -Be 1
+    }
+}

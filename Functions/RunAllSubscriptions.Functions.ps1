@@ -342,7 +342,8 @@ function Invoke-PreFlightChecks
             Write-Host "  This includes the resume-state file, so -Resume on a future session won't help recover." -ForegroundColor Yellow
             Write-Host "  To persist outputs across sessions, attach a storage account via the Cloud Shell" -ForegroundColor Yellow
             Write-Host "  settings menu (gear icon) > Reset User Settings > Mount storage account." -ForegroundColor Yellow
-            Write-Host "  Continuing in ephemeral mode - download the report ZIP from $InventoryRoot before closing the shell." -ForegroundColor Yellow
+            if ($ReadOnly) { Write-Host "  A run here would keep its report ZIP only until the shell closes: download it from $InventoryRoot before closing the shell." -ForegroundColor Yellow }
+            else { Write-Host "  Continuing in ephemeral mode - download the report ZIP from $InventoryRoot before closing the shell." -ForegroundColor Yellow }
             Write-Host ""
         }
         else
