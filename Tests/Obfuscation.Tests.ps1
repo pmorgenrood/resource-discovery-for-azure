@@ -377,7 +377,9 @@ Describe "Metrics JSON Structure" {
             $Raw = Get-Content $metricsFile.FullName -Raw
             $Parsed = $Raw | ConvertFrom-Json
             $Parsed | Should -Not -BeNullOrEmpty -Because "Metrics file should be valid JSON"
-            $Parsed.PSObject.Properties.Name | Should -Contain 'Metrics' -Because "Metrics JSON should have a Metrics property"
+            # Field names are matched letter for letter (-ccontains): Should
+            # -Contain ignores letter case.
+            ($Parsed.PSObject.Properties.Name -ccontains 'Metrics') | Should -BeTrue -Because "Metrics JSON should have a Metrics property, letter for letter"
             # The file's top-level Metrics value must be a list (an empty list
             # is fine).
             ($Parsed.PSObject.Properties['Metrics'].Value -is [System.Array]) | Should -BeTrue -Because "the top-level Metrics value must be a list in '$($metricsFile.Name)'"
@@ -408,7 +410,7 @@ Describe "Consumption CSV Headers" {
         $Columns = @(($FirstLine | ConvertFrom-Csv -Header (1..200 | ForEach-Object { "c$_" })).PSObject.Properties | Where-Object { $null -ne $_.Value } | ForEach-Object { [string]$_.Value })
         foreach ($header in $ExpectedHeaders)
         {
-            $Columns | Should -Contain $header -Because "CSV should contain header '$header' as a column name"
+            ($Columns -ccontains $header) | Should -BeTrue -Because "CSV should contain header '$header' as a column name, letter for letter"
         }
     }
 }

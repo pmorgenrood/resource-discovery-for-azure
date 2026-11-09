@@ -46,10 +46,10 @@ Describe "Dictionary Structure" {
     It "Should be valid JSON with all four maps" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH or run -Obfuscate first"; return }
         $script:Dictionary | Should -Not -BeNullOrEmpty
-        $script:Dictionary.PSObject.Properties.Name | Should -Contain 'ResourceIdMap'
-        $script:Dictionary.PSObject.Properties.Name | Should -Contain 'ResourceNameMap'
-        $script:Dictionary.PSObject.Properties.Name | Should -Contain 'SubscriptionMap'
-        $script:Dictionary.PSObject.Properties.Name | Should -Contain 'ResourceGroupMap'
+        ($script:Dictionary.PSObject.Properties.Name -ccontains 'ResourceIdMap') | Should -BeTrue -Because 'the map name is matched letter for letter'
+        ($script:Dictionary.PSObject.Properties.Name -ccontains 'ResourceNameMap') | Should -BeTrue -Because 'the map name is matched letter for letter'
+        ($script:Dictionary.PSObject.Properties.Name -ccontains 'SubscriptionMap') | Should -BeTrue -Because 'the map name is matched letter for letter'
+        ($script:Dictionary.PSObject.Properties.Name -ccontains 'ResourceGroupMap') | Should -BeTrue -Because 'the map name is matched letter for letter'
     }
 
     It "Should have a GeneratedAt timestamp" {
