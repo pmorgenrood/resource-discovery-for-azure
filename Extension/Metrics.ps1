@@ -655,7 +655,7 @@ if ($Task -eq 'Processing')
     # parallel batch runspaces under a lock (Monitor) on the array itself.
     $MetricBatchCounts = [long[]]::new(6)
     # Subscription id -> why batch was turned off for it during the phase (the
-    # data plane refused the token or the caller: 401 or 403).
+    # data plane answered 403: Microsoft.Insights is not registered there).
     $MetricBatchOffSubs = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $MetricBatchNotes = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
     # Tenants whose token was renewed after a 401 and has not worked since: a
@@ -1258,12 +1258,12 @@ function Add-MetricRecord
                                     }
                                     if ($Off.TryAdd($TenantKey, 1))
                                     {
-                                        $Notes.Add(('The metrics data plane refused a renewed token (401) for subscription {0}; batch is off for its tenant for the rest of the phase.' -f $Unit.SubscriptionId))
+                                        $Notes.Add(('The metrics data plane refused a renewed token (401) for subscription {0}; batch is off for its tenant for the rest of the phase. A 401 means the token is refused or the caller has no Monitoring Reader on the subscription itself (not only on its resource groups).' -f $Unit.SubscriptionId))
                                     }
                                 }
                                 if ($Kind -eq 'Refused' -and $OffSubs.TryAdd($Unit.SubscriptionId, $LastError))
                                 {
-                                    $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. The batch API needs Monitoring Reader on the subscription itself (not only on its resource groups) and Microsoft.Insights registered there.' -f $Unit.SubscriptionId, $LastError))
+                                    $Notes.Add(('Batch turned off for subscription {0}: the data plane refused the request ({1}). Its metrics use the per-resource path. A 403 means Microsoft.Insights is not registered on the subscription.' -f $Unit.SubscriptionId, $LastError))
                                 }
                                 $Notes.Add(('Batch request failed after {0} attempt(s) ({1}) for {2} resource(s) of {3} in {4}; their metrics use the per-resource path.' -f $Attempts, $LastError, $Unit.ResourceIds.Count, $Unit.Namespace, $Unit.Region))
                                 Send-AllGroupsOn
