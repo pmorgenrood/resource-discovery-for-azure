@@ -23,7 +23,8 @@ param(
     # point it at a local listener.
     [string]$MetricsBatchEndpointFormat = 'https://{0}.metrics.monitor.azure.com',
     # Internal: seconds each Azure Monitor request may take. Tests lower it.
-    [int]$MetricsCallTimeoutSeconds = 120
+    # 0 or less would make every request time out at once.
+    [ValidateRange(1, 3600)][int]$MetricsCallTimeoutSeconds = 120
 )
 
 
