@@ -75,10 +75,67 @@ Describe 'Get-MetricsRetryCommand' {
         Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
     }
 
+    It 'seeds a masked run from that run''s own dictionary, over the one it was seeded with' {
+        $Run = @{ Obfuscate = $true; ObfuscationDictionary = '/data/seed.json' }
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run -DictionaryFile "/r/it's/ObfuscationDictionary_x.json" | Should -Be "./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '/r/it''s/ObfuscationDictionary_x.json'"
+    }
+
+    It 'gives no dictionary to a run that was not masked' {
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters @{} -DictionaryFile '/r/ObfuscationDictionary_x.json' | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+    }
+
     It 'never writes a credential or a switch that was turned off' {
         $Run = @{ Obfuscate = [switch]$false; DeviceLogin = $false; Appid = 'app-1'; Secret = (ConvertTo-SecureString 'not-a-real-value' -AsPlainText -Force); SkipMetrics = $true; Debug = $true; ObfuscationDictionary = '/data/d.json' }
         $Command = Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run
         $Command | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+    }
+}
+
+Describe 'Write-MetricsIncompleteRunEnd after a masked run' {
+    BeforeAll {
+        # A report root with one subscription folder that holds its dictionary
+        # and one that does not.
+        $script:ReportRoot = Join-Path $TestDrive 'reports'
+        $script:WithDict = Join-Path $script:ReportRoot 'ResourcesReport_with'
+        New-Item -ItemType Directory -Path $script:WithDict, (Join-Path $script:ReportRoot 'ResourcesReport_without') -Force | Out-Null
+        $script:DictFile = Join-Path $script:WithDict 'ObfuscationDictionary_ResourcesReport_with.json'
+        Set-Content -LiteralPath $script:DictFile -Value '{}'
+        $script:Replace = "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
+    }
+    BeforeEach {
+        $script:Lines = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Lines.Add([string]$Object) }
+    }
+
+    It 'seeds each command from the dictionary in that subscription''s report folder' {
+        $Entry = [pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Message = 'still failed'; ReportFolder = 'ResourcesReport_with'; Complete = $false }
+        Write-MetricsIncompleteRunEnd -Entries @($Entry) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -ReportRoot $script:ReportRoot | Should -BeTrue
+
+        $script:Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $script:DictFile.Replace("'", "''"))
+        $script:Lines | Should -Contain $script:Replace
+    }
+
+    It 'says so when that subscription''s dictionary cannot be found' {
+        $Entry = [pscustomobject]@{ Name = 'sub-three'; Id = 'id-3'; Message = 'still failed'; ReportFolder = 'ResourcesReport_without'; Complete = $false }
+        $null = Write-MetricsIncompleteRunEnd -Entries @($Entry) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -ReportRoot $script:ReportRoot
+
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-3 -Obfuscate'
+        $script:Lines | Should -Contain "  The dictionary of the first run was not found for sub-three (id-3): pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids."
+        $script:Lines | Should -Contain $script:Replace
+    }
+
+    It 'uses the dictionary file it is given for a direct run' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -DictionaryFile $script:DictFile
+
+        $script:Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $script:DictFile.Replace("'", "''"))
+    }
+
+    It 'adds no dictionary and no upload line after a run that was not masked' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{} -DictionaryFile $script:DictFile -ReportRoot $script:ReportRoot
+
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+        $script:Lines | Should -Not -Contain $script:Replace
+        @($script:Lines | Where-Object { $_ -like '*dictionary*' }).Count | Should -Be 0
     }
 }
 
@@ -98,7 +155,9 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         function script:Invoke-DirectRunEnd
         {
-            param([hashtable]$Arguments, [switch]$NoZip)
+            param([hashtable]$Arguments, [switch]$NoZip, [string]$DictionaryFile)
+            # The dictionary a masked run saves, set as the run sets it.
+            $Global:DictionaryFile = $DictionaryFile
             # The report zip of the run, or none when it could not be written.
             $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
             if (-not $NoZip) { Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip' }
@@ -109,12 +168,26 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
         $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionDict = Get-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
         else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
         if ($script:SessionZip) { $Global:ZipOutputFile = $script:SessionZip.Value }
         else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionDict) { $Global:DictionaryFile = $script:SessionDict.Value }
+        else { Remove-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'seeds the command of a masked run from the dictionary it saved' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Dict = Join-Path $TestDrive 'ObfuscationDictionary_direct.json'
+        Set-Content -LiteralPath $Dict -Value '{}'
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; Obfuscate = $true; ObfuscationDictionary = '/data/seed.json' } -DictionaryFile $Dict
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $Dict.Replace("'", "''"))
+        $Result.Lines | Should -Contain "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
     }
 
     It 'prints the command with the run''s switches and exits 3' {
@@ -326,7 +399,7 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
 
         function script:Invoke-WrapperEnd
         {
-            param([hashtable]$InventoryPassthrough, [object[]]$CollectorFailures = @())
+            param([hashtable]$InventoryPassthrough, [object[]]$CollectorFailures = @(), [string]$InventoryRoot = (Join-Path $TestDrive 'no-reports'))
             # Read by the lifted statements, which run in this scope.
             Set-Variable -Name TenantID -Value 'tenant-1'
             Set-Variable -Name WrapperTranscriptStarted -Value $false
@@ -357,6 +430,20 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
         $Result.ExitCode | Should -Be 3
         $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -SkipConsumption -ConcurrencyLimit 12'
         $Result.Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
+    }
+
+    It 'seeds the command of a masked run from the dictionary in the subscription''s report folder' {
+        $Root = Join-Path $TestDrive 'wrapper-reports'
+        $Folder = Join-Path $Root 'ResourcesReport_x'
+        New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        $Dict = Join-Path $Folder 'ObfuscationDictionary_ResourcesReport_x.json'
+        Set-Content -LiteralPath $Dict -Value '{}'
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-WrapperEnd -InventoryPassthrough @{ Obfuscate = $true; ConcurrencyLimit = 6 } -InventoryRoot $Root
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 6 -ObfuscationDictionary '{0}'" -f $Dict.Replace("'", "''"))
+        $Result.Lines | Should -Contain "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
     }
 
     It 'exits 5 with a collector failure too' {

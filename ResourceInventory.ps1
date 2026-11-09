@@ -1846,6 +1846,6 @@ if ($ZipWritten)
 # whole run.
 if (-not $RunAllSubs.IsPresent)
 {
-    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipFile $Global:ZipOutputFile
+    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipFile $Global:ZipOutputFile -DictionaryFile $Global:DictionaryFile
     if ($DirectRunExitCode -ne 0) { exit $DirectRunExitCode }
 }

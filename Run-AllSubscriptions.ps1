@@ -2168,8 +2168,9 @@ if ($AuthSkippedPhases.Count -gt 0)
 # error or an error with no status) has incomplete metrics: listed
 # with the command that collects it again, with the switches this run forwards,
 # and exit 3 (5 with collector failures), as for a data phase skipped for the
-# sign-in.
-$MetricsIncomplete = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough
+# sign-in. After a masked run each command is seeded with the dictionary in
+# that subscription's report folder under $InventoryRoot.
+$MetricsIncomplete = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough -ReportRoot $InventoryRoot
 
 # Machine-facing signal for collector failures (#22), distinct from the auth
 # banner above. A collector failure is not an auth problem - it means one or
