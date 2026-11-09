@@ -312,6 +312,43 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Written.Count | Should -Be $Rows
     }
 
+    It 'names only the file, not its folder, when the consumption file cannot be written, and does not say rows were left when the write changed nothing' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Pages = 0
+        Mock Get-UsageAggregates {
+            $script:Pages++
+            $Next = if ($script:Pages -eq 1) { 'page-2' } else { $null }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ('/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-{0}' -f $script:Pages)); ContinuationToken = $Next }
+        }
+        # The first page is written; the second write fails before it writes a
+        # thing, with the full path in its text, and the file can then not be
+        # opened for writing (another program holds it).
+        $script:CsvRows = 0
+        function Export-Csv
+        {
+            [CmdletBinding()]
+            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
+            process
+            {
+                $script:CsvRows++
+                if ($script:CsvRows -eq 2)
+                {
+                    (Get-Item -LiteralPath $Path).IsReadOnly = $true
+                    throw ("Access to the path '{0}' is denied." -f $Path)
+                }
+                $InputObject | Microsoft.PowerShell.Utility\Export-Csv -Path $Path -Encoding utf8 -Append -NoTypeInformation
+            }
+        }
+        try { GetResorceConsumption }
+        finally { (Get-Item -LiteralPath $Global:ConsumptionFileCsv).IsReadOnly = $false }
+        $Message = [string]$Global:ConsumptionFailedSubs[0].Message
+        $Message | Should -Match ([regex]::Escape("Access to the path '{0}' is denied." -f (Split-Path -Path $Global:ConsumptionFileCsv -Leaf)))
+        $Message | Should -Not -Match ([regex]::Escape((Split-Path -Path $Global:ConsumptionFileCsv -Parent)))
+        $Message | Should -Not -Match 'could not be removed'
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 1
+        @(Import-Csv -LiteralPath $Global:ConsumptionFileCsv).Count | Should -Be 1
+    }
+
     It 'writes a usage row without additionalInfo when the caller runs under Set-StrictMode -Version Latest' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }

@@ -1591,24 +1591,38 @@ function ExecuteInventoryProcessing()
                     }
                     catch
                     {
+                        # A write error's text holds the file's full path, which can name the user,
+                        # and these messages go to the shareable diagnostics log: keep the file
+                        # name only.
+                        $CsvFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Global:ConsumptionFileCsv)
+                        $CsvFolders = @(@((Split-Path -Path $CsvFullPath -Parent), (Split-Path -Path $Global:ConsumptionFileCsv -Parent)) | Where-Object { -not [string]::IsNullOrEmpty($_) } | Select-Object -Unique)
+                        $HideFolder = {
+                            param([string]$Text)
+                            foreach ($Folder in $CsvFolders) { $Text = $Text.Replace($Folder + '/', '').Replace($Folder + '\', '').Replace($Folder, '<output folder>') }
+                            $Text
+                        }
+                        $WriteMessage = & $HideFolder ([string]$_.Exception.Message)
                         # A write that fails part-way can leave some of this page's rows in the
-                        # file; cut them off again, so the file holds only the rows counted.
-                        $WriteError = $_
-                        try
+                        # file; cut them off again, so the file holds only the rows counted. A
+                        # file the failed write did not change is left as it is.
+                        $CsvNow = Get-Item -LiteralPath $Global:ConsumptionFileCsv -ErrorAction SilentlyContinue
+                        if ($null -ne $CsvNow -and $CsvNow.Length -ne $CsvLengthBefore)
                         {
-                            if ($CsvLengthBefore -lt 0) { Remove-Item -LiteralPath $Global:ConsumptionFileCsv -Force -ErrorAction Stop }
-                            else
+                            try
                             {
-                                $CsvStream = [System.IO.File]::Open($CsvItem.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
-                                try { $CsvStream.SetLength($CsvLengthBefore) } finally { $CsvStream.Dispose() }
+                                if ($CsvLengthBefore -lt 0) { Remove-Item -LiteralPath $Global:ConsumptionFileCsv -Force -ErrorAction Stop }
+                                else
+                                {
+                                    $CsvStream = [System.IO.File]::Open($CsvNow.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
+                                    try { $CsvStream.SetLength($CsvLengthBefore) } finally { $CsvStream.Dispose() }
+                                }
+                            }
+                            catch
+                            {
+                                throw ("{0}; the rows of this page written before the error could not be removed from the consumption file ({1})" -f $WriteMessage, (& $HideFolder ([string]$_.Exception.Message)))
                             }
                         }
-                        catch [System.Management.Automation.ItemNotFoundException] { }
-                        catch
-                        {
-                            throw ("{0}; the rows of this page written before the error could not be removed from the consumption file ({1})" -f $WriteError.Exception.Message, $_.Exception.Message)
-                        }
-                        throw $WriteError
+                        throw $WriteMessage
                     }
                     # Rows written to the consumption file: a -ResourceGroup run leaves out the
                     # other resource groups' rows, and a page that fails part-way writes none.
