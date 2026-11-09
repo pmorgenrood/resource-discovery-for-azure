@@ -67,10 +67,8 @@ BeforeAll {
 
     # Obfuscation pattern: prod_ or nonprod_ followed by an optional type-tag
     # (databricks_, aks_, vmss_) and a GUID. The type-tagged variants are the
-    # legitimate output for resources whose IDs do not fit the standard ARM
-    # shape (AKS-managed RGs, Databricks-managed clusters, VMSS instances
-    # inside AKS node pools). See ResourceInventory.ps1 lines 650-655 and
-    # 1030-1034 for where these are produced.
+    # name tokens ResourceInventory.ps1 writes for Databricks resources,
+    # resources in AKS-managed resource groups and scale set instances.
     $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
     # A masked resource ID is an ARM-shaped path, never a flat token; the
@@ -101,6 +99,30 @@ BeforeAll {
     }
     $script:DictionaryAvailable = -not [string]::IsNullOrEmpty($DictPath) -and (Test-Path $DictPath)
     $script:Dictionary = if ($script:DictionaryAvailable) { Get-Content $DictPath -Raw | ConvertFrom-Json } else { $null }
+
+    # The tag-value tokenizer of ResourceInventory.ps1 itself: the one
+    # 'if ($resourceItem.ContainsKey('Tags') ...)' block of its resource loop,
+    # taken from the source with the PowerShell parser. Invoke-TagObfuscation
+    # runs it on one row, the same shape the collectors produce (a
+    # case-insensitive [hashtable] whose 'Tags' value is an array of
+    # { Name, Value } objects), with the given tag dictionary. A changed or
+    # missing block in the product fails the tests that use it.
+    $RiAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+    $TagBlocks = @($RiAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq "`$resourceItem.ContainsKey('Tags') -and `$null -ne `$resourceItem.Tags" }, $true))
+    $script:TagBlock = if ($TagBlocks.Count -eq 1) { [scriptblock]::Create($TagBlocks[0].Extent.Text) } else { $null }
+    function script:Invoke-TagObfuscation
+    {
+        param(
+            [Parameter(Mandatory)] $ResourceItem,
+            [Parameter(Mandatory)] $TagValueDictionary
+        )
+        if ($null -eq $script:TagBlock) { throw 'Expected one tag tokenizer block in ResourceInventory.ps1.' }
+        $Saved = $Global:TagValueDictionary
+        $Global:TagValueDictionary = $TagValueDictionary
+        # PowerShell names ignore case, so the block reads $ResourceItem as its $resourceItem.
+        try { . $script:TagBlock }
+        finally { $Global:TagValueDictionary = $Saved }
+    }
 }
 
 AfterAll {
@@ -784,7 +806,7 @@ Describe "Dictionary File Exclusion" {
 # The -Obfuscate run also writes a LOCAL Full_<ReportName>_<timestamp>.json
 # ($Global:AllResourceFile) that holds the RAW, un-obfuscated resource dump.
 # The packaging step's json filter excludes BOTH ObfuscationDictionary_* and
-# Full_* from the shipped ZIP (ResourceInventory.ps1 L1671). The Dictionary
+# Full_* from the shipped ZIP (ResourceInventory.ps1). The Dictionary
 # File Exclusion block above guards the dictionary; this guards the Full_*
 # dump: the other local-only artifact whose presence would leak every real
 # identifier for every obfuscated dimension. Count-independent; asserts the
@@ -945,13 +967,11 @@ Describe "Obfuscation Injectivity" {
 # against (documented fixture limitation: the dictionary is NOT fabricated).
 #
 # To cover tag keys, values and their dictionary without weakening anything
-# above, this block adds two
-# fixture-independent layers, mirroring the sanctioned classifier-logic +
-# source-audit approach established in ProdNonprodPrefix.Tests.ps1:
-#   1. A logic-level exercise of the EXACT tag-obfuscation loop
-#      (ResourceInventory.ps1 L1002-1017) against a representative structured
-#      Tags hashtable with MIXED-CASE keys: the same shape collectors produce
-#      (Services/Compute/VirtualMachines.ps1 L71/L99: $obj = @{ ...; Tags = ... }).
+# above, this block adds two fixture-independent layers:
+#   1. ResourceInventory.ps1's own tag tokenizer (Invoke-TagObfuscation, taken
+#      from the source) run on a representative structured Tags hashtable with
+#      MIXED-CASE keys: the same shape the collectors produce
+#      ($obj = @{ ...; Tags = ... }).
 #      Asserts keys survive verbatim, values become prod_/nonprod_ tokens,
 #      the same value yields the same token, and the structured Tags is NOT
 #      nulled/dropped.
@@ -964,39 +984,6 @@ Describe "Obfuscation Injectivity" {
 # ============================================================
 Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
     BeforeAll {
-        # Faithful mirror of the tag-value classifier + tokenizer in
-        # ResourceInventory.ps1 L1002-1017. Same non-prod regex set as every
-        # other class. Operates on the SAME shape the collectors
-        # produce: a case-insensitive [hashtable] $ResourceItem whose 'Tags'
-        # value is an array of { Name, Value } objects. Replicated here (rather
-        # than invoked) because the inline block lives inside the module-loop in
-        # ResourceInventoryLoop and the prod-only fixture cannot drive tag data
-        # through the ZIP. The source-audit Context below guards the real source.
-        function script:Invoke-TagObfuscation
-        {
-            param(
-                [Parameter(Mandatory)] $ResourceItem,
-                [Parameter(Mandatory)] $TagValueDictionary
-            )
-
-            if ($ResourceItem.ContainsKey('Tags') -and $null -ne $ResourceItem.Tags)
-            {
-                foreach ($tag in $ResourceItem.Tags)
-                {
-                    if ($null -ne $tag -and -not [string]::IsNullOrEmpty([string]$tag.Value))
-                    {
-                        $RealTagValue = [string]$tag.Value
-                        if (-not $TagValueDictionary.ContainsKey($RealTagValue))
-                        {
-                            $TagPrefix = if ($RealTagValue -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealTagValue -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-                            $TagValueDictionary[$RealTagValue] = $TagPrefix + [guid]::NewGuid().ToString()
-                        }
-                        $tag.Value = $TagValueDictionary[$RealTagValue]
-                    }
-                }
-            }
-        }
-
         $script:TagTokenPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         $script:RiSourcePath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'ResourceInventory.ps1'
     }
@@ -1057,7 +1044,7 @@ Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
 
     It "records each token -> real tag value mapping so TagMap can be inverted" {
         # TagMap is built by inverting $Global:TagValueDictionary
-        # (ResourceInventory.ps1 L1582-1586). Assert the dictionary this loop
+        # (ResourceInventory.ps1). Assert the dictionary this loop
         # populates carries the real value under the emitted token, which is
         # exactly what the inversion serializes into TagMap.
         $Dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
@@ -1089,8 +1076,8 @@ Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
             # The mixed-case bug was a case-sensitive scrub. -cmatch is
             # case-SENSITIVE, and these anchor on the SCRUB ASSIGNMENT STATEMENT
             # ($resourceItem.<case>.tags/Tags = $null), which is unique to the
-            # malformed-row path (L948-949): the bare ContainsKey('Tags') token
-            # also appears at the L1002 obfuscation guard, so matching the token
+            # malformed-row path: the bare ContainsKey('Tags') token
+            # also appears at the tag obfuscation guard, so matching the token
             # alone would be a false guard. Dropping either case variant
             # (reintroducing a lowercase-only / case-sensitive scrub) fails here.
             ($script:RiSource -cmatch '\$resourceItem\.tags = \$null') | Should -BeTrue -Because "lowercase tag key variant must be scrubbed on the malformed-row path"
@@ -1169,27 +1156,9 @@ Describe "AKS Multi-Node-Pool Tags: no cross-row aliasing" {
         $Rows = & $script:AksModule -Sub $script:AksSub -Resources @($script:AksCluster) -Task 'Processing' -ResourceIdDictionary $null
         $Dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
 
-        # Run the SAME tag-obfuscation loop ResourceInventory.ps1 runs per
-        # resourceItem (L1002-1017), once per row, exactly as production does.
-        foreach ($ResourceItem in $Rows)
-        {
-            if ($ResourceItem.ContainsKey('Tags') -and $null -ne $ResourceItem.Tags)
-            {
-                foreach ($tag in $ResourceItem.Tags)
-                {
-                    if ($null -ne $tag -and -not [string]::IsNullOrEmpty([string]$tag.Value))
-                    {
-                        $RealTagValue = [string]$tag.Value
-                        if (-not $Dict.ContainsKey($RealTagValue))
-                        {
-                            $TagPrefix = if ($RealTagValue -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealTagValue -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-                            $Dict[$RealTagValue] = $TagPrefix + [guid]::NewGuid().ToString()
-                        }
-                        $tag.Value = $Dict[$RealTagValue]
-                    }
-                }
-            }
-        }
+        # Run ResourceInventory.ps1's own tag tokenizer once per row, exactly
+        # as production does.
+        foreach ($ResourceItem in $Rows) { Invoke-TagObfuscation -ResourceItem $ResourceItem -TagValueDictionary $Dict }
 
         # injectivity: exactly one real value went in, so exactly one entry
         # must come out. A count of 2 here is the aliasing bug's signature (the
