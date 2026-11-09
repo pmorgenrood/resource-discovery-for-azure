@@ -549,16 +549,19 @@ if ($Task -eq 'Processing')
 
                 # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
                 # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
-                # other failure uses the generic budget and 2^attempt backoff. Returns @{ Retry; SleepSeconds } (no jitter).
+                # other failure uses the generic budget and 2^(failures-1) backoff. Each count includes the current
+                # failure, and one kind never spends the other's budget. Returns @{ Retry; SleepSeconds } (no jitter).
                 function Get-RdaMetricRetryPlan
                 {
+                    [CmdletBinding()]
                     param(
-                        [int]$Attempt, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds,
+                        [int]$GenericFailures, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds,
                         [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds
                     )
-                    $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $Attempt -lt $MaxRetries }
+                    $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $GenericFailures -le $MaxRetries }
                     if (-not $Retry) { return @{ Retry = $false; SleepSeconds = 0 } }
-                    $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+                    $Failures = if ($Throttled) { $ThrottledAttempts } else { $GenericFailures }
+                    $Backoff = [math]::Min([math]::Pow(2, [math]::Max($Failures - 1, 0)), 30)
                     if ($Throttled)
                     {
                         $Backoff = [math]::Min($Backoff * 2, 60)
@@ -654,6 +657,7 @@ if ($Task -eq 'Processing')
                     {
                         $Attempt = 0
                         $ThrottledAttempts = 0
+                        $GenericFailures = 0
                         $Succeeded = $false
                         $LastError = $null
                         $MetricQuery = $null
@@ -726,7 +730,9 @@ if ($Task -eq 'Processing')
                             }
 
                             # A BadRequest under -StopOnBadRequest has already left the loop above.
-                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds `
+                            # Timeouts and other errors count against the generic budget; throttled answers do not.
+                            if (-not $Throttled) { $GenericFailures++ }
+                            $Plan = Get-RdaMetricRetryPlan -GenericFailures $GenericFailures -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds `
                                 -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
                             if ($Plan.Retry)
                             {

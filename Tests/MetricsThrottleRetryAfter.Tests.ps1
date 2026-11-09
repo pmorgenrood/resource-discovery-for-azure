@@ -21,7 +21,7 @@ BeforeAll {
 
     function Plan([hashtable]$Over)
     {
-        $P = @{ Attempt = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
+        $P = @{ GenericFailures = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
         foreach ($K in $Over.Keys) { $P[$K] = $Over[$K] }
         Get-RdaMetricRetryPlan @P
     }
@@ -57,8 +57,8 @@ Describe 'Get-RdaMetricRetryPlan - throttled attempts' {
     }
 
     It 'keeps the throttled backoff (2x, capped) when Retry-After is shorter than it' {
-        $P = Plan @{ Attempt = 3; Throttled = $true; ThrottledAttempts = 4; RetryAfterSeconds = 2 }
-        $P.SleepSeconds | Should -Be 16 -Because '2^3 = 8, doubled for throttling = 16, above the 2s the server asked'
+        $P = Plan @{ Throttled = $true; ThrottledAttempts = 4; RetryAfterSeconds = 2 }
+        $P.SleepSeconds | Should -Be 16 -Because '2^(4-1) = 8, doubled for throttling = 16, above the 2s the server asked'
     }
 
     It 'bounds an absurd Retry-After to the configured maximum' {
@@ -66,32 +66,53 @@ Describe 'Get-RdaMetricRetryPlan - throttled attempts' {
     }
 
     It 'falls back to its own backoff when no Retry-After was supplied' {
-        (Plan @{ Attempt = 1; Throttled = $true; ThrottledAttempts = 2; RetryAfterSeconds = 0 }).SleepSeconds | Should -Be 4
+        (Plan @{ Throttled = $true; ThrottledAttempts = 2; RetryAfterSeconds = 0 }).SleepSeconds | Should -Be 4
     }
 
     It 'does not spend the generic budget: keeps retrying past MaxRetries while throttled' {
-        $P = Plan @{ Attempt = $script:MaxRetries + 2; Throttled = $true; ThrottledAttempts = $script:MaxThrottle; RetryAfterSeconds = 5 }
+        $P = Plan @{ GenericFailures = $script:MaxRetries + 1; Throttled = $true; ThrottledAttempts = $script:MaxThrottle; RetryAfterSeconds = 5 }
         $P.Retry | Should -BeTrue
     }
 
     It 'gives up once the throttle budget is exhausted' {
-        (Plan @{ Attempt = 9; Throttled = $true; ThrottledAttempts = $script:MaxThrottle + 1 }).Retry | Should -BeFalse
+        (Plan @{ Throttled = $true; ThrottledAttempts = $script:MaxThrottle + 1 }).Retry | Should -BeFalse
     }
 
     It 'a sustained 429 wave now waits out the directed delay instead of failing inside 30 seconds' {
         # Old behaviour: 3 retries at 4+8+16 = 28s of waiting, then Outcome = Throttled.
         $Total = 0
-        for ($i = 1; $i -le $script:MaxThrottle; $i++) { $Total += (Plan @{ Attempt = $i - 1; Throttled = $true; ThrottledAttempts = $i; RetryAfterSeconds = 20 }).SleepSeconds }
+        for ($i = 1; $i -le $script:MaxThrottle; $i++) { $Total += (Plan @{ Throttled = $true; ThrottledAttempts = $i; RetryAfterSeconds = 20 }).SleepSeconds }
         $Total | Should -BeGreaterThan 28
     }
 }
 
 Describe 'Get-RdaMetricRetryPlan - unchanged behaviour for other failures' {
-    It 'generic failures use 2^attempt capped at 30 and stop after MaxRetries' {
-        (Plan @{ Attempt = 0 }).SleepSeconds | Should -Be 1
-        (Plan @{ Attempt = 2 }).SleepSeconds | Should -Be 4
-        (Plan @{ Attempt = 6; MaxRetries = 10 }).SleepSeconds | Should -Be 30
-        (Plan @{ Attempt = $script:MaxRetries }).Retry | Should -BeFalse
+    It 'generic failures use 2^(failures-1) capped at 30 and stop after MaxRetries' {
+        (Plan @{ GenericFailures = 1 }).SleepSeconds | Should -Be 1
+        (Plan @{ GenericFailures = 3 }).SleepSeconds | Should -Be 4
+        (Plan @{ GenericFailures = 7; MaxRetries = 10 }).SleepSeconds | Should -Be 30
+        (Plan @{ GenericFailures = $script:MaxRetries }).Retry | Should -BeTrue
+        (Plan @{ GenericFailures = $script:MaxRetries + 1 }).Retry | Should -BeFalse
+    }
+}
+
+Describe 'Get-RdaMetricRetryPlan - throttled and generic failures keep separate budgets' {
+    It 'a generic failure after 3 throttled answers still retries, with the first generic backoff' {
+        $P = Plan @{ GenericFailures = 1; ThrottledAttempts = 3 }
+        $P.Retry | Should -BeTrue
+        $P.SleepSeconds | Should -Be 1
+    }
+
+    It 'throttled answers after 3 generic failures still get the whole throttle budget' {
+        $P = Plan @{ GenericFailures = $script:MaxRetries; Throttled = $true; ThrottledAttempts = 1 }
+        $P.Retry | Should -BeTrue
+        $P.SleepSeconds | Should -Be 2
+        (Plan @{ GenericFailures = $script:MaxRetries; Throttled = $true; ThrottledAttempts = $script:MaxThrottle }).Retry | Should -BeTrue
+    }
+
+    It 'the retry loop counts generic failures on their own and passes that count to the plan' {
+        $script:MetricsSrc | Should -Match 'if \(-not \$Throttled\) \{ \$GenericFailures\+\+ \}'
+        $script:MetricsSrc | Should -Match 'Get-RdaMetricRetryPlan -GenericFailures \$GenericFailures -Throttled \$Throttled'
     }
 
     It 'has no Permanent parameter: a BadRequest leaves the loop before the plan is asked' {
@@ -110,8 +131,7 @@ Describe 'Retry-After reaches the runspace' {
         $script:MetricsSrc | Should -Match '\$MetricRetryAfterFnDef\s*=.*\$\{function:Get-RdaRetryAfterSeconds\}'
         $script:MetricsSrc | Should -Match 'Set-Item -Path function:Get-RdaRetryAfterSeconds'
         $script:MetricsSrc | Should -Match 'Get-RdaRetryAfterSeconds -ErrorRecord \$_'
-        $script:MetricsSrc | Should -Match 'Get-RdaMetricRetryPlan -Attempt \$Attempt -Throttled \$Throttled'
-    }
+            }
 
     It 'the retry loop has an explicit exit when the budget is exhausted (the while is no longer bounded by attempts)' {
         $script:MetricsSrc | Should -Match '(?s)while \(-not \$Succeeded\)\s*\{.*?Budget exhausted.*?break'

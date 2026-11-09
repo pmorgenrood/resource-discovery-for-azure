@@ -96,7 +96,16 @@ function Get-AzMetric
         }
     }
     # RDA_TEST_METRIC_MULTI_ERROR makes every multi-name request fail in a chosen way.
-    switch ($(if ($Names.Count -gt 1) { $env:RDA_TEST_METRIC_MULTI_ERROR } else { '' }))
+    $MultiError = if ($Names.Count -gt 1) { $env:RDA_TEST_METRIC_MULTI_ERROR } else { '' }
+    # RDA_TEST_METRIC_MULTI_SEQUENCE lists, comma-separated, how each multi-name request fails in turn
+    # (the n-th call made fails the n-th way); past the end of the list a request succeeds.
+    if ($Names.Count -gt 1 -and $env:RDA_TEST_METRIC_MULTI_SEQUENCE)
+    {
+        $Sequence = @($env:RDA_TEST_METRIC_MULTI_SEQUENCE -split ',')
+        $CallIndex = @(Get-ChildItem -LiteralPath $env:RDA_TEST_METRIC_CALL_DIR -Filter '*.json').Count - 1
+        $MultiError = if ($CallIndex -lt $Sequence.Count) { $Sequence[$CallIndex] } else { '' }
+    }
+    switch ($MultiError)
     {
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
@@ -194,7 +203,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [switch]$RealSleep)
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [switch]$RealSleep, [string[]]$MultiSequence = @())
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -212,6 +221,7 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $env:RDA_TEST_METRIC_POINTS = $PointsFile
+        $env:RDA_TEST_METRIC_MULTI_SEQUENCE = $MultiSequence -join ','
         $env:RDA_TEST_METRIC_NO_SLEEP = $(if ($RealSleep) { '' } else { '1' })
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
@@ -258,7 +268,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS', 'Env:RDA_TEST_METRIC_NO_SLEEP' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS', 'Env:RDA_TEST_METRIC_NO_SLEEP', 'Env:RDA_TEST_METRIC_MULTI_SEQUENCE' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -543,6 +553,35 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         foreach ($Name in $script:DiskMetricNames)
         {
             @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+    }
+
+    It 'retries a server error that follows 3 throttled answers' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'throttled-then-error' -MultiSequence @('Throttled', 'Throttled', 'Throttled', 'ServerError')
+
+        # Throttled answers do not spend the generic budget, so the fifth request is made and succeeds.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 5
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'gives throttled answers that follow 3 server errors the whole throttle budget' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'error-then-throttled' -MultiSequence (@('ServerError') * 3 + @('Throttled') * 6)
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 10
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 0
+    }
+
+    It 'stops at the fourth server error even when throttled answers came between them' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'error-budget-mixed' -MultiSequence @('ServerError', 'Throttled', 'ServerError', 'Throttled', 'ServerError', 'ServerError')
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 6
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=6 .*InternalServerError' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
     }
 
