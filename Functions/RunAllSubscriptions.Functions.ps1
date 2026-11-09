@@ -1066,8 +1066,9 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     # Only the resource groups were proven listable: empty, or a role that
-    # cannot read the resources (the console asks to check Reader).
-    $Lines.Add(('  0 resources - groups listable, report empty: {0}' -f $Empty.Count))
+    # cannot read the resources (the console asks to check Reader). The label
+    # is as wide as the two beside it, so the colons line up.
+    $Lines.Add(('  0 resources - groups only : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
 
     # --- Health --------------------------------------------------------------

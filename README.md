@@ -219,7 +219,7 @@ The wrapper always covers the whole tenant. To scope a run to **one** subscripti
 
 ### Running Across All Subscriptions
 
-Use `Run-AllSubscriptions.ps1` to generate a separate inventory report for each subscription in a tenant, instead of the default single consolidated report. The wrapper prompts you to sign in once, then invokes `ResourceInventory.ps1` for each subscription. By default subscriptions are processed sequentially (one at a time); use `-ParallelStreams` to process several concurrently.
+Use `Run-AllSubscriptions.ps1` to generate a separate inventory report for each subscription in a tenant, instead of the default single consolidated report. The wrapper prompts you to sign in once, then invokes `ResourceInventory.ps1` for each subscription. By default the number of subscriptions processed at once is tuned to the machine's CPU and memory (one at a time on a small machine); use `-ParallelStreams` to set it.
 
 ```powershell
 ./Run-AllSubscriptions.ps1 -TenantID "12345678-1234-1234-1234-123456789012"
@@ -289,7 +289,7 @@ Pass `-ParallelStreams N` to process N subscriptions concurrently in separate `p
 
 Each stream is a separate background process. They don't share state with each other. Each has its own Azure session, its own progress tracking file, and its own output folder. The wrapper splits your subscription list across the streams in round-robin order so the workload stays balanced even when subscriptions vary in size.
 
-The default is `-ParallelStreams 1` (existing sequential behavior, fully preserved). Pick a higher value based on the environment you're running in. See the table in [Choosing where to run for large tenants](#choosing-where-to-run-for-large-tenants-cloud-shell-vs-local) below.
+Without `-ParallelStreams` the count is tuned to the machine (one stream per 2 vCPUs, at most 6, fewer when memory is short; `-ParallelStreams 1` is the sequential run). Pick a value based on the environment you're running in. See the table in [Choosing where to run for large tenants](#choosing-where-to-run-for-large-tenants-cloud-shell-vs-local) below.
 
 `-ParallelStreams` and `-ConcurrencyLimit` compose. `-ConcurrencyLimit` throttles the metrics-collection runspace pool *within* one subscription; `-ParallelStreams` is the count of subscriptions running concurrently. Useful combinations:
 
@@ -530,7 +530,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 - Tenant-domain-style `-TenantID` (e.g. `contoso.onmicrosoft.com`) is resolved via Microsoft's public OIDC discovery endpoint, no sign-in needed. Pass the tenant GUID directly if discovery fails.
 
 **Subscription returned 0 resources:**
-- The up-front role check only shows that the identity can list the subscription's resource groups. So 0 resources means the subscription is empty (or holds only types the report does not list), or the identity cannot read its resources: a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account than Az PowerShell. With one stream (the default), the wrapper prints an `Invoke-AzRestMethod` Resource Graph query (Az.Accounts, which the tool installs) to check what Resource Graph returns for the Az PowerShell account; check the Azure CLI's account (`az account show`) apart, since the discovery query runs as that one.
+- The up-front role check only shows that the identity can list the subscription's resource groups. So 0 resources means the subscription is empty (or holds only types the report does not list), or the identity cannot read its resources: a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account than Az PowerShell. On the sequential path (one stream: `-ParallelStreams 1`, which the auto-tuning also picks on a host with fewer than 4 vCPUs or little memory), the wrapper prints an `Invoke-AzRestMethod` Resource Graph query (Az.Accounts, which the tool installs) to check what Resource Graph returns for the Az PowerShell account; check the Azure CLI's account (`az account show`) apart, since the discovery query runs as that one. With more streams the warning has no query: run that subscription again with `-ParallelStreams 1` to get it.
 - Failed subs are listed at the end of the wrapper transcript and in `InventoryReports/RunAllSubscriptions_failures_<timestamp>.log`.
 
 **Run stops immediately with "not authorized to read consumption/billing data":**
