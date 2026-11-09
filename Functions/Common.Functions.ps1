@@ -420,6 +420,9 @@ function Invoke-RdaInsightsProviderPreflight
     # Already being registered (by someone else, or an earlier run): nothing to
     # ask; it joins the shared wait below only after a "y".
     $AlreadyRegistering = [System.Collections.Generic.List[string]]::new()
+    # shortcut: the reads run one after another, one ARM GET per subscription
+    # (well under a second each). Read them in parallel once a tenant with
+    # hundreds of subscriptions makes the preflight take minutes.
     foreach ($Id in $Ids)
     {
         $Read = Get-RdaInsightsProviderState -SubscriptionId $Id -TimeoutSeconds $CallTimeoutSeconds
