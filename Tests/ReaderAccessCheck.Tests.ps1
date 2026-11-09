@@ -2495,6 +2495,35 @@ exit 1
         @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains('skipped by the up-front role check') -or $_.Name -like '*.resume-state*' } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
     }
 
+    It 'takes a subscription an earlier run completed off the completed list when it fails again, so -Resume collects it (<Cause>, <Label>)' -TestCases @(
+        @{ Cause = 'consumption incomplete'; Label = 'one stream'; Streams = 1 }
+        @{ Cause = 'consumption incomplete'; Label = 'two streams'; Streams = 2 }
+        @{ Cause = 'collection failed'; Label = 'one stream'; Streams = 1 }
+        @{ Cause = 'collection failed'; Label = 'two streams'; Streams = 2 }
+    ) {
+        param($Cause, $Label, $Streams)
+        # Run 1: Sub A completes, Sub B fails, so the state is kept with A completed.
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -Fail @($script:SubB.Id)
+        $null = script:Invoke-WrapperRun -Streams $Streams
+        (script:Read-WrapperState).Completed | Should -Be @($script:SubA.Id)
+        # Run 2, without -Resume: Sub A fails this time.
+        script:Use-WrapperCase -CaseHome $script:CaseHome
+        if ($Cause -eq 'consumption incomplete') { script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id) }
+        else { script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -Fail @($script:SubA.Id) }
+        $Second = script:Invoke-WrapperRun -Streams $Streams
+        $State = script:Read-WrapperState
+        $State.Failed | Should -Contain $script:SubA.Id -Because ($Second.Text -join "`n")
+        @($State.Completed) | Should -Not -Contain $script:SubA.Id
+        # Run 3, -Resume: Sub A is collected again.
+        script:Use-WrapperCase -CaseHome $script:CaseHome
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB)
+        $Before = @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubA.Id)).Count
+        $Third = script:Invoke-WrapperRun -Streams $Streams -Arguments @('-Resume')
+        $Third.ExitCode | Should -Be 0 -Because ($Third.Text -join "`n")
+        @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubA.Id)).Count | Should -Be ($Before + 1)
+    }
+
     It 'skips a completed subscription on -Resume after collecting one listed before it, when the state held one completed id' {
         script:Use-WrapperCase
         script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -Fail @($script:SubA.Id)
