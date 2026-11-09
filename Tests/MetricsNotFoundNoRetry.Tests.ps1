@@ -205,6 +205,40 @@ Describe 'Get-MetricFailure decides in one order for the whole chain' {
         (Get-MetricFailure -Exception $Ex).Kind | Should -Be $Kind
     }
 
+    It 'reads the Status number an Azure.Core RequestFailedException carries (<Status>)' -ForEach @(
+        @{ Status = 404; Kind = 'NotFound' }
+        @{ Status = 400; Kind = 'BadRequest' }
+        @{ Status = 403; Kind = 'Refused' }
+        @{ Status = 429; Kind = 'Throttled' }
+        @{ Status = 503; Kind = 'Other' }
+    ) {
+        # A stand-in with the same shape: an int Status and a message that names no status.
+        $Ex = [System.Exception]::new('Service request failed.')
+        $Ex | Add-Member -NotePropertyName Status -NotePropertyValue ([int]$Status)
+        $Failure = Get-MetricFailure -Exception $Ex
+        $Failure.Kind | Should -Be $Kind
+        $Failure.Status | Should -Be $Status
+        # Wrapped, it is read the same way.
+        (Get-MetricFailure -Exception ([System.Exception]::new('The request failed.', $Ex))).Kind | Should -Be $Kind
+    }
+
+    It 'lets a Status number decide over the text, as any status does' {
+        $Ex = [System.Exception]::new("upstream: Operation returned an invalid status code 'NotFound'")
+        $Ex | Add-Member -NotePropertyName Status -NotePropertyValue 503
+        (Get-MetricFailure -Exception $Ex).Kind | Should -Be 'Other'
+    }
+
+    It 'does not take a Status that is not an HTTP status number for one (<Label>)' -ForEach @(
+        @{ Label = 'a WebException status'; Value = [System.Net.WebExceptionStatus]::ProtocolError }
+        @{ Label = 'a text'; Value = 'Failed' }
+        @{ Label = 'a number out of range'; Value = 7 }
+    ) {
+        $Ex = [System.Exception]::new("Operation returned an invalid status code 'NotFound'")
+        $Ex | Add-Member -NotePropertyName Status -NotePropertyValue $Value
+        # No status, so Az's text decides.
+        (Get-MetricFailure -Exception $Ex).Kind | Should -Be 'NotFound'
+    }
+
     It 'gives no status for an error with none, and Other' {
         $Failure = Get-MetricFailure -Exception ([System.Exception]::new('Timed out after 120s'))
         $Failure.Kind | Should -Be 'Other'
