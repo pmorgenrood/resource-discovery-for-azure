@@ -84,6 +84,10 @@ function Get-RdaStandInContext
 }
 function Get-AzContext { [CmdletBinding()] param() Get-RdaStandInContext }
 function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context) Get-RdaStandInContext }
+# A parallel run snapshots the context for its stream workers, which import it.
+function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
+function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
+function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
 function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
 function Get-AzAccessToken { [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString) [pscustomobject]@{ Token = 'stand-in-token'; Type = 'Bearer'; ExpiresOn = (Get-Date).AddHours(1) } }
 function Get-AzSubscription
@@ -685,7 +689,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Pf.ExitCode | Should -Be 0
     }
 
-    It 'with -Resume and -ResumeFailedOnly, leaves a retry that an earlier run completed out of the read check, as the run does' {
+    It 'with -Resume and -ResumeFailedOnly, checks a retry that an earlier run also listed as completed, as the run does' {
         script:New-Case
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
         $Failed = @('A', 'B' | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = ('Sub ' + $_); LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 } })
@@ -694,7 +698,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-ResumeFailedOnly')
         $Run = script:Invoke-Wrapper -Arguments @('-Resume', '-ResumeFailedOnly')
         $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight checks what the run checks'
-        $Pf.ExitCode | Should -Be 0
+        $Pf.ExitCode | Should -Be 1 -Because 'Sub A failed after it was completed, so it is retried, and it cannot be read'
     }
 
     It 'ends as the run does when no subscription of the tenant is Enabled' {
@@ -850,6 +854,39 @@ Describe 'A subscription that an earlier run completed and a later run failed' -
         script:Get-Calls | Should -Be (script:Get-Ids 'B', 'C')
         $Run3.ExitCode | Should -Be 0
         Test-Path -LiteralPath $script:State | Should -BeFalse -Because 'nothing is left to retry'
+    }
+}
+
+Describe 'A resume state that lists a subscription as both completed and failed' -Skip:($IsWindows) {
+    It 'is collected by -Resume -ResumeFailedOnly from a state file an earlier version wrote' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{
+            TenantID                 = $script:Tenant
+            CompletedSubscriptionIds = @($script:Subs['A'].Id, $script:Subs['B'].Id)
+            FailedAttempts           = @([pscustomobject]@{ Id = $script:Subs['B'].Id; Name = $script:Subs['B'].Name; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'stand-in'; Attempts = 1 })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
+        $Run = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume', '-ResumeFailedOnly')
+        script:Get-Calls | Should -Be (script:Get-Ids 'B')
+        $Run.ExitCode | Should -Be 0
+        Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+
+    It 'keeps a subscription a parallel run failed off the completed list, so -Resume -ResumeFailedOnly collects it' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
+        $null = script:Invoke-Wrapper -Streams 1
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B', 'C'
+        $null = script:Invoke-Wrapper -Streams 2
+        $State = script:Read-StateAt -Path $script:State
+        $State.Completed | Should -Not -Contain $script:Subs['B'].Id
+        $State.Failed | Should -Be (script:Get-Ids 'B', 'C')
+        script:Clear-Calls
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $Run = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume', '-ResumeFailedOnly')
+        script:Get-Calls | Should -Be (script:Get-Ids 'B', 'C')
+        $Run.ExitCode | Should -Be 0
     }
 }
 

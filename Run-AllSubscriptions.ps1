@@ -900,6 +900,9 @@ if ($PreflightOnly)
         # (read only here: nothing is written back).
         $PfCompleted = @(Get-CompletedSubscriptionIds -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ })
         $PfFailed = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ })
+        # As the run does: a subscription on both lists is not completed.
+        $PfFailedIdsAtStart = @($PfFailed | ForEach-Object { [string]$_.Id })
+        $PfCompleted = @($PfCompleted | Where-Object { $PfFailedIdsAtStart -notcontains $_ })
         $PfStreamCompleted = @()
         $PfStreamFailed = @()
         $PfStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeKey)
@@ -983,6 +986,12 @@ $CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $R
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
 $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey
+# A subscription on both lists failed after it was completed (a run of an
+# earlier version left both): the failure is the newer fact, so it is not
+# completed. Otherwise -Resume -ResumeFailedOnly would keep it as a retry and
+# then skip it as completed, run after run.
+$FailedIdsAtStart = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+$CompletedIds = @($CompletedIds | Where-Object { $FailedIdsAtStart -notcontains [string]$_ })
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -1842,6 +1851,12 @@ else
                     Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
                 }
             }
+            # A subscription a stream failed and did not complete this run is not
+            # completed, whatever an earlier run recorded: otherwise the merge
+            # below drops its new failure, and -Resume skips it.
+            $StreamCompletedIds = @($AllCompletedFromStreams | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $StreamFailedIds = @($AllFailedFromStreams | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Where-Object { $StreamCompletedIds -notcontains $_ })
+            $CompletedIds = @($CompletedIds | Where-Object { $StreamFailedIds -notcontains [string]$_ })
             if ($AllCompletedFromStreams.Count -gt 0)
             {
                 $CompletedIds = @($CompletedIds + $AllCompletedFromStreams | Sort-Object -Unique)
