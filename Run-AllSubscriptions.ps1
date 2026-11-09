@@ -258,8 +258,13 @@ if (-not (Test-Path -Path $AzModulesFunctionsFile -PathType Leaf))
 . $AzModulesFunctionsFile
 
 $RequiredAzSubModules = @('Az.Accounts', 'Az.Compute', 'Az.Monitor', 'Az.Billing')
-$AzAccountsCheck = Test-RdaAzAccountsVersion
-if ($AzAccountsCheck.Status -eq 'LoadedTooOld')
+# -SubModule: the wrapper loads only Az.Accounts, but each subscription's run
+# loads the others. A submodule whose manifest pins an older Az.Accounts would
+# stop every one of those runs, so it stops the run here, once, before any
+# subscription (SubModulePinned), and an older Az.Accounts loaded with one
+# names it (LoadedTooOld).
+$AzAccountsCheck = Test-RdaAzAccountsVersion -SubModule $RequiredAzSubModules
+if ($AzAccountsCheck.Status -in @('LoadedTooOld', 'SubModulePinned'))
 {
     foreach ($AzAccountsLine in $AzAccountsCheck.Messages)
     {
@@ -323,8 +328,9 @@ if ($MissingAzSubModules.Count -gt 0)
     }
 
     # Check once more after the install: no second install, no loop. If the
-    # install did not give a supported Az.Accounts, stop with the command.
-    $AzAccountsCheck = Test-RdaAzAccountsVersion
+    # install did not give a supported Az.Accounts, or a submodule it put
+    # first pins an older one, stop with the command.
+    $AzAccountsCheck = Test-RdaAzAccountsVersion -SubModule $RequiredAzSubModules
     if ($AzAccountsCheck.Status -ne 'Ok')
     {
         foreach ($AzAccountsLine in $AzAccountsCheck.Messages)
@@ -361,8 +367,10 @@ catch
 # -MinimumVersion loads 5.5.4 or newer or throws into the catch. It guards a
 # session where Import-Module is a function that drops -MinimumVersion (one
 # a profile defines, for example), which Tests/AzAccountsVersion.Tests.ps1
-# covers. The printed advice is the way out; nothing retries.
-$AzAccountsCheck = Test-RdaAzAccountsVersion
+# covers. The printed advice is the way out; nothing retries. -SubModule, as
+# above: a submodule that pins an older Az.Accounts stops the run here, once,
+# not in every subscription's run.
+$AzAccountsCheck = Test-RdaAzAccountsVersion -SubModule $RequiredAzSubModules
 if ($AzAccountsCheck.Status -ne 'Ok')
 {
     foreach ($AzAccountsLine in $AzAccountsCheck.Messages)
@@ -403,6 +411,10 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
 Disable-ConsoleQuickEdit
 
 $RunStartTime = Get-Date
+# This run's id. It is in each stream summary's file name and in the summary
+# the stream writes, so when two runs share one inventory root, each removes,
+# reads and accepts only its own stream summaries.
+$RunId = [guid]::NewGuid().ToString()
 $FailedSubscriptions = @()
 # The same failures for RunSummary.log: { Name; Id } for each subscription.
 $FailedSubscriptionDetail = @()
@@ -1184,14 +1196,16 @@ else
     if ($StreamCount -ge 2)
     {
 
-        # A stream's summary file has a fixed path, so one left by an earlier
-        # run (interrupted, or its stream died before writing) would be read
-        # as this run's when this run's stream writes none. Each is removed
-        # before any stream starts; one that cannot be removed stops the run
-        # here, before anything is collected or any state changes.
+        # A stream's summary file name holds the stream number and this run's
+        # id, so another run's summaries are never at these paths. Anything
+        # that is there all the same would be read as this run's when this
+        # run's stream writes none, so each is removed before any stream
+        # starts; one that cannot be removed stops the run here, before
+        # anything is collected or any state changes. Only this run's names
+        # are touched.
         for ($S = 0; $S -lt $StreamCount; $S++)
         {
-            $OldSummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-summary.json" -f $S)
+            $OldSummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-{1}-summary.json" -f $S, $RunId)
             try
             {
                 if (Test-Path -LiteralPath $OldSummaryPath -PathType Leaf) { Remove-Item -LiteralPath $OldSummaryPath -Force -ErrorAction Stop }
@@ -1272,7 +1286,7 @@ else
                 $SliceIds = @($SliceList | ForEach-Object { $_.Id })
                 $SliceNames = @($SliceList | ForEach-Object { $_.Name })
 
-                $SummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-summary.json" -f $S)
+                $SummaryPath = Join-Path $InventoryRoot (".rda-stream-{0}-{1}-summary.json" -f $S, $RunId)
                 $FailuresPath = Join-Path $InventoryRoot ("RunAllSubscriptions_failures_{0}_stream-{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'), $S)
 
                 # The subscriptions this stream will run: under -Resume the
@@ -1313,6 +1327,7 @@ else
                 # hashtable when present with value $true.
                 $WorkerArgs = @{
                     TenantID           = $TenantID
+                    RunId              = $RunId
                     StreamId           = [string]$S
                     InventoryRoot      = $InventoryRoot
                     ScriptRoot         = $PSScriptRoot
@@ -1383,142 +1398,128 @@ else
             # same shape as a sequential run.
             foreach ($S in $StreamSummaries)
             {
-                if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
-                {
-                    Write-Host ("[stream-{0}] WARNING: no summary file at {1} - the stream did not finish cleanly" -f $S.StreamId, $S.SummaryPath) -ForegroundColor Yellow
-                    # As for a summary that cannot be read: the stream's
-                    # subscriptions are not confirmed, not failed.
-                    $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Missing' }
-                    continue
-                }
+                # Each stream is read on its own: a throw while one is read
+                # makes that stream not confirmed, and the next stream is
+                # still read, so no stream's subscriptions drop out of every
+                # list. $Recorded is set once the stream is in a list.
+                $Recorded = $false
                 try
                 {
-                    $StreamSummary = Get-Content -Path $S.SummaryPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                }
-                catch
-                {
-                    Write-Host ("[stream-{0}] ERROR: could not parse summary file {1}: {2}" -f $S.StreamId, $S.SummaryPath, $_.Exception.Message) -ForegroundColor Red
-                    $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
-                    continue
-                }
-                # Read, but taken as this run's summary of the stream only when
-                # it is a JSON object that names this stream and has a row for
-                # every subscription the stream ran this time. Anything else
-                # ('{}', 'null', a list, another stream's, too few rows) is
-                # treated as a summary that cannot be read: not confirmed.
-                $NotThisRun = $null
-                if ($StreamSummary -isnot [System.Management.Automation.PSCustomObject])
-                {
-                    $NotThisRun = 'it is not a JSON object'
-                }
-                elseif ([string]$StreamSummary.StreamId -ne [string]$S.StreamId)
-                {
-                    $NotThisRun = ("it names stream '{0}'" -f $StreamSummary.StreamId)
-                }
-                else
-                {
-                    $RowIds = @(@($StreamSummary.ResourceCounts) + @($StreamSummary.Failed) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
-                    $NoRow = @($S.ExpectedIds | Where-Object { $RowIds -notcontains $_ })
-                    if ($NoRow.Count -gt 0) { $NotThisRun = ('it has no row for {0} of the {1} subscription(s) the stream ran' -f $NoRow.Count, $S.SubCount) }
-                    else
+                    if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
                     {
-                        # Each success row must hold what the aggregation and
-                        # the output verification read: Count a whole number
-                        # of 0 or more, and Zip empty or a path. The values
-                        # are not printed (they can hold real names).
-                        $BadRows = @(@($StreamSummary.ResourceCounts) | Where-Object { $null -ne $_ } | Where-Object {
-                                $Row = $_
-                                $CountOk = ($Row.Count -is [int] -or $Row.Count -is [long]) -and $Row.Count -ge 0 -and $Row.Count -le [int]::MaxValue
-                                $ZipOk = $null -eq $Row.Zip -or ($Row.Zip -is [string] -and ($Row.Zip -eq '' -or $(try { $null = [System.IO.Path]::GetFullPath($Row.Zip); $true } catch { $false })))
-                                -not ($CountOk -and $ZipOk)
-                            })
-                        if ($BadRows.Count -gt 0) { $NotThisRun = ('{0} of its success row(s) have a Count that is not a whole number of 0 or more, or a Zip that is not a path' -f $BadRows.Count) }
+                        # As for a summary that cannot be read: the stream's
+                        # subscriptions are not confirmed, not failed.
+                        $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Missing' }
+                        $Recorded = $true
+                        Write-Host ("[stream-{0}] WARNING: no summary file at {1} - the stream did not finish cleanly" -f $S.StreamId, $S.SummaryPath) -ForegroundColor Yellow
+                        continue
                     }
-                }
-                if ($null -ne $NotThisRun)
-                {
-                    Write-Host ("[stream-{0}] ERROR: summary file {1} is not this run's summary of stream {0}: {2}" -f $S.StreamId, $S.SummaryPath, $NotThisRun) -ForegroundColor Red
-                    $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
-                    continue
-                }
-
-                # Surface stream-level failures (failed-to-start, etc.) so the
-                # wrapper transcript distinguishes "the whole stream broke" from
-                # "the stream ran fine but some subs in it failed". Per-sub
-                # failures are still folded into $FailedSubscriptions via the
-                # streamSummary.Failed enumeration below.
-                if ($StreamSummary.Status -and $StreamSummary.Status -ne 'ok' -and $StreamSummary.Status -ne 'partial-failure')
-                {
-                    $ReasonText = if ($StreamSummary.Reason) { $StreamSummary.Reason } else { '(no reason given)' }
-                    Write-Host ("[stream-{0}] stream status: {1} - {2}" -f $S.StreamId, $StreamSummary.Status, $ReasonText) -ForegroundColor Red
-                }
-
-                if ($StreamSummary.ResourceCounts)
-                {
-                    foreach ($rc in $StreamSummary.ResourceCounts)
+                    try
                     {
-                        if ($null -eq $rc) { continue }
-                        $SubResourceCounts += [pscustomobject]@{
-                            Name    = $rc.Name
-                            Id      = $rc.Id
-                            Count   = [int]$rc.Count
-                            # Missing in a summary from an older worker: 0.
-                            # Null: the worker's count query failed (unknown).
-                            Skipped = if ($null -eq $rc.PSObject.Properties['Skipped']) { [long]0 } elseif ($null -ne $rc.Skipped) { [long]$rc.Skipped } else { $null }
-                            Zip     = [string]$rc.Zip
-                        }
+                        $StreamSummary = Get-Content -Path $S.SummaryPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
                     }
-                }
+                    catch
+                    {
+                        $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
+                        $Recorded = $true
+                        Write-Host ("[stream-{0}] ERROR: could not parse summary file {1}: {2}" -f $S.StreamId, $S.SummaryPath, $_.Exception.Message) -ForegroundColor Red
+                        continue
+                    }
+                    # Read, but taken as this run's summary of the stream only
+                    # when Resolve-StreamSummary accepts it: a JSON object that
+                    # names this run and this stream, has a row for every
+                    # subscription the stream ran this time, and holds in
+                    # every field the aggregation reads the shape the worker
+                    # writes. Anything else ('{}', 'null', a list, another
+                    # run's or stream's, too few rows, a bad value) is
+                    # treated as a summary that cannot
+                    # be read: not confirmed. Only its checked values are used
+                    # below.
+                    $Read = Resolve-StreamSummary -Summary $StreamSummary -RunId $RunId -StreamId $S.StreamId -ExpectedIds $S.ExpectedIds
+                    if (-not $Read.Accepted)
+                    {
+                        $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
+                        $Recorded = $true
+                        Write-Host ("[stream-{0}] ERROR: summary file {1} is not this run's summary of stream {0}: {2}" -f $S.StreamId, $S.SummaryPath, $Read.Reason) -ForegroundColor Red
+                        continue
+                    }
 
-                if ($StreamSummary.Failed)
-                {
-                    foreach ($f in $StreamSummary.Failed)
+                    # All of the stream's values are added together, after
+                    # they are all read.
+                    $SubResourceCounts += @($Read.ResourceCounts)
+                    foreach ($f in @($Read.Failed))
                     {
                         $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $f.Name, $S.StreamId, $f.Reason)
                         $FailedSubscriptionDetail += [pscustomobject]@{ Name = $f.Name; Id = $f.Id }
                     }
-                }
-
-                if ($null -ne $StreamSummary.ConsumptionRecords)
-                {
-                    if ($null -eq $Global:ConsumptionRecordCount) { $Global:ConsumptionRecordCount = 0 }
-                    $Global:ConsumptionRecordCount = [int]$Global:ConsumptionRecordCount + [int]$StreamSummary.ConsumptionRecords
-                }
-                if ($StreamSummary.ConsumptionFailedSubs -and $StreamSummary.ConsumptionFailedSubs.Count -gt 0)
-                {
-                    if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
-                    $Global:ConsumptionFailedSubs += @($StreamSummary.ConsumptionFailedSubs)
-                }
-
-                if ($StreamSummary.MetricsFailedSubs -and $StreamSummary.MetricsFailedSubs.Count -gt 0)
-                {
-                    if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
-                    $Global:MetricsFailedSubs += @($StreamSummary.MetricsFailedSubs)
-                }
-
-                if ($StreamSummary.CollectorFailures -and $StreamSummary.CollectorFailures.Count -gt 0)
-                {
-                    if ($null -eq $Global:CollectorFailures) { $Global:CollectorFailures = @() }
-                    $Global:CollectorFailures += @($StreamSummary.CollectorFailures)
-                }
-
-                # If a stream wrote a failures log, add it to the wrapper's diag-file
-                # accumulator so the final summary surfaces the path. The wrapper's
-                # existing $DiagFile was nullable; using a single concatenated log
-                # avoids breaking that contract.
-                if ((Test-Path -Path $S.FailuresPath -PathType Leaf) -and ((Get-Item $S.FailuresPath).Length -gt 0))
-                {
-                    if ($null -eq $DiagFile)
+                    if ($null -ne $Read.ConsumptionRecords)
                     {
-                        $DiagFile = Join-Path $InventoryRoot ("RunAllSubscriptions_failures_{0}_{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'), [guid]::NewGuid().ToString().Substring(0, 4))
+                        if ($null -eq $Global:ConsumptionRecordCount) { $Global:ConsumptionRecordCount = 0 }
+                        $Global:ConsumptionRecordCount = [int]$Global:ConsumptionRecordCount + $Read.ConsumptionRecords
                     }
-                    try
+                    if (@($Read.ConsumptionFailedSubs).Count -gt 0)
                     {
-                        Get-Content -Path $S.FailuresPath -Raw | Out-File -FilePath $DiagFile -Append -Encoding utf8
+                        if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
+                        $Global:ConsumptionFailedSubs += @($Read.ConsumptionFailedSubs)
                     }
-                    catch
+                    if (@($Read.MetricsFailedSubs).Count -gt 0)
                     {
-                        Write-Verbose ("Failed to merge stream failures log {0}: {1}" -f $S.FailuresPath, $_.Exception.Message)
+                        if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
+                        $Global:MetricsFailedSubs += @($Read.MetricsFailedSubs)
+                    }
+                    if (@($Read.CollectorFailures).Count -gt 0)
+                    {
+                        if ($null -eq $Global:CollectorFailures) { $Global:CollectorFailures = @() }
+                        $Global:CollectorFailures += @($Read.CollectorFailures)
+                    }
+                    $Recorded = $true
+
+                    # Surface stream-level failures (failed-to-start, etc.) so the
+                    # wrapper transcript distinguishes "the whole stream broke" from
+                    # "the stream ran fine but some subs in it failed". Per-sub
+                    # failures are folded into $FailedSubscriptions above.
+                    if ($Read.Status -and $Read.Status -ne 'ok' -and $Read.Status -ne 'partial-failure')
+                    {
+                        $ReasonText = if ($Read.StatusReason) { $Read.StatusReason } else { '(no reason given)' }
+                        Write-Host ("[stream-{0}] stream status: {1} - {2}" -f $S.StreamId, $Read.Status, $ReasonText) -ForegroundColor Red
+                    }
+
+                    # If a stream wrote a failures log, add it to the wrapper's diag-file
+                    # accumulator so the final summary surfaces the path. The wrapper's
+                    # existing $DiagFile was nullable; using a single concatenated log
+                    # avoids breaking that contract.
+                    if ((Test-Path -Path $S.FailuresPath -PathType Leaf) -and ((Get-Item $S.FailuresPath).Length -gt 0))
+                    {
+                        if ($null -eq $DiagFile)
+                        {
+                            $DiagFile = Join-Path $InventoryRoot ("RunAllSubscriptions_failures_{0}_{1}.log" -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'), [guid]::NewGuid().ToString().Substring(0, 4))
+                        }
+                        try
+                        {
+                            Get-Content -Path $S.FailuresPath -Raw | Out-File -FilePath $DiagFile -Append -Encoding utf8
+                        }
+                        catch
+                        {
+                            Write-Verbose ("Failed to merge stream failures log {0}: {1}" -f $S.FailuresPath, $_.Exception.Message)
+                        }
+                    }
+                }
+                catch
+                {
+                    # Its values were not added: not confirmed. After they
+                    # were added, only a console line or the failures log
+                    # was lost, and the stream stays confirmed.
+                    $ReadError = $_.Exception.Message
+                    if (-not $Recorded)
+                    {
+                        $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
+                        try { Write-Host ("[stream-{0}] ERROR: could not read the summary of stream {0}: {1}" -f $S.StreamId, $ReadError) -ForegroundColor Red }
+                        catch { $null = $_ }
+                    }
+                    else
+                    {
+                        try { Write-Host ("[stream-{0}] WARNING: after its results were read: {1}" -f $S.StreamId, $ReadError) -ForegroundColor Yellow }
+                        catch { $null = $_ }
                     }
                 }
             }
@@ -1760,6 +1761,19 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
 {
     # Filter ZIPs by current run timestamp only
     $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # Then only the zips this run's subscriptions named (the Zip of each
+    # success row, which the output verification above found), so a zip
+    # another run writes under the same inventory root in the same time is
+    # left out. When a stream's summary is missing or could not be read, its
+    # subscriptions' zips cannot be named, so the time filter alone is kept
+    # and the Exit code lines say to check the consolidated zip for them.
+    if ($UnreadableStreamSummaries.Count -eq 0)
+    {
+        $ZipPathComparer = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
+        $RunZipPaths = [System.Collections.Generic.HashSet[string]]::new($ZipPathComparer)
+        foreach ($Row in @($SubResourceCounts | Where-Object { -not [string]::IsNullOrEmpty($_.Zip) })) { [void]$RunZipPaths.Add([System.IO.Path]::GetFullPath([string]$Row.Zip)) }
+        $SubZips = @($SubZips | Where-Object { $RunZipPaths.Contains([System.IO.Path]::GetFullPath($_.FullName)) })
+    }
     if ($SubZips.Count -gt 0)
     {
         $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -1842,7 +1856,7 @@ if ($FailedSubscriptions.Count -eq 0 -and $UnreadableStreamSummaries.Count -eq 0
     }
     catch
     {
-        Write-Host ("WARNING: Could not remove resume state file {0}: $_" -f $ResumeStateFile) -ForegroundColor Yellow
+        Write-Host ('WARNING: Could not remove resume state file {0}: {1}' -f $ResumeStateFile, $_) -ForegroundColor Yellow
     }
 }
 
