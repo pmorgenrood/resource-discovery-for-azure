@@ -36,6 +36,20 @@ Describe "Classifier fidelity: nonprod words and prod default" {
         @($script:HintPatterns | ForEach-Object { $_.Replace('/|', '') } | Select-Object -Unique).Count | Should -BeLessOrEqual 1 -Because 'every class uses the same segment hint'
     }
 
+    It "picks every masked token prefix with the rule, never a fixed prefix" {
+        # Every '$<name>Prefix =' line of ResourceInventory.ps1 either runs the
+        # rule, calls the shared classifier, uses the flag the rule set, or
+        # keeps the prefix of a token already made. A line that writes a fixed
+        # 'prod_' would let one kind of token skip the rule.
+        $Source = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1')
+        $Assignments = @($Source | Where-Object { $_ -match '^\s*\$\w*Prefix\s*=' })
+        $Assignments.Count | Should -BeGreaterOrEqual 1
+        foreach ($Line in $Assignments)
+        {
+            ($Line -match "-match '\\b\(" -or $Line -match 'Get-ObfuscationPrefix' -or $Line -match '\$IsNonProd' -or $Line -match "\.Split\('_'\)\[0\]") | Should -BeTrue -Because "'$($Line.Trim())' must pick the prefix with the rule"
+        }
+    }
+
     It "classifies nonprod word '<Keyword>' as nonprod_" -ForEach @(
         @{ Keyword = 'dev'; Sample = 'app-dev-01' }
         @{ Keyword = 'test'; Sample = 'test-db-01' }
