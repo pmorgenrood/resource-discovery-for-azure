@@ -488,21 +488,6 @@ function Resolve-TenantId
     return $Resolved
 }
 
-# Why -SubscriptionID cannot be used ($Value), or $null when it can: it must be
-# a subscription id, which Azure writes as a GUID (8-4-4-4-12 hex digits,
-# spaces around it allowed). Empty is a reason too, so a -SubscriptionID that
-# was given never turns into a run of the whole tenant.
-function Get-SubscriptionIdProblem
-{
-    param([AllowNull()][AllowEmptyString()][string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return 'it is empty' }
-    if ($Value.Trim() -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
-    {
-        return 'it is not a subscription id, which is a GUID such as 00000000-0000-0000-0000-000000000000'
-    }
-    return $null
-}
-
 # The key that names a run's resume state files and is recorded in them as
 # TenantID (the -Tenant value of every resume state helper): the tenant, as
 # before, for a run of the whole tenant, and '<tenant>-subscription-<id>' in

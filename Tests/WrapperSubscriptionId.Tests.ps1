@@ -273,22 +273,6 @@ Describe 'The -SubscriptionID helpers' {
         . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
     }
 
-    It 'takes a GUID, with spaces around it and in any letter case' {
-        Get-SubscriptionIdProblem -Value 'aaaaaaaa-0000-4000-8000-000000000001' | Should -BeNullOrEmpty
-        Get-SubscriptionIdProblem -Value ' AAAAAAAA-0000-4000-8000-000000000001 ' | Should -BeNullOrEmpty
-    }
-
-    It 'gives a reason for <Value>' -ForEach @(
-        @{ Value = ''; Reason = 'it is empty' }
-        @{ Value = '   '; Reason = 'it is empty' }
-        @{ Value = 'my-subscription'; Reason = 'it is not a subscription id*' }
-        @{ Value = '{aaaaaaaa-0000-4000-8000-000000000001}'; Reason = 'it is not a subscription id*' }
-        @{ Value = 'aaaaaaaa00004000800000000000001'; Reason = 'it is not a subscription id*' }
-        @{ Value = 'aaaaaaaa-0000-4000-8000-000000000001,bbbbbbbb-0000-4000-8000-000000000002'; Reason = 'it is not a subscription id*' }
-    ) {
-        Get-SubscriptionIdProblem -Value $Value | Should -BeLike $Reason
-    }
-
     It 'keys a run of the whole tenant by the tenant as it is, and a one-subscription run by both in small letters' {
         Get-ResumeStateKey -Tenant 'ABCDEF01-1234-1234-1234-123456789012' | Should -BeExactly 'ABCDEF01-1234-1234-1234-123456789012'
         Get-ResumeStateKey -Tenant 'ABCDEF01-1234-1234-1234-123456789012' -SubscriptionID '' | Should -BeExactly 'ABCDEF01-1234-1234-1234-123456789012'
@@ -722,7 +706,8 @@ Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
         $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
         $Body = @($Block.Clauses[0].Item2.Statements)
-        $EmptyStop = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match "ContainsKey\('SubscriptionID'\)" })
+        # The id check, the first statement of the script (before the 5.1 block).
+        $EmptyStop = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq "`$PSBoundParameters.ContainsKey('SubscriptionID')" })
         $Forward = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.ForEachStatementAst] -and $_.Extent.Text -match 'PSBoundParameters\.GetEnumerator' })
         $script:Found = @($EmptyStop.Count, $Forward.Count)
         $script:Probe = Join-Path ([System.IO.Path]::GetTempPath()) ('ps51-probe-' + [guid]::NewGuid().ToString('N') + '.ps1')
@@ -732,12 +717,30 @@ Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
     }
     AfterAll { Remove-Item -LiteralPath $script:Probe -Force -ErrorAction SilentlyContinue }
 
-    It 'finds the empty -SubscriptionID stop as the first statement, before any install offer, and the forwarding loop' {
+    It 'finds the -SubscriptionID check as the first statement of the script, before the PowerShell 7, Azure CLI and Az module set-up, and the forwarding loop' {
         $script:Found | Should -Be @(1, 1)
         $Path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
-        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersion\.Major -lt 7' })[0]
-        @($Block.Clauses[0].Item2.Statements)[0].Extent.Text | Should -Match "ContainsKey\('SubscriptionID'\)"
+        @($Ast.EndBlock.Statements)[0].Extent.Text | Should -Match "ContainsKey\('SubscriptionID'\)"
+        $First = @($Ast.EndBlock.Statements)[0].Extent.EndOffset
+        foreach ($Setup in 'Get-Command az', 'Install-Module', 'Import-Module', 'PSVersion.Major -lt 7') { $Ast.Extent.Text.IndexOf($Setup) | Should -BeGreaterThan $First -Because "$Setup comes after the id check" }
+    }
+
+    It 'stops a non-GUID -SubscriptionID with exit 1 before re-launching, giving the reason (<Value>)' -ForEach @(
+        @{ Value = 'my-subscription' }
+        @{ Value = '{aaaaaaaa-0000-4000-8000-000000000001}' }
+        @{ Value = 'aaaaaaaa00004000800000000000001' }
+        @{ Value = 'aaaaaaaa-0000-4000-8000-000000000001,bbbbbbbb-0000-4000-8000-000000000002' }
+    ) {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID $Value
+        $LASTEXITCODE | Should -Be 1
+        ($Out -join "`n") | Should -BeLike ("*ERROR: -SubscriptionID '{0}' cannot be used: it is not a subscription id*" -f $Value)
+        @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -BeNullOrEmpty
+    }
+
+    It 'takes a GUID with spaces around it and in any letter case' {
+        $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID ' AAAAAAAA-0000-4000-8000-000000000001 '
+        $LASTEXITCODE | Should -Be 0
     }
 
     It 'forwards -SubscriptionID with its value and -PreflightOnly as a bare switch' {

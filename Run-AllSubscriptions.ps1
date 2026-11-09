@@ -111,6 +111,28 @@ param (
     [switch]$PreflightOnly
 )
 
+# -SubscriptionID must be a subscription id (a GUID). Checked first, before
+# PowerShell 7, the Azure CLI or the Az modules are looked for, offered or
+# installed, and before any file is written, so a mistyped id changes nothing
+# on the machine and never starts a run. Given but empty is a mistake too
+# (Windows PowerShell would drop an empty value when it re-launches the script
+# in PowerShell 7), never a run of the whole tenant. Windows PowerShell 5.1
+# syntax only, like the block below.
+if ($PSBoundParameters.ContainsKey('SubscriptionID'))
+{
+    $SubscriptionIdProblem = $null
+    if ([string]::IsNullOrWhiteSpace($SubscriptionID)) { $SubscriptionIdProblem = 'it is empty' }
+    elseif ($SubscriptionID.Trim() -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { $SubscriptionIdProblem = 'it is not a subscription id, which is a GUID such as 00000000-0000-0000-0000-000000000000' }
+    if ($null -ne $SubscriptionIdProblem)
+    {
+        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: {1}. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID, $SubscriptionIdProblem) -ForegroundColor Red
+        Write-Host "  Next: pass the subscription's id, as 'Get-AzSubscription -TenantId <tenant>' lists it, or leave -SubscriptionID out to collect every subscription." -ForegroundColor Yellow
+        # As Exit-Wrapper says it for a preflight (its functions are not loaded yet).
+        if ($PreflightOnly) { Write-Host 'Preflight failed: the subscription id. Nothing was collected or written to the inventory folder (exit 1).' -ForegroundColor Red }
+        exit 1
+    }
+}
+
 # ---------------------------------------------------------------------------
 # PowerShell 7 bootstrap. This MUST run before the dot-source below: the helper
 # files this script loads declare "#requires -Version 7.0", which Windows
@@ -126,16 +148,6 @@ param (
 # ---------------------------------------------------------------------------
 if ($PSVersionTable.PSVersion.Major -lt 7)
 {
-    # Windows PowerShell drops an empty native argument, so an empty
-    # -SubscriptionID would reach PowerShell 7 with no value. Stop here, first,
-    # before any offer to install PowerShell 7, with the message PowerShell 7
-    # gives for it.
-    if ($PSBoundParameters.ContainsKey('SubscriptionID') -and [string]::IsNullOrWhiteSpace($SubscriptionID))
-    {
-        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: it is empty. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID) -ForegroundColor Red
-        exit 1
-    }
-
     Write-Host ("Detected Windows PowerShell {0}. This tool requires PowerShell 7." -f $PSVersionTable.PSVersion) -ForegroundColor Yellow
 
     $PwshPath = $null
@@ -502,21 +514,11 @@ if ($PreflightOnly)
 # run under Set-StrictMode never reads it unset.
 $WrapperTranscriptStarted = $false
 
-# -SubscriptionID must be a subscription id (a GUID). Checked here, before the
-# run creates or writes any file (the inventory folder, the transcript), so a
-# mistyped id never starts a run. Given but empty is a mistake too, never a run
-# of the whole tenant.
-$script:PreflightCheck = 'the subscription id'
+# -SubscriptionID was checked at the start (a GUID); from here on it is the
+# id in small letters.
 $OneSubscription = $PSBoundParameters.ContainsKey('SubscriptionID')
 if ($OneSubscription)
 {
-    $SubscriptionIdProblem = Get-SubscriptionIdProblem -Value $SubscriptionID
-    if ($null -ne $SubscriptionIdProblem)
-    {
-        Write-Host ("ERROR: -SubscriptionID '{0}' cannot be used: {1}. The run stopped before creating or writing any file (exit 1)." -f $SubscriptionID, $SubscriptionIdProblem) -ForegroundColor Red
-        Write-Host "  Next: pass the subscription's id, as 'Get-AzSubscription -TenantId <tenant>' lists it, or leave -SubscriptionID out to collect every subscription." -ForegroundColor Yellow
-        Exit-Wrapper -Code 1
-    }
     $SubscriptionID = $SubscriptionID.Trim().ToLowerInvariant()
 }
 
