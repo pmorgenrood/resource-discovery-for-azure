@@ -172,9 +172,19 @@ cleanly (the loop exited because the `ContinuationToken` was exhausted).
 ## Recovering from a consumption crash
 
 If a subscription's consumption is incomplete (see the diagnostics log, or a
-`Complete = $false` health entry), you do not need to re-run the whole tenant.
-The rows already written to the CSV up to the failed page are valid and kept —
-you re-collect that subscription's consumption and splice the fresh copy back in.
+`Complete = $false` health entry), the simple way is the one the run's
+**FAILED (consumption)** lines give: fix the cause, run the same command again
+with the same settings (without `-Resume` or `-ResumeFailedOnly`), and upload
+only the new report.
+
+The splice below is only for a report that holds **that one subscription**: a
+per-subscription report of `Run-AllSubscriptions.ps1`, or a direct run with
+`-SubscriptionID`. It replaces the report's whole consumption CSV with the
+recovery run's, so for a report of several subscriptions (a direct run without
+`-SubscriptionID`) it would drop the consumption of every other subscription;
+for such a report, run the same command again instead. In a one-subscription
+report you re-collect that subscription's consumption and splice the fresh copy
+in.
 
 **Step 1 — re-collect the subscription with consumption enabled.** Seed with the
 original run's obfuscation dictionary so the recovered data lines up with the
