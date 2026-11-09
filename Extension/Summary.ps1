@@ -159,11 +159,11 @@ if ($Samples.Count -gt 0)
 # that EXISTS; the consumption CSV lists VMs that produced a compute-usage
 # record in the billing window. A running VM with no compute-usage record is an
 # anomaly - it usually means consumption data was incomplete for that VM's
-# subscription (auth / billing-scope gap), not that the VM is idle. We compare
-# counts, and also the ids when the two files' ids meet. The output contract
-# gives the inventory ID and the consumption ResourceId the same string, so ids
-# that never meet are an older or broken mask; such a report is compared by
-# counts only.
+# subscription (auth / billing-scope gap), not that the VM is idle. The ids
+# decide (a running VM is billed when its own id, or its scale set's, is): the
+# output contract gives the inventory ID and the consumption ResourceId the
+# same string. Only a masked report whose ids never meet (an older or broken
+# mask), or one with a running VM without an ID, is compared by counts.
 $VmBilling = $null
 if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $ConsumptionFile -PathType Leaf))
 {
@@ -212,12 +212,10 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
     if ($HasConsumptionData -and $RunningVmCount -gt 0)
     {
         $Gap = $RunningVmCount - $BilledVmCount
-        # When the files' ids can be joined (at least one running VM's ID is a
-        # billed id, case aside), a running VM is billed only when its own ID
+        # By id (case aside), a running VM is billed only when its own ID, or
+        # its scale set's (the VM's Set: a member can be billed under the set),
         # is: equal counts can hide a running VM with no charge beside a billed
-        # id of another VM. Ids that never meet fall back to the counts.
-        # A scale set member can be billed under its scale set's id (the VM's
-        # Set), so either id counts.
+        # id of another VM.
         $IdRunningVms = @($RunningVms | Where-Object { $_.PSObject.Properties.Name -contains 'ID' -and -not [string]::IsNullOrWhiteSpace([string]$_.ID) })
         $MatchedVmCount = @($RunningVms | Where-Object {
                 $Ids = @(foreach ($Key in 'ID', 'Set') { if ($_.PSObject.Properties.Name -contains $Key -and -not [string]::IsNullOrWhiteSpace([string]$_.$Key)) { [string]$_.$Key } })
