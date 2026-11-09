@@ -749,7 +749,8 @@ function Test-AzPsTokenSilent
 }
 
 # Machine-facing signal. Exit code 3 == "completed, but a requested data phase
-# was auth-skipped". Exit code 4 == "completed, but one or more collectors
+# was auth-skipped, or a subscription's consumption download failed or stopped
+# part-way". Exit code 4 == "completed, but one or more collectors
 # failed for one or more subscriptions" (#22). Exit code 5 == BOTH occurred in
 # the same run. A plain if/elseif chain would let 3 mask 4 (or vice versa) when
 # both problems occur together, silently hiding one from any automation that
@@ -765,7 +766,7 @@ function Test-AzPsTokenSilent
 #
 # Priority logic pulled into its own function so it is independently
 # unit-testable (see Tests/RunAllSubscriptionsReconciliation.Tests.ps1) without
-# requiring a live wrapper run. Pure function: two booleans in, exit code out.
+# requiring a live wrapper run. Pure function: three booleans in, exit code out.
 function Get-WrapperExitCode
 {
     param(
