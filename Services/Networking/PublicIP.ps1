@@ -49,8 +49,8 @@ if ($Task -eq 'Processing')
             if (-not [string]::IsNullOrEmpty([string]$Data.ipConfiguration.id))
             {
                 $AssocId = $Data.ipConfiguration.id
-                $AssociatedResource = if ([string]::IsNullOrEmpty($AssocId)) { $null } elseif ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
-                $AssociatedResourceType = if ([string]::IsNullOrEmpty($AssocId)) { $null } else { $AssocId.split('/')[7] }
+                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
+                $AssociatedResourceType = $AssocId.split('/')[7]
             }
             elseif (-not [string]::IsNullOrEmpty([string]$Data.natGateway.id))
             {
