@@ -129,8 +129,9 @@ Describe "Obfuscated ID Uniqueness" {
             {
                 # A child resource also names its parent (a database its server,
                 # a volume its account and pool), and two children of one name
-                # under two parents are two resources.
-                @($G.Group | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $_.Name, $_.ResourceGroup, $_.Subscription, $_.DatabaseServer, $_.ManagedInstance, $_.ParentVirtualMachine, $_.NetAppAccount, $_.CapacityPool } | Select-Object -Unique).Count | Should -Be 1 -Because "rows of masked id '$($G.Name)' in $($Section.Name) are one resource, so they share one name, group, subscription and parent"
+                # under two parents are two resources. An Automation row has no
+                # Name: its resource is the runbook of its account.
+                @($G.Group | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}' -f $_.Name, $_.ResourceGroup, $_.Subscription, $_.DatabaseServer, $_.ManagedInstance, $_.ParentVirtualMachine, $_.NetAppAccount, $_.CapacityPool, $_.AutomationAccountName, $_.RunbookName } | Select-Object -Unique).Count | Should -Be 1 -Because "rows of masked id '$($G.Name)' in $($Section.Name) are one resource, so they share one name, group, subscription and parent"
             }
         }
     }
