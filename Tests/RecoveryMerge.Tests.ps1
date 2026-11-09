@@ -598,7 +598,8 @@ Describe 'Merge-RecoveryData consumption handling' {
             '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,',
             '{},Compute,m1,MET,eastus,vm,-1,Hours,2026-01-01,2026-01-02,/id,eastus,,,',
             '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,,eastus,,,',
-            '{},Compute,,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,'
+            '{},Compute,,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,',
+            '{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,"   ",eastus,,,'
         ) -join "`n"
         $GapCsv = if ($Which -eq 'gap') { $Csv } else { $script:CsvHeader }
         $RecCsv = if ($Which -eq 'recovery') { $Csv } else { $script:CsvHeader }
@@ -613,7 +614,25 @@ Describe 'Merge-RecoveryData consumption handling' {
         (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash | Should -Be (Get-FileHash -LiteralPath $Source).Hash
         $Drop = @($Result.Warnings | Where-Object { $_ -like '*downstream drops each such row*' })
         $Drop.Count | Should -Be 1
-        $Drop[0] | Should -BeLike ("*the $Which bundle's consumption file '{0}' has 3 row(s)*" -f (Split-Path -Leaf $Source))
+        $Drop[0] | Should -BeLike ("*the $Which bundle's consumption file '{0}' has 4 row(s)*" -f (Split-Path -Leaf $Source))
+    }
+
+    It 'merges a masked consumption file with a whitespace-only ResourceId, which downstream drops by itself' {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $Csv = @(
+            $script:CsvHeader,
+            ('{{}},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,{0},eastus,,,' -f $Masked.Records[0].ID),
+            '{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,"   ",eastus,,,'
+        ) -join "`n"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        @($Result.Warnings | Where-Object { $_ -like '*has 1 row(s) with an empty ResourceId*' }).Count | Should -Be 1
     }
 
     It 'reads each consumption file in one streaming pass that keeps no row' {

@@ -136,7 +136,7 @@ Behaviour:
   dictionary that is not empty proves nothing about the files beside it either,
   so when both bundles have a dictionary every id the merge takes must be
   masked: each inventory record's `ID`, each consumption row's `ResourceId`
-  (an empty one is skipped, as downstream drops that row) and each metric's
+  (an empty or whitespace-only one is skipped, as downstream drops that row) and each metric's
   `ID`. Masked means a flat `prod_`/`nonprod_` token, or `obfuscated` or
   `obfuscated_<guid>` for an id that could not be masked (the flat forms this
   tool writes under `-Obfuscate` today), or an ARM path whose subscription,
