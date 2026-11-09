@@ -511,7 +511,9 @@ function Invoke-RdaInsightsProviderPreflight
         }
         else
         {
-            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}). Registering needs the /register/action permission, which the Contributor and Owner roles include. Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError) -ForegroundColor Yellow
+            # The right is named only when Azure refused the register for lack of it.
+            $Rights = if ($RegisterError -match '\bHTTP 403\b|AuthorizationFailed') { ' Registering needs the /register/action permission, which the Contributor and Owner roles include.' } else { '' }
+            Write-Host ('  Could not register Microsoft.Insights on subscription {0} ({1}).{2} Its metrics are collected with one call per resource.' -f $Entry.SubscriptionId, $RegisterError, $Rights) -ForegroundColor Yellow
             $Result.NotRegistered.Add($Entry.SubscriptionId)
         }
     }
