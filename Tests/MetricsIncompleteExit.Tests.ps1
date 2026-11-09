@@ -602,6 +602,59 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
     }
 }
 
+Describe 'The wrapper''s next ResourceInventory.ps1 run after one that exited 2' {
+    BeforeAll {
+        # Each block that runs ResourceInventory.ps1 for one subscription, from
+        # its first statement to the exit code check, as written. A stand-in
+        # ResourceInventory.ps1 in the same folder ends without calling exit,
+        # as a run whose zip was written does.
+        function script:Get-InventoryCallBlocks
+        {
+            param([string]$File)
+            $Ast = Get-ScriptAst -File $File
+            $Calls = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.InvocationOperator -eq 'Ampersand' -and $Node.Extent.Text -match 'ResourceInventory\.ps1' }, $true))
+            foreach ($Call in $Calls)
+            {
+                $Block = $Call.Parent.Parent
+                $Statements = @($Block.Statements)
+                $Check = @(0..($Statements.Count - 1) | Where-Object { $Statements[$_].Extent.Text -match '^if \(\$null -ne \$LASTEXITCODE' })[0]
+                [pscustomobject]@{ File = $File; Line = $Call.Extent.StartLineNumber; Text = (@($Statements[0..$Check] | ForEach-Object { $_.Extent.Text }) -join "`n") }
+            }
+        }
+        $script:CallBlocks = @(
+            Get-InventoryCallBlocks -File 'Run-AllSubscriptions.ps1'
+            Get-InventoryCallBlocks -File 'Run-AllSubscriptions.Stream.ps1'
+        )
+        $script:CallFolder = Join-Path $TestDrive 'inventory-call'
+        New-Item -ItemType Directory -Path $script:CallFolder -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:CallFolder 'ResourceInventory.ps1') -Value '$null = $args'
+        $script:SessionExit = $global:LASTEXITCODE
+    }
+    AfterAll {
+        $global:LASTEXITCODE = $script:SessionExit
+    }
+
+    It 'finds the three blocks that run ResourceInventory.ps1' {
+        $script:CallBlocks.Count | Should -Be 3
+    }
+
+    It 'does not read the earlier run''s exit code 2 as a failure of the next run (block <Index>)' -ForEach @(
+        @{ Index = 0 }, @{ Index = 1 }, @{ Index = 2 }
+    ) {
+        $Block = $script:CallBlocks[$Index]
+        $Lifted = Join-Path $script:CallFolder ('block-{0}.ps1' -f $Index)
+        Set-Content -LiteralPath $Lifted -Encoding utf8 -Value (@(
+                '$ScriptRoot = $PSScriptRoot; $InventoryPassthrough = @{}; $TenantID = ''tenant-1''; $SubId = ''id-1''; $Sub = [pscustomobject]@{ Id = ''id-1''; Name = ''sub-one'' }'
+                'try {'
+                $Block.Text
+                '''ok'' } catch { ''failed: '' + $_.Exception.Message }'
+            ) -join "`n")
+
+        $global:LASTEXITCODE = 2
+        & $Lifted | Should -Be 'ok' -Because ('{0} line {1}' -f $Block.File, $Block.Line)
+    }
+}
+
 Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
     BeforeAll {
         # The run's param block and its top-level statements from the one that

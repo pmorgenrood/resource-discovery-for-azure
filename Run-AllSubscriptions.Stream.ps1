@@ -225,6 +225,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
     try
     {
+        # A run that ends without exit leaves the last exit code, so an
+        # earlier subscription's exit 2 would fail this one too.
+        $global:LASTEXITCODE = 0
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
