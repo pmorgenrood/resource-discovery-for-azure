@@ -763,26 +763,27 @@ Describe 'The preflight and the run check the same subscriptions' -Skip:($IsWind
     }
 }
 
-Describe 'A -PreflightOnly -Resume under a home folder with brackets in its name' -Skip:($IsWindows) {
+Describe 'A home folder with brackets in its name' -Skip:($IsWindows) {
     AfterEach {
         if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
     }
 
-    It 'reads the per-stream state of an interrupted parallel run there' {
+    It 'stops <Label> with exit 1 before writing anything' -ForEach @(
+        @{ Label = 'a preflight'; Arguments = @('-PreflightOnly', '-Resume') }
+        @{ Label = 'a run'; Arguments = @('-Resume') }
+    ) {
         script:New-Case
         # The same case under a home whose name holds brackets.
         $script:CaseHome = Join-Path $script:TestBase ('home[' + [guid]::NewGuid().ToString().Substring(0, 4) + ']')
         [void][System.IO.Directory]::CreateDirectory($script:CaseHome)
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
-        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
-        [void][System.IO.Directory]::CreateDirectory($script:Root)
-        script:Set-Scenario -Subs 'A', 'B', 'C'
-        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
-        [pscustomobject]@{ Completed = @($script:Subs['C'].Id); FailedAttempts = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
-        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-SkipConsumption')
-        $Pf.ExitCode | Should -Be 0
-        @($Pf.Text | Where-Object { $_ -like '  The run would collect 1 of these 3 subscription(s)*' }).Count | Should -Be 1
+        script:Set-Scenario -Subs 'A', 'B'
+        $Run = script:Invoke-Wrapper -Arguments $Arguments
+        $Run.ExitCode | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('ERROR: The inventory folder {0} has [ or ] in its path, which this script cannot use. Set HOME to a folder without them and run again.' -f $script:Root) }).Count | Should -Be 1
+        [System.IO.Directory]::Exists($script:Root) | Should -BeFalse
+        script:Get-Calls | Should -BeNullOrEmpty
     }
 }
 
