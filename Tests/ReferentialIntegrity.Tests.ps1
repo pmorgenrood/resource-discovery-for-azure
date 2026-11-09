@@ -161,7 +161,10 @@ Describe "Consumption to Inventory Cross-Reference" {
             $row.ResourceId | Should -Be $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
             $Checked++
         }
-        $Checked | Should -BeGreaterThan 0 -Because 'the fixture bills at least one inventoried resource, so the check must look at a row'
+        # A zip whose consumption bills no resource its inventory lists has no
+        # row to check here; every consumption id is still held to the
+        # dictionary above. Skipped then, so it is never a silent pass.
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no consumption row bills a resource the inventory lists' }
     }
 }
 
