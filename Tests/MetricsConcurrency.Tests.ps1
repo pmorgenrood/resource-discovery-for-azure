@@ -15,7 +15,8 @@
 # process: one run's limit cannot leak into the next. The stand-in Az.Monitor
 # module counts calls in flight in a static counter shared by all runspaces of
 # the process, and holds each call until the expected number are in flight at
-# once (or 20 s pass), so the peak is exact on a slow or busy host.
+# once (or no new call has started for 20 s, or 90 s pass), so the peak is exact
+# on a slow or busy host.
 #
 # No live Azure. Run with:
 #   Invoke-Pester ./Tests/MetricsConcurrency.Tests.ps1 -Output Detailed
@@ -48,11 +49,13 @@ function Get-AzMetric
     try
     {
         # A bounded barrier: each call holds until RDA_TEST_BARRIER calls have been
-        # in flight at once, or 20 s pass, so the peak does not depend on how fast
-        # the host starts the calls. A limit that lets fewer calls run at once
-        # never fills it, and each call is released by the 20 s bound.
-        $Deadline = [DateTime]::UtcNow.AddSeconds(20)
-        while ([RdaInFlightProbe]::Peak -lt [int]$env:RDA_TEST_BARRIER -and [DateTime]::UtcNow -lt $Deadline)
+        # in flight at once, so the peak does not depend on how fast the host
+        # starts the calls. While calls keep starting, the barrier keeps holding,
+        # however slow the host is. It lets go when no new call has started for
+        # 20 s, which is how a limit that lets fewer calls run at once shows, or
+        # after 90 s in all, which stays under the 120 s per-call timeout.
+        $Deadline = [DateTime]::UtcNow.AddSeconds(90)
+        while ([RdaInFlightProbe]::Peak -lt [int]$env:RDA_TEST_BARRIER -and [RdaInFlightProbe]::SecondsSinceLastEnter -lt 20 -and [DateTime]::UtcNow -lt $Deadline)
         {
             Start-Sleep -Milliseconds 10
         }
@@ -88,8 +91,10 @@ public static class RdaInFlightProbe
     private static int current;
     private static int peak;
     private static int calls;
+    private static long lastEnter;
     public static void Enter()
     {
+        System.Threading.Interlocked.Exchange(ref lastEnter, System.Diagnostics.Stopwatch.GetTimestamp());
         System.Threading.Interlocked.Increment(ref calls);
         int now = System.Threading.Interlocked.Increment(ref current);
         int seen;
@@ -101,6 +106,10 @@ public static class RdaInFlightProbe
     public static void Leave() { System.Threading.Interlocked.Decrement(ref current); }
     public static int Peak { get { return System.Threading.Volatile.Read(ref peak); } }
     public static int Calls { get { return System.Threading.Volatile.Read(ref calls); } }
+    public static double SecondsSinceLastEnter
+    {
+        get { return (System.Diagnostics.Stopwatch.GetTimestamp() - System.Threading.Interlocked.Read(ref lastEnter)) / (double)System.Diagnostics.Stopwatch.Frequency; }
+    }
 }
 "@
 
