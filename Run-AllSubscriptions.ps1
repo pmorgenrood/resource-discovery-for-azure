@@ -438,6 +438,14 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# The consumption counterparts: ResourceInventory.ps1 only sets them when they
+# are $null and then adds to them, and the stream aggregation below adds to
+# them too. Reset here, so a run in the same PowerShell session as an earlier
+# one does not report that run's consumption failure (exit 3) or add its
+# record count to this run's.
+$Global:ConsumptionFailedSubs = @()
+$Global:ConsumptionRecordCount = 0
+
 # The tenant's subscription list ResourceInventory.ps1 -RunAllSubs keeps for
 # the rest of this process (see LoginSession). Cleared here so a second run in
 # the same PowerShell session lists the subscriptions again.
@@ -900,24 +908,38 @@ if ($ParallelStreams -le 1)
                 Zip     = $Global:ZipOutputFile
             }
 
-            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
-            if ($CountMessage.Kind -eq 'Empty')
+            # Narration only: a write that fails here (as when the transcript's
+            # folder is gone) must not turn the success recorded above into a
+            # failure in the catch below.
+            try
             {
-                # Loud yellow signal so this stands out in the per-iteration narration
-                # and in the wrapper transcript. The most common cause is the signed-in
-                # identity not having Reader on the subscription; second is a sub that
-                # genuinely has no resources. Either way the user almost always wants
-                # to know immediately rather than discover it days later when the
-                # consolidated report turns out to be empty for some subs.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: (Invoke-AzRestMethod -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Payload '{{""subscriptions"":[""{1}""],""query"":""resources | summarize count()""}}').Content" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
-            }
-            else
-            {
-                # 'NetworkOnly' (only skipped network types) is not a warning.
-                Write-Host $CountMessage.Text -ForegroundColor DarkGreen
-            }
+                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
+                if ($CountMessage.Kind -eq 'Empty')
+                {
+                    # Loud yellow signal so this stands out in the per-iteration narration
+                    # and in the wrapper transcript. The most common cause is the signed-in
+                    # identity not having Reader on the subscription; second is a sub that
+                    # genuinely has no resources. Either way the user almost always wants
+                    # to know immediately rather than discover it days later when the
+                    # consolidated report turns out to be empty for some subs.
+                    Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: (Invoke-AzRestMethod -Method POST -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Payload '{{""subscriptions"":[""{1}""],""query"":""resources | summarize count()""}}').Content" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                }
+                else
+                {
+                    # 'NetworkOnly' (only skipped network types) is not a warning.
+                    Write-Host $CountMessage.Text -ForegroundColor DarkGreen
+                }
 
-            Write-Host "Completed subscription: $($Sub.Name)" -ForegroundColor Green
+                Write-Host "Completed subscription: $($Sub.Name)" -ForegroundColor Green
+            }
+            catch
+            {
+                # The note goes to the same broken output under -Verbose, so
+                # it gets its own guard.
+                $NarrationError = $_.Exception.Message
+                try { Write-Verbose ("Could not write the completion lines: {0}" -f $NarrationError) }
+                catch { $null = $_ }
+            }
 
             # Mark complete and persist immediately so a mid-run sign-out is recoverable.
             # If the sub was previously in FailedAttempts (i.e. this is a retry that
@@ -1095,14 +1117,26 @@ else
                 $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
                 $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { $null }
                 $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount; Skipped = $SkipCount; Zip = $Global:ZipOutputFile }
-                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
-                if ($CountMessage.Kind -eq 'Empty')
+                # Narration only, as in the sequential branch: a failed write
+                # must not turn the success into a failure.
+                try
                 {
-                    Write-Host ("WARNING: '{0}' returned 0 resources." -f $Sub.Name) -ForegroundColor Yellow
+                    $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
+                    if ($CountMessage.Kind -eq 'Empty')
+                    {
+                        Write-Host ("WARNING: '{0}' returned 0 resources." -f $Sub.Name) -ForegroundColor Yellow
+                    }
+                    else
+                    {
+                        Write-Host $CountMessage.Text -ForegroundColor DarkGreen
+                    }
                 }
-                else
+                catch
                 {
-                    Write-Host $CountMessage.Text -ForegroundColor DarkGreen
+                    # Its own guard, as in the sequential branch.
+                    $NarrationError = $_.Exception.Message
+                    try { Write-Verbose ("Could not write the completion line: {0}" -f $NarrationError) }
+                    catch { $null = $_ }
                 }
                 if (-not ($CompletedIds -contains $Sub.Id))
                 {
@@ -1167,8 +1201,10 @@ else
             {
                 Write-Host ("ERROR: could not remove the old stream summary {0}: {1}" -f $OldSummaryPath, $_.Exception.Message) -ForegroundColor Red
                 Write-Host "This run could read it as its own stream's summary. Remove it by hand, then run again." -ForegroundColor Yellow
-                Write-Host "Exit code 2: an old stream summary could not be removed; no subscription was collected and no consolidated zip was made." -ForegroundColor Yellow
-                Exit-Wrapper -Code 2
+                # A setup stop before any stream starts: exit 1, as for the
+                # context snapshot and worker script stops below.
+                Write-Host "Exit code 1: an old stream summary could not be removed; no subscription was collected and no consolidated zip was made." -ForegroundColor Yellow
+                Exit-Wrapper -Code 1
             }
         }
 
@@ -1384,6 +1420,20 @@ else
                     $RowIds = @(@($StreamSummary.ResourceCounts) + @($StreamSummary.Failed) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
                     $NoRow = @($S.ExpectedIds | Where-Object { $RowIds -notcontains $_ })
                     if ($NoRow.Count -gt 0) { $NotThisRun = ('it has no row for {0} of the {1} subscription(s) the stream ran' -f $NoRow.Count, $S.SubCount) }
+                    else
+                    {
+                        # Each success row must hold what the aggregation and
+                        # the output verification read: Count a whole number
+                        # of 0 or more, and Zip empty or a path. The values
+                        # are not printed (they can hold real names).
+                        $BadRows = @(@($StreamSummary.ResourceCounts) | Where-Object { $null -ne $_ } | Where-Object {
+                                $Row = $_
+                                $CountOk = ($Row.Count -is [int] -or $Row.Count -is [long]) -and $Row.Count -ge 0 -and $Row.Count -le [int]::MaxValue
+                                $ZipOk = $null -eq $Row.Zip -or ($Row.Zip -is [string] -and ($Row.Zip -eq '' -or $(try { $null = [System.IO.Path]::GetFullPath($Row.Zip); $true } catch { $false })))
+                                -not ($CountOk -and $ZipOk)
+                            })
+                        if ($BadRows.Count -gt 0) { $NotThisRun = ('{0} of its success row(s) have a Count that is not a whole number of 0 or more, or a Zip that is not a path' -f $BadRows.Count) }
+                    }
                 }
                 if ($null -ne $NotThisRun)
                 {

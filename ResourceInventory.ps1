@@ -262,7 +262,9 @@ Function RunInventorySetup()
         # this session (Functions/AzModules.Functions.ps1 holds the number).
         # The printed command is the way out: once it has run, the next run
         # passes this check.
-        $AzAccountsCheck = Test-RdaAzAccountsVersion
+        # -SubModule: Az modules an earlier run in this session loaded can
+        # hold an older Az.Accounts there; the check names the one to update.
+        $AzAccountsCheck = Test-RdaAzAccountsVersion -SubModule $RequiredAzSubModules
         if ($AzAccountsCheck.Status -ne 'Ok')
         {
             foreach ($Line in $AzAccountsCheck.Messages)
@@ -303,9 +305,11 @@ Function RunInventorySetup()
         # newer, but Az.Compute, Az.Monitor and Az.Billing load after it: one
         # whose manifest asks for an exact older Az.Accounts (RequiredVersion)
         # makes PowerShell load that older copy next to the new one, and the
-        # check reads the lowest loaded copy. The printed advice (a new
-        # session, or the install command) is the way out; nothing retries.
-        $AzAccountsCheck = Test-RdaAzAccountsVersion
+        # check reads the lowest loaded copy. A new session alone loads the
+        # same pair again, so -SubModule makes the advice name the submodule
+        # and the command that updates it. The printed advice is the way out;
+        # nothing retries.
+        $AzAccountsCheck = Test-RdaAzAccountsVersion -SubModule $RequiredAzSubModules
         if ($AzAccountsCheck.Status -ne 'Ok')
         {
             foreach ($Line in $AzAccountsCheck.Messages)
@@ -1984,6 +1988,18 @@ if (-not $RunAllSubs.IsPresent)
 
     Write-Host "Pre-flight checks passed." -ForegroundColor Green
     Write-Host ""
+}
+
+# A direct run owns the health lists, so it starts them empty: a second run in
+# the same session must not report the first run's failures. Under -RunAllSubs
+# the wrapper (or its stream worker) empties them once at its own start and
+# gathers every subscription's entries in them, so they are left alone here.
+if (-not $RunAllSubs.IsPresent)
+{
+    $Global:CollectorFailures = @()
+    $Global:MetricsFailedSubs = @()
+    $Global:ConsumptionFailedSubs = @()
+    $Global:ConsumptionRecordCount = 0
 }
 
 $Global:Runtime = Measure-Command -Expression {
