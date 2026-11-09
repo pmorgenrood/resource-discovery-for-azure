@@ -1094,7 +1094,8 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         $Classify.Count | Should -Be 1
         $Throttled = $false
         $BadRequest = Test-MetricBadRequest -Exception $NoResponse
-        $LastError = $NoResponse.Message
+        # Read by the lifted statements, which run in this scope.
+        Set-Variable -Name LastError -Value $NoResponse.Message
         $BadRequest | Should -BeFalse
         [pscustomobject]@{ Exception = $NoResponse } | ForEach-Object { . ([scriptblock]::Create($Classify[0].Extent.Text)) }
         $Throttled | Should -BeTrue
