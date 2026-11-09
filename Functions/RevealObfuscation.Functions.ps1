@@ -484,7 +484,11 @@ function Get-RevealZipLimitProblem
         $Name = $Entry.FullName
         if (-not [string]::IsNullOrWhiteSpace($Name))
         {
-            if ([System.IO.Path]::IsPathRooted($Name) -or $Name.StartsWith('/') -or $Name.StartsWith('\'))
+            # IsPathRooted follows the host, so on Linux and macOS it does not
+            # see a Windows drive ('C:/x', 'C:\x' or the drive-relative 'C:x').
+            # Those, and '/' or '\' names (UNC '\\server' among them), are
+            # refused on every host.
+            if ([System.IO.Path]::IsPathRooted($Name) -or $Name.StartsWith('/') -or $Name.StartsWith('\') -or $Name -match '\A[A-Za-z]:')
             {
                 return ("it holds the file '{0}', whose path is rooted" -f $Name)
             }
