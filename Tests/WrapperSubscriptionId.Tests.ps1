@@ -20,6 +20,11 @@
 # and a stand-in `az` (first on PATH) answer from a scenario file. On Windows
 # the wrapper writes to C:\InventoryReports instead, so the end-to-end tests
 # do not run there.
+# shortcut: on Windows only the helper and parse-level tests run (the wrapper's
+# Windows inventory folder is fixed at C:\InventoryReports, a shared folder a
+# test must not write to, and the stand-in az is a sh script); upgrade when the
+# harness rewrites that path in its copy of the tool and ships an az.cmd
+# stand-in, run on a Windows host.
 #
 # Run with: Invoke-Pester ./Tests/WrapperSubscriptionId.Tests.ps1 -Output Detailed
 
