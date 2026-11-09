@@ -14,11 +14,13 @@
 
 Describe "Classifier fidelity: nonprod words and prod default" {
     BeforeAll {
-        # Each line of ResourceInventory.ps1 that chooses the nonprod_ prefix
-        # tests a value with two -match patterns: the nonprod words, then the
-        # segment hints. Both are read from the source, not copied here.
+        # Each line of ResourceInventory.ps1 and Functions/*.ps1 that chooses
+        # the nonprod_ prefix tests a value with two -match patterns: the
+        # nonprod words, then the segment hints. Both are read from the source,
+        # not copied here.
         $Source = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1')
-        $script:RuleLines = @($Source | Where-Object { ($_ -match 'nonprod_' -or $_ -match '\$IsNonProd =') -and $_ -match "-match '\\b\(" })
+        $FunctionSource = @(Get-ChildItem -Path (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions') -Filter '*.ps1' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content -LiteralPath $_.FullName })
+        $script:RuleLines = @(@($Source) + $FunctionSource | Where-Object { ($_ -match 'nonprod_' -or $_ -match '\$IsNonProd =') -and $_ -match "-match '\\b\(" })
         $script:WordPatterns = @($script:RuleLines | ForEach-Object { if ($_ -match "-match '(\\b\([^']+)'") { $Matches[1] } } | Select-Object -Unique)
         $script:HintPatterns = @($script:RuleLines | ForEach-Object { if ($_ -match "-match '(\(\^[^']+)'") { $Matches[1] } } | Select-Object -Unique)
         # The product's functions, from ResourceInventory.ps1 and Functions/:
@@ -83,6 +85,21 @@ Describe "Classifier fidelity: nonprod words and prod default" {
             $ViaClassifier = @($script:PrefixFunctions | Where-Object { $Line -match ('=\s*' + [regex]::Escape($_) + '\b') }).Count -gt 0
             ($Line -match "-match '\\b\(" -or $ViaClassifier -or $Line -match '\$IsNonProd' -or $Line -match "\.Split\('_'\)\[0\]") | Should -BeTrue -Because "'$($Line.Trim())' must pick the prefix with the rule"
         }
+    }
+
+    It "never sets a prefix to a fixed prod_ or nonprod_ in the product's function files" {
+        # Prefix lines in Functions/ (the free-text tokenizer, and on some
+        # versions token helpers) may also copy or keep a prefix already
+        # picked, so they are not held to the line rule above; none may set a
+        # fixed 'prod_' or 'nonprod_', which would let one kind of token skip
+        # the rule. A rule line there reads the same words and hints as every
+        # other (the first test).
+        $Root = Split-Path $PSScriptRoot -Parent
+        $Fixed = @(Get-ChildItem -Path (Join-Path $Root 'Functions') -Filter '*.ps1' -ErrorAction SilentlyContinue | ForEach-Object {
+                $File = $_.Name
+                Get-Content -LiteralPath $_.FullName | Where-Object { $_ -match "^\s*\$\w*Prefix\s*=\s*['`"](non)?prod_['`"]\s*(;|#|$)" } | ForEach-Object { "${File}: $($_.Trim())" }
+            })
+        $Fixed | Should -BeNullOrEmpty -Because 'every prefix comes from the rule'
     }
 
     It "classifies nonprod word '<Keyword>' as nonprod_" -ForEach @(
