@@ -359,6 +359,42 @@ Describe 'Resume state messages whose error text holds braces' {
     }
 }
 
+Describe 'Save-CompletedSubscriptionIds keeps the old state when its write fails' {
+    BeforeEach {
+        $script:KeepDir = Join-Path $script:TestRoot ('keep_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:KeepDir -Force | Out-Null
+        $script:KeepPath = Join-Path $script:KeepDir 'state.json'
+        Save-CompletedSubscriptionIds -Path $script:KeepPath -Tenant 't' -Ids @('done-1') -FailedAttempts @([pscustomobject]@{ Id = 'failed-1'; Name = 'F'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'r'; Attempts = 1 })
+        $script:KeepBefore = Get-Content -LiteralPath $script:KeepPath -Raw
+    }
+
+    It 'a write that stops part-way (a full disk) leaves the old state, warns, and leaks no error' {
+        # The write leaves a cut temp file and a non-terminating error, as
+        # Set-Content does when the disk fills.
+        Mock Set-Content -MockWith {
+            [System.IO.File]::WriteAllText([string]$PesterBoundParameters['Path'], '{"TenantID": "t", "Compl')
+            Write-Error 'stand-in: no space left on the disk'
+        }
+        Mock Write-Host -MockWith { }
+        $Out = @(Save-CompletedSubscriptionIds -Path $script:KeepPath -Tenant 't' -Ids @('done-1', 'done-2') 2>&1)
+        @($Out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count | Should -Be 0
+        Get-Content -LiteralPath $script:KeepPath -Raw | Should -Be $script:KeepBefore
+        @(Get-CompletedSubscriptionIds -Path $script:KeepPath -Tenant 't') | Should -Be @('done-1')
+        @(Get-FailedAttempts -Path $script:KeepPath -Tenant 't').Id | Should -Be @('failed-1')
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { ([string]$Object) -like '*WARNING: Failed to persist resume state to *no space left on the disk*' }
+        Test-Path -LiteralPath "$script:KeepPath.tmp" | Should -BeFalse
+    }
+
+    It 'a temp path that cannot be written (a folder is there) leaves the old state, warns about the write, and leaks no error' {
+        New-Item -ItemType Directory -Path "$script:KeepPath.tmp" -Force | Out-Null
+        Mock Write-Host -MockWith { }
+        $Out = @(Save-CompletedSubscriptionIds -Path $script:KeepPath -Tenant 't' -Ids @('done-1', 'done-2') 2>&1)
+        @($Out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count | Should -Be 0
+        Get-Content -LiteralPath $script:KeepPath -Raw | Should -Be $script:KeepBefore
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { ([string]$Object) -like ('WARNING: Failed to persist resume state to {0}: *' -f $script:KeepPath) }
+    }
+}
+
 Describe 'A resume state warning that cannot be written' {
     # Both state writes run inside a subscription's try, after its success
     # row is added. When the inventory folder is gone the console or
@@ -751,5 +787,57 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         { Get-RunSummaryLogContent -Visible 0 -Eligible 0 -Processed 0 `
                 -FailedSubscriptions $null -CollectorFailures $null `
                 -MetricsFailedSubs $null -ConsumptionFailedSubs $null } | Should -Not -Throw
+    }
+}
+
+Describe 'Consumption failures: one rule for the count, the list and the sign-in skips' {
+
+    BeforeAll {
+        # Contoso-Billing twice (two of its pages failed), a twin with the same
+        # name, and the '(auth)' sign-in rows of two subscriptions (one twice,
+        # as an older stream left it) and of a direct run with no
+        # SubscriptionId.
+        $script:ConsumptionRows = @(
+            [pscustomobject]@{ Name = 'Contoso-Billing'; Id = '44444444-4444-4444-4444-444444444444'; Message = 'page 2 failed' }
+            [pscustomobject]@{ Name = 'Contoso-Billing'; Id = '44444444-4444-4444-4444-444444444444'; Message = 'page 3 failed' }
+            [pscustomobject]@{ Name = 'Contoso-Billing'; Id = '55555555-5555-5555-5555-555555555555'; Message = 'page 2 failed' }
+            [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'skipped'; SubscriptionId = '66666666-6666-6666-6666-666666666666' }
+            [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'skipped'; SubscriptionId = '66666666-6666-6666-6666-666666666666' }
+            [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'skipped'; SubscriptionId = '77777777-7777-7777-7777-777777777777' }
+        )
+    }
+
+    It 'Get-ConsumptionFailureView names each real subscription once by name and id and counts the sign-in skips per subscription' {
+        $View = Get-ConsumptionFailureView -ConsumptionFailedSubs $script:ConsumptionRows
+        @($View.Subscriptions | ForEach-Object { $_.Id }) | Should -Be @('44444444-4444-4444-4444-444444444444', '55555555-5555-5555-5555-555555555555')
+        $View.SignInSkipped | Should -Be 2
+    }
+
+    It 'Get-ConsumptionFailureView counts a sign-in row with no SubscriptionId once, and an empty list as none' {
+        $Direct = @([pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'skipped' })
+        $View = Get-ConsumptionFailureView -ConsumptionFailedSubs $Direct
+        @($View.Subscriptions).Count | Should -Be 0
+        $View.SignInSkipped | Should -Be 1
+        (Get-ConsumptionFailureView -ConsumptionFailedSubs $null).SignInSkipped | Should -Be 0
+    }
+
+    It 'RunSummary.log counts by the same rule, and <Case>' -ForEach @(
+        @{ Case = 'without -Obfuscated lists each real subscription once and no sign-in row'; Obfuscated = $false }
+        @{ Case = 'with -Obfuscated names none'; Obfuscated = $true }
+    ) {
+        $Lines = Get-RunSummaryLogContent -Visible 4 -Eligible 4 -Processed 4 -ConsumptionFailedSubs $script:ConsumptionRows -Obfuscated:$Obfuscated
+        $Text = $Lines -join "`n"
+        $Text | Should -Match 'Consumption failed subs\s+: 2(\r?\n|$)'
+        $Text | Should -Match 'Consumption sign-in skipped\s+: 2 subscription\(s\)'
+        $Text | Should -Not -Match '66666666|77777777' -Because 'the sign-in rows are counted, not named'
+        if ($Obfuscated)
+        {
+            $Text | Should -Not -Match 'Contoso|44444444|55555555'
+        }
+        else
+        {
+            @($Lines | Where-Object { $_ -like '  - Contoso-Billing (*' }).Count | Should -Be 2
+            $Text | Should -Not -Match '\(auth\)'
+        }
     }
 }

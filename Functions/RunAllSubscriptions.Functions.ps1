@@ -540,7 +540,9 @@ function Save-CompletedSubscriptionIds
         # a large tenant / Cloud Shell run that gets killed). The temp file shares
         # the target directory so the move stays on the same volume.
         $TmpPath = "$Path.tmp"
-        $State | ConvertTo-Json -Depth 4 | Set-Content -Path $TmpPath -Encoding utf8
+        # Stop on a failed write (a full disk leaves a cut temp file), so the
+        # move below never puts it over the good state.
+        $State | ConvertTo-Json -Depth 4 | Set-Content -Path $TmpPath -Encoding utf8 -ErrorAction Stop
         [System.IO.File]::Move($TmpPath, $Path, $true)
     }
     catch
@@ -838,8 +840,10 @@ function Write-StreamState
     catch
     {
         # A failed write (the folder is gone) must stop here, or it is a silent
-        # non-terminating error and this warning never runs. The next -Resume
-        # then runs the subscription again, as its id is not on file.
+        # non-terminating error and this warning never runs. A subscription
+        # that worked is then not on file, so the next -Resume runs it again;
+        # one that failed is still in the stream summary's Failed rows, which
+        # the wrapper adds to the resume state for -ResumeFailedOnly.
         # Its own guard, as in Save-CompletedSubscriptionIds.
         $StateError = $_.Exception.Message
         try { Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $StateError) 'Yellow' }
@@ -1100,6 +1104,21 @@ function Test-ConsumptionAccess
     }
 }
 
+# The one rule for the consumption failure rows, the same for a sequential
+# and a parallel run: Subscriptions holds each real subscription whose
+# consumption failed once, by Name and Id; SignInSkipped is how many
+# subscriptions had the phase skipped for sign-in (the '(auth)' rows, one per
+# SubscriptionId; a row with none, from a direct run of all, counts once).
+function Get-ConsumptionFailureView
+{
+    param([object]$ConsumptionFailedSubs)
+    $Rows = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+    [pscustomobject]@{
+        Subscriptions = @(@($Rows | Where-Object { $_.Id -ne '(auth)' }) | Sort-Object -Property Name, Id -Unique)
+        SignInSkipped = @(@($Rows | Where-Object { $_.Id -eq '(auth)' }) | ForEach-Object { [string]$_.SubscriptionId } | Sort-Object -Unique).Count
+    }
+}
+
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation
 # timestamp (no file I/O, no Azure calls) so it is unit-testable offline: the
@@ -1172,7 +1191,9 @@ function Get-RunSummaryLogContent
     $Failed = @(@($FailedSubscriptions) | Where-Object { $null -ne $_ })
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
-    $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+    # Consumption by the console's rule (Get-ConsumptionFailureView).
+    $ConsumptionView = Get-ConsumptionFailureView -ConsumptionFailedSubs $ConsumptionFailedSubs
+    $Consumption = @($ConsumptionView.Subscriptions)
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -1291,6 +1312,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
+    $Lines.Add(('  Consumption sign-in skipped   : {0} subscription(s)' -f $ConsumptionView.SignInSkipped))
 
     # --- Exit code -----------------------------------------------------------
     $ExitText = @(@($ExitCodeLines) | Where-Object { -not [string]::IsNullOrEmpty($_) })
