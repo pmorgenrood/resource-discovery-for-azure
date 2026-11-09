@@ -13,11 +13,11 @@
 # subscriptions of a report, so a report of A and B and a later report of A
 # were both shipped.
 # Reveal now never guesses: any report that shares a subscription id (read
-# from its dictionary, or its run's log name) with another report is left out, each
-# such subscription is named by its masked token with the reports that hold
-# it, the run exits non-zero, and every subscription with exactly one report
-# still ships. Each report is paired only with the dictionary of its own
-# stamp.
+# from its dictionary, or its run's log name) with another report is left
+# out, each such subscription is named by its masked token with the reports
+# that hold it, the run exits non-zero, and every report whose subscriptions
+# are in no other report still ships. Each report is paired only with the
+# dictionary of its own stamp.
 #
 # The zips and dictionaries are built here with placeholder values; no live
 # Azure and no inventory run.

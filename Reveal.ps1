@@ -30,26 +30,32 @@
     + Resource Group); everything else stays masked. Pairing in all-mode is done
     WITHIN each folder, and only between a report zip and the dictionary of the
     same <stamp>, so it never crosses one report's tokens against another's
-    dictionary. Reveal never guesses which of two reports of one subscription
-    is right (a newer recovery run of one service is not the fuller report).
-    When a subscription id named in one report's dictionary is also named in
-    another report under the root (for example Run-AllSubscriptions.ps1 run
-    twice into it, or a recovery run of one subscription), none of those
-    reports is revealed, whichever other
-    subscriptions they hold: each such subscription is named by its masked
-    token with the report folders that hold it, counted as failed, and the run
-    exits non-zero. Pass -InventoryRoot pointing at one run's folders, or move
-    the extra report away. Every subscription with exactly one report is still
-    revealed and shipped. Each report's subscriptions are read from the real
-    ids in its dictionary, and from the name of the DebugLog_ or ErrorLog_
-    file its run wrote into the inventory root
-    (DebugLog_ResourcesReport_<stamp>_<subscription id>.log). A subscription
-    with no resources has an empty dictionary, so it is matched by that log
-    alone. Limit: a report whose dictionary names no subscription and whose
-    log is not there (a run of ResourceInventory.ps1 without
-    Run-AllSubscriptions.ps1, which names its log by stamp only, or a log
-    that was deleted) cannot be matched, so it is revealed on its own, even
-    beside an older report of the same subscription.
+    dictionary. A report zip with no dictionary of its stamp, or a dictionary
+    with no report zip of its stamp, cannot be revealed: it is counted as
+    failed and the run exits non-zero (a folder with neither, or a staging
+    folder of an earlier reveal, is only noted as skipped).
+    Reveal never guesses which of two reports of one subscription is right (a
+    newer recovery run of one service is not the fuller report). When a
+    subscription id of one report is also a subscription id of another
+    report under the root (for example Run-AllSubscriptions.ps1 run twice
+    into it, or a recovery run of one subscription), none of those reports is
+    revealed, whichever other subscriptions they hold: each such subscription
+    is named by its masked token with the report folders that hold it,
+    counted as failed, and the run exits non-zero. Pass -InventoryRoot
+    pointing at one run's folders, or move the extra report away. Every
+    report whose subscriptions are in no other report is still revealed and
+    shipped. Two such reports with the same file name (the same stamp in two
+    folders) both ship: the later one by folder name goes in the bundle as
+    <folder>_ResourcesReport_<stamp>.zip.
+    Each report's subscriptions are read from the real ids in its dictionary,
+    and from the name of the DebugLog_ or ErrorLog_ file its run wrote into
+    the inventory root (DebugLog_ResourcesReport_<stamp>_<subscription id>.log).
+    A subscription with no resources has an empty dictionary, so it is
+    matched by that log alone. Limit: a report whose dictionary names no
+    subscription and whose log is not there (a run of ResourceInventory.ps1
+    without Run-AllSubscriptions.ps1, which names its log by stamp only, or a
+    log that was deleted) cannot be matched, so it is revealed on its own,
+    even beside an older report of the same subscription.
 
     HANDLE WITH CARE. The output contains the real values you chose to reveal.
     Share it only with the party meant to ingest it. Dictionaries and any
@@ -493,23 +499,25 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 #    service (no consumption, no metrics) is newer than the full run it
 #    repairs. So each report's subscriptions are read from the real ids in its
 #    dictionary's four id maps (the inventory's subscription values are tokens
-#    that resolve through these same maps), and any report that shares a
-#    subscription id with another report is left out together with that
-#    other report, whichever
-#    subscriptions it also holds. Each such subscription is named by its masked
-#    token, with the report folders that hold it, and counted as failed, so
-#    the run exits non-zero. The user passes -InventoryRoot pointing at one
-#    run's folders, or moves the extra report away. Every subscription with
-#    exactly one report is still revealed and shipped.
-# A report's subscriptions also come from the name of its run's DebugLog_ or
-# ErrorLog_ file in the inventory root (see $RunLogSubIds), so a report of a
-# subscription with no resources, whose dictionary is empty, is matched too.
-# Limit: a report whose dictionary names no subscription and that has no such
-# log (a run without Run-AllSubscriptions.ps1 names its log by stamp only, or
-# the log was deleted) cannot be matched to one, so it is revealed on its own,
-# and an older non-empty report of the same subscription is then revealed
-# beside it. Closing that would need the run to write its subscription
-# somewhere Reveal can read, which is a change to what the tool writes.
+#    that resolve through these same maps) and from the name of its run's
+#    DebugLog_ or ErrorLog_ file in the inventory root (see $RunLogSubIds), and
+#    any report that shares a subscription id with another report is left out
+#    together with that other report, whichever subscriptions it also holds.
+#    Each such subscription is named by its masked token, with the report
+#    folders that hold it, and counted as failed, so the run exits non-zero.
+#    The user passes -InventoryRoot pointing at one run's folders, or moves
+#    the extra report away. Every report whose subscriptions are in no other
+#    report is still revealed and shipped. A shared stamp alone is not
+#    ambiguous: two such reports both ship, under distinct names (see
+#    $UsedOutNames).
+# The log name is what matches a report of a subscription with no resources,
+# whose dictionary is empty. Limit: a report whose dictionary names no
+# subscription and that has no such log (a run without Run-AllSubscriptions.ps1
+# names its log by stamp only, or the log was deleted) cannot be matched to
+# one, so it is revealed on its own, and an older non-empty report of the same
+# subscription is then revealed beside it. Closing that would need the run to
+# write its subscription somewhere Reveal can read, which is a change to what
+# the tool writes.
 $Candidates = [System.Collections.Generic.List[object]]::new()
 # The subscription each run was for, from the names of the local logs it
 # wrote. Under Run-AllSubscriptions.ps1 (-RunAllSubs) each
