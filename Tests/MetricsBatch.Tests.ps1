@@ -867,6 +867,37 @@ $null = & (Join-Path $RepoRoot 'Extension/Metrics.ps1') -Subscriptions @([pscust
         @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 4 attempt\(s\) \(Timed out after 2s\)' }).Count | Should -Be 1
     }
 
+    It 'hands every metric of a batch request that stops part way to the per-resource path' {
+        # A stand-in Start-ThreadJob, found first by the parallel runspaces, throws for every
+        # batch request (an error outside the guarded request) and passes every other call on.
+        $Real = (Get-Command -Name 'Start-ThreadJob' -CommandType Cmdlet | Select-Object -First 1).ModuleName
+        $FakeDir = Join-Path $script:ModuleRoot 'RdaTestStopBatch'
+        New-Item -ItemType Directory -Path $FakeDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $FakeDir 'RdaTestStopBatch.psm1') -Encoding utf8 -Value (@'
+function Start-ThreadJob
+{
+    [CmdletBinding()]
+    param([scriptblock]$ScriptBlock, [object[]]$ArgumentList, [int]$ThrottleLimit)
+    $First = if ($ArgumentList) { $ArgumentList[0] }
+    if ($First -is [hashtable] -and [string]$First['Uri'] -match 'metrics:getBatch') { throw 'stopped by the test' }
+    REAL\Start-ThreadJob @PSBoundParameters
+}
+Export-ModuleMember -Function Start-ThreadJob
+'@).Replace('REAL', $Real)
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $script:Mixed -RunName 'batch-unit-stops' -Batch
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $FakeDir -Recurse -Force
+        }
+
+        $Run.Posts.Count | Should -Be 0
+        Assert-SameRecords -Expected $script:PerResource -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'stopped \(stopped by the test\)' }).Count | Should -BeGreaterThan 0
+    }
+
     It 'does not retry a request Azure rejects (400) and does not turn batch off' {
         $Disks = @(1..60 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
         $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-400'
