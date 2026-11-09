@@ -2007,38 +2007,18 @@ function Get-ConsumptionMissingEntries
     @(Get-ConsumptionIncompleteEntries -Entries $Missing)
 }
 
-# The lines under the FAILED (consumption) banner: the ResourceInventory.ps1
-# command that collects each subscription in $Entries again, with the settings
-# that shape its report (-ResourceGroup, -Service, -SkipMetrics, -Obfuscate), so
-# the new report is made the same way. Under -Obfuscate it reuses the run's
-# dictionary (-ObfuscationDictionary $DictionaryFile) so the same resources get
-# the same masked names; without a file it says where to find it. The new
-# report replaces the one the run wrote for that subscription, so only one of
-# them is to be uploaded.
+# The lines under the FAILED (consumption) banner: how to collect the cost
+# data again. A report holds one or more subscriptions, and downstream adds up
+# the consumption rows of every report it is given, so the safe way is to run
+# the same command again, with the same settings, and upload only the new
+# report: uploading both would count the rows this run did write twice, and
+# uploading a new report of one subscription in place of a report of several
+# would drop the others. Nothing is printed when there are no entries.
 function Get-ConsumptionRetryAdvice
 {
-    param([object[]]$Entries, [string]$TenantID, [string]$ResourceGroup, [string[]]$Service, [switch]$SkipMetrics, [switch]$Obfuscate, [string]$DictionaryFile)
-    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
-    if ($List.Count -eq 0) { return @() }
-    $Quote = { param($Value) "'" + ([string]$Value -replace "'", "''") + "'" }
-    $Tail = ''
-    if (-not [string]::IsNullOrEmpty($ResourceGroup)) { $Tail += ' -ResourceGroup ' + (& $Quote $ResourceGroup) }
-    $Services = @(@($Service) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    if ($Services.Count -gt 0) { $Tail += ' -Service ' + (@($Services | ForEach-Object { & $Quote $_ }) -join ',') }
-    if ($SkipMetrics) { $Tail += ' -SkipMetrics' }
-    if ($Obfuscate)
-    {
-        $Tail += ' -Obfuscate'
-        if (-not [string]::IsNullOrEmpty($DictionaryFile)) { $Tail += ' -ObfuscationDictionary ' + (& $Quote $DictionaryFile) }
-    }
-    $TenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
-    $Lines = @('To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.')
-    if ($Obfuscate -and [string]::IsNullOrEmpty($DictionaryFile))
-    {
-        $Lines += 'Add -ObfuscationDictionary with the ObfuscationDictionary_*.json file from that subscription''s report folder, so its masked names stay the same as in this run.'
-    }
-    $Lines += @($List | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}{2}' -f $TenantArg, $_.Id, $Tail })
-    return $Lines
+    param([object[]]$Entries)
+    if (@(Get-ConsumptionIncompleteEntries -Entries $Entries).Count -eq 0) { return @() }
+    return @('To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.')
 }
 
 # The last lines of a run in which the billing download of one or more
