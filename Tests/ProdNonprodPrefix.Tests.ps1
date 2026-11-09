@@ -58,6 +58,26 @@ Describe "Prefix Consistency Per Resource" {
     }
 }
 
+Describe "Name Matches The Id's Name Token" {
+    It "Each joinable row's Name is the last segment of its ID" {
+        # A billed resource with no ID match is joined by Name, ResourceGroup
+        # and Subscription taken from the consumption path, so in the sections
+        # that join, a row's Name must be its masked ID's name token itself,
+        # not only share its prefix.
+        $Checked = 0
+        foreach ($Section in @('VirtualMachines', 'VMDisk', 'Databricks', 'PostgreSQLflexible', 'MySQLflexible', 'SQLVM', 'SQLDB', 'SQLPool', 'SQLMI'))
+        {
+            foreach ($r in @($script:Inventory.$Section | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) }))
+            {
+                if ($r.ID -like '/providers/rda.noid/ids/*') { continue }
+                $Checked++
+                $r.Name | Should -BeExactly (($r.ID.TrimEnd('/') -split '/')[-1]) -Because "$Section row '$($r.ID)' should carry its ID's name token as Name"
+            }
+        }
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no joinable row in this fixture' }
+    }
+}
+
 Describe "Prefix Format Validation" {
     It "All obfuscated IDs should be masked ARM paths whose every masked segment starts with exactly 'prod_' or 'nonprod_'" {
         foreach ($r in $script:AllResources)
