@@ -541,6 +541,17 @@ function Invoke-RdaReveal
             }
         }
 
+        # The dictionary has entries, but none of them was found in the report.
+        # If the report still holds a masked value, the dictionary belongs to
+        # another report (or -Fields picks dimensions this report does not
+        # carry): fail instead of writing the still masked report as revealed.
+        # A report with no masked value at all is written unchanged, as above.
+        if ($TotalHits -eq 0 -and (Test-RevealZipHasMaskedValue -Path $InputZip -TokenPattern $TokenPattern))
+        {
+            if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -Completed }
+            throw "Nothing to reveal: the report holds masked values, but the selected field(s) [$($Fields -join ', ')] have no mapping in this dictionary for any of them. Check that the dictionary belongs to this report."
+        }
+
         # Atomic output: compress to a sibling *.partial.zip, then swap it into
         # place with File.Move(overwrite). A same-volume move is a rename, so a
         # hard kill (SIGKILL / shell timeout) DURING compression can never leave a
