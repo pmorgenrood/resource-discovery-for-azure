@@ -136,7 +136,8 @@ Describe 'Reveal.ps1 -Resume checks the record' {
         $Run = Invoke-Reveal -Root $Case.Root -Staging $Case.Staging -Bundle $Bundle -Extra @('-Resume')
 
         $Run.Exit | Should -Not -Be 0 -Because $Run.Text
-        ($Run.Text -replace '\s+', ' ') | Should -Match 'does not record which fields'
+        ($Run.Text -replace '\s+', ' ') | Should -Match 'is not one Reveal wrote \(its Fields is not a list of field names\)'
+        ($Run.Text -replace '\s+', ' ') | Should -Not -Match 'older Reveal'
         Test-Path -LiteralPath $Bundle | Should -BeFalse
     }
 
