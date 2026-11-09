@@ -119,7 +119,7 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
 
 # Reads the server-directed retry delay (seconds) from a failed Get-AzMetric call, so the Azure Monitor retry loop in
 # Extension/Metrics.ps1 waits as long as the service asks. It reads the standard Retry-After header.
-# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws - a diagnostics aid must not break the retry loop.
+# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws: a failure to read the header must not break the retry loop.
 function Get-RdaRetryAfterSeconds
 {
     param(
@@ -165,7 +165,7 @@ function Get-RdaRetryAfterSeconds
 
                     $Raw = ([string]$Raw).Trim()
 
-                    # delta-seconds form (what the consumption header uses).
+                    # delta-seconds form (Retry-After and the consumption header).
                     $Seconds = 0
                     if ([int]::TryParse($Raw, [ref]$Seconds))
                     {
