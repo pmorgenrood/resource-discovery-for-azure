@@ -418,6 +418,9 @@ $RunId = [guid]::NewGuid().ToString()
 $FailedSubscriptions = @()
 # The same failures for RunSummary.log: { Name; Id } for each subscription.
 $FailedSubscriptionDetail = @()
+# The checked Failed rows of the stream summaries ({ Id; Name; Reason }), for
+# the resume state when a stream could not write its own.
+$StreamSummaryFailed = @()
 # Streams whose summary file is missing or could not be read: { StreamId;
 # SubCount; Reason = 'Missing' or 'Unreadable' }. Their subscriptions are not
 # confirmed (exit 2), but they are not counted or named as failed
@@ -1150,10 +1153,20 @@ else
                     try { Write-Verbose ("Could not write the completion line: {0}" -f $NarrationError) }
                     catch { $null = $_ }
                 }
+                # As in the sequential branch: the failure entry goes on every
+                # success, also when an earlier run already marked the id
+                # complete, or -ResumeFailedOnly would retry it for ever.
+                $StateChanged = $false
                 if (-not ($CompletedIds -contains $Sub.Id))
                 {
                     $CompletedIds += $Sub.Id
-                    $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                    $StateChanged = $true
+                }
+                $BeforeFailedCount = @($FailedAttempts).Count
+                $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
+                if ($StateChanged)
+                {
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
                 }
             }
@@ -1451,6 +1464,7 @@ else
                     {
                         $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $f.Name, $S.StreamId, $f.Reason)
                         $FailedSubscriptionDetail += [pscustomobject]@{ Name = $f.Name; Id = $f.Id }
+                        $StreamSummaryFailed += $f
                     }
                     if ($null -ne $Read.ConsumptionRecords)
                     {
@@ -1577,6 +1591,17 @@ else
             if ($AllCompletedFromStreams.Count -gt 0)
             {
                 $CompletedIds = @($CompletedIds + $AllCompletedFromStreams | Sort-Object -Unique)
+            }
+            # A stream whose state file could not be written (Write-StreamState
+            # warns) still names the subscription in its summary's Failed rows.
+            # Its failure goes in the merge too, so -ResumeFailedOnly retries
+            # it, when no stream state holds that id.
+            $StreamStateFailedIds = @($AllFailedFromStreams | Where-Object { $_ } | ForEach-Object { [string]$_.Id })
+            foreach ($f in @($StreamSummaryFailed | Where-Object { $_ }))
+            {
+                if ($StreamStateFailedIds -contains [string]$f.Id) { continue }
+                $StreamStateFailedIds += [string]$f.Id
+                $AllFailedFromStreams += @(Add-FailedAttempt -Existing @($FailedAttempts | Where-Object { $_ -and $_.Id -eq $f.Id }) -Id $f.Id -Name $f.Name -Reason $f.Reason)
             }
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
@@ -2030,16 +2055,23 @@ if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)
 }
 if ($ConsumptionFailures.Count -gt 0)
 {
+    # One rule for the count and the list, as RunSummary.log and
+    # MainSummary.html use: each real subscription once, by name and id (two
+    # can share a name). The '(auth)' rows of a phase skipped for sign-in name
+    # no subscription here, so they get their own count line.
+    $ConsumptionView = Get-ConsumptionFailureView -ConsumptionFailedSubs $ConsumptionFailures
     Write-Host ""
-    Write-Host ("Consumption Failures:    {0} subscription(s)" -f $ConsumptionFailures.Count) -ForegroundColor Yellow
+    Write-Host ("Consumption Failures:    {0} subscription(s)" -f @($ConsumptionView.Subscriptions).Count) -ForegroundColor Yellow
     # List the affected subscriptions by name so the operator knows exactly
     # which subs are missing billing data (e.g. to go request Reader access
-    # on them). Mirrors the metrics-failure block below. Exclude the '(auth)'
-    # sentinel used for the whole-phase skip - it is not a specific sub.
-    # By name and id: two subscriptions can share a name.
-    foreach ($cf in (@($ConsumptionFailures | Where-Object { $_.Id -ne '(auth)' }) | Sort-Object -Property Name, Id -Unique))
+    # on them). Mirrors the metrics-failure block below.
+    foreach ($cf in @($ConsumptionView.Subscriptions))
     {
         Write-Host ("  - {0} ({1})" -f $cf.Name, $cf.Id) -ForegroundColor Yellow
+    }
+    if ($ConsumptionView.SignInSkipped -gt 0)
+    {
+        Write-Host ("  Consumption skipped for sign-in on {0} subscription(s)." -f $ConsumptionView.SignInSkipped) -ForegroundColor Yellow
     }
     # The consumption failure message is repeated verbatim across every sub
     # when the cause is a broken Az module - dedupe to avoid screen wall.
