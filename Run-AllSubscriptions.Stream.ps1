@@ -355,9 +355,11 @@ $Summary = [pscustomobject]@{
     Failed                 = $FailedSubs
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
-    # Unique by name and id: Select-Object -Unique compares objects by their text,
-    # which is the same for any two of these, so it kept only the first.
-    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Where-Object { $null -ne $_ } | Sort-Object -Property Name, Id, Message -Unique)
+    # Every entry, as the wrapper's own run keeps them: one per subscription whose
+    # consumption failed, and one '(auth)' entry per subscription whose phase was
+    # skipped for the sign-in (each looks the same, so making them unique would
+    # count one where there were several).
+    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Where-Object { $null -ne $_ })
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
 }

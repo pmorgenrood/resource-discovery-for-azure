@@ -1832,6 +1832,12 @@ Remove-Item -LiteralPath $Stage -Recurse -Force
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
+# The report is written, but the consumption phase was skipped for the sign-in.
+if (@($Scenario.AuthSkipIds) -contains $SubscriptionID)
+{
+    if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
+    $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' }
+}
 # The report is written, but this subscription's billing pull stopped part-way.
 if (@($Scenario.ConsumptionFailIds) -contains $SubscriptionID)
 {
@@ -1967,7 +1973,7 @@ exit 1
 
         function script:Set-WrapperScenario
         {
-            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @(), [string[]]$ConsumptionFail = @())
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @(), [string[]]$ConsumptionFail = @(), [string[]]$AuthSkip = @())
             [pscustomobject]@{
                 Tenant        = $script:WrapperTenant
                 Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
@@ -1979,6 +1985,7 @@ exit 1
                 Disagree      = @($Disagree)
                 LockRoot      = @($LockRoot)
                 ConsumptionFailIds = @($ConsumptionFail)
+                AuthSkipIds   = @($AuthSkip)
             } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
         }
 
@@ -2548,6 +2555,16 @@ exit 1
         $Run.Text | Should -Contain 'Consumption (billing) data is missing or incomplete for 2 subscription(s):'
         $Run.Text | Should -Contain ('  - {0} ({0})' -f $script:SubA.Id)
         $Run.Text | Should -Contain ('  - {0} ({0})' -f $SubC.Id)
+    }
+
+    It 'counts each subscription of one stream whose consumption was skipped for the sign-in' {
+        script:Use-WrapperCase
+        $SubC = @{ Id = 'sub-c'; Name = 'Sub C' }
+        # Two streams: Sub A and Sub C share stream 0.
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB, $SubC) -AuthSkip @($script:SubA.Id, $SubC.Id)
+        $Run = script:Invoke-WrapperRun -Streams 2
+        $Run.ExitCode | Should -Be 3 -Because ($Run.Text -join "`n")
+        @($Run.Text | Where-Object { $_ -match '^Consumption Failures:\s+2 subscription\(s\)' }).Count | Should -Be 1 -Because ($Run.Text -join "`n")
     }
 
     It 'skips a completed subscription on -Resume after collecting one listed before it, when the state held one completed id' {
