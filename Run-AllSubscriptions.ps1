@@ -787,9 +787,25 @@ if ($OneSubscription)
     $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @($SubWarnings | Where-Object { $_ } | ForEach-Object { [string]$_ })
     # The pick's lines speak of a run; a preflight only stops its check.
     foreach ($Line in @($OnePick.Lines)) { Write-Host $(if ($PreflightOnly) { $Line.Text -replace ', so this run stopped before collecting anything \(exit 1\)', '' } else { $Line.Text }) -ForegroundColor $Line.Colour }
-    if ($OnePick.Stop) { Exit-Wrapper -Code 1 }
+    if ($OnePick.Stop)
+    {
+        # An earlier run of this subscription may have left its own resume
+        # state; no run of the whole tenant reads or removes it.
+        if (-not $PreflightOnly -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+        {
+            Write-Host ("  This subscription's resume state file {0} is kept for the next run of this command. If the subscription is gone for good, remove it with: Remove-Item -LiteralPath '{1}'" -f $ResumeStateFile, $ResumeStateFile.Replace("'", "''")) -ForegroundColor Yellow
+        }
+        Exit-Wrapper -Code 1
+    }
     $AllSubscriptions = @($OnePick.Subscription)
+    if (-not $PreflightOnly)
+    {
+        Write-Host ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor DarkGray
+    }
 }
+# The re-run hints below name -SubscriptionID for a one-subscription run, so a
+# retry reads this run's own resume state, not the whole tenant's.
+$RerunWith = if ($OneSubscription) { "-SubscriptionID $SubscriptionID " } else { '' }
 if ($IncludeDisabled)
 {
     $Subscriptions = $AllSubscriptions
@@ -1891,7 +1907,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
         Write-Host "Recover by either:" -ForegroundColor Yellow
         Write-Host "  - Locating the missing per-sub directory under the inventory root and inspecting why its zip is absent, OR" -ForegroundColor Yellow
-        Write-Host "  - Re-running with -Resume to re-collect any unprocessed/missing subscription." -ForegroundColor Yellow
+        Write-Host ("  - Re-running with {0}-Resume to re-collect any unprocessed/missing subscription." -f $RerunWith) -ForegroundColor Yellow
         if ($WrapperTranscriptStarted)
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
@@ -2211,8 +2227,8 @@ if ($FailedSubscriptions.Count -gt 0)
 {
     Write-Host ("Subscriptions Failed:    {0} ({1})" -f $FailedSubscriptions.Count, ($FailedSubscriptions -join ', ')) -ForegroundColor Red
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
-    Write-Host "Re-run with -Resume to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
-    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
+    Write-Host ("Re-run with {0}-Resume to retry failed and any unprocessed subscriptions." -f $RerunWith) -ForegroundColor Yellow
+    Write-Host ("Or re-run with {0}-ResumeFailedOnly to retry ONLY the failed subscriptions." -f $RerunWith) -ForegroundColor Yellow
     if ($DiagFile -and (Test-Path $DiagFile))
     {
         Write-Host ("Failure Diagnostics:     {0}" -f $DiagFile) -ForegroundColor Red
@@ -2229,7 +2245,7 @@ elseif ($FailedAttempts.Count -gt 0)
     # them so the operator does not lose track of historical failures simply
     # because the most recent run was clean.
     Write-Host ("Pending Retries:         {0} subscription(s) from a prior run still in FailedAttempts" -f $FailedAttempts.Count) -ForegroundColor Yellow
-    Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
+    Write-Host ("Re-run with {0}-ResumeFailedOnly to retry them." -f $RerunWith) -ForegroundColor Yellow
 }
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($OuterZipFile)

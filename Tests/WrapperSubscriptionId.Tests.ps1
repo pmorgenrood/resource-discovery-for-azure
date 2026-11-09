@@ -441,6 +441,36 @@ Describe 'Run-AllSubscriptions.ps1 -SubscriptionID, end to end' -Skip:($IsWindow
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 
+    It 'says its resume state is its own, and names -SubscriptionID in the re-run hints of a failed one-subscription run' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $Id = $script:Subs['B'].Id
+        $Run = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $Id)
+        @($Run.Text | Where-Object { $_ -eq ('-SubscriptionID: this run keeps its own resume state ({0}); the resume state of a run of the whole tenant is neither read nor changed.' -f (Split-Path -Leaf (script:Get-OneState 'B'))) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('Re-run with -SubscriptionID {0} -Resume to retry failed and any unprocessed subscriptions.' -f $Id) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('Or re-run with -SubscriptionID {0} -ResumeFailedOnly to retry ONLY the failed subscriptions.' -f $Id) }).Count | Should -Be 1
+        # A run of the whole tenant keeps the hints as they were.
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $Whole = script:Invoke-Wrapper
+        @($Whole.Text | Where-Object { $_ -eq 'Re-run with -Resume to retry failed and any unprocessed subscriptions.' }).Count | Should -Be 1
+        @($Whole.Text | Where-Object { $_ -like '-SubscriptionID: this run keeps its own resume state*' }).Count | Should -Be 0
+    }
+
+    It 'names its kept resume state file and how to remove it when its subscription is gone, and leaves the file as it is' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+        $Kept = script:Get-OneState 'B'
+        $Hash = script:Get-FileHashOrNone $Kept
+        $Hash | Should -Not -BeNullOrEmpty
+        script:Set-Scenario -Subs 'A'
+        $Run = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)
+        $Run.ExitCode | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ("  This subscription's resume state file {0} is kept for the next run of this command. If the subscription is gone for good, remove it with: Remove-Item -LiteralPath '{0}'" -f $Kept) }).Count | Should -Be 1
+        script:Get-FileHashOrNone $Kept | Should -Be $Hash
+    }
+
     It 'leaves the state of an unfinished whole-tenant run as it is after a one-subscription -Resume run, and that run still continues' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C'
