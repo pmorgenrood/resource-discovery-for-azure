@@ -199,8 +199,16 @@ Describe 'FAILED (consumption) lines of the wrapper' {
 
     It 'says to run the same command again and upload only the new report, when a subscription other than the sign-in entry failed' {
         Get-ConsumptionRetryAdvice -Entries $script:Failures | Should -Be @(
-            'To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
+            'To collect it again, fix the cause and run the same command again, with the same settings and without -Resume or -ResumeFailedOnly. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
         )
+    }
+
+    It 'names a higher -ConsumptionMaxPages when the page limit stopped a pull' {
+        $Capped = [pscustomobject]@{ Name = 'Sub C'; Id = 'sub-c'; Message = 'Read the limit of 3 usage pages for one subscription; the usage API offered more, which were not read. (stopped at consumption page 3, after 3 record(s))' }
+        $Lines = @(Get-ConsumptionRetryAdvice -Entries @($Capped))
+        $Lines.Count | Should -Be 2
+        $Lines[1] | Should -Be 'The page limit stopped a pull: give that run a higher -ConsumptionMaxPages than this one used.'
+        @(Get-ConsumptionRetryAdvice -Entries @($script:Failures[0])).Count | Should -Be 1
     }
 
     It 'says nothing when only the sign-in entry is there' {

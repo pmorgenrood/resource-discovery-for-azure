@@ -205,7 +205,7 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
         $Lines[($At + 1)..($Lines.Count - 1)] | Should -Be @(
             'Consumption (billing) data is missing or incomplete for 1 subscription(s):'
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
-            'To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
+            'To collect it again, fix the cause and run the same command again, with the same settings and without -Resume or -ResumeFailedOnly. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
             '========================================================'
         )
     }
@@ -241,7 +241,7 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
             '  - Sub B (placeholder-subscription-b)'
             'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount) first.'
-            'To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
+            'To collect it again, fix the cause and run the same command again, with the same settings and without -Resume or -ResumeFailedOnly. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
             '========================================================'
         )
     }
