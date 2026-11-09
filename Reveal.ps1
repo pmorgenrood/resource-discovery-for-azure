@@ -419,7 +419,7 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
         $Job = Start-Job -ScriptBlock {
             param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip)
             . $RevealFunctions
-            Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip *> $null
+            Invoke-RdaRevealFolder -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip *> $null
         } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath
         $LaunchUtc = [DateTime]::UtcNow
         $Running.Add([pscustomobject]@{ Item = $Item; Job = $Job; StartUtc = $LaunchUtc; Deadline = $LaunchUtc.AddSeconds($RevealTimeoutSeconds) })
