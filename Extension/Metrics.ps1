@@ -383,8 +383,9 @@ function Get-MetricExceptionChain
     return , $Chain
 }
 
-# The HTTP status an exception carries itself (its response's, else its own) as a
-# number, or $null when it carries none. Only 100 to 599 counts as a status.
+# The HTTP status an exception carries itself (its response's, else its own
+# StatusCode, else its Status number) as a number, or $null when it carries none.
+# Only 100 to 599 counts as a status.
 function Get-MetricExceptionStatus
 {
     param($Ex)
@@ -398,6 +399,12 @@ function Get-MetricExceptionStatus
     if ($null -eq $StatusCode -and $null -ne $Ex.PSObject.Properties['StatusCode'])
     {
         $StatusCode = $Ex.StatusCode
+    }
+    # Azure.Core's RequestFailedException gives it as an int named Status. Only an int
+    # counts, so a WebException's Status (an enum such as ProtocolError) does not.
+    if ($null -eq $StatusCode -and $null -ne $Ex.PSObject.Properties['Status'] -and $Ex.Status -is [int])
+    {
+        $StatusCode = $Ex.Status
     }
     if ($null -eq $StatusCode) { return $null }
     # A number, a status name ('NotFound') or an HttpStatusCode value.
