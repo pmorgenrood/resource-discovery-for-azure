@@ -1600,41 +1600,22 @@ function Add-MetricRecord
                 # from the exception and every exception it wraps, because the outer message may not
                 # name it. Only when no exception in the chain carries a status are the messages of
                 # the same chain matched, so an id holding '429' does not make another error count as throttled.
+                # The chain and each status are read as for Test-MetricNotFound and Test-MetricBadRequest.
                 function Test-MetricThrottled
                 {
                     param([System.Exception]$Exception)
 
-                    $Pending = [System.Collections.Generic.Queue[object]]::new()
-                    $Pending.Enqueue($Exception)
-                    $Checked = 0
+                    $Chain = Get-MetricExceptionChain -Exception $Exception
                     $SawStatus = $false
                     $Messages = [System.Collections.Generic.List[string]]::new()
-                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    foreach ($Ex in $Chain)
                     {
-                        $Ex = $Pending.Dequeue()
-                        if ($null -eq $Ex) { continue }
-                        $Checked++
                         $Messages.Add([string]$Ex.Message)
-
-                        $StatusCode = $null
-                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.Response.StatusCode
-                        }
-                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
-                        {
-                            $StatusCode = $Ex.StatusCode
-                        }
-                        if ($null -ne $StatusCode)
+                        $Status = Get-MetricExceptionStatus -Ex $Ex
+                        if ($null -ne $Status)
                         {
                             $SawStatus = $true
-                            if ("$StatusCode" -in @('429', 'TooManyRequests')) { return $true }
-                        }
-
-                        $Pending.Enqueue($Ex.InnerException)
-                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-                        {
-                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                            if ($Status -in @('429', 'TooManyRequests')) { return $true }
                         }
                     }
 

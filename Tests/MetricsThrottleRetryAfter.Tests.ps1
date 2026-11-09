@@ -242,9 +242,13 @@ Describe 'Test-MetricThrottled - the status code decides first' {
     BeforeAll {
         $Tokens = $null; $Errors = $null
         $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
-        $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Test-MetricThrottled' }, $true) | Select-Object -First 1
-        if (-not $FnAst) { throw 'Test-MetricThrottled was not found in Extension/Metrics.ps1' }
-        . ([scriptblock]::Create($FnAst.Extent.Text))
+        # Test-MetricThrottled walks the chain with the helpers Test-MetricNotFound uses.
+        foreach ($Name in 'Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Test-MetricThrottled')
+        {
+            $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq $Name }, $true) | Select-Object -First 1
+            if (-not $FnAst) { throw "$Name was not found in Extension/Metrics.ps1" }
+            . ([scriptblock]::Create($FnAst.Extent.Text))
+        }
 
         function New-StatusException([string]$Message, $StatusCode, $Inner = $null)
         {
@@ -338,6 +342,18 @@ Describe 'Test-MetricThrottled - the status code decides first' {
         $Inner = [System.Exception]::new('The request is being throttled.')
         $Middle = New-StatusException -Message 'denied' -StatusCode ([System.Net.HttpStatusCode]::Forbidden) -Inner $Inner
         Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Middle)) | Should -BeFalse
+    }
+
+    It 'reads the exception''s own status when its response has no status value (<Code>)' -ForEach @(@{ Code = 'TooManyRequests'; Want = $true }, @{ Code = 'ServiceUnavailable'; Want = $false }) {
+        $Ex = [System.Net.Http.HttpRequestException]::new('The request is being throttled.', $null, [System.Net.HttpStatusCode]$Code)
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $null })
+        Test-MetricThrottled -Exception $Ex | Should -Be $Want
+    }
+
+    It 'walks the chain with the same helper as the 404 and 400 checks' {
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Test-MetricThrottled' }, $true) | Select-Object -First 1
+        $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionChain -Exception \$Exception'
+        $FnAst.Extent.Text | Should -Match 'Get-MetricExceptionStatus -Ex \$Ex'
     }
 
     It 'the retry loop asks it, not a message match, whether an answer was throttled' {
