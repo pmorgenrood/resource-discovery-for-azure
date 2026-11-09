@@ -1197,15 +1197,20 @@ $StreamsAuto = -not $PSBoundParameters.ContainsKey('ParallelStreams')
 $ConcurrencyAuto = -not $PSBoundParameters.ContainsKey('ConcurrencyLimit')
 if ($StreamsAuto) { $ParallelStreams = $AutoTune.Streams }
 if ($ConcurrencyAuto) { $ConcurrencyLimit = $AutoTune.Concurrency }
-# One subscription (a -SubscriptionID run, or a tenant or retry list of one)
-# runs on the sequential path: it skips a subscription an earlier run
-# completed under -Resume, which the parallel branch's one-subscription
-# fallback does not.
-if ($ParallelStreams -gt 1 -and $Subscriptions.Count -le 1) { $ParallelStreams = 1 }
 
 $RamLabel = if ($AutoTune.RamGB -gt 0) { '{0} GB RAM' -f $AutoTune.RamGB } else { 'RAM undetected' }
 $StreamsSrc = if ($StreamsAuto) { 'auto' } else { 'explicit' }
 $ConcurrencySrc = if ($ConcurrencyAuto) { 'auto' } else { 'explicit' }
+# One subscription (a -SubscriptionID run, or a tenant or retry list of one)
+# runs on the sequential path: it skips a subscription an earlier run
+# completed under -Resume, which the parallel branch's one-subscription
+# fallback does not (that fallback is reached again once the parallel-resume
+# work, which collects only what is left, lands).
+if ($ParallelStreams -gt 1 -and $Subscriptions.Count -le 1)
+{
+    $ParallelStreams = 1
+    $StreamsSrc = 'one eligible subscription'
+}
 Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundColor DarkGray
 Write-Host ("Parallelism: -ParallelStreams {0} ({1}), -ConcurrencyLimit {2} ({3}). Pass either flag to override." -f $ParallelStreams, $StreamsSrc, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
 

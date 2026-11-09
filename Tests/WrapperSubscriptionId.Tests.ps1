@@ -817,6 +817,7 @@ Describe 'A one-subscription -Resume run asked for more than one stream' -Skip:(
         $Run = script:Invoke-Wrapper -Arguments $Arguments -Streams 2
         script:Get-Calls | Should -BeNullOrEmpty
         @($Run.Text | Where-Object { $_ -like 'Skipping (already completed): Sub B (*' }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like 'Parallelism: -ParallelStreams 1 (one eligible subscription)*' }).Count | Should -Be 1
     }
 }
 
