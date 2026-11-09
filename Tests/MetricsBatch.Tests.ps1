@@ -1497,6 +1497,7 @@ Describe 'Get-RdaInsightsProviderState' {
             $script:Paths.Add($Path)
             $Next = $script:Answers.Dequeue()
             if ($Next -is [string]) { throw $Next }
+            if ($Next -is [System.Exception]) { throw $Next }
             $Next
         }
     }
@@ -1511,14 +1512,37 @@ Describe 'Get-RdaInsightsProviderState' {
         $script:Paths[0] | Should -BeLike '/subscriptions/sub-a/providers/Microsoft.Insights?api-version=*'
     }
 
-    It 'sends the GET again after a server error or a request that throws' {
+    It 'sends the GET again after a server error or a request that throws a network error' {
         $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 503; Content = '' })
-        $script:Answers.Enqueue('connection reset')
+        $script:Answers.Enqueue([System.Net.Http.HttpRequestException]::new('connection reset'))
         $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
         $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
 
         $Read.State | Should -Be 'Registered'
         $script:Paths.Count | Should -Be 3
+    }
+
+    It 'sends the GET again after a network error or a time-out found inside another error' {
+        $script:Answers.Enqueue([System.InvalidOperationException]::new('the request failed', [System.IO.IOException]::new('the stream was closed')))
+        $script:Answers.Enqueue([System.Exception]::new('the request failed', [System.Threading.Tasks.TaskCanceledException]::new('the request timed out')))
+        $script:Answers.Enqueue([System.Exception]::new('the request failed', [System.Net.Sockets.SocketException]::new(104)))
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'Registered'
+        $script:Paths.Count | Should -Be 4
+    }
+
+    It 'reads Unknown at once, with no wait, for an error that would come back the same way' {
+        # No Az context: every try fails the same way, so it is not sent again.
+        $script:Answers.Enqueue('Run Connect-AzAccount to login.')
+        $script:Answers.Enqueue([pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' })
+        $Read = Get-RdaInsightsProviderState -SubscriptionId 'sub-a'
+
+        $Read.State | Should -Be 'Unknown'
+        $Read.Error | Should -Be 'Run Connect-AzAccount to login.'
+        $script:Paths.Count | Should -Be 1
+        Should -Invoke Start-Sleep -Times 0 -Exactly
     }
 
     It 'reads Unknown at once on a refusal, and after the last retry' {
