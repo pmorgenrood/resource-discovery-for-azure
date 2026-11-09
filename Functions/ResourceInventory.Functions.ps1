@@ -117,6 +117,87 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
     return $Result
 }
 
+# Best-effort extraction of a SERVER-DIRECTED retry delay (seconds) from a failed Azure cmdlet's error (consumption-retry-after header, else the standard Retry-After) so a throttled caller waits exactly as long as the service asks.
+# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws - a diagnostics aid must not break the retry loop.
+function Get-RdaRetryAfterSeconds
+{
+    param(
+        [Parameter(Mandatory = $true)]$ErrorRecord
+    )
+
+    # Priority order: the consumption/billing-specific header first (that is what
+    # the Cost Management throttle emits), then the standard HTTP Retry-After.
+    $HeaderNames = @('x-ms-ratelimit-microsoft.consumption-retry-after', 'Retry-After')
+
+    try
+    {
+        # PowerShell may surface the CloudException directly as .Exception or nested
+        # under one or more .InnerException levels; walk the chain (bounded).
+        $Ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        $Depth = 0
+        while ($null -ne $Ex -and $Depth -lt 5)
+        {
+            $Headers = $null
+            $ResponseProp = $Ex.PSObject.Properties['Response']
+            if ($ResponseProp -and $null -ne $ResponseProp.Value)
+            {
+                $HeadersProp = $ResponseProp.Value.PSObject.Properties['Headers']
+                if ($HeadersProp) { $Headers = $HeadersProp.Value }
+            }
+
+            if ($null -ne $Headers -and $Headers.Keys)
+            {
+                foreach ($Name in $HeaderNames)
+                {
+                    # Case-insensitive lookup: HTTP header names are
+                    # case-insensitive, but the underlying dictionary is ordinal.
+                    $Raw = $null
+                    foreach ($Key in $Headers.Keys)
+                    {
+                        if ($Key -and $Key.Equals($Name, [System.StringComparison]::OrdinalIgnoreCase))
+                        {
+                            $Raw = @($Headers[$Key])[0]
+                            break
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($Raw)) { continue }
+
+                    $Raw = ([string]$Raw).Trim()
+
+                    # delta-seconds form (what the consumption header uses).
+                    $Seconds = 0
+                    if ([int]::TryParse($Raw, [ref]$Seconds))
+                    {
+                        if ($Seconds -lt 0) { $Seconds = 0 }
+                        return $Seconds
+                    }
+
+                    # HTTP-date form: wait until that instant. Parse with the
+                    # invariant culture and AssumeUniversal - RFC 7231 HTTP-dates are
+                    # English/GMT, so a non-English-culture host must not fail to parse
+                    # them (which would silently degrade to blind backoff).
+                    $When = [datetimeoffset]::MinValue
+                    if ([datetimeoffset]::TryParse($Raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When))
+                    {
+                        $Delta = [int][math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
+                        if ($Delta -lt 0) { $Delta = 0 }
+                        return $Delta
+                    }
+                }
+            }
+
+            $Ex = $Ex.InnerException
+            $Depth++
+        }
+    }
+    catch
+    {
+        # Best-effort only - fall through to 0 so the caller uses its own backoff.
+    }
+
+    return 0
+}
+
 # Runs `az graph query` and returns the parsed JSON result. Azure CLI
 # failures (expired auth, throttling, a malformed KQL string, a transient
 # ARM error) print to stderr and exit non-zero, but the previous call sites
