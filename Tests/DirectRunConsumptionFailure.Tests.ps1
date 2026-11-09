@@ -198,15 +198,14 @@ Describe 'Direct run whose billing pull failed for one subscription' -Skip:$scri
         $script:Failed.End | Should -Not -Match 'Sub B \('
     }
 
-    It 'ends with FAILED (consumption), naming the subscription and the command that collects it again' {
+    It 'ends with FAILED (consumption), naming the subscription and how to collect it again' {
         $Lines = @($script:Failed.Console -split "`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
         $At = [array]::LastIndexOf($Lines, '================= FAILED (consumption) =================')
         $At | Should -BeGreaterThan 0 -Because $script:Failed.Console
         $Lines[($At + 1)..($Lines.Count - 1)] | Should -Be @(
             'Consumption (billing) data is missing or incomplete for 1 subscription(s):'
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
-            'To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -Service ''PublicIP'' -SkipMetrics'
+            'To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
             '========================================================'
         )
     }
@@ -233,7 +232,7 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
         $script:Skipped.End | Should -Not -Match '\(all subscriptions\)'
     }
 
-    It 'ends with FAILED (consumption), naming every subscription of the run and the command that collects it again' {
+    It 'ends with FAILED (consumption), naming every subscription of the run and how to collect it again' {
         $Lines = @($script:Skipped.Console -split "`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
         $At = [array]::LastIndexOf($Lines, '================= FAILED (consumption) =================')
         $At | Should -BeGreaterThan 0 -Because $script:Skipped.Console
@@ -241,10 +240,8 @@ Describe 'Direct run whose consumption phase was skipped for the sign-in' -Skip:
             'Consumption (billing) data is missing or incomplete for 2 subscription(s):'
             '  - Sub A (12345678-1234-1234-1234-123456789012)'
             '  - Sub B (placeholder-subscription-b)'
-            'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.'
-            'To collect one again, run the command below. Its new report replaces the one this run wrote for that subscription: upload only the new one, so its rows are not counted twice.'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID 12345678-1234-1234-1234-123456789012 -Service ''PublicIP'' -SkipMetrics'
-            '  ./ResourceInventory.ps1 -TenantID 12345678-1234-1234-1234-123456789012 -SubscriptionID placeholder-subscription-b -Service ''PublicIP'' -SkipMetrics'
+            'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount) first.'
+            'To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.'
             '========================================================'
         )
     }

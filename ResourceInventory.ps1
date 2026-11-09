@@ -2033,7 +2033,7 @@ Write-SkippedSubscriptionSummary -Decision $script:AccessSkipped
 # could not be refreshed (the '(auth)' entry) collected no billing data for any
 # subscription of the run: each of them is listed and the run exits 3, as the
 # wrapper does for a sign-in skip (Get-ConsumptionMissingEntries). A direct run
-# keeps no retry list: the command printed collects the subscription again.
+# keeps no retry list: the same command, run again, collects it again.
 # Under -RunAllSubs the wrapper reports this through its own exit code, so this
 # is skipped there. The zip check keeps the code to runs that produced their
 # report.
@@ -2041,8 +2041,7 @@ $ConsumptionIncomplete = @(Get-ConsumptionMissingEntries -Entries $Global:Consum
 if (-not $RunAllSubs.IsPresent -and $ConsumptionIncomplete.Count -gt 0 -and (Test-Path -LiteralPath $Global:ZipOutputFile))
 {
     $ConsumptionSignInSkipped = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
-    $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount), then collect it again.' })
-    $RetryDictionary = if ($Obfuscate.IsPresent) { [string]$Global:DictionaryFile } else { $null }
-    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @(Get-ConsumptionRetryAdvice -Entries $ConsumptionIncomplete -TenantID $TenantID -ResourceGroup $ResourceGroup -Service $Service -SkipMetrics:$SkipMetrics -Obfuscate:$Obfuscate -DictionaryFile $RetryDictionary))
+    $SignInAdvice = @(if ($ConsumptionSignInSkipped) { 'The consumption phase was skipped: no usable Azure context/token after one reconnect attempt. Sign in again (Connect-AzAccount) first.' })
+    Write-ConsumptionFailedBanner -Entries $ConsumptionIncomplete -Advice (@($SignInAdvice) + @(Get-ConsumptionRetryAdvice -Entries $ConsumptionIncomplete))
     exit 3
 }

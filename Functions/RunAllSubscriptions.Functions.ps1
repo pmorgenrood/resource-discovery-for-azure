@@ -748,17 +748,6 @@ function Test-AzPsTokenSilent
     }
 }
 
-# The lines under the wrapper's FAILED (consumption) banner: the command that
-# collects each such subscription again. The wrapper marks the subscription as
-# completed (its report was written), so a direct run of that subscription is
-# what collects its cost data again, with the wrapper's -SkipMetrics and
-# -Obfuscate (Get-ConsumptionRetryAdvice).
-function Get-ConsumptionFailedAdvice
-{
-    param([object[]]$Entries, [string]$TenantID, [switch]$SkipMetrics, [switch]$Obfuscate)
-    return @(Get-ConsumptionRetryAdvice -Entries $Entries -TenantID $TenantID -SkipMetrics:$SkipMetrics -Obfuscate:$Obfuscate)
-}
-
 # Machine-facing signal. Exit code 3 == "completed, but a requested data phase
 # was auth-skipped". Exit code 4 == "completed, but one or more collectors
 # failed for one or more subscriptions" (#22). Exit code 5 == BOTH occurred in
