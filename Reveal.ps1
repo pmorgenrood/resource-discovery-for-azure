@@ -445,7 +445,7 @@ $OutputZipParent = Split-Path -Path $OutputZip -Parent
 if (-not [string]::IsNullOrEmpty($OutputZipParent) -and (Test-Path -LiteralPath $OutputZipParent -PathType Container))
 {
     $OutputZipParent = (Resolve-Path -LiteralPath $OutputZipParent).Path
-    if ($OutputZipParent -eq $StagingDirectory)
+    if ([string]::Equals((ConvertTo-RevealComparablePath $OutputZipParent), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison))
     {
         throw "-OutputZip must not be inside the staging directory ($StagingDirectory); it would be included in itself. Choose a path outside staging."
     }
@@ -457,8 +457,11 @@ Write-Host ("Staging        : {0}" -f $StagingDirectory) -ForegroundColor Cyan
 Write-Host ("Output zip     : {0}" -f $OutputZip) -ForegroundColor Cyan
 Write-Host ""
 
+# Compared as the file system does (case-sensitive except on Windows), so on
+# Linux a report folder whose name differs from staging only by case is still
+# read.
 $Folders = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -ne $StagingDirectory })
+        Where-Object { -not [string]::Equals((ConvertTo-RevealComparablePath $_.FullName), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison) })
 
 $PairedCount = 0
 $RevealedCount = 0
