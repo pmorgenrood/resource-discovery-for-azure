@@ -646,6 +646,10 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         $Run.Calls.Count | Should -Be 60
         Assert-SameRecords -Expected $Expected -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 1
+        # A 403 from the batch API means Microsoft.Insights is not registered there.
+        $Note = @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' })[0]
+        $Note | Should -Match 'A 403 means Microsoft\.Insights is not registered on the subscription'
+        $Note | Should -Not -Match 'Monitoring Reader'
     }
 
     It 'does not batch a subscription where Microsoft.Insights is not registered' {
@@ -785,6 +789,8 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         Assert-SameRecords -Expected $Expected -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match 'renewing the token of 1 tenant' }).Count | Should -Be 1
         @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' }).Count | Should -Be 1
+        # A 401 that stays after a renewal means the caller has no Monitoring Reader there.
+        @($Run.DebugLines | Where-Object { $_ -match 'refused a renewed token' })[0] | Should -Match 'Monitoring Reader on the subscription itself'
         @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
     }
 
@@ -1491,8 +1497,19 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
     It 'says in the README what a 403 and a 401 do, as the code does' {
         $Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
         $Readme | Should -Not -Match ([regex]::Escape('401/403, batch is turned off for that subscription'))
-        $Readme | Should -Match 'answers 403: batch is turned off for that subscription'
-        $Readme | Should -Match 'A 401 \(token refused\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
+        # Microsoft's batch API guide: a 401 means the token is refused or the caller has
+        # no Monitoring Reader on the subscription itself; a 403 means Microsoft.Insights
+        # is not registered there.
+        $Lines = $Readme -split "`r?`n"
+        $ReaderLine = @($Lines | Where-Object { $_ -match '^- \*\*Monitoring Reader \(or Reader\) on the subscription itself' })
+        $ProviderLine = @($Lines | Where-Object { $_ -match '^- \*\*The `Microsoft\.Insights` resource provider registered' })
+        $ReaderLine.Count | Should -Be 1
+        $ProviderLine.Count | Should -Be 1
+        $ReaderLine[0] | Should -Not -Match '\b403\b'
+        $ReaderLine[0] | Should -Match 'Without it Azure answers 401'
+        $ReaderLine[0] | Should -Match 'A 401 \(token refused, or no Monitoring Reader on the subscription\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
+        $ProviderLine[0] | Should -Not -Match '\b401\b'
+        $ProviderLine[0] | Should -Match 'Without it Azure answers 403: batch is turned off for that subscription'
     }
 
     It 'runs the preflight only under -UseMetricsBatch' {
