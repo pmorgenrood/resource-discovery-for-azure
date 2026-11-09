@@ -58,11 +58,13 @@
     are written before consolidation. Defaults to
     <InventoryRoot>/RevealedStaging_<timestamp>. Kept after the run (not
     auto-deleted) so a partial run is recoverable; pass -RemoveStaging to delete
-    it once the outer zip is built. Must be a new or empty folder, or one a
-    reveal of the same -InventoryRoot staged into before (Reveal marks it with
-    a hidden .reveal-staging.json file); any other folder is refused. Only the
-    zips this run revealed (or, with -Resume, found already revealed) go in the
-    outer zip.
+    it once the outer zip is built. Must be a new or empty folder, or (with
+    -Resume) one a reveal of the same -InventoryRoot staged into before (Reveal
+    marks it with a hidden .reveal-staging.json file that records the fields
+    and each finished output); any other folder is refused. Reveal makes the
+    folder readable by its owner only before writing into it. Only the zips
+    this run revealed (or, with -Resume, found already revealed and matching
+    the record) go in the outer zip.
 
 .PARAMETER RemoveStaging
     ALL-SUBSCRIPTIONS MODE. After the outer zip is successfully created (only on
@@ -71,9 +73,12 @@
 
 .PARAMETER Resume
     ALL-SUBSCRIPTIONS MODE. Continue an interrupted run instead of starting
-    fresh. Re-uses a prior run's staging directory and SKIPS any folder whose
-    revealed zip is already present, so a resumed run does not redo completed
-    work - and gets past a folder that previously stalled. With -Resume and no
+    fresh. Re-uses a prior run's staging directory and SKIPS any report whose
+    revealed zip the staging mark records as finished (same bytes, same source
+    report and dictionary), so a resumed run does not redo completed work - and
+    gets past a folder that previously stalled. Any other report is revealed
+    again. The run must use the same -Fields (or -All) as the run it resumes,
+    or it is refused. With -Resume and no
     explicit -StagingDirectory, the most recent RevealedStaging_* under the
     inventory root is auto-detected.
 

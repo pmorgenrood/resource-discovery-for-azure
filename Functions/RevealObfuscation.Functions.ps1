@@ -762,12 +762,13 @@ function Invoke-RdaReveal
         # place with File.Move(overwrite). A same-volume move is a rename, so a
         # hard kill (SIGKILL / shell timeout) DURING compression can never leave a
         # truncated zip at $OutputZip. This matters for the all-subscriptions
-        # reveal (Reveal.ps1), whose -Resume trusts the presence of the output zip
-        # to mean "this folder is done" and whose consolidation sweeps every *.zip
-        # in staging: a partial file left at the FINAL name would be both skipped
-        # on resume AND folded into the outer zip. The .partial.zip name is
-        # excluded from that consolidation sweep, so only the completed archive
-        # ever appears at $OutputZip. The Remove-Item below is required because
+        # reveal (Reveal.ps1), which records each output zip once it is complete,
+        # puts in the outer zip only the outputs on its own list for the run
+        # (never every *.zip in staging), and on -Resume checks a staged zip
+        # against that record: a partial file left at the FINAL name would look
+        # like a finished output. The .partial.zip name is never on that list,
+        # so only the completed archive ever appears at $OutputZip. The
+        # Remove-Item below is required because
         # ZipFile.CreateFromDirectory throws if the destination already exists.
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -CurrentItem 'Compressing output' -Index 3 -Total 3 }
         $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
