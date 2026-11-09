@@ -342,6 +342,16 @@ Describe 'The -SubscriptionID helpers' {
         @($Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'SubscriptionID' })[0].StaticType | Should -Be ([string])
         @($Ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PreflightOnly' })[0].StaticType | Should -Be ([switch])
     }
+
+    It 'says in the README that a -PreflightOnly set-up check ends with its own message, as the script does it before its helpers load' {
+        $Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
+        # Contains, not -like: a backtick is the escape character of a wildcard.
+        $Readme.Contains('except for the set-up checks made first (PowerShell 7, the Azure CLI, the Az modules and the tool''s own `Functions` files): one of those that fails ends with its own message and exit code `1`') | Should -BeTrue
+        # Those checks exit before the helpers that print 'Preflight failed' load.
+        $Text = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Text.IndexOf('Azure CLI (az) is required but was not found.') | Should -BeLessThan $Text.IndexOf('. $FunctionsFile')
+        $Text.IndexOf('failed to load:') | Should -BeLessThan $Text.IndexOf('. $FunctionsFile')
+    }
 }
 
 Describe 'Resume state in a folder with brackets in its name' {
