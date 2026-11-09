@@ -1271,6 +1271,13 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         }
     }
 
+    It 'says in the README what a 403 and a 401 do, as the code does' {
+        $Readme = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'README.md') -Raw
+        $Readme | Should -Not -Match ([regex]::Escape('401/403, batch is turned off for that subscription'))
+        $Readme | Should -Match 'answers 403: batch is turned off for that subscription'
+        $Readme | Should -Match 'A 401 \(token refused\) renews the tenant''s token once and sends the request again; a second 401 turns batch off for that whole tenant'
+    }
+
     It 'runs the preflight only under -UseMetricsBatch' {
         $Preflight = @($script:Calls | Where-Object { $_.Name -eq 'Invoke-RdaInsightsProviderPreflight' })
         @($Preflight | ForEach-Object { $_.File } | Sort-Object) | Should -Be @('ResourceInventory.ps1', 'Run-AllSubscriptions.ps1')
