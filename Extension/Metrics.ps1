@@ -1013,15 +1013,16 @@ function Add-MetricRecord
                         }
 
                         # The definitions of this unit that have a record or were handed on, so a
-                        # unit that stops part way hands on only the rest.
-                        $Done = [System.Collections.Generic.HashSet[object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+                        # unit that stops part way hands on only the rest. Kept by MetricIndex, which
+                        # is unique per definition.
+                        $Done = [System.Collections.Generic.HashSet[int]]::new()
 
                         # One group (or the rest of one) to the per-resource path, as without -UseMetricsBatch.
                         function Send-GroupOn($Group)
                         {
                             $Outcomes.Add([pscustomobject]@{ Kind = 'Fallback'; Group = $Group })
                             Add-BatchCount 5 @($Group).Count
-                            foreach ($Def in $Group) { [void]$Done.Add($Def) }
+                            foreach ($Def in $Group) { [void]$Done.Add([int]$Def.MetricIndex) }
                         }
 
                         # Every group of the unit to the per-resource path.
@@ -1336,7 +1337,7 @@ function Add-MetricRecord
                                 foreach ($Answer in $GroupAnswers)
                                 {
                                     Add-MetricRecord -Def $Answer.Def -Request $Answered -MetricQuery ([pscustomobject]@{ Name = [pscustomobject]@{ Value = $Answer.Metric.Name }; Data = $Answer.Metric.Data }) -ExtraSeconds $Seconds
-                                    [void]$Done.Add($Answer.Def)
+                                    [void]$Done.Add([int]$Answer.Def.MetricIndex)
                                     $AnsweredDefs++
                                 }
                                 foreach ($Def in $Missing)
@@ -1357,7 +1358,7 @@ function Add-MetricRecord
                             foreach ($Group in $Unit.Groups)
                             {
                                 $Rest = [System.Collections.Generic.List[object]]::new()
-                                foreach ($Def in $Group) { if (-not $Done.Contains($Def)) { $Rest.Add($Def) } }
+                                foreach ($Def in $Group) { if (-not $Done.Contains([int]$Def.MetricIndex)) { $Rest.Add($Def) } }
                                 if ($Rest.Count -eq @($Group).Count) { Send-GroupOn $Group }
                                 elseif ($Rest.Count -gt 0) { Send-GroupOn ([object[]]$Rest.ToArray()) }
                             }
