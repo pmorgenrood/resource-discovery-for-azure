@@ -1800,6 +1800,11 @@ if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 # with -OutputDirectory can also hold another run's files.
 $JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime
 
+# A zip with no readable Metrics file would read as a run with no metrics. So
+# unless the run had -SkipMetrics, no zip is made and the run counts as having
+# written no report (exit 2; under the wrapper, that subscription failed).
+$MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles)
+
 if ($Obfuscate.IsPresent)
 {
     $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -Obfuscated:$Obfuscate.IsPresent -SubscriptionID $SubscriptionID
@@ -1829,7 +1834,12 @@ else
 
 # A failed zip is removed and reported; the report file is named only when the
 # zip was written. A direct run then exits 2 at its end.
-$ZipWritten = Write-RdaReportZip -CompressionOutput $CompressionOutput
+$ZipWritten = if ($MetricsNotWritten)
+{
+    Write-Log -Message ("No report was written: the metrics output was not written, so no zip was made. The other report files are still in {0}; run again." -f $DefaultPath) -Severity 'Error'
+    $false
+}
+else { Write-RdaReportZip -CompressionOutput $CompressionOutput }
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'

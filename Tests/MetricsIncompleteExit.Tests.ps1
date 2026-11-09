@@ -479,6 +479,129 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
     }
 }
 
+Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
+    BeforeAll {
+        # The run's param block and its top-level statements from the one that
+        # writes the empty Metrics file to the end, as written, with both
+        # function files loaded and the real Compress-Archive. A stand-in
+        # Out-File fails for a Metrics file when asked, as a full disk does.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^if \(\$SkipMetrics\.IsPresent\)' })[-1]
+        $script:MetricsEnd = Join-Path $TestDrive 'metrics-end.ps1'
+        Set-Content -LiteralPath $script:MetricsEnd -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                'function Out-File { [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject) begin { $Items = [System.Collections.Generic.List[object]]::new() } process { $Items.Add($InputObject) } end { if ($env:RDA_TEST_METRICS_WRITE_FAIL -and (Split-Path -Path $FilePath -Leaf) -like ''Metrics_*'') { Write-Error ''There is not enough space on the disk.'' } else { $Items | Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -Encoding utf8 -Append:$Append } } }'
+                '$Runtime = ''0:01''; $ReportingRunTime = ''0:01'''
+                @($Top[$From..($Top.Count - 1)] | ForEach-Object { $_.Extent.Text })
+            ) -join "`n")
+
+        # Writes the other files of a run, sets the names the run sets, runs
+        # the lifted statements and returns the exit code, the lines and the zip.
+        function script:Invoke-MetricsEnd
+        {
+            param([hashtable]$Arguments, [switch]$WriteFails, [string]$MetricsContent)
+            $Stamp = '20261109130000000' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
+            $Folder = Join-Path $TestDrive ('run-' + $Stamp)
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            $Global:DefaultPath = $Folder.TrimEnd('/') + '/'
+            $Global:ReportName = 'ResourcesReport'
+            $Global:CurrentDateTime = $Stamp
+            $Global:HtmlFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.html'
+            $Global:ConsumptionFileCsv = $Global:DefaultPath + 'Consumption_ResourcesReport_' + $Stamp + '.csv'
+            $Global:ZipOutputFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.zip'
+            $Global:MetricsJsonFile = $Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '.json'
+            $Global:MetricsFailedSubs = @()
+            Set-Content -LiteralPath $Global:HtmlFile -Value 'html'
+            Set-Content -LiteralPath $Global:ConsumptionFileCsv -Value 'InstanceData,MeterCategory'
+            Set-Content -LiteralPath ($Global:DefaultPath + 'Inventory_ResourcesReport_' + $Stamp + '.json') -Value '{}'
+            if ($PSBoundParameters.ContainsKey('MetricsContent')) { Set-Content -LiteralPath ($Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '_1.json') -Value $MetricsContent }
+            $env:RDA_TEST_METRICS_WRITE_FAIL = $(if ($WriteFails) { '1' } else { '' })
+            try
+            {
+                $global:LASTEXITCODE = 0
+                $Lines = @(& $script:MetricsEnd @Arguments *>&1 | ForEach-Object { [string]$_ })
+                $Entries = @()
+                if (Test-Path -LiteralPath $Global:ZipOutputFile)
+                {
+                    $Zip = [System.IO.Compression.ZipFile]::OpenRead($Global:ZipOutputFile)
+                    try { $Entries = @($Zip.Entries | ForEach-Object { $_.FullName }) } finally { $Zip.Dispose() }
+                }
+                [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines; ZipLeft = (Test-Path -LiteralPath $Global:ZipOutputFile); Entries = $Entries }
+            }
+            finally
+            {
+                Remove-Item -Path 'Env:RDA_TEST_METRICS_WRITE_FAIL' -ErrorAction SilentlyContinue
+            }
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'makes no zip and exits 2 when the Metrics file could not be written and the other files are fine' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -WriteFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the metrics output was not written*' }).Count | Should -Be 1
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
+    }
+
+    It 'exits 2 under -RunAllSubs and adds the zip for the wrapper, so that subscription counts as failed' {
+        $Global:RdaUnwrittenReportZips = @()
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -WriteFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        $Global:RdaUnwrittenReportZips | Should -Be @($Global:ZipOutputFile)
+    }
+
+    It 'makes no zip and exits 2 when the only Metrics file of the run cannot be read (<Kind>)' -ForEach @(
+        @{ Kind = 'cut short'; Content = '{"Metrics":[{"ID":"a"' }
+        @{ Kind = 'no Metrics list'; Content = '{"Other":[]}' }
+        @{ Kind = 'a list, not an object'; Content = '[]' }
+    ) {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContent $Content
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+    }
+
+    It 'zips the empty Metrics file and exits 0 when the run collected no metrics' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        @($Result.Entries | Where-Object { $_ -eq (Split-Path -Path $Global:MetricsJsonFile -Leaf) }).Count | Should -Be 1
+    }
+
+    It 'zips the run''s Metrics file and exits 0 when it holds metrics' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContent '{"Metrics":[{"ID":"a","MetricSeries":[1]}]}'
+
+        $Result.ExitCode | Should -Be 0
+        @($Result.Entries | Where-Object { $_ -like 'Metrics_*_1.json' }).Count | Should -Be 1
+    }
+
+    It 'still makes the zip and exits 0 after -SkipMetrics' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1'; SkipMetrics = $true } -WriteFails
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeTrue
+    }
+}
+
 Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
     BeforeAll {
         # The run's param block and its top-level statements from the one that
@@ -487,7 +610,7 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
         $Top = @($Ast.EndBlock.Statements)
         $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$JsonWildCard =|^\$JsonFiles = Get-RdaReportJsonFiles|Write-RdaShareableDiagnosticsLog' })[0]
-        $To = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$ZipWritten = Write-RdaReportZip' })[0]
+        $To = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$ZipWritten = ' -and $Top[$_].Extent.Text -match 'Write-RdaReportZip' })[0]
         $script:ZipFiles = Join-Path $TestDrive 'zip-files.ps1'
         Set-Content -LiteralPath $script:ZipFiles -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
@@ -517,7 +640,9 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
                     ('Metrics_ResourcesReport_{0}_2.json' -f $Stamp)
                     ('Transcript_Log_ResourcesReport_{0}.txt' -f $Stamp)))
             {
-                Set-Content -LiteralPath ($Global:DefaultPath + $Name) -Value $Name
+                # A Metrics file holds a Metrics list, as the run writes it.
+                $Content = if ($Name -like 'Metrics_*') { '{"Metrics":[]}' } else { $Name }
+                Set-Content -LiteralPath ($Global:DefaultPath + $Name) -Value $Content
             }
             if ($Obfuscate) { Set-Content -LiteralPath ($Global:DefaultPath + ('ObfuscationDictionary_ResourcesReport_{0}.json' -f $Stamp)) -Value '{}' }
             $Arguments = @{ TenantID = 'tenant-1' }
