@@ -1072,8 +1072,9 @@ if ($Task -eq 'Processing')
     # A subscription with a request that still failed after its retries (not
     # BadRequest) is metrics incomplete: one entry in $Global:MetricsFailedSubs,
     # as for metrics skipped for the sign-in, with Complete = $false so the wrapper
-    # tells the two apart. The wrapper lists it at the end of the run and keeps it
-    # on the retry list; the failed records stay in the report with MetricError true.
+    # tells the two apart. The wrapper (or a direct run) lists it at the end of the
+    # run with the command that collects it again, and exits 3; the failed records
+    # stay in the report with MetricError true.
     if ($MetricFailedGroupIds.Count -gt 0)
     {
         $FailedIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MetricFailedGroupIds), [System.StringComparer]::OrdinalIgnoreCase)
