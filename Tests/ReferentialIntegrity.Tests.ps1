@@ -34,8 +34,8 @@ BeforeAll {
         @($_.Value) | ForEach-Object { if ($null -ne $_.ID) { $script:AllIds += $_.ID } }
     }
 
-    # --- Task 6 (P8) additive fixtures --------------------------------------
-    # Metric rows back the per-resource cached-token check (Req 2.4). Metrics
+    # --- Additional fixtures ------------------------------------------------
+    # Metric rows back the per-resource cached-token check. Metrics
     # live in one or more Metrics_*.json members, each exposing a .Metrics array.
     $MetricRows = @()
     Get-ChildItem -Path $script:ExtractPath -Filter "Metrics_*.json" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -217,18 +217,17 @@ Describe "ResourceGroup Determinism" {
 }
 
 # ============================================================================
-# Task 6 (spec: obfuscation-and-reveal) — additive P8 coverage.
+# Cross-reference coverage.
 # Purely additive. Closes gaps for cross-reference pairs not already asserted
 # above (SQLDB server/pool, SQLMIDB managed instance, AvSet VMs, VMSS related
-# cluster), the out-of-scope 'obfuscated' sentinel (Req 2.3), and the metric
-# per-resource cached token (Req 2.4). Where the live fixture lacks a given
+# cluster), the out-of-scope 'obfuscated' sentinel, and the metric
+# per-resource cached token. Where the live fixture lacks a given
 # pair the block skips gracefully rather than fabricating resources.
-#   Validates: Requirements 2.2, 2.3, 2.4 | Property: P8
 # The disk->VM (VM Disk to VM) and SQLVM->parent VM (SQL VM to VM) pairs are
 # already covered by the blocks above and are intentionally NOT duplicated here.
 # ============================================================================
 
-Describe "SQLDB to SQL Server Cross-Reference (P8)" {
+Describe "SQLDB to SQL Server Cross-Reference" {
     It "Every SQLDB DatabaseServer carries the same token its parent SQL Server uses (or the 'obfuscated' sentinel)" {
         $SqlDbs = @($script:Inventory.SQLDB) | Where-Object { $null -ne $_ }
         if ($SqlDbs.Count -eq 0) { Set-ItResult -Skipped -Because "no SQLDB resources in this fixture"; return }
@@ -263,7 +262,7 @@ Describe "SQLDB to SQL Server Cross-Reference (P8)" {
     }
 }
 
-Describe "SQLMIDB to Managed Instance Cross-Reference (P8)" {
+Describe "SQLMIDB to Managed Instance Cross-Reference" {
     It "Every SQLMIDB ManagedInstance carries the same token its managed instance uses (or the 'obfuscated' sentinel)" {
         $MiDbs = @($script:Inventory.SQLMIDB) | Where-Object { $null -ne $_ }
         if ($MiDbs.Count -eq 0) { Set-ItResult -Skipped -Because "no SQLMIDB resources in this fixture"; return }
@@ -281,7 +280,7 @@ Describe "SQLMIDB to Managed Instance Cross-Reference (P8)" {
     }
 }
 
-Describe "AvSet to VM Cross-Reference (P8)" {
+Describe "AvSet to VM Cross-Reference" {
     It "Every AvSet VirtualMachines token carries the same token the member VM uses (or the 'obfuscated' sentinel)" {
         $AvSets = @($script:Inventory.AvSet) | Where-Object { $null -ne $_ }
         if ($AvSets.Count -eq 0) { Set-ItResult -Skipped -Because "no AvSet resources in this fixture"; return }
@@ -299,7 +298,7 @@ Describe "AvSet to VM Cross-Reference (P8)" {
     }
 }
 
-Describe "VMSS Related-Cluster Cross-Reference (P8)" {
+Describe "VMSS Related-Cluster Cross-Reference" {
     It "Every VMSS related-cluster value carries the same token its AKS cluster uses, the out-of-scope sentinel, or a well-formed token for a Service-Fabric-backed scale set" {
         $VmssItems = @($script:Inventory.VMSS) | Where-Object { $null -ne $_ }
         if ($VmssItems.Count -eq 0) { Set-ItResult -Skipped -Because "no VMSS resources in this fixture"; return }
@@ -308,8 +307,8 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
         # first; if none owns the node pool's resource group it falls back to
         # a Service Fabric cluster match instead. Either way it resolves the
         # cluster's real ID through $ResourceIdDictionary and emits the SAME
-        # token the cluster's own row uses for its identity (Req 2.2), or the
-        # 'obfuscated' sentinel when the target is out of scope (Req 2.3).
+        # token the cluster's own row uses for its identity, or the
+        # 'obfuscated' sentinel when the target is out of scope.
         # There is no dedicated Service Fabric collector/inventory bucket, so
         # a Service-Fabric-backed match can't be looked up against a known-ID
         # allowlist the way AKS can - instead we accept any well-formed masked
@@ -332,12 +331,12 @@ Describe "VMSS Related-Cluster Cross-Reference (P8)" {
     }
 }
 
-Describe "Cross-Reference Out-of-Scope Sentinel (P8)" {
+Describe "Cross-Reference Out-of-Scope Sentinel" {
     It "Every in-scope cross-reference value is a valid target token or exactly the 'obfuscated' sentinel" {
         # Gather every known ID cross-reference field across the in-scope pairs.
         # Each value must be one of: a token that resolves to a real target ID in
-        # the inventory (same-token, Req 2.2), the literal 'obfuscated' sentinel
-        # for an out-of-scope target (Req 2.3), a benign 'None'/'' placeholder,
+        # the inventory (same token), the literal 'obfuscated' sentinel
+        # for an out-of-scope target, a benign 'None'/'' placeholder,
         # or a well-formed token. It must NEVER be a raw ARM path.
         $Refs = @()
         @($script:Inventory.VMDisk)  | Where-Object { $null -ne $_ } | ForEach-Object { if ($_.AssociatedResource) { $Refs += $_.AssociatedResource } }
@@ -356,7 +355,7 @@ Describe "Cross-Reference Out-of-Scope Sentinel (P8)" {
     }
 }
 
-Describe "Metric Per-Resource Cached Token (P8)" {
+Describe "Metric Per-Resource Cached Token" {
     It "Metric rows for the same resource carry a consistent obfuscated identity across their own metrics" {
         if ($script:MetricRows.Count -eq 0) { Set-ItResult -Skipped -Because "no metric rows in this fixture"; return }
         # A resource's obfuscated identity must be stable across all of its own
@@ -374,7 +373,7 @@ Describe "Metric Per-Resource Cached Token (P8)" {
 
     It "Metric rows for resources absent from the main dictionary still carry a cached per-resource token" {
         if ($script:MetricRows.Count -eq 0) { Set-ItResult -Skipped -Because "no metric rows in this fixture"; return }
-        # Req 2.4: a metric row whose resource is NOT in the main inventory
+        # a metric row whose resource is NOT in the main inventory
         # dictionary gets a fresh cached token so it still correlates across its
         # own metrics. In a single-run fixture every metric-bearing resource is
         # normally also inventoried, so this fallback path may be unexercised.

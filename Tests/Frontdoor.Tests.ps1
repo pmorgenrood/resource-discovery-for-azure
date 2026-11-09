@@ -94,7 +94,7 @@ Describe "Front Door WAF Field" {
         foreach ($fd in $script:FrontDoors)
         {
             # Valid values: 'False' (Classic, no WAF), a WAF policy name (Classic, WAF attached),
-            # 'obfuscated' (Classic, obfuscated mode), 'Unknown' (Standard/Premium — security
+            # 'obfuscated' (Classic, obfuscated mode), 'Unknown' (Standard/Premium: security
             # policies aren't visible on the profile, so we don't assert attachment).
             $fd.WebApplicationFirewall | Should -Not -BeNullOrEmpty -Because "WAF field should always have a value (False, name, obfuscated, or Unknown)"
         }
@@ -104,7 +104,7 @@ Describe "Front Door WAF Field" {
         if ($script:FrontDoors.Count -eq 0) { Set-ItResult -Skipped -Because "no Front Door resources in fixture"; return }
         foreach ($fd in $script:FrontDoors)
         {
-            # Disallow misleading 'Enabled' — Standard/Premium should report 'Unknown' now.
+            # Disallow misleading 'Enabled': Standard/Premium should report 'Unknown' now.
             $fd.WebApplicationFirewall | Should -Not -Be 'Enabled' -Because "Std/Premium WAF attachment is not detectable from the profile; 'Enabled' is misleading"
         }
     }

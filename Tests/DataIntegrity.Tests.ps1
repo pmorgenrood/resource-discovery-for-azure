@@ -59,7 +59,7 @@ AfterAll {
 }
 
 # ============================================================
-# 1. PII Leak Scan — no real Azure identifiers in any output file
+# 1. PII Leak Scan: no real Azure identifiers in any output file
 # ============================================================
 Describe "PII Leak Scan" {
     It "Should not contain /subscriptions/ resource paths in any file" {
@@ -101,7 +101,7 @@ Describe "PII Leak Scan" {
 }
 
 # ============================================================
-# 2. Cross-Reference Integrity — obfuscated IDs match across types
+# 2. Cross-Reference Integrity: obfuscated IDs match across types
 # ============================================================
 Describe "Cross-Reference Integrity" {
     It "Every VMDisk AssociatedResource should match a VM ID or be null" {
@@ -153,7 +153,7 @@ Describe "Cross-Reference Integrity" {
 }
 
 # ============================================================
-# 3. Deterministic Mapping — same real sub/RG = same obfuscated value
+# 3. Deterministic Mapping: same real sub/RG = same obfuscated value
 # ============================================================
 Describe "Deterministic Mapping" {
     It "All resources should share the same subscription value per real subscription" {
@@ -182,7 +182,7 @@ Describe "Deterministic Mapping" {
 }
 
 # ============================================================
-# 4. Non-Sensitive Fields Preserved — real values not obfuscated
+# 4. Non-Sensitive Fields Preserved: real values not obfuscated
 # ============================================================
 Describe "Non-Sensitive Fields Preserved" {
     It "VM Location should be a real Azure region" {
@@ -254,7 +254,7 @@ Describe "Non-Sensitive Fields Preserved" {
 }
 
 # ============================================================
-# 5. No Null Obfuscated Fields — fallbacks should generate values
+# 5. No Null Obfuscated Fields: fallbacks should generate values
 # ============================================================
 Describe "No Null Obfuscated Fields" {
     It "No resource should have a null ID" {

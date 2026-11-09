@@ -2,12 +2,12 @@
 # Run with: Invoke-Pester ./Tests/Obfuscation.Tests.ps1 -Output Detailed
 
 BeforeAll {
-    # Helper for the Determinism (P1) block below. Given a dictionary map
+    # Helper for the Determinism block below. Given a dictionary map
     # (token -> real-value) and a selector that derives the real value from a
     # map value, return the groups of real values that are reachable from MORE
     # THAN ONE distinct token. A non-empty result means the same real value
     # produced two different tokens within the run, which breaks obfuscation
-    # determinism (P1). Defined in BeforeAll so it is in scope for the It blocks.
+    # determinism. Defined in BeforeAll so it is in scope for the It blocks.
     function Get-DeterminismViolation
     {
         param(
@@ -780,26 +780,25 @@ Describe "Dictionary File Exclusion" {
 }
 
 # ============================================================
-# 16b. Full (raw) resource dump excluded from zip (P10)
+# 16b. Full (raw) resource dump excluded from zip
 # The -Obfuscate run also writes a LOCAL Full_<ReportName>_<timestamp>.json
 # ($Global:AllResourceFile) that holds the RAW, un-obfuscated resource dump.
 # The packaging step's json filter excludes BOTH ObfuscationDictionary_* and
 # Full_* from the shipped ZIP (ResourceInventory.ps1 L1671). The Dictionary
 # File Exclusion block above guards the dictionary; this guards the Full_*
-# dump — the other local-only artifact whose presence would leak every real
+# dump: the other local-only artifact whose presence would leak every real
 # identifier for every obfuscated dimension. Count-independent; asserts the
 # shared ZIP carries no Full_* member.
-# Validates: Requirements 12.1 | Property: P10
 # ============================================================
-Describe "Full Resource Dump Exclusion (P10)" {
+Describe "Full Resource Dump Exclusion" {
     It "Should not contain the raw Full_* resource dump in the zip" {
         $FullDumpFiles = $script:AllFiles | Where-Object { $_.Name -like "Full_*" }
-        $FullDumpFiles | Should -BeNullOrEmpty -Because "Full_* raw resource dump should stay local, not in the shared zip (P10)"
+        $FullDumpFiles | Should -BeNullOrEmpty -Because "Full_* raw resource dump should stay local, not in the shared zip"
     }
 }
 
 # ============================================================
-# 17. Obfuscation determinism (P1)
+# 17. Obfuscation determinism
 # Within a single run, the same real value must always map to the
 # SAME token. The obfuscated zip alone carries no real values, so
 # determinism is asserted against the reverse-lookup dictionary
@@ -809,15 +808,14 @@ Describe "Full Resource Dump Exclusion (P10)" {
 # one RG token" invariant. Skips gracefully when no dictionary
 # fixture is available; count-independent (iterates whatever tokens
 # the run produced).
-# Validates: Requirements 2.1, 2.5 | Property: P1
 # ============================================================
-Describe "Obfuscation Determinism (P1)" {
+Describe "Obfuscation Determinism" {
     It "ResourceGroup: each real resource group maps to exactly one token" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
         $Map = $script:Dictionary.ResourceGroupMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceGroupMap absent/empty in this dictionary"; return }
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/resourceGroups/([^/]+)') { $Matches[1] } }
-        $Violations | Should -BeNullOrEmpty -Because "no real resource group may yield two different tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real resource group may yield two different tokens within a run"
     }
 
     It "Subscription: each real subscription maps to exactly one token" {
@@ -825,7 +823,7 @@ Describe "Obfuscation Determinism (P1)" {
         $Map = $script:Dictionary.SubscriptionMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "SubscriptionMap absent/empty in this dictionary"; return }
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/subscriptions/([0-9a-fA-F-]+)') { $Matches[1] } }
-        $Violations | Should -BeNullOrEmpty -Because "no real subscription may yield two different tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real subscription may yield two different tokens within a run"
     }
 
     It "ResourceId: each real resource id maps to exactly one token" {
@@ -833,7 +831,7 @@ Describe "Obfuscation Determinism (P1)" {
         $Map = $script:Dictionary.ResourceIdMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceIdMap absent/empty in this dictionary"; return }
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Violations | Should -BeNullOrEmpty -Because "no real resource id may yield two different tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real resource id may yield two different tokens within a run"
     }
 
     It "ResourceName: each real resource id maps to exactly one name token" {
@@ -844,7 +842,7 @@ Describe "Obfuscation Determinism (P1)" {
         # display name in different RGs legitimately get different name tokens),
         # so determinism is asserted against the real resource id, not the name.
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Violations | Should -BeNullOrEmpty -Because "no real resource id may yield two different name tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real resource id may yield two different name tokens within a run"
     }
 
     It "Tag: each real tag value maps to exactly one token" {
@@ -852,7 +850,7 @@ Describe "Obfuscation Determinism (P1)" {
         $Map = $script:Dictionary.TagMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "TagMap absent/empty in this dictionary"; return }
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Violations | Should -BeNullOrEmpty -Because "no real tag value may yield two different tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real tag value may yield two different tokens within a run"
     }
 
     It "FreeText: each real free-text value maps to exactly one token" {
@@ -860,12 +858,12 @@ Describe "Obfuscation Determinism (P1)" {
         $Map = $script:Dictionary.FreeTextMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "FreeTextMap absent/empty in this dictionary"; return }
         $Violations = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Violations | Should -BeNullOrEmpty -Because "no real free-text value may yield two different tokens within a run (P1)"
+        $Violations | Should -BeNullOrEmpty -Because "no real free-text value may yield two different tokens within a run"
     }
 }
 
 # ============================================================
-# 18. Obfuscation injectivity / no token collisions (P2)
+# 18. Obfuscation injectivity / no token collisions
 # Distinct real values must produce DISTINCT tokens (a fresh GUID
 # per newly seen value), so one token never stands in for two
 # different real values. Asserted against the reverse-lookup
@@ -873,24 +871,23 @@ Describe "Obfuscation Determinism (P1)" {
 # property names they are unique by construction, so within a map
 # an injectivity failure surfaces as the SAME real value being
 # reachable from MORE THAN ONE distinct token. That is the converse
-# of the P1 determinism check and is exactly what
-# Get-DeterminismViolation detects, so the P1 helper is reused here
-# to express the P2 invariant per map: each real value appears under
+# of the determinism check and is exactly what
+# Get-DeterminismViolation detects, so the helper is reused here
+# to express the invariant per map: each real value appears under
 # at most one token (the set of real values has no duplicates).
-# Selectors mirror the P1 block so ResourceName injectivity is keyed
+# Selectors mirror the determinism block so ResourceName injectivity is keyed
 # on the real resource id (two resources that share a display name in
 # different RGs legitimately get different name tokens). Skips
 # gracefully when no dictionary fixture is available;
 # count-independent (iterates whatever tokens the run produced).
-# Validates: Requirements 2.1 | Property: P2
 # ============================================================
-Describe "Obfuscation Injectivity (P2)" {
+Describe "Obfuscation Injectivity" {
     It "ResourceGroup: no two tokens share the same real resource group" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
         $Map = $script:Dictionary.ResourceGroupMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceGroupMap absent/empty in this dictionary"; return }
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/resourceGroups/([^/]+)') { $Matches[1] } }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource groups must map to distinct tokens; no token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource groups must map to distinct tokens; no token may cover two real values"
     }
 
     It "Subscription: no two tokens share the same real subscription" {
@@ -898,7 +895,7 @@ Describe "Obfuscation Injectivity (P2)" {
         $Map = $script:Dictionary.SubscriptionMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "SubscriptionMap absent/empty in this dictionary"; return }
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) if ($v -match '/subscriptions/([0-9a-fA-F-]+)') { $Matches[1] } }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real subscriptions must map to distinct tokens; no token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real subscriptions must map to distinct tokens; no token may cover two real values"
     }
 
     It "ResourceId: no two tokens share the same real resource id" {
@@ -906,17 +903,17 @@ Describe "Obfuscation Injectivity (P2)" {
         $Map = $script:Dictionary.ResourceIdMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceIdMap absent/empty in this dictionary"; return }
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct tokens; no token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct tokens; no token may cover two real values"
     }
 
     It "ResourceName: no two name tokens share the same real resource id" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available; set `$env:TEST_DICT_PATH"; return }
         $Map = $script:Dictionary.ResourceNameMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "ResourceNameMap absent/empty in this dictionary"; return }
-        # Name tokens are keyed per real resource id (mirrors the P1 selector),
+        # Name tokens are keyed per real resource id (mirrors the selector),
         # so injectivity is asserted against the real resource id, not the name.
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct name tokens; no name token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real resource ids must map to distinct name tokens; no name token may cover two real values"
     }
 
     It "Tag: no two tokens share the same real tag value" {
@@ -924,7 +921,7 @@ Describe "Obfuscation Injectivity (P2)" {
         $Map = $script:Dictionary.TagMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "TagMap absent/empty in this dictionary"; return }
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real tag values must map to distinct tokens; no token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real tag values must map to distinct tokens; no token may cover two real values"
     }
 
     It "FreeText: no two tokens share the same real free-text value" {
@@ -932,43 +929,44 @@ Describe "Obfuscation Injectivity (P2)" {
         $Map = $script:Dictionary.FreeTextMap
         if ($null -eq $Map -or @($Map.PSObject.Properties).Count -eq 0) { Set-ItResult -Skipped -Because "FreeTextMap absent/empty in this dictionary"; return }
         $Collisions = Get-DeterminismViolation -Map $Map -RealValueSelector { param($v) $v }
-        $Collisions | Should -BeNullOrEmpty -Because "distinct real free-text values must map to distinct tokens; no token may cover two real values (P2)"
+        $Collisions | Should -BeNullOrEmpty -Because "distinct real free-text values must map to distinct tokens; no token may cover two real values"
     }
 }
 
 # ============================================================
-# 19. Tag tokenization — keys kept, values masked, determinism,
+# 19. Tag tokenization: keys kept, values masked, determinism,
 #     and the mixed-case tag-key regression.
-# Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5 | Property: P1
 #
-# The ZIP-content VM Tags test (above) and the TagMap P1/P2 blocks are the
+# The ZIP-content VM Tags test (above) and the TagMap determinism and
+# injectivity blocks are the
 # authoritative checks WHEN the fixture carries tagged resources. They are
 # DATA-DEPENDENT: this fixture's in-scope resources carried no tags, so TagMap
 # is empty (those blocks skip) and the VM Tags loop has no rows to assert
-# against (documented fixture limitation — the dictionary is NOT fabricated).
+# against (documented fixture limitation: the dictionary is NOT fabricated).
 #
-# To close Req 4.1-4.5 without weakening anything above, this block adds two
+# To cover tag keys, values and their dictionary without weakening anything
+# above, this block adds two
 # fixture-independent layers, mirroring the sanctioned classifier-logic +
-# source-audit approach established in ProdNonprodPrefix.Tests.ps1 (Task 3):
+# source-audit approach established in ProdNonprodPrefix.Tests.ps1:
 #   1. A logic-level exercise of the EXACT tag-obfuscation loop
 #      (ResourceInventory.ps1 L1002-1017) against a representative structured
-#      Tags hashtable with MIXED-CASE keys — the same shape collectors produce
+#      Tags hashtable with MIXED-CASE keys: the same shape collectors produce
 #      (Services/Compute/VirtualMachines.ps1 L71/L99: $obj = @{ ...; Tags = ... }).
-#      Asserts keys survive verbatim (4.1), values become prod_/nonprod_ tokens
-#      (4.2), the same value yields the same token (4.3 | P1), and the structured
-#      Tags is NOT nulled/dropped (4.5).
+#      Asserts keys survive verbatim, values become prod_/nonprod_ tokens,
+#      the same value yields the same token, and the structured Tags is NOT
+#      nulled/dropped.
 #   2. A SOURCE-AUDIT regression that genuinely fails if the lowercase /
 #      case-sensitive tag scrub bug were reintroduced into ResourceInventory.ps1
-#      (4.5): the malformed-row scrub must clear BOTH the 'tags' and 'Tags' key
+#      The malformed-row scrub must clear BOTH the 'tags' and 'Tags' key
 #      variants (case-insensitive), the structured-tag obfuscation must be
 #      guarded by ContainsKey('Tags') and reassign only $tag.Value, and
 #      $tag.Name must never be reassigned (key kept verbatim).
 # ============================================================
-Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (P1)" {
+Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
     BeforeAll {
         # Faithful mirror of the tag-value classifier + tokenizer in
         # ResourceInventory.ps1 L1002-1017. Same non-prod regex set as every
-        # other class (Req 3.3). Operates on the SAME shape the collectors
+        # other class. Operates on the SAME shape the collectors
         # produce: a case-insensitive [hashtable] $ResourceItem whose 'Tags'
         # value is an array of { Name, Value } objects. Replicated here (rather
         # than invoked) because the inline block lives inside the module-loop in
@@ -1003,7 +1001,7 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
         $script:RiSourcePath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'ResourceInventory.ps1'
     }
 
-    It "keeps mixed-case tag KEYS verbatim and masks VALUES to tokens (Req 4.1, 4.2, 4.5)" {
+    It "keeps mixed-case tag KEYS verbatim and masks VALUES to tokens" {
         # Mixed-case keys on purpose (Environment / CostCenter / Owner) to guard
         # the case-insensitive handling. Values are synthetic only (no real ids).
         $ResourceItem = @{
@@ -1019,20 +1017,20 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
         script:Invoke-TagObfuscation -ResourceItem $ResourceItem -TagValueDictionary $Dict
 
         # 4.5: structured Tags survives (not nulled / not dropped by a scrub)
-        $ResourceItem.Tags | Should -Not -BeNullOrEmpty -Because "structured Tags must survive tokenization, not be nulled (Req 4.5)"
-        @($ResourceItem.Tags).Count | Should -Be 3 -Because "no tag row may be dropped by a mixed-case scrub (Req 4.5)"
+        $ResourceItem.Tags | Should -Not -BeNullOrEmpty -Because "structured Tags must survive tokenization, not be nulled"
+        @($ResourceItem.Tags).Count | Should -Be 3 -Because "no tag row may be dropped by a mixed-case scrub"
 
         $ExpectedKeys = @('Environment', 'CostCenter', 'Owner')
         for ($i = 0; $i -lt 3; $i++)
         {
             # 4.1: key kept verbatim, including its original mixed casing
-            $ResourceItem.Tags[$i].Name  | Should -BeExactly $ExpectedKeys[$i] -Because "tag KEY '$($ExpectedKeys[$i])' must be preserved verbatim, casing intact (Req 4.1)"
+            $ResourceItem.Tags[$i].Name  | Should -BeExactly $ExpectedKeys[$i] -Because "tag KEY '$($ExpectedKeys[$i])' must be preserved verbatim, casing intact"
             # 4.2: value replaced with a prod_/nonprod_ token
-            $ResourceItem.Tags[$i].Value | Should -Match $script:TagTokenPattern -Because "tag VALUE must be a prod_/nonprod_ token, not raw (Req 4.2)"
+            $ResourceItem.Tags[$i].Value | Should -Match $script:TagTokenPattern -Because "tag VALUE must be a prod_/nonprod_ token, not raw"
         }
     }
 
-    It "emits the SAME token for the same tag value across resources (Req 4.3 | P1)" {
+    It "emits the SAME token for the same tag value across resources" {
         $Dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $ItemA = @{ ID = 'a'; Tags = @([PSCustomObject]@{ Name = 'Env'; Value = 'shared-value' }) }
         $ItemB = @{ ID = 'b'; Tags = @([PSCustomObject]@{ Name = 'Tier'; Value = 'shared-value' }) }
@@ -1040,10 +1038,10 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
         script:Invoke-TagObfuscation -ResourceItem $ItemA -TagValueDictionary $Dict
         script:Invoke-TagObfuscation -ResourceItem $ItemB -TagValueDictionary $Dict
 
-        $ItemA.Tags[0].Value | Should -Be $ItemB.Tags[0].Value -Because "the same real tag value must map to one token within a run (Req 4.3 / P1)"
+        $ItemA.Tags[0].Value | Should -Be $ItemB.Tags[0].Value -Because "the same real tag value must map to one token within a run"
     }
 
-    It "derives the prod/nonprod prefix from the tag VALUE (Req 4.2 environment signal)" {
+    It "derives the prod/nonprod prefix from the tag VALUE" {
         $Dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
         $Item = @{
             ID   = 'x'
@@ -1057,7 +1055,7 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
         $Item.Tags[1].Value | Should -Match '^prod_'    -Because "'core-billing' is neutral -> prod"
     }
 
-    It "records each token -> real tag value mapping so TagMap can be inverted (Req 4.4)" {
+    It "records each token -> real tag value mapping so TagMap can be inverted" {
         # TagMap is built by inverting $Global:TagValueDictionary
         # (ResourceInventory.ps1 L1582-1586). Assert the dictionary this loop
         # populates carries the real value under the emitted token, which is
@@ -1068,16 +1066,16 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
         script:Invoke-TagObfuscation -ResourceItem $Item -TagValueDictionary $Dict
 
         $Token = $Item.Tags[0].Value
-        $Dict.ContainsKey('analytics-platform') | Should -BeTrue -Because "the real tag value must be keyed in the dictionary that TagMap inverts (Req 4.4)"
-        $Dict['analytics-platform'] | Should -Be $Token -Because "token <-> real value must round-trip through TagMap (Req 4.4)"
+        $Dict.ContainsKey('analytics-platform') | Should -BeTrue -Because "the real tag value must be keyed in the dictionary that TagMap inverts"
+        $Dict['analytics-platform'] | Should -Be $Token -Because "token <-> real value must round-trip through TagMap"
     }
 
-    # ---- Source-audit regression: the mixed-case / lowercase-scrub bug (Req 4.5) ----
+    # ---- Source-audit regression: the mixed-case / lowercase-scrub bug ----
     # Reads the shipped source and fails if the case-insensitive tag handling is
     # regressed. This is the assertion that genuinely guards the already-fixed
     # bug: if a future edit reintroduced a lowercase-only / case-sensitive scrub
     # that nulled structured Tags, one of these fails.
-    Context "Source case-insensitive tag handling (Req 4.5)" {
+    Context "Source case-insensitive tag handling" {
         BeforeAll {
             $script:RiSourcePresent = Test-Path $script:RiSourcePath
             $script:RiSource = if ($script:RiSourcePresent) { Get-Content $script:RiSourcePath -Raw } else { '' }
@@ -1087,31 +1085,31 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
             $script:RiSourcePresent | Should -BeTrue -Because "the regression audits the shipped obfuscation source"
         }
 
-        It "malformed-row scrub clears BOTH 'tags' and 'Tags' key variants (case-insensitive) (Req 4.5)" {
+        It "malformed-row scrub clears BOTH 'tags' and 'Tags' key variants (case-insensitive)" {
             # The mixed-case bug was a case-sensitive scrub. -cmatch is
             # case-SENSITIVE, and these anchor on the SCRUB ASSIGNMENT STATEMENT
             # ($resourceItem.<case>.tags/Tags = $null), which is unique to the
-            # malformed-row path (L948-949) — the bare ContainsKey('Tags') token
+            # malformed-row path (L948-949): the bare ContainsKey('Tags') token
             # also appears at the L1002 obfuscation guard, so matching the token
             # alone would be a false guard. Dropping either case variant
             # (reintroducing a lowercase-only / case-sensitive scrub) fails here.
-            ($script:RiSource -cmatch '\$resourceItem\.tags = \$null') | Should -BeTrue -Because "lowercase tag key variant must be scrubbed on the malformed-row path (Req 4.5)"
-            ($script:RiSource -cmatch '\$resourceItem\.Tags = \$null') | Should -BeTrue -Because "PascalCase tag key variant must be scrubbed on the malformed-row path (Req 4.5)"
+            ($script:RiSource -cmatch '\$resourceItem\.tags = \$null') | Should -BeTrue -Because "lowercase tag key variant must be scrubbed on the malformed-row path"
+            ($script:RiSource -cmatch '\$resourceItem\.Tags = \$null') | Should -BeTrue -Because "PascalCase tag key variant must be scrubbed on the malformed-row path"
         }
 
-        It "structured-tag obfuscation is guarded by ContainsKey('Tags') and tokenizes in place (Req 4.2, 4.5)" {
-            ($script:RiSource -cmatch "ContainsKey\('Tags'\) -and") | Should -BeTrue -Because "structured Tags must be tokenized in place, never scrubbed to null (Req 4.5)"
-            $script:RiSource | Should -Match '\$tag\.Value = \$Global:TagValueDictionary' -Because "the tag VALUE is what gets tokenized (Req 4.2)"
+        It "structured-tag obfuscation is guarded by ContainsKey('Tags') and tokenizes in place" {
+            ($script:RiSource -cmatch "ContainsKey\('Tags'\) -and") | Should -BeTrue -Because "structured Tags must be tokenized in place, never scrubbed to null"
+            $script:RiSource | Should -Match '\$tag\.Value = \$Global:TagValueDictionary' -Because "the tag VALUE is what gets tokenized"
         }
 
-        It "never reassigns a tag KEY (`$tag.Name), so keys are kept verbatim (Req 4.1)" {
-            $script:RiSource | Should -Not -Match '\$tag\.Name\s*=[^=]' -Because "tag KEYS must be preserved verbatim; reassigning `$tag.Name would rewrite a key (Req 4.1)"
+        It "never reassigns a tag KEY (`$tag.Name), so keys are kept verbatim" {
+            $script:RiSource | Should -Not -Match '\$tag\.Name\s*=[^=]' -Because "tag KEYS must be preserved verbatim; reassigning `$tag.Name would rewrite a key"
         }
     }
 }
 
 # ============================================================
-# 20. AKS multi-node-pool Tags: no shared-reference aliasing (P1, P2)
+# 20. AKS multi-node-pool Tags: no shared-reference aliasing
 # Regression for a real bug found in this session: Services/Containers/AKS.ps1
 # emits one row per node pool for a cluster (foreach ($2 in
 # $data.agentPoolProfiles)). The 'Tags' field must carry each cluster's real
@@ -1122,17 +1120,16 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
 # ($tag.Value = $Global:TagValueDictionary[$realTagValue]); with aliased
 # objects, row 1's mutation is visible to row 2, so row 2 re-reads an
 # already-tokenized value as if it were "real" and re-keys it into
-# $Global:TagValueDictionary — corrupting the dictionary (P2 injectivity
-# violation: one real value ends up spuriously mapped under two dictionary
-# keys) and breaking TagMap. This test invokes the ACTUAL collector (not a
+# $Global:TagValueDictionary: corrupting the dictionary (one real value
+# mapped under two dictionary keys) and breaking TagMap. This test invokes
+# the ACTUAL collector (not a
 # mirror) against a synthetic two-node-pool cluster and proves: (a) the
 # collector does not hand back the same Tags object instance across rows, and
 # (b) running the real tag-obfuscation loop over the collector's output
 # produces exactly ONE dictionary entry for the one real tag value, with both
-# rows resolving to the SAME token (P1 determinism preserved across rows).
-# Validates: Requirements 2.1, 4.1, 4.2, 4.3 | Properties: P1, P2
+# rows resolving to the SAME token.
 # ============================================================
-Describe "AKS Multi-Node-Pool Tags — no cross-row aliasing (P1, P2)" {
+Describe "AKS Multi-Node-Pool Tags: no cross-row aliasing" {
     BeforeAll {
         # Minimal synthetic managedClusters resource with TWO node pools and
         # ONE real tag value shared by the whole cluster. No real identifiers.
@@ -1168,7 +1165,7 @@ Describe "AKS Multi-Node-Pool Tags — no cross-row aliasing (P1, P2)" {
         [object]::ReferenceEquals($Rows[0].Tags, $Rows[1].Tags) | Should -BeFalse -Because "each node-pool row must get its own Tags object instance, not a shared reference"
     }
 
-    It "the real tag-obfuscation loop yields exactly ONE dictionary entry and ONE shared token across both rows (P1, P2)" {
+    It "the real tag-obfuscation loop yields exactly ONE dictionary entry and ONE shared token across both rows" {
         $Rows = & $script:AksModule -Sub $script:AksSub -Resources @($script:AksCluster) -Task 'Processing' -ResourceIdDictionary $null
         $Dict = New-Object 'System.Collections.Generic.Dictionary[string,string]'
 
@@ -1194,14 +1191,14 @@ Describe "AKS Multi-Node-Pool Tags — no cross-row aliasing (P1, P2)" {
             }
         }
 
-        # P2 injectivity: exactly one real value went in, so exactly one entry
+        # injectivity: exactly one real value went in, so exactly one entry
         # must come out. A count of 2 here is the aliasing bug's signature (the
         # already-tokenized value on row 2 gets misread as a second "real" value).
-        $Dict.Count | Should -Be 1 -Because "one real tag value must yield exactly one dictionary entry, even across multiple node-pool rows for the same cluster (P2)"
+        $Dict.Count | Should -Be 1 -Because "one real tag value must yield exactly one dictionary entry, even across multiple node-pool rows for the same cluster"
 
-        # P1 determinism across rows: both rows' tag must resolve to the SAME
+        # determinism across rows: both rows' tag must resolve to the SAME
         # token, and that token must actually be present as a dictionary value.
-        $Rows[0].Tags[0].Value | Should -Be $Rows[1].Tags[0].Value -Because "the same real tag value on two rows of the same cluster must yield the same token (P1)"
+        $Rows[0].Tags[0].Value | Should -Be $Rows[1].Tags[0].Value -Because "the same real tag value on two rows of the same cluster must yield the same token"
         $Dict.Values | Should -Contain $Rows[0].Tags[0].Value -Because "the shared token must be the one real dictionary entry produced, not a spurious second entry"
     }
 }
