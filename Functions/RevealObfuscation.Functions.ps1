@@ -291,16 +291,31 @@ function Invoke-RdaReveal
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZip)
         try
         {
-            # Line by line, stopping at the first masked value, so a large entry
-            # is never held in memory whole. A token never spans a line break.
+            # Each entry is read in fixed chunks of 64 KB characters, not line by
+            # line: Inventory_*.json and Metrics_*.json are written on one line,
+            # so a line can be the whole entry. Each chunk is scanned with the
+            # last ($MaxTokenLength - 1) characters of the previous chunk in
+            # front of it, so a token split across two chunks is still found.
+            # $MaxTokenLength (128) covers 'nonprod_' + a type hint of up to 83
+            # characters + '_' + a GUID; the longest hint the tool writes is
+            # 'databricks'. The scan stops at the first token, so at most one
+            # chunk plus the carry-over is held in memory.
+            $ChunkLength = 65536
+            $MaxTokenLength = 128
+            $CarryLength = $MaxTokenLength - 1
+            $Buffer = [char[]]::new($CarryLength + $ChunkLength)
             foreach ($Entry in $Archive.Entries)
             {
                 $Reader = [System.IO.StreamReader]::new($Entry.Open())
                 try
                 {
-                    while ($null -ne ($Line = $Reader.ReadLine()))
+                    $Kept = 0
+                    while (($Read = $Reader.ReadBlock($Buffer, $Kept, $ChunkLength)) -gt 0)
                     {
-                        if ([regex]::IsMatch($Line, $TokenPattern)) { $HasToken = $true; break }
+                        $Filled = $Kept + $Read
+                        if ([regex]::IsMatch([string]::new($Buffer, 0, $Filled), $TokenPattern)) { $HasToken = $true; break }
+                        $Kept = [Math]::Min($CarryLength, $Filled)
+                        [Array]::Copy($Buffer, $Filled - $Kept, $Buffer, 0, $Kept)
                     }
                 }
                 finally { $Reader.Dispose() }

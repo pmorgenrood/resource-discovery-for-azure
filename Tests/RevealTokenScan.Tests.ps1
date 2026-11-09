@@ -7,8 +7,11 @@
 # the report for any masked value. It read each zip entry whole with
 # ReadToEnd(), so a large entry was held in memory as one string, and an entry
 # longer than the largest string .NET can hold failed with an out-of-memory
-# error instead of the 'Nothing to reveal' message. It now reads line by line
-# and stops at the first masked value.
+# error instead of the 'Nothing to reveal' message. Reading line by line did
+# not fix that: the tool writes Inventory_*.json and Metrics_*.json on one
+# line, so a line can be the whole entry. It now reads fixed-size chunks, with
+# the end of the previous chunk carried over so a token split across two
+# chunks is still found, and stops at the first masked value.
 #
 # The zips and dictionaries are built here with placeholder values; no live
 # Azure and no inventory run.
@@ -45,6 +48,12 @@ BeforeAll {
 
     # 1024 short lines with no masked value (1 MiB of text).
     $script:Block = (('"Name": "' + ('a' * 1012) + '",') + "`n") * 1024
+
+    # 1 MiB of one-line JSON text with no masked value and no line break.
+    $script:LineBlock = ('{"Name":"' + ('a' * 1012) + '"},') * 1024
+
+    # The reveal scan's chunk length, in characters.
+    $script:ChunkLength = 65536
 }
 
 AfterAll {
@@ -92,5 +101,61 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
         Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null
         (Get-FileHash -LiteralPath $Out).Hash | Should -Be (Get-FileHash -LiteralPath $Zip).Hash
         Test-Path -LiteralPath (Join-Path $script:WorkDir 'clean_out.partial.zip') | Should -BeFalse
+    }
+
+    It 'finds a masked value near the end of a large one-line entry and still fails' {
+        $Zip = Build-TestZip -Name 'oneline_late.zip' -Write {
+            param($W)
+            $W.Write('[')
+            for ($i = 0; $i -lt 16; $i++) { $W.Write($script:LineBlock) }
+            $W.Write('{"ID":"' + $script:Token + '"}]')
+        }
+        $Out = Join-Path $script:WorkDir 'oneline_late_out.zip'
+        { Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null } |
+            Should -Throw '*Nothing to reveal: the selected field*'
+        Test-Path -LiteralPath $Out | Should -BeFalse
+    }
+
+    It 'finds a masked value split across two chunks' {
+        # The token starts 20 characters before the end of the first chunk, so
+        # neither chunk holds it whole.
+        $Zip = Build-TestZip -Name 'straddle.zip' -Write {
+            param($W)
+            $W.Write('a' * ($script:ChunkLength - 20))
+            $W.Write($script:Token)
+            $W.Write('a' * $script:ChunkLength)
+        }
+        $Out = Join-Path $script:WorkDir 'straddle_out.zip'
+        { Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null } |
+            Should -Throw '*Nothing to reveal: the selected field*'
+        Test-Path -LiteralPath $Out | Should -BeFalse
+    }
+
+    It 'stops at the first masked value of a one-line entry too long to hold as one string' {
+        # 1,100 MiB on one line: longer than the largest .NET string, so reading
+        # the line whole fails. The masked value is near the start.
+        $Zip = Build-TestZip -Name 'oneline_huge.zip' -Write {
+            param($W)
+            $W.Write('[{"ID":"' + $script:Token + '"},')
+            for ($i = 0; $i -lt 1100; $i++) { $W.Write($script:LineBlock) }
+            $W.Write('{}]')
+        }
+        $Out = Join-Path $script:WorkDir 'oneline_huge_out.zip'
+        { Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null } |
+            Should -Throw '*Nothing to reveal: the selected field*'
+        Test-Path -LiteralPath $Out | Should -BeFalse
+    }
+
+    It 'copies a large one-line entry with no masked value unchanged' {
+        $Zip = Build-TestZip -Name 'oneline_clean.zip' -Write {
+            param($W)
+            $W.Write('[')
+            for ($i = 0; $i -lt 16; $i++) { $W.Write($script:LineBlock) }
+            $W.Write('{"ID":"prod_not-a-token"}]')
+        }
+        $Out = Join-Path $script:WorkDir 'oneline_clean_out.zip'
+        Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null
+        (Get-FileHash -LiteralPath $Out).Hash | Should -Be (Get-FileHash -LiteralPath $Zip).Hash
+        Test-Path -LiteralPath (Join-Path $script:WorkDir 'oneline_clean_out.partial.zip') | Should -BeFalse
     }
 }
