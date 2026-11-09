@@ -13,10 +13,11 @@
 # - Every subscription, resource group and name segment is a prod_/nonprod_
 #   token. Consumption-only tokens carry sub_, rg_ or rg_mc_; a name token may
 #   carry a databricks_, aks_ or vmss_ hint; a '$system' name stays as written.
-# - Namespace and type segments stay as written. A path Azure wrote oddly
-#   keeps its shape: a type with no name after it at the end, or a trailing
-#   '/', hold no real name, so they pass. An empty segment inside the path
-#   fails: there a type cannot be told from a name.
+# - Namespace and type segments stay as written. Each provider block is a
+#   namespace and then at least one type and name pair: a part with no
+#   partner (a type with no name, a namespace with no type) could be a real
+#   name kept as a type, so it fails, as an empty segment inside the path
+#   does. One trailing '/' holds no name and passes.
 function Get-MaskedIdPattern
 {
     param([switch]$AllowScopeOnly)
@@ -26,7 +27,7 @@ function Get-MaskedIdPattern
     # keywords, namespaces and types keep any case.
     $Scope = '/subscriptions/(?-i:(prod|nonprod)_(sub_)?' + $Guid + ')(/resourcegroups/(?-i:(prod|nonprod)_(rg_)?(mc_)?' + $Guid + '))?'
     $Name = '((?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + ')|\$system)'
-    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)'
+    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')+)'
     # A subscription or group scope with one or more provider blocks (none,
     # with -AllowScopeOnly: a charge billed to the subscription or the group
     # itself), or a tenant-scope id of provider blocks only.
@@ -55,7 +56,9 @@ function Test-ObfuscatedRun
     foreach ($Id in $Ids)
     {
         # /providers/<namespace>(/<type>/<name>)+[/providers/<namespace>(/<type>/<name>)+ ...]
-        $Parts = $Id.TrimEnd('/').Split('/')
+        # with one trailing '/' at most; no part is empty.
+        $Parts = $(if ($Id.EndsWith('/')) { $Id.Substring(0, $Id.Length - 1) } else { $Id }).Split('/')
+        if ($Parts[0] -ne '' -or @($Parts[1..($Parts.Count - 1)] | Where-Object { $_ -eq '' }).Count -gt 0) { return $false }
         $Tokens = 0
         $i = 1
         while ($i -lt $Parts.Count)
@@ -69,7 +72,7 @@ function Test-ObfuscatedRun
             }
             if ($i -lt 3 -or $i + 1 -ge $Parts.Count) { return $false }
             $Name = $Parts[$i + 1]
-            if ($Name -match $Token) { $Tokens++ } elseif ($Name -cne '$system') { return $false }
+            if ($Name -match $Token) { $Tokens++ } elseif ($Name -ne '$system') { return $false }
             $i += 2
         }
         if ($Tokens -eq 0) { return $false }

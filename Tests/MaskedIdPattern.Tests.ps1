@@ -24,7 +24,6 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'extension resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/{T}' }
         @{ Label = 'consumption-only token'; Id = '/subscriptions/prod_sub_11111111-2222-4333-8444-555555555555/resourcegroups/prod_rg_mc_11111111-2222-4333-8444-555555555555/providers/microsoft.compute/disks/prod_aks_11111111-2222-4333-8444-555555555555' }
         @{ Label = '$system name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.servicebus/namespaces/{T}/topics/$system' }
-        @{ Label = 'tenant-scope id with a type and no name'; Id = '/providers/Microsoft.Capacity/reservationOrders' }
         @{ Label = 'resource id with Azure keywords in mixed case'; Id = '/subscriptions/{T}/resourceGroups/{T}/providers/Microsoft.Compute/virtualMachines/{T}' }
         @{ Label = 'stand-in path of an id that is not an ARM path'; Id = '/providers/rda.noid/ids/{T}' }
         @{ Label = 'tenant-scope id with a trailing slash'; Id = '/providers/Microsoft.Capacity/reservationOrders/{T}/' }
@@ -47,6 +46,10 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'an empty segment inside the path'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
         @{ Label = 'a token in upper case'; Id = '/subscriptions/PROD_11111111-2222-4333-8444-555555555555/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}' }
         @{ Label = 'a name token in upper case'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/NONPROD_11111111-2222-4333-8444-555555555555' }
+        @{ Label = 'a tenant-scope type with no name'; Id = '/providers/Microsoft.Capacity/reservationOrders' }
+        @{ Label = 'a namespace with no type'; Id = '/providers/Microsoft.Capacity' }
+        @{ Label = 'a child type with no name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/extensions' }
+        @{ Label = 'an extension block with no type'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T)
         $Masked | Should -Not -Match $script:Pattern
@@ -95,6 +98,7 @@ Describe 'Test-ObfuscatedRun' {
         @{ Case = 'resource and child'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}', '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}') }
         @{ Case = 'an extension resource'; Ids = @('/providers/Microsoft.Management/managementGroups/{T}/providers/Microsoft.Authorization/policyAssignments/{T}') }
         @{ Case = 'a $system name'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}/topics/$system') }
+        @{ Case = 'a $System name in another case'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}/topics/$System') }
     ) {
         Test-ObfuscatedRun -Ids @($Ids | ForEach-Object { $_.Replace('{T}', $script:T) }) | Should -BeTrue
     }
@@ -108,6 +112,9 @@ Describe 'Test-ObfuscatedRun' {
         @{ Case = 'an extension block with no type'; Ids = @('/providers/Microsoft.Management/managementGroups/{T}/providers/Microsoft.Authorization') }
         @{ Case = 'only $system names'; Ids = @('/providers/microsoft.capacity/reservationorders/$system') }
         @{ Case = 'no namespace'; Ids = @('/providers//reservationorders/{T}') }
+        @{ Case = 'a part before the path'; Ids = @('x/providers/microsoft.capacity/reservationorders/{T}') }
+        @{ Case = 'an empty type'; Ids = @('/providers/microsoft.capacity//{T}') }
+        @{ Case = 'two trailing slashes'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}//') }
     ) {
         Test-ObfuscatedRun -Ids @($Ids | ForEach-Object { $_.Replace('{T}', $script:T) }) | Should -BeFalse
     }
