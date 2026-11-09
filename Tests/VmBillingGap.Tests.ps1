@@ -118,6 +118,20 @@ Describe 'VM billing-coverage banner' {
         $Html | Should -Match '6 running VMs'
     }
 
+    It 'reads a consumption file in a folder with brackets in its name' {
+        $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
+        $Dir = Join-Path $script:WorkDir 'con[1]'
+        [void][System.IO.Directory]::CreateDirectory($Dir)
+        $Csv = Join-Path $Dir 'con_bracket.csv'
+        $Rows = foreach ($i in 1..4) { [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = ('prod_{0}' -f [guid]::NewGuid()) } }
+        [System.IO.File]::WriteAllLines($Csv, [string[]]@($Rows | ConvertTo-Csv -NoTypeInformation))
+
+        $Html = Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv
+
+        $Html | Should -Match '10 running VMs'
+        $Html | Should -Match 'only 4 VMs'
+    }
+
     It 'reports the gap percentage' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_pct.csv'
