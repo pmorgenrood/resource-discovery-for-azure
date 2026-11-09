@@ -424,6 +424,27 @@ function Get-RoleCheckCountedScopeKinds
     return $Above + @('target resource group')
 }
 
+# Get-AzAccessToken for a retried token request (Invoke-ConsumptionCallWithRetry).
+# Some Az versions answer a failed request, for example a failed token cache
+# check, with a warning and no token instead of an error; this throws then, with
+# the warnings' text, so the retry rule can read it. Returns { Token; Warnings }:
+# the cmdlet's answer and the warnings it wrote.
+function Get-RdaAccessToken
+{
+    param([string]$ResourceUrl, [string]$TenantId)
+    $Seen = @()
+    $Request = @{ ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue'; WarningVariable = 'Seen' }
+    if (-not [string]::IsNullOrEmpty($ResourceUrl)) { $Request.ResourceUrl = $ResourceUrl }
+    if (-not [string]::IsNullOrEmpty($TenantId)) { $Request.TenantId = $TenantId }
+    $Answer = Get-AzAccessToken @Request
+    $Present = $null -ne $Answer -and $null -ne $Answer.PSObject.Properties['Token'] -and $(if ($Answer.Token -is [securestring]) { $Answer.Token.Length -gt 0 } else { -not [string]::IsNullOrWhiteSpace([string]$Answer.Token) })
+    if (-not $Present)
+    {
+        throw ('Get-AzAccessToken gave no token. {0}' -f ((@($Seen) | ForEach-Object { [string]$_.Message }) -join ' ')).TrimEnd()
+    }
+    return [pscustomobject]@{ Token = $Answer; Warnings = @($Seen) }
+}
+
 # The signed-in identity's object id, from the 'oid' claim of its own Resource
 # Manager token (no directory call). The token request has the role check's
 # retry policy (Invoke-ConsumptionCallWithRetry), so a failed token cache check
@@ -442,10 +463,10 @@ function Get-RoleCheckCallerObjectId
         }
         $Call = Invoke-ConsumptionCallWithRetry -MaxRetries $MaxRetries -Argument $ResourceUrl -Operation {
             param($Url)
-            Get-AzAccessToken -ResourceUrl $Url -WarningAction SilentlyContinue -ErrorAction Stop
+            Get-RdaAccessToken -ResourceUrl $Url
         }
         if ($null -ne $Call.Error) { throw $Call.Error }
-        $Token = $Call.Value
+        $Token = $Call.Value.Token
         $Raw = if ($Token.Token -is [securestring]) { [System.Net.NetworkCredential]::new('', $Token.Token).Password } else { [string]$Token.Token }
         $Parts = $Raw.Split('.')
         if ($Parts.Count -lt 2) { return $null }
@@ -463,9 +484,9 @@ function Get-RoleCheckCallerObjectId
 }
 
 # One ARM GET through Invoke-AzRestMethod with the consumption check's retry
-# policy (Invoke-ConsumptionCallWithRetry): throttling (429), timeouts and 5xx
-# are retried with backoff; any other status is returned at once, so a 400 is
-# not retried. List answers are followed through the path and query of
+# policy (Invoke-ConsumptionCallWithRetry): throttling (429), timeouts (408),
+# a conflict (409) and 5xx are retried with backoff; any other status is
+# returned at once, so a 400 is not retried. List answers are followed through the path and query of
 # nextLink, for at most $MaxPages pages; past that the answer is an error
 # ('more than N pages'), as is a nextLink that is not a valid URL; either
 # leaves the check inconclusive, so the subscription is not readable.

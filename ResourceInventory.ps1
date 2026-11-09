@@ -956,10 +956,8 @@ function ExecuteInventoryProcessing()
             # Retried as the billing calls are (Invoke-ConsumptionCallWithRetry): a
             # failed token cache check, when two token requests run at once, passes
             # on a retry, while a sign-in that cannot be used is not retried.
-            $Call = Invoke-ConsumptionCallWithRetry -Operation { Get-AzAccessToken -ErrorAction Stop -WarningAction SilentlyContinue }
-            if ($null -ne $Call.Error) { return $false }
-            $Tok = $Call.Value
-            return ($null -ne $Tok -and -not [string]::IsNullOrWhiteSpace($Tok.Token))
+            $Call = Invoke-ConsumptionCallWithRetry -Operation { Get-RdaAccessToken }
+            return ($null -eq $Call.Error)
         }
 
         if (& $TokenOk) { return $true }

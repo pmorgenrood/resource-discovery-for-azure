@@ -1681,4 +1681,25 @@ Describe 'Test-DataPlaneAuthReady (ResourceInventory.ps1) retries a failed token
         Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeTrue
         $script:TokenCalls | Should -Be 2
     }
+
+    It 'is ready when the first token request only warns and gives no token, and the next one works' {
+        $script:TokenCalls = 0
+        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
+        Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeTrue
+        $script:TokenCalls | Should -Be 2
+    }
+}
+
+Describe 'Get-RoleCheckCallerObjectId retries a token request that only warns' {
+    BeforeAll { function Get-AzAccessToken { param($ResourceUrl, [switch]$AsSecureString) } }
+    It 'reads the object id after a first request that gave no token' {
+        Mock Start-Sleep { }
+        Mock Get-AzContext { [pscustomobject]@{ Environment = [pscustomobject]@{ ResourceManagerUrl = 'https://management.azure.com/' } } }
+        $script:TokenCalls = 0
+        $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"caller-1"}')).TrimEnd('=')
+        $script:Jwt = 'e30.{0}.sig' -f $Claims
+        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed.'; return $null }; [pscustomobject]@{ Token = $script:Jwt } }
+        Get-RoleCheckCallerObjectId | Should -Be 'caller-1'
+        $script:TokenCalls | Should -Be 2
+    }
 }
