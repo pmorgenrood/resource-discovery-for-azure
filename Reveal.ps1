@@ -344,6 +344,19 @@ if (Test-Path -LiteralPath $StagingDirectory)
         }
         throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
     }
+    if (-not $Resume -and $MarkedForThisRoot)
+    {
+        # Reveal's own folder from an earlier run, still holding its files. A
+        # fresh run into it would mix with them (and -RemoveStaging would then
+        # leave the earlier files without their mark, so the folder could not
+        # be resumed or reused). Say plainly what to do instead.
+        $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
+                Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') })
+        if ($Held.Count -gt 0)
+        {
+            throw ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
+        }
+    }
     if ($Resume -and $MarkedForThisRoot)
     {
         # A resumed run must reveal the same fields as the run it continues, or
@@ -755,13 +768,24 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
 {
     try
     {
-        # Remove only what Reveal put there: this run's zips, their partial
-        # files and the staging mark. Anything else in the folder is not ours,
-        # so the folder is then kept.
+        # Remove only what Reveal put there: this run's zips, the other
+        # finished outputs the mark records (when their bytes still match the
+        # record, for example an older report of a subscription that this run
+        # left out), their partial files and the staging mark. Anything else
+        # in the folder is not ours, so the folder is then kept.
         foreach ($Staged in $StagedZips)
         {
             Remove-Item -LiteralPath $Staged.FullName -Force -ErrorAction Stop
             Remove-Item -LiteralPath (($Staged.FullName -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+        }
+        foreach ($Name in @($StagingOutputs.Keys))
+        {
+            $Recorded = Join-Path $StagingDirectory $Name
+            if ((Test-Path -LiteralPath $Recorded -PathType Leaf) -and (Get-RevealFileSha256 $Recorded) -ceq [string]$StagingOutputs[$Name]['Sha256'])
+            {
+                Remove-Item -LiteralPath $Recorded -Force -ErrorAction Stop
+                Remove-Item -LiteralPath (($Recorded -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+            }
         }
         Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath ($StagingMarkerPath + '.tmp') -Force -ErrorAction SilentlyContinue
