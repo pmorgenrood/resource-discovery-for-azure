@@ -1419,7 +1419,7 @@ function Get-ConsumptionErrorKind
     {
         # Only a number right after 'status code ... success:', 'status' or
         # 'HTTP' (not 'https' or 'HttpClient', and not a port or a timeout).
-        if ([string]$Ex.Message -match '(?i)(status code does not indicate success:\s*|\bstatus(\s+code)?\s*[:=]?\s*|\bhttp(/\d(\.\d)?)?\s*:?\s*)(?<code>[45]\d\d)\b(?!\s*(seconds?|ms|milliseconds?)\b)')
+        if ([string]$Ex.Message -match '(?i)(status code does not indicate success:\s*|\b(http)?status(\s*code)?\s*[:=]?\s*|\bhttp(/\d(\.\d)?)?\s*:?\s*)(?<code>[45]\d\d)\b(?!\s*(seconds?|ms|milliseconds?)\b)')
         {
             $Named = [int]$Matches['code']
             if ($Named -eq 408 -or $Named -eq 409 -or $Named -eq 429 -or $Named -ge 500) { return 'Transient' }
