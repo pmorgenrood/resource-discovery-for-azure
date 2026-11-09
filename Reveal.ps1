@@ -28,9 +28,11 @@
 
     Both modes reveal ONLY the dimensions you select (default: Subscription name
     + Resource Group); everything else stays masked. Pairing in all-mode is done
-    WITHIN each folder (dictionary and report zip share the same <stamp>), so it
-    works regardless of -ReportName and never crosses one subscription's tokens
-    against another's dictionary.
+    WITHIN each folder, and only between a report zip and the dictionary of the
+    same <stamp>, so it never crosses one report's tokens against another's
+    dictionary. When the root holds more than one run of the same subscription
+    (Run-AllSubscriptions.ps1 run twice into it), only the newest report of each
+    subscription is revealed; the older ones are listed as left out.
 
     HANDLE WITH CARE. The output contains the real values you chose to reveal.
     Share it only with the party meant to ingest it. Dictionaries and any
@@ -365,34 +367,124 @@ $RunOutputs = [System.Collections.Generic.List[string]]::new()
 # (e.g. 0.5) at a whole >=1s Wait-Job timeout.
 $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 
-# Resolve each folder's obfuscated report + dictionary up front, handling the
-# cheap cases synchronously (missing pair -> skip; already-revealed under
-# -Resume -> skip). Everything that needs the reveal engine becomes a queued
-# work item, drained by the bounded pool below.
-$Queue = [System.Collections.Generic.Queue[object]]::new()
+# Find the reports to reveal, handling the cheap cases synchronously (missing
+# pair -> skip; already revealed under -Resume -> skip). Everything that needs
+# the reveal engine becomes a queued work item, drained by the bounded pool
+# below.
+#
+# Run-AllSubscriptions.ps1 runs ResourceInventory.ps1 once per subscription,
+# and each of those runs writes a NEW folder ResourcesReport<stamp> under the
+# inventory root holding ResourcesReport_<stamp>.zip and
+# ObfuscationDictionary_ResourcesReport_<stamp>.json. A second wrapper run into
+# the same root adds a second folder per subscription, with new masked tokens.
+# So:
+#  - every report zip in a folder is paired only with the dictionary of the
+#    SAME stamp (never with another stamp's dictionary next to it), and a
+#    report with no such dictionary is skipped;
+#  - for each subscription (read from the real subscription ids in its
+#    dictionary) only the NEWEST report is revealed. Shipping an older run's
+#    report too would put the same resources in the bundle twice under
+#    different tokens, and downstream would count them twice. The older ones
+#    are listed in the summary as left out.
+# A report whose dictionary names no subscription (a subscription with no
+# resources has an empty dictionary) cannot be matched to one, so it is
+# revealed on its own; it carries no resources or costs to count twice.
+$Candidates = [System.Collections.Generic.List[object]]::new()
 foreach ($Folder in $Folders)
 {
-    $Dict = Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    # The obfuscated per-sub reports, excluding any *_revealed.zip or
+    # *.partial.zip left by a prior run.
+    $Zips = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ResourcesReport_*.zip' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike '*_revealed.zip' -and $_.Name -notlike '*.partial.zip' } |
+            Sort-Object Name)
+    $Dicts = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
 
-    # The obfuscated per-sub report, excluding any *_revealed.zip left by a prior run.
-    $Zip = Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ResourcesReport_*.zip' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike '*_revealed.zip' } |
-        Select-Object -First 1
-
-    if ($null -eq $Dict -or $null -eq $Zip)
+    if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
     {
-        $Reason = if ($null -eq $Zip) { 'no obfuscated report zip in folder' } else { 'no obfuscation dictionary in folder' }
+        $Reason = if ($Zips.Count -eq 0) { 'no obfuscated report zip in folder' } else { 'no obfuscation dictionary in folder' }
         $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason }
         continue
     }
 
+    foreach ($Zip in $Zips)
+    {
+        # ResourcesReport_<stamp>.zip pairs with
+        # ObfuscationDictionary_ResourcesReport_<stamp>.json (or the short
+        # ObfuscationDictionary_<stamp>.json), and with nothing else.
+        $Stamp = $Zip.BaseName.Substring('ResourcesReport_'.Length)
+        $DictNames = @(('ObfuscationDictionary_' + $Zip.BaseName + '.json'), ('ObfuscationDictionary_' + $Stamp + '.json'))
+        $Matched = @($Dicts | Where-Object { $Name = $_.Name; @($DictNames | Where-Object { [string]::Equals($_, $Name, $PathComparison) }).Count -gt 0 })
+        if ($Matched.Count -ne 1)
+        {
+            $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0]))" } else { 'more than one dictionary with the same stamp' }
+            $SkippedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason }
+            continue
+        }
+        $Dict = $Matched[0]
+
+        # The subscription: the real subscription ids in the dictionary's
+        # SubscriptionMap (token -> the real id of a resource of that
+        # subscription).
+        $SubIds = @()
+        try
+        {
+            $DictJson = Get-Content -LiteralPath $Dict.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $DictJson.SubscriptionMap)
+            {
+                foreach ($Property in $DictJson.SubscriptionMap.PSObject.Properties)
+                {
+                    $SubId = Get-SubGuidFromResourceId ([string]$Property.Value)
+                    if (-not [string]::IsNullOrEmpty($SubId)) { $SubIds += $SubId.ToLowerInvariant() }
+                }
+            }
+        }
+        catch
+        {
+            $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message) }
+            continue
+        }
+        $SubIds = @($SubIds | Sort-Object -Unique)
+        $Key = if ($SubIds.Count -gt 0) { 'subscription:' + ($SubIds -join ',') } else { 'report:' + $Zip.FullName }
+        # Newest first: by the stamp's date and time (yyyyMMddHHmmssfff), else
+        # by the zip's write time in the same form.
+        $Order = if ($Stamp -match '^(\d{17})') { $Matches[1] } else { $Zip.LastWriteTime.ToString('yyyyMMddHHmmssfff', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $Candidates.Add([pscustomobject]@{ Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Key = $Key; Order = $Order })
+    }
+}
+
+$LeftOutItems = @()
+$Selected = [System.Collections.Generic.List[object]]::new()
+foreach ($Group in ($Candidates | Group-Object -Property Key))
+{
+    $Newest = @($Group.Group | Sort-Object -Property @{ Expression = 'Order'; Descending = $true }, @{ Expression = { $_.Zip.FullName }; Descending = $true })
+    $Selected.Add($Newest[0])
+    foreach ($Older in @($Newest | Select-Object -Skip 1))
+    {
+        $LeftOutItems += [pscustomobject]@{ Report = ('{0}/{1}' -f $Older.Folder, $Older.Zip.Name); Newer = ('{0}/{1}' -f $Newest[0].Folder, $Newest[0].Zip.Name) }
+    }
+}
+
+$Queue = [System.Collections.Generic.Queue[object]]::new()
+$UsedOutNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression = { $_.Zip.Name } }))
+{
+    $Folder = $Candidate.Folder
+    $Zip = $Candidate.Zip
+    $Dict = $Candidate.Dict
     $PairedCount++
 
     # Write the revealed copy straight into staging under the ORIGINAL zip name
     # so the consolidated outer zip matches the structure the ingestion server
     # expects from a normal multi-subscription run.
-    $OutPath = Join-Path $StagingDirectory $Zip.Name
+    $OutName = $Zip.Name
+    if (-not $UsedOutNames.Add($OutName))
+    {
+        # Two selected reports with the same file name (stamps are unique, so
+        # only a copied folder does this): never let one overwrite the other.
+        $OutName = $Folder + '_' + $Zip.Name
+        $null = $UsedOutNames.Add($OutName)
+    }
+    $OutPath = Join-Path $StagingDirectory $OutName
 
     if ($Resume -and (Test-Path -LiteralPath $OutPath))
     {
@@ -404,14 +496,7 @@ foreach ($Folder in $Folders)
         continue
     }
 
-    if (Test-Path -LiteralPath $OutPath)
-    {
-        # Defensive: per-run stamps are unique so this is not expected, but never
-        # silently overwrite one subscription's output with another's.
-        $OutPath = Join-Path $StagingDirectory ($Folder.Name + '_' + $Zip.Name)
-    }
-
-    $Queue.Enqueue([pscustomobject]@{ Folder = $Folder.Name; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath })
+    $Queue.Enqueue([pscustomobject]@{ Folder = $Folder; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath })
 }
 
 # Bounded job pool. Keep up to -ParallelStreams reveals in flight, each its own
@@ -541,11 +626,16 @@ Write-Host ("Paired (zip + dictionary)        : {0}" -f $PairedCount) -Foregroun
 Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -ForegroundColor Green
 Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
 Write-Host ("Skipped (missing zip or dict)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host ("Left out (older, same sub)       : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Failed during reveal             : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
 
 foreach ($s in $SkippedItems)
 {
     Write-Host ("  SKIP: {0} - {1}" -f $s.Folder, $s.Reason) -ForegroundColor Yellow
+}
+foreach ($o in $LeftOutItems)
+{
+    Write-Host ("  OLDER: {0} - left out: {1} is a newer report of the same subscription" -f $o.Report, $o.Newer) -ForegroundColor Yellow
 }
 foreach ($f in $FailedItems)
 {
