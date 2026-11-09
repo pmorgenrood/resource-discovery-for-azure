@@ -191,6 +191,26 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
         Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('soon, maybe') }) | Should -Be 0
     }
 
+    It 'gives 0 for <Value>, which is not an HTTP-date' -TestCases @(
+        @{ Value = '12.31' }
+        @{ Value = '23:00' }
+        @{ Value = '2.5' }
+    ) {
+        param($Value)
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @($Value) }) | Should -Be 0
+    }
+
+    It 'reads the older RFC 850 and asctime HTTP-date forms' {
+        $Soon = [datetimeoffset]::UtcNow.AddSeconds(30)
+        $Inv = [System.Globalization.CultureInfo]::InvariantCulture
+        foreach ($When in @($Soon.ToString("dddd, dd-MMM-yy HH':'mm':'ss 'GMT'", $Inv), $Soon.ToString("ddd MMM d HH':'mm':'ss yyyy", $Inv)))
+        {
+            $Seconds = Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @($When) })
+            $Seconds | Should -BeGreaterOrEqual 28
+            $Seconds | Should -BeLessOrEqual 31
+        }
+    }
+
     It 'gives 0 for a negative value' {
         Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('-5') }) | Should -Be 0
     }

@@ -119,7 +119,7 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
 
 # Reads the server-directed retry delay (seconds) from a failed Get-AzMetric call, so the Azure Monitor retry loop in
 # Extension/Metrics.ps1 waits as long as the service asks. It reads the standard Retry-After header.
-# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws: a failure to read the header must not break the retry loop.
+# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed strictly, invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws: a failure to read the header must not break the retry loop.
 function Get-RdaRetryAfterSeconds
 {
     param(
@@ -186,8 +186,12 @@ function Get-RdaRetryAfterSeconds
                     # invariant culture and AssumeUniversal - RFC 7231 HTTP-dates are
                     # English/GMT, so a non-English-culture host must not fail to parse
                     # them (which would silently degrade to blind backoff).
+                    # Only the three RFC 7231 date forms are accepted (RFC 1123, RFC 850
+                    # and asctime), so text such as "12.31" or "23:00" is not read as a date.
+                    $DateForms = [string[]]@('r', "dddd, dd-MMM-yy HH':'mm':'ss 'GMT'", "ddd MMM d HH':'mm':'ss yyyy")
+                    $DateStyles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AllowInnerWhite
                     $When = [datetimeoffset]::MinValue
-                    if ([datetimeoffset]::TryParse($Raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When))
+                    if ([datetimeoffset]::TryParseExact($Raw, $DateForms, [System.Globalization.CultureInfo]::InvariantCulture, $DateStyles, [ref]$When))
                     {
                         # Clamped before the int cast, so a far-future date cannot overflow it.
                         $Delta = [math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
