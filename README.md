@@ -467,7 +467,7 @@ What it needs:
   - `N`, or a run with no one to answer (scheduled, piped, CI), registers nothing. The run prints the command to register it per subscription and collects those metrics one resource at a time.
   - The next run finds a registered subscription registered and does not ask again.
   - Nothing is registered without `-UseMetricsBatch` and a `Y`.
-- Azure public cloud (`AzureCloud`). In other clouds the switch has no effect.
+- Azure public cloud (`AzureCloud`). In other clouds the switch has no effect: `Microsoft.Insights` is not checked, nothing is asked or registered, and every metric is collected one resource at a time.
 
 The debug log (`-Debug`) has a `Metrics batch` line in the metrics summary: requests sent, resources answered, and how many metrics went one resource at a time, with the reason for each fallback.
 
