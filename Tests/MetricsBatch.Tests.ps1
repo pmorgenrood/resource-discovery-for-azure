@@ -1348,12 +1348,15 @@ function global:Invoke-AzRestMethod
 }
 function global:Read-Host { Add-Content -LiteralPath $CallLog -Value 'Read-Host'; 'y' }
 & $Script -ResourceGroup 'rg-one' -UseMetricsBatch -OutputDirectory $OutDir
+exit $LASTEXITCODE
 '@
             $Pwsh = Join-Path $PSHOME 'pwsh'
             $Output = & $Pwsh -NoProfile -NonInteractive -File $Runner -Script (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -CallLog $CallLog -OutDir $Work 2>&1 | Out-String
+            $ExitCode = $LASTEXITCODE
 
-            # The run got as far as the refusal.
+            # The run got as far as the refusal, and the refusal is a failure.
             $Output | Should -Match 'Resource Group Name present, but missing Subscription ID'
+            $ExitCode | Should -Be 1 -Because $Output
             $Calls = @(if (Test-Path -LiteralPath $CallLog) { Get-Content -LiteralPath $CallLog })
             @($Calls | Where-Object { $_ -like 'Invoke-AzRestMethod*' }) | Should -BeNullOrEmpty
             @($Calls | Where-Object { $_ -eq 'Read-Host' }) | Should -BeNullOrEmpty

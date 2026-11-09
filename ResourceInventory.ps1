@@ -690,7 +690,8 @@ Function RunInventorySetup()
     {
         Write-Log -Message ("Resource Group Name present, but missing Subscription ID.") -Severity 'Error'
         Write-Log -Message ("If using ResourceGroup parameter you must also put SubscriptionId") -Severity 'Error'
-        Exit
+        # A refused run is a failure, so it exits 1, not 0.
+        exit 1
     }
 
     # -UseMetricsBatch only: offer once to register the Microsoft.Insights
