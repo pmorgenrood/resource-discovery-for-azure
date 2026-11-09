@@ -381,9 +381,9 @@ Describe "Metrics JSON Structure" {
             $Parsed = $Raw | ConvertFrom-Json
             $Parsed | Should -Not -BeNullOrEmpty -Because "Metrics file should be valid JSON"
             $Parsed.PSObject.Properties.Name | Should -Contain 'Metrics' -Because "Metrics JSON should have a Metrics property"
-            # Downstream drops the whole file unless Metrics is a list (an empty
-            # list is fine).
-            ($Raw -match '"Metrics"\s*:\s*\[') | Should -BeTrue -Because "the Metrics property must be a list in '$($metricsFile.Name)'"
+            # The file's top-level Metrics value must be a list (an empty list
+            # is fine).
+            ($Parsed.PSObject.Properties['Metrics'].Value -is [System.Array]) | Should -BeTrue -Because "the top-level Metrics value must be a list in '$($metricsFile.Name)'"
         }
     }
 }
@@ -406,8 +406,8 @@ Describe "Consumption CSV Headers" {
         }
 
         $ExpectedHeaders = @('InstanceData', 'MeterCategory', 'MeterId', 'MeterName', 'MeterRegion', 'MeterSubCategory', 'Quantity', 'Unit', 'UsageStartTime', 'UsageEndTime', 'ResourceId', 'ResourceLocation', 'ConsumptionMeter', 'ReservationId', 'ReservationOrderId')
-        # Downstream finds each column by its exact name, so the header is
-        # parsed and compared name by name.
+        # Each column must carry its exact name, so the header is parsed and
+        # compared name by name.
         $Columns = @(($FirstLine | ConvertFrom-Csv -Header (1..200 | ForEach-Object { "c$_" })).PSObject.Properties | Where-Object { $null -ne $_.Value } | ForEach-Object { [string]$_.Value })
         foreach ($header in $ExpectedHeaders)
         {

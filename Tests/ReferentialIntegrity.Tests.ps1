@@ -163,7 +163,7 @@ Describe "Consumption to Inventory Cross-Reference" {
         $RealOf = @{}
         foreach ($P in @($Map.PSObject.Properties)) { $RealOf[$P.Name] = [string]$P.Value }
         $InventoryByReal = @{}
-        # The first inventory row of a real id wins, as downstream takes the first.
+        # The first inventory row of a real id is the one compared.
         foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id) -and -not $InventoryByReal.ContainsKey($RealOf[$Id].ToLowerInvariant())) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
         $Checked = 0
         # Every masked consumption id is in the dictionary: an id the run
@@ -177,7 +177,7 @@ Describe "Consumption to Inventory Cross-Reference" {
             if ([string]::IsNullOrEmpty($row.ResourceId) -or -not $RealOf.ContainsKey($row.ResourceId)) { continue }
             $Real = $RealOf[$row.ResourceId].ToLowerInvariant()
             if (-not $InventoryByReal.ContainsKey($Real)) { continue }
-            # Downstream joins the two files by id ignoring case, so case aside.
+            # The two files must name the resource with one id, letter case aside.
             $row.ResourceId | Should -Be $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
             $Checked++
         }
@@ -211,7 +211,7 @@ Describe "Subscription and Resource Group Determinism" {
         foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real subscription' }
     }
 
-    It "One real resource group has one resource group token, and one token one real resource group" {
+    It "One real resource group name has one resource group token" {
         $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
         {
             $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
@@ -224,14 +224,16 @@ Describe "Subscription and Resource Group Determinism" {
         {
             $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
             if ($M.Count -lt 5 -or $R.Count -lt 5 -or $M[3] -ine 'resourcegroups' -or $R[3] -ine 'resourcegroups') { continue }
-            # A group is one group within its subscription, letter case aside.
-            $Real = ($R[2] + '/' + $R[4]).ToLowerInvariant()
+            # Group tokens are made per group name, letter case aside, so groups
+            # of one name in two subscriptions share a token on purpose; the
+            # subscription token keeps them apart.
+            $Real = $R[4].ToLowerInvariant()
             if (-not $TokensOf.ContainsKey($Real)) { $TokensOf[$Real] = @{} }; $TokensOf[$Real][$M[4]] = $true
             if (-not $RealsOf.ContainsKey($M[4])) { $RealsOf[$M[4]] = @{} }; $RealsOf[$M[4]][$Real] = $true
         }
         if ($TokensOf.Count -eq 0) { Set-ItResult -Skipped -Because 'no masked resource group path in the dictionary'; return }
-        foreach ($Real in $TokensOf.Keys) { $TokensOf[$Real].Count | Should -Be 1 -Because 'a real resource group keeps one token in every id' }
-        foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real resource group' }
+        foreach ($Real in $TokensOf.Keys) { $TokensOf[$Real].Count | Should -Be 1 -Because 'a real resource group name keeps one token in every id' }
+        foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real resource group name' }
     }
 }
 
