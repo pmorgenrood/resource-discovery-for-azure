@@ -15,7 +15,10 @@ function Get-RunDictionaryPath
             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     }
     if ([string]::IsNullOrEmpty($ZipPath)) { return $null }
-    $DictPath = Join-Path (Split-Path $ZipPath -Parent) ('ObfuscationDictionary_' + [System.IO.Path]::GetFileNameWithoutExtension($ZipPath) + '.json')
+    # A bare file name has no parent folder: it is in the current one.
+    $ZipDir = Split-Path $ZipPath -Parent
+    if ([string]::IsNullOrEmpty($ZipDir)) { $ZipDir = '.' }
+    $DictPath = Join-Path $ZipDir ('ObfuscationDictionary_' + [System.IO.Path]::GetFileNameWithoutExtension($ZipPath) + '.json')
     if (Test-Path -LiteralPath $DictPath) { return $DictPath }
     return $null
 }

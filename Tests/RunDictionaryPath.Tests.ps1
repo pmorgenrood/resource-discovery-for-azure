@@ -51,6 +51,13 @@ Describe 'Get-RunDictionaryPath' {
         Get-RunDictionaryPath -TestsRoot $script:Dir | Should -BeNullOrEmpty
     }
 
+    It 'takes the dictionary of a zip given by its bare file name' {
+        $env:TEST_ZIP_PATH = 'ResourcesReport_20261101000000000a.zip'
+        Push-Location $script:Dir
+        try { $Found = Get-RunDictionaryPath -TestsRoot $script:Dir } finally { Pop-Location }
+        Split-Path $Found -Leaf | Should -Be 'ObfuscationDictionary_ResourcesReport_20261101000000000a.json'
+    }
+
     It 'takes TEST_DICT_PATH when it is set' {
         $env:TEST_ZIP_PATH = Join-Path $script:Dir 'ResourcesReport_20261101000000000a.zip'
         $env:TEST_DICT_PATH = Join-Path $script:Dir 'ObfuscationDictionary_ResourcesReport_20261102000000000b.json'
