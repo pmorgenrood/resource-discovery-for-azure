@@ -787,6 +787,19 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             return $Out
         }
         function script:Get-CanonicalValueMap { param($Dict) $O = [ordered]@{}; foreach ($K in @($Dict.Keys | Sort-Object)) { $O[$K] = script:Get-TokenShape $Dict[$K] }; $O }
+        # A failed id query says what is lost (the skipped rows' masked ids
+        # and dictionary entries, not inventory rows) and the ways round it.
+        function script:Test-TokenFailureText
+        {
+            param([string]$Text)
+            $Text | Should -Not -BeNullOrEmpty
+            $Text | Should -Match 'masked ids'
+            $Text | Should -Match 'dictionary entries'
+            $Text | Should -Match 'inventory rows themselves are complete'
+            $Text | Should -Not -Match 'inventory would be incomplete'
+            $Text | Should -Match '-IncludeNetworkResources'
+            $Text | Should -Match 'without -Obfuscate'
+        }
     }
 
     AfterAll {
@@ -874,6 +887,9 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
     It 'a failed id query (<Mode>) stops the subscription under -RunAllSubs; it is never read as 0 rows' -TestCases @(@{ Mode = 'throw' }, @{ Mode = 'null' }) {
         { script:Invoke-Discovery -Obfuscate -FailToken $Mode } | Should -Throw
         $Global:ResourceIdDictionary.Count | Should -Be 0 -Because 'the token loop did not run'
+        $Reason = $null
+        try { script:Invoke-Discovery -Obfuscate -FailToken $Mode } catch { $Reason = $_.Exception.Message }
+        script:Test-TokenFailureText -Text $Reason
     }
 
     It 'a failed id query (<Mode>) ends a direct run with exit 1 before the token loop' -TestCases @(@{ Mode = 'throw' }, @{ Mode = 'null' }) {
@@ -900,6 +916,7 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
             $LASTEXITCODE | Should -Be 1
             $Out | Should -Not -Contain 'REACHED-TOKEN-LOOP'
             @($Out | Where-Object { $_ -like 'LOGGED-ERROR Resource discovery failed*' }).Count | Should -Be 1
+            script:Test-TokenFailureText -Text (@($Out | Where-Object { $_ -like 'LOGGED-ERROR Resource discovery failed*' })[0])
         }
         finally { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
     }
