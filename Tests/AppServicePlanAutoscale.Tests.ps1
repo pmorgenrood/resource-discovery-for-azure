@@ -21,13 +21,13 @@
 #   - targets that are not one string (missing, an array, a number) and a
 #     plan id that is an array give the same answer as the -eq check
 #   - a resource that is not an autoscale setting does not count
+#   - a plan with no id (null, empty or not a string) is $false, even when a
+#     setting has a missing or empty target
 #
 # The Subscription column is found with a lookup by subscription id instead of
 # a scan per plan. Those tests pin the -eq answer: letter case is ignored, a
 # missing id gives nothing, two subscriptions with one id give both names, and
 # a subscription id that is not a string keeps the scan.
-#   - a plan with no id (null, empty or not a string) is $false, even when a
-#     setting has a missing or empty target
 #
 # No live Azure. All GUIDs are the Azure documentation placeholder, not real
 # identifiers.
