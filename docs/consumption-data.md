@@ -66,9 +66,11 @@ and 8 seconds)**, unless the failure is one a retry cannot change: access
 refused (401, 403, or an error that says access was denied), a sign-in that
 cannot be used (an expired or invalid token, one that needs the user, or an
 error that says to run `Connect-AzAccount`), a bad request (400) or not found
-(404, or an error that says it could not be found), named by the error or by
-an error inside it. Every other failure is retried, for example 429
-throttling, a timeout, a server error (5xx), a transfer cut off part-way
+(404, or an error that says it could not be found), or any other 4xx status
+except 408, 409 and 429, named by the error or by an error inside it. A
+known HTTP status decides first. Every other failure is retried, for example
+429 throttling, a timeout (408), a conflict (409), a server error (5xx), a
+transfer cut off part-way
 (`Error while copying content to a stream`), a sign-in service error that
 names only its code, or an error that is not recognised. The **same** page is retried (the previous page's
 `ContinuationToken` is preserved), so no rows are duplicated or skipped. This
