@@ -124,33 +124,92 @@ Describe 'The skip list' {
     BeforeAll {
         # What a collector's text says about the resource types it reads:
         # every type comparison (.type / TYPE with -eq, -like, -match, -in,
-        # -contains and their negated or case forms) and every spelled-out
-        # provider type. A -like or -match pattern counts as reading each
-        # skip-list type it matches; a comparison whose right side is not a
-        # quoted literal (a variable, an expression) cannot be checked, so it
-        # is reported on its own.
+        # -contains and their case forms, with the type on either side), every
+        # spelled-out provider type, and every skipped type named by its id
+        # segment ('/networkinterfaces/'). A -like or -match pattern counts as
+        # reading each skip-list type it matches. A comparison that cannot be
+        # checked is reported on its own: a negated one (-ne, -notlike,
+        # -notmatch, -notin, -notcontains reads every type but the named ones),
+        # or one whose other side is not a quoted literal or a list of them (a
+        # variable, an expression, an interpolated string, a joined string).
         function script:Get-CollectorTypeRead
         {
             param([string]$Text, [string[]]$SkipList)
             $Hits = [System.Collections.Generic.List[string]]::new()
             $Unchecked = [System.Collections.Generic.List[string]]::new()
             $Literals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $Compare = '(?i)\btype\b[''"]?(?:\.ToLower(?:Invariant)?\(\))?(?:\s*\))?[''"]?\s*-[ic]?(eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains)\s*(''[^'']*''|"[^"]*"|\S+)'
+            $Ops = 'eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains'
+            # The other side: an @( ) list, a quoted string, or any one word.
+            $Side = '(@\((?:[^()]|\([^()]*\))*\)|''[^'']*''|"[^"]*"|\S+)'
+            # The quoted strings of the other side, or $null when it is
+            # anything else (a variable, an expression, a string with $ in it,
+            # a list with any of those in it).
+            $GetQuoted = {
+                param([string]$S)
+                if ($S -match '^''[^'']*''$' -or $S -match '^"[^"$]*"$') { return , @($S.Substring(1, $S.Length - 2)) }
+                if ($S -match '^@\((?<Inner>[\s\S]*)\)$')
+                {
+                    $Inner = $Matches['Inner']
+                    if (($Inner -replace '''[^'']*''|"[^"$]*"', '') -notmatch '^[\s,]*$') { return $null }
+                    return , @([regex]::Matches($Inner, '''([^'']*)''|"([^"]*)"') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+                }
+                return $null
+            }
+            $Compare = '(?i)\btype\b[''"]?(?:\.ToLower(?:Invariant)?\(\))?(?:\s*\))?[''"]?\s*-[ic]?(' + $Ops + ')\s*' + $Side + '(\s*\+)?'
+            $Reverse = '(?i)' + $Side + '\s*-[ic]?(' + $Ops + ')\s*\(?\s*"?\$\(?[\w:]*(?:\.\w+)*\.type\b'
             foreach ($M in [regex]::Matches($Text, $Compare))
             {
-                $Op = $M.Groups[1].Value.ToLowerInvariant() -replace '^not', '' -replace '^ne$', 'eq'
-                $Right = $M.Groups[2].Value
-                if ($Right -notmatch '^[''"].*[''"]$')
+                $Op = $M.Groups[1].Value.ToLowerInvariant()
+                $Values = & $GetQuoted $M.Groups[2].Value
+                if ($Op -match '^(ne|not)' -or $M.Groups[3].Success -or $null -eq $Values)
                 {
                     $Unchecked.Add($M.Value)
                     continue
                 }
-                $Value = $Right.Substring(1, $Right.Length - 2)
-                switch ($Op)
+                foreach ($Value in $Values)
                 {
-                    'like' { foreach ($T in $SkipList) { if ($T -like $Value) { $Hits.Add("$T (by -like '$Value')") } } }
-                    'match' { foreach ($T in $SkipList) { if ($T -match $Value) { $Hits.Add("$T (by -match '$Value')") } } }
-                    default { [void]$Literals.Add($Value) }
+                    switch ($Op)
+                    {
+                        'like' { foreach ($T in $SkipList) { if ($T -like $Value) { $Hits.Add("$T (by -like '$Value')") } } }
+                        'match' { foreach ($T in $SkipList) { if ($T -match $Value) { $Hits.Add("$T (by -match '$Value')") } } }
+                        default { [void]$Literals.Add($Value) }
+                    }
+                }
+            }
+            # The type on the right: only a quoted literal or a quoted list on
+            # the left, with -eq, -in or -contains, can be checked.
+            foreach ($M in [regex]::Matches($Text, $Reverse))
+            {
+                $Op = $M.Groups[2].Value.ToLowerInvariant()
+                $Values = & $GetQuoted $M.Groups[1].Value
+                if ($Op -notin @('eq', 'in', 'contains') -or $null -eq $Values)
+                {
+                    $Unchecked.Add($M.Value)
+                    continue
+                }
+                foreach ($Value in $Values) { [void]$Literals.Add($Value) }
+            }
+            # A skipped type named by its id segment in any quoted string with
+            # a / in it ('*/providers/microsoft.network/networkinterfaces/*',
+            # '/networkinterfaces/'). In an id the child type comes two parts
+            # after the parent (parent/name/child), in a type one part after.
+            # A parent segment followed by a child type reads only that child:
+            # a kept one ('/networkwatchers/*/connectionmonitors/') is fine, a
+            # skipped one ('/flowlogs/') is a hit on its own segment.
+            $Segments = @{}
+            foreach ($T in $SkipList) { $P = $T.Split('/'); $Segments[$P[$P.Count - 1]] = $T }
+            foreach ($M in [regex]::Matches($Text, '''[^''\r\n]*/[^''\r\n]*''|"[^"\r\n]*/[^"\r\n]*"'))
+            {
+                $Lit = $M.Value.Substring(1, $M.Value.Length - 2).ToLowerInvariant()
+                $Parts = @($Lit.Split('/') | ForEach-Object { $_.TrimEnd('*', '?', '$') })
+                $Step = if ($Parts[0] -match '^\^?microsoft') { 1 } else { 2 }
+                for ($i = 0; $i -lt $Parts.Count; $i++)
+                {
+                    if (-not $Segments.ContainsKey($Parts[$i])) { continue }
+                    $T = $Segments[$Parts[$i]]
+                    $Child = if ($i + $Step -lt $Parts.Count) { $Parts[$i + $Step] } else { '' }
+                    if ($T.Split('/').Count -eq 2 -and $Child -match '^[a-z0-9]+$') { continue }
+                    $Hits.Add("$T (by the id segment in '$Lit')")
                 }
             }
             foreach ($M in [regex]::Matches($Text, '(?i)[''"](microsoft\.[a-z0-9]+/[a-z0-9./]+)[''"]'))
@@ -212,14 +271,43 @@ Describe 'The skip list' {
         @{ Label = 'by -split on the type'; Text = '$Resources | Where-Object { ($_.type -split ''/'')[1] -eq ''routetables'' }'; Expect = 'unchecked' }
         @{ Label = 'by the type in brackets and -match'; Text = '$Resources | Where-Object { ($_.type) -match ''^microsoft\.network/route'' }'; Expect = 'hit' }
         @{ Label = 'by the type in a string and -match'; Text = '$Resources | Where-Object { "$($_.type)" -match ''^microsoft\.network/route'' }'; Expect = 'hit' }
+        # A negated comparison reads every type but the ones it names.
+        @{ Label = 'by -ne a kept type'; Text = '$Resources | Where-Object { $_.type -ne ''microsoft.compute/virtualmachines'' }'; Expect = 'unchecked' }
+        @{ Label = 'by -notlike a kept pattern'; Text = '$Resources | Where-Object { $_.TYPE -notlike ''microsoft.compute/*'' }'; Expect = 'unchecked' }
+        @{ Label = 'by -notmatch a kept pattern'; Text = '$Resources | Where-Object { $_.type -notmatch ''^microsoft\.compute/'' }'; Expect = 'unchecked' }
+        @{ Label = 'by -notin kept types'; Text = '$Resources | Where-Object { $_.type -notin ''microsoft.compute/virtualmachines'', ''microsoft.compute/disks'' }'; Expect = 'unchecked' }
+        @{ Label = 'by -notcontains a kept type'; Text = '$Resources | Where-Object { $_.type -notcontains ''microsoft.compute/disks'' }'; Expect = 'unchecked' }
+        # The type on the right of the comparison.
+        @{ Label = 'by a list variable -contains the type'; Text = '$Resources | Where-Object { $NetworkTypes -contains $_.type }'; Expect = 'unchecked' }
+        @{ Label = 'by a function''s list -contains the type'; Text = '$Resources | Where-Object { (Get-NetTypes) -contains $_.TYPE }'; Expect = 'unchecked' }
+        @{ Label = 'by a list variable -notcontains the type'; Text = '$Resources | Where-Object { $Kept -notcontains $_.type }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept literal -ne the type'; Text = '$Resources | Where-Object { ''microsoft.compute/disks'' -ne $_.type }'; Expect = 'unchecked' }
+        @{ Label = 'by a literal list -contains the type'; Text = '$Resources | Where-Object { @(''microsoft.compute/disks'', ''microsoft.network/routetables'') -contains $_.type }'; Expect = 'hit' }
+        # Selection by id, an interpolated type and a joined type.
+        @{ Label = 'by id with -like'; Text = '$Resources | Where-Object { $_.id -like ''*/providers/microsoft.network/networkinterfaces/*'' }'; Expect = 'hit' }
+        @{ Label = 'by id with -match'; Text = '$Resources | Where-Object { $_.id -match ''/networkinterfaces/'' }'; Expect = 'hit' }
+        @{ Label = 'by a skipped child type in an id'; Text = '$Resources | Where-Object { $_.ID -like ''*/networkwatchers/*/flowlogs/*'' }'; Expect = 'hit' }
+        @{ Label = 'by an id in a double-quoted string'; Text = '$Nic = $Resources | Where-Object { $_.id -eq "$VmId/../networkinterfaces/$Name" }'; Expect = 'hit' }
+        @{ Label = 'by an interpolated type'; Text = '$Resources | Where-Object { $_.type -eq "microsoft.network/$Kind" }'; Expect = 'unchecked' }
+        @{ Label = 'by a joined type'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/'' + ''routetables'' }'; Expect = 'unchecked' }
+        # A quoted list on the right is read as literals.
+        @{ Label = 'by -in a quoted list'; Text = '$Resources | Where-Object { $_.type -in @(''microsoft.compute/virtualmachines'', ''microsoft.network/routetables'') }'; Expect = 'hit' }
+        @{ Label = 'by -in a list with a variable'; Text = '$Resources | Where-Object { $_.type -in @(''microsoft.compute/virtualmachines'', $Other) }'; Expect = 'unchecked' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
         else { @($Read.Unchecked) | Should -Not -BeNullOrEmpty }
     }
 
-    It 'the collector check passes a collector that reads only kept types' {
-        $Read = script:Get-CollectorTypeRead -Text '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/publicipaddresses'' -or $_.TYPE -like ''microsoft.compute/*'' }' -SkipList @(Get-RdaNetworkSkipList)
+    It 'the collector check passes a collector that reads only kept types <Label>' -TestCases @(
+        @{ Label = 'by literals and a pattern'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/publicipaddresses'' -or $_.TYPE -like ''microsoft.compute/*'' }' }
+        @{ Label = 'by -in a quoted list'; Text = '$Resources | Where-Object { $_.type -in @(''microsoft.compute/virtualmachines'') }' }
+        @{ Label = 'by -in a quoted list over lines'; Text = "`$Resources | Where-Object { `$_.type -in @(`n    'microsoft.compute/virtualmachines'`n    'microsoft.compute/disks'`n) }" }
+        @{ Label = 'by a quoted list -contains the type'; Text = '$Resources | Where-Object { @(''microsoft.compute/virtualmachines'', ''microsoft.compute/disks'') -contains $_.type }' }
+        @{ Label = 'by the id of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.id -like ''*/networkwatchers/*/connectionmonitors/*'' }' }
+        @{ Label = 'by the type of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/networkwatchers/connectionmonitors'' }' }
+    ) {
+        $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         @($Read.Hits) | Should -BeNullOrEmpty
         @($Read.Unchecked) | Should -BeNullOrEmpty
     }
