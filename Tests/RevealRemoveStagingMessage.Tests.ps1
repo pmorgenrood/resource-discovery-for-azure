@@ -55,11 +55,18 @@ BeforeAll {
         Copy-Item -LiteralPath $script:Source -Destination $Root -Recurse
         if ($BadFolder)
         {
-            # A folder whose report zip cannot be read, with a real dictionary beside it.
+            # A folder of a second subscription whose report zip cannot be
+            # read, with a real dictionary beside it. The dictionary is the
+            # first one with its subscription ids changed to another
+            # placeholder: Reveal reveals only the newest report of each
+            # subscription, so a copy for the same subscription would be left
+            # out as an older run instead of failing.
             $Bad = Join-Path $Root 'broken'
             $null = New-Item -ItemType Directory -Path $Bad -Force
             Set-Content -LiteralPath (Join-Path $Bad 'ResourcesReport_20260101000000000abcd.zip') -Value 'not a zip' -Encoding utf8
-            Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $script:Source -Filter 'ObfuscationDictionary_*.json' -File)[0].FullName -Destination (Join-Path $Bad 'ObfuscationDictionary_ResourcesReport_20260101000000000abcd.json')
+            $DictText = [System.IO.File]::ReadAllText(@(Get-ChildItem -LiteralPath $script:Source -Filter 'ObfuscationDictionary_*.json' -File)[0].FullName)
+            $DictText = [regex]::Replace($DictText, '(?i)(/subscriptions/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '${1}ffffffff-ffff-ffff-ffff-ffffffffffff')
+            [System.IO.File]::WriteAllText((Join-Path $Bad 'ObfuscationDictionary_ResourcesReport_20260101000000000abcd.json'), $DictText)
         }
         $OutZip = if ($BadZip) { Join-Path $Root 'no-such-folder/bundle.zip' } else { Join-Path $Root 'bundle.zip' }
         $Command = "[System.Globalization.CultureInfo]::CurrentCulture = '$Culture'; Set-Location -LiteralPath '$($script:Tree)'; & ./Reveal.ps1 -InventoryRoot '$Root' -OutputZip '$OutZip' -RemoveStaging -FolderTimeoutMinutes 2; exit `$LASTEXITCODE"
