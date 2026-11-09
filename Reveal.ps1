@@ -497,12 +497,25 @@ try
         if (-not $StagingLockExisted) { Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue }
         throw $Message
     }
-    # Release the lock and remove its file, when staging is about to be removed
-    # or the run ends.
+    # Release the lock and remove its file, when staging is about to be removed.
+    # The file is removed while the lock is still held, so no other run can
+    # open it in between: such a run would hold a lock on a removed file, and
+    # a third run would make a new lock file and run beside it. Unix allows
+    # removing a file that is open.
+    # shortcut: Windows does not allow removing a file opened with no sharing,
+    # and opening it with DeleteOnClose would also remove a lock file that a
+    # refused run must leave, so there the lock is released first and the file
+    # removed after; the small window between the two steps stays on Windows.
     function Remove-RevealStagingLock
     {
-        if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+        if ($IsWindows)
+        {
+            if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+            Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue
+            return
+        }
         Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue
+        if ($null -ne $StagingLock) { $StagingLock.Dispose() }
     }
     $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
     $StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop | Where-Object { $_.Name -ne $StagingLockName }).Count -eq 0
