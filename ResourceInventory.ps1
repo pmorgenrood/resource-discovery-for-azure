@@ -1583,7 +1583,33 @@ function ExecuteInventoryProcessing()
                     # -ErrorAction Stop: the run's error preference can be SilentlyContinue, and a
                     # failed write (a full disk, a file that cannot be written) must stop this
                     # subscription's pull as incomplete, not count the rows as written.
-                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation -ErrorAction Stop
+                    $CsvItem = Get-Item -LiteralPath $Global:ConsumptionFileCsv -ErrorAction SilentlyContinue
+                    $CsvLengthBefore = if ($null -ne $CsvItem) { $CsvItem.Length } else { -1 }
+                    try
+                    {
+                        $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation -ErrorAction Stop
+                    }
+                    catch
+                    {
+                        # A write that fails part-way can leave some of this page's rows in the
+                        # file; cut them off again, so the file holds only the rows counted.
+                        $WriteError = $_
+                        try
+                        {
+                            if ($CsvLengthBefore -lt 0) { Remove-Item -LiteralPath $Global:ConsumptionFileCsv -Force -ErrorAction Stop }
+                            else
+                            {
+                                $CsvStream = [System.IO.File]::Open($CsvItem.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
+                                try { $CsvStream.SetLength($CsvLengthBefore) } finally { $CsvStream.Dispose() }
+                            }
+                        }
+                        catch [System.Management.Automation.ItemNotFoundException] { }
+                        catch
+                        {
+                            throw ("{0}; the rows of this page written before the error could not be removed from the consumption file ({1})" -f $WriteError.Exception.Message, $_.Exception.Message)
+                        }
+                        throw $WriteError
+                    }
                     # Rows written to the consumption file: a -ResourceGroup run leaves out the
                     # other resource groups' rows, and a page that fails part-way writes none.
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
