@@ -309,7 +309,8 @@ function Merge-RecoveryData
         # Drop the $null that an empty or missing map yields, so an empty
         # ResourceIdMap (a run that found no resources) counts as 0 keys and
         # the check below is skipped instead of stopping a merge that no
-        # re-run could ever get past.
+        # re-run could ever get past. A bundle with an empty map must then give
+        # the merge no resource; that is checked once the sources are known.
         $SharedIdKeyCount = $null
         $GapIdKeys = @($GapDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
         $RecoveryIdKeys = @($RecoveryDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
@@ -525,6 +526,41 @@ function Merge-RecoveryData
         {
             $Hint = if ($MetricsSourceLabel -eq 'gap') { 'Run this merge with -RecoverMetrics and a recovery bundle whose metrics are whole.' } else { 'Re-run the recovery WITHOUT -SkipMetrics into a new folder, then run this merge again pointed at it.' }
             throw ("Merge-RecoveryData: the {0} bundle's metrics file '{1}' cannot be used: {2}. Downstream would drop every metric in the zip. Nothing was written to '{3}'. {4}" -f $MetricsSourceLabel, $MetricsFile.FullName, $Problem, $OutputPath, $Hint)
+        }
+    }
+
+    # -- Guard: an empty ResourceIdMap in a masked merge. The shared-token
+    #    check above is skipped when a ResourceIdMap is empty, because a masked
+    #    run over a subscription with no resources writes an empty map. Every
+    #    resource a masked run writes, in its inventory, consumption or metrics,
+    #    gets a ResourceIdMap entry. So a bundle with an empty map that still
+    #    gives this merge an inventory record, a consumption row or a metric was
+    #    not masked by that dictionary (for example a plain run written into a
+    #    folder that still holds an old masked run's dictionary), and its real
+    #    names and ids would ship inside a masked bundle. That stops the merge.
+    if ($GapDictionaryFile -and $RecoveryDictionaryFile)
+    {
+        $GapKeptKeys = @($GapInventory.PSObject.Properties.Name | Where-Object { $_ -ne 'Version' -and $_ -notin $MergeKeys })
+        $ConsumptionHasRows = $false
+        if ($ConsumptionSourceFile)
+        {
+            $ConsumptionHasRows = (@(Import-Csv -LiteralPath $ConsumptionSourceFile.FullName -ErrorAction Stop | Select-Object -First 1).Count -gt 0)
+        }
+        foreach ($Side in @(
+                @{ Label = 'gap'; IdKeys = $GapIdKeys; Dict = $GapDictionaryFile; Inventory = $GapInventory; Keys = $GapKeptKeys },
+                @{ Label = 'recovery'; IdKeys = $RecoveryIdKeys; Dict = $RecoveryDictionaryFile; Inventory = $RecoveryInventory; Keys = $MergeKeys }
+            ))
+        {
+            if (@($Side.IdKeys).Count -gt 0) { continue }
+            $Given = [System.Collections.Generic.List[string]]::new()
+            $RecordCount = 0
+            foreach ($Key in $Side.Keys) { $RecordCount += @($Side.Inventory.$Key | Where-Object { $null -ne $_ }).Count }
+            if ($RecordCount -gt 0) { $Given.Add(('{0} inventory record(s)' -f $RecordCount)) }
+            if ($ConsumptionHasRows -and $ConsumptionSource -eq $Side.Label) { $Given.Add('consumption rows') }
+            if ($SelectedMetricsCount -gt 0 -and $MetricsSourceLabel -eq $Side.Label) { $Given.Add(('{0} metric(s)' -f $SelectedMetricsCount)) }
+            if ($Given.Count -eq 0) { continue }
+            $Way = if ($Side.Label -eq 'recovery') { "Re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { "Re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'" -f $RecoveryDictionaryFile.FullName }
+            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' has an empty ResourceIdMap, so that run masked no resource, but the {0} bundle gives this merge {2}. They were not masked with that dictionary, so real names and ids would ship inside a masked bundle. Nothing was written to '{3}'. If that run's own dictionary was moved, put it back in that folder. Otherwise {4} into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at it." -f $Side.Label, $Side.Dict.Name, ($Given -join ', '), $OutputPath, $Way)
         }
     }
 
