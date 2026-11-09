@@ -1482,6 +1482,54 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
     }
 }
 
+Describe 'Two Run-AllSubscriptions.ps1 runs in one PowerShell session' {
+    BeforeAll {
+        # The run-wide lists the wrapper sets at its start, as written: every
+        # $Global: assignment before $InventoryRoot is set. And its last
+        # statements, from its FAILED (auth) lines to its exit code.
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Top = @((Get-ScriptAst -File 'Run-AllSubscriptions.ps1').EndBlock.Statements)
+        $Root = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$InventoryRoot = ' })[0]
+        $script:WrapperStart = @($Top[0..($Root - 1)] | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -like '$Global:*' } | ForEach-Object { $_.Extent.Text }) -join "`n"
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$AuthSkippedPhases = @\(\)' })[0]
+        $To = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^if \(\$WrapperExitCode -ne 0\)' })[-1]
+        $script:WrapperEnd = (@($Top[$From..($To - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n'EXIT=' + `$WrapperExitCode"
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('MetricsFailedSubs', 'CollectorFailures', 'ConsumptionFailedSubs', 'ConsumptionRecordCount', 'RdaUnwrittenReportZips'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'clears the consumption entries and count of the first run at the start of the second, which then exits 0' {
+        # The first run: its consumption was skipped for the sign-in.
+        . ([scriptblock]::Create($script:WrapperStart))
+        $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = 'Consumption'; Id = '(auth)'; Message = 'no usable Azure context' }
+        $Global:ConsumptionRecordCount = 42
+
+        # The second run in the same session: nothing failed.
+        . ([scriptblock]::Create($script:WrapperStart))
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 0
+        [int]$Global:ConsumptionRecordCount | Should -Be 0
+
+        Set-Variable -Name TenantID -Value 'tenant-1'
+        Set-Variable -Name WrapperTranscriptStarted -Value $false
+        Set-Variable -Name InventoryPassthrough -Value @{ ConcurrencyLimit = 6 }
+        Set-Variable -Name InventoryRoot -Value (Join-Path $TestDrive 'no-reports')
+        $Lines = @(. ([scriptblock]::Create($script:WrapperEnd)) 6>&1 | ForEach-Object { [string]$_ })
+        $Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
+        ($Lines | Where-Object { $_ -like 'EXIT=*' } | Select-Object -Last 1) | Should -Be 'EXIT=0'
+    }
+}
+
 Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
     BeforeAll {
         # The wrapper's statements that count the zips and exit 2 when one is
