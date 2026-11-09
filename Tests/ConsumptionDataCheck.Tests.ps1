@@ -259,12 +259,8 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
         # The write fails with an error that does not stop by itself, as a full
         # disk can.
-        function Export-Csv
-        {
-            [CmdletBinding()]
-            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
-            process { Write-Error 'stand-in: there is not enough space on the disk' }
-        }
+        # -RemoveParameterType: the mock then takes -Encoding utf8 as the cmdlet does.
+        Mock Export-Csv -RemoveParameterType Encoding { Write-Error 'stand-in: there is not enough space on the disk' }
         # The run's own error preference can be SilentlyContinue.
         $ErrorActionPreference = 'SilentlyContinue'
         GetResorceConsumption
@@ -292,16 +288,13 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         # The real writer, which fails on the given row after the rows before it
         # are in the file.
         $script:CsvRows = 0
-        function Export-Csv
-        {
-            [CmdletBinding()]
-            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
-            process
-            {
-                $script:CsvRows++
-                if ($script:CsvRows -eq $script:FailAt) { throw 'stand-in: there is not enough space on the disk' }
-                $InputObject | Microsoft.PowerShell.Utility\Export-Csv -Path $Path -Encoding utf8 -Append -NoTypeInformation
-            }
+        # The cmdlet itself, which a module-qualified name would not reach past the mock.
+        $script:RealExportCsv = Get-Command -Name Export-Csv -CommandType Cmdlet
+        # -RemoveParameterType: the mock then takes -Encoding utf8 as the cmdlet does.
+        Mock Export-Csv -RemoveParameterType Encoding {
+            $script:CsvRows++
+            if ($script:CsvRows -eq $script:FailAt) { throw 'stand-in: there is not enough space on the disk' }
+            $InputObject | & $script:RealExportCsv -Path $Path -Encoding utf8 -Append -NoTypeInformation
         }
         GetResorceConsumption
         $script:CsvRows | Should -Be $FailAt
@@ -324,20 +317,17 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         # thing, with the full path in its text, and the file can then not be
         # opened for writing (another program holds it).
         $script:CsvRows = 0
-        function Export-Csv
-        {
-            [CmdletBinding()]
-            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
-            process
+        # The cmdlet itself, which a module-qualified name would not reach past the mock.
+        $script:RealExportCsv = Get-Command -Name Export-Csv -CommandType Cmdlet
+        # -RemoveParameterType: the mock then takes -Encoding utf8 as the cmdlet does.
+        Mock Export-Csv -RemoveParameterType Encoding {
+            $script:CsvRows++
+            if ($script:CsvRows -eq 2)
             {
-                $script:CsvRows++
-                if ($script:CsvRows -eq 2)
-                {
-                    (Get-Item -LiteralPath $Path).IsReadOnly = $true
-                    throw ("Access to the path '{0}' is denied." -f $Path)
-                }
-                $InputObject | Microsoft.PowerShell.Utility\Export-Csv -Path $Path -Encoding utf8 -Append -NoTypeInformation
+                (Get-Item -LiteralPath $Path).IsReadOnly = $true
+                throw ("Access to the path '{0}' is denied." -f $Path)
             }
+            $InputObject | & $script:RealExportCsv -Path $Path -Encoding utf8 -Append -NoTypeInformation
         }
         try { GetResorceConsumption }
         finally { (Get-Item -LiteralPath $Global:ConsumptionFileCsv).IsReadOnly = $false }
