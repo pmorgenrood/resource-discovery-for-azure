@@ -163,8 +163,9 @@ if ($Samples.Count -gt 0)
 # subscription (auth / billing-scope gap), not that the VM is idle. The ids
 # decide (a running VM is billed when its own id, or its scale set's, is): the
 # output contract gives the inventory ID and the consumption ResourceId the
-# same string. Only a masked report whose ids never meet (an older or broken
-# mask), or one with a running VM without an ID, is compared by counts.
+# same string. A masked report whose ids never meet although VMs are billed
+# (an older or broken mask) says the coverage could not be linked; only a
+# report with a running VM without an ID is compared by counts.
 $VmBilling = $null
 if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -LiteralPath $ConsumptionFile -PathType Leaf))
 {
@@ -232,6 +233,14 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Literal
         {
             $Gap = $RunningVmCount - $MatchedVmCount
             $BilledVmCount = $MatchedVmCount
+        }
+        elseif ($IdRunningVms.Count -eq $RunningVmCount -and $BilledVmCount -gt 0)
+        {
+            # A masked report whose ids never meet although VMs were billed: the
+            # contract gives both files the same token for a resource, so equal
+            # counts here say nothing about coverage. Said as such, not hidden.
+            $VmBilling = [pscustomobject]@{ Running = $RunningVmCount; Billed = $BilledVmCount; Gap = $RunningVmCount; GapPct = 100.0; Unlinked = $true }
+            $Gap = -1
         }
         if ($Gap -gt $VmBillingGapThreshold)
         {
@@ -842,7 +851,14 @@ if ($null -ne $VmBilling)
     {
         ''
     }
-    $CoverageBanner = ('<div class="coverage-banner"><span class="coverage-icon">&#9888;</span><div><b>VM billing-coverage check:</b> {0} running VMs were discovered in the inventory, but only {1} VMs have compute-usage records in the consumption window &mdash; {2} running VMs ({3}%) have no compute charge. This usually means consumption data was incomplete for some subscriptions (auth or billing-scope gaps), not that the VMs are idle. Verify consumption collection for the affected subscriptions.{4}</div></div>' -f $VmBilling.Running, $VmBilling.Billed, $VmBilling.Gap, $VmBilling.GapPct, $IdNote)
+    $CoverageBanner = if ($VmBilling.PSObject.Properties.Name -contains 'Unlinked')
+    {
+        ('<div class="coverage-banner"><span class="coverage-icon">&#9888;</span><div><b>VM billing-coverage check:</b> coverage could not be linked. None of the {0} running VMs in the inventory has its id in the consumption data, which bills {1} VMs. In a masked report both files give a resource the same token, so this report&#39;s inventory and consumption do not match (for example, they come from different runs or masks), and the VM billing coverage could not be checked.</div></div>' -f $VmBilling.Running, $VmBilling.Billed)
+    }
+    else
+    {
+        ('<div class="coverage-banner"><span class="coverage-icon">&#9888;</span><div><b>VM billing-coverage check:</b> {0} running VMs were discovered in the inventory, but only {1} VMs have compute-usage records in the consumption window &mdash; {2} running VMs ({3}%) have no compute charge. This usually means consumption data was incomplete for some subscriptions (auth or billing-scope gaps), not that the VMs are idle. Verify consumption collection for the affected subscriptions.{4}</div></div>' -f $VmBilling.Running, $VmBilling.Billed, $VmBilling.Gap, $VmBilling.GapPct, $IdNote)
+    }
 }
 
 $Html = @"

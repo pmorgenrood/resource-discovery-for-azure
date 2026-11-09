@@ -359,6 +359,17 @@ Describe 'VM billing-coverage banner' {
         Get-Content -LiteralPath $Html -Raw | Should -Match '2 running VMs were discovered in the inventory, but only 0 VMs have compute-usage records'
     }
 
+    It 'says coverage could not be linked in a masked report whose VM ids never meet the billed ids, with equal counts' {
+        $Inv = New-TestInventory -RunningVms 3 -DeallocatedVms 0
+        foreach ($Vm in $Inv.VirtualMachines) { $Vm | Add-Member -NotePropertyName ID -NotePropertyValue ('/subscriptions/prod_{0}/resourcegroups/prod_{1}/providers/microsoft.compute/virtualmachines/prod_{2}' -f [guid]::NewGuid(), [guid]::NewGuid(), [guid]::NewGuid()) }
+        $Csv = Join-Path $script:WorkDir 'con_unlinked.csv'
+        New-TestConsumptionCsv -Path $Csv -BilledVms 3
+
+        $Html = Invoke-Summary -Inventory $Inv -ConsumptionFile $Csv
+        $Html | Should -Match 'VM billing-coverage check:</b> coverage could not be linked'
+        $Html | Should -Match 'None of the 3 running VMs in the inventory has its id in the consumption data, which bills 3 VMs'
+    }
+
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_thresh.csv'

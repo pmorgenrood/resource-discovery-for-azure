@@ -246,8 +246,11 @@ function New-RdaAllSubHtmlSummary
         }
         catch
         {
-            # A single unreadable inventory must not abort the whole summary.
-            $SubReports += [pscustomobject]@{ Name = ('(unreadable inventory: {0})' -f $Folder.Name); Total = 0; Link = $null; Folder = $Folder.Name; Unreadable = $true }
+            # A single unreadable inventory must not abort the whole summary, and
+            # its report html is still linked.
+            $UnreadableHtml = Get-ChildItem -LiteralPath $Folder.FullName -Filter '*.html' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*_revealed*' } | Select-Object -First 1
+            $UnreadableLink = if ($null -ne $UnreadableHtml) { (Join-Path $Folder.Name $UnreadableHtml.Name) } else { $null }
+            $SubReports += [pscustomobject]@{ Name = ('(unreadable inventory: {0})' -f $Folder.Name); Total = 0; Link = $UnreadableLink; Folder = $Folder.Name; Unreadable = $true }
             continue
         }
 
@@ -642,7 +645,7 @@ function New-RdaAllSubHtmlSummaryFromZip
     if (-not $KeepOriginalReports)
     {
         $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
-        if (Test-Path -Path $SummaryScript -PathType Leaf)
+        if (Test-Path -LiteralPath $SummaryScript -PathType Leaf)
         {
             $ReRendered = 0
             foreach ($SubDir in @(Get-ChildItem -LiteralPath $OutputDirectory -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue))
