@@ -961,57 +961,61 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         @($script:Helpers | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @($script:HelperNames | Sort-Object)
     }
 
+    It 'takes no throttled flag: the status and the error decide' {
+        @((Get-Command -Name Test-MetricRerunCanFix).Parameters.Keys) | Should -Not -Contain 'Throttled'
+    }
+
     It 'counts a timeout and throttling' {
-        Test-MetricRerunCanFix -TimedOut $true -Throttled $false -Exception $null | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception ([System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $true -Exception $null | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")) | Should -BeTrue
     }
 
     It 'counts a server error and an error whose status cannot be read' {
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status InternalServerError) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status GatewayTimeout) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'ServiceUnavailable'")) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new('The connection was reset.')) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $null | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status InternalServerError) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status GatewayTimeout) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'ServiceUnavailable'")) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new('The connection was reset.')) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception $null | Should -BeTrue
     }
 
     It 'does not count a client error' {
         foreach ($Status in @('BadRequest', 'Unauthorized', 'Forbidden', 'NotFound', 'Conflict'))
         {
-            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status $Status) | Should -BeFalse -Because $Status
-            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new("Operation returned an invalid status code '$Status'")) | Should -BeFalse -Because $Status
+            Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status $Status) | Should -BeFalse -Because $Status
+            Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code '$Status'")) | Should -BeFalse -Because $Status
         }
         # A client error wrapped in a server error is still the client's.
         $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status BadRequest), [System.Net.HttpStatusCode]::InternalServerError)
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Wrapped | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Wrapped | Should -BeFalse
     }
 
     It 'does not count a <Status> wrapped in a server error' -ForEach @(@{ Status = 'Unauthorized'; Code = 401 }, @{ Status = 'Forbidden'; Code = 403 }, @{ Status = 'NotFound'; Code = 404 }) {
         # By the inner status code.
         $ByCode = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status $Status), [System.Net.HttpStatusCode]::InternalServerError)
         Get-MetricErrorStatus -Exception $ByCode | Should -Be $Code
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $ByCode | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByCode | Should -BeFalse
         # By the inner Az message, two levels down.
         $ByText = [System.Net.Http.HttpRequestException]::new('The gateway failed.', [System.Exception]::new('Retry failed.', [System.Exception]::new("Operation returned an invalid status code '$Status'")), [System.Net.HttpStatusCode]::BadGateway)
         Get-MetricErrorStatus -Exception $ByText | Should -Be $Code
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $ByText | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByText | Should -BeFalse
     }
 
     It 'does not count a client error whose message reads like throttling' {
-        # "429" or "throttl" in a resource name sets the throttled flag; the status is read first.
+        # "429" or "throttl" in a resource name does not count as throttling; the status is read first.
         $ByCode = [System.Net.Http.HttpRequestException]::new('No access to vm-429-throttled.', $null, [System.Net.HttpStatusCode]::Forbidden)
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception $ByCode | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByCode | Should -BeFalse
         $ByText = [System.Exception]::new("Operation returned an invalid status code 'NotFound' for vm-429-throttled")
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception $ByText | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByText | Should -BeFalse
         # Real throttling and a throttled request whose status cannot be read still count.
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status TooManyRequests) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception ([System.Exception]::new('Rate limit reached.')) | Should -BeTrue
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status ServiceUnavailable) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status TooManyRequests) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new('Rate limit reached.')) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status ServiceUnavailable) | Should -BeTrue
     }
 
     It 'reads BadRequest from the status, not from a resource name in the message' {
         $Named = [System.Net.Http.HttpRequestException]::new('The service is unavailable for vm-BadRequest-01.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
         Test-MetricBadRequest -Exception $Named | Should -BeFalse
-        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Named | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Named | Should -BeTrue
         # With no status anywhere, only the Az text of a 400 is a BadRequest.
         Test-MetricBadRequest -Exception ([System.Exception]::new('The connection to vm-BadRequest-01 was closed.')) | Should -BeFalse
         Test-MetricBadRequest -Exception ([System.Exception]::new("Operation returned an invalid status code 'BadRequest'")) | Should -BeTrue
@@ -1025,7 +1029,7 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         {
             $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status $Inner), [System.Net.HttpStatusCode]::InternalServerError)
             Get-MetricErrorStatus -Exception $Wrapped | Should -Be 500 -Because $Inner
-            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Wrapped | Should -BeTrue -Because $Inner
+            Test-MetricRerunCanFix -TimedOut $false -Exception $Wrapped | Should -BeTrue -Because $Inner
         }
     }
 }

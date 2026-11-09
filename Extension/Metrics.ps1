@@ -681,12 +681,12 @@ if ($Task -eq 'Processing')
                 # throttling, a server error (HTTP 5xx), or an error whose status cannot
                 # be read. A client error (HTTP 4xx such as 401, 403 or 404, or
                 # BadRequest anywhere in the chain) fails the same way on every run.
-                # $Throttled comes from the message text, which can hold "429" or
-                # "throttl" in a resource name, so it does not decide alone: a readable
+                # The throttled flag is not read: it comes from the message text,
+                # which can hold "429" or "throttl" in a resource name. A readable
                 # status wins, and with none the request counts whether throttled or not.
                 function Test-MetricRerunCanFix
                 {
-                    param([bool]$TimedOut, [bool]$Throttled, [System.Exception]$Exception)
+                    param([bool]$TimedOut, [System.Exception]$Exception)
 
                     if ($TimedOut) { return $true }
                     if ($null -eq $Exception) { return $true }
@@ -832,7 +832,7 @@ if ($Task -eq 'Processing')
                         {
                             $Request.BadRequest = $BadRequest
                             # Its subscription's metrics are incomplete only when a re-run can fix it.
-                            $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $TimedOut -Throttled $Throttled -Exception $LastException
+                            $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $TimedOut -Exception $LastException
                             $Classified = $true
                             throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
                         }
@@ -843,7 +843,7 @@ if ($Task -eq 'Processing')
                     catch
                     {
                         # Any other failure of the request is read the same way.
-                        if (-not $Classified) { $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $_.Exception }
+                        if (-not $Classified) { $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $false -Exception $_.Exception }
                         if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
                         $Request.ErrorMessage = $_.Exception.Message
                     }
