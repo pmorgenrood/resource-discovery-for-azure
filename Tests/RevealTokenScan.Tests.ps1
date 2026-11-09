@@ -28,7 +28,7 @@ BeforeAll {
     Set-Content -LiteralPath $script:EmptyDict -Encoding utf8 -Value '{"ResourceGroupMap":{},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":{},"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
 
     # Writes a zip with one entry; the script block writes the entry's text.
-    function New-TestZip
+    function Build-TestZip
     {
         param([string]$Name, [scriptblock]$Write)
         $Path = Join-Path $script:WorkDir $Name
@@ -56,7 +56,7 @@ AfterAll {
 
 Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
     It 'finds a masked value on a later line of a large entry and still fails' {
-        $Zip = New-TestZip -Name 'late.zip' -Write {
+        $Zip = Build-TestZip -Name 'late.zip' -Write {
             param($W)
             for ($i = 0; $i -lt 32; $i++) { $W.Write($script:Block) }
             $W.WriteLine('"ID": "' + $script:Token + '"')
@@ -71,7 +71,7 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
     It 'stops at the first masked value of an entry too long to hold as one string' {
         # 1,100 MiB of text: longer than the largest .NET string, so reading the
         # entry whole fails. The masked value is on the first line.
-        $Zip = New-TestZip -Name 'huge.zip' -Write {
+        $Zip = Build-TestZip -Name 'huge.zip' -Write {
             param($W)
             $W.WriteLine('"ID": "' + $script:Token + '"')
             for ($i = 0; $i -lt 1100; $i++) { $W.Write($script:Block) }
@@ -83,7 +83,7 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
     }
 
     It 'copies an entry with no masked value unchanged' {
-        $Zip = New-TestZip -Name 'clean.zip' -Write {
+        $Zip = Build-TestZip -Name 'clean.zip' -Write {
             param($W)
             for ($i = 0; $i -lt 8; $i++) { $W.Write($script:Block) }
             $W.Write('"ID": "prod_not-a-token"')
