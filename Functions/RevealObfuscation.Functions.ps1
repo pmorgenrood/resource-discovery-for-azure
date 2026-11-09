@@ -284,10 +284,18 @@ function Invoke-RdaReveal
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZipFull)
         try
         {
+            # Line by line, stopping at the first masked value, so a large entry
+            # is never held in memory whole. A token never spans a line break.
             foreach ($Entry in $Archive.Entries)
             {
                 $Reader = [System.IO.StreamReader]::new($Entry.Open())
-                try { $HasToken = [regex]::IsMatch($Reader.ReadToEnd(), $TokenPattern) }
+                try
+                {
+                    while ($null -ne ($Line = $Reader.ReadLine()))
+                    {
+                        if ([regex]::IsMatch($Line, $TokenPattern)) { $HasToken = $true; break }
+                    }
+                }
                 finally { $Reader.Dispose() }
                 if ($HasToken) { break }
             }
