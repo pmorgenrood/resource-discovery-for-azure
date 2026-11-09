@@ -431,6 +431,31 @@ Describe "Metric Per-Resource Cached Token" {
         if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no metric row names an inventoried resource' }
     }
 
+    It "Metric rows with an inventory ID carry that row's Name, ResourceGroup and Subscription" {
+        if ($script:MetricRows.Count -eq 0) { Set-ItResult -Skipped -Because "no metric rows in this fixture"; return }
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run'; return }
+        # A metric attaches by ID, else by Name and ResourceGroup (plus
+        # Subscription), so under -Obfuscate a metric row whose ID is an
+        # inventory row's ID (letter case aside; the first such row) carries
+        # that row's masked Name, ResourceGroup and Subscription too.
+        $RowById = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
+            @($_.Value) | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) } | ForEach-Object { if (-not $RowById.ContainsKey([string]$_.ID)) { $RowById[[string]$_.ID] = $_ } }
+        }
+        $Checked = 0
+        foreach ($m in $script:MetricRows)
+        {
+            if ([string]::IsNullOrEmpty($m.ID) -or -not $RowById.ContainsKey([string]$m.ID)) { continue }
+            $Row = $RowById[[string]$m.ID]
+            $Checked++
+            foreach ($Field in @('Name', 'ResourceGroup', 'Subscription'))
+            {
+                [string]$m.$Field | Should -BeExactly ([string]$Row.$Field) -Because "metric '$($m.Metric)' of '$($m.ID)' should carry its inventory row's $Field"
+            }
+        }
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no metric row has an inventory ID' }
+    }
+
     It "Metric rows for resources absent from the main dictionary still carry a cached per-resource token" {
         if ($script:MetricRows.Count -eq 0) { Set-ItResult -Skipped -Because "no metric rows in this fixture"; return }
         # a metric row whose resource is NOT in the main inventory
