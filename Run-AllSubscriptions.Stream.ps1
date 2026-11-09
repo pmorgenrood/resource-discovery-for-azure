@@ -230,6 +230,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
     try
     {
+        # The consumption failures recorded before this subscription, so the ones
+        # its own run adds can be told apart.
+        $ConsumptionFailuresBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -253,7 +256,17 @@ for ($i = 0; $i -lt $PairCount; $i++)
             Write-Stream ("done: {0} - {1:N0} resources" -f $SubName, $ResCount) 'Green'
         }
 
-        if (-not ($Completed -contains $SubId))
+        # A subscription whose consumption download failed, stopped part-way or was
+        # skipped for the sign-in stays on the retry list, not completed, so a
+        # later -Resume or -ResumeFailedOnly collects it again (as the wrapper's
+        # sequential path does).
+        $NewConsumptionFailures = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) | Select-Object -Skip $ConsumptionFailuresBefore)
+        if ($NewConsumptionFailures.Count -gt 0)
+        {
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
+        }
+        elseif (-not ($Completed -contains $SubId))
         {
             $Completed += $SubId
             # If this is a retry that finally succeeded, drop the sub from
