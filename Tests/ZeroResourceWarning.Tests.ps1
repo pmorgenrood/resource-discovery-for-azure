@@ -39,7 +39,12 @@ Describe 'The 0-resources warning of a collected subscription' {
         $Named[0] | Should -Match 'Azure CLI'
         $Named[0] | Should -Match 'resource groups'
         @($Warnings | Where-Object { $_ -match 'Likely permission gap' -or $_ -match 'Resource Graph lists no resource' }) | Should -BeNullOrEmpty
-        # A Search-AzGraph hint says which account it checks.
-        @($Warnings | Where-Object { $_ -match 'Search-AzGraph' -and $_ -notmatch "it runs as the Az PowerShell account; check the Azure CLI's account apart" }) | Should -BeNullOrEmpty
+        # The inline warning gives a Search-AzGraph hint that says which account it checks.
+        if ($File -eq 'Run-AllSubscriptions.ps1')
+        {
+            $Hint = @($Warnings | Where-Object { $_ -match 'Search-AzGraph' })
+            $Hint.Count | Should -Be 1
+            $Hint[0] | Should -Match "it runs as the Az PowerShell account; check the Azure CLI's account apart"
+        }
     }
 }

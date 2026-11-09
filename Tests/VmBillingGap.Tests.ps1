@@ -304,9 +304,10 @@ Describe 'VM billing-coverage banner' {
         Get-Content -LiteralPath $Html -Raw | Should -Match '2 running VMs were discovered in the inventory, but only 0 VMs have compute-usage records'
     }
 
-    It 'reads an inventory without a VirtualMachines section under Set-StrictMode -Version Latest' {
+    It 'reads an inventory without a VirtualMachines section or a Version under Set-StrictMode -Version Latest' {
         $InvPath = Join-Path $script:WorkDir 'inv-novm.json'
-        '{"Version":"3.2.3","PublicIP":[{"Name":"pip","Subscription":"sub"}]}' | Set-Content -LiteralPath $InvPath -Encoding utf8
+        # No Version key either: both may be missing.
+        '{"PublicIP":[{"Name":"pip","Subscription":"sub"}]}' | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-novm.csv'
         @([pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '/subscriptions/x/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm1' }) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
         $Html = Join-Path $script:WorkDir 'novm.html'
