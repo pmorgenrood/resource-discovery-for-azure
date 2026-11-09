@@ -213,6 +213,60 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
         Test-Path -LiteralPath (Join-Path $Case.Dir 'bundle.zip') | Should -BeFalse
         Assert-LockFree $Case
     }
+
+    It 'after the run is stopped while a reveal job runs, and leaves no job writing in staging' {
+        $Case = New-Case -Name 'stop-job'
+        $Probe = Join-Path $Case.Dir 'probe'
+        $null = New-Item -ItemType Directory -Path $Probe -Force
+        # A slow stand-in for the reveal job, in its own process as the real
+        # one is: it notes its process id, then keeps writing the staged
+        # output, its partial file and its expanded copy until it is stopped.
+        $Host_ = [powershell]::Create()
+        try
+        {
+            $null = $Host_.AddScript({
+                    param($Reveal, $Root, $Staging, $Bundle, $Probe)
+                    function Start-Job
+                    {
+                        param([scriptblock]$ScriptBlock, [object[]]$ArgumentList)
+                        Microsoft.PowerShell.Core\Start-Job -ArgumentList (@($ArgumentList) + $Probe) -ScriptBlock {
+                            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory, $Probe)
+                            [System.IO.File]::WriteAllText((Join-Path $Probe 'pid'), [string]$PID)
+                            $Partial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+                            while ($true)
+                            {
+                                foreach ($Path in @($OutputZip, $Partial, (Join-Path $TempDirectory 'expanded.json')))
+                                {
+                                    try { [System.IO.File]::WriteAllText($Path, 'still writing') } catch { $null = $_ }
+                                }
+                                Start-Sleep -Milliseconds 100
+                            }
+                        }
+                    }
+                    & $Reveal -InventoryRoot $Root -StagingDirectory $Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 *> $null
+                }).AddArgument($script:Reveal).AddArgument($Case.Root).AddArgument($Case.Staging).AddArgument((Join-Path $Case.Dir 'bundle.zip')).AddArgument($Probe)
+            $Async = $Host_.BeginInvoke()
+            $PidFile = Join-Path $Probe 'pid'
+            $Deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $PidFile) -and [DateTime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 200 }
+            Test-Path -LiteralPath $PidFile | Should -BeTrue -Because 'the reveal job must be running before the run is stopped'
+            $ChildPid = [int](Get-Content -LiteralPath $PidFile -Raw)
+            Start-Sleep -Milliseconds 500
+            # Stop the run as Ctrl+C does.
+            $Host_.Stop()
+            $null = $Async.AsyncWaitHandle.WaitOne(30000)
+        }
+        finally { $Host_.Dispose() }
+
+        Get-Process -Id $ChildPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty -Because 'no reveal job may outlive the run'
+        # Anything still writing would put its files back.
+        Start-Sleep -Seconds 2
+        $Left = @(Get-ChildItem -LiteralPath $Case.Staging -Recurse -Force -File | Where-Object { $_.Name -ne '.reveal-lock' -and $_.Name -ne '.reveal-staging.json' } | ForEach-Object { $_.FullName.Substring($Case.Staging.Length) })
+        $Left | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $Case.Dir 'bundle.zip') | Should -BeFalse
+        Assert-LockFree $Case
+        Get-Process -Id $ChildPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Remove-RevealStagingLock' -Skip:$IsWindows {
