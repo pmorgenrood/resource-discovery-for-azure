@@ -284,6 +284,12 @@ if ([string]::IsNullOrEmpty($OutputZip))
 {
     $OutputZip = Join-Path $InventoryRoot ("AllSubscriptions_Revealed_" + $Timestamp + ".zip")
 }
+# The outer zip is written with .NET file calls, which read a relative path
+# against the process folder, so make it a full path against the PowerShell
+# location here, taken as written. Add '.zip' when the name has another
+# ending, as Compress-Archive did.
+$OutputZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
+if ([System.IO.Path]::GetExtension($OutputZip) -ne '.zip') { $OutputZip += '.zip' }
 # The staging folder must belong to a reveal of THIS inventory root. Reveal
 # marks each staging folder it uses with a small hidden file naming the
 # inventory root. A folder that already holds files but has no such mark (or a
@@ -788,16 +794,19 @@ if ($StagedZips.Count -gt 0)
 {
     try
     {
-        # -LiteralPath (not -Path): staged names are taken verbatim. -Path treats
-        # each value as a wildcard, so a report name containing '[' or ']' would
-        # silently fail to match and abort the archive.
-        # -DestinationPath has no literal form and also reads '[' and ']' as a
-        # wildcard, so an inventory root 'Reports[1]' would write the outer zip
-        # into a neighbour 'Reports1'. Escape it so it is taken as written.
-        Compress-Archive -LiteralPath $StagedZips.FullName -DestinationPath ([WildcardPattern]::Escape($OutputZip)) -Force
+        # The outer zip holds the real values, so it is owner-only (0600, or an
+        # owner-only ACL on Windows) from the start: it is written to a sibling
+        # .partial.zip made owner-only before anything goes in, then moved to
+        # its name, which keeps that. Each staged zip goes in at the top by its
+        # file name, as Compress-Archive -LiteralPath put it. The paths are
+        # taken as written, so '[' and ']' in a name are not a wildcard.
+        $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+        Write-RevealZipFromFiles -Files @($StagedZips.FullName) -Path $OutputZipPartial
+        [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
     }
     catch
     {
+        Remove-Item -LiteralPath $OutputZipPartial -Force -ErrorAction SilentlyContinue
         # Fail LOUD but do not die here. The revealed per-subscription zips are
         # already in staging, so the run is recoverable. Record the reason and
         # fall through to the summary instead of terminating before it prints

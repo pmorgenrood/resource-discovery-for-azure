@@ -74,22 +74,47 @@ function Test-RevealIsMacOS
 function Set-RevealOwnerOnlyDirectory
 {
     param([Parameter(Mandatory = $true)] [string] $Path)
+    Set-RevealOwnerOnlyPath -Path $Path -Directory $true
+}
+
+# The same for a file: mode 0600 on Unix, and on Windows a protected ACL that
+# gives only the current user full control. Used for each zip Reveal writes,
+# which holds real names and ids.
+function Set-RevealOwnerOnlyFile
+{
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    Set-RevealOwnerOnlyPath -Path $Path -Directory $false
+}
+
+function Set-RevealOwnerOnlyPath
+{
+    param([Parameter(Mandatory = $true)] [string] $Path, [bool] $Directory)
     if ($IsWindows)
     {
         $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $Security = [System.Security.AccessControl.DirectorySecurity]::new()
+        if ($Directory)
+        {
+            $Security = [System.Security.AccessControl.DirectorySecurity]::new()
+            $Inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $Item = [System.IO.DirectoryInfo]::new($Path)
+        }
+        else
+        {
+            $Security = [System.Security.AccessControl.FileSecurity]::new()
+            $Inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+            $Item = [System.IO.FileInfo]::new($Path)
+        }
         $Security.SetAccessRuleProtection($true, $false)
         $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
             $User,
             [System.Security.AccessControl.FileSystemRights]::FullControl,
-            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            $Inheritance,
             [System.Security.AccessControl.PropagationFlags]::None,
             [System.Security.AccessControl.AccessControlType]::Allow)
         $Security.AddAccessRule($Rule)
-        $Directory = [System.IO.DirectoryInfo]::new($Path)
-        [System.IO.FileSystemAclExtensions]::SetAccessControl($Directory, $Security)
+        [System.IO.FileSystemAclExtensions]::SetAccessControl($Item, $Security)
 
-        $Check = [System.IO.FileSystemAclExtensions]::GetAccessControl($Directory)
+        $Check = [System.IO.FileSystemAclExtensions]::GetAccessControl($Item)
         $Rules = @($Check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
         $Others = @($Rules | Where-Object { $_.IdentityReference.Value -ne $User.Value })
         if (-not $Check.AreAccessRulesProtected -or $Rules.Count -eq 0 -or $Others.Count -gt 0)
@@ -99,9 +124,12 @@ function Set-RevealOwnerOnlyDirectory
         return
     }
 
+    # 0700 for a folder, 0600 for a file.
+    $Want = if ($Directory) { 0x1C0 } else { 0x180 }
     if (Test-RevealUnixModeApi)
     {
-        [System.IO.File]::SetUnixFileMode($Path, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
+        $Flags = if ($Directory) { 'UserRead, UserWrite, UserExecute' } else { 'UserRead, UserWrite' }
+        [System.IO.File]::SetUnixFileMode($Path, [System.IO.UnixFileMode]$Flags)
         $Mode = [int][System.IO.File]::GetUnixFileMode($Path)
     }
     else
@@ -113,16 +141,94 @@ function Set-RevealOwnerOnlyDirectory
         # file name and fail. The path is made a full path first, so it starts
         # with '/' and cannot be read as an option.
         $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-        & chmod 700 $Path
+        $Octal = [Convert]::ToString($Want, 8)
+        & chmod $Octal $Path
         if ($LASTEXITCODE -ne 0) { throw "Could not make $Path readable by its owner only (chmod ended with $LASTEXITCODE)." }
         $Text = if (Test-RevealIsMacOS) { & stat -f '%Lp' $Path } else { & stat -c '%a' $Path }
         if ($LASTEXITCODE -ne 0) { throw "Could not read the mode of $Path (stat ended with $LASTEXITCODE)." }
         $Mode = [Convert]::ToInt32(([string]$Text).Trim(), 8)
     }
-    if (($Mode -band 0x1FF) -ne 0x1C0)
+    if (($Mode -band 0x1FF) -ne $Want)
     {
         throw ("Could not make {0} readable by its owner only: its mode is {1}." -f $Path, [Convert]::ToString($Mode -band 0x1FF, 8))
     }
+}
+
+# Make a new, empty file at $Path that only its owner can read (see
+# Set-RevealOwnerOnlyFile), before anything is written into it. A file
+# already at $Path is removed first, so the new one never keeps its
+# permissions. The path must be a full path.
+function New-RevealOwnerOnlyFile
+{
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Delete($Path) }
+    $Stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $Stream.Dispose()
+    try { Set-RevealOwnerOnlyFile -Path $Path }
+    catch
+    {
+        [System.IO.File]::Delete($Path)
+        throw ("Reveal will not write real names and ids into {0}: {1}" -f $Path, $_.Exception.Message)
+    }
+}
+
+# Write a zip of every file under $SourceDirectory to $Path, owner-only from
+# the start (New-RevealOwnerOnlyFile). The entries are the same as
+# ZipFile.CreateFromDirectory writes with no base folder: each file by its
+# path under $SourceDirectory with '/' between parts, and an entry ending in
+# '/' for each empty folder.
+function Write-RevealZipFromDirectory
+{
+    param([Parameter(Mandatory = $true)] [string] $SourceDirectory, [Parameter(Mandatory = $true)] [string] $Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Base = [System.IO.DirectoryInfo]::new($SourceDirectory)
+    $BaseLength = $Base.FullName.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar).Length + 1
+    New-RevealOwnerOnlyFile -Path $Path
+    $Stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try
+    {
+        $Archive = [System.IO.Compression.ZipArchive]::new($Stream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+        try
+        {
+            foreach ($Item in $Base.EnumerateFileSystemInfos('*', [System.IO.SearchOption]::AllDirectories))
+            {
+                $Name = $Item.FullName.Substring($BaseLength).Replace([System.IO.Path]::DirectorySeparatorChar, '/')
+                if ($Item -is [System.IO.FileInfo])
+                {
+                    $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Archive, $Item.FullName, $Name, [System.IO.Compression.CompressionLevel]::Optimal)
+                }
+                elseif (-not $Item.EnumerateFileSystemInfos().GetEnumerator().MoveNext())
+                {
+                    $null = $Archive.CreateEntry($Name + '/')
+                }
+            }
+        }
+        finally { $Archive.Dispose() }
+    }
+    finally { $Stream.Dispose() }
+}
+
+# Write a zip of the given files, each at the top by its file name, to $Path,
+# owner-only from the start. Used for the all-subscriptions outer zip.
+function Write-RevealZipFromFiles
+{
+    param([Parameter(Mandatory = $true)] [string[]] $Files, [Parameter(Mandatory = $true)] [string] $Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-RevealOwnerOnlyFile -Path $Path
+    $Stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try
+    {
+        $Archive = [System.IO.Compression.ZipArchive]::new($Stream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+        try
+        {
+            foreach ($File in $Files)
+            {
+                $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Archive, $File, [System.IO.Path]::GetFileName($File), [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        }
+        finally { $Archive.Dispose() }
+    }
+    finally { $Stream.Dispose() }
 }
 
 function Get-JsonEscaped
@@ -506,7 +612,16 @@ function Copy-RevealZipUnchanged
 {
     param([string] $InputZip, [string] $OutputZip)
     $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
-    [System.IO.File]::Copy($InputZip, $OutputZipPartial, $true)
+    # The copy holds the report as it is, so it is owner-only from the start,
+    # as a revealed zip is.
+    New-RevealOwnerOnlyFile -Path $OutputZipPartial
+    $Source = [System.IO.File]::OpenRead($InputZip)
+    try
+    {
+        $Target = [System.IO.FileStream]::new($OutputZipPartial, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try { $Source.CopyTo($Target) } finally { $Target.Dispose() }
+    }
+    finally { $Source.Dispose() }
     [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
 }
 
@@ -757,8 +872,8 @@ function Invoke-RdaReveal
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -CurrentItem 'Expanding archive' -Index 1 -Total 3 }
         # Use System.IO.Compression directly instead of Expand-Archive /
         # Compress-Archive: the cmdlets are markedly slower (a multi-MB report can
-        # take minutes to re-zip), whereas ZipFile.ExtractToDirectory /
-        # CreateFromDirectory do the same work in a fraction of the time and
+        # take minutes to re-zip), whereas ZipFile.ExtractToDirectory and a
+        # ZipArchive (Write-RevealZipFromDirectory) do the same work in a fraction of the time and
         # produce the same flat archive layout. $TmpRoot was just created empty,
         # so extraction has nothing to overwrite.
         Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -848,16 +963,17 @@ function Invoke-RdaReveal
         # (never every *.zip in staging), and on -Resume checks a staged zip
         # against that record: a partial file left at the FINAL name would look
         # like a finished output. The .partial.zip name is never on that list,
-        # so only the completed archive ever appears at $OutputZip. The
-        # Remove-Item below is required because
-        # ZipFile.CreateFromDirectory throws if the destination already exists.
+        # so only the completed archive ever appears at $OutputZip. A
+        # .partial.zip left by a killed run is removed and made new.
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -CurrentItem 'Compressing output' -Index 3 -Total 3 }
         $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
-        if (Test-Path -LiteralPath $OutputZipPartial) { Remove-Item -LiteralPath $OutputZipPartial -Force }
-        # includeBaseDirectory = $false so the archive entries sit at the root
-        # (the members of $TmpRoot), matching the previous
-        # Compress-Archive -Path "$TmpRoot\*" layout the ingestion server expects.
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($TmpRoot, $OutputZipPartial, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        # The entries sit at the root (the members of $TmpRoot), as
+        # ZipFile.CreateFromDirectory with no base folder writes them, matching
+        # the previous Compress-Archive -Path "$TmpRoot\*" layout the ingestion
+        # server expects. The zip is owner-only from the start (0600, or an
+        # owner-only ACL on Windows), and the move keeps that at the final name:
+        # it holds the real values.
+        Write-RevealZipFromDirectory -SourceDirectory $TmpRoot -Path $OutputZipPartial
         [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -Completed }
 
