@@ -123,10 +123,11 @@ five are derived from the `InstanceData` JSON on each record.
 - **A dedicated `Subscription` column.** The subscription is embedded in
   `ResourceId` (`/subscriptions/<id>/…`). In a multi-subscription run each
   subscription has its own folder/CSV, so the owning subscription is implicit.
-- **Every `additionalInfo` key as its own column.** Only `ConsumptionMeter`,
-  `ReservationId`, and `ReservationOrderId` are broken out. Any other
-  `additionalInfo` keys remain inside the raw `InstanceData` JSON (column 1) —
-  not lost, just not columnarised.
+- **Every `additionalInfo` key as its own column, or in `InstanceData`.** Only
+  `ConsumptionMeter`, `ReservationId`, and `ReservationOrderId` are broken out.
+  The `InstanceData` column (column 1) holds a fixed set of 18 `additionalInfo`
+  fields, in a fixed order (`''` or `0` when Azure gave none); any other key
+  Azure sends is not written.
 
 ## Obfuscation of consumption data
 
@@ -140,12 +141,14 @@ the inventory obfuscation dictionary:
   including the resource provider and type and the `mc_` AKS-managed-RG marker.
   This lets the ingestion dashboard categorise rows (AKS, VMSS, etc.) without
   seeing real identifiers.
-- The tokens use per-run caches keyed by the real value, so the same real
-  sub/RG/name always maps to the same token **within a run** (deterministic).
-- These caches are **independent of** the inventory `ObfuscationDictionary`.
-  Consumption tokens are therefore internally consistent but do **not** equal the
-  inventory tokens for the same resource — categorisation relies on the path
-  structure, not an ID-to-inventory join.
+- A resource the inventory already masked keeps the inventory's masked id: the
+  consumption phase reads the same dictionary (`ResourceIdMap`, and the
+  subscription, resource group and name maps), so the consumption `ResourceId`
+  equals the inventory `ID` for the same resource. Downstream joins the two by
+  that id, so they must match.
+- Other values use per-run caches keyed by the real value, so the same real
+  sub/RG/name always maps to the same token **within a run**, and a run seeded
+  with `-ObfuscationDictionary` reuses that dictionary's tokens.
 - `ReservationId` and `ReservationOrderId` are flattened to `obfuscated`.
 
 ## Per-subscription health and failure-point reporting
@@ -222,9 +225,9 @@ over from the original run unchanged, the HTML report is regenerated, and a
 fresh ZIP is written. `Merge-RecoveryData` returns `ConsumptionSource = recovery`
 so you can confirm the replacement happened.
 
-> Note: consumption uses the per-run token scheme described above, so the
-> replaced consumption file is internally consistent and categorises correctly
-> even though its tokens differ from the original run's — nothing downstream
-> joins consumption tokens to inventory tokens.
+> Note: downstream joins consumption rows to inventory rows by the masked id, so
+> under `-Obfuscate` the recovery run must be seeded with the original run's
+> obfuscation dictionary (Step 1), so that its consumption ids use the same
+> tokens as the original report's inventory.
 
 See also: [Recovery and diagnostics features](recovery-and-diagnostics.md).
