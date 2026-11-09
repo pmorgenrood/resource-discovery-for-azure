@@ -170,8 +170,9 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 # To tell them apart we make ONE cheap, access-scoped control-plane call via the
 # native Az module (Invoke-AzRestMethod) - an authenticated ARM GET of the
 # subscription's resource groups. Listing resource groups requires a role on the
-# subscription (Reader is enough): HTTP 200 means the identity DOES have access
-# (so 0 resources == genuinely empty), 403/401 means no role, and 404 means ARM
+# subscription (Reader is enough): HTTP 200 means the identity can list them
+# (so 0 resources is an empty subscription, unless its role reads resource
+# groups only or covers some of them), 403/401 means no role, and 404 means ARM
 # is hiding a subscription the identity cannot see. Using the module cmdlet (not
 # the `az` CLI) keeps this portable across Windows/Linux/macOS with no per-OS
 # shell quoting - see .kiro/steering/cross-platform-powershell.md.
@@ -205,8 +206,9 @@ function Get-SubscriptionAccessState
     $Status = [int]$Response.StatusCode
     if ($Status -ge 200 -and $Status -lt 300)
     {
-        # Identity can read the subscription, so 0 resources means it is
-        # genuinely empty.
+        # The identity can list the resource groups, so 0 resources most likely
+        # means an empty subscription (a role that reads resource groups only
+        # would look the same; the label says to check Reader).
         return 'Empty'
     }
     if ($Status -eq 403 -or $Status -eq 401)

@@ -1010,13 +1010,13 @@ if ($ParallelStreams -le 1)
             if ($ResCount -eq 0)
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
-                # and in the wrapper transcript. Read access is not the cause: a
-                # subscription the identity cannot read stops the run at the
-                # up-front role check (or is skipped there with -AllowPartialAccess)
-                # before it is collected, so the discovery query returned no
-                # resource for this one. The check uses the Az PowerShell sign-in
-                # and the query the Azure CLI's, so the warning names that case.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check (Az PowerShell sign-in), so the discovery query (Azure CLI sign-in) returned no resource for it: an empty subscription, one that holds only resources the query leaves out, or one the Azure CLI's identity cannot read when it is signed in as another account. Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                # and in the wrapper transcript. A subscription whose resource groups
+                # the identity cannot list stops the run at the up-front role check
+                # (or is skipped there with -AllowPartialAccess), but that check
+                # proves no more than the listing: a role without Reader, a role on
+                # some resource groups only, or an Azure CLI (which runs the query)
+                # signed in as another account can still return 0 resources.
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. The up-front role check (Az PowerShell sign-in) only showed that the identity can list its resource groups. So it is an empty subscription, one that holds only resources the discovery query leaves out, or one whose resources the identity cannot read (a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {
@@ -1847,9 +1847,9 @@ if ($EmptySubs.Count -gt 0)
     }
     if ($GenuinelyEmptySubs.Count -gt 0)
     {
-        Write-Host ("  GENUINELY EMPTY ({0}) - access confirmed, the subscription has no resources:" -f $GenuinelyEmptySubs.Count) -ForegroundColor Yellow
+        Write-Host ("  EMPTY ({0}) - the identity can list their resource groups, and the report holds no resources:" -f $GenuinelyEmptySubs.Count) -ForegroundColor Yellow
         foreach ($e in $GenuinelyEmptySubs) { Write-Host ("    - {0} ({1})" -f $e.Name, $e.Id) -ForegroundColor Yellow }
-        Write-Host "    No action needed - these are expected to be empty in the report." -ForegroundColor DarkGray
+        Write-Host "    If resources are expected there, check that the identity holds Reader on these subscriptions." -ForegroundColor DarkGray
     }
     if ($UnknownSubs.Count -gt 0)
     {
@@ -1877,7 +1877,7 @@ if ($EmptySubs.Count -gt 0)
     }
     foreach ($e in $GenuinelyEmptySubs)
     {
-        $EmptyDiag += ("EMPTY {0} ({1}) - access confirmed, no resources; no action needed" -f $e.Name, $e.Id)
+        $EmptyDiag += ("EMPTY {0} ({1}) - resource groups can be listed, no resources in the report; if resources are expected, check Reader" -f $e.Name, $e.Id)
     }
     foreach ($e in $UnknownSubs)
     {

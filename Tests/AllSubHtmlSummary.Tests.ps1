@@ -141,10 +141,11 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         $Html | Should -Match '1 subscription\(s\) have 0 resources in their report'
     }
 
-    It 'says what a report with 0 resources means, without naming read access as a cause' {
-        # Every subscription a run collects passed the up-front role check, and a
-        # report lists only the types a collector covers, so a subscription with
-        # only virtual networks has 0 resources in its report.
+    It 'says what a report with 0 resources means: types the tool does not report, none at all, or resources the identity cannot read' {
+        # A report lists only the types a collector covers, so a subscription
+        # with only virtual networks has 0 resources in its report; the up-front
+        # role check only lists resource groups, so a role without Reader can
+        # also give 0, and the banner names it, not a 'permission gap' guess.
         $Run = New-Run
         New-SubFolder -Root $Run -Services @{ VirtualMachines = 3 } -SubName 'Sub A' | Out-Null
         New-SubFolder -Root $Run -Services @{} -SubName 'Network Only Sub' | Out-Null
@@ -153,8 +154,8 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out | Out-Null
         $Html = Get-Content -Path $Out -Raw
         $Html | Should -Match 'hold no resources of the types this tool reports'
-        $Html | Should -Not -Match 'Reader'
-        $Html | Should -Not -Match 'permission'
+        $Html | Should -Match 'a role without Reader'
+        $Html | Should -Not -Match 'permission gap'
     }
 
     It 'detects obfuscated posture from prod_/nonprod_ tokens' {
@@ -244,7 +245,7 @@ Describe 'New-RdaAllSubHtmlSummary unreadable inventory' {
         (Get-Card $Html 'Empty (0 resources)') | Should -Be '1'
         $Html | Should -Match '<b>1 subscription\(s\) have 0 resources in their report\.</b>'
         $Html | Should -Match '<b>1 report\(s\) have an inventory that could not be read\.</b>'
-        $Html | Should -Match 'or the Azure CLI is signed in as an account that cannot read them\.'
+        $Html | Should -Match 'or the identity cannot read their resources \(a role without Reader, or an Azure CLI signed in as an account that cannot read them\)\.'
         $Html | Should -Match '<span class="tag warn">inventory unreadable</span>'
     }
 }
