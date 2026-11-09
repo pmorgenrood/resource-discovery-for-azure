@@ -82,6 +82,30 @@ Describe "Dictionary Structure" {
         if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no masked path with the same parts as its real id' }
     }
 
+    It "A masked id keeps every namespace, type and child-type segment of its real id" {
+        if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
+        # Rows are found by their path words (/microsoft.compute/disks/, a
+        # scale set's /virtualmachines/, an elastic pool), so every segment
+        # that is not a token, extension blocks included, is the real id's own
+        # segment, letter case aside. An id the tool cannot mask part by part
+        # has its own stand-in path and is not compared.
+        $Token = '^(?-i:(prod|nonprod)_(sub_|rg_|rg_mc_|mc_|databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+        $Checked = 0
+        foreach ($P in @($script:Dictionary.ResourceIdMap.PSObject.Properties))
+        {
+            if ([string]$P.Name -like '/providers/rda.noid/ids/*') { continue }
+            $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
+            $M.Count | Should -Be $R.Count -Because "masked id '$($P.Name)' should keep every segment of its real id"
+            for ($i = 1; $i -lt $M.Count; $i++)
+            {
+                if ($M[$i] -cmatch $Token) { continue }
+                $M[$i] | Should -Be $R[$i] -Because "masked id '$($P.Name)' should keep segment $i of its real id as written"
+                $Checked++
+            }
+        }
+        if ($Checked -eq 0) { Set-ItResult -Skipped -Because 'no masked path in the dictionary' }
+    }
+
     It "ResourceIdMap values should be real Azure resource IDs" {
         if (-not $script:DictionaryAvailable) { Set-ItResult -Skipped -Because "No ObfuscationDictionary fixture available"; return }
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
