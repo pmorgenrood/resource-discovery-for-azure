@@ -8,6 +8,23 @@ if ($Task -eq 'Processing')
     {
         $Tmp = @()
 
+        # Azure resource ids ignore letter case, but the run's dictionary is keyed
+        # as Resource Graph wrote each id. An id that misses is looked up again,
+        # ignoring case, in a copy of the dictionary made on the first miss. No
+        # token is found: 'obfuscated'.
+        $IgnoreCase = @{ Map = $null }
+        $GetLinkToken = {
+            param([string]$Id)
+            if ($ResourceIdDictionary.ContainsKey($Id)) { return $ResourceIdDictionary[$Id] }
+            if ($null -eq $IgnoreCase.Map)
+            {
+                $IgnoreCase.Map = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($Key in $ResourceIdDictionary.Keys) { if (-not $IgnoreCase.Map.ContainsKey($Key)) { $IgnoreCase.Map[$Key] = $ResourceIdDictionary[$Key] } }
+            }
+            if ($IgnoreCase.Map.ContainsKey($Id)) { return $IgnoreCase.Map[$Id] }
+            return 'obfuscated'
+        }
+
         foreach ($1 in $PublicIP)
         {
             $Sub1 = $SUB | Where-Object { $_.Id -eq $1.subscriptionId }
@@ -26,15 +43,16 @@ if ($Task -eq 'Processing')
             if ($null -ne $Data.ipConfiguration.id)
             {
                 $AssocId = $Data.ipConfiguration.id
-                $AssociatedResource = if ([string]::IsNullOrEmpty($AssocId)) { $null } elseif ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { if ($ResourceIdDictionary.ContainsKey($AssocId)) { $ResourceIdDictionary[$AssocId] } else { 'obfuscated' } } else { $AssocId.split('/')[8] }
+                $AssociatedResource = if ([string]::IsNullOrEmpty($AssocId)) { $null } elseif ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
                 $AssociatedResourceType = if ([string]::IsNullOrEmpty($AssocId)) { $null } else { $AssocId.split('/')[7] }
             }
             elseif (-not [string]::IsNullOrEmpty([string]$Data.natGateway.id))
             {
                 # Obfuscated the same way as an ipConfiguration id: the NAT gateway's
-                # own token when the dictionary has it, else 'obfuscated'.
+                # own token when the dictionary has it (letter case aside), else
+                # 'obfuscated'.
                 $AssocId = [string]$Data.natGateway.id
-                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { if ($ResourceIdDictionary.ContainsKey($AssocId)) { $ResourceIdDictionary[$AssocId] } else { 'obfuscated' } } else { $AssocId.split('/')[8] }
+                $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
                 $AssociatedResourceType = $AssocId.split('/')[7]
             }
             else

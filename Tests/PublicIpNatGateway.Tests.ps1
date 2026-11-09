@@ -81,10 +81,16 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResource | Should -Not -Match 'nat-a'
     }
 
-    It 'treats a NAT gateway id in different case as a different key, and writes obfuscated' {
+    It 'finds the NAT gateway token when the id differs only in letter case' {
         $Dict = New-Dictionary -Map @{ $script:NatId = 'prod_nat-token' }
         $Row = (Invoke-Collector @(New-PublicIp -NoIpConfiguration -NatGateway ([pscustomobject]@{ id = $script:NatId.ToLowerInvariant() })) -Dictionary $Dict)[0]
-        $Row.AssociatedResource | Should -BeExactly 'obfuscated'
+        $Row.AssociatedResource | Should -BeExactly 'prod_nat-token'
+    }
+
+    It 'finds the ipConfiguration token when the id differs only in letter case' {
+        $Dict = New-Dictionary -Map @{ $script:NicCfgId = 'prod_cfg-token' }
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId.ToUpperInvariant() }) -NoNatGateway) -Dictionary $Dict)[0]
+        $Row.AssociatedResource | Should -BeExactly 'prod_cfg-token'
     }
 
     It 'prefers ipConfiguration when both are set, as before' {
