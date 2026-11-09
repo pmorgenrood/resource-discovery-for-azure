@@ -502,7 +502,9 @@ Describe 'Callers use the message and the switch' {
         $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
         $Summary = [regex]::Match($Readme, '(?s)The wrapper forwards (.*?) to the inner')
         $Summary.Success | Should -BeTrue -Because 'the README has a wrapper-forwarding summary'
-        $Forwarded = @([regex]::Matches($script:Wrapper, "InventoryPassthrough\['(\w+)'\]") | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+        # The wrapper's own switches; -Debug is a common parameter with its
+        # own README section.
+        $Forwarded = @([regex]::Matches($script:Wrapper, "InventoryPassthrough\['(\w+)'\]") | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notin @('Debug', 'Verbose') } | Select-Object -Unique)
         $Forwarded | Should -Contain 'IncludeNetworkResources'
         foreach ($Name in $Forwarded) { $Summary.Groups[1].Value | Should -Match ([regex]::Escape("``-$Name``")) -Because "the wrapper forwards -$Name" }
     }
