@@ -979,4 +979,17 @@ Describe 'ResourceInventory.ps1 reads free space as the wrapper does' {
         $Text | Should -Match '\[System\.IO\.DriveInfo\]::new\(\$RootItem\.FullName\)\.AvailableFreeSpace'
         $Text | Should -Not -Match '\[math\]::Round\(\$Drive\.Free / 1MB, 0\)'
     }
+
+    It 'reads the folder''s own volume, not the drive''s free figure, on Linux and macOS' -Skip:($IsWindows) {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $RunAllSubs.IsPresent' })
+        $Space = @($If[0].Clauses[0].Item2.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('$PreFlightInventoryRoot -ErrorAction Stop') })
+        $Space.Count | Should -Be 1
+        $PreFlightInventoryRoot = $TestDrive
+        # A drive whose free figure is 1 byte: read, it would stop the run.
+        Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 1 }; FullName = $TestDrive } }
+        $Said = @(. ([scriptblock]::Create($Space[0].Extent.Text)) 6>&1 | ForEach-Object { [string]$_ })
+        @($Said | Where-Object { $_ -like 'Free disk space: * MB at *' -or $_ -like 'WARNING: Free disk space at *' }).Count | Should -Be 1
+        @($Said | Where-Object { $_ -like 'WARNING: Could not determine free disk space*' }) | Should -BeNullOrEmpty
+    }
 }
