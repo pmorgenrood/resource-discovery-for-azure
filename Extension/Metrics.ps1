@@ -318,6 +318,17 @@ function Get-MetricWorkItemDefCount
     return @($Item).Count
 }
 
+# The seconds to wait before a batch request is sent again after attempt
+# $Attempt (0 first): 1, 2, 4 ... s, at most 30. A throttled request waits twice
+# that, or what Retry-After asks when that is longer, at most 120 s.
+function Get-MetricBatchBackoff
+{
+    param([int]$Attempt, [string]$Kind, [double]$RetryAfter = 0)
+    $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
+    if ($Kind -eq 'Throttled') { $Backoff = [math]::Min([math]::Max($Backoff * 2, $RetryAfter), 120) }
+    return $Backoff
+}
+
 if ($Task -eq 'Processing')
 {
     function Write-MetricsDiag([string]$Line)
@@ -949,6 +960,8 @@ function Add-MetricRecord
                 $DispatchItems = [System.Collections.Generic.List[object]]::new()
                 foreach ($Item in $BatchGroups) { if ($Item -is [System.Array]) { $DispatchItems.Add($Item) } }
                 $BatchOutcomes = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+                # Its text, for the parallel runspaces (a script block cannot be handed over).
+                $BatchBackoffSource = ${function:Get-MetricBatchBackoff}.ToString()
 
                 # At most two passes. A request whose token is refused (401) on the first
                 # pass is held back; its tenant's token is renewed once and the request is
@@ -991,6 +1004,7 @@ function Add-MetricRecord
                         # Add-MetricRecord, defined by the source text below, reads these two.
                         $null = $DiagBag, $MetricBag
                         . ([scriptblock]::Create($using:AddMetricRecordSource))
+                        ${function:Get-MetricBatchBackoff} = [scriptblock]::Create($using:BatchBackoffSource)
 
                         function Add-BatchCount([int]$Index, [long]$By)
                         {
@@ -1204,8 +1218,7 @@ function Add-MetricRecord
                             if ($Kind -in 'Refused', 'TokenRefused', 'BadRequest') { break }
                             if ($Attempt -lt $CallMaxRetries)
                             {
-                                $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
-                                if ($Kind -eq 'Throttled') { $Backoff = [math]::Min([math]::Max($Backoff * 2, $RetryAfter), 60) }
+                                $Backoff = Get-MetricBatchBackoff -Attempt $Attempt -Kind $Kind -RetryAfter $RetryAfter
                                 Start-Sleep -Seconds ([math]::Round($Backoff + (Get-Random -Minimum 0 -Maximum 1000) / 1000.0, 2))
                             }
                             $Attempt++
