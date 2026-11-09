@@ -277,7 +277,8 @@ Describe 'Retry-After reaches the runspace' {
         $TestSrc = Get-Content -LiteralPath $PSCommandPath -Raw
         foreach ($Src in @($script:MetricsSrc, $TestSrc))
         {
-            $Src | Should -Not -Match '~28s'
+            # The character class keeps this line from matching itself.
+            $Src | Should -Not -Match '~2[8]s'
             $Src | Should -Not -Match '4s?\+8s?\+16s?'
         }
         $script:MetricsSrc | Should -Match '(?m)^\s*# .*3 generic retries in ~14s'
