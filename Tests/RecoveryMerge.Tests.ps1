@@ -929,7 +929,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $C.Output | Should -BeFalse
     }
 
-    It 'advises, when only the recovery has a dictionary, a plain recovery re-run first and a gap re-run seeded with the recovery dictionary second' {
+    It 'advises, when only the recovery has a dictionary, a plain recovery re-run first and a masked gap re-run followed by a recovery re-run seeded with it second' {
         $C = New-Case
         $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_recTok' = '/id/rec' } }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
@@ -942,9 +942,115 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
         $Message | Should -Not -BeNullOrEmpty
         $Message | Should -BeLike '*re-run the recovery without -Obfuscate into a new folder*'
-        $Message | Should -BeLike ("*re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'*" -f $RecDictPath)
+        $Message | Should -BeLike '*re-run the gap with -Obfuscate into a new folder*then re-run the recovery with -Obfuscate -ObfuscationDictionary set to the ObfuscationDictionary_*.json that new gap run wrote*-GapBundlePath and -RecoveryBundlePath pointing at the two new folders*'
         $Message.IndexOf('re-run the recovery without -Obfuscate') | Should -BeLessThan $Message.IndexOf('re-run the gap with -Obfuscate')
-        $Message | Should -Not -BeLike '*re-run the gap bundle with -Obfuscate,*' -Because 'a gap re-run with -Obfuscate alone mints new tokens and leads into the shared-token stop'
+        $Message | Should -Not -BeLike ("*-ObfuscationDictionary '{0}'*" -f $RecDictPath) -Because 'a gap seeded with the recovery dictionary mints tokens the recovery lacks, so the next merge stops on the missing-token check'
+    }
+
+    It 'stops again when the gap is re-run seeded with the recovery dictionary, which is why the message does not advise it' {
+        $C = New-Case
+        $Rec = Get-MaskedBundleData -Count 2
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Rec.Records }) -Dictionary $Rec.Dictionary
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } | Should -Throw
+
+        # The gap run sees every resource, so seeded with the recovery dictionary it keeps the recovery's tokens and mints new ones for the rest.
+        $SeededGap = Get-MaskedBundleData -Count 3 -Seed $Rec
+        $NewGap = $C.Gap + '_rerun'
+        New-Bundle -Dir $NewGap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $SeededGap.Records; AppServices = $Rec.Records }) -Dictionary $SeededGap.Dictionary
+
+        { Merge-RecoveryData -GapBundlePath $NewGap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*lacks 3 of the 5 ResourceIdMap token(s)*'
+    }
+
+    It 'names a masked gap re-run and then a recovery re-run seeded with it when the gap must be re-run masked, and the next merge passes (<Case>)' -ForEach @(
+        @{ Case = 'gap not masked, recovery masked'; Gap = 'plain' },
+        @{ Case = 'plain gap next to an old empty dictionary'; Gap = 'empty' },
+        @{ Case = 'plain gap data next to a dictionary'; Gap = 'plaindata' },
+        @{ Case = 'gap dictionary cannot be read'; Gap = 'unreadable' }
+    ) {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        switch ($Gap)
+        {
+            'plain' { New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) }
+            'empty' { New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary ([ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{} }) }
+            'plaindata' { New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $Masked.Dictionary }
+            'unreadable'
+            {
+                New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+                Set-Content -LiteralPath (Get-ChildItem -LiteralPath $C.Gap -Filter 'ObfuscationDictionary_*.json').FullName -Value '{ "ResourceIdMap": ' -NoNewline -Encoding utf8
+            }
+        }
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+        $RecDictPath = (Get-ChildItem -LiteralPath $C.Recovery -Filter 'ObfuscationDictionary_*.json').FullName
+
+        $Message = $null
+        try { $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue }
+        catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike '*re-run the gap with -Obfuscate into a new folder*then re-run the recovery with -Obfuscate -ObfuscationDictionary set to the ObfuscationDictionary_*.json that new gap run wrote, also into a new folder*-GapBundlePath and -RecoveryBundlePath pointing at the two new folders*'
+        $Message | Should -Not -BeLike ("*-ObfuscationDictionary '{0}'*" -f $RecDictPath)
+        Test-Path -LiteralPath $C.Output | Should -BeFalse
+
+        # Follow the way out: a masked gap re-run into a new folder, then a recovery re-run seeded with that new gap's dictionary.
+        $NewGapData = Get-MaskedBundleData -Count 3
+        $NewRecData = Get-MaskedBundleData -Count 2 -Seed $NewGapData
+        $NewGap = $C.Gap + '_rerun'
+        $NewRec = $C.Recovery + '_rerun'
+        New-Bundle -Dir $NewGap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = $NewGapData.Records }) -Dictionary $NewGapData.Dictionary
+        New-Bundle -Dir $NewRec -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $NewRecData.Records }) -Dictionary $NewRecData.Dictionary
+        $Result = Merge-RecoveryData -GapBundlePath $NewGap -RecoveryBundlePath $NewRec -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        @($Result.Warnings).Count | Should -Be 0
+        Test-Path -Path $Result.OutputZip | Should -BeTrue
+    }
+
+    It 'names a recovery re-run seeded with the gap dictionary into a new folder, and the next merge passes (<Case>)' -ForEach @(
+        @{ Case = 'recovery dictionary cannot be read'; Rec = 'unreadable' },
+        @{ Case = 'recovery has no consumption file under -RecoverConsumption'; Rec = 'noconsumption' },
+        @{ Case = 'recovery has no metrics file under -RecoverMetrics'; Rec = 'nometrics' }
+    ) {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $Seeded.Records }) -Dictionary $Seeded.Dictionary
+        if ($Rec -eq 'unreadable')
+        {
+            Set-Content -LiteralPath (Get-ChildItem -LiteralPath $C.Recovery -Filter 'ObfuscationDictionary_*.json').FullName -Value '' -NoNewline -Encoding utf8
+        }
+        $GapDictPath = (Get-ChildItem -LiteralPath $C.Gap -Filter 'ObfuscationDictionary_*.json').FullName
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Rec -eq 'noconsumption') { $Splat.RecoverConsumption = $true }
+        if ($Rec -eq 'nometrics') { $Splat.RecoverMetrics = $true }
+
+        $Message = $null
+        try { $null = Merge-RecoveryData @Splat } catch { $Message = $_.Exception.Message }
+
+        $Message | Should -BeLike ("*-Obfuscate -ObfuscationDictionary '{0}' into a new folder*then run this merge again with -RecoveryBundlePath pointing at it*" -f $GapDictPath)
+        Test-Path -LiteralPath $C.Output | Should -BeFalse
+
+        # Follow the way out: the recovery re-run seeded with the gap dictionary into a new folder, with what was missing.
+        $NewRecData = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $NewRec = $C.Recovery + '_rerun'
+        $NewSplat = @{ Dir = $NewRec; Base = $script:RecBase; Dictionary = $NewRecData.Dictionary }
+        if ($Rec -eq 'noconsumption')
+        {
+            $NewSplat.ConsumptionCsv = "$script:CsvHeader`n{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$($NewRecData.Records[0].ID),eastus,,,"
+        }
+        if ($Rec -eq 'nometrics')
+        {
+            $NewSplat.MetricsFiles = @{ '__0' = (Get-MetricsJson -Name $NewRecData.Records[0].Name -Id $NewRecData.Records[0].ID) }
+        }
+        New-Bundle @NewSplat -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = $NewRecData.Records })
+        $Splat.RecoveryBundlePath = $NewRec
+        $Result = Merge-RecoveryData @Splat
+
+        # Recovered metrics always add the note that the HTML report does not show them; no other warning may appear.
+        @($Result.Warnings | Where-Object { $_ -notlike '*does not render metrics*' }).Count | Should -Be 0
+        Test-Path -Path $Result.OutputZip | Should -BeTrue
     }
 
     It 'merges on the next run once the recovery is re-run without -Obfuscate into a new folder' {

@@ -152,9 +152,16 @@ Behaviour:
   masked, or not seeded, is re-run with `-Obfuscate -ObfuscationDictionary
   <gap dict>`. When the gap run was not masked but the recovery was, re-run
   the recovery without `-Obfuscate` (the quick way out); or, to ship a masked
-  bundle, re-run the gap with `-Obfuscate -ObfuscationDictionary <recovery
-  dict>` so its tokens match the recovery's (a gap re-run with `-Obfuscate`
-  alone mints new tokens, and the merge then stops on the shared-token check).
+  bundle, re-run the gap with `-Obfuscate`, then re-run the recovery with
+  `-Obfuscate -ObfuscationDictionary <that new gap run's dict>`. The same
+  two re-runs are the way out whenever the gap is the bundle to re-run masked
+  (its dictionary cannot be read, its `ResourceIdMap` is empty, or it holds
+  plain data). Do not seed a gap re-run with the recovery's dictionary: that
+  run still mints tokens for every resource the recovery did not see, so the
+  recovery's map lacks them and the merge stops on the missing-token check.
+  A recovery re-run, for any stop, uses the gap's masking: `-Obfuscate
+  -ObfuscationDictionary <gap dict>` when the gap is masked, no `-Obfuscate`
+  when it is not.
   Re-run into a new folder, then run the merge again pointed at it. A reused
   `-OutputDirectory` still holds the old run's files, including its
   dictionary, so the merge would stop again.
