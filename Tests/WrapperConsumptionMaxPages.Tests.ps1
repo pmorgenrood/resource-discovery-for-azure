@@ -60,7 +60,22 @@ Describe 'Run-AllSubscriptions.ps1 passes -ConsumptionMaxPages on' {
         $NotGiven.ContainsKey('ConsumptionMaxPages') | Should -BeFalse
     }
 
-    It 'gives it to every parallel worker' {
-        $script:Parsed['Run-AllSubscriptions.ps1'].Extent.Text | Should -Match ([regex]::Escape('if ($ConsumptionMaxPages -gt 0) { $WorkerArgs.ConsumptionMaxPages = $ConsumptionMaxPages }'))
+    It 'gives it to every parallel worker, in the arguments each Start-Job gets' {
+        # The statements of the per-stream loop body, from '$WorkerArgs = @{' to
+        # the Start-Job that takes them, are run with the loop's inputs.
+        $Ast = $script:Parsed['Run-AllSubscriptions.ps1']
+        $Build = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left.Extent.Text -eq '$WorkerArgs' }, $true))
+        $Build.Count | Should -Be 1
+        $Block = $Build[0].Parent
+        $Statements = @($Block.Statements)
+        $First = [array]::IndexOf($Statements, $Build[0])
+        $Job = @(0..($Statements.Count - 1) | Where-Object { $_ -gt $First -and $Statements[$_].Extent.Text -match 'Start-Job' })[0]
+        $null -ne $Job | Should -BeTrue
+        $Text = (@($Statements[$First..($Job - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n`$WorkerArgs"
+        $Run = [scriptblock]::Create('param($Vars) foreach ($K in $Vars.Keys) { Set-Variable -Name $K -Value $Vars[$K] }' + "`n" + $Text)
+        $Given = & $Run @{ ConsumptionMaxPages = 20000; S = 0; ConcurrencyLimit = 6; ConsumptionWindowArgs = @{} }
+        $Given['ConsumptionMaxPages'] | Should -Be 20000
+        $NotGiven = & $Run @{ ConsumptionMaxPages = 0; S = 0; ConcurrencyLimit = 6; ConsumptionWindowArgs = @{} }
+        $NotGiven.ContainsKey('ConsumptionMaxPages') | Should -BeFalse
     }
 }
