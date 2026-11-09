@@ -656,6 +656,18 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight ends as the run does'
         $Pf.ExitCode | Should -Be 0
     }
+
+    It 'checks a -ResumeFailedOnly retry that is also listed as completed when no per-stream state is there, as the run collects it' {
+        script:New-Case
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @([pscustomobject]@{ Id = $script:Subs['A'].Id; Name = 'Sub A'; LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 }); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'A'
+        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly')
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly')
+        $Run.ExitCode | Should -Be 1 -Because 'the run retries A and stops at its read access check'
+        $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight checks the subscription the run would collect'
+        @($Pf.Text | Where-Object { $_ -like 'Preflight failed: *' }).Count | Should -Be 1
+    }
 }
 
 Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {

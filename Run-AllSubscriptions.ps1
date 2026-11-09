@@ -880,7 +880,8 @@ if ($PreflightOnly)
         $PfFailed = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ })
         $PfStreamCompleted = @()
         $PfStreamFailed = @()
-        foreach ($PfStreamFile in @(Get-StreamResumeStateFiles -InventoryRoot $PfRoot -Tenant $ResumeKey))
+        $PfStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $PfRoot -Tenant $ResumeKey)
+        foreach ($PfStreamFile in $PfStreamFiles)
         {
             try
             {
@@ -894,7 +895,13 @@ if ($PreflightOnly)
             }
         }
         if ($PfStreamCompleted.Count -gt 0) { $PfCompleted = @($PfCompleted + $PfStreamCompleted | Sort-Object -Unique) }
-        $PfFailed = @(Merge-FailedAttempts -ExistingFailedAttempts $PfFailed -StreamFailedAttempts $PfStreamFailed -CompletedIds $PfCompleted | Where-Object { $null -ne $_ })
+        # As the run does: the retry list is reconciled with the completed list
+        # only when per-stream state files are there; otherwise the run keeps
+        # it as the file holds it, so the preflight checks the same list.
+        if ($PfStreamFiles.Count -gt 0)
+        {
+            $PfFailed = @(Merge-FailedAttempts -ExistingFailedAttempts $PfFailed -StreamFailedAttempts $PfStreamFailed -CompletedIds $PfCompleted | Where-Object { $null -ne $_ })
+        }
         if ($ResumeFailedOnly)
         {
             $PfFailedIds = @($PfFailed | ForEach-Object { [string]$_.Id })
