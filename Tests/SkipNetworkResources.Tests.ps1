@@ -134,16 +134,27 @@ Describe 'The skip list' {
         #     can be checked;
         #   - the type as the whole value of a hashtable entry is copied into
         #     an output field and selects nothing, so it is left alone;
-        #   - every other use cannot be checked and is reported on its own: a
+        #   - every other use of a .type read is reported on its own: a
         #     negated operator (-ne, -notlike, -notmatch, -notin, -notcontains
         #     read every type but the named ones), a -not or ! above the
-        #     comparison, a variable or expression on the other side, a method
-        #     call on the type or with the type as an argument, a switch, a
-        #     -split, a string with other text around the type, an assignment.
+        #     comparison in the same statement, the comparison inside another
+        #     comparison (-eq $false) or a -xor, an -or whose other side is
+        #     not itself a type comparison (or an -and or -or of them), a
+        #     variable or expression on the other side, a method call on the
+        #     type or with the type as an argument, a switch, a -split, a
+        #     string with other text around the type, an assignment.
         # Where-Object -Property type with an operator switch is judged the
-        # same way. Every spelled-out provider type, and every skipped type
-        # named by its id segment ('/networkinterfaces/'), anywhere in the
-        # file, is read from the text as well.
+        # same way. The type read by its name in any other way is reported as
+        # well: .'type', ['type'], a method given 'type' (.Item('type')), and
+        # any other command given type as a parameter value (Group-Object
+        # type, Select-Object -ExpandProperty type). Every spelled-out
+        # provider type, and every skipped type named by its id segment
+        # ('/networkinterfaces/'), anywhere in the file, is read from the
+        # text as well.
+        # The check reads expressions only, not the control flow around them:
+        # a positive comparison whose rows are dropped by if/else or continue
+        # (if ($R.type -eq 'x') { continue }) passes.
+        # shortcut: control-flow negation is not detected; add a fixture test that runs each collector over skipped-type rows if a collector ever iterates all resources.
         function script:Get-CollectorTypeRead
         {
             param([string]$Text, [string[]]$SkipList)
@@ -208,17 +219,45 @@ Describe 'The skip list' {
                 $N
             }
 
+            # The type read by its name in any other way: .'type', ['type'],
+            # .Item('type') and the like, or a command other than Where-Object
+            # given type as a parameter value (Group-Object type,
+            # Select-Object -ExpandProperty type).
+            $IsTypeName = { param($Node) $Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $Node.Value -eq 'type' }
+            foreach ($Node in @($Ast.FindAll({
+                            param($Node)
+                            ($Node -is [System.Management.Automation.Language.MemberExpressionAst] -and $Node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                            (& $IsTypeName $Node.Member) -and $Node.Member.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::BareWord) -or
+                            ($Node -is [System.Management.Automation.Language.IndexExpressionAst] -and (& $IsTypeName $Node.Index)) -or
+                            ($Node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and @($Node.Arguments | Where-Object { & $IsTypeName $_ }).Count -gt 0)
+                        }, $true)))
+            {
+                $Unchecked.Add($Node.Extent.Text)
+            }
+            $Commands = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -notin @('Where-Object', 'where', '?') }, $true))
+            foreach ($Cmd in $Commands)
+            {
+                $El = @($Cmd.CommandElements)
+                for ($i = 1; $i -lt $El.Count; $i++)
+                {
+                    $Value = if ($El[$i] -is [System.Management.Automation.Language.CommandParameterAst]) { $El[$i].Argument } else { $El[$i] }
+                    $Values = if ($Value -is [System.Management.Automation.Language.ArrayLiteralAst]) { @($Value.Elements) } else { @($Value) }
+                    if (@($Values | Where-Object { & $IsTypeName $_ }).Count -gt 0) { $Unchecked.Add($Cmd.Extent.Text); break }
+                }
+            }
+
             # Every '.type' member read (a method named type is not one).
             $Reads = @($Ast.FindAll({
                         param($Node)
                         $Node -is [System.Management.Automation.Language.MemberExpressionAst] -and
                         $Node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
                         $Node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
-                        $Node.Member.Value -eq 'type'
+                        $Node.Member.Value -eq 'type' -and $Node.Member.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord
                     }, $true))
-            foreach ($Read in $Reads)
-            {
-                # Climb through what keeps the value the type itself.
+            # The node a .type read climbs to (see the loop below), and the
+            # comparisons that have a type read on one side.
+            $Climb = {
+                param($Read)
                 $Cur = $Read
                 while ($true)
                 {
@@ -243,6 +282,40 @@ Describe 'The skip list' {
                     }
                     break
                 }
+                $Cur
+            }
+            $TypeComparisons = [System.Collections.Generic.HashSet[object]]::new()
+            foreach ($Read in $Reads)
+            {
+                $Cur = & $Climb $Read
+                if ($Cur.Parent -is [System.Management.Automation.Language.BinaryExpressionAst]) { [void]$TypeComparisons.Add($Cur.Parent) }
+            }
+            # Whether an expression keeps only rows of the types a type
+            # comparison in it names: that comparison itself, an -and with
+            # one in it, or an -or of such expressions only.
+            $Unwrap = {
+                param($Node)
+                while ($true)
+                {
+                    if ($Node -is [System.Management.Automation.Language.ParenExpressionAst]) { $Node = $Node.Pipeline; continue }
+                    if ($Node -is [System.Management.Automation.Language.PipelineAst] -and $Node.PipelineElements.Count -eq 1 -and $Node.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) { $Node = $Node.PipelineElements[0].Expression; continue }
+                    return $Node
+                }
+            }
+            $Restricts = $null
+            $Restricts = {
+                param($Node)
+                $Node = & $Unwrap $Node
+                if ($TypeComparisons.Contains($Node)) { return $true }
+                if ($Node -isnot [System.Management.Automation.Language.BinaryExpressionAst]) { return $false }
+                if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::And) { return ((& $Restricts $Node.Left) -or (& $Restricts $Node.Right)) }
+                if ($Node.Operator -eq [System.Management.Automation.Language.TokenKind]::Or) { return ((& $Restricts $Node.Left) -and (& $Restricts $Node.Right)) }
+                $false
+            }
+            foreach ($Read in $Reads)
+            {
+                # Climb through what keeps the value the type itself.
+                $Cur = & $Climb $Read
                 $P = $Cur.Parent
                 # The whole value of a hashtable entry: an output field.
                 if ($P -is [System.Management.Automation.Language.CommandExpressionAst] -and $P.Parent -is [System.Management.Automation.Language.PipelineAst] -and $P.Parent.PipelineElements.Count -eq 1 -and
@@ -267,6 +340,32 @@ Describe 'The skip list' {
                 if ($Negated)
                 {
                     $Unchecked.Add($Up.Extent.Text)
+                    continue
+                }
+                # The comparison inside another one (-eq $false, -ne $true),
+                # a -xor, or an -or whose other side keeps other types.
+                $Wider = $null
+                $Child = $P
+                $Up = $P.Parent
+                while ($null -ne $Up)
+                {
+                    if ($Up -is [System.Management.Automation.Language.ParenExpressionAst] -or $Up -is [System.Management.Automation.Language.CommandExpressionAst] -or
+                        ($Up -is [System.Management.Automation.Language.PipelineAst] -and $Up.PipelineElements.Count -eq 1))
+                    {
+                        $Child = $Up; $Up = $Up.Parent; continue
+                    }
+                    if ($Up -isnot [System.Management.Automation.Language.BinaryExpressionAst]) { break }
+                    if ($Up.Operator -eq [System.Management.Automation.Language.TokenKind]::Or)
+                    {
+                        $Side = if ([object]::ReferenceEquals($Up.Left, $Child)) { $Up.Right } else { $Up.Left }
+                        if (-not (& $Restricts $Side)) { $Wider = $Up; break }
+                    }
+                    elseif ($Up.Operator -ne [System.Management.Automation.Language.TokenKind]::And) { $Wider = $Up; break }
+                    $Child = $Up; $Up = $Up.Parent
+                }
+                if ($null -ne $Wider)
+                {
+                    $Unchecked.Add($Wider.Extent.Text)
                     continue
                 }
                 $TypeLeft = [object]::ReferenceEquals($P.Left, $Cur)
@@ -410,6 +509,23 @@ Describe 'The skip list' {
         @{ Label = 'by [string]::Equals of the type'; Text = '$Resources | Where-Object { [string]::Equals($_.type, $T) }'; Expect = 'unchecked' }
         # The type kept in a variable and compared later.
         @{ Label = 'by the type kept in a variable'; Text = '$Resources | Where-Object { $T = $_.type; $Net.Contains($T) }'; Expect = 'unchecked' }
+        # The type read by its name, with no .type member read.
+        @{ Label = 'by PSObject.Properties[''type'']'; Text = '$Resources | Where-Object { $Net.Contains($_.PSObject.Properties[''type''].Value) }'; Expect = 'unchecked' }
+        @{ Label = 'by an index [''type'']'; Text = '$Resources | Where-Object { $_[''type''] -eq ''microsoft.compute/virtualmachines'' }'; Expect = 'unchecked' }
+        @{ Label = 'by a quoted .''type'''; Text = '$Resources | Where-Object { $_.''type'' -eq ''microsoft.compute/virtualmachines'' }'; Expect = 'unchecked' }
+        @{ Label = 'by .Item(''type'')'; Text = '$Resources | Where-Object { $Net.Contains($_.PSObject.Properties.Item(''type'').Value) }'; Expect = 'unchecked' }
+        @{ Label = 'by Group-Object -Property type'; Text = '$Resources | Group-Object -Property type | Where-Object { $_.Name -match ''^microsoft\.network/'' }'; Expect = 'unchecked' }
+        @{ Label = 'by Group-Object type'; Text = '$Resources | Group-Object type | Where-Object { $_.Name -match ''^microsoft\.network/'' }'; Expect = 'unchecked' }
+        @{ Label = 'by Select-Object -ExpandProperty type'; Text = '$T = $Resources | Select-Object -ExpandProperty type'; Expect = 'unchecked' }
+        @{ Label = 'by Sort-Object type'; Text = '$Resources | Sort-Object type | Select-Object -First 1'; Expect = 'unchecked' }
+        @{ Label = 'by Select-Object name, type'; Text = '$Resources | Select-Object name, type'; Expect = 'unchecked' }
+        # A comparison that widens a type comparison to other types.
+        @{ Label = 'by a kept type -eq $false'; Text = '$Resources | Where-Object { ($_.type -eq ''microsoft.compute/virtualmachines'') -eq $false }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept type -ne $true'; Text = '$Resources | Where-Object { ($_.TYPE -eq ''microsoft.compute/virtualmachines'') -ne $true }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept type -or $true'; Text = '$Resources | Where-Object { $_.type -eq ''microsoft.compute/virtualmachines'' -or $true }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept type -xor $true'; Text = '$Resources | Where-Object { $_.type -eq ''microsoft.compute/virtualmachines'' -xor $true }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept type -or a name'; Text = '$Resources | Where-Object { ($_.type -eq ''microsoft.compute/disks'' -and $_.sku) -or $_.name -like ''nic*'' }'; Expect = 'unchecked' }
+        @{ Label = 'by a kept type -and a flag, -eq $false'; Text = '$Resources | Where-Object { (($_.type -eq ''microsoft.compute/disks'') -and $Flag) -eq $false }'; Expect = 'unchecked' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
@@ -423,6 +539,8 @@ Describe 'The skip list' {
         @{ Label = 'by a quoted list -contains the type'; Text = '$Resources | Where-Object { @(''microsoft.compute/virtualmachines'', ''microsoft.compute/disks'') -contains $_.type }' }
         @{ Label = 'by the id of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.id -like ''*/networkwatchers/*/connectionmonitors/*'' }' }
         @{ Label = 'by the type of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/networkwatchers/connectionmonitors'' }' }
+        @{ Label = 'by a kept type -and another test'; Text = '$Resources | Where-Object { $_.type -eq ''microsoft.compute/disks'' -and $_.properties.diskState -ne ''Unattached'' }' }
+        @{ Label = 'by -or of -and type comparisons'; Text = '$Resources | Where-Object { ($_.type -eq ''microsoft.compute/disks'' -and $_.sku) -or ($_.TYPE -in @(''microsoft.compute/virtualmachines'') -and ($_.type -like ''microsoft.compute/*'' -or $_.type -eq ''microsoft.web/sites'')) }' }
         # The type copied into an output field selects no rows.
         @{ Label = 'and copies the type into an output field'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/frontdoors'' } | ForEach-Object { @{ ''ResourceType'' = $_.TYPE; ''Policy'' = $_.properties.backupPolicy.type } }' }
     ) {
