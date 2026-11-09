@@ -1,6 +1,6 @@
 # Requires -Modules Pester
 # Offline coverage for the metrics throttle handling in Extension/Metrics.ps1:
-# a 429 wave used to exhaust the 3 generic retries in ~28s (4s+8s+16s) and record the metric as
+# a 429 wave used to exhaust the 3 generic retries in ~14s (2s, 4s, 8s) and record the metric as
 # Throttled/failed, ignoring the server's Retry-After. Get-RdaMetricRetryPlan now gives throttled
 # attempts their own budget and waits at least Retry-After (bounded). Extracted by AST like
 # MetricsErrorBodyCapture.Tests.ps1 does, because the function lives inside the -Parallel block.
@@ -96,7 +96,8 @@ Describe 'Get-RdaMetricRetryPlan - throttled attempts' {
     }
 
     It 'a sustained 429 wave now waits out the directed delay instead of failing inside 30 seconds' {
-        # Old behaviour: 3 retries at 4+8+16 = 28s of waiting, then Outcome = Throttled.
+        # Old behaviour: 3 retries at 2 + 4 + 8 = 14 s of waiting (plus jitter), then Outcome = Throttled.
+        # The bound below is twice that, so the new plan waits well past the old one.
         $Total = 0
         for ($i = 1; $i -le $script:MaxThrottle; $i++) { $Total += (Plan @{ Throttled = $true; ThrottledAttempts = $i; RetryAfterSeconds = 20 }).SleepSeconds }
         $Total | Should -BeGreaterThan 28
@@ -269,6 +270,17 @@ Describe 'Retry-After reaches the runspace' {
         $FunctionsSrc | Should -Match '(?m)^# .*Azure Monitor.*\r?\n(# .*\r?\n)*function Get-RdaRetryAfterSeconds'
         # The Resource Graph retry no longer matches the Get-AzMetric loop, which now has its own throttle budget.
         $FunctionsSrc | Should -Not -Match 'Mirrors the Get-AzMetric wrapper'
+    }
+
+    It 'the comments give the old throttled backoff as 2 + 4 + 8 = 14 s' {
+        # The old loop counted attempts from 0, so its throttled waits were 2^0, 2^1 and 2^2, doubled.
+        $TestSrc = Get-Content -LiteralPath $PSCommandPath -Raw
+        foreach ($Src in @($script:MetricsSrc, $TestSrc))
+        {
+            $Src | Should -Not -Match '~28s'
+            $Src | Should -Not -Match '4s?\+8s?\+16s?'
+        }
+        $script:MetricsSrc | Should -Match '(?m)^\s*# .*3 generic retries in ~14s'
     }
 
     It 'the retry loop has an explicit exit when the budget is exhausted (the while is no longer bounded by attempts)' {

@@ -480,7 +480,7 @@ if ($Task -eq 'Processing')
     $MetricTimeoutSeconds = 120
     $MetricMaxRetries = 3
     # Throttling (429) has its OWN retry budget and honours the server's Retry-After: a throttle wave used to exhaust
-    # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
+    # the 3 generic retries in ~14s and record the metric as failed, when waiting the directed few seconds would have succeeded.
     $MetricMaxThrottleRetries = 6
     $MetricMaxRetryAfterSeconds = 120
     # Total wait cap for the throttled retries of one request: a retry whose sleep would take the total past it is not made.
