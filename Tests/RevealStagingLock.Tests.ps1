@@ -214,3 +214,31 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
         Assert-LockFree $Case
     }
 }
+
+Describe 'Remove-RevealStagingLock' -Skip:$IsWindows {
+    # Released first and removed after, another run could open the lock file
+    # in between and hold a lock on a removed file, and a third run would then
+    # make a new lock file and run beside it. So the file is removed while the
+    # lock is still held.
+    It 'removes the lock file while it still holds the lock' {
+        $Tokens = $null; $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Reveal, [ref]$Tokens, [ref]$Errors)
+        $Function = $Ast.Find({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Remove-RevealStagingLock' }, $true)
+        $Function | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($Function.Extent.Text))
+
+        $Dir = Join-Path $script:WorkDir 'removelock'
+        $null = New-Item -ItemType Directory -Path $Dir -Force
+        $StagingLockPath = Join-Path $Dir '.reveal-lock'
+        $Real = [System.IO.FileStream]::new($StagingLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        # Notes whether the lock file was still there when the lock was released.
+        $Seen = [System.Collections.Generic.List[bool]]::new()
+        $StagingLock = [pscustomobject]@{ Path = $StagingLockPath; Real = $Real; Seen = $Seen }
+        $StagingLock | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Seen.Add((Test-Path -LiteralPath $this.Path)); $this.Real.Dispose() }
+
+        Remove-RevealStagingLock
+
+        $Seen | Should -Be @($false)
+        Test-Path -LiteralPath $StagingLockPath | Should -BeFalse
+    }
+}
