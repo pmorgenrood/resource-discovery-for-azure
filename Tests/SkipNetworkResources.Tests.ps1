@@ -448,6 +448,13 @@ Describe 'Per-subscription count message' {
         $M.Text | Should -Not -Match '(?i)billable'
     }
 
+    It 'collected 0 and skipped > 0 with -SkipConsumption: does not say the costs come from consumption data' {
+        $ByType = [ordered]@{ 'microsoft.network/virtualnetworks' = 12; 'microsoft.network/networksecuritygroups' = 20; 'microsoft.network/routetables' = 8 }
+        $M = Get-RdaResourceCountMessage -Collected 0 -Skipped 40 -SkippedByType $ByType -SkipConsumption
+        $M.Kind | Should -Be 'NetworkOnly'
+        $M.Text | Should -Be '0 resources collected. 40 network resources skipped (20 networksecuritygroups, 12 virtualnetworks, 8 routetables).'
+    }
+
     It 'collected > 0 and skipped > 0' {
         $M = Get-RdaResourceCountMessage -Collected 120 -Skipped 35
         $M.Kind | Should -Be 'Collected'
@@ -538,6 +545,52 @@ Describe 'Callers use the message and the switch' {
             $script:Out[0] | Should -BeLike $Expect
             if (-not $Warn) { $script:Out[0] | Should -Not -BeLike '*WARNING*' }
         }
+    }
+
+    It 'every count line (wrapper, stream worker, direct run) names the consumption data only when it is collected (-SkipConsumption <Skip>)' -TestCases @(
+        @{ Skip = $false }, @{ Skip = $true }
+    ) {
+        param($Skip)
+        $Blocks = @(@(script:Get-CountLineBlock $script:WrapperAst) + @(script:Get-CountLineBlock $script:StreamAst) + @(script:Get-CountLineBlock $script:InventoryAst))
+        $Blocks.Count | Should -Be 4
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        Mock -CommandName Write-Log -MockWith { $script:Out.Add([string]$Message) }
+        function Write-Stream { param($Message, $Color) $script:Out.Add([string]$Message) }
+        # The lifted lines read these through dynamic scope.
+        Set-Variable -Name SkipConsumption -Value ([switch]$Skip)
+        Set-Variable -Name ResCount -Value 0
+        Set-Variable -Name SubName -Value 'sub-a'
+        $Sub = [pscustomobject]@{ Name = 'sub-a'; Id = $script:Sub }
+        $Global:Resources = @()
+        $Global:SkippedResourceCount = 5
+        $Global:SkippedResourceTypes = [ordered]@{ 'microsoft.network/networkinterfaces' = 5 }
+        foreach ($Block in $Blocks)
+        {
+            $script:Out.Clear()
+            . $Block
+            $script:Out.Count | Should -Be 1 -Because "one line from: $Block"
+            $script:Out[0] | Should -BeLike '*0 resources collected. 5 network resources skipped (5 networkinterfaces).*'
+            if ($Skip) { $script:Out[0] | Should -Not -Match '(?i)consumption' -Because '-SkipConsumption collects no consumption data' }
+            else { $script:Out[0] | Should -BeLike '*Network costs still come from the consumption data.' }
+        }
+    }
+
+    It 'the run summary names the consumption data only when it is collected (-SkipConsumption <Skip>)' -TestCases @(
+        @{ Skip = $false }, @{ Skip = $true }
+    ) {
+        param($Skip)
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        # The lifted summary reads these through dynamic scope.
+        Set-Variable -Name SkipConsumption -Value ([switch]$Skip)
+        Set-Variable -Name SubResourceCounts -Value @([pscustomobject]@{ Name = 'collected'; Id = 'id-a'; Count = 5; Skipped = 3 })
+        . $script:RunSummary
+        $Line = @($script:Out | Where-Object { $_ -like 'Network resources skipped:*' })
+        $Line.Count | Should -Be 1
+        $Line[0] | Should -BeLike '*-IncludeNetworkResources keeps them)'
+        if ($Skip) { $Line[0] | Should -Be 'Network resources skipped: 3 (-IncludeNetworkResources keeps them)' }
+        else { $Line[0] | Should -Be 'Network resources skipped: 3 (network costs still come from the consumption data; -IncludeNetworkResources keeps them)' }
     }
 
     It 'the stream worker builds its line from it, loads Common.Functions.ps1 and reports the skipped count' {

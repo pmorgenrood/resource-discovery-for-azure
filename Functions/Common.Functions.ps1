@@ -402,12 +402,15 @@ function Connect-RdaWrapperSession
 #   NetworkOnly - nothing collected, but network rows were skipped. Not a
 #                 warning: the subscription only holds skipped types.
 #   Collected   - rows were collected.
+# With -SkipConsumption no consumption data is collected, so the line does not
+# say that network costs come from it.
 function Get-RdaResourceCountMessage
 {
     param(
         [Parameter(Mandatory = $true)][long]$Collected,
         [AllowNull()]$Skipped,
-        [System.Collections.IDictionary]$SkippedByType
+        [System.Collections.IDictionary]$SkippedByType,
+        [switch]$SkipConsumption
     )
 
     $SkippedCount = if ($null -eq $Skipped) { [long]0 } else { [long]$Skipped }
@@ -428,7 +431,8 @@ function Get-RdaResourceCountMessage
                     ForEach-Object { '{0:N0} {1}' -f [long]$_.Value, ([string]$_.Key -replace '^(?i)microsoft\.network/', '') })
         }
         $Split = if ($Parts.Count -gt 0) { ' (' + ($Parts -join ', ') + ')' } else { '' }
-        $Text = '0 resources collected. {0:N0} {1} skipped{2}. Network costs still come from the consumption data.' -f $SkippedCount, $Noun, $Split
+        $Costs = if ($SkipConsumption) { '' } else { ' Network costs still come from the consumption data.' }
+        $Text = '0 resources collected. {0:N0} {1} skipped{2}.{3}' -f $SkippedCount, $Noun, $Split, $Costs
         return [pscustomobject]@{ Kind = 'NetworkOnly'; Text = $Text }
     }
 
