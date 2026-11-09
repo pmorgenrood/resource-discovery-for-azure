@@ -128,12 +128,15 @@ Describe "Consumption to Inventory Cross-Reference" {
         # dictionary (ResourceIdMap: masked id -> real id). A consumption row
         # whose real resource is in the inventory must carry the inventory's
         # masked id for it, string for string.
-        # Found as DictionaryValidation.Tests.ps1 finds it: TEST_DICT_PATH, else the
-        # newest ObfuscationDictionary_*.json in Tests/, else next to the zip.
+        # The run's own dictionary: TEST_DICT_PATH, else the newest
+        # ObfuscationDictionary_*.json next to TEST_ZIP_PATH, else (no
+        # TEST_ZIP_PATH) the newest one in Tests/, where the zip was found too.
+        # A dictionary of another run in Tests/ is never taken for a zip given
+        # by path.
         $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
         {
-            $DictDirs = @($PSScriptRoot; if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent })
-            $DictDirs | ForEach-Object { Get-ChildItem -Path $_ -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName } | Select-Object -First 1
+            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
+            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
         if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because "no obfuscation dictionary for this zip, so real resources cannot be matched"; return }
         $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
