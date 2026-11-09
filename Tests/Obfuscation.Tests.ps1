@@ -89,21 +89,15 @@ BeforeAll {
         }
     }
 
-    # Locate the reverse-lookup dictionary for the determinism (P1) checks.
-    # Same discovery convention as DictionaryValidation.Tests.ps1: prefer
-    # $env:TEST_DICT_PATH, then the Tests/ folder, then next to the zip. The
-    # dictionary is LOCAL-ONLY and is never inside the shared zip.
+    # Locate the reverse-lookup dictionary for the determinism checks: the
+    # run's own one, as DictionaryValidation.Tests.ps1 finds it (TEST_DICT_PATH,
+    # else next to TEST_ZIP_PATH, else in Tests/ when no TEST_ZIP_PATH is set).
+    # The dictionary is LOCAL-ONLY and is never inside the shared zip.
     $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
     {
-        $Found = Get-ChildItem -Path $PSScriptRoot -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
+        $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
+        Get-ChildItem -Path $DictDir -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-        if ([string]::IsNullOrEmpty($Found))
-        {
-            $ZipDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
-            Get-ChildItem -Path $ZipDir -Filter "ObfuscationDictionary_*.json" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-        }
-        else { $Found }
     }
     $script:DictionaryAvailable = -not [string]::IsNullOrEmpty($DictPath) -and (Test-Path $DictPath)
     $script:Dictionary = if ($script:DictionaryAvailable) { Get-Content $DictPath -Raw | ConvertFrom-Json } else { $null }
