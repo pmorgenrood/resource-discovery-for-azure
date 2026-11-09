@@ -273,6 +273,43 @@ if ([string]::IsNullOrEmpty($OutputZip))
 # put them in the upload, -Resume would read them as done, and -RemoveStaging
 # would delete them. So such a folder is refused before anything is written.
 $StagingMarkerName = '.reveal-staging.json'
+# The fields this run reveals, in one form, recorded in the mark and compared
+# by -Resume.
+$FieldsKey = (@($Fields | Sort-Object -Unique) -join ', ')
+# The finished outputs of this staging folder, by file name: each output's
+# SHA-256 and the report and dictionary (name and SHA-256) it came from. Kept
+# in the mark and written again after each output is complete.
+$StagingOutputs = @{}
+$MarkerData = $null
+
+# Write the mark: the inventory root, the fields and the finished outputs. It
+# is written to a sibling file and then moved over the mark, so a run killed
+# while writing never leaves half a mark.
+function Save-RevealStagingMarker
+{
+    $Json = [ordered]@{
+        Purpose       = 'Reveal staging folder'
+        InventoryRoot = $InventoryRoot
+        Fields        = @($Fields | Sort-Object -Unique)
+        All           = [bool]$All
+        Outputs       = $StagingOutputs
+    } | ConvertTo-Json -Depth 5
+    $Temp = $StagingMarkerPath + '.tmp'
+    [System.IO.File]::WriteAllText($Temp, $Json, [System.Text.UTF8Encoding]::new($false))
+    if ($IsWindows)
+    {
+        $TempItem = Get-Item -LiteralPath $Temp -Force
+        $TempItem.Attributes = $TempItem.Attributes -bor [System.IO.FileAttributes]::Hidden
+    }
+    [System.IO.File]::Move($Temp, $StagingMarkerPath, $true)
+}
+
+# The SHA-256 of a file, as upper-case hex.
+function Get-RevealFileSha256
+{
+    param([string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
 $PathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 if (Test-Path -LiteralPath $StagingDirectory)
 {
@@ -285,8 +322,12 @@ if (Test-Path -LiteralPath $StagingDirectory)
     $MarkedRoot = $null
     if (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf)
     {
-        try { $MarkedRoot = [string](Get-Content -LiteralPath $StagingMarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).InventoryRoot }
-        catch { $MarkedRoot = $null }
+        try
+        {
+            $MarkerData = Get-Content -LiteralPath $StagingMarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            $MarkedRoot = [string]$MarkerData['InventoryRoot']
+        }
+        catch { $MarkerData = $null; $MarkedRoot = $null }
     }
     $MarkedForThisRoot = $false
     if (-not [string]::IsNullOrEmpty($MarkedRoot))
@@ -303,6 +344,26 @@ if (Test-Path -LiteralPath $StagingDirectory)
         }
         throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
     }
+    if ($Resume -and $MarkedForThisRoot)
+    {
+        # A resumed run must reveal the same fields as the run it continues, or
+        # one bundle would mix reports revealed for different fields.
+        $MarkedFields = $MarkerData['Fields']
+        if ($null -eq $MarkedFields)
+        {
+            throw ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
+        }
+        $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
+        if ($MarkedFieldsKey -cne $FieldsKey)
+        {
+            throw ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
+        }
+        $RecordedOutputs = $MarkerData['Outputs']
+        if ($RecordedOutputs -is [System.Collections.IDictionary])
+        {
+            foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
+        }
+    }
 }
 New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
 # Canonicalize staging too, so the per-folder exclusion compare below matches
@@ -314,16 +375,7 @@ $StagingDirectory = (Resolve-Path -LiteralPath $StagingDirectory).Path
 try { Set-RevealOwnerOnlyDirectory -Path $StagingDirectory }
 catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $StagingDirectory, $_.Exception.Message) }
 $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
-if (-not (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf))
-{
-    ([pscustomobject]@{ Purpose = 'Reveal staging folder'; InventoryRoot = $InventoryRoot } | ConvertTo-Json -Compress) |
-        Set-Content -LiteralPath $StagingMarkerPath -Encoding utf8NoBOM
-    if ($IsWindows)
-    {
-        $MarkerItem = Get-Item -LiteralPath $StagingMarkerPath -Force
-        $MarkerItem.Attributes = $MarkerItem.Attributes -bor [System.IO.FileAttributes]::Hidden
-    }
-}
+Save-RevealStagingMarker
 
 # The output zip must not live inside the staging directory, or it would be
 # swept into itself on the final Compress-Archive.
@@ -485,18 +537,40 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
         $null = $UsedOutNames.Add($OutName)
     }
     $OutPath = Join-Path $StagingDirectory $OutName
+    $SourceSha256 = Get-RevealFileSha256 $Zip.FullName
+    $DictSha256 = Get-RevealFileSha256 $Dict.FullName
 
-    if ($Resume -and (Test-Path -LiteralPath $OutPath))
+    if ($Resume -and $StagingOutputs.ContainsKey($OutName))
     {
-        # Already revealed on a prior run: its zip is sitting in staging. Skip so
-        # a resumed run does not redo completed work (and can advance past a
-        # folder that previously stalled the batch).
-        $ResumedCount++
-        $RunOutputs.Add($OutPath)
-        continue
+        # Revealed on a prior run. Take it only when the mark recorded it as
+        # finished, its bytes still match the record, and it came from this
+        # same report and dictionary; otherwise redo it. Skipping lets a
+        # resumed run advance past a folder that previously stalled the batch.
+        $Record = $StagingOutputs[$OutName]
+        $Redo = $null
+        if (-not (Test-Path -LiteralPath $OutPath -PathType Leaf)) { $Redo = 'its revealed zip is missing' }
+        elseif ([string]$Record['Sha256'] -cne (Get-RevealFileSha256 $OutPath)) { $Redo = 'its revealed zip does not match the one recorded' }
+        elseif ([string]$Record['SourceFolder'] -cne $Folder -or [string]$Record['SourceName'] -cne $Zip.Name -or [string]$Record['SourceSha256'] -cne $SourceSha256) { $Redo = 'its source report changed' }
+        elseif ([string]$Record['DictionaryName'] -cne $Dict.Name -or [string]$Record['DictionarySha256'] -cne $DictSha256) { $Redo = 'its dictionary changed' }
+        if ($null -eq $Redo)
+        {
+            $ResumedCount++
+            $RunOutputs.Add($OutPath)
+            continue
+        }
+        Write-Host ("Resume: revealing {0} again: {1}." -f $OutName, $Redo) -ForegroundColor Yellow
+        $null = $StagingOutputs.Remove($OutName)
+        Save-RevealStagingMarker
+    }
+    elseif ($Resume -and (Test-Path -LiteralPath $OutPath))
+    {
+        Write-Host ("Resume: revealing {0} again: the mark has no record of it as finished." -f $OutName) -ForegroundColor Yellow
     }
 
-    $Queue.Enqueue([pscustomobject]@{ Folder = $Folder; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath })
+    $Queue.Enqueue([pscustomobject]@{
+            Folder = $Folder; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath; OutName = $OutName
+            SourceName = $Zip.Name; SourceSha256 = $SourceSha256; DictionaryName = $Dict.Name; DictionarySha256 = $DictSha256
+        })
 }
 
 # Bounded job pool. Keep up to -ParallelStreams reveals in flight, each its own
@@ -543,6 +617,17 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 {
                     $RevealedCount++
                     $RunOutputs.Add($R.Item.OutPath)
+                    # Record the finished output in the mark, so a later
+                    # -Resume can check it before taking it.
+                    $StagingOutputs[$R.Item.OutName] = [ordered]@{
+                        Sha256           = Get-RevealFileSha256 $R.Item.OutPath
+                        SourceFolder     = $R.Item.Folder
+                        SourceName       = $R.Item.SourceName
+                        SourceSha256     = $R.Item.SourceSha256
+                        DictionaryName   = $R.Item.DictionaryName
+                        DictionarySha256 = $R.Item.DictionarySha256
+                    }
+                    Save-RevealStagingMarker
                 }
                 else
                 {
@@ -679,6 +764,7 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
             Remove-Item -LiteralPath (($Staged.FullName -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ($StagingMarkerPath + '.tmp') -Force -ErrorAction SilentlyContinue
         $Leftover = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop)
         if ($Leftover.Count -eq 0)
         {
