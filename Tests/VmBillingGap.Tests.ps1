@@ -304,6 +304,17 @@ Describe 'VM billing-coverage banner' {
         Get-Content -LiteralPath $Html -Raw | Should -Match '2 running VMs were discovered in the inventory, but only 0 VMs have compute-usage records'
     }
 
+    It 'reads an inventory without a VirtualMachines section under Set-StrictMode -Version Latest' {
+        $InvPath = Join-Path $script:WorkDir 'inv-novm.json'
+        '{"Version":"3.2.3","PublicIP":[{"Name":"pip","Subscription":"sub"}]}' | Set-Content -LiteralPath $InvPath -Encoding utf8
+        $Csv = Join-Path $script:WorkDir 'cons-novm.csv'
+        @([pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = '/subscriptions/x/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm1' }) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Join-Path $script:WorkDir 'novm.html'
+        $Script = $script:SummaryScript
+        { & { Set-StrictMode -Version Latest; & $Script -JsonFile $InvPath -HtmlFile $Html -ConsumptionFile $Csv *> $null } } | Should -Not -Throw
+        Test-Path -LiteralPath $Html | Should -BeTrue
+    }
+
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_thresh.csv'
