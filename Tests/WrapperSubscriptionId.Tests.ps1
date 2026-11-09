@@ -831,6 +831,28 @@ Describe 'A one-subscription -Resume run asked for more than one stream' -Skip:(
     }
 }
 
+Describe 'A subscription that an earlier run completed and a later run failed' -Skip:($IsWindows) {
+    It 'is collected by -Resume -ResumeFailedOnly, and the run after that has nothing left to do' {
+        script:New-Case
+        # Run 1 completes Sub A and Sub B; Sub C fails, so the state is kept.
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
+        $null = script:Invoke-Wrapper -Streams 1
+        # A run without -Resume fails Sub B, which the first run completed (and Sub C again).
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B', 'C'
+        $Run2 = script:Invoke-Wrapper -Streams 1
+        $Run2.ExitCode | Should -Not -Be 1
+        $State = script:Read-StateAt -Path $script:State
+        $State.Failed | Should -Be (script:Get-Ids 'B', 'C')
+        $State.Completed | Should -Not -Contain $script:Subs['B'].Id -Because 'the failed attempt ends the earlier completion'
+        script:Clear-Calls
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $Run3 = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume', '-ResumeFailedOnly')
+        script:Get-Calls | Should -Be (script:Get-Ids 'B', 'C')
+        $Run3.ExitCode | Should -Be 0
+        Test-Path -LiteralPath $script:State | Should -BeFalse -Because 'nothing is left to retry'
+    }
+}
+
 Describe 'A one-subscription retry that succeeds, asked for four streams' -Skip:($IsWindows) {
     It 'takes the subscription off the retry list when it was also listed as completed, and clears the state' {
         script:New-Case

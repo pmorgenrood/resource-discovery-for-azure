@@ -1393,6 +1393,13 @@ if ($ParallelStreams -le 1)
             catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
 
             $FailedSubscriptions += $Sub.Name
+            # A failed attempt ends an earlier run's completion of this sub: take
+            # it off the completed list, so a later -Resume (or -Resume with
+            # -ResumeFailedOnly) collects it again instead of skipping it.
+            if ($CompletedIds -contains $Sub.Id)
+            {
+                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+            }
             # Persist the failure to the resume-state file so a future run with
             # -ResumeFailedOnly can target it. Use the exception message as the
             # Reason so the operator can see at a glance why each sub failed
@@ -1515,6 +1522,12 @@ else
                 try { $DiagLines | Out-File -FilePath $DiagFile -Append -Encoding utf8 }
                 catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
                 $FailedSubscriptions += $Sub.Name
+                # Same as the sequential branch: a failed attempt takes the sub
+                # off the completed list.
+                if ($CompletedIds -contains $Sub.Id)
+                {
+                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
+                }
                 # Mirror the sequential branch: persist failure to the
                 # resume-state file so -ResumeFailedOnly works even for the
                 # single-sub-collapses-to-inline corner case.
