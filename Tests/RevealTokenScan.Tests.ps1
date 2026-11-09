@@ -30,7 +30,31 @@ BeforeAll {
     $script:EmptyDict = Join-Path $script:WorkDir 'ObfuscationDictionary_empty.json'
     Set-Content -LiteralPath $script:EmptyDict -Encoding utf8 -Value '{"ResourceGroupMap":{},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":{},"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
 
+    # Reveal holds every zip to the ingestion server's limits, one of which is
+    # at most 100 to 1 compression. The long runs of one character these tests
+    # write compress far more than that, so each zip also gets a stored entry
+    # of random bytes, which keeps the whole zip within the limit. It is not
+    # a .json or .csv member, and random bytes hold no masked value.
+    function Add-Padding
+    {
+        param([System.IO.Compression.ZipArchive]$Archive, [long]$Bytes)
+        $Entry = $Archive.CreateEntry('Padding.bin', [System.IO.Compression.CompressionLevel]::NoCompression)
+        $Stream = $Entry.Open()
+        try
+        {
+            $Buffer = [byte[]]::new(1MB)
+            for ($Left = $Bytes; $Left -gt 0; $Left -= $Buffer.Length)
+            {
+                [System.Security.Cryptography.RandomNumberGenerator]::Fill($Buffer)
+                $Stream.Write($Buffer, 0, [int][Math]::Min($Left, $Buffer.Length))
+            }
+        }
+        finally { $Stream.Dispose() }
+    }
+
     # Writes a zip with one entry; the script block writes the entry's text.
+    # The entries here are at most about 1.1 GiB, so 16 MiB of padding keeps
+    # the zip within 100 to 1.
     function Build-TestZip
     {
         param([string]$Name, [scriptblock]$Write)
@@ -41,6 +65,7 @@ BeforeAll {
             $Entry = $Archive.CreateEntry('Inventory_test.json', [System.IO.Compression.CompressionLevel]::Fastest)
             $Writer = [System.IO.StreamWriter]::new($Entry.Open())
             try { & $Write $Writer } finally { $Writer.Dispose() }
+            Add-Padding -Archive $Archive -Bytes 16MB
         }
         finally { $Archive.Dispose() }
         return $Path
@@ -183,12 +208,16 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated s
             $Archive = [System.IO.Compression.ZipFile]::Open($Path, 'Create')
             try
             {
+                $Total = [long]0
                 foreach ($Key in $Entries.Keys)
                 {
                     $Entry = $Archive.CreateEntry($Key, [System.IO.Compression.CompressionLevel]::Fastest)
                     $Writer = [System.IO.StreamWriter]::new($Entry.Open())
                     try { $Writer.Write([string]$Entries[$Key]) } finally { $Writer.Dispose() }
+                    $Total += [System.Text.Encoding]::UTF8.GetByteCount([string]$Entries[$Key])
                 }
+                # Keeps the zip within 100 to 1 (see Add-Padding).
+                Add-Padding -Archive $Archive -Bytes ([long][Math]::Ceiling($Total / 50) + 1)
             }
             finally { $Archive.Dispose() }
             return $Path
