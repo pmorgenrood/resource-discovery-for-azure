@@ -131,8 +131,9 @@ five are derived from the `InstanceData` JSON on each record.
 
 ## Obfuscation of consumption data
 
-When `-Obfuscate` is used, consumption is masked with a scheme **separate** from
-the inventory obfuscation dictionary:
+When `-Obfuscate` is used, consumption is masked with the inventory's
+obfuscation dictionary, plus per-run caches for values the dictionary does not
+hold:
 
 - `ResourceId` / `resourceUri` is rebuilt segment-by-segment. The subscription
   id, resource group name, and resource name segments are replaced with
