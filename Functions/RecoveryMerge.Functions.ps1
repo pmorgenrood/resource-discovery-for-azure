@@ -622,7 +622,6 @@ function Merge-RecoveryData
             if ($null -ne $BadCell) { return }
             $Row = $_
             $RowIndex++
-            $ConsumptionHasRows = $true
             $RowId = [string]$Row.ResourceId
             $RowDropped = ([string]::IsNullOrWhiteSpace($RowId) -or [string]::IsNullOrWhiteSpace([string]$Row.MeterId))
             foreach ($Column in $NumberColumns)
@@ -656,6 +655,7 @@ function Merge-RecoveryData
                 $ConsumptionUnmaskedRow = $RowIndex
             }
         }
+        $ConsumptionHasRows = ($RowIndex -gt 0)
         if ($null -ne $BadCell)
         {
             $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
