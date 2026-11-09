@@ -50,7 +50,7 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
-    [int]    $ConcurrencyLimit = 6
+    [ValidateRange(1, [int]::MaxValue)][int] $ConcurrencyLimit = 6
 )
 
 # ---------------------------------------------------------------------------
