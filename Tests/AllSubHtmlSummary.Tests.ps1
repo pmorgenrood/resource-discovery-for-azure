@@ -302,6 +302,16 @@ Describe 'New-RdaAllSubHtmlSummary unreadable inventory' {
         $Html | Should -Match 'or the identity cannot read their resources \(a role without Reader, or an Azure CLI signed in as an account that cannot read them\)\.'
         $Html | Should -Match '<span class="tag warn">inventory unreadable</span>'
     }
+
+    It 'still links the report html of a folder whose inventory cannot be read' {
+        $Run = New-Run
+        $Dir = New-SubFolder -Root $Run -BadInventory
+        $HtmlName = @(Get-ChildItem -LiteralPath $Dir -Filter '*.html' -File)[0].Name
+        $Out = Join-Path $Run 'main.html'
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out 6>$null | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match ([regex]::Escape(('href="{0}' -f (Join-Path (Split-Path $Dir -Leaf) $HtmlName))))
+    }
 }
 
 Describe 'New-RdaAllSubHtmlSummary with no reports under strict mode' {
