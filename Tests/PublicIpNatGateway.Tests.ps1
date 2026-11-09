@@ -110,6 +110,18 @@ Describe 'Public IP on a NAT gateway' {
         $Row.AssociatedResourceType | Should -BeExactly 'loadBalancers'
     }
 
+    It 'names the NAT gateway when ipConfiguration is there with an empty id' {
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = '' }) -NatGateway ([pscustomobject]@{ id = $script:NatId })))[0]
+        $Row.AssociatedResource | Should -BeExactly 'nat-a'
+        $Row.AssociatedResourceType | Should -BeExactly 'natGateways'
+    }
+
+    It 'leaves the link empty, as before, for an empty ipConfiguration id and no NAT gateway' {
+        $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = '' }) -NoNatGateway))[0]
+        $Row.AssociatedResource | Should -BeNullOrEmpty
+        $Row.AssociatedResourceType | Should -BeNullOrEmpty
+    }
+
     It 'prefers ipConfiguration when both are set, as before' {
         $Row = (Invoke-Collector @(New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId }) -NatGateway ([pscustomobject]@{ id = $script:NatId })))[0]
         $Row.AssociatedResource | Should -BeExactly 'nic-a'

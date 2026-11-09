@@ -46,7 +46,7 @@ if ($Task -eq 'Processing')
             # provider type at segment 7 and the resource name at segment 8:
             #   .../providers/Microsoft.Network/networkInterfaces/<nic>/ipConfigurations/<cfg>
             #   .../providers/Microsoft.Network/natGateways/<nat>
-            if ($null -ne $Data.ipConfiguration.id)
+            if (-not [string]::IsNullOrEmpty([string]$Data.ipConfiguration.id))
             {
                 $AssocId = $Data.ipConfiguration.id
                 $AssociatedResource = if ([string]::IsNullOrEmpty($AssocId)) { $null } elseif ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
@@ -60,6 +60,12 @@ if ($Task -eq 'Processing')
                 $AssocId = [string]$Data.natGateway.id
                 $AssociatedResource = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { & $GetLinkToken $AssocId } else { $AssocId.split('/')[8] }
                 $AssociatedResourceType = $AssocId.split('/')[7]
+            }
+            elseif ($null -ne $Data.ipConfiguration.id)
+            {
+                # An empty ipConfiguration id and no NAT gateway: empty, as before.
+                $AssociatedResource = $null
+                $AssociatedResourceType = $null
             }
             else
             {
