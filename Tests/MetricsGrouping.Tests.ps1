@@ -18,6 +18,10 @@
 #   - a batch written to Metrics_*.json never splits one call's metrics, and
 #     there are no more batches than with one definition at a time.
 #
+# Each run sets RDA_TEST_METRIC_NO_SLEEP, so Metrics.ps1 skips the real wait
+# between retries and the throttled test does not sleep for minutes. A run
+# with -RealSleep leaves it unset, as in a real run.
+#
 # Get-AzMetric runs inside ForEach-Object -Parallel and Start-ThreadJob
 # runspaces, which Pester mocks do not reach. The tests therefore put a stand-in
 # Az.Monitor module first on PSModulePath. It records every call as a file and
@@ -190,7 +194,7 @@ Export-ModuleMember -Function Get-AzMetric
     # diagnostics lines.
     function Invoke-MetricsRun
     {
-        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{})
+        param([object[]]$Resources, [string]$RunName, [string]$Invalid = '', [string]$Omit = '', [string]$MultiError = '', [int]$SingleDelayMs = 0, [hashtable]$Points = @{}, [switch]$RealSleep)
 
         $RunDir = Join-Path $TestDrive $RunName
         $CallDir = Join-Path $RunDir 'calls'
@@ -208,14 +212,17 @@ Export-ModuleMember -Function Get-AzMetric
         $env:RDA_TEST_METRIC_MULTI_ERROR = $MultiError
         $env:RDA_TEST_SINGLE_DELAY_MS = $(if ($SingleDelayMs -gt 0) { [string]$SingleDelayMs } else { '' })
         $env:RDA_TEST_METRIC_POINTS = $PointsFile
+        $env:RDA_TEST_METRIC_NO_SLEEP = $(if ($RealSleep) { '' } else { '1' })
         $Global:DebugLogFile = Join-Path $RunDir 'debug.log'
 
+        $RunStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         try
         {
             $null = & $script:MetricsScript -Subscriptions $script:Subscriptions -Resources $Resources -Task 'Processing' -ConcurrencyLimit 16 -FilePath (Join-Path $RunDir 'Metrics_test') -Obfuscate $false *>&1
         }
         finally
         {
+            $RunStopwatch.Stop()
             $Global:DebugLogFile = $script:OriginalDebugLogFile
         }
 
@@ -228,6 +235,7 @@ Export-ModuleMember -Function Get-AzMetric
             Files      = $Files
             Records    = @($Files | ForEach-Object { $_.Records })
             DebugLines = @(if (Test-Path -LiteralPath (Join-Path $RunDir 'debug.log')) { Get-Content -LiteralPath (Join-Path $RunDir 'debug.log') })
+            Seconds    = $RunStopwatch.Elapsed.TotalSeconds
         }
     }
 
@@ -250,7 +258,7 @@ Export-ModuleMember -Function Get-AzMetric
 AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
-    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS' -ErrorAction SilentlyContinue
+    Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR', 'Env:RDA_TEST_METRIC_INVALID', 'Env:RDA_TEST_METRIC_OMIT', 'Env:RDA_TEST_METRIC_MULTI_ERROR', 'Env:RDA_TEST_SINGLE_DELAY_MS', 'Env:RDA_TEST_METRIC_POINTS', 'Env:RDA_TEST_METRIC_NO_SLEEP' -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 Azure Monitor requests per resource' {
@@ -514,11 +522,21 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         @($Run.DebugLines | Where-Object { $_ -match 'Azure Monitor requests: 1 for 4 metric definition\(s\), of which 0 single-metric fallback request\(s\)' }).Count | Should -Be 1
     }
 
+    It 'still sleeps between retries when the test hook is unset' {
+        # A server error waits 1 + 2 + 4 seconds (plus jitter) over its 3 retries.
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-real-sleep' -MultiError 'ServerError' -RealSleep
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        $Run.Seconds | Should -BeGreaterOrEqual 7
+    }
+
     It 'retries a throttled grouped request and does not fall back to one request per metric' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-throttled' -MultiError 'Throttled'
 
         # Throttled attempts have their own budget: 1 + 6 retries.
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 7
+        # The test hook skips the real waits, which add up to about two minutes.
+        $Run.Seconds | Should -BeLessThan 30
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         $Run.Records.Count | Should -Be 4
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0

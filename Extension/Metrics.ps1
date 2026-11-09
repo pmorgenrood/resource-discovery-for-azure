@@ -483,6 +483,9 @@ if ($Task -eq 'Processing')
     # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
     $MetricMaxThrottleRetries = 6
     $MetricMaxRetryAfterSeconds = 120
+    # Test hook: offline tests set RDA_TEST_METRIC_NO_SLEEP=1 to skip the real wait between retries.
+    # Real runs never set it, so they wait as planned.
+    $MetricSkipRetrySleep = ($env:RDA_TEST_METRIC_NO_SLEEP -eq '1')
     # Get-RdaRetryAfterSeconds (Functions/ResourceInventory.Functions.ps1) is not visible inside -Parallel runspaces; ship its definition.
     $MetricRetryAfterFnDef = if (Get-Command Get-RdaRetryAfterSeconds -CommandType Function -ErrorAction SilentlyContinue) { ${function:Get-RdaRetryAfterSeconds}.ToString() } else { $null }
 
@@ -538,6 +541,7 @@ if ($Task -eq 'Processing')
                 $CallMaxThrottleRetries = $using:MetricMaxThrottleRetries
                 $CallMaxRetryAfterSeconds = $using:MetricMaxRetryAfterSeconds
                 $RetryAfterFnDef = $using:MetricRetryAfterFnDef
+                $SkipRetrySleep = $using:MetricSkipRetrySleep
                 if ($RetryAfterFnDef) { Set-Item -Path function:Get-RdaRetryAfterSeconds -Value ([scriptblock]::Create($RetryAfterFnDef)) }
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
@@ -729,7 +733,7 @@ if ($Task -eq 'Processing')
                                 # Jitter so a wave of throttled calls does not retry in lockstep.
                                 $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
                                 $SleepSeconds = [math]::Round($Plan.SleepSeconds + $Jitter, 2)
-                                Start-Sleep -Seconds $SleepSeconds
+                                if (-not $SkipRetrySleep) { Start-Sleep -Seconds $SleepSeconds }
                             }
                             else
                             {
