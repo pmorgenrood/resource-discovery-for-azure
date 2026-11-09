@@ -159,6 +159,10 @@ Describe 'Reveal.ps1 with a full run and a newer scoped recovery run of one subs
         $script:Run.Text | Should -Match 'LEFT OUT: ResourcesReport20260303000000000cccc/ResourcesReport_20260303000000000cccc\.zip'
     }
 
+    It 'counts every whole pair as paired, also the ones left out' {
+        $script:Run.Text | Should -Match 'Paired \(zip \+ dictionary\)\s+: 3'
+    }
+
     It 'still reveals and ships the subscription that has one report' {
         Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000001bbbb.zip')
         Get-InnerText (Join-Path $script:Run.Staging 'ResourcesReport_20260101000000001bbbb.zip') | Should -Match 'rg-b-full'
