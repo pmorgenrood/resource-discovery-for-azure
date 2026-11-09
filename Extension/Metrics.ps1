@@ -1577,9 +1577,10 @@ function Add-MetricRecord
                 # True when Azure answered HTTP 404 (NotFound): the resource is not there any more
                 # (deleted, or being deleted, after discovery) or is not in this subscription. The
                 # same request is refused the same way on every retry, so it gets one attempt.
-                # A status code decides: the outermost exception in the chain that carries one is
-                # read, so a 5xx that wraps or quotes a 404 keeps its retries. Only when no
-                # exception carries a status is the text read: Get-AzMetric reports a 404 as
+                # A status code decides: a 404 on any exception in the chain makes it a 404, so a
+                # 5xx that wraps a 404 is one too (a client status wins over a 5xx wrapper). A
+                # chain whose statuses are all something else is not a 404, even when its text
+                # quotes one. Only when no exception carries a status is the text read: Get-AzMetric reports a 404 as
                 # "invalid status code 'NotFound'" with no status code on the exception (quotes
                 # optional, the literal 'invalid status code ' prefix is the anchor), and a newer
                 # SDK may give the error code 'ResourceNotFound' instead.
@@ -1588,11 +1589,17 @@ function Add-MetricRecord
                     param([System.Exception]$Exception)
 
                     $Chain = Get-MetricExceptionChain -Exception $Exception
+                    $SawStatus = $false
                     foreach ($Ex in $Chain)
                     {
                         $Status = Get-MetricExceptionStatus -Ex $Ex
-                        if ($null -ne $Status) { return ($Status -in @('404', 'NotFound')) }
+                        if ($null -ne $Status)
+                        {
+                            $SawStatus = $true
+                            if ($Status -in @('404', 'NotFound')) { return $true }
+                        }
                     }
+                    if ($SawStatus) { return $false }
                     foreach ($Ex in $Chain)
                     {
                         if ([string]$Ex.Message -match "invalid status code '?NotFound\b|^\s*\[ResourceNotFound\]")

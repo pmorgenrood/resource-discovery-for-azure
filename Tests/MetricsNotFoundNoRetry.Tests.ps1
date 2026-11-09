@@ -55,8 +55,19 @@ Describe 'Test-MetricNotFound' {
         Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new("upstream said: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)) | Should -BeFalse
     }
 
-    It 'reads the outermost status: a 500 that wraps a 404 is not permanent' {
+    It 'reads a 404 anywhere in the chain: a 500 that wraps a 404 is permanent' {
         $Inner = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Inner, [System.Net.HttpStatusCode]::InternalServerError)) | Should -BeTrue
+    }
+
+    It 'reads a 404 under a wrapper that carries no status, below a 5xx' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        $Middle = [System.Exception]::new('The request failed.', $Inner)
+        Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Middle, [System.Net.HttpStatusCode]::BadGateway)) | Should -BeTrue
+    }
+
+    It 'does not match a chain whose statuses are all 5xx, even when a message quotes a 404' {
+        $Inner = [System.Net.Http.HttpRequestException]::new("Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable)
         Test-MetricNotFound -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Inner, [System.Net.HttpStatusCode]::InternalServerError)) | Should -BeFalse
     }
 
