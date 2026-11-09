@@ -559,6 +559,7 @@ if ($Task -eq 'Processing')
                 function Get-RdaMetricRetryPlan
                 {
                     [CmdletBinding()]
+                    [OutputType([hashtable])]
                     param(
                         [int]$GenericFailures, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds,
                         [double]$ThrottleWaitedSeconds, [double]$Jitter,
