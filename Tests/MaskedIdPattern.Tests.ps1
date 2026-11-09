@@ -24,7 +24,7 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'consumption-only token'; Id = '/subscriptions/prod_sub_11111111-2222-4333-8444-555555555555/resourcegroups/prod_rg_mc_11111111-2222-4333-8444-555555555555/providers/microsoft.compute/disks/prod_aks_11111111-2222-4333-8444-555555555555' }
         @{ Label = '$system name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.servicebus/namespaces/{T}/topics/$system' }
         @{ Label = 'tenant-scope id with a type and no name'; Id = '/providers/Microsoft.Capacity/reservationOrders' }
-        @{ Label = 'tenant-scope id with an empty segment'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
+        @{ Label = 'stand-in path of an id that is not an ARM path'; Id = '/providers/rda.noid/ids/{T}' }
         @{ Label = 'tenant-scope id with a trailing slash'; Id = '/providers/Microsoft.Capacity/reservationOrders/{T}/' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T).Replace('{N}', $script:N)
@@ -41,6 +41,7 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'a path with no provider block'; Id = '/subscriptions/{T}/resourcegroups/{T}' }
         @{ Label = 'a real name after an empty segment'; Id = '/providers/microsoft.capacity/reservationorders//reservations/res-a' }
         @{ Label = 'a real name before a trailing slash'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/' }
+        @{ Label = 'an empty segment inside the path'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T)
         $Masked | Should -Not -Match $script:Pattern
