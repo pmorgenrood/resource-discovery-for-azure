@@ -41,7 +41,9 @@ function Get-MaskedIdPattern
 # and one real name there can look like a token, so a run whose IDs are all
 # tenant-scope is told by its dictionary (only an -Obfuscate run writes one),
 # or, with no dictionary at hand (it is never in the shared zip), when every
-# name of every one of its IDs is a full prod_/nonprod_<guid> token.
+# name of every one of its IDs is a full prod_/nonprod_<guid> token (a
+# '$system' name, which stays as written, aside; an extension resource adds a
+# second /providers/<namespace> block).
 function Test-ObfuscatedRun
 {
     param([string[]]$Ids, [string]$DictionaryPath)
@@ -52,10 +54,25 @@ function Test-ObfuscatedRun
     $Token = '^(?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
     foreach ($Id in $Ids)
     {
-        # /providers/<namespace>/<type>/<name>[/<type>/<name> ...]
+        # /providers/<namespace>(/<type>/<name>)+[/providers/<namespace>(/<type>/<name>)+ ...]
         $Parts = $Id.TrimEnd('/').Split('/')
-        if ($Parts.Count -lt 5 -or $Parts[1] -ne 'providers' -or $Parts.Count % 2 -eq 0) { return $false }
-        for ($i = 4; $i -lt $Parts.Count; $i += 2) { if ($Parts[$i] -notmatch $Token) { return $false } }
+        $Tokens = 0
+        $i = 1
+        while ($i -lt $Parts.Count)
+        {
+            if ($Parts[$i] -ieq 'providers')
+            {
+                # A namespace, then at least one type and name.
+                if ($i + 3 -ge $Parts.Count -or [string]::IsNullOrEmpty($Parts[$i + 1]) -or $Parts[$i + 2] -ieq 'providers') { return $false }
+                $i += 2
+                continue
+            }
+            if ($i -lt 3 -or $i + 1 -ge $Parts.Count) { return $false }
+            $Name = $Parts[$i + 1]
+            if ($Name -match $Token) { $Tokens++ } elseif ($Name -cne '$system') { return $false }
+            $i += 2
+        }
+        if ($Tokens -eq 0) { return $false }
     }
     return $true
 }

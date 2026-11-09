@@ -91,8 +91,12 @@ Describe 'Test-ObfuscatedRun' {
         Test-ObfuscatedRun -Ids @($script:Tenant) -DictionaryPath $script:Dict | Should -BeTrue
     }
 
-    It 'marks a run of tenant-scope ids obfuscated with no dictionary when every name is a token' {
-        Test-ObfuscatedRun -Ids @($script:Tenant, ('/providers/microsoft.capacity/reservationorders/' + $script:T + '/reservations/' + $script:T)) | Should -BeTrue
+    It 'marks a run of tenant-scope ids obfuscated with no dictionary when every name is a token (<Case>)' -ForEach @(
+        @{ Case = 'resource and child'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}', '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}') }
+        @{ Case = 'an extension resource'; Ids = @('/providers/Microsoft.Management/managementGroups/{T}/providers/Microsoft.Authorization/policyAssignments/{T}') }
+        @{ Case = 'a $system name'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}/topics/$system') }
+    ) {
+        Test-ObfuscatedRun -Ids @($Ids | ForEach-Object { $_.Replace('{T}', $script:T) }) | Should -BeTrue
     }
 
     It 'leaves a run of tenant-scope ids plain with no dictionary when <Case>' -ForEach @(
@@ -100,6 +104,10 @@ Describe 'Test-ObfuscatedRun' {
         @{ Case = 'a child name is real'; Ids = @('/providers/microsoft.capacity/reservationorders/{T}/reservations/res-a') }
         @{ Case = 'an id has a type and no name'; Ids = @('/providers/Microsoft.Capacity/reservationOrders') }
         @{ Case = 'a token is in upper case'; Ids = @('/providers/microsoft.capacity/reservationorders/PROD_11111111-2222-4333-8444-555555555555') }
+        @{ Case = 'a real name in an extension block'; Ids = @('/providers/Microsoft.Management/managementGroups/{T}/providers/Microsoft.Authorization/policyAssignments/pa-a') }
+        @{ Case = 'an extension block with no type'; Ids = @('/providers/Microsoft.Management/managementGroups/{T}/providers/Microsoft.Authorization') }
+        @{ Case = 'only $system names'; Ids = @('/providers/microsoft.capacity/reservationorders/$system') }
+        @{ Case = 'no namespace'; Ids = @('/providers//reservationorders/{T}') }
     ) {
         Test-ObfuscatedRun -Ids @($Ids | ForEach-Object { $_.Replace('{T}', $script:T) }) | Should -BeFalse
     }
