@@ -156,12 +156,13 @@ function Merge-RecoveryData
         }
 
         # Collect the DISTINCT obfuscation tokens present in the inventory text.
-        # The pattern matches single prod_/nonprod_<guid> tokens. Inventory IDs are not
-        # flat tokens: they are ARM-shaped paths
-        # (/subscriptions/<token>/resourcegroups/<token>/providers/<type>/<token>),
-        # so the pattern finds the subscription, resource-group and name tokens inside
-        # each path, and the Name/Subscription/ResourceGroup fields carry the same
-        # tokens. Those single tokens are keys of the name, subscription and
+        # The pattern matches single prod_/nonprod_<guid> tokens. This base writes an
+        # inventory ID either as a flat prod_/nonprod_ token or as an ARM-shaped path
+        # (/subscriptions/<token>/resourcegroups/<token>/providers/<type>/.../<token>,
+        # parent names kept real; the full ARM shape comes with PR #53). The
+        # pattern finds the flat token, or the subscription, resource-group and
+        # name tokens inside the path, and the Name/Subscription/ResourceGroup
+        # fields carry the same tokens. Those single tokens are keys of the name, subscription and
         # resource-group maps, so they are what this check counts. Consumption-style
         # tokens (prod_sub_/prod_rg_...) live in the CSV, not the inventory JSON, so
         # they never enter this scan.
