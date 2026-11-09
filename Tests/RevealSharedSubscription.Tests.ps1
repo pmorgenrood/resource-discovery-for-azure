@@ -440,7 +440,9 @@ Describe 'Reveal.ps1 with half a report pair in a folder' {
         $OldStaging = Join-Path $script:Root 'RevealedStaging_2026-01-01_00-00-00'
         $null = New-Item -ItemType Directory -Path $OldStaging -Force
         Copy-Item -LiteralPath (Join-Path $script:Root 'good/ResourcesReport_20260101000000000aaaa.zip') -Destination $OldStaging
-        [System.IO.File]::WriteAllText((Join-Path $OldStaging '.reveal-staging.json'), '{}')
+        # The mark an earlier reveal of this root writes.
+        $OldMark = [ordered]@{ Purpose = 'Reveal staging folder'; InventoryRoot = (Resolve-Path -LiteralPath $script:Root).Path; Fields = @('ResourceGroup', 'Subscription'); All = $false; Outputs = @{} }
+        [System.IO.File]::WriteAllText((Join-Path $OldStaging '.reveal-staging.json'), ($OldMark | ConvertTo-Json -Depth 5))
         $script:Run = Invoke-Reveal -Root $script:Root -Name 'halfpair' -Extra @('-RemoveStaging')
     }
 

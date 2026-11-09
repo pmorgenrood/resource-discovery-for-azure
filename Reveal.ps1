@@ -655,9 +655,12 @@ foreach ($Folder in $Folders)
             Sort-Object Name)
     $Dicts = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
 
-    # A staging folder of an earlier reveal holds revealed zips under the
-    # report names and no dictionary. It is not a report folder.
-    if ((Test-Path -LiteralPath (Join-Path $Folder.FullName $StagingMarkerName) -PathType Leaf) -or $Folder.Name -like 'RevealedStaging_*')
+    # A staging folder of an earlier reveal of this root holds revealed zips
+    # under the report names and no dictionary. It is not a report folder. It
+    # is known by the Reveal mark it holds for this root, never by its name
+    # or by a file of the mark's name alone: a report folder named
+    # RevealedStaging_* is still read.
+    if (Test-RevealMarkerForThisRoot (Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)))
     {
         $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
         continue
@@ -674,6 +677,10 @@ foreach ($Folder in $Folders)
     if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
     {
         $Reason = if ($Zips.Count -eq 0) { 'an obfuscation dictionary but no obfuscated report zip (ResourcesReport_<stamp>.zip) in folder, so its report is not in the bundle' } else { 'an obfuscated report zip but no obfuscation dictionary in folder, so it cannot be revealed and is not in the bundle (a report made without -Obfuscate does not belong under this inventory root)' }
+        if ($Zips.Count -gt 0 -and $Folder.Name -like 'RevealedStaging_*')
+        {
+            $Reason += '. If this is a staging folder of an earlier reveal (it holds no Reveal mark for this inventory root), move it out of the inventory root'
+        }
         $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
         continue
     }
