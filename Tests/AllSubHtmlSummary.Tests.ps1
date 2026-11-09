@@ -218,6 +218,21 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
     }
 }
 
+Describe 'Extension/Summary.ps1 privacy banner' {
+    It 'the per-subscription report never says it holds no real identifiers from a sample' {
+        $Run = New-Run
+        $Dir = New-SubFolder -Root $Run -Services @{ PublicIP = 3 } -Obfuscated
+        $Json = @(Get-ChildItem -LiteralPath $Dir -Filter 'Inventory_*.json')[0].FullName
+        $Out = Join-Path $Run 'per-sub.html'
+        $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
+        $Console = @(& $Script -JsonFile $Json -HtmlFile $Out 6>&1 | ForEach-Object { [string]$_ })
+        $Html = Get-Content -Path $Out -Raw
+        $Html | Should -Match 'privacy-banner obfuscated'
+        $Html | Should -Not -Match 'Real identifiers are not present|Suitable for sharing'
+        @($Console | Where-Object { $_ -match 'safe to share' }) | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'New-RdaAllSubHtmlSummaryFromZip (rebuild from consolidated zip)' {
 
     BeforeAll {

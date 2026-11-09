@@ -15,9 +15,8 @@
 # This test is SELF-CONTAINED: it builds a tiny Inventory JSON and a tiny
 # Consumption CSV in a temp dir, invokes the REAL Extension/Summary.ps1, and
 # asserts the banner is present / absent / scoped correctly. No live Azure, no
-# output zip. The comparison is count-level by design (the inventory and
-# consumption files obfuscate resource ids through different dictionaries, so a
-# per-VM join is impossible in an obfuscated report).
+# output zip. The comparison is by counts, and by ids when the two files' ids
+# meet (case aside); ids that never meet are compared by counts only.
 
 BeforeAll {
     $script:SummaryScript = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'Extension', 'Summary.ps1' | Resolve-Path | Select-Object -ExpandProperty Path
@@ -236,6 +235,25 @@ Describe 'VM billing-coverage banner' {
         $Line | Should -Not -BeNullOrEmpty -Because ($Out -join "`n")
         [int]($Line -replace '^GROWTH_MB=') | Should -BeLessThan 250
         Get-Content -Path $HtmlPath -Raw | Should -Match 'only 0 VMs'
+    }
+
+    It 'shows a running VM with no charge when another id is billed in its place and the counts are equal' {
+        $Ids = @(1..3 | ForEach-Object { '/subscriptions/{0}/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm{1}' -f '12345678-1234-1234-1234-123456789012', $_ })
+        $Inv = [pscustomobject]@{ VirtualMachines = @(
+                [pscustomobject]@{ ID = $Ids[0]; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
+                [pscustomobject]@{ ID = $Ids[1]; Name = 'vm2'; Subscription = 'sub'; PowerState = 'vm running' }
+                [pscustomobject]@{ ID = $Ids[2]; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' }) }
+        $InvPath = Join-Path $script:WorkDir 'inv-swapped.json'
+        $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
+        $Csv = Join-Path $script:WorkDir 'cons-swapped.csv'
+        # vm1 billed (in capitals), vm2 not, vm3 (stopped) billed: 2 running, 2 billed ids.
+        @([pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = $Ids[0].ToUpperInvariant() }, [pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = $Ids[2] }) |
+            Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Join-Path $script:WorkDir 'swapped.html'
+        & $script:SummaryScript -JsonFile $InvPath -HtmlFile $Html -ConsumptionFile $Csv -VmBillingGapThreshold 0 *> $null
+        $Text = Get-Content -LiteralPath $Html -Raw
+        $Text | Should -Match 'class="coverage-banner"'
+        $Text | Should -Match '2 running VMs were discovered in the inventory, but only 1 VMs have compute-usage records'
     }
 
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
