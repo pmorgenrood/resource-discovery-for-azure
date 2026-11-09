@@ -411,7 +411,7 @@ Describe 'Reveal.ps1 with two stamps in one folder' {
 
     It 'keeps staging under -RemoveStaging' {
         $Lines = @($script:Run.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
-        $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) hold half a report pair or a dictionary that cannot be read (see FAIL). Staging kept: put back the missing or broken report zip or dictionary, then re-run with -Resume:') -Because $script:Run.Text
+        $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:') -Because $script:Run.Text
         Test-Path -LiteralPath (Join-Path $script:Run.Staging 'ResourcesReport_20260202000000000ffff.zip') | Should -BeTrue
     }
 
@@ -462,7 +462,7 @@ Describe 'Reveal.ps1 with half a report pair in a folder' {
     It 'ships the whole pairs and keeps staging' {
         Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000003dddd.zip')
         $Lines = @($script:Run.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
-        $Lines | Should -Be @('-RemoveStaging skipped: 3 folder(s) hold half a report pair or a dictionary that cannot be read (see FAIL). Staging kept: put back the missing or broken report zip or dictionary, then re-run with -Resume:') -Because $script:Run.Text
+        $Lines | Should -Be @('-RemoveStaging skipped: 3 folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:') -Because $script:Run.Text
         Test-Path -LiteralPath $script:Run.Staging | Should -BeTrue
     }
 }
@@ -491,7 +491,70 @@ Describe 'Reveal.ps1 -RemoveStaging with two half pairs in one folder' {
 
     It 'counts one folder and says to put back the missing half, not to -Resume alone' {
         $Lines = @($script:Run.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
-        $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) hold half a report pair or a dictionary that cannot be read (see FAIL). Staging kept: put back the missing or broken report zip or dictionary, then re-run with -Resume:') -Because $script:Run.Text
+        $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:') -Because $script:Run.Text
+    }
+}
+
+# The way out each -RemoveStaging line gives must make the next run pass. The
+# pair line said only to put back a missing or broken file, which does not
+# help an extra dictionary of the same stamp or a report made without
+# -Obfuscate; the failed-folder line said only to run -Resume, which gives a
+# corrupt report's failure again. Each case is followed here to a clean run.
+Describe 'Reveal.ps1 -RemoveStaging way out for files that cannot be paired' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'wayoutpair'
+        Add-Report -Folder (Join-Path $script:Root 'good') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a')
+        $script:Extra = Join-Path $script:Root 'extra'
+        Add-Report -Folder $script:Extra -Stamp '20260101000000001bbbb' -Subs @(New-Sub -Id $script:SubB -RgName 'rg-b')
+        Copy-Item -LiteralPath (Join-Path $script:Extra 'ObfuscationDictionary_ResourcesReport_20260101000000001bbbb.json') -Destination (Join-Path $script:Extra 'ObfuscationDictionary_20260101000000001bbbb.json')
+        $script:Plain = Join-Path $script:Root 'plain'
+        Add-Report -Folder $script:Plain -Stamp '20260101000000002cccc' -Subs @(New-Sub -Id $script:SubC -RgName 'rg-c') -NoDictionary
+        $script:First = Invoke-Reveal -Root $script:Root -Name 'wayoutpair' -Extra @('-RemoveStaging')
+    }
+
+    It 'says to move the extra dictionary or the plain report away' {
+        $script:First.Exit | Should -Not -Be 0 -Because $script:First.Text
+        $Lines = @($script:First.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
+        $Lines | Should -Be @('-RemoveStaging skipped: 2 folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:') -Because $script:First.Text
+    }
+
+    It 'passes the -Resume run once they are moved away' {
+        $Away = Join-Path $script:WorkDir 'wayoutpair_away'
+        $null = New-Item -ItemType Directory -Path $Away -Force
+        Move-Item -LiteralPath (Join-Path $script:Extra 'ObfuscationDictionary_20260101000000001bbbb.json') -Destination $Away
+        Move-Item -LiteralPath (Join-Path $script:Plain 'ResourcesReport_20260101000000002cccc.zip') -Destination $Away
+        $Run = Invoke-Reveal -Root $script:Root -Name 'wayoutpair' -Extra @('-Resume', '-RemoveStaging')
+        $Run.Exit | Should -Be 0 -Because $Run.Text
+        Get-ZipNames $Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001bbbb.zip')
+        Test-Path -LiteralPath $Run.Staging | Should -BeFalse
+    }
+}
+
+Describe 'Reveal.ps1 -RemoveStaging way out for a report that failed to reveal' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'wayoutreveal'
+        Add-Report -Folder (Join-Path $script:Root 'good') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a')
+        $script:Broken = Join-Path $script:Root 'broken'
+        $script:BrokenSub = New-Sub -Id $script:SubB -RgName 'rg-b'
+        Add-Report -Folder $script:Broken -Stamp '20260101000000001bbbb' -Subs @($script:BrokenSub)
+        $script:BrokenZip = Join-Path $script:Broken 'ResourcesReport_20260101000000001bbbb.zip'
+        $script:GoodBytes = [System.IO.File]::ReadAllBytes($script:BrokenZip)
+        [System.IO.File]::WriteAllText($script:BrokenZip, 'not a zip')
+        $script:First = Invoke-Reveal -Root $script:Root -Name 'wayoutreveal' -Extra @('-RemoveStaging')
+    }
+
+    It 'says to fix the cause before -Resume' {
+        $script:First.Exit | Should -Not -Be 0 -Because $script:First.Text
+        $Lines = @($script:First.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
+        $Lines | Should -Be @('-RemoveStaging skipped: 1 folder(s) failed or timed out (see FAIL). Staging kept: fix the cause each FAIL line names (for a timeout, raise -FolderTimeoutMinutes), then re-run with -Resume:') -Because $script:First.Text
+    }
+
+    It 'passes the -Resume run once the report is put right' {
+        [System.IO.File]::WriteAllBytes($script:BrokenZip, $script:GoodBytes)
+        $Run = Invoke-Reveal -Root $script:Root -Name 'wayoutreveal' -Extra @('-Resume', '-RemoveStaging')
+        $Run.Exit | Should -Be 0 -Because $Run.Text
+        Get-ZipNames $Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001bbbb.zip')
+        Test-Path -LiteralPath $Run.Staging | Should -BeFalse
     }
 }
 
@@ -526,7 +589,7 @@ Describe 'Reveal.ps1 -RemoveStaging with a subscription in two reports' {
     It 'keeps staging and says to move the extra report away, not that folders failed' {
         $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
         $Lines = @($script:Run.Lines | Where-Object { $_ -like '-RemoveStaging skipped: *' })
-        $Lines | Should -Be @('-RemoveStaging skipped: 1 subscription(s) are in more than one report, in 2 folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume with -InventoryRoot pointing at one run''s folders):') -Because $script:Run.Text
+        $Lines | Should -Be @('-RemoveStaging skipped: 1 subscription(s) are in more than one report, in 2 folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume, into a new staging folder, with -InventoryRoot pointing at one run''s folders):') -Because $script:Run.Text
         Test-Path -LiteralPath $script:Run.Staging | Should -BeTrue
     }
 }

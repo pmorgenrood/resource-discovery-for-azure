@@ -1046,12 +1046,16 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
 }
 elseif ($RemoveStaging -and -not $CleanRun)
 {
-    # Name each cause, with the way out for it: folders whose reveal failed
-    # or timed out (-Resume redoes them), half report pairs or unreadable
-    # dictionaries (the missing or broken file must be put back first), a
-    # subscription in more than one report (the extra report must be moved
-    # away first), and the outer zip. Each count is of distinct folders, not of
-    # FAIL lines: one folder can have more than one.
+    # Name each cause, with the way out for it, so that following it makes
+    # the next run pass: folders whose reveal failed or timed out (the cause
+    # each FAIL line names must be fixed first, or -Resume gives the same
+    # failure; a timeout needs a longer -FolderTimeoutMinutes), report zips
+    # and dictionaries that cannot be paired or read (a missing or broken file
+    # must be put back, or an extra dictionary of the same stamp or a report
+    # made without -Obfuscate moved away), a subscription in more than one
+    # report (the extra report must be moved away first), and the outer zip.
+    # Each count is of distinct folders, not of FAIL lines: one folder can
+    # have more than one.
     $FolderCount = {
         param([string]$Kind)
         # Folder names compared as the file system does, as $PathComparison
@@ -1066,19 +1070,19 @@ elseif ($RemoveStaging -and -not $CleanRun)
     $SharedFolders = & $FolderCount 'shared'
     if ($RevealFailedFolders -gt 0)
     {
-        Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out. Staging kept so you can recover them with -Resume:" -f $RevealFailedFolders) -ForegroundColor Yellow
+        Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out (see FAIL). Staging kept: fix the cause each FAIL line names (for a timeout, raise -FolderTimeoutMinutes), then re-run with -Resume:" -f $RevealFailedFolders) -ForegroundColor Yellow
     }
     if ($HalfPairFolders -gt 0)
     {
-        Write-Host ("-RemoveStaging skipped: {0} folder(s) hold half a report pair or a dictionary that cannot be read (see FAIL). Staging kept: put back the missing or broken report zip or dictionary, then re-run with -Resume:" -f $HalfPairFolders) -ForegroundColor Yellow
+        Write-Host ("-RemoveStaging skipped: {0} folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:" -f $HalfPairFolders) -ForegroundColor Yellow
     }
     if ($SharedSubs -gt 0)
     {
-        Write-Host ("-RemoveStaging skipped: {0} subscription(s) are in more than one report, in {1} folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume with -InventoryRoot pointing at one run's folders):" -f $SharedSubs, $SharedFolders) -ForegroundColor Yellow
+        Write-Host ("-RemoveStaging skipped: {0} subscription(s) are in more than one report, in {1} folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume, into a new staging folder, with -InventoryRoot pointing at one run's folders):" -f $SharedSubs, $SharedFolders) -ForegroundColor Yellow
     }
     if ($null -ne $ConsolidationError)
     {
-        Write-Host "-RemoveStaging skipped: the outer zip could not be built (see above). Staging kept so you can re-run, or zip the revealed reports by hand:" -ForegroundColor Yellow
+        Write-Host "-RemoveStaging skipped: the outer zip could not be built (see above). Staging kept: fix the cause, then re-run with -Resume, or zip the revealed reports by hand:" -ForegroundColor Yellow
     }
     Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
 }
