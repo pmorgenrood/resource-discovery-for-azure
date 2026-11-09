@@ -251,7 +251,7 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
             if (-not $NoZip) { Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip' }
             # Whether the run wrote its zip, as Write-RdaReportZip returns it;
             # read by the run's last statement.
-            $ZipWritten = -not $NoZip
+            Set-Variable -Name ZipWritten -Value (-not $NoZip)
             $global:LASTEXITCODE = 0
             $Lines = @(& $script:DirectRun @Arguments 6>&1 | ForEach-Object { [string]$_ })
             [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines }
@@ -609,7 +609,7 @@ Describe 'Two direct ResourceInventory.ps1 runs in one PowerShell session' {
             Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip'
             # The zip was written, as Write-RdaReportZip returns it; read by the
             # run's last statement.
-            $ZipWritten = $true
+            Set-Variable -Name ZipWritten -Value $true
             $env:RDA_TEST_METRICS_GAP = $(if ($Gap) { '1' } else { '' })
             try
             {
@@ -908,9 +908,9 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
             Set-Content -LiteralPath $Zip -Value 'zip'
         }
         $Global:RdaUnwrittenReportZips = @($Partial)
-        $RunStartTime = (Get-Date).AddMinutes(-5)
+        Set-Variable -Name RunStartTime -Value (Get-Date).AddMinutes(-5)
         $script:Packed = @()
-        function Compress-Archive { param([string[]]$Path, [string]$DestinationPath, [switch]$Force) $script:Packed = @($Path) }
+        Mock Compress-Archive { $script:Packed = @($Path) }
         $Lines = @(. ([scriptblock]::Create($script:Consolidate)) 6>&1 | ForEach-Object { [string]$_ })
 
         $script:Packed | Should -Be @($Good)
@@ -926,9 +926,9 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
             Set-Content -LiteralPath $Zip -Value 'zip'
         }
         $Global:RdaUnwrittenReportZips = @()
-        $RunStartTime = (Get-Date).AddMinutes(-5)
+        Set-Variable -Name RunStartTime -Value (Get-Date).AddMinutes(-5)
         $script:Packed = @()
-        function Compress-Archive { param([string[]]$Path, [string]$DestinationPath, [switch]$Force) $script:Packed = @($Path) }
+        Mock Compress-Archive { $script:Packed = @($Path) }
         $Lines = @(. ([scriptblock]::Create($script:Consolidate)) 6>&1 | ForEach-Object { [string]$_ })
 
         @($script:Packed | Sort-Object) | Should -Be @($Zips | Sort-Object)
@@ -950,7 +950,7 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
         $StreamSummaryPath = Join-Path $TestDrive 'stream-unwritten-summary.json'
         . ([scriptblock]::Create((@($Write | ForEach-Object { $_.Extent.Text }) -join "`n")))
 
-        $S = [pscustomobject]@{ SummaryPath = $StreamSummaryPath }
+        Set-Variable -Name S -Value ([pscustomobject]@{ SummaryPath = $StreamSummaryPath })
         $Global:RdaUnwrittenReportZips = @()
         . ([scriptblock]::Create($Read[0].Extent.Text + "`n" + $Merge[0].Extent.Text))
         @($Global:RdaUnwrittenReportZips) | Should -Be @('/reports/ResourcesReport_y/ResourcesReport_y.zip')
