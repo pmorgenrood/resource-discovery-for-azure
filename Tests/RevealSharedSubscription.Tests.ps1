@@ -13,7 +13,7 @@
 # subscriptions of a report, so a report of A and B and a later report of A
 # were both shipped.
 # Reveal now never guesses: any report that shares a subscription id (read
-# from its dictionary) or its stamp with another report is left out, each
+# from its dictionary, or its run's log name) with another report is left out, each
 # such subscription is named by its masked token with the reports that hold
 # it, the run exits non-zero, and every subscription with exactly one report
 # still ships. Each report is paired only with the dictionary of its own
@@ -209,11 +209,13 @@ Describe 'Reveal.ps1 with a run over A and B and a later run of A' {
     }
 }
 
-Describe 'Reveal.ps1 with two reports of the same stamp' {
+# Two reports with the same stamp but different subscriptions (a copied
+# folder) are not ambiguous: each subscription is in one report. They used to
+# be left out for the shared stamp alone. Both now ship, under distinct inner
+# zip names.
+Describe 'Reveal.ps1 with two reports of the same stamp and different subscriptions' {
     BeforeAll {
         $script:Root = Join-Path $script:WorkDir 'samestamp'
-        # A copied folder: the same stamp in two folders, here with different
-        # subscriptions so only the stamp is shared.
         $script:S1 = New-Sub -Id $script:SubA -RgName 'rg-a'
         $script:S2 = New-Sub -Id $script:SubB -RgName 'rg-b'
         $script:S3 = New-Sub -Id $script:SubC -RgName 'rg-c'
@@ -223,18 +225,16 @@ Describe 'Reveal.ps1 with two reports of the same stamp' {
         $script:Run = Invoke-Reveal -Root $script:Root -Name 'samestamp'
     }
 
-    It 'names both reports, leaves them out and exits non-zero' {
-        $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
-        $Line = @($script:Run.Lines | Where-Object { $_ -like '  FAIL: reports with the same stamp 20260101000000000dddd*' })
-        $Line.Count | Should -Be 1 -Because $script:Run.Text
-        $Line[0] | Should -Match 'first/ResourcesReport_20260101000000000dddd\.zip'
-        $Line[0] | Should -Match 'second/ResourcesReport_20260101000000000dddd\.zip'
-        $script:Run.Text | Should -Match 'LEFT OUT: first/ResourcesReport_20260101000000000dddd\.zip'
-        $script:Run.Text | Should -Match 'LEFT OUT: second/ResourcesReport_20260101000000000dddd\.zip'
+    It 'leaves nothing out and exits 0' {
+        $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
+        $script:Run.Text | Should -Not -Match 'FAIL: '
+        $script:Run.Text | Should -Match 'Left out \(sub in >1 report\)\s+: 0'
     }
 
-    It 'still ships the report with its own stamp' {
-        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000001eeee.zip')
+    It 'ships both reports of the stamp under distinct names, each with its own values' {
+        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000dddd.zip', 'ResourcesReport_20260101000000001eeee.zip', 'second_ResourcesReport_20260101000000000dddd.zip')
+        Get-InnerText (Join-Path $script:Run.Staging 'ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-a'
+        Get-InnerText (Join-Path $script:Run.Staging 'second_ResourcesReport_20260101000000000dddd.zip') | Should -Match 'rg-b'
     }
 }
 
