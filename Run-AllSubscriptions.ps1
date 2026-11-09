@@ -600,6 +600,45 @@ if (-not $PreflightOnly)
 
     Invoke-PreFlightChecks -InventoryRoot $InventoryRoot
 }
+else
+{
+    # The free-space check of Invoke-PreFlightChecks, read only: on the
+    # inventory folder, or the nearest folder above it that is there (a
+    # preflight creates nothing). The write probe is left out (it writes).
+    $script:PreflightCheck = 'free disk space'
+    $PfDiskPath = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+    while (-not [string]::IsNullOrEmpty($PfDiskPath) -and -not (Test-Path -LiteralPath $PfDiskPath -PathType Container))
+    {
+        $PfDiskParent = Split-Path -Path $PfDiskPath -Parent
+        $PfDiskPath = if ($PfDiskParent -eq $PfDiskPath) { $null } else { $PfDiskParent }
+    }
+    try
+    {
+        $PfDrive = if ($PfDiskPath) { (Get-Item -LiteralPath $PfDiskPath -ErrorAction Stop).PSDrive } else { $null }
+        if ($null -ne $PfDrive -and $null -ne $PfDrive.Free)
+        {
+            $PfFreeMB = [math]::Round($PfDrive.Free / 1MB, 0)
+            if ($PfFreeMB -lt 100)
+            {
+                Write-Host ("ERROR: Free disk space at {0} is {1} MB. A run needs at least 100 MB to start." -f $PfDiskPath, $PfFreeMB) -ForegroundColor Red
+                Exit-Wrapper -Code 1
+            }
+            elseif ($PfFreeMB -lt 500)
+            {
+                Write-Host ("WARNING: Free disk space at {0} is {1} MB. A large multi-subscription run can exceed this." -f $PfDiskPath, $PfFreeMB) -ForegroundColor Yellow
+            }
+            else
+            {
+                Write-Host ("Free disk space: {0:N0} MB at {1}" -f $PfFreeMB, $PfDiskPath) -ForegroundColor Green
+            }
+        }
+    }
+    catch
+    {
+        # As in a run: free space that cannot be read is a warning, not a stop.
+        Write-Host ("WARNING: Could not determine free disk space at {0}: {1}" -f $PfDiskPath, $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
 
 
 $script:PreflightCheck = 'the tenant'

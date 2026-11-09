@@ -726,3 +726,35 @@ Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
         @($Out | Where-Object { $_ -like 'ARGS *' }) | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
+    BeforeAll {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $PreflightOnly' -and $_.Extent.Text.Contains('Invoke-PreFlightChecks') })
+        if ($If.Count -ne 1 -or $null -eq $If[0].ElseClause) { throw 'the -PreflightOnly else block was not found in Run-AllSubscriptions.ps1' }
+        $script:DiskBlock = [scriptblock]::Create((@($If[0].ElseClause.Statements | ForEach-Object { $_.Extent.Text }) -join "`n"))
+        function script:Invoke-DiskCheck
+        {
+            param([long]$FreeBytes)
+            $script:Exited = $null
+            Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = $FreeBytes } } }
+            Mock Exit-Wrapper { param($Code) $script:Exited = $Code }
+            @(. $script:DiskBlock 6>&1 | ForEach-Object { [string]$_ })
+        }
+        function Exit-Wrapper { param($Code) }
+    }
+
+    It 'stops with exit 1 naming free disk space when less than 100 MB is free, as a run does, and writes nothing' {
+        $Lines = Invoke-DiskCheck -FreeBytes (50MB)
+        $script:Exited | Should -Be 1
+        $script:PreflightCheck | Should -Be 'free disk space'
+        @($Lines | Where-Object { $_ -like 'ERROR: Free disk space at * is 50 MB. A run needs at least 100 MB to start.' }).Count | Should -Be 1
+        Should -Invoke Get-Item -Times 1 -Exactly
+    }
+
+    It 'passes with enough free space' {
+        $Lines = Invoke-DiskCheck -FreeBytes (2GB)
+        $script:Exited | Should -BeNullOrEmpty
+        @($Lines | Where-Object { $_ -like 'Free disk space: * MB at *' }).Count | Should -Be 1
+    }
+}
