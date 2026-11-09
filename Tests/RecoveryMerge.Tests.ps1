@@ -448,6 +448,34 @@ Describe 'Merge-RecoveryData consumption handling' {
         @($Result.Warnings | Where-Object { $_ -match "files match 'Consumption_\*\.csv'" }).Count | Should -Be 1
     }
 
+    It 'stops before writing anything when the <Which> consumption file it would zip lacks <Missing>' -ForEach @(
+        @{ Which = 'gap'; Missing = 'MeterId'; Header = 'InstanceData,MeterCategory,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId' },
+        @{ Which = 'recovery'; Missing = 'ResourceId'; Header = 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceUri' },
+        @{ Which = 'gap'; Missing = 'any header'; Header = '' }
+    ) {
+        $C = New-Case
+        $Bad = if ($Header) { "$Header`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id" } else { '' }
+        $GapCsv = if ($Which -eq 'gap') { $Bad } else { $script:CsvHeader }
+        $RecCsv = if ($Which -eq 'recovery') { $Bad } else { $script:CsvHeader }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $GapCsv
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $RecCsv
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Which -eq 'recovery') { $Splat.RecoverConsumption = $true }
+
+        { Merge-RecoveryData @Splat } | Should -Throw -ExpectedMessage "*the $Which bundle's consumption file*has no*column*Nothing was written*"
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a consumption file downstream would drop stops the merge before any file is written'
+    }
+
+    It 'carries a consumption file with quoted headers forward byte for byte' {
+        $C = New-Case
+        $Quoted = '"' + ($script:CsvHeader -replace ',', '","') + '"' + "`n" + '"{}","Compute","m1","MET","eastus","vm","1","Hours","2026-01-01","2026-01-02","/id","eastus","","",""'
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Quoted
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+        (Get-FileHash -LiteralPath (Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase))).Hash |
+            Should -Be (Get-FileHash -LiteralPath (Join-Path $C.Gap ('Consumption_{0}.csv' -f $script:GapBase))).Hash
+    }
+
     It 'writes a canonical header-only CSV when neither bundle has consumption' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
@@ -488,6 +516,24 @@ Describe 'Merge-RecoveryData metrics handling' {
         Test-Path -Path $Rebased | Should -BeTrue -Because 'recovery metrics are rebased to the output bundle base'
         (Get-Content -Path $Rebased -Raw) | Should -Match 'rec-metric'
         Test-Path -Path (Join-Path $C.Output ('Metrics_{0}__0.json' -f $script:RecBase)) | Should -BeFalse -Because 'the recovery base name must not survive into the output'
+    }
+
+    It 'stops before writing anything when a <Which> metrics file it would zip <Case>' -ForEach @(
+        @{ Which = 'gap'; Case = 'has Metrics that is not a list'; Text = '{"Metrics":"one"}' },
+        @{ Which = 'gap'; Case = 'is a JSON list'; Text = '[{"Metrics":[]}]' },
+        @{ Which = 'recovery'; Case = 'is not valid JSON'; Text = '{"Metrics":[' },
+        @{ Which = 'recovery'; Case = 'has no Metrics list'; Text = '{"Items":[]}' }
+    ) {
+        $C = New-Case
+        $GapMetrics = if ($Which -eq 'gap') { @{ '__0' = '{"Metrics":[]}'; '__1' = $Text } } else { @{ '__0' = '{"Metrics":[]}' } }
+        $RecMetrics = if ($Which -eq 'recovery') { @{ '__0' = $Text } } else { @{ '__0' = '{"Metrics":[]}' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $GapMetrics
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -MetricsFiles $RecMetrics
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Which -eq 'recovery') { $Splat.RecoverMetrics = $true }
+
+        { Merge-RecoveryData @Splat } | Should -Throw -ExpectedMessage "*the $Which bundle's metrics file*cannot be used*Nothing was written*"
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a metrics file downstream would drop stops the merge before any file is written'
     }
 
     It 'throws when -RecoverMetrics is set but the recovery bundle has no metrics' {
