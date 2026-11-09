@@ -1010,12 +1010,12 @@ if ($ParallelStreams -le 1)
             if ($ResCount -eq 0)
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
-                # and in the wrapper transcript. The most common cause is the signed-in
-                # identity not having Reader on the subscription; second is a sub that
-                # genuinely has no resources. Either way the user almost always wants
-                # to know immediately rather than discover it days later when the
-                # consolidated report turns out to be empty for some subs.
-                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. Likely permission gap (no Reader on the subscription) or a genuinely empty subscription. Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
+                # and in the wrapper transcript. Read access is not the cause: a
+                # subscription the identity cannot read stops the run at the
+                # up-front role check (or is skipped there with -AllowPartialAccess)
+                # before it is collected, so Resource Graph lists no resource in
+                # this one.
+                Write-Host ("WARNING: Subscription '{0}' returned 0 resources. It passed the up-front role check, so Resource Graph lists no resource in it (an empty subscription). Verify with: Search-AzGraph -Query 'resources | summarize count()' -Subscription {1}" -f $Sub.Name, $Sub.Id) -ForegroundColor Yellow
             }
             else
             {

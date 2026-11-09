@@ -236,7 +236,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
         if ($ResCount -eq 0)
         {
-            Write-Stream ("WARNING: '{0}' returned 0 resources (likely permission gap or empty sub)" -f $SubName) 'Yellow'
+            Write-Stream ("WARNING: '{0}' returned 0 resources (it passed the up-front role check, so it is an empty subscription)" -f $SubName) 'Yellow'
         }
         else
         {
