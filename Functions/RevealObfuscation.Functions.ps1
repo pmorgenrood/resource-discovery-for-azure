@@ -172,7 +172,8 @@ function Test-RevealPathInside
     $FolderId = Get-RevealPathIdentity $Folder
     if ($null -eq $FolderId) { return $false }
     $Current = [System.IO.Path]::GetFullPath($Path)
-    while (-not (Test-Path -LiteralPath $Current))
+    # A file is in the folder that holds it.
+    while (-not (Test-Path -LiteralPath $Current -PathType Container))
     {
         $Current = [System.IO.Path]::GetDirectoryName($Current)
         if ([string]::IsNullOrEmpty($Current)) { return $false }

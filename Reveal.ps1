@@ -488,18 +488,14 @@ New-Item -ItemType Directory -Path $RevealTempRoot -Force | Out-Null
 try { Set-RevealOwnerOnlyDirectory -Path $RevealTempRoot }
 catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $RevealTempRoot, $_.Exception.Message) }
 
-# The output zip must not live inside the staging directory, or it would be
-# swept into itself on the final Compress-Archive.
-# NB: Split-Path's -Parent switch is only valid with -Path, not -LiteralPath
-# (the two are in different parameter sets), so -Path is required here.
-$OutputZipParent = Split-Path -Path $OutputZip -Parent
-if (-not [string]::IsNullOrEmpty($OutputZipParent) -and (Test-Path -LiteralPath $OutputZipParent -PathType Container))
+# The output zip must not live anywhere inside the staging directory: directly
+# in it, it would be swept into itself, and in a folder under it, it would
+# stop -RemoveStaging from removing staging. Checked by identity, links
+# followed, from the nearest folder of the output path that exists (see
+# Test-RevealPathInside).
+if (Test-RevealPathInside -Path $OutputZip -Folder $StagingDirectory)
 {
-    $OutputZipParent = (Resolve-Path -LiteralPath $OutputZipParent).Path
-    if ([string]::Equals((ConvertTo-RevealComparablePath $OutputZipParent), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison))
-    {
-        throw "-OutputZip must not be inside the staging directory ($StagingDirectory); it would be included in itself. Choose a path outside staging."
-    }
+    throw "-OutputZip must not be inside the staging directory ($StagingDirectory); it would be included in itself or kept in staging. Choose a path outside staging."
 }
 
 Write-Host ("Inventory root : {0}" -f $InventoryRoot) -ForegroundColor Cyan
