@@ -1348,6 +1348,9 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The request was canceled due to the configured HttpClient.Timeout of 400 seconds elapsing.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('An error occurred while sending the request to https://login.example:443/token')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Status: 404 for this request.')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Request failed. StatusCode: 401')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTPStatusCode=403')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('StatusCode: 503')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP/1.1 503 Service Unavailable; the resource could not be found right now.')) | Should -Be 'Transient'
     }
 }
