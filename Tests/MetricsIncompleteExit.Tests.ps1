@@ -694,3 +694,56 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
         (Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 }).ExitCode | Should -Be 0
     }
 }
+
+Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
+    BeforeAll {
+        # The wrapper's statements that count the zips and exit 2 when one is
+        # missing, as written, with a stand-in Exit-Wrapper that records its code.
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Top = @((Get-ScriptAst -File 'Run-AllSubscriptions.ps1').EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$ExpectedZipCount = ' })[0]
+        $script:OutputCheck = (@($Top[$From..($From + 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
+
+        function script:Invoke-OutputCheck
+        {
+            param([hashtable]$InventoryPassthrough)
+            # Read by the lifted statements, which run in this scope.
+            $InventoryRoot = Join-Path $TestDrive 'check-reports'
+            New-Item -ItemType Directory -Path (Join-Path $InventoryRoot 'ResourcesReport_x') -Force | Out-Null
+            Set-Variable -Name TenantID -Value 'tenant-1'
+            Set-Variable -Name WrapperTranscriptStarted -Value $false
+            Set-Variable -Name ResumeStateFile -Value (Join-Path $InventoryRoot '.resume-state.json')
+            Set-Variable -Name RunStartTime -Value (Get-Date)
+            Set-Variable -Name SubResourceCounts -Value @([pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Count = 3 })
+            function Exit-Wrapper { param([int]$Code) Write-Output ('EXIT=' + $Code); throw 'wrapper exited' }
+            $Lines = [System.Collections.Generic.List[string]]::new()
+            try { . ([scriptblock]::Create($script:OutputCheck)) 6>&1 | ForEach-Object { $Lines.Add([string]$_) } }
+            catch { if ($_.Exception.Message -ne 'wrapper exited') { throw } }
+            return @($Lines)
+        }
+
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
+        else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'prints the FAILED (metrics) lines before it exits 2 for a missing zip' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 }
+
+        $Lines | Should -Contain 'EXIT=2'
+        $Lines | Should -Contain '=================== FAILED (metrics) ==================='
+        $Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+        [array]::IndexOf($Lines, '=================== FAILED (metrics) ===================') | Should -BeLessThan ([array]::IndexOf($Lines, 'EXIT=2'))
+    }
+
+    It 'prints no FAILED (metrics) lines when the metrics are complete' {
+        $Global:MetricsFailedSubs = @()
+        $Lines = Invoke-OutputCheck -InventoryPassthrough @{ ConcurrencyLimit = 6 }
+
+        $Lines | Should -Contain 'EXIT=2'
+        $Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+    }
+}

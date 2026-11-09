@@ -591,7 +591,7 @@ A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor
 
 A direct `ResourceInventory.ps1` run whose metrics were skipped because the sign-in could not be refreshed prints a short "FAILED (auth)" line for the metrics and exits `3` too.
 
-A direct `ResourceInventory.ps1` run whose report zip could not be written (for example a full disk) removes any partial zip, prints a "No report was written" line that names the folder that still holds the report files, and exits `2`. This wins over `3`: the "FAILED (metrics)" lines are still printed. Under `-RunAllSubs` the partial zip is removed too, and the wrapper's per-subscription output check then exits `2`.
+A direct `ResourceInventory.ps1` run whose report zip could not be written (for example a full disk) removes any partial zip, prints a "No report was written" line that names the folder that still holds the report files, and exits `2`. This wins over `3`: the "FAILED (metrics)" lines are still printed. Under `-RunAllSubs` the partial zip is removed too, and the wrapper's per-subscription output check then prints the "FAILED (metrics)" lines and exits `2`.
 
 ### Important Notes
 

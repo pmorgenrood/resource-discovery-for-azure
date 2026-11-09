@@ -1676,6 +1676,9 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
         }
+        # This early exit skips the end of the run, so the FAILED (metrics)
+        # lines are printed here too.
+        $null = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough -ReportRoot $InventoryRoot
         Exit-Wrapper -Code 2
     }
     Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {0} successful sub(s))" -f $ActualZipCount) -ForegroundColor Green
