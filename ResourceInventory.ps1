@@ -1218,13 +1218,16 @@ function ExecuteInventoryProcessing()
 
         # A write that fails stops here also when the run's error preference is
         # SilentlyContinue. A partial file is removed: the run then makes no zip,
-        # since a bad Inventory file fails the whole upload.
+        # since a bad Inventory file fails the whole upload. The failure is also
+        # recorded, so a file the write left behind is never taken as written.
+        $script:InventoryWriteFailed = $false
         try
         {
             $Global:SmaResources | ConvertTo-Json -depth 100 -compress | Out-File $Global:JsonFile -ErrorAction Stop
         }
         catch
         {
+            $script:InventoryWriteFailed = $true
             Write-Log -Message ('The inventory file could not be written: {0}: {1}' -f (Split-Path -Path $Global:JsonFile -Leaf), $_.Exception.Message) -Severity 'Error'
             if (Test-Path -LiteralPath $Global:JsonFile) { Remove-Item -LiteralPath $Global:JsonFile -Force -ErrorAction SilentlyContinue }
         }
@@ -1690,7 +1693,17 @@ finally
     catch { }
 }
 
-FinalizeOutputs
+# The summary reads the Inventory file, so it runs only when that file was
+# written and reads as an object. Otherwise the run makes no zip and exits 2
+# (under the wrapper, that subscription failed); see the zip step below.
+if ($script:InventoryWriteFailed -or -not (Test-RdaReportInventoryWritten -JsonFiles @($Global:JsonFile)))
+{
+    $InventoryNotWritten = $true
+}
+else
+{
+    FinalizeOutputs
+}
 
 Write-Log -Message ("Compressing Resources Output: {0}" -f $Global:ZipOutputFile) -Severity 'Info'
 
@@ -1822,7 +1835,7 @@ $JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Globa
 # no report (exit 2; under the wrapper, that subscription failed).
 # A missing or unreadable Inventory file fails the whole upload, so such a run
 # makes no zip either (exit 2), with or without -SkipMetrics.
-$InventoryNotWritten = -not (Test-RdaReportInventoryWritten -JsonFiles $JsonFiles)
+$InventoryNotWritten = ($InventoryNotWritten -eq $true) -or -not (Test-RdaReportInventoryWritten -JsonFiles $JsonFiles)
 $MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and ((@($Global:RdaMetricsWriteFailures | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -gt 0) -or -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles))
 
 if ($Obfuscate.IsPresent)

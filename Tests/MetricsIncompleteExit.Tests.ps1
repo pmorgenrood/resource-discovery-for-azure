@@ -936,6 +936,129 @@ Describe 'The Inventory file of a ResourceInventory.ps1 run' {
     }
 }
 
+Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
+    BeforeAll {
+        # The function that writes the Inventory file and the run's top-level
+        # statements from the first one that runs FinalizeOutputs to the end, as
+        # written, with the run's param block, both function files, the run's
+        # error preference and the real Summary.ps1. A stand-in Out-File writes
+        # the given part of the Inventory file and then fails as a full disk does
+        # (an error, not a throw); a stand-in Remove-Item fails when asked.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $Writer = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'ProcessResourceResult' }, $true))[0]
+        $Finalizer = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'FinalizeOutputs' })[0]
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_] -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $Top[$_].Extent.Text -match '\bFinalizeOutputs\b' })[0]
+        $script:FlowFolder = Join-Path $TestDrive 'inventory-flow'
+        New-Item -ItemType Directory -Path (Join-Path $script:FlowFolder 'Extension') -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Extension/Summary.ps1') -Destination (Join-Path $script:FlowFolder 'Extension/Summary.ps1')
+        Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Functions') -Destination (Join-Path $script:FlowFolder 'Functions') -Recurse
+        $script:InventoryFlow = Join-Path $script:FlowFolder 'inventory-flow.ps1'
+        Set-Content -LiteralPath $script:InventoryFlow -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                'function Out-File { [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject) begin { $Items = [System.Collections.Generic.List[object]]::new() } process { $Items.Add($InputObject) } end { $Text = ($Items -join ''''); if ($env:RDA_TEST_INVENTORY_WRITE_FAIL -and (Split-Path -Path $FilePath -Leaf) -like ''Inventory_*'') { Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -InputObject $env:RDA_TEST_INVENTORY_PART; Write-Error ''There is not enough space on the disk.'' } else { Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -InputObject $Text -Encoding utf8 -Append:$Append } } }'
+                'function Remove-Item { [CmdletBinding()] param([string]$LiteralPath, [string]$Path, [switch]$Force) if ($env:RDA_TEST_REMOVE_FAIL) { Write-Error ''Access to the path is denied.'' } else { Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters } }'
+                '$ErrorActionPreference = ''SilentlyContinue'''
+                '$Runtime = ''0:01''; $ReportingRunTime = ''0:01''; $PlatformOS = ''Linux'''
+                $Writer.Extent.Text
+                $Finalizer.Extent.Text
+                'ProcessResourceResult'
+                @($Top[$From..($Top.Count - 1)] | ForEach-Object { $_.Extent.Text })
+            ) -join "`n")
+
+        # Sets the names the run sets and the other files of a run, runs the
+        # lifted statements and returns the exit code, the lines and the zip.
+        function script:Invoke-InventoryFlow
+        {
+            param([hashtable]$Arguments, [switch]$WriteFails, [string]$Part = '', [switch]$RemoveFails)
+            $Stamp = '20261109140000000' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
+            $Folder = Join-Path $TestDrive ('flow-' + $Stamp)
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            $Global:DefaultPath = $Folder.TrimEnd('/') + '/'
+            $Global:ReportName = 'ResourcesReport'
+            $Global:CurrentDateTime = $Stamp
+            $Global:JsonFile = $Global:DefaultPath + 'Inventory_ResourcesReport_' + $Stamp + '.json'
+            $Global:HtmlFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.html'
+            $Global:ConsumptionFileCsv = $Global:DefaultPath + 'Consumption_ResourcesReport_' + $Stamp + '.csv'
+            $Global:ZipOutputFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.zip'
+            $Global:MetricsJsonFile = $Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '.json'
+            $Global:MetricsFailedSubs = @()
+            $Global:RdaMetricsWriteFailures = @()
+            $Global:SmaResources = [pscustomobject]@{ VirtualMachines = @([pscustomobject]@{ ID = 'vm-1'; Name = 'vm-1' }) }
+            $Global:Version = '1.0'
+            Set-Content -LiteralPath $Global:ConsumptionFileCsv -Value 'InstanceData,MeterCategory'
+            $env:RDA_TEST_INVENTORY_WRITE_FAIL = $(if ($WriteFails) { '1' } else { '' })
+            $env:RDA_TEST_INVENTORY_PART = $Part
+            $env:RDA_TEST_REMOVE_FAIL = $(if ($RemoveFails) { '1' } else { '' })
+            try
+            {
+                $global:LASTEXITCODE = 0
+                $Lines = @(& $script:InventoryFlow @Arguments *>&1 | ForEach-Object { [string]$_ })
+                [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines; ZipLeft = (Test-Path -LiteralPath $Global:ZipOutputFile) }
+            }
+            finally
+            {
+                foreach ($Name in @('RDA_TEST_INVENTORY_WRITE_FAIL', 'RDA_TEST_INVENTORY_PART', 'RDA_TEST_REMOVE_FAIL'))
+                {
+                    Microsoft.PowerShell.Management\Remove-Item -Path ('Env:' + $Name) -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'JsonFile', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'SmaResources', 'Version'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'skips the summary, makes no zip and exits 2 when the write failed and its partial file was removed' {
+        $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' } -WriteFails -Part '{"Virtual'
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the inventory file was not written*' }).Count | Should -Be 1
+        @($Result.Lines | Where-Object { $_ -like '*HTML report generation FAILED*' }).Count | Should -Be 0
+        Test-Path -LiteralPath $Global:HtmlFile | Should -BeFalse
+    }
+
+    It 'makes no zip and exits 2 when the write failed and left a file that reads as an object' {
+        $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' } -WriteFails -Part '{}' -RemoveFails
+
+        Test-Path -LiteralPath $Global:JsonFile | Should -BeTrue
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the inventory file was not written*' }).Count | Should -Be 1
+    }
+
+    It 'exits 2 under -RunAllSubs when the write failed, so that subscription counts as failed' {
+        $Global:RdaUnwrittenReportZips = @()
+        $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -WriteFails -Part '{}' -RemoveFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        $Global:RdaUnwrittenReportZips | Should -Be @($Global:ZipOutputFile)
+    }
+
+    It 'writes the summary and the zip and exits 0 when the write works' {
+        $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeTrue
+        Test-Path -LiteralPath $Global:HtmlFile | Should -BeTrue
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 0
+    }
+}
+
 Describe 'The Metrics files an earlier ResourceInventory.ps1 run could not write' {
     BeforeAll {
         # The run's param block and its top-level statements before the
