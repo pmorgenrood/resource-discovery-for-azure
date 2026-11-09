@@ -163,3 +163,54 @@ Describe 'Reveal.ps1 staging lock on a relative staging folder' -Skip:$IsWindows
         ($Run.Text -replace '\s+', ' ') | Should -Match 'Could not find'
     }
 }
+
+Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
+    # Each run is made in this session, as a user at a prompt would, so a lock
+    # left open by a stopped run would refuse the next run here as 'in use'.
+    BeforeAll {
+        function Invoke-RevealHere
+        {
+            param($Case, [string]$Bundle)
+            $Text = (& $script:Reveal -InventoryRoot $Case.Root -StagingDirectory $Case.Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+            return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = $Text }
+        }
+
+        function Assert-LockFree
+        {
+            param($Case)
+            $Lock = [System.IO.FileStream]::new((Join-Path $Case.Staging '.reveal-lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $Lock.Dispose()
+            $Next = Invoke-RevealHere -Case $Case -Bundle (Join-Path $Case.Dir 'next.zip')
+            $Next.Exit | Should -Be 0 -Because $Next.Text
+            Test-Path -LiteralPath (Join-Path $Case.Dir 'next.zip') -PathType Leaf | Should -BeTrue
+        }
+    }
+
+    It 'after refusing an -OutputZip inside staging' {
+        $Case = New-Case -Name 'stop-inside'
+        { Invoke-RevealHere -Case $Case -Bundle (Join-Path $Case.Staging 'out.zip') } | Should -Throw '*must not be inside the staging directory*'
+        Assert-LockFree $Case
+    }
+
+    It 'after a terminating error later in the run' {
+        $Case = New-Case -Name 'stop-error'
+        # Only the first run fails.
+        $env:REVEAL_LOCK_TEST_FAIL_ONCE = '1'
+        try
+        {
+            Mock Write-Host -ParameterFilter { $env:REVEAL_LOCK_TEST_FAIL_ONCE -eq '1' -and "$Object" -like 'Inventory root :*' } { $env:REVEAL_LOCK_TEST_FAIL_ONCE = $null; throw 'a failure after the lock' }
+            { Invoke-RevealHere -Case $Case -Bundle (Join-Path $Case.Dir 'bundle.zip') } | Should -Throw '*a failure after the lock*'
+            Assert-LockFree $Case
+        }
+        finally { $env:REVEAL_LOCK_TEST_FAIL_ONCE = $null }
+    }
+
+    It 'after the run is stopped, as Ctrl+C stops it' {
+        $Case = New-Case -Name 'stop-pipeline'
+        # Select-Object -First stops the run after its first line, the way a
+        # stop request from Ctrl+C does.
+        $null = & $script:Reveal -InventoryRoot $Case.Root -StagingDirectory $Case.Staging -OutputZip (Join-Path $Case.Dir 'bundle.zip') -FolderTimeoutMinutes 5 6>&1 | Select-Object -First 1
+        Test-Path -LiteralPath (Join-Path $Case.Dir 'bundle.zip') | Should -BeFalse
+        Assert-LockFree $Case
+    }
+}

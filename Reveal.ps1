@@ -482,780 +482,789 @@ catch [System.IO.IOException]
     if (-not $IsHeld) { throw }
     throw ("The staging folder {0} is in use by another Reveal run (its lock file {1} is held: {2}). Wait for that run to end, or use another -StagingDirectory." -f $StagingDirectory, $StagingLockPath, $_.Exception.Message)
 }
-# Release the lock and remove the lock file this run made (so a folder Reveal
-# refuses is left as it was), then stop with $Message.
-function Stop-RevealStagingRefused
+# Everything after the lock is taken runs in this try, so the lock is
+# released however the run stops: a refusal, a failure, any terminating
+# error or Ctrl+C. Without it a stopped run would leave the lock open in the
+# caller's session, and the next run there would be refused as "in use".
+try
 {
-    param([string]$Message)
-    $StagingLock.Dispose()
-    if (-not $StagingLockExisted) { Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue }
-    throw $Message
-}
-# Release the lock and remove its file, when staging is about to be removed
-# or the run ends.
-function Remove-RevealStagingLock
-{
-    if ($null -ne $StagingLock) { $StagingLock.Dispose() }
-    Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue
-}
-$StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
-$StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop | Where-Object { $_.Name -ne $StagingLockName }).Count -eq 0
-$Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
-$MarkerData = $Marker.Data
-$MarkedRoot = $Marker.Root
-$MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
-if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
-{
-    if ($Resume)
+    # Release the lock and remove the lock file this run made (so a folder Reveal
+    # refuses is left as it was), then stop with $Message.
+    function Stop-RevealStagingRefused
     {
-        $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
-        Stop-RevealStagingRefused (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
+        param([string]$Message)
+        $StagingLock.Dispose()
+        if (-not $StagingLockExisted) { Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue }
+        throw $Message
     }
-    Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
-}
-if (-not $Resume -and $MarkedForThisRoot)
-{
-    # Reveal's own folder from an earlier run, still holding its files. A
-    # fresh run into it would mix with them (and -RemoveStaging would then
-    # leave the earlier files without their mark, so the folder could not
-    # be resumed or reused). Say plainly what to do instead.
-    $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
-            Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') -and $_.Name -ne $RevealTempName -and $_.Name -ne $StagingLockName })
-    if ($Held.Count -gt 0)
+    # Release the lock and remove its file, when staging is about to be removed
+    # or the run ends.
+    function Remove-RevealStagingLock
     {
-        Stop-RevealStagingRefused ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
+        if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+        Remove-Item -LiteralPath $StagingLockPath -Force -ErrorAction SilentlyContinue
     }
-}
-if ($Resume -and $MarkedForThisRoot)
-{
-    # A resumed run must reveal the same fields as the run it continues, or
-    # one bundle would mix reports revealed for different fields.
-    $MarkedFields = $MarkerData['Fields']
-    if ($null -eq $MarkedFields)
+    $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
+    $StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop | Where-Object { $_.Name -ne $StagingLockName }).Count -eq 0
+    $Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
+    $MarkerData = $Marker.Data
+    $MarkedRoot = $Marker.Root
+    $MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
+    if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
     {
-        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
-    }
-    # The rest of the mark must have the shape Reveal writes, or it is not
-    # Reveal's, and the folder is refused before anything in it changes.
-    $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
-    if ($null -ne $ShapeProblem)
-    {
-        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
-    }
-    $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
-    if ($MarkedFieldsKey -cne $FieldsKey)
-    {
-        Stop-RevealStagingRefused ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
-    }
-    # The recorded outputs are read from a file anyone who can write to
-    # staging can change, and -RemoveStaging deletes each one whose bytes
-    # match its record. So every record is checked before any is used: its
-    # name is a plain file name directly in staging (no folder part, not
-    # '.' or '..', not a rooted path), and its fields have the types Reveal
-    # writes, with each SHA-256 as 64 hex characters. One bad record
-    # refuses the whole mark, before anything is written or deleted.
-    $RecordedOutputs = $MarkerData['Outputs']
-    $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
-    if ($null -ne $BadRecord)
-    {
-        Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
-    }
-    if ($RecordedOutputs -is [System.Collections.IDictionary])
-    {
-        foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
-    }
-}
-New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
-# Canonicalize staging too, so the per-folder exclusion compare below matches
-# the absolute FullName that Get-ChildItem returns.
-$StagingDirectory = (Resolve-Path -LiteralPath $StagingDirectory).Path
-# Staging will hold real names and ids. Make it owner-only (0700, or an
-# owner-only ACL on Windows) before anything is written into it, whether it was
-# just made or already existed; stop if that cannot be done.
-try { Set-RevealOwnerOnlyDirectory -Path $StagingDirectory }
-catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $StagingDirectory, $_.Exception.Message) }
-$StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
-Save-RevealStagingMarker
-# Expanded copies go here. Any left by an earlier run of this folder that was
-# stopped are removed first.
-$RevealTempRoot = Join-Path $StagingDirectory $RevealTempName
-if (Test-Path -LiteralPath $RevealTempRoot) { Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction Stop }
-New-Item -ItemType Directory -Path $RevealTempRoot -Force | Out-Null
-try { Set-RevealOwnerOnlyDirectory -Path $RevealTempRoot }
-catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $RevealTempRoot, $_.Exception.Message) }
-
-# The output zip must not live anywhere inside the staging directory: directly
-# in it, it would be swept into itself, and in a folder under it, it would
-# stop -RemoveStaging from removing staging. Checked by identity, links
-# followed, from the nearest folder of the output path that exists (see
-# Test-RevealPathInside).
-if (Test-RevealPathInside -Path $OutputZip -Folder $StagingDirectory)
-{
-    throw "-OutputZip must not be inside the staging directory ($StagingDirectory); it would be included in itself or kept in staging. Choose a path outside staging."
-}
-
-Write-Host ("Inventory root : {0}" -f $InventoryRoot) -ForegroundColor Cyan
-Write-Host ("Revealing      : {0}" -f ($Fields -join ', ')) -ForegroundColor Cyan
-Write-Host ("Staging        : {0}" -f $StagingDirectory) -ForegroundColor Cyan
-Write-Host ("Output zip     : {0}" -f $OutputZip) -ForegroundColor Cyan
-Write-Host ""
-
-# The staging folder is left out by its identity (see Get-RevealPathIdentity),
-# not its name: a report folder whose name differs from staging only by case
-# is still read, also in a case-sensitive Windows folder, and staging reached
-# through a link is still left out. A folder whose identity cannot be read is
-# compared by name, as the platform does.
-$StagingIdentity = Get-RevealPathIdentity $StagingDirectory
-$Folders = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object {
-            $FolderIdentity = if ($null -ne $StagingIdentity) { Get-RevealPathIdentity $_.FullName } else { $null }
-            if ($null -ne $FolderIdentity) { $FolderIdentity -cne $StagingIdentity }
-            else { -not [string]::Equals((ConvertTo-RevealComparablePath $_.FullName), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison) }
-        })
-
-$PairedCount = 0
-$RevealedCount = 0
-$ResumedCount = 0
-$SkippedItems = @()
-$FailedItems = @()
-# The staged zips this run stands for: the ones it revealed and, under -Resume,
-# the ones a prior run of this staging folder already revealed. Only these go
-# in the outer zip, never any other *.zip that happens to sit in staging.
-$RunOutputs = [System.Collections.Generic.List[string]]::new()
-
-# Hard cap on how long a single folder's reveal may run. A pathological report
-# (e.g. an unusually large or malformed zip) can make Expand-Archive /
-# Compress-Archive run effectively forever; without a cap one bad folder stalls
-# the entire batch. When a folder exceeds this it is abandoned, recorded as a
-# timeout failure, and the run continues with the next folder. Configurable via
-# -FolderTimeoutMinutes (default 20); Ceiling keeps a fractional-minute value
-# (e.g. 0.5) at a whole >=1s Wait-Job timeout.
-$RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
-
-# Find the reports to reveal, handling the cheap cases synchronously (half a
-# pair -> failed; already revealed under -Resume -> skip). Everything that needs
-# the reveal engine becomes a queued work item, drained by the bounded pool
-# below.
-#
-# Run-AllSubscriptions.ps1 runs ResourceInventory.ps1 once per subscription,
-# and each of those runs writes a NEW folder ResourcesReport<stamp> under the
-# inventory root holding ResourcesReport_<stamp>.zip and
-# ObfuscationDictionary_ResourcesReport_<stamp>.json. A second wrapper run into
-# the same root adds a second folder per subscription, with new masked tokens.
-# So:
-#  - every report zip in a folder is paired only with the dictionary of the
-#    SAME stamp (never with another stamp's dictionary next to it), and a
-#    report with no such dictionary, or a dictionary with no such report, is
-#    counted as failed (a folder with neither is only noted as skipped);
-#  - Reveal never guesses which of two reports of one subscription is right.
-#    The newer report is not always the fuller one: a recovery run of one
-#    service (no consumption, no metrics) is newer than the full run it
-#    repairs. So each report's subscriptions are read from the real ids in its
-#    dictionary's four id maps (the inventory's subscription values are tokens
-#    that resolve through these same maps), or, when its dictionary names
-#    none, from the name of its run's DebugLog_ or ErrorLog_ file in the
-#    inventory root (see $RunLogSubIds), and
-#    any report that shares a subscription id with another report is left out
-#    together with that other report, whichever subscriptions it also holds.
-#    Each such subscription is named by its masked token, with the report
-#    folders that hold it, and counted as failed, so the run exits non-zero.
-#    The user passes -InventoryRoot pointing at one run's folders, or moves
-#    the extra report away. Every report whose subscriptions are in no other
-#    report is still revealed and shipped. A shared stamp alone is not
-#    ambiguous: two such reports both ship, under distinct names (see
-#    $UsedOutNames).
-# The log name is what matches a report of a subscription with no resources,
-# whose dictionary is empty. Limit: a report whose dictionary names no
-# subscription and that has no such log (a run without Run-AllSubscriptions.ps1
-# names its log by stamp only, or the log was deleted) cannot be matched to
-# one, so it is revealed on its own, and an older non-empty report of the same
-# subscription is then revealed beside it. Closing that would need the run to
-# write its subscription somewhere Reveal can read, which is a change to what
-# the tool writes.
-$Candidates = [System.Collections.Generic.List[object]]::new()
-# The subscription each run was for, from the names of the local logs it
-# wrote. Under Run-AllSubscriptions.ps1 (-RunAllSubs) each
-# ResourceInventory.ps1 run writes DebugLog_<report>_<subscription id>.log, and
-# ErrorLog_<report>_<subscription id>.log when it logs an error, into the
-# parent of its report folder (the inventory root), where <report> is the
-# report zip's name without '.zip'. The run writes the debug log for every
-# subscription, also one with no resources, whose dictionary is empty and
-# names none. So an empty report is matched to its subscription when that
-# log is there. The log is used ONLY for a report whose dictionary names no
-# subscription: the stamp is not unique to one report (two folders can hold
-# reports of one stamp, for example a copied folder), so for a report whose
-# dictionary names its subscriptions, the logs of another report of the same
-# stamp would wrongly add that report's subscription to it. Logs are keyed by
-# the folder that holds them and the report name, and a report reads only the
-# logs in the folder that holds its own report folder.
-$RunLogSubIds = [System.Collections.Generic.Dictionary[string, object]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
-foreach ($Log in @(Get-ChildItem -LiteralPath $InventoryRoot -File -ErrorAction SilentlyContinue))
-{
-    if ($Log.Name -notmatch '^(?:DebugLog|ErrorLog)_(?<report>.+)_(?<sub>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.log$') { continue }
-    $LogKey = (ConvertTo-RevealComparablePath $Log.DirectoryName) + [System.IO.Path]::DirectorySeparatorChar + $Matches['report']
-    if (-not $RunLogSubIds.ContainsKey($LogKey)) { $RunLogSubIds[$LogKey] = [System.Collections.Generic.List[string]]::new() }
-    $LogSubId = $Matches['sub'].ToLowerInvariant()
-    if (-not $RunLogSubIds[$LogKey].Contains($LogSubId)) { $RunLogSubIds[$LogKey].Add($LogSubId) }
-}
-foreach ($Folder in $Folders)
-{
-    # The obfuscated per-sub reports, excluding any *_revealed.zip or
-    # *.partial.zip left by a prior run.
-    $Zips = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ResourcesReport_*.zip' -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notlike '*_revealed.zip' -and $_.Name -notlike '*.partial.zip' } |
-            Sort-Object Name)
-    $Dicts = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
-
-    # A staging folder of an earlier reveal of this root holds revealed zips
-    # under the report names and no dictionary. It is not a report folder. It
-    # is known by the Reveal mark it holds for this root, never by its name
-    # or by a file of the mark's name alone: a report folder named
-    # RevealedStaging_* is still read. The mark must also have the whole
-    # shape Reveal writes (see Get-RevealMarkerShapeProblem); a partial
-    # look-alike is not Reveal's, so its folder is read as a report folder.
-    $FolderMarker = Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)
-    if ((Test-RevealMarkerForThisRoot $FolderMarker) -and $null -eq (Get-RevealMarkerShapeProblem -Data $FolderMarker.Data))
-    {
-        $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
-        continue
-    }
-    # A folder with neither a report zip nor a dictionary may be anything,
-    # so it is only noted. A folder with only one of them is a report that
-    # cannot be revealed: it is counted as failed, so the run does not look
-    # complete without it.
-    if ($Zips.Count -eq 0 -and $Dicts.Count -eq 0)
-    {
-        $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'no obfuscated report zip and no obfuscation dictionary in folder' }
-        continue
-    }
-    if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
-    {
-        $Reason = if ($Zips.Count -eq 0) { 'an obfuscation dictionary but no obfuscated report zip (ResourcesReport_<stamp>.zip) in folder, so its report is not in the bundle' } else { 'an obfuscated report zip but no obfuscation dictionary in folder, so it cannot be revealed and is not in the bundle (a report made without -Obfuscate does not belong under this inventory root)' }
-        if ($Zips.Count -gt 0 -and $Folder.Name -like 'RevealedStaging_*')
+        if ($Resume)
         {
-            $Reason += '. If this is a staging folder of an earlier reveal (it holds no Reveal mark for this inventory root), move it out of the inventory root'
+            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
+            Stop-RevealStagingRefused (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
         }
-        $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
-        continue
+        Stop-RevealStagingRefused ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
     }
-    # The dictionaries some report zip of this folder pairs with.
-    $PairedDictNames = [System.Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
-
-    foreach ($Zip in $Zips)
+    if (-not $Resume -and $MarkedForThisRoot)
     {
-        # ResourcesReport_<stamp>.zip pairs with
-        # ObfuscationDictionary_ResourcesReport_<stamp>.json (or the short
-        # ObfuscationDictionary_<stamp>.json), and with nothing else.
-        $Stamp = $Zip.BaseName.Substring('ResourcesReport_'.Length)
-        $DictNames = @(('ObfuscationDictionary_' + $Zip.BaseName + '.json'), ('ObfuscationDictionary_' + $Stamp + '.json'))
-        $Matched = @($Dicts | Where-Object { $Name = $_.Name; @($DictNames | Where-Object { [string]::Equals($_, $Name, $PathComparison) }).Count -gt 0 })
-        foreach ($M in $Matched) { $null = $PairedDictNames.Add($M.Name) }
-        if ($Matched.Count -ne 1)
+        # Reveal's own folder from an earlier run, still holding its files. A
+        # fresh run into it would mix with them (and -RemoveStaging would then
+        # leave the earlier files without their mark, so the folder could not
+        # be resumed or reused). Say plainly what to do instead.
+        $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
+                Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') -and $_.Name -ne $RevealTempName -and $_.Name -ne $StagingLockName })
+        if ($Held.Count -gt 0)
         {
-            $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0])), so it cannot be revealed and is not in the bundle" } else { 'more than one dictionary with the same stamp, so it is not revealed and is not in the bundle' }
-            $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
-            continue
+            Stop-RevealStagingRefused ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
         }
-        $Dict = $Matched[0]
-        # Every whole pair (one report zip and the one dictionary of its
-        # stamp) is counted, also one whose dictionary then cannot be read
-        # and one later left out because its subscription is in another
-        # report.
-        $PairedCount++
-
-        # The subscriptions: every real subscription id in the dictionary's
-        # four id maps (token -> the real id of a resource), and the masked
-        # subscription tokens of each id (SubscriptionMap keys), used to name
-        # it without printing the real id.
-        $SubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-        $SubTokens = @{}
-        try
+    }
+    if ($Resume -and $MarkedForThisRoot)
+    {
+        # A resumed run must reveal the same fields as the run it continues, or
+        # one bundle would mix reports revealed for different fields.
+        $MarkedFields = $MarkerData['Fields']
+        if ($null -eq $MarkedFields)
         {
-            $DictJson = Get-Content -LiteralPath $Dict.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            foreach ($MapName in @('SubscriptionMap', 'ResourceGroupMap', 'ResourceIdMap', 'ResourceNameMap'))
-            {
-                $Map = $DictJson.$MapName
-                if ($null -eq $Map) { continue }
-                foreach ($Property in $Map.PSObject.Properties)
-                {
-                    $SubId = Get-SubGuidFromResourceId ([string]$Property.Value)
-                    if ([string]::IsNullOrEmpty($SubId)) { continue }
-                    $SubId = $SubId.ToLowerInvariant()
-                    $null = $SubIds.Add($SubId)
-                    if ($MapName -eq 'SubscriptionMap')
-                    {
-                        if (-not $SubTokens.ContainsKey($SubId)) { $SubTokens[$SubId] = [System.Collections.Generic.List[string]]::new() }
-                        if (-not $SubTokens[$SubId].Contains($Property.Name)) { $SubTokens[$SubId].Add($Property.Name) }
-                    }
-                }
-            }
+            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
         }
-        catch
+        # The rest of the mark must have the shape Reveal writes, or it is not
+        # Reveal's, and the folder is refused before anything in it changes.
+        $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
+        if ($null -ne $ShapeProblem)
         {
-            $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message); Kind = 'pair'; Folders = @($Folder.Name) }
-            continue
+            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
         }
-        # A dictionary that names no subscription: the subscription the run's
-        # own logs name, in the folder that holds this report's folder (see
-        # $RunLogSubIds). Two such reports of one stamp both take every
-        # subscription those logs name, so they are left out together rather
-        # than either being shipped as the other's subscription.
-        if ($SubIds.Count -eq 0)
+        $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
+        if ($MarkedFieldsKey -cne $FieldsKey)
         {
-            $LogKey = (ConvertTo-RevealComparablePath $Folder.Parent.FullName) + [System.IO.Path]::DirectorySeparatorChar + $Zip.BaseName
-            if ($RunLogSubIds.ContainsKey($LogKey))
-            {
-                foreach ($LogSubId in $RunLogSubIds[$LogKey]) { $null = $SubIds.Add($LogSubId) }
-            }
+            Stop-RevealStagingRefused ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
         }
-        $Candidates.Add([pscustomobject]@{
-                Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp
-                Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
-                SubIds = @($SubIds | Sort-Object); SubTokens = $SubTokens
-            })
+        # The recorded outputs are read from a file anyone who can write to
+        # staging can change, and -RemoveStaging deletes each one whose bytes
+        # match its record. So every record is checked before any is used: its
+        # name is a plain file name directly in staging (no folder part, not
+        # '.' or '..', not a rooted path), and its fields have the types Reveal
+        # writes, with each SHA-256 as 64 hex characters. One bad record
+        # refuses the whole mark, before anything is written or deleted.
+        $RecordedOutputs = $MarkerData['Outputs']
+        $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
+        if ($null -ne $BadRecord)
+        {
+            Stop-RevealStagingRefused ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
+        }
+        if ($RecordedOutputs -is [System.Collections.IDictionary])
+        {
+            foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
+        }
     }
-    # A dictionary no report zip of its stamp pairs with: its report is
-    # missing from the folder.
-    foreach ($Lone in @($Dicts | Where-Object { -not $PairedDictNames.Contains($_.Name) } | Sort-Object Name))
-    {
-        $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Lone.Name); Reason = 'an obfuscation dictionary with no report zip of the same stamp in its folder, so its report is not in the bundle'; Kind = 'pair'; Folders = @($Folder.Name) }
-    }
-}
-
-# Which reports hold each subscription id.
-$ReportsBySub = @{}
-foreach ($Candidate in $Candidates)
-{
-    foreach ($SubId in $Candidate.SubIds)
-    {
-        if (-not $ReportsBySub.ContainsKey($SubId)) { $ReportsBySub[$SubId] = [System.Collections.Generic.List[object]]::new() }
-        $ReportsBySub[$SubId].Add($Candidate)
-    }
-}
-$Ambiguous = [System.Collections.Generic.HashSet[int]]::new()
-$AdviceText = 'Reveal does not guess which report is right, so it reveals none of them. Pass -InventoryRoot pointing at one run''s folders, or move the extra report away.'
-foreach ($SubId in @($ReportsBySub.Keys | Sort-Object))
-{
-    $Holders = @($ReportsBySub[$SubId] | Sort-Object -Property Report)
-    if ($Holders.Count -lt 2) { continue }
-    foreach ($Holder in $Holders) { $null = $Ambiguous.Add($Holder.Index) }
-    # Name the subscription by its masked token in each report (never the
-    # real id), with the report that holds it.
-    $Named = @($Holders | ForEach-Object {
-            $Tokens = if ($_.SubTokens.ContainsKey($SubId)) { @($_.SubTokens[$SubId]) -join ', ' } else { 'no subscription token' }
-            '{0} in {1}' -f $Tokens, $_.Report
-        })
-    $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText); Kind = 'shared'; Folders = @($Holders | ForEach-Object { $_.Folder }) }
-}
-
-$LeftOutItems = @()
-$Selected = [System.Collections.Generic.List[object]]::new()
-foreach ($Candidate in $Candidates)
-{
-    if (-not $Ambiguous.Contains($Candidate.Index)) { $Selected.Add($Candidate); continue }
-    $Tokens = @($Candidate.SubIds | ForEach-Object { if ($Candidate.SubTokens.ContainsKey($_)) { @($Candidate.SubTokens[$_]) } } | Select-Object -Unique)
-    $Holds = if ($Tokens.Count -gt 0) { 'its subscription(s) masked as ' + ($Tokens -join ', ') } else { 'its subscription(s) (no subscription token in its dictionary)' }
-    $LeftOutItems += [pscustomobject]@{ Report = $Candidate.Report; Holds = $Holds }
-}
-$LeftOutItems = @($LeftOutItems | Sort-Object -Property Report)
-
-# A resumed run keeps a recorded output only when it is a name Reveal assigns
-# to the report pair the record names: the record's report zip name (a
-# ResourcesReport_<stamp>.zip, as Reveal reads them), or that name with a copy
-# number in front (2_, 3_ and so on, see $UsedOutNames below). When that pair
-# is under the root now (the same folder and report zip name), the record
-# must also name its dictionary. A record of a pair no longer under the root
-# (for example an older report that was moved away) is kept, so a clean
-# -RemoveStaging still removes that older output. Any other record (for
-# example one for notes.txt, which Reveal never writes) is dropped from the
-# mark, and its file is kept: -RemoveStaging deletes only recorded outputs, so
-# it never deletes a file Reveal did not write.
-$DroppedRecords = @()
-foreach ($Name in @($StagingOutputs.Keys | Sort-Object))
-{
-    $Record = $StagingOutputs[$Name]
-    $SourceName = [string]$Record['SourceName']
-    $Assigned = $SourceName -cmatch '\AResourcesReport_.+\.zip\z' -and $SourceName -cnotlike '*_revealed.zip' -and $SourceName -cnotlike '*.partial.zip' -and
-    ($Name -ceq $SourceName -or $Name -cmatch ('\A(?:[2-9]|[1-9][0-9]+)_' + [regex]::Escape($SourceName) + '\z'))
-    if ($Assigned)
-    {
-        $Pair = @($Candidates | Where-Object { [string]$Record['SourceFolder'] -ceq $_.Folder -and $SourceName -ceq $_.Zip.Name })
-        if ($Pair.Count -gt 0 -and @($Pair | Where-Object { [string]$Record['DictionaryName'] -ceq $_.Dict.Name }).Count -eq 0) { $Assigned = $false }
-    }
-    if (-not $Assigned)
-    {
-        $DroppedRecords += $Name
-        $null = $StagingOutputs.Remove($Name)
-    }
-}
-if ($DroppedRecords.Count -gt 0)
-{
-    foreach ($Name in $DroppedRecords)
-    {
-        Write-Host ("Resume: dropped the staging mark's record of {0}: it is not an output Reveal makes for a report pair under {1}. Its file, if any, is kept." -f $Name, $InventoryRoot) -ForegroundColor Yellow
-    }
+    New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
+    # Canonicalize staging too, so the per-folder exclusion compare below matches
+    # the absolute FullName that Get-ChildItem returns.
+    $StagingDirectory = (Resolve-Path -LiteralPath $StagingDirectory).Path
+    # Staging will hold real names and ids. Make it owner-only (0700, or an
+    # owner-only ACL on Windows) before anything is written into it, whether it was
+    # just made or already existed; stop if that cannot be done.
+    try { Set-RevealOwnerOnlyDirectory -Path $StagingDirectory }
+    catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $StagingDirectory, $_.Exception.Message) }
+    $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
     Save-RevealStagingMarker
-}
+    # Expanded copies go here. Any left by an earlier run of this folder that was
+    # stopped are removed first.
+    $RevealTempRoot = Join-Path $StagingDirectory $RevealTempName
+    if (Test-Path -LiteralPath $RevealTempRoot) { Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction Stop }
+    New-Item -ItemType Directory -Path $RevealTempRoot -Force | Out-Null
+    try { Set-RevealOwnerOnlyDirectory -Path $RevealTempRoot }
+    catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $RevealTempRoot, $_.Exception.Message) }
 
-$Queue = [System.Collections.Generic.Queue[object]]::new()
-$UsedOutNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression = { $_.Zip.Name } }))
-{
-    $Folder = $Candidate.Folder
-    $Zip = $Candidate.Zip
-    $Dict = $Candidate.Dict
-
-    # Write the revealed copy straight into staging under the ORIGINAL zip name
-    # so the consolidated outer zip matches the structure the ingestion server
-    # expects from a normal multi-subscription run.
-    $OutName = $Zip.Name
-    if (-not $UsedOutNames.Add($OutName))
+    # The output zip must not live anywhere inside the staging directory: directly
+    # in it, it would be swept into itself, and in a folder under it, it would
+    # stop -RemoveStaging from removing staging. Checked by identity, links
+    # followed, from the nearest folder of the output path that exists (see
+    # Test-RevealPathInside).
+    if (Test-RevealPathInside -Path $OutputZip -Folder $StagingDirectory)
     {
-        # Two selected reports with the same file name (the same stamp in two
-        # folders, for example a copied folder, with different
-        # subscriptions). Both ship: the later ones, by folder name, go in
-        # as 2_<name>, 3_<name> and so on, so neither overwrites the other.
-        # The number is not taken from the folder's name, which can hold a
-        # real customer or resource name. Such a name never starts with
-        # 'ResourcesReport_', so it cannot be another report's own name.
-        $Copy = 2
-        do
-        {
-            $OutName = ('{0}_{1}' -f $Copy, $Zip.Name)
-            $Copy++
-        } while (-not $UsedOutNames.Add($OutName))
+        throw "-OutputZip must not be inside the staging directory ($StagingDirectory); it would be included in itself or kept in staging. Choose a path outside staging."
     }
-    $OutPath = Join-Path $StagingDirectory $OutName
-    $SourceSha256 = Get-RevealFileSha256 $Zip.FullName
-    $DictSha256 = Get-RevealFileSha256 $Dict.FullName
 
-    if ($Resume -and $StagingOutputs.ContainsKey($OutName))
+    Write-Host ("Inventory root : {0}" -f $InventoryRoot) -ForegroundColor Cyan
+    Write-Host ("Revealing      : {0}" -f ($Fields -join ', ')) -ForegroundColor Cyan
+    Write-Host ("Staging        : {0}" -f $StagingDirectory) -ForegroundColor Cyan
+    Write-Host ("Output zip     : {0}" -f $OutputZip) -ForegroundColor Cyan
+    Write-Host ""
+
+    # The staging folder is left out by its identity (see Get-RevealPathIdentity),
+    # not its name: a report folder whose name differs from staging only by case
+    # is still read, also in a case-sensitive Windows folder, and staging reached
+    # through a link is still left out. A folder whose identity cannot be read is
+    # compared by name, as the platform does.
+    $StagingIdentity = Get-RevealPathIdentity $StagingDirectory
+    $Folders = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object {
+                $FolderIdentity = if ($null -ne $StagingIdentity) { Get-RevealPathIdentity $_.FullName } else { $null }
+                if ($null -ne $FolderIdentity) { $FolderIdentity -cne $StagingIdentity }
+                else { -not [string]::Equals((ConvertTo-RevealComparablePath $_.FullName), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison) }
+            })
+
+    $PairedCount = 0
+    $RevealedCount = 0
+    $ResumedCount = 0
+    $SkippedItems = @()
+    $FailedItems = @()
+    # The staged zips this run stands for: the ones it revealed and, under -Resume,
+    # the ones a prior run of this staging folder already revealed. Only these go
+    # in the outer zip, never any other *.zip that happens to sit in staging.
+    $RunOutputs = [System.Collections.Generic.List[string]]::new()
+
+    # Hard cap on how long a single folder's reveal may run. A pathological report
+    # (e.g. an unusually large or malformed zip) can make Expand-Archive /
+    # Compress-Archive run effectively forever; without a cap one bad folder stalls
+    # the entire batch. When a folder exceeds this it is abandoned, recorded as a
+    # timeout failure, and the run continues with the next folder. Configurable via
+    # -FolderTimeoutMinutes (default 20); Ceiling keeps a fractional-minute value
+    # (e.g. 0.5) at a whole >=1s Wait-Job timeout.
+    $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
+
+    # Find the reports to reveal, handling the cheap cases synchronously (half a
+    # pair -> failed; already revealed under -Resume -> skip). Everything that needs
+    # the reveal engine becomes a queued work item, drained by the bounded pool
+    # below.
+    #
+    # Run-AllSubscriptions.ps1 runs ResourceInventory.ps1 once per subscription,
+    # and each of those runs writes a NEW folder ResourcesReport<stamp> under the
+    # inventory root holding ResourcesReport_<stamp>.zip and
+    # ObfuscationDictionary_ResourcesReport_<stamp>.json. A second wrapper run into
+    # the same root adds a second folder per subscription, with new masked tokens.
+    # So:
+    #  - every report zip in a folder is paired only with the dictionary of the
+    #    SAME stamp (never with another stamp's dictionary next to it), and a
+    #    report with no such dictionary, or a dictionary with no such report, is
+    #    counted as failed (a folder with neither is only noted as skipped);
+    #  - Reveal never guesses which of two reports of one subscription is right.
+    #    The newer report is not always the fuller one: a recovery run of one
+    #    service (no consumption, no metrics) is newer than the full run it
+    #    repairs. So each report's subscriptions are read from the real ids in its
+    #    dictionary's four id maps (the inventory's subscription values are tokens
+    #    that resolve through these same maps), or, when its dictionary names
+    #    none, from the name of its run's DebugLog_ or ErrorLog_ file in the
+    #    inventory root (see $RunLogSubIds), and
+    #    any report that shares a subscription id with another report is left out
+    #    together with that other report, whichever subscriptions it also holds.
+    #    Each such subscription is named by its masked token, with the report
+    #    folders that hold it, and counted as failed, so the run exits non-zero.
+    #    The user passes -InventoryRoot pointing at one run's folders, or moves
+    #    the extra report away. Every report whose subscriptions are in no other
+    #    report is still revealed and shipped. A shared stamp alone is not
+    #    ambiguous: two such reports both ship, under distinct names (see
+    #    $UsedOutNames).
+    # The log name is what matches a report of a subscription with no resources,
+    # whose dictionary is empty. Limit: a report whose dictionary names no
+    # subscription and that has no such log (a run without Run-AllSubscriptions.ps1
+    # names its log by stamp only, or the log was deleted) cannot be matched to
+    # one, so it is revealed on its own, and an older non-empty report of the same
+    # subscription is then revealed beside it. Closing that would need the run to
+    # write its subscription somewhere Reveal can read, which is a change to what
+    # the tool writes.
+    $Candidates = [System.Collections.Generic.List[object]]::new()
+    # The subscription each run was for, from the names of the local logs it
+    # wrote. Under Run-AllSubscriptions.ps1 (-RunAllSubs) each
+    # ResourceInventory.ps1 run writes DebugLog_<report>_<subscription id>.log, and
+    # ErrorLog_<report>_<subscription id>.log when it logs an error, into the
+    # parent of its report folder (the inventory root), where <report> is the
+    # report zip's name without '.zip'. The run writes the debug log for every
+    # subscription, also one with no resources, whose dictionary is empty and
+    # names none. So an empty report is matched to its subscription when that
+    # log is there. The log is used ONLY for a report whose dictionary names no
+    # subscription: the stamp is not unique to one report (two folders can hold
+    # reports of one stamp, for example a copied folder), so for a report whose
+    # dictionary names its subscriptions, the logs of another report of the same
+    # stamp would wrongly add that report's subscription to it. Logs are keyed by
+    # the folder that holds them and the report name, and a report reads only the
+    # logs in the folder that holds its own report folder.
+    $RunLogSubIds = [System.Collections.Generic.Dictionary[string, object]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
+    foreach ($Log in @(Get-ChildItem -LiteralPath $InventoryRoot -File -ErrorAction SilentlyContinue))
     {
-        # Revealed on a prior run. Take it only when the mark recorded it as
-        # finished, its bytes still match the record, and it came from this
-        # same report and dictionary; otherwise redo it. Skipping lets a
-        # resumed run advance past a folder that previously stalled the batch.
-        $Record = $StagingOutputs[$OutName]
-        $Redo = $null
-        if (-not (Test-Path -LiteralPath $OutPath -PathType Leaf)) { $Redo = 'its revealed zip is missing' }
-        elseif ([string]$Record['Sha256'] -cne (Get-RevealFileSha256 $OutPath)) { $Redo = 'its revealed zip does not match the one recorded' }
-        elseif ([string]$Record['SourceFolder'] -cne $Folder -or [string]$Record['SourceName'] -cne $Zip.Name -or [string]$Record['SourceSha256'] -cne $SourceSha256) { $Redo = 'its source report changed' }
-        elseif ([string]$Record['DictionaryName'] -cne $Dict.Name -or [string]$Record['DictionarySha256'] -cne $DictSha256) { $Redo = 'its dictionary changed' }
-        else
+        if ($Log.Name -notmatch '^(?:DebugLog|ErrorLog)_(?<report>.+)_(?<sub>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.log$') { continue }
+        $LogKey = (ConvertTo-RevealComparablePath $Log.DirectoryName) + [System.IO.Path]::DirectorySeparatorChar + $Matches['report']
+        if (-not $RunLogSubIds.ContainsKey($LogKey)) { $RunLogSubIds[$LogKey] = [System.Collections.Generic.List[string]]::new() }
+        $LogSubId = $Matches['sub'].ToLowerInvariant()
+        if (-not $RunLogSubIds[$LogKey].Contains($LogSubId)) { $RunLogSubIds[$LogKey].Add($LogSubId) }
+    }
+    foreach ($Folder in $Folders)
+    {
+        # The obfuscated per-sub reports, excluding any *_revealed.zip or
+        # *.partial.zip left by a prior run.
+        $Zips = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ResourcesReport_*.zip' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike '*_revealed.zip' -and $_.Name -notlike '*.partial.zip' } |
+                Sort-Object Name)
+        $Dicts = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
+
+        # A staging folder of an earlier reveal of this root holds revealed zips
+        # under the report names and no dictionary. It is not a report folder. It
+        # is known by the Reveal mark it holds for this root, never by its name
+        # or by a file of the mark's name alone: a report folder named
+        # RevealedStaging_* is still read. The mark must also have the whole
+        # shape Reveal writes (see Get-RevealMarkerShapeProblem); a partial
+        # look-alike is not Reveal's, so its folder is read as a report folder.
+        $FolderMarker = Read-RevealStagingMarker -Path (Join-Path $Folder.FullName $StagingMarkerName)
+        if ((Test-RevealMarkerForThisRoot $FolderMarker) -and $null -eq (Get-RevealMarkerShapeProblem -Data $FolderMarker.Data))
         {
-            try { Assert-RevealZipWithinLimits -Path $OutPath -What 'revealed zip' }
-            catch { $Redo = 'its revealed zip is over the zip limits' }
-        }
-        if ($null -eq $Redo)
-        {
-            $ResumedCount++
-            $RunOutputs.Add($OutPath)
+            $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
             continue
         }
-        Write-Host ("Resume: revealing {0} again: {1}." -f $OutName, $Redo) -ForegroundColor Yellow
-        $null = $StagingOutputs.Remove($OutName)
-        Save-RevealStagingMarker
-    }
-    elseif ($Resume -and (Test-Path -LiteralPath $OutPath))
-    {
-        Write-Host ("Resume: revealing {0} again: the mark has no record of it as finished." -f $OutName) -ForegroundColor Yellow
-    }
-
-    $Queue.Enqueue([pscustomobject]@{
-            Folder = $Folder; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath; OutName = $OutName
-            SourceName = $Zip.Name; SourceSha256 = $SourceSha256; DictionaryName = $Dict.Name; DictionarySha256 = $DictSha256
-        })
-}
-
-# Bounded job pool. Keep up to -ParallelStreams reveals in flight, each its own
-# child process (so a pathological Expand/Compress can be stopped instead of
-# wedging the batch) bounded by its OWN per-folder deadline ($RevealTimeoutSeconds).
-# The parent reaps every job serially in this one loop, so the shared counters
-# and record lists are mutated only on the parent thread - no cross-thread races.
-# The folders are independent (each has its own report zip + dictionary and
-# writes its own staged output), so revealing several at once is safe and the
-# obfuscation/reveal determinism is per-folder. -ParallelStreams 1 reproduces
-# the original one-at-a-time behaviour.
-$TotalToReveal = $Queue.Count
-$DoneCount = 0
-$Running = [System.Collections.Generic.List[object]]::new()
-
-while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
-{
-    # Fill free slots from the queue, stamping each job with its own deadline.
-    while ($Running.Count -lt $ParallelStreams -and $Queue.Count -gt 0)
-    {
-        $Item = $Queue.Dequeue()
-        # This job's own folder for its expanded copy, removed when the job is
-        # reaped or stopped.
-        $Item | Add-Member -NotePropertyName TempDir -NotePropertyValue (Join-Path $RevealTempRoot ([guid]::NewGuid().ToString('N')))
-        New-Item -ItemType Directory -Path $Item.TempDir -Force | Out-Null
-        $Job = Start-Job -ScriptBlock {
-            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory)
-            . $RevealFunctions
-            Invoke-RdaRevealFolder -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip -TempDirectory $TempDirectory *> $null
-        } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath, $Item.TempDir
-        $LaunchUtc = [DateTime]::UtcNow
-        $Running.Add([pscustomobject]@{ Item = $Item; Job = $Job; StartUtc = $LaunchUtc; Deadline = $LaunchUtc.AddSeconds($RevealTimeoutSeconds) })
-    }
-
-    Start-Sleep -Seconds 2
-
-    # Reap finished (Completed/Failed/Stopped) or timed-out jobs; keep the rest.
-    $StillRunning = [System.Collections.Generic.List[object]]::new()
-    foreach ($R in $Running)
-    {
-        if (@('Completed', 'Failed', 'Stopped') -contains $R.Job.State)
+        # A folder with neither a report zip nor a dictionary may be anything,
+        # so it is only noted. A folder with only one of them is a report that
+        # cannot be revealed: it is counted as failed, so the run does not look
+        # complete without it.
+        if ($Zips.Count -eq 0 -and $Dicts.Count -eq 0)
         {
+            $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'no obfuscated report zip and no obfuscation dictionary in folder' }
+            continue
+        }
+        if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
+        {
+            $Reason = if ($Zips.Count -eq 0) { 'an obfuscation dictionary but no obfuscated report zip (ResourcesReport_<stamp>.zip) in folder, so its report is not in the bundle' } else { 'an obfuscated report zip but no obfuscation dictionary in folder, so it cannot be revealed and is not in the bundle (a report made without -Obfuscate does not belong under this inventory root)' }
+            if ($Zips.Count -gt 0 -and $Folder.Name -like 'RevealedStaging_*')
+            {
+                $Reason += '. If this is a staging folder of an earlier reveal (it holds no Reveal mark for this inventory root), move it out of the inventory root'
+            }
+            $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
+            continue
+        }
+        # The dictionaries some report zip of this folder pairs with.
+        $PairedDictNames = [System.Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
+
+        foreach ($Zip in $Zips)
+        {
+            # ResourcesReport_<stamp>.zip pairs with
+            # ObfuscationDictionary_ResourcesReport_<stamp>.json (or the short
+            # ObfuscationDictionary_<stamp>.json), and with nothing else.
+            $Stamp = $Zip.BaseName.Substring('ResourcesReport_'.Length)
+            $DictNames = @(('ObfuscationDictionary_' + $Zip.BaseName + '.json'), ('ObfuscationDictionary_' + $Stamp + '.json'))
+            $Matched = @($Dicts | Where-Object { $Name = $_.Name; @($DictNames | Where-Object { [string]::Equals($_, $Name, $PathComparison) }).Count -gt 0 })
+            foreach ($M in $Matched) { $null = $PairedDictNames.Add($M.Name) }
+            if ($Matched.Count -ne 1)
+            {
+                $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0])), so it cannot be revealed and is not in the bundle" } else { 'more than one dictionary with the same stamp, so it is not revealed and is not in the bundle' }
+                $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason; Kind = 'pair'; Folders = @($Folder.Name) }
+                continue
+            }
+            $Dict = $Matched[0]
+            # Every whole pair (one report zip and the one dictionary of its
+            # stamp) is counted, also one whose dictionary then cannot be read
+            # and one later left out because its subscription is in another
+            # report.
+            $PairedCount++
+
+            # The subscriptions: every real subscription id in the dictionary's
+            # four id maps (token -> the real id of a resource), and the masked
+            # subscription tokens of each id (SubscriptionMap keys), used to name
+            # it without printing the real id.
+            $SubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            $SubTokens = @{}
             try
             {
-                # Re-throw any terminating error the child raised into the catch.
-                Receive-Job -Job $R.Job -ErrorAction Stop | Out-Null
-                if (Test-Path -LiteralPath $R.Item.OutPath)
+                $DictJson = Get-Content -LiteralPath $Dict.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                foreach ($MapName in @('SubscriptionMap', 'ResourceGroupMap', 'ResourceIdMap', 'ResourceNameMap'))
                 {
-                    $RevealedCount++
-                    $RunOutputs.Add($R.Item.OutPath)
-                    # Record the finished output in the mark, so a later
-                    # -Resume can check it before taking it.
-                    $StagingOutputs[$R.Item.OutName] = [ordered]@{
-                        Sha256           = Get-RevealFileSha256 $R.Item.OutPath
-                        SourceFolder     = $R.Item.Folder
-                        SourceName       = $R.Item.SourceName
-                        SourceSha256     = $R.Item.SourceSha256
-                        DictionaryName   = $R.Item.DictionaryName
-                        DictionarySha256 = $R.Item.DictionarySha256
+                    $Map = $DictJson.$MapName
+                    if ($null -eq $Map) { continue }
+                    foreach ($Property in $Map.PSObject.Properties)
+                    {
+                        $SubId = Get-SubGuidFromResourceId ([string]$Property.Value)
+                        if ([string]::IsNullOrEmpty($SubId)) { continue }
+                        $SubId = $SubId.ToLowerInvariant()
+                        $null = $SubIds.Add($SubId)
+                        if ($MapName -eq 'SubscriptionMap')
+                        {
+                            if (-not $SubTokens.ContainsKey($SubId)) { $SubTokens[$SubId] = [System.Collections.Generic.List[string]]::new() }
+                            if (-not $SubTokens[$SubId].Contains($Property.Name)) { $SubTokens[$SubId].Add($Property.Name) }
+                        }
                     }
-                    Save-RevealStagingMarker
-                }
-                else
-                {
-                    $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = 'reveal completed but produced no output zip'; Kind = 'reveal'; Folders = @($R.Item.Folder) }
                 }
             }
             catch
             {
-                # Drop any partial/truncated output so it is neither consolidated
-                # nor treated as done by a later -Resume.
+                $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message); Kind = 'pair'; Folders = @($Folder.Name) }
+                continue
+            }
+            # A dictionary that names no subscription: the subscription the run's
+            # own logs name, in the folder that holds this report's folder (see
+            # $RunLogSubIds). Two such reports of one stamp both take every
+            # subscription those logs name, so they are left out together rather
+            # than either being shipped as the other's subscription.
+            if ($SubIds.Count -eq 0)
+            {
+                $LogKey = (ConvertTo-RevealComparablePath $Folder.Parent.FullName) + [System.IO.Path]::DirectorySeparatorChar + $Zip.BaseName
+                if ($RunLogSubIds.ContainsKey($LogKey))
+                {
+                    foreach ($LogSubId in $RunLogSubIds[$LogKey]) { $null = $SubIds.Add($LogSubId) }
+                }
+            }
+            $Candidates.Add([pscustomobject]@{
+                    Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp
+                    Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
+                    SubIds = @($SubIds | Sort-Object); SubTokens = $SubTokens
+                })
+        }
+        # A dictionary no report zip of its stamp pairs with: its report is
+        # missing from the folder.
+        foreach ($Lone in @($Dicts | Where-Object { -not $PairedDictNames.Contains($_.Name) } | Sort-Object Name))
+        {
+            $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Lone.Name); Reason = 'an obfuscation dictionary with no report zip of the same stamp in its folder, so its report is not in the bundle'; Kind = 'pair'; Folders = @($Folder.Name) }
+        }
+    }
+
+    # Which reports hold each subscription id.
+    $ReportsBySub = @{}
+    foreach ($Candidate in $Candidates)
+    {
+        foreach ($SubId in $Candidate.SubIds)
+        {
+            if (-not $ReportsBySub.ContainsKey($SubId)) { $ReportsBySub[$SubId] = [System.Collections.Generic.List[object]]::new() }
+            $ReportsBySub[$SubId].Add($Candidate)
+        }
+    }
+    $Ambiguous = [System.Collections.Generic.HashSet[int]]::new()
+    $AdviceText = 'Reveal does not guess which report is right, so it reveals none of them. Pass -InventoryRoot pointing at one run''s folders, or move the extra report away.'
+    foreach ($SubId in @($ReportsBySub.Keys | Sort-Object))
+    {
+        $Holders = @($ReportsBySub[$SubId] | Sort-Object -Property Report)
+        if ($Holders.Count -lt 2) { continue }
+        foreach ($Holder in $Holders) { $null = $Ambiguous.Add($Holder.Index) }
+        # Name the subscription by its masked token in each report (never the
+        # real id), with the report that holds it.
+        $Named = @($Holders | ForEach-Object {
+                $Tokens = if ($_.SubTokens.ContainsKey($SubId)) { @($_.SubTokens[$SubId]) -join ', ' } else { 'no subscription token' }
+                '{0} in {1}' -f $Tokens, $_.Report
+            })
+        $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText); Kind = 'shared'; Folders = @($Holders | ForEach-Object { $_.Folder }) }
+    }
+
+    $LeftOutItems = @()
+    $Selected = [System.Collections.Generic.List[object]]::new()
+    foreach ($Candidate in $Candidates)
+    {
+        if (-not $Ambiguous.Contains($Candidate.Index)) { $Selected.Add($Candidate); continue }
+        $Tokens = @($Candidate.SubIds | ForEach-Object { if ($Candidate.SubTokens.ContainsKey($_)) { @($Candidate.SubTokens[$_]) } } | Select-Object -Unique)
+        $Holds = if ($Tokens.Count -gt 0) { 'its subscription(s) masked as ' + ($Tokens -join ', ') } else { 'its subscription(s) (no subscription token in its dictionary)' }
+        $LeftOutItems += [pscustomobject]@{ Report = $Candidate.Report; Holds = $Holds }
+    }
+    $LeftOutItems = @($LeftOutItems | Sort-Object -Property Report)
+
+    # A resumed run keeps a recorded output only when it is a name Reveal assigns
+    # to the report pair the record names: the record's report zip name (a
+    # ResourcesReport_<stamp>.zip, as Reveal reads them), or that name with a copy
+    # number in front (2_, 3_ and so on, see $UsedOutNames below). When that pair
+    # is under the root now (the same folder and report zip name), the record
+    # must also name its dictionary. A record of a pair no longer under the root
+    # (for example an older report that was moved away) is kept, so a clean
+    # -RemoveStaging still removes that older output. Any other record (for
+    # example one for notes.txt, which Reveal never writes) is dropped from the
+    # mark, and its file is kept: -RemoveStaging deletes only recorded outputs, so
+    # it never deletes a file Reveal did not write.
+    $DroppedRecords = @()
+    foreach ($Name in @($StagingOutputs.Keys | Sort-Object))
+    {
+        $Record = $StagingOutputs[$Name]
+        $SourceName = [string]$Record['SourceName']
+        $Assigned = $SourceName -cmatch '\AResourcesReport_.+\.zip\z' -and $SourceName -cnotlike '*_revealed.zip' -and $SourceName -cnotlike '*.partial.zip' -and
+        ($Name -ceq $SourceName -or $Name -cmatch ('\A(?:[2-9]|[1-9][0-9]+)_' + [regex]::Escape($SourceName) + '\z'))
+        if ($Assigned)
+        {
+            $Pair = @($Candidates | Where-Object { [string]$Record['SourceFolder'] -ceq $_.Folder -and $SourceName -ceq $_.Zip.Name })
+            if ($Pair.Count -gt 0 -and @($Pair | Where-Object { [string]$Record['DictionaryName'] -ceq $_.Dict.Name }).Count -eq 0) { $Assigned = $false }
+        }
+        if (-not $Assigned)
+        {
+            $DroppedRecords += $Name
+            $null = $StagingOutputs.Remove($Name)
+        }
+    }
+    if ($DroppedRecords.Count -gt 0)
+    {
+        foreach ($Name in $DroppedRecords)
+        {
+            Write-Host ("Resume: dropped the staging mark's record of {0}: it is not an output Reveal makes for a report pair under {1}. Its file, if any, is kept." -f $Name, $InventoryRoot) -ForegroundColor Yellow
+        }
+        Save-RevealStagingMarker
+    }
+
+    $Queue = [System.Collections.Generic.Queue[object]]::new()
+    $UsedOutNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression = { $_.Zip.Name } }))
+    {
+        $Folder = $Candidate.Folder
+        $Zip = $Candidate.Zip
+        $Dict = $Candidate.Dict
+
+        # Write the revealed copy straight into staging under the ORIGINAL zip name
+        # so the consolidated outer zip matches the structure the ingestion server
+        # expects from a normal multi-subscription run.
+        $OutName = $Zip.Name
+        if (-not $UsedOutNames.Add($OutName))
+        {
+            # Two selected reports with the same file name (the same stamp in two
+            # folders, for example a copied folder, with different
+            # subscriptions). Both ship: the later ones, by folder name, go in
+            # as 2_<name>, 3_<name> and so on, so neither overwrites the other.
+            # The number is not taken from the folder's name, which can hold a
+            # real customer or resource name. Such a name never starts with
+            # 'ResourcesReport_', so it cannot be another report's own name.
+            $Copy = 2
+            do
+            {
+                $OutName = ('{0}_{1}' -f $Copy, $Zip.Name)
+                $Copy++
+            } while (-not $UsedOutNames.Add($OutName))
+        }
+        $OutPath = Join-Path $StagingDirectory $OutName
+        $SourceSha256 = Get-RevealFileSha256 $Zip.FullName
+        $DictSha256 = Get-RevealFileSha256 $Dict.FullName
+
+        if ($Resume -and $StagingOutputs.ContainsKey($OutName))
+        {
+            # Revealed on a prior run. Take it only when the mark recorded it as
+            # finished, its bytes still match the record, and it came from this
+            # same report and dictionary; otherwise redo it. Skipping lets a
+            # resumed run advance past a folder that previously stalled the batch.
+            $Record = $StagingOutputs[$OutName]
+            $Redo = $null
+            if (-not (Test-Path -LiteralPath $OutPath -PathType Leaf)) { $Redo = 'its revealed zip is missing' }
+            elseif ([string]$Record['Sha256'] -cne (Get-RevealFileSha256 $OutPath)) { $Redo = 'its revealed zip does not match the one recorded' }
+            elseif ([string]$Record['SourceFolder'] -cne $Folder -or [string]$Record['SourceName'] -cne $Zip.Name -or [string]$Record['SourceSha256'] -cne $SourceSha256) { $Redo = 'its source report changed' }
+            elseif ([string]$Record['DictionaryName'] -cne $Dict.Name -or [string]$Record['DictionarySha256'] -cne $DictSha256) { $Redo = 'its dictionary changed' }
+            else
+            {
+                try { Assert-RevealZipWithinLimits -Path $OutPath -What 'revealed zip' }
+                catch { $Redo = 'its revealed zip is over the zip limits' }
+            }
+            if ($null -eq $Redo)
+            {
+                $ResumedCount++
+                $RunOutputs.Add($OutPath)
+                continue
+            }
+            Write-Host ("Resume: revealing {0} again: {1}." -f $OutName, $Redo) -ForegroundColor Yellow
+            $null = $StagingOutputs.Remove($OutName)
+            Save-RevealStagingMarker
+        }
+        elseif ($Resume -and (Test-Path -LiteralPath $OutPath))
+        {
+            Write-Host ("Resume: revealing {0} again: the mark has no record of it as finished." -f $OutName) -ForegroundColor Yellow
+        }
+
+        $Queue.Enqueue([pscustomobject]@{
+                Folder = $Folder; Zip = $Zip.FullName; Dict = $Dict.FullName; OutPath = $OutPath; OutName = $OutName
+                SourceName = $Zip.Name; SourceSha256 = $SourceSha256; DictionaryName = $Dict.Name; DictionarySha256 = $DictSha256
+            })
+    }
+
+    # Bounded job pool. Keep up to -ParallelStreams reveals in flight, each its own
+    # child process (so a pathological Expand/Compress can be stopped instead of
+    # wedging the batch) bounded by its OWN per-folder deadline ($RevealTimeoutSeconds).
+    # The parent reaps every job serially in this one loop, so the shared counters
+    # and record lists are mutated only on the parent thread - no cross-thread races.
+    # The folders are independent (each has its own report zip + dictionary and
+    # writes its own staged output), so revealing several at once is safe and the
+    # obfuscation/reveal determinism is per-folder. -ParallelStreams 1 reproduces
+    # the original one-at-a-time behaviour.
+    $TotalToReveal = $Queue.Count
+    $DoneCount = 0
+    $Running = [System.Collections.Generic.List[object]]::new()
+
+    while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
+    {
+        # Fill free slots from the queue, stamping each job with its own deadline.
+        while ($Running.Count -lt $ParallelStreams -and $Queue.Count -gt 0)
+        {
+            $Item = $Queue.Dequeue()
+            # This job's own folder for its expanded copy, removed when the job is
+            # reaped or stopped.
+            $Item | Add-Member -NotePropertyName TempDir -NotePropertyValue (Join-Path $RevealTempRoot ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path $Item.TempDir -Force | Out-Null
+            $Job = Start-Job -ScriptBlock {
+                param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory)
+                . $RevealFunctions
+                Invoke-RdaRevealFolder -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip -TempDirectory $TempDirectory *> $null
+            } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath, $Item.TempDir
+            $LaunchUtc = [DateTime]::UtcNow
+            $Running.Add([pscustomobject]@{ Item = $Item; Job = $Job; StartUtc = $LaunchUtc; Deadline = $LaunchUtc.AddSeconds($RevealTimeoutSeconds) })
+        }
+
+        Start-Sleep -Seconds 2
+
+        # Reap finished (Completed/Failed/Stopped) or timed-out jobs; keep the rest.
+        $StillRunning = [System.Collections.Generic.List[object]]::new()
+        foreach ($R in $Running)
+        {
+            if (@('Completed', 'Failed', 'Stopped') -contains $R.Job.State)
+            {
+                try
+                {
+                    # Re-throw any terminating error the child raised into the catch.
+                    Receive-Job -Job $R.Job -ErrorAction Stop | Out-Null
+                    if (Test-Path -LiteralPath $R.Item.OutPath)
+                    {
+                        $RevealedCount++
+                        $RunOutputs.Add($R.Item.OutPath)
+                        # Record the finished output in the mark, so a later
+                        # -Resume can check it before taking it.
+                        $StagingOutputs[$R.Item.OutName] = [ordered]@{
+                            Sha256           = Get-RevealFileSha256 $R.Item.OutPath
+                            SourceFolder     = $R.Item.Folder
+                            SourceName       = $R.Item.SourceName
+                            SourceSha256     = $R.Item.SourceSha256
+                            DictionaryName   = $R.Item.DictionaryName
+                            DictionarySha256 = $R.Item.DictionarySha256
+                        }
+                        Save-RevealStagingMarker
+                    }
+                    else
+                    {
+                        $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = 'reveal completed but produced no output zip'; Kind = 'reveal'; Folders = @($R.Item.Folder) }
+                    }
+                }
+                catch
+                {
+                    # Drop any partial/truncated output so it is neither consolidated
+                    # nor treated as done by a later -Resume.
+                    Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+                    $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = $_.Exception.Message; Kind = 'reveal'; Folders = @($R.Item.Folder) }
+                }
+                Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
+                $DoneCount++
+            }
+            elseif ([DateTime]::UtcNow -ge $R.Deadline)
+            {
+                # Exceeded this folder's cap. Kill the child so it cannot hold a slot,
+                # clean any partial output and the child's expanded copy (its own
+                # cleanup never runs once it is killed), record the timeout, free
+                # the slot.
+                Stop-Job -Job $R.Job -ErrorAction SilentlyContinue
+                Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
-                $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = $_.Exception.Message; Kind = 'reveal'; Folders = @($R.Item.Folder) }
+                $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = ("timed out after {0:0.##} minutes" -f ($RevealTimeoutSeconds / 60)); Kind = 'reveal'; Folders = @($R.Item.Folder) }
+                $DoneCount++
             }
-            Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
-            $DoneCount++
-        }
-        elseif ([DateTime]::UtcNow -ge $R.Deadline)
-        {
-            # Exceeded this folder's cap. Kill the child so it cannot hold a slot,
-            # clean any partial output and the child's expanded copy (its own
-            # cleanup never runs once it is killed), record the timeout, free
-            # the slot.
-            Stop-Job -Job $R.Job -ErrorAction SilentlyContinue
-            Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
-            $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = ("timed out after {0:0.##} minutes" -f ($RevealTimeoutSeconds / 60)); Kind = 'reveal'; Folders = @($R.Item.Folder) }
-            $DoneCount++
-        }
-        else
-        {
-            $StillRunning.Add($R)
-        }
-    }
-    $Running = $StillRunning
-
-    # Heartbeat: overall done/total plus the in-flight folders and their elapsed.
-    $InFlight = ($Running | ForEach-Object { '{0} [{1}s]' -f $_.Item.Folder, [int]([DateTime]::UtcNow - $_.StartUtc).TotalSeconds }) -join ', '
-    Write-RdaProgress -Activity 'Revealing per-subscription reports' `
-        -CurrentItem ('{0} of {1} done; {2} running: {3}' -f $DoneCount, $TotalToReveal, $Running.Count, $InFlight) `
-        -Index $DoneCount -Total $TotalToReveal
-}
-
-Write-RdaProgress -Activity 'Revealing per-subscription reports' -Completed
-# Every job is reaped, so no expanded copy is still in use.
-Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction SilentlyContinue
-
-# Consolidate the revealed per-sub zips into one outer zip for upload.
-# Only this run's outputs (see $RunOutputs) are taken. A *.partial.zip is never
-# among them: the single-report engine compresses to a sibling .partial.zip and
-# renames it to the final name on success, so a .partial.zip only exists if a
-# reveal was hard-killed mid-compress, and must never go in the outer zip.
-$StagedZips = @($RunOutputs | Select-Object -Unique |
-        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-        ForEach-Object { Get-Item -LiteralPath $_ })
-$ConsolidationError = $null
-if ($StagedZips.Count -gt 0)
-{
-    try
-    {
-        # The outer zip holds the real values, so it is owner-only (0600, or an
-        # owner-only ACL on Windows) from the start: it is written to a sibling
-        # .partial.zip made owner-only before anything goes in, then moved to
-        # its name, which keeps that. Each staged zip goes in at the top by its
-        # file name, as Compress-Archive -LiteralPath put it. The paths are
-        # taken as written, so '[' and ']' in a name are not a wildcard.
-        $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
-        Write-RevealZipFromFiles -Files @($StagedZips.FullName) -Path $OutputZipPartial
-        # A bundle the ingestion server would refuse is not moved into place,
-        # and the run does not say it is ready to upload.
-        Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'outer zip'
-        [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
-    }
-    catch
-    {
-        Remove-Item -LiteralPath $OutputZipPartial -Force -ErrorAction SilentlyContinue
-        # Fail LOUD but do not die here. The revealed per-subscription zips are
-        # already in staging, so the run is recoverable. Record the reason and
-        # fall through to the summary instead of terminating before it prints
-        # (which looked like a silent crash - header shown, no summary).
-        $ConsolidationError = $_.Exception.Message
-    }
-}
-
-# ---- Summary ---------------------------------------------------------------
-Write-Host ""
-Write-Host "================ Reveal Summary ================" -ForegroundColor Green
-Write-Host ("Per-subscription folders scanned : {0}" -f $Folders.Count) -ForegroundColor Green
-Write-Host ("Paired (zip + dictionary)        : {0}" -f $PairedCount) -ForegroundColor Green
-Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -ForegroundColor Green
-Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
-Write-Host ("Skipped (not a report folder)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host ("Left out (sub in >1 report)      : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host ("Failed (see FAIL lines)          : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
-
-foreach ($s in $SkippedItems)
-{
-    Write-Host ("  SKIP: {0} - {1}" -f $s.Folder, $s.Reason) -ForegroundColor Yellow
-}
-foreach ($o in $LeftOutItems)
-{
-    Write-Host ("  LEFT OUT: {0} - not revealed with {1}: it shares a subscription with another report (see FAIL)" -f $o.Report, $o.Holds) -ForegroundColor Yellow
-}
-foreach ($f in $FailedItems)
-{
-    Write-Host ("  FAIL: {0} - {1}" -f $f.Folder, $f.Reason) -ForegroundColor Red
-}
-
-Write-Host ""
-if ($null -eq $ConsolidationError -and $StagedZips.Count -gt 0 -and (Test-Path -LiteralPath $OutputZip))
-{
-    Write-Host ("Consolidated {0} revealed report(s) into:" -f $StagedZips.Count) -ForegroundColor Green
-    Write-Host ("  {0}" -f $OutputZip) -ForegroundColor Green
-    Write-Host "Upload this single zip to the ingestion server." -ForegroundColor Green
-}
-elseif ($null -ne $ConsolidationError)
-{
-    Write-Host ("Revealed {0} report(s), but consolidating them into the outer zip FAILED:" -f $StagedZips.Count) -ForegroundColor Red
-    Write-Host ("  {0}" -f $ConsolidationError) -ForegroundColor Red
-    Write-Host ("The revealed per-subscription zips are intact in staging - re-run or zip them manually:" ) -ForegroundColor Yellow
-    Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
-}
-else
-{
-    Write-Host "No revealed reports were produced - nothing to consolidate. Check the SKIP/FAIL list above." -ForegroundColor Red
-}
-
-# Only tear down staging on a fully CLEAN run (outer zip built, nothing failed
-# or timed out, no consolidation error). If any folder failed/timed out, the
-# staged zips are the only record of what already completed - deleting them
-# would defeat a later -Resume. So keep staging and say why.
-$CleanRun = ($FailedItems.Count -eq 0 -and $null -eq $ConsolidationError)
-if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
-{
-    try
-    {
-        # Remove only what Reveal put there: this run's zips, the other
-        # finished outputs the mark records (when their bytes still match the
-        # record, for example a report that an earlier run revealed and this
-        # run left out), their partial files and the staging mark. Anything else
-        # in the folder is not ours, so the folder is then kept.
-        foreach ($Staged in $StagedZips)
-        {
-            Remove-Item -LiteralPath $Staged.FullName -Force -ErrorAction Stop
-            Remove-Item -LiteralPath (($Staged.FullName -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
-        }
-        foreach ($Name in @($StagingOutputs.Keys))
-        {
-            $Recorded = Join-Path $StagingDirectory $Name
-            if ((Test-Path -LiteralPath $Recorded -PathType Leaf) -and (Get-RevealFileSha256 $Recorded) -ceq [string]$StagingOutputs[$Name]['Sha256'])
+            else
             {
-                Remove-Item -LiteralPath $Recorded -Force -ErrorAction Stop
-                Remove-Item -LiteralPath (($Recorded -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+                $StillRunning.Add($R)
             }
         }
-        Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath ($StagingMarkerPath + '.tmp') -Force -ErrorAction SilentlyContinue
-        # The run is done with staging, so its lock goes too.
-        Remove-RevealStagingLock
-        $Leftover = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop)
-        if ($Leftover.Count -eq 0)
-        {
-            Remove-Item -LiteralPath $StagingDirectory -Force -ErrorAction Stop
-            Write-Host ("Removed staging directory: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
-        }
-        else
-        {
-            Write-Host ("Removed the revealed zips from staging, but kept the folder: it holds {0} item(s) Reveal did not put there: {1}" -f $Leftover.Count, $StagingDirectory) -ForegroundColor Yellow
-        }
-    }
-    catch
-    {
-        Write-Host ("WARNING: could not remove staging directory {0}: {1}" -f $StagingDirectory, $_.Exception.Message) -ForegroundColor Yellow
-    }
-}
-elseif ($RemoveStaging -and -not $CleanRun)
-{
-    # Name each cause, with the way out for it, so that following it makes
-    # the next run pass: folders whose reveal failed or timed out (the cause
-    # each FAIL line names must be fixed first, or -Resume gives the same
-    # failure; a timeout needs a longer -FolderTimeoutMinutes), report zips
-    # and dictionaries that cannot be paired or read (a missing or broken file
-    # must be put back, or an extra dictionary of the same stamp or a report
-    # made without -Obfuscate moved away), a subscription in more than one
-    # report (the extra report must be moved away first), and the outer zip.
-    # Each count is of distinct folders, not of FAIL lines: one folder can
-    # have more than one.
-    $FolderCount = {
-        param([string]$Kind)
-        # The names come from one listing of the inventory root, in which two
-        # names are two folders, so they are compared exactly: 'bad' and 'BAD'
-        # are two folders on Linux and in a case-sensitive Windows folder, and
-        # a case-insensitive folder cannot list both.
-        $Distinct = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-        foreach ($Name in @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders })) { $null = $Distinct.Add([string]$Name) }
-        $Distinct.Count
-    }
-    $RevealFailedFolders = & $FolderCount 'reveal'
-    $HalfPairFolders = & $FolderCount 'pair'
-    $SharedSubs = @($FailedItems | Where-Object { $_.Kind -eq 'shared' }).Count
-    $SharedFolders = & $FolderCount 'shared'
-    if ($RevealFailedFolders -gt 0)
-    {
-        Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out (see FAIL). Staging kept: fix the cause each FAIL line names (for a timeout, raise -FolderTimeoutMinutes), then re-run with -Resume:" -f $RevealFailedFolders) -ForegroundColor Yellow
-    }
-    if ($HalfPairFolders -gt 0)
-    {
-        Write-Host ("-RemoveStaging skipped: {0} folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:" -f $HalfPairFolders) -ForegroundColor Yellow
-    }
-    if ($SharedSubs -gt 0)
-    {
-        Write-Host ("-RemoveStaging skipped: {0} subscription(s) are in more than one report, in {1} folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume, into a new staging folder, with -InventoryRoot pointing at one run's folders):" -f $SharedSubs, $SharedFolders) -ForegroundColor Yellow
-    }
-    if ($null -ne $ConsolidationError)
-    {
-        Write-Host "-RemoveStaging skipped: the outer zip could not be built (see above). Staging kept: fix the cause, then re-run with -Resume, or zip the revealed reports by hand:" -ForegroundColor Yellow
-    }
-    Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
-}
-else
-{
-    Write-Host ("Individual revealed zips kept in: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
-}
+        $Running = $StillRunning
 
-# The run is done with staging: release its lock (the lock file stays, holding
-# no lock, unless staging was removed above).
-if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+        # Heartbeat: overall done/total plus the in-flight folders and their elapsed.
+        $InFlight = ($Running | ForEach-Object { '{0} [{1}s]' -f $_.Item.Folder, [int]([DateTime]::UtcNow - $_.StartUtc).TotalSeconds }) -join ', '
+        Write-RdaProgress -Activity 'Revealing per-subscription reports' `
+            -CurrentItem ('{0} of {1} done; {2} running: {3}' -f $DoneCount, $TotalToReveal, $Running.Count, $InFlight) `
+            -Index $DoneCount -Total $TotalToReveal
+    }
+
+    Write-RdaProgress -Activity 'Revealing per-subscription reports' -Completed
+    # Every job is reaped, so no expanded copy is still in use.
+    Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Consolidate the revealed per-sub zips into one outer zip for upload.
+    # Only this run's outputs (see $RunOutputs) are taken. A *.partial.zip is never
+    # among them: the single-report engine compresses to a sibling .partial.zip and
+    # renames it to the final name on success, so a .partial.zip only exists if a
+    # reveal was hard-killed mid-compress, and must never go in the outer zip.
+    $StagedZips = @($RunOutputs | Select-Object -Unique |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            ForEach-Object { Get-Item -LiteralPath $_ })
+    $ConsolidationError = $null
+    if ($StagedZips.Count -gt 0)
+    {
+        try
+        {
+            # The outer zip holds the real values, so it is owner-only (0600, or an
+            # owner-only ACL on Windows) from the start: it is written to a sibling
+            # .partial.zip made owner-only before anything goes in, then moved to
+            # its name, which keeps that. Each staged zip goes in at the top by its
+            # file name, as Compress-Archive -LiteralPath put it. The paths are
+            # taken as written, so '[' and ']' in a name are not a wildcard.
+            $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+            Write-RevealZipFromFiles -Files @($StagedZips.FullName) -Path $OutputZipPartial
+            # A bundle the ingestion server would refuse is not moved into place,
+            # and the run does not say it is ready to upload.
+            Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'outer zip'
+            [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
+        }
+        catch
+        {
+            Remove-Item -LiteralPath $OutputZipPartial -Force -ErrorAction SilentlyContinue
+            # Fail LOUD but do not die here. The revealed per-subscription zips are
+            # already in staging, so the run is recoverable. Record the reason and
+            # fall through to the summary instead of terminating before it prints
+            # (which looked like a silent crash - header shown, no summary).
+            $ConsolidationError = $_.Exception.Message
+        }
+    }
+
+    # ---- Summary ---------------------------------------------------------------
+    Write-Host ""
+    Write-Host "================ Reveal Summary ================" -ForegroundColor Green
+    Write-Host ("Per-subscription folders scanned : {0}" -f $Folders.Count) -ForegroundColor Green
+    Write-Host ("Paired (zip + dictionary)        : {0}" -f $PairedCount) -ForegroundColor Green
+    Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -ForegroundColor Green
+    Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
+    Write-Host ("Skipped (not a report folder)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host ("Left out (sub in >1 report)      : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host ("Failed (see FAIL lines)          : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
+
+    foreach ($s in $SkippedItems)
+    {
+        Write-Host ("  SKIP: {0} - {1}" -f $s.Folder, $s.Reason) -ForegroundColor Yellow
+    }
+    foreach ($o in $LeftOutItems)
+    {
+        Write-Host ("  LEFT OUT: {0} - not revealed with {1}: it shares a subscription with another report (see FAIL)" -f $o.Report, $o.Holds) -ForegroundColor Yellow
+    }
+    foreach ($f in $FailedItems)
+    {
+        Write-Host ("  FAIL: {0} - {1}" -f $f.Folder, $f.Reason) -ForegroundColor Red
+    }
+
+    Write-Host ""
+    if ($null -eq $ConsolidationError -and $StagedZips.Count -gt 0 -and (Test-Path -LiteralPath $OutputZip))
+    {
+        Write-Host ("Consolidated {0} revealed report(s) into:" -f $StagedZips.Count) -ForegroundColor Green
+        Write-Host ("  {0}" -f $OutputZip) -ForegroundColor Green
+        Write-Host "Upload this single zip to the ingestion server." -ForegroundColor Green
+    }
+    elseif ($null -ne $ConsolidationError)
+    {
+        Write-Host ("Revealed {0} report(s), but consolidating them into the outer zip FAILED:" -f $StagedZips.Count) -ForegroundColor Red
+        Write-Host ("  {0}" -f $ConsolidationError) -ForegroundColor Red
+        Write-Host ("The revealed per-subscription zips are intact in staging - re-run or zip them manually:" ) -ForegroundColor Yellow
+        Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host "No revealed reports were produced - nothing to consolidate. Check the SKIP/FAIL list above." -ForegroundColor Red
+    }
+
+    # Only tear down staging on a fully CLEAN run (outer zip built, nothing failed
+    # or timed out, no consolidation error). If any folder failed/timed out, the
+    # staged zips are the only record of what already completed - deleting them
+    # would defeat a later -Resume. So keep staging and say why.
+    $CleanRun = ($FailedItems.Count -eq 0 -and $null -eq $ConsolidationError)
+    if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
+    {
+        try
+        {
+            # Remove only what Reveal put there: this run's zips, the other
+            # finished outputs the mark records (when their bytes still match the
+            # record, for example a report that an earlier run revealed and this
+            # run left out), their partial files and the staging mark. Anything else
+            # in the folder is not ours, so the folder is then kept.
+            foreach ($Staged in $StagedZips)
+            {
+                Remove-Item -LiteralPath $Staged.FullName -Force -ErrorAction Stop
+                Remove-Item -LiteralPath (($Staged.FullName -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+            }
+            foreach ($Name in @($StagingOutputs.Keys))
+            {
+                $Recorded = Join-Path $StagingDirectory $Name
+                if ((Test-Path -LiteralPath $Recorded -PathType Leaf) -and (Get-RevealFileSha256 $Recorded) -ceq [string]$StagingOutputs[$Name]['Sha256'])
+                {
+                    Remove-Item -LiteralPath $Recorded -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath (($Recorded -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath ($StagingMarkerPath + '.tmp') -Force -ErrorAction SilentlyContinue
+            # The run is done with staging, so its lock goes too.
+            Remove-RevealStagingLock
+            $Leftover = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop)
+            if ($Leftover.Count -eq 0)
+            {
+                Remove-Item -LiteralPath $StagingDirectory -Force -ErrorAction Stop
+                Write-Host ("Removed staging directory: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
+            }
+            else
+            {
+                Write-Host ("Removed the revealed zips from staging, but kept the folder: it holds {0} item(s) Reveal did not put there: {1}" -f $Leftover.Count, $StagingDirectory) -ForegroundColor Yellow
+            }
+        }
+        catch
+        {
+            Write-Host ("WARNING: could not remove staging directory {0}: {1}" -f $StagingDirectory, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+    elseif ($RemoveStaging -and -not $CleanRun)
+    {
+        # Name each cause, with the way out for it, so that following it makes
+        # the next run pass: folders whose reveal failed or timed out (the cause
+        # each FAIL line names must be fixed first, or -Resume gives the same
+        # failure; a timeout needs a longer -FolderTimeoutMinutes), report zips
+        # and dictionaries that cannot be paired or read (a missing or broken file
+        # must be put back, or an extra dictionary of the same stamp or a report
+        # made without -Obfuscate moved away), a subscription in more than one
+        # report (the extra report must be moved away first), and the outer zip.
+        # Each count is of distinct folders, not of FAIL lines: one folder can
+        # have more than one.
+        $FolderCount = {
+            param([string]$Kind)
+            # The names come from one listing of the inventory root, in which two
+            # names are two folders, so they are compared exactly: 'bad' and 'BAD'
+            # are two folders on Linux and in a case-sensitive Windows folder, and
+            # a case-insensitive folder cannot list both.
+            $Distinct = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($Name in @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders })) { $null = $Distinct.Add([string]$Name) }
+            $Distinct.Count
+        }
+        $RevealFailedFolders = & $FolderCount 'reveal'
+        $HalfPairFolders = & $FolderCount 'pair'
+        $SharedSubs = @($FailedItems | Where-Object { $_.Kind -eq 'shared' }).Count
+        $SharedFolders = & $FolderCount 'shared'
+        if ($RevealFailedFolders -gt 0)
+        {
+            Write-Host ("-RemoveStaging skipped: {0} folder(s) failed or timed out (see FAIL). Staging kept: fix the cause each FAIL line names (for a timeout, raise -FolderTimeoutMinutes), then re-run with -Resume:" -f $RevealFailedFolders) -ForegroundColor Yellow
+        }
+        if ($HalfPairFolders -gt 0)
+        {
+            Write-Host ("-RemoveStaging skipped: {0} folder(s) hold a report zip or dictionary that cannot be paired or read (see FAIL). Staging kept: put back the missing or broken file each FAIL line names, or move away the extra dictionary of the same stamp or the report made without -Obfuscate, then re-run with -Resume:" -f $HalfPairFolders) -ForegroundColor Yellow
+        }
+        if ($SharedSubs -gt 0)
+        {
+            Write-Host ("-RemoveStaging skipped: {0} subscription(s) are in more than one report, in {1} folder(s) (see FAIL). Staging kept: move the extra report away, then re-run with -Resume (or run without -Resume, into a new staging folder, with -InventoryRoot pointing at one run's folders):" -f $SharedSubs, $SharedFolders) -ForegroundColor Yellow
+        }
+        if ($null -ne $ConsolidationError)
+        {
+            Write-Host "-RemoveStaging skipped: the outer zip could not be built (see above). Staging kept: fix the cause, then re-run with -Resume, or zip the revealed reports by hand:" -ForegroundColor Yellow
+        }
+        Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host ("Individual revealed zips kept in: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
+    }
+}
+finally
+{
+    # The run is done with staging: release its lock (the lock file stays,
+    # holding no lock, unless staging was removed).
+    if ($null -ne $StagingLock) { $StagingLock.Dispose() }
+}
 
 # Non-zero exit if nothing was produced, or if any subscription failed to reveal,
 # so an automated/large run surfaces problems instead of looking clean.
