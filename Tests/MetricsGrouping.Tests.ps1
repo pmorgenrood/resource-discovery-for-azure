@@ -118,6 +118,11 @@ function Get-AzMetric
         'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource is gone.', $null, [System.Net.HttpStatusCode]::NotFound) }
         'Status503' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
         'NoStatus' { throw 'The connection was closed before the answer came.' }
+        'Status500Wrapping401' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The client is not signed in.', $null, [System.Net.HttpStatusCode]::Unauthorized), [System.Net.HttpStatusCode]::InternalServerError) }
+        'Status500Wrapping403' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The client has no access.', $null, [System.Net.HttpStatusCode]::Forbidden), [System.Net.HttpStatusCode]::InternalServerError) }
+        'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The resource is gone.', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
+        # A client error whose text holds "429" and "throttl" in a resource name.
+        'ForbiddenNamed429' { throw "Operation returned an invalid status code 'Forbidden' for vm-429-throttled" }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -778,7 +783,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
-    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }) {
+    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }, @{ SingleError = 'Status500Wrapping401' }, @{ SingleError = 'Status500Wrapping403' }, @{ SingleError = 'Status500Wrapping404' }) {
         # No access or a resource that is gone fails the same way on every run.
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-client-' + $SingleError) -SingleError $SingleError
 
@@ -851,5 +856,25 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         # A client error wrapped in a server error is still the client's.
         $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status BadRequest), [System.Net.HttpStatusCode]::InternalServerError)
         Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Wrapped | Should -BeFalse
+    }
+
+    It 'does not count a <Status> wrapped in a server error' -ForEach @(@{ Status = 'Unauthorized'; Code = 401 }, @{ Status = 'Forbidden'; Code = 403 }, @{ Status = 'NotFound'; Code = 404 }) {
+        # By the inner status code.
+        $ByCode = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status $Status), [System.Net.HttpStatusCode]::InternalServerError)
+        Get-MetricErrorStatus -Exception $ByCode | Should -Be $Code
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $ByCode | Should -BeFalse
+        # By the inner Az message, two levels down.
+        $ByText = [System.Net.Http.HttpRequestException]::new('The gateway failed.', [System.Exception]::new('Retry failed.', [System.Exception]::new("Operation returned an invalid status code '$Status'")), [System.Net.HttpStatusCode]::BadGateway)
+        Get-MetricErrorStatus -Exception $ByText | Should -Be $Code
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $ByText | Should -BeFalse
+    }
+
+    It 'still counts a server error that wraps another server error, a timeout or throttling' {
+        foreach ($Inner in @('ServiceUnavailable', 'RequestTimeout', 'TooManyRequests'))
+        {
+            $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status $Inner), [System.Net.HttpStatusCode]::InternalServerError)
+            Get-MetricErrorStatus -Exception $Wrapped | Should -Be 500 -Because $Inner
+            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Wrapped | Should -BeTrue -Because $Inner
+        }
     }
 }

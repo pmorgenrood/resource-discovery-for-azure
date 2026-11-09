@@ -629,14 +629,16 @@ if ($Task -eq 'Processing')
                     return $false
                 }
 
-                # The HTTP status Azure answered with, as a number, from the first
-                # exception in the chain that holds one: its status code, or the
-                # "status code 'Forbidden'" text of the Az message. $null when none can
-                # be read.
+                # The HTTP status Azure answered with, as a number: its status code, or
+                # the "status code 'Forbidden'" text of the Az message. The whole chain
+                # is read. A client error (4xx other than 408 and 429) anywhere in it
+                # wins, because an outer server error can wrap it; else the first
+                # status found. $null when none can be read.
                 function Get-MetricErrorStatus
                 {
                     param([System.Exception]$Exception)
 
+                    $FirstStatus = $null
                     $Pending = [System.Collections.Generic.Queue[object]]::new()
                     $Pending.Enqueue($Exception)
                     $Checked = 0
@@ -663,9 +665,13 @@ if ($Task -eq 'Processing')
                         {
                             if ($null -eq $Value) { continue }
                             $Text = [string]$Value
-                            if ($Text -match '^\d{3}$') { return [int]$Text }
+                            $Status = $null
                             $Parsed = [System.Net.HttpStatusCode]::OK
-                            if ([System.Enum]::TryParse([System.Net.HttpStatusCode], $Text, $true, [ref]$Parsed)) { return [int]$Parsed }
+                            if ($Text -match '^\d{3}$') { $Status = [int]$Text }
+                            elseif ([System.Enum]::TryParse([System.Net.HttpStatusCode], $Text, $true, [ref]$Parsed)) { $Status = [int]$Parsed }
+                            if ($null -eq $Status) { continue }
+                            if ($Status -ge 400 -and $Status -lt 500 -and $Status -notin @(408, 429)) { return $Status }
+                            if ($null -eq $FirstStatus) { $FirstStatus = $Status }
                         }
 
                         $Pending.Enqueue($Ex.InnerException)
@@ -675,7 +681,7 @@ if ($Task -eq 'Processing')
                         }
                     }
 
-                    return $null
+                    return $FirstStatus
                 }
 
                 # True when a request that still failed after its retries can work on a
