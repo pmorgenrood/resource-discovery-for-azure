@@ -51,7 +51,7 @@ param (
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
     [switch] $UseMetricsBatch,
-    [int]    $ConcurrencyLimit = 6,
+    [ValidateRange(1, [int]::MaxValue)][int] $ConcurrencyLimit = 6,
     # The parent's -UseMetricsBatch preflight: subscriptions whose metrics stay
     # on the per-resource path this run (Microsoft.Insights not registered).
     # Last, so the position of every earlier parameter stays as it was.

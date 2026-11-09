@@ -64,7 +64,7 @@ param (
     # typically 2x vCPU bounded to [6,16]. The 6 here is only the fallback the
     # auto path clamps to; passing -ConcurrencyLimit explicitly always overrides
     # auto-tuning.
-    [int]$ConcurrencyLimit = 6,
+    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6,
 
     # Number of parallel "streams" that process subscriptions concurrently.
     # When OMITTED, this is AUTO-TUNED from the host's CPU/RAM (see
