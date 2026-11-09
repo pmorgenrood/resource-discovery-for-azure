@@ -1750,12 +1750,16 @@ if ($SubResourceCounts.Count -gt 0)
     $TotalRes = ($SubResourceCounts | Measure-Object -Property Count -Sum).Sum
     Write-Host ("Total Resources:         {0:N0} across {1} subscription(s)" -f $TotalRes, $NonEmptySubs.Count) -ForegroundColor Green
     $TotalSkipped = [long](($SubResourceCounts | ForEach-Object { [long]$_.Skipped } | Measure-Object -Sum).Sum)
-    if ($TotalSkipped -gt 0)
+    # A sub whose count query failed ($null) adds nothing to the total, so
+    # the line says how many could not be counted.
+    $UncountedSubs = @($SubResourceCounts | Where-Object { $null -eq $_.Skipped }).Count
+    if ($TotalSkipped -gt 0 -or $UncountedSubs -gt 0)
     {
         # With -SkipConsumption no consumption data is collected, so the line
         # does not say that network costs come from it.
         $CostNote = if ($SkipConsumption) { '' } else { 'network costs still come from the consumption data; ' }
-        Write-Host ("Network resources skipped: {0:N0} ({1}-IncludeNetworkResources keeps them)" -f $TotalSkipped, $CostNote) -ForegroundColor DarkGreen
+        $UncountedNote = if ($UncountedSubs -gt 0) { ' ({0} subscription(s) could not be counted)' -f $UncountedSubs } else { '' }
+        Write-Host ("Network resources skipped: {0:N0}{2} ({1}-IncludeNetworkResources keeps them)" -f $TotalSkipped, $CostNote, $UncountedNote) -ForegroundColor DarkGreen
     }
     if ($NetworkOnlySubs.Count -gt 0)
     {

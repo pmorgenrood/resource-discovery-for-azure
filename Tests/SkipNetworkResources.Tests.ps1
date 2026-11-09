@@ -962,6 +962,19 @@ Describe 'Callers use the message and the switch' {
         $script:Out | Should -Contain '    - network-only (id-c) - 7 network resources skipped'
     }
 
+    It 'the run summary says how many subscriptions'' skipped count is unknown (<Label>)' -TestCases @(
+        @{ Label = 'next to a known count'; Rows = @(@{ Name = 'a'; Id = 'id-a'; Count = 5; Skipped = 10 }, @{ Name = 'b'; Id = 'id-b'; Count = 500; Skipped = $null }); Expect = 'Network resources skipped: 10 (1 subscription(s) could not be counted) (network costs still come from the consumption data; -IncludeNetworkResources keeps them)' }
+        @{ Label = 'with nothing else skipped'; Rows = @(@{ Name = 'a'; Id = 'id-a'; Count = 5; Skipped = 0 }, @{ Name = 'b'; Id = 'id-b'; Count = 500; Skipped = $null }, @{ Name = 'c'; Id = 'id-c'; Count = 0; Skipped = $null }); Expect = 'Network resources skipped: 0 (2 subscription(s) could not be counted) (network costs still come from the consumption data; -IncludeNetworkResources keeps them)' }
+    ) {
+        param($Label, $Rows, $Expect)
+        $script:Out = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
+        # The lifted summary reads this through dynamic scope.
+        Set-Variable -Name SubResourceCounts -Value @($Rows | ForEach-Object { [pscustomobject]$_ })
+        . $script:RunSummary
+        @($script:Out | Where-Object { $_ -like 'Network resources skipped:*' }) | Should -Be @($Expect) -Because "an unknown count is not 0 ($Label)"
+    }
+
     It 'the run summary writes no skipped lines when nothing was skipped' {
         $script:Out = [System.Collections.Generic.List[string]]::new()
         Mock -CommandName Write-Host -MockWith { $script:Out.Add([string]$Object) }
