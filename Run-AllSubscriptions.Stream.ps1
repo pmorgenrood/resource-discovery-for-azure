@@ -251,6 +251,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # leaves $LASTEXITCODE as it was: the `exit 1` of an earlier
         # subscription in this stream would mark this one failed.
         $global:LASTEXITCODE = 0
+        # Cleared too, so a run that ends before naming its zip cannot leave
+        # the previous subscription's zip as its own.
+        $Global:ZipOutputFile = $null
         & (Join-Path $ScriptRoot 'ResourceInventory.ps1') -TenantID $TenantID -SubscriptionID $SubId @InventoryPassthrough -RunAllSubs
         # Only treat as failure if the inner script set a non-zero exit code.
         # Some completion paths in ResourceInventory.ps1 leave $LASTEXITCODE
@@ -267,7 +270,9 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # every run; $null when its count query failed, kept as $null so the
         # wrapper's run summary does not read it as 0 skipped).
         $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { $null }
-        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount }
+        # Zip: the report zip this run wrote, which the wrapper's output
+        # verification looks for.
+        $ResourceCounts += [pscustomobject]@{ Name = $SubName; Id = $SubId; Count = $ResCount; Skipped = $SkipCount; Zip = $Global:ZipOutputFile }
 
         $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
         if ($CountMessage.Kind -eq 'Empty')

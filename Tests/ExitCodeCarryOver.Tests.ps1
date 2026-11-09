@@ -172,10 +172,32 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string]$FailSub = '', [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '')
+            param([object[]]$Subs, [string]$FailSub = '', [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @())
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             $CaseHome = Join-Path $CaseDir 'home'
             New-Item -ItemType Directory -Path $CaseHome -Force | Out-Null
+            if ($MissingStreamSummary)
+            {
+                # A folder where stream 0's summary file goes: the stream
+                # cannot write its summary, so the wrapper finds no summary
+                # file for it (as when its job dies before the end).
+                New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports/.rda-stream-0-summary.json') -Force | Out-Null
+            }
+            if ($Stream0Completed.Count -gt 0)
+            {
+                # Stream 0's resume file from an earlier run that stopped
+                # before its end: under -Resume it skips these subscriptions.
+                $Reports = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports') -Force
+                [pscustomobject]@{ Tenant = $script:Tenant; StreamId = '0'; Completed = @($Stream0Completed); FailedAttempts = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Reports.FullName ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
+            }
+            if ($Stream1SummaryJson)
+            {
+                # Stream 1 then reports what this text says, not what it did.
+                $Reports = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports') -Force
+                $Summary = Join-Path $Reports.FullName '.rda-stream-1-summary.json'
+                Set-Content -LiteralPath $Summary -Value $Stream1SummaryJson -Encoding utf8
+                [System.IO.File]::SetUnixFileMode($Summary, [System.IO.UnixFileMode]'UserRead, GroupRead, OtherRead')
+            }
             if ($CorruptStreamSummary)
             {
                 # Stream 0's summary file is left as text that is not JSON and
@@ -199,6 +221,7 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
             [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = $FailSub; CollectorFailSub = $CollectorFailSub } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             $WrapperArgs = @('-TenantID', $script:Tenant, '-SkipMetrics', '-SkipConsumption', '-ParallelStreams', [string]$Streams)
+            if ($Resume) { $WrapperArgs += '-Resume' }
             if ($PriorExitCode -ge 0)
             {
                 $Launcher = Join-Path $CaseDir 'launcher.ps1'
@@ -440,6 +463,71 @@ if ($Task -eq 'Processing' -and $CollectorFailSub -and @($Resources | Where-Obje
         $Run.MainSummary | Should -Not -BeNullOrEmpty -Because $Run.Console
         $Run.MainSummary | Should -Match ([regex]::Escape('The summary of stream 0 could not be read.</b> Its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.')) -Because 'MainSummary.html must show the same signal as the console and RunSummary.log'
         $Run.MainSummary | Should -Not -Match 'failed to process' -Because 'no subscription failed'
+    }
+
+    It 'two streams with -Resume: a stream with no summary file names its 2 subscriptions as not confirmed, not as one failed subscription' {
+        # Three subscriptions over two streams: stream-0 holds Sub A then Sub C.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -MissingStreamSummary -Resume
+        $Run.Console | Should -Match '\[stream-0\] WARNING: no summary file' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
+        $Run.Console | Should -Match 'Stream Summary Unreadable:\s+stream-0 \(2 subscription\(s\) not confirmed; check the consolidated zip\)' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 2 subscription(s) are not confirmed; check the consolidated zip for their reports.'))
+        # No subscription was skipped: all three ran this time.
+        $Run.Console | Should -Match '(?m)^Subscriptions Skipped:\s+0 \(already completed\)' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^Subscriptions Processed: 3\s*$' -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        $Run.RunSummary | Should -Match '(?m)^  Failed subscriptions\s+: 0\s*$' -Because $Run.RunSummary
+        $Run.MainSummary | Should -Match ([regex]::Escape('The summary of stream 0 could not be read.</b> Its 2 subscription(s) are not confirmed')) -Because $Run.Console
+        $Run.MainSummary | Should -Not -Match 'failed to process' -Because 'no subscription failed'
+        # The resume state is kept, and nothing is put on the retry list.
+        $Run.StateKept | Should -BeTrue -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0 -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams with -Resume: an unreadable stream summary names only the subscriptions the stream ran this time as not confirmed' {
+        # Stream-0 holds Sub A then Sub C; its resume file says Sub A is done,
+        # so this run it runs only Sub C.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -CorruptStreamSummary -Resume -Stream0Completed @($script:SubA.Id)
+        $Run.Console | Should -Match '\[stream-0\] skipping \(already completed\): Sub A' -Because $Run.Console
+        $Run.Console | Should -Match 'Stream Summary Unreadable:\s+stream-0 \(1 subscription\(s\) not confirmed; check the consolidated zip\)' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.'))
+        $Run.Console | Should -Match '(?m)^Subscriptions Skipped:\s+1 \(already completed\)' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^Subscriptions Processed: 2\s*$' -Because $Run.Console
+        $Run.RunSummary | Should -Match ([regex]::Escape('  Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.')) -Because $Run.RunSummary
+        $Run.MainSummary | Should -Match ([regex]::Escape('The summary of stream 0 could not be read.</b> Its 1 subscription(s) are not confirmed')) -Because $Run.Console
+        $Run.StateKept | Should -BeTrue -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams: the zips of a stream whose summary could not be read do not hide the missing zip of a subscription that reported success' {
+        # Stream-0 (Sub A, Sub C) writes two zips but its summary cannot be
+        # read; stream 1 runs Sub B (one zip) but reports Sub X, which has no
+        # zip. Three zips for one success must not pass the check.
+        $SubX = [pscustomobject]@{ Name = 'Sub X'; Id = [guid]::new(('0' * 31) + 'e').ToString(); Count = 1 }
+        $Forged = [pscustomobject]@{ Status = 'ok'; ResourceCounts = @($SubX); Failed = @() } | ConvertTo-Json -Depth 5
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -CorruptStreamSummary -Stream1SummaryJson $Forged
+        $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'verification: OK' -Because $Run.Console
+        $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
+        $Run.Console | Should -Match ('(?m)^\s*- Sub X \({0}\) \[1 resources\]' -f [regex]::Escape($SubX.Id)) -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: a report is missing (verification gap, see Per-subscription output verification failed); no consolidated zip was made.'))
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams: the verification-gap stop does not count a stream with no summary file as a failed subscription' {
+        # Stream 1 reports four subscriptions that worked; only three reports
+        # are on disk, so the run stops at the output verification.
+        $Phantoms = @('6', '7', '8', '9' | ForEach-Object { [pscustomobject]@{ Name = ('Sub {0}' -f $_); Id = [guid]::new(('0' * 31) + $_).ToString(); Count = 1 } })
+        $Forged = [pscustomobject]@{ Status = 'ok'; ResourceCounts = $Phantoms; Failed = @() } | ConvertTo-Json -Depth 5
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -MissingStreamSummary -Stream1SummaryJson $Forged
+        $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'ERROR lines above' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 2 subscription(s) are not confirmed; no consolidated zip was made.'))
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
     It 'sequential: a non-zero $LASTEXITCODE left in the session before the run fails no subscription' {
