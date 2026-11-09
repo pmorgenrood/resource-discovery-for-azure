@@ -87,17 +87,23 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         function script:Invoke-DirectRunEnd
         {
-            param([hashtable]$Arguments)
+            param([hashtable]$Arguments, [switch]$NoZip)
+            # The report zip of the run, or none when it could not be written.
+            $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
+            if (-not $NoZip) { Set-Content -LiteralPath $Global:ZipOutputFile -Value 'zip' }
             $global:LASTEXITCODE = 0
             $Lines = @(& $script:DirectRun @Arguments 6>&1 | ForEach-Object { [string]$_ })
             [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines }
         }
 
         $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
         else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionZip) { $Global:ZipOutputFile = $script:SessionZip.Value }
+        else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
     }
 
     It 'prints the command with the run''s switches and exits 3' {
@@ -109,6 +115,14 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
         $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
         ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
+    }
+
+    It 'still prints the command but does not exit 3 when its zip could not be written' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' } -NoZip
+
+        $Result.ExitCode | Should -Be 0
+        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
     }
 
     It 'exits 0 and prints nothing when the metrics are complete' {

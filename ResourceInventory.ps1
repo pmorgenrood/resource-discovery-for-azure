@@ -1837,10 +1837,10 @@ Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severi
 # request (grouped or for one metric) still failed after its retries
 # (throttling, timeout, server error)
 # names each subscription with the command that collects it again, with this
-# run's switches, and exits 3. Under -RunAllSubs the wrapper does this for the
-# whole run.
+# run's switches, and exits 3 when its zip was written. Under -RunAllSubs the
+# wrapper does this for the whole run.
 if (-not $RunAllSubs.IsPresent)
 {
-    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters
+    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipFile $Global:ZipOutputFile
     if ($DirectRunExitCode -ne 0) { exit $DirectRunExitCode }
 }
