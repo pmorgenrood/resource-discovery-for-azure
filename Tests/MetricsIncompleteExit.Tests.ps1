@@ -218,8 +218,9 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
         function script:Invoke-WrapperEnd
         {
             param([hashtable]$InventoryPassthrough, [object[]]$CollectorFailures = @())
-            $TenantID = 'tenant-1'
-            $WrapperTranscriptStarted = $false
+            # Read by the lifted statements, which run in this scope.
+            Set-Variable -Name TenantID -Value 'tenant-1'
+            Set-Variable -Name WrapperTranscriptStarted -Value $false
             $Global:CollectorFailures = $CollectorFailures
             $Global:ConsumptionFailedSubs = @()
             $Lines = @(. ([scriptblock]::Create($script:WrapperEnd)) 6>&1 | ForEach-Object { [string]$_ })
