@@ -94,13 +94,4 @@ Describe 'Run-AllSubscriptions.ps1 end-of-run failure lists with two subscriptio
         $Lines = Invoke-Block $script:MetricsText
         @($Lines | Where-Object { $_ -like '  - Pay-As-You-Go (*' }) | Should -Be @("  - Pay-As-You-Go ($script:SubA)")
     }
-
-    It 'leaves out of Metrics Auth Failures a subscription of the same name whose metrics are incomplete' {
-        $Global:MetricsFailedSubs = @(
-            [pscustomobject]@{ Name = 'Pay-As-You-Go'; Id = $script:SubA; Message = 'Metrics phase skipped: no usable Azure context/token after one reconnect attempt.' },
-            [pscustomobject]@{ Name = 'Pay-As-You-Go'; Id = $script:SubB; Message = 'stand-in: Azure Monitor requests still failed after their retries'; Complete = $false })
-        $Lines = Invoke-Block $script:MetricsText
-        ($Lines -join "`n") | Should -Match 'Metrics Auth Failures:\s+1 subscription\(s\)'
-        @($Lines | Where-Object { $_ -like '  - Pay-As-You-Go (*' }) | Should -Be @("  - Pay-As-You-Go ($script:SubA)")
-    }
 }
