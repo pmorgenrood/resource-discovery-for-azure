@@ -138,6 +138,59 @@ Describe 'Get-RdaMetricRetryPlan - throttled and generic failures keep separate 
     }
 }
 
+Describe 'Get-RdaRetryAfterSeconds - offline' {
+    BeforeAll {
+        # An exception-like object with Response.Headers, as the Az cmdlets expose it, built without Az.
+        function New-FakeThrottle([hashtable]$Headers, $Inner = $null)
+        {
+            return [PSCustomObject]@{
+                Message        = 'Operation returned an invalid status code ''TooManyRequests'''
+                Response       = [PSCustomObject]@{ Headers = $Headers }
+                InnerException = $Inner
+            }
+        }
+    }
+
+    It 'reads delta seconds' {
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('17') }) | Should -Be 17
+    }
+
+    It 'reads an HTTP-date as the seconds until that time' {
+        $When = [datetimeoffset]::UtcNow.AddSeconds(30).ToString('r', [System.Globalization.CultureInfo]::InvariantCulture)
+        $Seconds = Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @($When) })
+        $Seconds | Should -BeGreaterOrEqual 28
+        $Seconds | Should -BeLessOrEqual 31
+    }
+
+    It 'gives 0 for an HTTP-date in the past' {
+        $When = [datetimeoffset]::UtcNow.AddMinutes(-5).ToString('r', [System.Globalization.CultureInfo]::InvariantCulture)
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @($When) }) | Should -Be 0
+    }
+
+    It 'matches a lower-case header name' {
+        $Headers = [System.Collections.Generic.Dictionary[string, string[]]]::new([System.StringComparer]::Ordinal)
+        $Headers['retry-after'] = @('9')
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle $Headers) | Should -Be 9
+    }
+
+    It 'finds the header on a nested InnerException' {
+        $Outer = [PSCustomObject]@{ Message = 'wrapper'; InnerException = [PSCustomObject]@{ Message = 'still a wrapper'; InnerException = (New-FakeThrottle @{ 'Retry-After' = @('12') }) } }
+        Get-RdaRetryAfterSeconds -ErrorRecord $Outer | Should -Be 12
+    }
+
+    It 'gives 0 for junk text' {
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('soon, maybe') }) | Should -Be 0
+    }
+
+    It 'gives 0 for a negative value' {
+        Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('-5') }) | Should -Be 0
+    }
+
+    It 'gives 0 when there is no response at all' {
+        Get-RdaRetryAfterSeconds -ErrorRecord ([System.Management.Automation.ErrorRecord]::new([System.Exception]::new('TooManyRequests'), 'x', 'NotSpecified', $null)) | Should -Be 0
+    }
+}
+
 Describe 'Retry-After reaches the runspace' {
     It 'Get-RdaRetryAfterSeconds reads the header from a real TooManyRequests CloudException' {
         if (-not $script:RealTypesAvailable) { Set-ItResult -Skipped -Because 'Az.Monitor (Microsoft.Rest types) is not installed here' }

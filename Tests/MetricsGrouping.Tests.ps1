@@ -40,6 +40,8 @@ BeforeAll {
     $script:MetricsScript = Join-Path $script:RepoRoot 'Extension/Metrics.ps1'
     if (-not (Test-Path $script:MetricsScript)) { throw "Metrics.ps1 not found at $script:MetricsScript" }
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
+    # Metrics.ps1 ships the Retry-After reader into its runspaces when it is loaded, as in a real run.
+    . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
 
     # Metrics.ps1 reads the current Az context once. Returning none keeps the run
     # offline and independent of any saved login on the machine.
@@ -113,6 +115,13 @@ function Get-AzMetric
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        'ThrottledRetryAfter100'
+        {
+            # A 429 that carries Retry-After: 100 on its Response.Headers, as the Az cmdlets expose it.
+            $Ex = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+            $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('100') } })
+            throw $Ex
+        }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -559,6 +568,22 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
             $Line -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
             [double]$Matches['Waited'] | Should -BeGreaterOrEqual 122
             [double]$Matches['Waited'] | Should -BeLessThan 128
+        }
+    }
+
+    It 'waits the Retry-After the server sends, until the total throttle wait cap stops it' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'throttled-retry-after' -MultiError 'ThrottledRetryAfter100'
+
+        # Two waits of 100 s (plus jitter) reach 200 s; a third would pass the 300 s cap, so 3 attempts in all.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 3
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            $Line = @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=3 ' -f [regex]::Escape($Name)) })
+            $Line.Count | Should -Be 1
+            $Line[0] -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 200
+            [double]$Matches['Waited'] | Should -BeLessThan 202
         }
     }
 
