@@ -433,7 +433,10 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
 
     It 'labels a 0-resource subscription whose resource groups can be listed for what the probe proved, not as empty' {
         $Lines = Get-RunSummaryLogContent -Visible 1 -Excluded 0 -Eligible 1 -Processed 1 -Skipped 0 -EmptyGenuinelyEmpty @([pscustomobject]@{ Name = 's'; Id = '44444444-4444-4444-4444-444444444444' })
-        @($Lines | Where-Object { $_ -eq '  0 resources - groups listable, report empty: 1' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -eq '  0 resources - groups only : 1' }).Count | Should -Be 1
+        # The three 0-resources labels put their colons in one column.
+        $Cols = @($Lines | Where-Object { $_ -like '  0 resources - *' } | ForEach-Object { $_.IndexOf(':') } | Sort-Object -Unique)
+        $Cols.Count | Should -Be 1
         @($Lines | Where-Object { $_ -match '0 resources - empty\s*:' }) | Should -BeNullOrEmpty
     }
 
@@ -498,5 +501,16 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         { Get-RunSummaryLogContent -Visible 0 -Eligible 0 -Processed 0 `
                 -FailedSubscriptions $null -CollectorFailures $null `
                 -MetricsFailedSubs $null -ConsumptionFailedSubs $null } | Should -Not -Throw
+    }
+}
+
+Describe 'The README on the 0-resources Resource Graph query' {
+    It 'says the query is printed on the sequential path, not "with one stream (the default)", since the default stream count is auto-tuned' {
+        $Readme = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'README.md') -Raw
+        $Readme.Contains('With one stream (the default), the wrapper prints') | Should -BeFalse
+        $Readme.Contains('On the sequential path (one stream: `-ParallelStreams 1`, which the auto-tuning also picks on a host with fewer than 4 vCPUs or little memory), the wrapper prints') | Should -BeTrue
+        # Nor anywhere else that the default is one stream (the code auto-tunes it).
+        $Readme.Contains('By default subscriptions are processed sequentially') | Should -BeFalse
+        $Readme.Contains('The default is `-ParallelStreams 1`') | Should -BeFalse
     }
 }
