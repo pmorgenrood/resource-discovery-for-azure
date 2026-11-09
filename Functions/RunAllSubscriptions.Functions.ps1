@@ -545,7 +545,11 @@ function Save-CompletedSubscriptionIds
     }
     catch
     {
-        Write-Host ('WARNING: Failed to persist resume state to {0}: {1}' -f $Path, $_) -ForegroundColor Yellow
+        # Its own guard: this runs inside a subscription's try after its
+        # success, and the console can be gone with the folder.
+        $StateError = $_
+        try { Write-Host ('WARNING: Failed to persist resume state to {0}: {1}' -f $Path, $StateError) -ForegroundColor Yellow }
+        catch { $null = $_ }
         Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
     }
 }
@@ -810,7 +814,11 @@ function Read-StreamState
     }
     catch
     {
-        Write-Stream ("WARNING: could not read stream state at {0}: {1}" -f $Path, $_.Exception.Message) 'Yellow'
+        # Its own guard, as in Write-StreamState: this runs at stream start,
+        # and a warning that cannot be written must not end the stream.
+        $StateError = $_.Exception.Message
+        try { Write-Stream ("WARNING: could not read stream state at {0}: {1}" -f $Path, $StateError) 'Yellow' }
+        catch { $null = $_ }
         return @{ Completed = @(); Failed = @() }
     }
 }
@@ -825,11 +833,17 @@ function Write-StreamState
             StreamId       = $StreamId
             Completed      = $Completed
             FailedAttempts = @($FailedAttempts)
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
+        } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8 -ErrorAction Stop
     }
     catch
     {
-        Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $_.Exception.Message) 'Yellow'
+        # A failed write (the folder is gone) must stop here, or it is a silent
+        # non-terminating error and this warning never runs. The next -Resume
+        # then runs the subscription again, as its id is not on file.
+        # Its own guard, as in Save-CompletedSubscriptionIds.
+        $StateError = $_.Exception.Message
+        try { Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $StateError) 'Yellow' }
+        catch { $null = $_ }
     }
 }
 
