@@ -512,5 +512,6 @@ Describe 'The README on the 0-resources Resource Graph query' {
         # Nor anywhere else that the default is one stream (the code auto-tunes it).
         $Readme.Contains('By default subscriptions are processed sequentially') | Should -BeFalse
         $Readme.Contains('The default is `-ParallelStreams 1`') | Should -BeFalse
+        $Readme.Contains('`1` (default) is the existing sequential behavior') | Should -BeFalse
     }
 }
