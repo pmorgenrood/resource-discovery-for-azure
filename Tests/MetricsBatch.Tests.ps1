@@ -1306,6 +1306,60 @@ Describe 'A direct run hands its preflight result to the metrics phase' {
     }
 }
 
+Describe 'A direct run with -ResourceGroup but no -SubscriptionID' {
+
+    # The run is refused; it must stop before the preflight reads, asks or
+    # registers anything. It runs in its own pwsh, with stand-ins for az, the
+    # Az context, Invoke-AzRestMethod and Read-Host that log each call.
+    It 'stops before the preflight reads, asks or registers anything' {
+        $Work = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-rg-nosub-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Work | Out-Null
+        try
+        {
+            $CallLog = Join-Path $Work 'calls.txt'
+            $Runner = Join-Path $Work 'run.ps1'
+            Set-Content -LiteralPath $Runner -Encoding utf8 -Value @'
+param($Script, $CallLog, $OutDir)
+$Global:RdaSessionInitialized = $true
+$Global:AzPowerShellLoaded = $true
+$Global:PlatformOS = 'PowerShell Unix'
+function global:az
+{
+    $Line = ($args -join ' ')
+    if ($Line -like 'account show*') { return '{"tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","user":{"name":"tester"}}' }
+    if ($Line -like 'account list*') { return '[{"id":"11111111-1111-1111-1111-111111111111","tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},{"id":"22222222-2222-2222-2222-222222222222","tenantId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]' }
+    Add-Content -LiteralPath $CallLog -Value ('az ' + $Line)
+}
+function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function global:Connect-AzAccount { Add-Content -LiteralPath $CallLog -Value 'Connect-AzAccount' }
+function global:Invoke-AzRestMethod
+{
+    param($Method, $Path, [switch]$AsJob)
+    Add-Content -LiteralPath $CallLog -Value ('Invoke-AzRestMethod {0} {1}' -f $Method, $Path)
+    $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+    if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+    $Read
+}
+function global:Read-Host { Add-Content -LiteralPath $CallLog -Value 'Read-Host'; 'y' }
+& $Script -ResourceGroup 'rg-one' -UseMetricsBatch -OutputDirectory $OutDir
+'@
+            $Pwsh = Join-Path $PSHOME 'pwsh'
+            $Output = & $Pwsh -NoProfile -NonInteractive -File $Runner -Script (Join-Path $script:RepoRoot 'ResourceInventory.ps1') -CallLog $CallLog -OutDir $Work 2>&1 | Out-String
+
+            # The run got as far as the refusal.
+            $Output | Should -Match 'Resource Group Name present, but missing Subscription ID'
+            $Calls = @(if (Test-Path -LiteralPath $CallLog) { Get-Content -LiteralPath $CallLog })
+            @($Calls | Where-Object { $_ -like 'Invoke-AzRestMethod*' }) | Should -BeNullOrEmpty
+            @($Calls | Where-Object { $_ -eq 'Read-Host' }) | Should -BeNullOrEmpty
+            $Output | Should -Not -Match 'checking the Microsoft\.Insights resource provider'
+        }
+        finally
+        {
+            Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Describe 'Get-RdaInsightsProviderState' {
 
     BeforeEach {
