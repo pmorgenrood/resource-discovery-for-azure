@@ -1711,6 +1711,23 @@ function Get-RunSummaryLogContent
 # Compress-Archive removes its destination when a write fails (a full disk does
 # this, also during -Update), so "the command finished" does not mean the zip is
 # there. Reads only the zip's directory, not the reports in it.
+# Whether the report zip at $Path is one a reader can use: it opens as a zip
+# and holds an Inventory_*.json. A file of a report zip's name that is cut
+# short or damaged is counted as missing, so it is named and collected again
+# instead of being put into the consolidated zip as a report.
+function Test-ReportZipReadable
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try
+    {
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try { return (@($Archive.Entries | Where-Object { $_.Name -like 'Inventory_*.json' }).Count -gt 0) }
+        finally { $Archive.Dispose() }
+    }
+    catch { return $false }
+}
+
 function Get-ConsolidatedZipProblem
 {
     param(

@@ -53,7 +53,10 @@ $Global:ResourceCount = 1
 # A zip written earlier in this run, removed now (as by an antivirus quarantine).
 if ([string]$Scenario.GoneBy -eq $SubscriptionID)
 {
-    Get-ChildItem -LiteralPath $Root -Directory -Filter ('ResourcesReport*-' + [string]$Scenario.GoneSub) | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter '*.zip' -File | Remove-Item -Force }
+    # Removed, or (Damage) cut short in place, as a failed disk write leaves it.
+    Get-ChildItem -LiteralPath $Root -Directory -Filter ('ResourcesReport*-' + [string]$Scenario.GoneSub) | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter '*.zip' -File | ForEach-Object { if ($Scenario.Damage) { [System.IO.File]::WriteAllBytes($_.FullName, [byte[]](0x50, 0x4B, 0x03)) } else { Remove-Item -LiteralPath $_.FullName -Force } } }
+    # The resume state can no longer be written (as on a full disk).
+    if ($Scenario.LockState) { & chmod 555 $Root }
 }
 if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; return }
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
@@ -150,8 +153,8 @@ exit 1
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '')
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState)
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -228,12 +231,13 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         @{ Case = 'sequential, no zip written'; Streams = 1; NoZip = 'B'; Gone = ''; GoneBy = ''; Missing = 'B'; Kept = @('A', 'C') }
         @{ Case = 'two streams, no zip written'; Streams = 2; NoZip = 'B'; Gone = ''; GoneBy = ''; Missing = 'B'; Kept = @('A', 'C') }
         @{ Case = 'sequential, a written zip gone before the consolidated zip'; Streams = 1; NoZip = ''; Gone = 'A'; GoneBy = 'C'; Missing = 'A'; Kept = @('B', 'C') }
+        @{ Case = 'sequential, a written zip cut short before the consolidated zip'; Streams = 1; NoZip = ''; Gone = 'A'; GoneBy = 'C'; Missing = 'A'; Kept = @('B', 'C'); Damage = $true }
     ) {
         script:New-Case
         $MissingSub = $script:Subs | Where-Object { $_.Name -eq ('Sub ' + $Missing) }
         $GoneId = if ($Gone) { ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $Gone) }).Id } else { '' }
         $GoneById = if ($GoneBy) { ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $GoneBy) }).Id } else { '' }
-        script:Set-Scenario -NoZip @(if ($NoZip) { ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $NoZip) }).Id }) -GoneSub $GoneId -GoneBy $GoneById
+        script:Set-Scenario -NoZip @(if ($NoZip) { ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $NoZip) }).Id }) -GoneSub $GoneId -GoneBy $GoneById -Damage:([bool]$Damage)
 
         $R1 = script:Invoke-Wrapper -Streams $Streams
         $R1.ExitCode | Should -Be 2
@@ -262,5 +266,22 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A report zip lost when the resume state cannot be written either' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
+    It 'says to run again without -Resume, since the state still lists it as completed' {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        script:Set-Scenario -GoneSub $A.Id -GoneBy $C.Id -LockState
+        try
+        {
+            $R1 = script:Invoke-Wrapper -Streams 1
+            $R1.ExitCode | Should -Be 2
+            @($R1.Text | Where-Object { $_ -like 'The resume state file * could not be updated and still lists some of them as completed*run again without -Resume*' }).Count | Should -Be 1
+            @($R1.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
+        }
+        finally { & chmod 755 $script:Root }
     }
 }

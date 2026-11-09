@@ -2309,9 +2309,14 @@ $ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
 # and the run exits 2, so the next -Resume collects them and carries the others.
 $MissingReports = @()
 $MissingReportCount = 0
+# Set when the resume state on disk still lists a missing subscription as
+# completed (the save did not reach the disk): a -Resume would skip it.
+$MissingStateNotSaved = $false
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
     $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # A report zip of this run that cannot be read counts as missing.
+    $ActualSubZips = @($ActualSubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName })
     $ActualSubZips = @(Join-CarriedReportZips -Zips $ActualSubZips -CarriedReports $CarriedReports)
     $ActualZipCount = $ActualSubZips.Count
     if ($ActualZipCount -lt $ExpectedZipCount)
@@ -2349,7 +2354,8 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
                 if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
                 $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
                 if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
-                if (-not (Test-Path -LiteralPath (Join-Path $InventoryRoot ([string]$ZipProp.Value)) -PathType Leaf)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
+                $ZipPath = Join-Path $InventoryRoot ([string]$ZipProp.Value)
+                if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf) -or -not (Test-ReportZipReadable -Path $ZipPath)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
             })
         foreach ($Gone in $GoneRecords)
         {
@@ -2359,6 +2365,9 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         if ($GoneRecords.Count -gt 0)
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+            # Read back: the same disk problem that lost a zip can stop the save.
+            $SavedCompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $MissingStateNotSaved = @($GoneRecords | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0
         }
         $MissingReports = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
         $MissingReportCount = [math]::Max($MissingCount, $MissingReports.Count)
@@ -2399,6 +2408,9 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
 {
     # Filter ZIPs by current run timestamp only, plus the zips carried from an earlier run on -Resume
     $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # Only report zips a reader can use go into the consolidated zip; one that
+    # cannot be read is named as missing above.
+    $SubZips = @($SubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName })
     $SubZips = @(Join-CarriedReportZips -Zips $SubZips -CarriedReports $CarriedReports)
     if ($SubZips.Count -gt 0)
     {
@@ -3151,7 +3163,14 @@ if ($MissingReportCount -gt 0)
     {
         Write-Host ("  ({0} more could not be named; see 'Per-subscription output verification failed' above.)" -f ($MissingReportCount - @($MissingReports).Count)) -ForegroundColor Red
     }
-    Write-Host "The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip." -ForegroundColor Red
+    if ($MissingStateNotSaved)
+    {
+        Write-Host ("The resume state file {0} could not be updated and still lists some of them as completed, so a -Resume would skip them. Fix the cause (for example, free up disk space), then run again without -Resume: it collects every subscription." -f $ResumeStateFile) -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host "The resume state is kept. Run again with -Resume: it collects these subscriptions again and carries the other reports into a new consolidated zip." -ForegroundColor Red
+    }
     Write-Host "=============================================================" -ForegroundColor Red
 }
 

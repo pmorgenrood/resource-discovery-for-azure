@@ -215,18 +215,17 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         @(Get-ChildItem -LiteralPath $Root -Filter 'AllSubscriptions_ResourcesReport_*.zip' -File) | Should -BeNullOrEmpty
     }
 
-    It 'a report zip held open by another process: the error names it, no zip is reported as written' {
+    It 'a report zip that cannot be read (held open by another process) is left out, and the zip holds the reports that can' {
+        # The per-subscription output check names it as missing and the next
+        # -Resume collects it again (Tests/MissingReportZip.Tests.ps1).
         $Root = Join-Path $TestDrive 'locked'
-        $null = New-SubReport -Root $Root -Stamp 'L1'
+        $Kept = New-SubReport -Root $Root -Stamp 'L1'
         $Held = New-SubReport -Root $Root -Stamp 'L2'
         $Lock = [System.IO.File]::Open($Held, 'Open', 'ReadWrite', 'None')
         try { $R = Invoke-BundleBlock -Root $Root } finally { $Lock.Dispose() }
 
-        @($R.Printed | Where-Object { $_ -like 'Reporting Data File:*' }).Count | Should -Be 0
-        @($R.Printed | Where-Object { $_ -like 'ERROR: Could not build the consolidated zip in *: *' }).Count | Should -Be 1
-        $R.BundleBuildError | Should -BeLike ('*{0}*' -f (Split-Path $Held -Leaf))
-        $R.OuterZipFile | Should -BeNullOrEmpty
-        @(Get-ChildItem -LiteralPath $Root -Filter 'AllSubscriptions_ResourcesReport_*.zip').Count | Should -Be 0
+        $R.BundleBuildError | Should -BeNullOrEmpty
+        (Get-ZipEntryNames -Path $R.OuterZipFile) | Should -Be @(Split-Path $Kept -Leaf)
     }
 
     It 'a write that finishes without error but leaves a report out is a failure too' {
