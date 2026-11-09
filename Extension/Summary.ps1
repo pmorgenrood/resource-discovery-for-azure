@@ -131,6 +131,8 @@ $TotalResources = ($ServiceSummary | Measure-Object -Property Count -Sum).Sum
 # resource Names and Subscription values across the first few populated
 # services; if most match the obfuscation signature treat the report as
 # obfuscated, else identifiable (the safe default for an unclear posture).
+# A sample proves nothing about the other records, so the banner never says
+# the report is free of real identifiers.
 $ObfuscationStatus = 'identifiable'
 $ObfPattern = '^(prod_|nonprod_)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 $Samples = New-Object System.Collections.Generic.List[string]
@@ -158,17 +160,19 @@ if ($Samples.Count -gt 0)
 # record in the billing window. A running VM with no compute-usage record is an
 # anomaly - it usually means consumption data was incomplete for that VM's
 # subscription (auth / billing-scope gap), not that the VM is idle. We compare
-# COUNTS only (not identities): the inventory and consumption files obfuscate
-# resource ids through different dictionaries, so a per-VM join is impossible in
-# an obfuscated report. Counts of distinct tokens are preserved either way.
+# counts, and also the ids when the two files' ids meet: a report whose ids
+# never meet (masked through different dictionaries) is compared by counts only.
 $VmBilling = $null
 if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $ConsumptionFile -PathType Leaf))
 {
     $RunningVmCount = 0
+    $RunningVmIds = @()
     $VmRecords = $Inventory.VirtualMachines
     if ($VmRecords)
     {
-        $RunningVmCount = @($VmRecords | Where-Object { $_.PowerState -match 'running' }).Count
+        $RunningVms = @($VmRecords | Where-Object { $_.PowerState -match 'running' })
+        $RunningVmCount = $RunningVms.Count
+        $RunningVmIds = @($RunningVms | Where-Object { $_.PSObject.Properties.Name -contains 'ID' -and -not [string]::IsNullOrWhiteSpace([string]$_.ID) } | ForEach-Object { [string]$_.ID })
     }
 
     # Count distinct VM-meter resources in the consumption CSV. A header-only or
@@ -207,6 +211,16 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
     if ($HasConsumptionData -and $RunningVmCount -gt 0)
     {
         $Gap = $RunningVmCount - $BilledVmCount
+        # When the files' ids can be joined (at least one running VM's ID is a
+        # billed id, case aside), a running VM is billed only when its own ID
+        # is: equal counts can hide a running VM with no charge beside a billed
+        # id of another VM. Ids that never meet fall back to the counts.
+        $MatchedVmCount = @($RunningVmIds | Where-Object { $BilledVmIds.Contains($_) }).Count
+        if ($MatchedVmCount -gt 0)
+        {
+            $IdGap = $RunningVmCount - $MatchedVmCount
+            if ($IdGap -gt $Gap) { $Gap = $IdGap; $BilledVmCount = $MatchedVmCount }
+        }
         if ($Gap -gt $VmBillingGapThreshold)
         {
             $GapPct = [math]::Round((100.0 * $Gap / $RunningVmCount), 1)
@@ -792,7 +806,7 @@ $PlatBlock = if ([string]::IsNullOrWhiteSpace($PlatSafe)) { '' } else { "<div><b
 # content carries real subscription / resource names.
 if ($ObfuscationStatus -eq 'obfuscated')
 {
-    $PrivacyBanner = '<div class="privacy-banner obfuscated"><span class="privacy-icon">&#128274;</span><div><b>Obfuscated report.</b> Resource and subscription names have been replaced with deterministic pseudonyms (prod_/nonprod_ prefixes). Real identifiers are not present. Suitable for sharing.</div></div>'
+    $PrivacyBanner = '<div class="privacy-banner obfuscated"><span class="privacy-icon">&#128274;</span><div><b>Obfuscated report.</b> Resource and subscription names in a sample of this report are deterministic pseudonyms (prod_/nonprod_ prefixes). Only a sample was checked: review the report before sharing it.</div></div>'
 }
 else
 {
@@ -888,7 +902,7 @@ $FileSize = (Get-Item $HtmlFile).Length
 Write-Host ("  File size: {0:N0} bytes ({1:N1} KB)" -f $FileSize, ($FileSize / 1KB)) -ForegroundColor Green
 if ($ObfuscationStatus -eq 'obfuscated')
 {
-    Write-Host "  Privacy posture: obfuscated (safe to share)" -ForegroundColor Green
+    Write-Host "  Privacy posture: obfuscated (names in a sample look masked; review before sharing)" -ForegroundColor Green
 }
 else
 {
