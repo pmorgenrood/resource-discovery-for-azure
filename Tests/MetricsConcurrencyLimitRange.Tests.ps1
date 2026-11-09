@@ -81,6 +81,7 @@ Describe '-ConcurrencyLimit keeps its default of 6' {
         @{ Script = 'ResourceInventory.ps1' }
         @{ Script = 'Run-AllSubscriptions.ps1' }
         @{ Script = 'Run-AllSubscriptions.Stream.ps1' }
+        @{ Script = 'Extension/Metrics.ps1' }
     ) {
         param($Script)
         $Binder = Get-LimitBinder -Script $Script
@@ -159,5 +160,83 @@ $Binding = @($Error | Where-Object {
 
     It 'writes no Metrics file' {
         @(Get-ChildItem -Path $script:ZeroOutDir -Filter 'Metrics_test*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+}
+
+Describe 'Metrics.ps1 called without -ConcurrencyLimit' {
+
+    # With no default the limit was 0, which is not checked when the parameter
+    # is left out, so ForEach-Object -ThrottleLimit 0 failed and the Metrics
+    # file came out with no records.
+    BeforeAll {
+        $ModuleRoot = Join-Path $TestDrive 'modules-default'
+        $FakeModuleDir = Join-Path $ModuleRoot 'Az.Monitor'
+        New-Item -ItemType Directory -Path $FakeModuleDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $FakeModuleDir 'Az.Monitor.psm1') -Encoding utf8 -Value @'
+function Get-AzMetric
+{
+    [CmdletBinding()]
+    param([string]$ResourceId, [string[]]$MetricName, [datetime]$StartTime, [datetime]$EndTime, [timespan]$TimeGrain, [string]$AggregationType, $DefaultProfile)
+    foreach ($Name in @($MetricName))
+    {
+        [PSCustomObject]@{
+            Id   = $ResourceId + '/providers/Microsoft.Insights/metrics/' + $Name
+            Name = [PSCustomObject]@{ Value = $Name; LocalizedValue = $Name }
+            Data = @([PSCustomObject]@{ TimeStamp = $StartTime; Average = 1.0; Maximum = 1.0; Minimum = 1.0; Total = 1.0; Count = 1.0 })
+        }
+    }
+}
+Export-ModuleMember -Function Get-AzMetric
+'@
+
+        $Runner = Join-Path $TestDrive 'run-metrics-default.ps1'
+        Set-Content -LiteralPath $Runner -Encoding utf8 -Value @'
+param([string]$MetricsScript, [string]$CommonFunctions, [string]$ModuleRoot, [string]$OutDir)
+
+$env:PSModulePath = $ModuleRoot + [System.IO.Path]::PathSeparator + $env:PSModulePath
+. $CommonFunctions
+function Get-AzContext { return $null }
+$Global:DebugLogFile = Join-Path $OutDir 'debug.log'
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'SilentlyContinue'
+
+$SubscriptionId = '12345678-1234-1234-1234-123456789012'
+$VmId = '/subscriptions/{0}/resourceGroups/rg-limit/providers/Microsoft.Compute/virtualMachines/vm-owner' -f $SubscriptionId
+$Resources = @([PSCustomObject]@{
+        TYPE           = 'microsoft.compute/disks'
+        Id             = '/subscriptions/{0}/resourceGroups/rg-limit/providers/Microsoft.Compute/disks/disk-01' -f $SubscriptionId
+        subscriptionId = $SubscriptionId
+        ResourceGroup  = 'rg-limit'
+        Name           = 'disk-01'
+        Location       = 'westeurope'
+        ManagedBy      = $VmId
+    })
+
+# No -ConcurrencyLimit: the script's own default applies.
+$null = & $MetricsScript -Subscriptions @([PSCustomObject]@{ id = $SubscriptionId; Name = 'test-subscription' }) -Resources $Resources -Task 'Processing' -FilePath (Join-Path $OutDir 'Metrics_test') -Obfuscate $false *>&1
+
+$Files = @(Get-ChildItem -Path $OutDir -Filter 'Metrics_test*.json')
+$Records = 0
+foreach ($File in $Files) { $Records += @((Get-Content -LiteralPath $File.FullName -Raw | ConvertFrom-Json).Metrics).Count }
+$Log = if (Test-Path -LiteralPath $Global:DebugLogFile) { Get-Content -LiteralPath $Global:DebugLogFile -Raw } else { '' }
+$Limit = [regex]::Match([string]$Log, 'ThrottleLimit=(\d+)').Groups[1].Value
+[PSCustomObject]@{ Files = $Files.Count; Records = $Records; Limit = $Limit } | ConvertTo-Json -Compress
+'@
+
+        $script:DefaultOutDir = Join-Path $TestDrive 'limit-default'
+        New-Item -ItemType Directory -Path $script:DefaultOutDir -Force | Out-Null
+        $Output = & $script:PwshPath -NoProfile -NonInteractive -File $Runner -MetricsScript (Join-Path $script:RepoRoot 'Extension/Metrics.ps1') -CommonFunctions (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -ModuleRoot $ModuleRoot -OutDir $script:DefaultOutDir 2>&1
+        $Json = @($Output | ForEach-Object { [string]$_ } | Where-Object { $_ -like '{*"Records"*' }) | Select-Object -Last 1
+        if (-not $Json) { throw ("The metrics run printed no result: {0}" -f (($Output | ForEach-Object { [string]$_ }) -join ' | ')) }
+        $script:DefaultResult = $Json | ConvertFrom-Json
+    }
+
+    It 'runs with a limit of 6' {
+        $script:DefaultResult.Limit | Should -Be '6'
+    }
+
+    It 'writes a Metrics file with records' {
+        $script:DefaultResult.Files | Should -BeGreaterThan 0
+        $script:DefaultResult.Records | Should -BeGreaterThan 0
     }
 }
