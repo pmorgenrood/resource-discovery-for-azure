@@ -306,6 +306,11 @@ New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
 # Canonicalize staging too, so the per-folder exclusion compare below matches
 # the absolute FullName that Get-ChildItem returns.
 $StagingDirectory = (Resolve-Path -LiteralPath $StagingDirectory).Path
+# Staging will hold real names and ids. Make it owner-only (0700, or an
+# owner-only ACL on Windows) before anything is written into it, whether it was
+# just made or already existed; stop if that cannot be done.
+try { Set-RevealOwnerOnlyDirectory -Path $StagingDirectory }
+catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $StagingDirectory, $_.Exception.Message) }
 $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
 if (-not (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf))
 {
