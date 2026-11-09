@@ -453,6 +453,43 @@ function Test-RdaReportMetricsWritten
     return $true
 }
 
+# True when this run's Inventory file is there and reads as a JSON object.
+# A missing or bad Inventory file fails the whole upload downstream. $JsonFiles
+# is the list Get-RdaReportJsonFiles returns. The file is read with
+# JsonDocument, which checks the whole file without building PowerShell
+# objects, so a large inventory costs little memory.
+function Test-RdaReportInventoryWritten
+{
+    param([string[]]$JsonFiles)
+
+    $InventoryFile = @(@($JsonFiles) | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Split-Path -Path $_ -Leaf) -like 'Inventory_*.json' })[0]
+    if ([string]::IsNullOrEmpty($InventoryFile) -or -not (Test-Path -LiteralPath $InventoryFile -PathType Leaf))
+    {
+        Write-Log -Message 'The inventory file is not there.' -Severity 'Warning'
+        return $false
+    }
+    $Stream = $null
+    $Document = $null
+    try
+    {
+        $Stream = [System.IO.File]::OpenRead($InventoryFile)
+        $Document = [System.Text.Json.JsonDocument]::Parse($Stream)
+        if ($Document.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) { return $true }
+        $Reason = 'it is not a JSON object'
+    }
+    catch
+    {
+        $Reason = $_.Exception.Message
+    }
+    finally
+    {
+        if ($null -ne $Document) { $Document.Dispose() }
+        if ($null -ne $Stream) { $Stream.Dispose() }
+    }
+    Write-Log -Message ('The inventory file could not be read: {0}: {1}' -f (Split-Path -Path $InventoryFile -Leaf), $Reason) -Severity 'Warning'
+    return $false
+}
+
 # Writes the report zip with Compress-Archive. Returns $true only when the zip
 # is there afterwards. When it fails, the error is shown, any partial zip it
 # left is removed (so a half report is never uploaded or counted as written by

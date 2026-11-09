@@ -1216,7 +1216,18 @@ function ExecuteInventoryProcessing()
         $Global:SmaResources | Add-Member -MemberType NoteProperty -Name 'Version' -Value NotSet
         $Global:SmaResources.Version = $Global:Version
 
-        $Global:SmaResources | ConvertTo-Json -depth 100 -compress | Out-File $Global:JsonFile
+        # A write that fails stops here also when the run's error preference is
+        # SilentlyContinue. A partial file is removed: the run then makes no zip,
+        # since a bad Inventory file fails the whole upload.
+        try
+        {
+            $Global:SmaResources | ConvertTo-Json -depth 100 -compress | Out-File $Global:JsonFile -ErrorAction Stop
+        }
+        catch
+        {
+            Write-Log -Message ('The inventory file could not be written: {0}: {1}' -f (Split-Path -Path $Global:JsonFile -Leaf), $_.Exception.Message) -Severity 'Error'
+            if (Test-Path -LiteralPath $Global:JsonFile) { Remove-Item -LiteralPath $Global:JsonFile -Force -ErrorAction SilentlyContinue }
+        }
 
         Write-Log -Message ('Resource Reporting Phase Done.') -Severity 'Info'
     }
@@ -1809,6 +1820,9 @@ $JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Globa
 # a Metrics file that could not be written loses its metrics. So unless the run
 # had -SkipMetrics, a run with either makes no zip and counts as having written
 # no report (exit 2; under the wrapper, that subscription failed).
+# A missing or unreadable Inventory file fails the whole upload, so such a run
+# makes no zip either (exit 2), with or without -SkipMetrics.
+$InventoryNotWritten = -not (Test-RdaReportInventoryWritten -JsonFiles $JsonFiles)
 $MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and ((@($Global:RdaMetricsWriteFailures | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -gt 0) -or -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles))
 
 if ($Obfuscate.IsPresent)
@@ -1840,7 +1854,12 @@ else
 
 # A failed zip is removed and reported; the report file is named only when the
 # zip was written. A direct run then exits 2 at its end.
-$ZipWritten = if ($MetricsNotWritten)
+$ZipWritten = if ($InventoryNotWritten)
+{
+    Write-Log -Message ("No report was written: the inventory file was not written or cannot be read, so no zip was made. The other report files are still in {0}; run again." -f $DefaultPath) -Severity 'Error'
+    $false
+}
+elseif ($MetricsNotWritten)
 {
     Write-Log -Message ("No report was written: the metrics output was not written, so no zip was made. The other report files are still in {0}; run again." -f $DefaultPath) -Severity 'Error'
     $false

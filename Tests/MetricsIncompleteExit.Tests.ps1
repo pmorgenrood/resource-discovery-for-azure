@@ -514,7 +514,7 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         # the lifted statements and returns the exit code, the lines and the zip.
         function script:Invoke-MetricsEnd
         {
-            param([hashtable]$Arguments, [switch]$WriteFails, [string]$MetricsContent, [string[]]$MetricsContents, [string[]]$WriteFailures = @())
+            param([hashtable]$Arguments, [switch]$WriteFails, [string]$MetricsContent, [string[]]$MetricsContents, [string[]]$WriteFailures = @(), [string]$InventoryContent = '{}', [switch]$NoInventory)
             $Stamp = '20261109130000000' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
             $Folder = Join-Path $TestDrive ('run-' + $Stamp)
             New-Item -ItemType Directory -Path $Folder -Force | Out-Null
@@ -528,7 +528,7 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
             $Global:MetricsFailedSubs = @()
             Set-Content -LiteralPath $Global:HtmlFile -Value 'html'
             Set-Content -LiteralPath $Global:ConsumptionFileCsv -Value 'InstanceData,MeterCategory'
-            Set-Content -LiteralPath ($Global:DefaultPath + 'Inventory_ResourcesReport_' + $Stamp + '.json') -Value '{}'
+            if (-not $NoInventory) { Set-Content -LiteralPath ($Global:DefaultPath + 'Inventory_ResourcesReport_' + $Stamp + '.json') -Value $InventoryContent }
             if ($PSBoundParameters.ContainsKey('MetricsContent')) { Set-Content -LiteralPath ($Global:DefaultPath + 'Metrics_ResourcesReport_' + $Stamp + '_1.json') -Value $MetricsContent }
             # One Metrics file per content, _1 to _n, as the batches write them.
             $Index = 0
@@ -639,6 +639,36 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
 
         $Result.ExitCode | Should -Be 0
         @($Result.Entries | Where-Object { $_ -like 'Metrics_*.json' }).Count | Should -Be 3
+    }
+
+    It 'makes no zip and exits 2 when the Inventory file of the run is <Kind>' -ForEach @(
+        @{ Kind = 'missing'; Missing = $true; Content = '' }
+        @{ Kind = 'cut short'; Missing = $false; Content = '{"VirtualMachines":[{"ID":"a"' }
+        @{ Kind = 'empty'; Missing = $false; Content = '' }
+        @{ Kind = 'a list, not an object'; Missing = $false; Content = '[]' }
+    ) {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -MetricsContent '{"Metrics":[]}' -InventoryContent $Content -NoInventory:$Missing
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the inventory file was not written*' }).Count | Should -Be 1
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
+    }
+
+    It 'exits 2 under -RunAllSubs when the Inventory file is missing, so that subscription counts as failed' {
+        $Global:RdaUnwrittenReportZips = @()
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -MetricsContent '{"Metrics":[]}' -NoInventory
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        $Global:RdaUnwrittenReportZips | Should -Be @($Global:ZipOutputFile)
+    }
+
+    It 'makes no zip and exits 2 when the Inventory file is missing, also after -SkipMetrics' {
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1'; SkipMetrics = $true } -NoInventory
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
     }
 
     It 'zips the empty Metrics file and exits 0 when the run collected no metrics' {
@@ -754,8 +784,9 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
                     ('Metrics_ResourcesReport_{0}_2.json' -f $Stamp)
                     ('Transcript_Log_ResourcesReport_{0}.txt' -f $Stamp)))
             {
-                # A Metrics file holds a Metrics list, as the run writes it.
-                $Content = if ($Name -like 'Metrics_*') { '{"Metrics":[]}' } else { $Name }
+                # A Metrics file holds a Metrics list and the Inventory file
+                # an object, as the run writes them.
+                $Content = if ($Name -like 'Metrics_*') { '{"Metrics":[]}' } elseif ($Name -like 'Inventory_*') { '{}' } else { $Name }
                 Set-Content -LiteralPath ($Global:DefaultPath + $Name) -Value $Content
             }
             if ($Obfuscate) { Set-Content -LiteralPath ($Global:DefaultPath + ('ObfuscationDictionary_ResourcesReport_{0}.json' -f $Stamp)) -Value '{}' }
@@ -820,6 +851,73 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $Entries = Invoke-ZipFiles -Folder $Folder -Stamp $Stamp -Obfuscate:($Mode -eq 'masked')
 
         $Entries | Should -Be (Get-CleanZipEntries -Stamp $Stamp)
+    }
+}
+
+Describe 'The Inventory file of a ResourceInventory.ps1 run' {
+    BeforeAll {
+        # The function that writes the Inventory file, as written, run with the
+        # error preference the run sets. A stand-in Out-File writes part of the
+        # file and then fails as a full disk does (an error, not a throw).
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $script:Writers = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'ProcessResourceResult' }, $true))
+        $script:InventoryWrite = Join-Path $TestDrive 'inventory-write.ps1'
+        Set-Content -LiteralPath $script:InventoryWrite -Encoding utf8 -Value (@(
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                'function Out-File { [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject) begin { $Items = [System.Collections.Generic.List[object]]::new() } process { $Items.Add($InputObject) } end { $Text = ($Items -join ''''); if ($env:RDA_TEST_INVENTORY_WRITE_FAIL -and (Split-Path -Path $FilePath -Leaf) -like ''Inventory_*'') { Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -InputObject $Text.Substring(0, [math]::Min(10, $Text.Length)); Write-Error ''There is not enough space on the disk.'' } else { Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -InputObject $Text -Append:$Append } } }'
+                '$ErrorActionPreference = ''SilentlyContinue'''
+                @($script:Writers | ForEach-Object { $_.Extent.Text })
+                'ProcessResourceResult'
+            ) -join "`n")
+
+        function script:Invoke-InventoryWrite
+        {
+            param([switch]$Fail)
+            $Global:JsonFile = Join-Path $TestDrive ('Inventory_ResourcesReport_{0}.json' -f [guid]::NewGuid().ToString('N'))
+            $Global:SmaResources = [pscustomobject]@{ VirtualMachines = @([pscustomobject]@{ ID = 'vm-1'; Name = 'vm-1' }) }
+            $Global:Version = '1.0'
+            $env:RDA_TEST_INVENTORY_WRITE_FAIL = $(if ($Fail) { '1' } else { '' })
+            try
+            {
+                $Lines = @(& $script:InventoryWrite *>&1 | ForEach-Object { [string]$_ })
+                [pscustomobject]@{ Lines = $Lines; Left = (Test-Path -LiteralPath $Global:JsonFile) }
+            }
+            finally
+            {
+                Remove-Item -Path 'Env:RDA_TEST_INVENTORY_WRITE_FAIL' -ErrorAction SilentlyContinue
+            }
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('JsonFile', 'SmaResources', 'Version'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'is written by one function' {
+        $script:Writers.Count | Should -Be 1
+    }
+
+    It 'is removed and the failure is shown when its write fails, also when errors are silenced' {
+        $Result = Invoke-InventoryWrite -Fail
+
+        $Result.Left | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*The inventory file could not be written:*' }).Count | Should -Be 1
+    }
+
+    It 'is written as an object when its write works' {
+        $Result = Invoke-InventoryWrite
+
+        $Result.Left | Should -BeTrue
+        (Get-Content -LiteralPath $Global:JsonFile -Raw | ConvertFrom-Json).VirtualMachines[0].ID | Should -Be 'vm-1'
     }
 }
 
