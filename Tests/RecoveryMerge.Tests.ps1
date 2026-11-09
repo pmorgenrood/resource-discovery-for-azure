@@ -59,7 +59,7 @@ BeforeAll {
     # Masked disk records shaped as the output contract says
     # (/subscriptions/<prod_ token>/resourcegroups/<prod_ token>/providers/microsoft.compute/disks/<prod_ token>),
     # with the dictionary a masked run writes for them (token -> real value).
-    function New-MaskedBundleData([int]$Count = 3)
+    function Get-MaskedBundleData([int]$Count = 3)
     {
         $Sub = 'prod_' + [guid]::NewGuid().ToString()
         $Rg = 'prod_' + [guid]::NewGuid().ToString()
@@ -722,7 +722,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         @{ Case = 'both maps empty'; Empty = 'both'; Give = 'inventory' }
     ) {
         $C = New-Case
-        $Masked = New-MaskedBundleData -Count 3
+        $Masked = Get-MaskedBundleData -Count 3
         $EmptyDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{} }
         $RealId = '/subscriptions/{0}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk-real' -f $script:DocsGuid
         $PlainCsv = "$script:CsvHeader`n{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$RealId,eastus,,,"
@@ -741,7 +741,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         $RecSplat = @{ Dir = $C.Recovery; Base = $script:RecBase }
         if ($Empty -eq 'gap')
         {
-            $RecMasked = New-MaskedBundleData -Count 3
+            $RecMasked = Get-MaskedBundleData -Count 3
             $RecInventory['AppServices'] = $RecMasked.Records
             $RecSplat.Dictionary = $RecMasked.Dictionary
         }
@@ -764,7 +764,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
     It 'merges a masked recovery into a masked gap whose ResourceIdMap is empty and that gives no resource' {
         $C = New-Case
-        $RecMasked = New-MaskedBundleData -Count 3
+        $RecMasked = Get-MaskedBundleData -Count 3
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{} }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = @() }) -ConsumptionCsv $script:CsvHeader -MetricsFiles @{ '__0' = '{"Metrics":[]}' } -Dictionary $GapDict
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $RecMasked.Records }) -Dictionary $RecMasked.Dictionary
@@ -778,7 +778,7 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
 
     It 'merges a masked gap with a recovery whose ResourceIdMap is empty and that gives no resource' {
         $C = New-Case
-        $Masked = New-MaskedBundleData -Count 3
+        $Masked = Get-MaskedBundleData -Count 3
         $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{} }
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @() }) -Dictionary $RecDict
