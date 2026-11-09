@@ -1832,6 +1832,12 @@ Remove-Item -LiteralPath $Stage -Recurse -Force
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
+# The report is written, but this subscription's billing pull stopped part-way.
+if (@($Scenario.ConsumptionFailIds) -contains $SubscriptionID)
+{
+    if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
+    $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = $SubscriptionID; Id = $SubscriptionID; Message = 'stand-in: the usage service failed (stopped at consumption page 2, after 5 record(s); this subscription''s consumption is INCOMPLETE)'; Complete = $false; PageAtFailure = 2; RecordsCollected = 5 }
+}
 '@ | Set-Content -LiteralPath (Join-Path $ToolRoot 'ResourceInventory.ps1') -Encoding utf8
 
         # Az.Accounts answers sign-in, context, token and subscription calls, and
@@ -1961,7 +1967,7 @@ exit 1
 
         function script:Set-WrapperScenario
         {
-            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @())
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @(), [string[]]$ConsumptionFail = @())
             [pscustomobject]@{
                 Tenant        = $script:WrapperTenant
                 Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
@@ -1972,6 +1978,7 @@ exit 1
                 Unknown       = @($Unknown)
                 Disagree      = @($Disagree)
                 LockRoot      = @($LockRoot)
+                ConsumptionFailIds = @($ConsumptionFail)
             } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
         }
 
@@ -2499,6 +2506,44 @@ exit 1
         $Second.ExitCode | Should -Be 0 -Because ($Second.Text -join "`n")
         $Second.Text | Should -Contain ('Skipping (already completed): {0} ({1})' -f $script:SubB.Name, $script:SubB.Id)
         @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubB.Id)).Count | Should -Be 1
+    }
+
+    It 'keeps a subscription whose consumption failed on the retry list, exits 3, and the next -Resume collects it again (<Label>)' -TestCases @(
+        @{ Label = 'one stream'; Streams = 1 }
+        @{ Label = 'two streams'; Streams = 2 }
+        @{ Label = 'two streams asked, one subscription'; Streams = 2; Only = $true }
+    ) {
+        param($Label, $Streams, $Only)
+        if ($Only)
+        {
+            script:Use-WrapperCase
+            script:Set-WrapperScenario -Subs @($script:SubA) -ConsumptionFail @($script:SubA.Id)
+            $One = script:Invoke-WrapperRun -Streams $Streams
+            $One.ExitCode | Should -Be 3 -Because ($One.Text -join "`n")
+            (script:Read-WrapperState).Failed | Should -Be @($script:SubA.Id)
+            @((script:Read-WrapperState).Completed) | Should -Not -Contain $script:SubA.Id
+            return
+        }
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id)
+        $First = script:Invoke-WrapperRun -Streams $Streams
+        $First.ExitCode | Should -Be 3 -Because ($First.Text -join "`n")
+        ($First.Text -join "`n") | Should -Match 'FAILED \(consumption\)'
+        $State = script:Read-WrapperState
+        $State.Failed | Should -Be @($script:SubA.Id)
+        $State.Completed | Should -Not -Contain $script:SubA.Id
+        $State.Completed | Should -Contain $script:SubB.Id
+
+        script:Use-WrapperCase -CaseHome $script:CaseHome
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB)
+        $Second = script:Invoke-WrapperRun -Streams $Streams -Arguments @('-Resume')
+        $Second.ExitCode | Should -Be 0 -Because ($Second.Text -join "`n")
+        @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubA.Id)).Count | Should -Be 2
+        # A parallel -Resume after a finished run collects every subscription its
+        # streams are given (each stream reads only its own state file, which the
+        # merge removed), so only the sequential run is checked for Sub B.
+        if ($Streams -le 1) { @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubB.Id)).Count | Should -Be 1 }
+        script:Read-WrapperState | Should -BeNullOrEmpty
     }
 
     It 'does not put a subscription without a read role on the retry list' {

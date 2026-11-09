@@ -1028,6 +1028,9 @@ if ($ParallelStreams -le 1)
 
         try
         {
+            # The consumption failures recorded before this subscription, so the ones
+            # its own run adds can be told apart.
+            $ConsumptionFailuresBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
             & (Join-Path $PSScriptRoot "ResourceInventory.ps1") -TenantID $TenantID -SubscriptionID $Sub.Id @InventoryPassthrough -RunAllSubs
             # Only treat as failure if the inner script set a non-zero exit code.
             # Some completion paths leave $LASTEXITCODE unset ($null), and
@@ -1068,15 +1071,28 @@ if ($ParallelStreams -le 1)
             # If the sub was previously in FailedAttempts (i.e. this is a retry that
             # finally succeeded), remove its entry so the resume-state file reflects
             # current truth.
+            # A subscription whose consumption download failed, stopped part-way or was
+            # skipped for the sign-in wrote its report without all of its cost data:
+            # it stays on the retry list, not completed, so -Resume and
+            # -ResumeFailedOnly collect it again instead of skipping it.
+            $NewConsumptionFailures = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) | Select-Object -Skip $ConsumptionFailuresBefore)
             $StateChanged = $false
-            if (-not ($CompletedIds -contains $Sub.Id))
+            if ($NewConsumptionFailures.Count -gt 0)
             {
-                $CompletedIds += $Sub.Id
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
                 $StateChanged = $true
             }
-            $BeforeFailedCount = @($FailedAttempts).Count
-            $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
-            if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
+            else
+            {
+                if (-not ($CompletedIds -contains $Sub.Id))
+                {
+                    $CompletedIds += $Sub.Id
+                    $StateChanged = $true
+                }
+                $BeforeFailedCount = @($FailedAttempts).Count
+                $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                if (@($FailedAttempts).Count -ne $BeforeFailedCount) { $StateChanged = $true }
+            }
             if ($StateChanged)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
@@ -1230,6 +1246,7 @@ else
             Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
             try
             {
+                $ConsumptionFailuresBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
                 & (Join-Path $PSScriptRoot "ResourceInventory.ps1") -TenantID $TenantID -SubscriptionID $Sub.Id @InventoryPassthrough -RunAllSubs
                 # Same null-guard as the sequential branch above.
                 if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "Script exited with code $LASTEXITCODE" }
@@ -1243,7 +1260,15 @@ else
                 {
                     Write-Host ("Resources collected: {0:N0}" -f $ResCount) -ForegroundColor DarkGreen
                 }
-                if (-not ($CompletedIds -contains $Sub.Id))
+                # As on the sequential path: a subscription whose consumption is
+                # incomplete stays on the retry list, not completed.
+                $NewConsumptionFailures = @(@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }) | Select-Object -Skip $ConsumptionFailuresBefore)
+                if ($NewConsumptionFailures.Count -gt 0)
+                {
+                    $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
+                }
+                elseif (-not ($CompletedIds -contains $Sub.Id))
                 {
                     $CompletedIds += $Sub.Id
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
