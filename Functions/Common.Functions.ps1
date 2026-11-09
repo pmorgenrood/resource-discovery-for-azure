@@ -333,9 +333,13 @@ function Get-MetricsRetryCommand
     }
     # The run's scope and output, when it set them, so the new report covers the
     # same resources and lands where the first one did.
-    if ($Given.Contains('MetricsLookbackDays') -and [string]$Given['MetricsLookbackDays'] -match '^\s*-?\d+\s*$')
+    # The lookback is written as the whole number of days the run used, as
+    # Metrics.ps1 reads it ([int], so 7.5 is 8). A value that does not convert
+    # is left out.
+    $Days = if ($Given.Contains('MetricsLookbackDays') -and $Given['MetricsLookbackDays'] -isnot [bool]) { $Given['MetricsLookbackDays'] -as [int] } else { $null }
+    if ($null -ne $Days)
     {
-        $Parts.Add('-MetricsLookbackDays'); $Parts.Add(([string]$Given['MetricsLookbackDays']).Trim())
+        $Parts.Add('-MetricsLookbackDays'); $Parts.Add([string]$Days)
     }
     if ($Given.Contains('ResourceGroup') -and -not [string]::IsNullOrEmpty([string]$Given['ResourceGroup']))
     {

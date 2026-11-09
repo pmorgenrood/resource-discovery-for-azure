@@ -74,6 +74,18 @@ Describe 'Get-MetricsRetryCommand' {
         Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be "./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -MetricsLookbackDays 14 -ResourceGroup 'rg-one' -Service 'Compute','It''s' -ReportName 'Report_A' -OutputDirectory '/data/out''s'"
     }
 
+    It 'writes the whole number of days the run used for a lookback of <Given>' -ForEach @(
+        @{ Given = 7.5; Used = 8 }
+        @{ Given = '7.5'; Used = 8 }
+        @{ Given = 6.5; Used = 6 }
+        @{ Given = ' 14 '; Used = 14 }
+    ) {
+        # Metrics.ps1 reads the lookback as [int], so the new run asks for the
+        # same days.
+        [int]$Given | Should -Be $Used
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters @{ MetricsLookbackDays = $Given } | Should -Be ('./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -MetricsLookbackDays {0}' -f $Used)
+    }
+
     It 'leaves out a lookback that is not a whole number and empty values' {
         $Run = @{ MetricsLookbackDays = '14; Remove-Item x'; ResourceGroup = ''; Service = @(); ReportName = $null }
         Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
