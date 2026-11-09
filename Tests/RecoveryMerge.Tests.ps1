@@ -56,6 +56,35 @@ BeforeAll {
         }
     }
 
+    # Masked disk records shaped as the output contract says
+    # (/subscriptions/<prod_ token>/resourcegroups/<prod_ token>/providers/microsoft.compute/disks/<prod_ token>),
+    # with the dictionary a masked run writes for them (token -> real value).
+    function New-MaskedBundleData([int]$Count = 3)
+    {
+        $Sub = 'prod_' + [guid]::NewGuid().ToString()
+        $Rg = 'prod_' + [guid]::NewGuid().ToString()
+        $Records = @()
+        $IdMap = [ordered]@{}; $NameMap = [ordered]@{}
+        for ($i = 0; $i -lt $Count; $i++)
+        {
+            $Name = 'prod_' + [guid]::NewGuid().ToString()
+            $Id = '/subscriptions/{0}/resourcegroups/{1}/providers/microsoft.compute/disks/{2}' -f $Sub, $Rg, $Name
+            $Records += [ordered]@{ Name = $Name; Subscription = $Sub; ResourceGroup = $Rg; Location = 'eastus'; ID = $Id }
+            $IdMap[$Id] = '/subscriptions/{0}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk{1}' -f $script:DocsGuid, $i
+            $NameMap[$Name] = 'disk' + $i
+        }
+        [pscustomobject]@{
+            Records    = $Records
+            Dictionary = [ordered]@{
+                GeneratedAt      = '2026-01-01 00:00:00'
+                ResourceIdMap    = $IdMap
+                ResourceNameMap  = $NameMap
+                SubscriptionMap  = [ordered]@{ $Sub = $script:DocsGuid }
+                ResourceGroupMap = [ordered]@{ $Rg = 'rg-app' }
+            }
+        }
+    }
+
     # Write a bundle folder. Inventory is a hashtable of service-name -> record[].
     function New-Bundle
     {
@@ -650,6 +679,80 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
             Should -Throw -ExpectedMessage ("*the $Which bundle's dictionary*cannot be read*Nothing was written*")
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a dictionary that cannot be read stops the merge before any file is written'
+    }
+
+    It 'stops when a bundle whose ResourceIdMap is empty gives the merge resources (<Case>)' -ForEach @(
+        @{ Case = 'plain recovery inventory next to an old empty dictionary'; Empty = 'recovery'; Give = 'inventory' },
+        @{ Case = 'plain recovery consumption next to an old empty dictionary'; Empty = 'recovery'; Give = 'consumption' },
+        @{ Case = 'plain recovery metrics next to an old empty dictionary'; Empty = 'recovery'; Give = 'metrics' },
+        @{ Case = 'plain gap inventory next to an old empty dictionary'; Empty = 'gap'; Give = 'inventory' },
+        @{ Case = 'both maps empty'; Empty = 'both'; Give = 'inventory' }
+    ) {
+        $C = New-Case
+        $Masked = New-MaskedBundleData -Count 3
+        $EmptyDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{} }
+        $RealId = '/subscriptions/{0}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk-real' -f $script:DocsGuid
+        $PlainCsv = "$script:CsvHeader`n{},Storage,m1,P10,eastus,disk,1,Hours,2026-01-01,2026-01-02,$RealId,eastus,,,"
+
+        # The gap: masked (contract-shaped ids and a dictionary holding them), or plain next to an empty dictionary.
+        if ($Empty -in 'gap', 'both')
+        {
+            New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = @((New-Record 'disk-real')) }) -Dictionary $EmptyDict
+        }
+        else
+        {
+            New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+        }
+        # The recovery: what it gives depends on the case; it is masked when only the gap map is empty.
+        $RecInventory = [ordered]@{ Version = '3.2.3' }
+        $RecSplat = @{ Dir = $C.Recovery; Base = $script:RecBase }
+        if ($Empty -eq 'gap')
+        {
+            $RecMasked = New-MaskedBundleData -Count 3
+            $RecInventory['AppServices'] = $RecMasked.Records
+            $RecSplat.Dictionary = $RecMasked.Dictionary
+        }
+        else
+        {
+            $RecSplat.Dictionary = $EmptyDict
+            if ($Give -eq 'inventory') { $RecInventory['AppServices'] = @((New-Record 'app-real')) }
+            if ($Give -eq 'consumption') { $RecSplat.ConsumptionCsv = $PlainCsv }
+            if ($Give -eq 'metrics') { $RecSplat.MetricsFiles = @{ '__0' = ('{"Metrics":[{"ID":"' + $RealId + '","Metric":"Percentage CPU","MetricValue":1}]}') } }
+        }
+        New-Bundle @RecSplat -Inventory $RecInventory
+        $Splat = @{ GapBundlePath = $C.Gap; RecoveryBundlePath = $C.Recovery; OutputPath = $C.Output; WarningAction = 'SilentlyContinue' }
+        if ($Give -eq 'consumption') { $Splat.RecoverConsumption = $true }
+        if ($Give -eq 'metrics') { $Splat.RecoverMetrics = $true }
+        $Label = if ($Empty -eq 'recovery') { 'recovery' } else { 'gap' }
+
+        { Merge-RecoveryData @Splat } | Should -Throw -ExpectedMessage "*the $Label bundle's dictionary*has an empty ResourceIdMap*real names and ids would ship inside a masked bundle*Nothing was written*"
+        Test-Path -LiteralPath $C.Output | Should -BeFalse
+    }
+
+    It 'merges a masked recovery into a masked gap whose ResourceIdMap is empty and that gives no resource' {
+        $C = New-Case
+        $RecMasked = New-MaskedBundleData -Count 3
+        $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{} }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = @() }) -ConsumptionCsv $script:CsvHeader -MetricsFiles @{ '__0' = '{"Metrics":[]}' } -Dictionary $GapDict
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $RecMasked.Records }) -Dictionary $RecMasked.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        $Merged = Get-Content -LiteralPath $Result.OutputInventory -Raw | ConvertFrom-Json
+        @($Merged.VMDisk.ID) | Should -Be @($RecMasked.Records | ForEach-Object { $_.ID })
+    }
+
+    It 'merges a masked gap with a recovery whose ResourceIdMap is empty and that gives no resource' {
+        $C = New-Case
+        $Masked = New-MaskedBundleData -Count 3
+        $RecDict = [ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = [ordered]@{} }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @() }) -Dictionary $RecDict
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
     }
 
     It 'leaves an existing output folder untouched when it stops' {
