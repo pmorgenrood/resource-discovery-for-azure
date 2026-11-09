@@ -11,8 +11,11 @@
 #   so one cut back to its scope fails.
 # - An extension resource adds a second /providers/<namespace> block.
 # - Every subscription, resource group and name segment is a prod_/nonprod_
-#   token. Consumption-only tokens carry sub_, rg_ or rg_mc_; a name token may
-#   carry a databricks_, aks_ or vmss_ hint; a '$system' name stays as written.
+#   token. A subscription or group token may carry the sub_, rg_ or rg_mc_ hint
+#   that the consumption and metrics steps give a resource the inventory does
+#   not hold (in any masked id, since a metric id can hold one); a name token
+#   may carry a databricks_, aks_ or vmss_ hint; a '$system' name stays as
+#   written.
 # - Namespace and type segments stay as written. Each provider block is a
 #   namespace and then at least one type and name pair: a part with no
 #   partner (a type with no name, a namespace with no type) could be a real
