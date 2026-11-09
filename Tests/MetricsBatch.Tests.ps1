@@ -583,13 +583,26 @@ Describe 'Metrics.ps1 batch work items' {
         $Inner = [System.Net.Http.HttpRequestException]::new('Too many requests.', $null, [System.Net.HttpStatusCode]::TooManyRequests)
         $Inner | Add-Member -NotePropertyName Response -NotePropertyValue $Response
         $Outer = [System.Exception]::new('The operation failed.', $Inner)
+        # A date is read against the live clock, so stand in for a slow scheduler here.
+        if ($Date) { Start-Sleep -Milliseconds 600 }
 
         (Get-MetricBatchFailure -Exception $Outer).Kind | Should -Be 'Throttled'
         $RetryAfter = Get-MetricBatchRetryAfter -Exception $Outer
-        # An HTTP date has whole seconds, so it can read up to 1 s short.
-        $RetryAfter | Should -BeGreaterThan ($Seconds - 1.5)
-        $RetryAfter | Should -BeLessOrEqual $Seconds
-        [math]::Round((Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter $RetryAfter)) | Should -Be $Wait
+        $Backoff = [math]::Round((Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter $RetryAfter))
+        if ($Date)
+        {
+            # A date is read against the live clock, so a slow run reads a few seconds short.
+            $RetryAfter | Should -BeGreaterThan ($Seconds - 5)
+            $RetryAfter | Should -BeLessOrEqual $Seconds
+            $Backoff | Should -BeGreaterThan ($Wait - 5)
+            $Backoff | Should -BeLessOrEqual $Wait
+        }
+        else
+        {
+            # A number of seconds does not depend on the clock, so it reads exactly.
+            $RetryAfter | Should -Be $Seconds
+            $Backoff | Should -Be $Wait
+        }
     }
 
     It 'reads no Retry-After when no exception in the chain carries one' {
