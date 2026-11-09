@@ -634,6 +634,29 @@ Describe 'Merge-RecoveryData consumption handling' {
         }
     }
 
+    It 'reads each consumption file once under -RecoverConsumption, and still compares their row counts and windows' {
+        $C = New-Case
+        $GapCsv = "$script:CsvHeader`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-02,2026-01-03,/id,eastus,,,"
+        $RecCsv = "$script:CsvHeader`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-02-01,2026-02-02,/id,eastus,,,"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $GapCsv
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -ConsumptionCsv $RecCsv
+        # Count every Import-Csv the merge makes, per file, then hand the call to the real cmdlet.
+        $script:CsvReads = [System.Collections.Generic.List[string]]::new()
+        $script:RealImportCsv = Get-Command -Name Import-Csv -CommandType Cmdlet
+        Mock Import-Csv {
+            $script:CsvReads.Add([System.IO.Path]::GetFileName($LiteralPath))
+            & $script:RealImportCsv -LiteralPath $LiteralPath -ErrorAction Stop
+        }
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
+
+        @($script:CsvReads | Where-Object { $_ -eq ('Consumption_{0}.csv' -f $script:RecBase) }).Count | Should -Be 1 -Because 'the recovery file is checked and summed up in one pass'
+        @($script:CsvReads | Where-Object { $_ -eq ('Consumption_{0}.csv' -f $script:GapBase) }).Count | Should -Be 1
+        $Warnings = $Result.Warnings -join "`n"
+        $Warnings | Should -BeLike '*FEWER rows than the gap CSV (1 vs 2)*'
+        $Warnings | Should -BeLike '*gap: 2026-01-01..2026-01-03; recovery: 2026-02-01..2026-02-02*'
+    }
+
     It 'merges a large masked consumption file and still finds a plain id in its last row' {
         $C = New-Case
         $Masked = Get-MaskedBundleData -Count 3
