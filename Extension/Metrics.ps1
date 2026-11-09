@@ -361,7 +361,8 @@ function Get-MetricBatchBackoff
 }
 
 # The exception and the ones it wraps (inner exceptions and a wrapped error
-# record's exception), outermost first, at most 10.
+# record's exception), outermost first, at most 10. An exception reached twice
+# (as an inner exception and as an error record's exception) is listed once.
 function Get-MetricExceptionChain
 {
     param([System.Exception]$Exception)
@@ -373,6 +374,10 @@ function Get-MetricExceptionChain
     {
         $Ex = $Pending.Dequeue()
         if ($null -eq $Ex) { continue }
+        # Seen before when the same object is already listed (not only an equal one).
+        $Seen = $false
+        foreach ($Listed in $Chain) { if ([object]::ReferenceEquals($Listed, $Ex)) { $Seen = $true; break } }
+        if ($Seen) { continue }
         $Chain.Add($Ex)
         $Pending.Enqueue($Ex.InnerException)
         if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
