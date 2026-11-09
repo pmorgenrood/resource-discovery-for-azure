@@ -49,6 +49,19 @@ BeforeAll {
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
     . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
     $script:MaskedIdPattern = Get-MaskedIdPattern
+
+    # Inventory IDs by Name, group and subscription (letter case aside): rows
+    # such as a SQL VM and its VM, or two same-name databases of a plain run,
+    # share those and keep their own IDs.
+    $script:InventoryIdsOf = @{}
+    $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
+        @($_.Value) | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) } | ForEach-Object {
+            $Key = ('{0}|{1}|{2}' -f $_.Name, $_.ResourceGroup, $_.Subscription).ToLowerInvariant()
+            if (-not $script:InventoryIdsOf.ContainsKey($Key)) { $script:InventoryIdsOf[$Key] = @() }
+            $script:InventoryIdsOf[$Key] += [string]$_.ID
+        }
+    }
+    $script:IsObfuscated = Test-ObfuscatedRun -Ids $script:AllIds -DictionaryPath (Get-RunDictionaryPath -TestsRoot $PSScriptRoot)
 }
 
 AfterAll {
@@ -381,11 +394,20 @@ Describe "Metric Per-Resource Cached Token" {
         }
         $Violations | Should -BeNullOrEmpty -Because "each obfuscated resource ID should map to a single Name/Subscription/ResourceGroup across its metric rows"
         # And the other way: a grouping by ID alone passes when every metric
-        # row gets a new ID (one-row groups), so rows of one Name, group and
-        # subscription must also share one ID.
+        # row gets a new ID (one-row groups), so in a masked run (where each
+        # resource has its own name token) rows of one Name, group and
+        # subscription must also share one ID, unless each of their IDs is an
+        # inventory row of that Name, group and subscription (a SQL VM and its
+        # VM share a name token). A plain run can give two resources one name,
+        # so it is not checked here.
+        if (-not $script:IsObfuscated) { return }
         $Split = @()
         $script:MetricRows | Where-Object { ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) } | Group-Object Name, ResourceGroup, Subscription | ForEach-Object {
-            if (@($_.Group.ID | Sort-Object -Unique).Count -gt 1) { $Split += $_.Name }
+            $GroupIds = @($_.Group.ID | Sort-Object -Unique)
+            if ($GroupIds.Count -le 1) { return }
+            $Key = ('{0}|{1}|{2}' -f $_.Group[0].Name, $_.Group[0].ResourceGroup, $_.Group[0].Subscription).ToLowerInvariant()
+            $Known = if ($script:InventoryIdsOf.ContainsKey($Key)) { $script:InventoryIdsOf[$Key] } else { @() }
+            if (@($GroupIds | Where-Object { $Known -notcontains $_ }).Count -gt 0) { $Split += $_.Name }
         }
         $Split | Should -BeNullOrEmpty -Because "metric rows of one Name/ResourceGroup/Subscription should carry one obfuscated resource ID"
     }
@@ -396,14 +418,7 @@ Describe "Metric Per-Resource Cached Token" {
         # Subscription), so a metric row whose Name, group and subscription
         # are an inventory row's must carry that row's ID (one of them, when
         # rows such as a SQL VM and its VM share those tokens).
-        $IdsOf = @{}
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | Where-Object { $null -ne $_ -and ![string]::IsNullOrEmpty($_.ID) -and ![string]::IsNullOrEmpty($_.Name) } | ForEach-Object {
-                $Key = ('{0}|{1}|{2}' -f $_.Name, $_.ResourceGroup, $_.Subscription).ToLowerInvariant()
-                if (-not $IdsOf.ContainsKey($Key)) { $IdsOf[$Key] = @() }
-                $IdsOf[$Key] += [string]$_.ID
-            }
-        }
+        $IdsOf = $script:InventoryIdsOf
         $Checked = 0
         foreach ($m in $script:MetricRows)
         {
