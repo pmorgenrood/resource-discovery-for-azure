@@ -19,6 +19,9 @@ if ($Task -eq 'Processing')
         foreach ($Db in $SQLSERVERMIDB)
         {
             if ($null -eq $Db.Id) { continue }
+            # shortcut: an id that is not one string (Azure always sends one) is
+            # read as its text; '-like' tested each item of an array. Upgrade
+            # only if Resource Graph ever returns a list here.
             $DbId = "$($Db.Id)"
             $At = $DbId.IndexOf('/databases/', [System.StringComparison]::OrdinalIgnoreCase)
             while ($At -ge 0)
