@@ -110,7 +110,7 @@ function Merge-RecoveryData
     #    without needing culture-aware date parsing. -----------------------------
     function Get-ConsumptionCsvStats([string]$Path)
     {
-        $Rows = @(Import-Csv -Path $Path -ErrorAction Stop)
+        $Rows = @(Import-Csv -LiteralPath $Path -ErrorAction Stop)
         $Starts = @($Rows | ForEach-Object { $_.UsageStartTime } | Where-Object { $_ } | Sort-Object -Unique)
         $Ends = @($Rows | ForEach-Object { $_.UsageEndTime } | Where-Object { $_ } | Sort-Object -Unique)
         [PSCustomObject]@{
@@ -135,7 +135,7 @@ function Merge-RecoveryData
         param([string]$DictionaryPath, [string]$InventoryPath)
 
         $DictKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $Dict = Get-Content -Path $DictionaryPath -Raw | ConvertFrom-Json
+        $Dict = Get-Content -LiteralPath $DictionaryPath -Raw | ConvertFrom-Json
         foreach ($MapProp in $Dict.PSObject.Properties)
         {
             # Only object-valued properties are token maps; skip scalar metadata
@@ -156,7 +156,7 @@ function Merge-RecoveryData
         # resource-group maps, so they are what this check counts. Consumption-style
         # tokens (prod_sub_/prod_rg_...) live in the CSV, not the inventory JSON, so
         # they never enter this scan.
-        $InventoryText = Get-Content -Path $InventoryPath -Raw
+        $InventoryText = Get-Content -LiteralPath $InventoryPath -Raw
         $InventoryTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($TokenMatch in [regex]::Matches($InventoryText, '(?i)\b(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'))
         {
@@ -175,7 +175,7 @@ function Merge-RecoveryData
     function Get-BundleFile
     {
         param([string]$Directory, [string]$Filter, [switch]$Optional)
-        $MatchingFiles = @(Get-ChildItem -Path $Directory -Filter $Filter -File -ErrorAction SilentlyContinue |
+        $MatchingFiles = @(Get-ChildItem -LiteralPath $Directory -Filter $Filter -File -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending)
         if (@($MatchingFiles).Count -gt 1)
         {
@@ -193,8 +193,8 @@ function Merge-RecoveryData
         return $Found
     }
 
-    if (-not (Test-Path -Path $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
-    if (-not (Test-Path -Path $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
+    if (-not (Test-Path -LiteralPath $GapBundlePath -PathType Container)) { throw ("Merge-RecoveryData: GapBundlePath not found: {0}" -f $GapBundlePath) }
+    if (-not (Test-Path -LiteralPath $RecoveryBundlePath -PathType Container)) { throw ("Merge-RecoveryData: RecoveryBundlePath not found: {0}" -f $RecoveryBundlePath) }
     $GapInventoryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Inventory_*.json'
     $RecoveryInventoryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Inventory_*.json'
     $GapConsumptionFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Consumption_*.csv'  -Optional
@@ -257,8 +257,8 @@ function Merge-RecoveryData
         $SharedIdKeyCount = $null
         try
         {
-            $GapDictCheck = Get-Content -Path $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
-            $RecoveryDictCheck = Get-Content -Path $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
+            $GapDictCheck = Get-Content -LiteralPath $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
+            $RecoveryDictCheck = Get-Content -LiteralPath $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
             # Drop the $null that an empty or missing map yields, so an empty
             # ResourceIdMap (a run that found no resources) counts as 0 keys and
             # the check below is skipped instead of stopping a merge that no
@@ -334,8 +334,8 @@ function Merge-RecoveryData
     }
 
     # -- Load inventories -----------------------------------------------------
-    $GapInventory = Get-Content -Path $GapInventoryFile.FullName -Raw | ConvertFrom-Json
-    $RecoveryInventory = Get-Content -Path $RecoveryInventoryFile.FullName -Raw | ConvertFrom-Json
+    $GapInventory = Get-Content -LiteralPath $GapInventoryFile.FullName -Raw | ConvertFrom-Json
+    $RecoveryInventory = Get-Content -LiteralPath $RecoveryInventoryFile.FullName -Raw | ConvertFrom-Json
 
     # Determine which service keys to splice in. Default = every collector key the
     # recovery run produced (excluding the 'Version' marker); -Service narrows it.
@@ -412,19 +412,19 @@ function Merge-RecoveryData
     $RecoveryMetricsFiles = @()
     if ($RecoverMetrics)
     {
-        $RecoveryMetricsFiles = @(Get-ChildItem -Path $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
+        $RecoveryMetricsFiles = @(Get-ChildItem -LiteralPath $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
         if ($RecoveryMetricsFiles.Count -eq 0)
         {
             throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
         }
     }
     $SummaryScript = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'Extension/Summary.ps1'
-    if (-not (Test-Path -Path $SummaryScript -PathType Leaf))
+    if (-not (Test-Path -LiteralPath $SummaryScript -PathType Leaf))
     {
         throw ("Merge-RecoveryData: report generator not found at '{0}'. Keep the Extension folder with the Functions folder. Nothing was written." -f $SummaryScript)
     }
 
-    if (-not (Test-Path -Path $OutputPath -PathType Container))
+    if (-not (Test-Path -LiteralPath $OutputPath -PathType Container))
     {
         New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
     }
@@ -496,11 +496,11 @@ function Merge-RecoveryData
     }
     if ($ConsumptionSourceFile)
     {
-        Copy-Item -Path $ConsumptionSourceFile.FullName -Destination $OutConsumptionFile -Force
+        Copy-Item -LiteralPath $ConsumptionSourceFile.FullName -Destination $OutConsumptionFile -Force
     }
     else
     {
-        "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -FilePath $OutConsumptionFile -Encoding utf8
+        "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -LiteralPath $OutConsumptionFile -Encoding utf8
     }
     # -- Metrics source. By default carry ALL gap Metrics_*.json forward verbatim.
     #    The metrics phase writes one file per batch (Metrics_<base>__<idx>.json),
@@ -520,7 +520,7 @@ function Merge-RecoveryData
         {
             $Suffix = $MetricsFile.BaseName -replace ('^Metrics_' + [regex]::Escape($RecoveryBase)), ''
             $RebasedName = 'Metrics_' + $BundleBase + $Suffix + '.json'
-            Copy-Item -Path $MetricsFile.FullName -Destination (Join-Path $OutputPath $RebasedName) -Force
+            Copy-Item -LiteralPath $MetricsFile.FullName -Destination (Join-Path $OutputPath $RebasedName) -Force
         }
         $MetricsSource = 'recovery'
         # Advisory: the regenerated HTML does not render metrics (Summary.ps1
@@ -532,17 +532,17 @@ function Merge-RecoveryData
     }
     else
     {
-        $GapMetricsFiles = @(Get-ChildItem -Path $GapBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
+        $GapMetricsFiles = @(Get-ChildItem -LiteralPath $GapBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
         if ($GapMetricsFiles.Count -gt 0)
         {
             foreach ($MetricsFile in $GapMetricsFiles)
             {
-                Copy-Item -Path $MetricsFile.FullName -Destination (Join-Path $OutputPath $MetricsFile.Name) -Force
+                Copy-Item -LiteralPath $MetricsFile.FullName -Destination (Join-Path $OutputPath $MetricsFile.Name) -Force
             }
         }
         else
         {
-            @{ Metrics = @() } | ConvertTo-Json -Depth 5 -Compress | Out-File -FilePath $OutMetricsFile -Encoding utf8
+            @{ Metrics = @() } | ConvertTo-Json -Depth 5 -Compress | Out-File -LiteralPath $OutMetricsFile -Encoding utf8
         }
         $MetricsSource = 'gap'
     }
@@ -555,10 +555,10 @@ function Merge-RecoveryData
     $DictionaryMerged = $false
     if ($GapDictionaryFile)
     {
-        $MergedDictionary = Get-Content -Path $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
+        $MergedDictionary = Get-Content -LiteralPath $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
         if ($RecoveryDictionaryFile)
         {
-            $RecoveryDictionary = Get-Content -Path $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
+            $RecoveryDictionary = Get-Content -LiteralPath $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
             foreach ($MapProp in $RecoveryDictionary.PSObject.Properties)
             {
                 $MapName = $MapProp.Name
@@ -577,7 +577,7 @@ function Merge-RecoveryData
                 }
             }
         }
-        $MergedDictionary | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutDictionaryFile -Encoding utf8
+        $MergedDictionary | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $OutDictionaryFile -Encoding utf8
         $DictionaryMerged = $true
     }
 
@@ -590,12 +590,13 @@ function Merge-RecoveryData
     # -- Re-zip, mirroring ResourceInventory.ps1's packaging filter: HTML +
     #    Consumption CSV + every *.json EXCEPT the local-only dictionary/Full/
     #    Heartbeat/ErrorLog files. The dictionary is deliberately NOT zipped. ---
-    $ZipJsonFiles = Get-ChildItem -Path $OutputPath -Filter '*.json' |
+    $ZipJsonFiles = Get-ChildItem -LiteralPath $OutputPath -Filter '*.json' |
         Where-Object { $_.Name -notlike 'ObfuscationDictionary_*' -and $_.Name -notlike 'Full_*' -and $_.Name -notlike 'Heartbeat_*' -and $_.Name -notlike 'ErrorLog_*' } |
         Select-Object -ExpandProperty FullName
     $ZipPaths = @($OutHtmlFile, $OutConsumptionFile) + $ZipJsonFiles
-    if (Test-Path -Path $OutZipFile) { Remove-Item -Path $OutZipFile -Force }
-    Compress-Archive -Path $ZipPaths -CompressionLevel Fastest -DestinationPath $OutZipFile
+    if (Test-Path -LiteralPath $OutZipFile) { Remove-Item -LiteralPath $OutZipFile -Force }
+    # -DestinationPath has no literal form, so its wildcard characters are escaped.
+    Compress-Archive -LiteralPath $ZipPaths -CompressionLevel Fastest -DestinationPath ([WildcardPattern]::Escape($OutZipFile))
 
     # -- Report what was done -------------------------------------------------
     return [PSCustomObject]@{

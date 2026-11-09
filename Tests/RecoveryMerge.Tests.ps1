@@ -93,7 +93,7 @@ BeforeAll {
     function Get-ZipEntryNames([string]$ZipPath)
     {
         $Dest = Join-Path $script:TmpRoot ('unzip_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-        Expand-Archive -Path $ZipPath -DestinationPath $Dest -Force
+        Expand-Archive -LiteralPath $ZipPath -DestinationPath $Dest -Force
         @(Get-ChildItem -Path $Dest -File | Select-Object -ExpandProperty Name)
     }
 
@@ -395,6 +395,48 @@ Describe 'Merge-RecoveryData consumption handling' {
         Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
         (Split-Path -Parent $Result.OutputInventory) | Should -BeExactly $Out
         @(Get-ChildItem -LiteralPath $C.Gap, $C.Recovery -File | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName).Hash + ' ' + $_.Name }) | Should -Be $Before
+    }
+
+    It 'reads and writes only the named folders when their names hold [1] and a folder named without the brackets sits next to each (<Case>)' -ForEach @(
+        @{ Case = 'gap consumption and metrics'; Recover = $false },
+        @{ Case = 'recovered consumption and metrics'; Recover = $true }
+    ) {
+        $Id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $Gap = Join-Path $script:TmpRoot ("gap_$Id[1]"); $GapDecoy = Join-Path $script:TmpRoot ("gap_${Id}1")
+        $Rec = Join-Path $script:TmpRoot ("rec_$Id[1]"); $RecDecoy = Join-Path $script:TmpRoot ("rec_${Id}1")
+        $Out = Join-Path $script:TmpRoot ("out_$Id[1]"); $OutDecoy = Join-Path $script:TmpRoot ("out_${Id}1")
+        $Csv = { param($Meter) "$script:CsvHeader`n{},Compute,m1,$Meter,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,," }
+        # New-Bundle writes with -FilePath, so the bracketed folders are filled with literal-path calls here.
+        foreach ($Pair in @(@($Gap, $script:GapBase, 'vm-real', 'GAP-REAL'), @($Rec, $script:RecBase, 'app-real', 'REC-REAL')))
+        {
+            $Tmp = Join-Path $script:TmpRoot ('stage_' + [guid]::NewGuid().ToString('N'))
+            $Key = if ($Pair[0] -eq $Gap) { 'VirtualMachines' } else { 'AppServices' }
+            New-Bundle -Dir $Tmp -Base $Pair[1] -Inventory ([ordered]@{ Version = '3.2.3'; $Key = @((New-Record $Pair[2])) }) -ConsumptionCsv (& $Csv $Pair[3]) -MetricsFiles @{ '__0' = ('{"Metrics":["' + $Pair[3] + '"]}') }
+            $null = New-Item -ItemType Directory -Path $Pair[0]
+            Get-ChildItem -LiteralPath $Tmp -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Pair[0] $_.Name) }
+        }
+        New-Bundle -Dir $GapDecoy -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm-decoy')) }) -ConsumptionCsv (& $Csv 'GAP-DECOY') -MetricsFiles @{ '__0' = '{"Metrics":["GAP-DECOY"]}' }
+        New-Bundle -Dir $RecDecoy -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app-decoy')) }) -ConsumptionCsv (& $Csv 'REC-DECOY') -MetricsFiles @{ '__0' = '{"Metrics":["REC-DECOY"]}' }
+        $null = New-Item -ItemType Directory -Path $OutDecoy
+
+        $Splat = @{ GapBundlePath = $Gap; RecoveryBundlePath = $Rec; OutputPath = $Out; WarningAction = 'SilentlyContinue' }
+        if ($Recover) { $Splat.RecoverConsumption = $true; $Splat.RecoverMetrics = $true }
+        $Result = Merge-RecoveryData @Splat
+
+        $Want = if ($Recover) { 'REC-REAL' } else { 'GAP-REAL' }
+        $Inv = Get-Content -LiteralPath (Join-Path $Out ('Inventory_{0}.json' -f $script:GapBase)) -Raw
+        $Inv | Should -Match 'vm-real'
+        $Inv | Should -Match 'app-real'
+        $Inv | Should -Not -Match 'decoy'
+        (Get-Content -LiteralPath (Join-Path $Out ('Consumption_{0}.csv' -f $script:GapBase)) -Raw) | Should -Match $Want
+        (Get-Content -LiteralPath (Join-Path $Out ('Metrics_{0}__0.json' -f $script:GapBase)) -Raw) | Should -Match $Want
+        Test-Path -LiteralPath (Join-Path $Out ('{0}.html' -f $script:GapBase)) | Should -BeTrue
+        $Result.OutputZip | Should -Be (Join-Path $Out ('{0}.zip' -f $script:GapBase))
+        $Entries = @(Get-ZipEntryNames -ZipPath $Result.OutputZip)
+        $Entries | Should -Contain ('Inventory_{0}.json' -f $script:GapBase)
+        $Entries | Should -Contain ('Consumption_{0}.csv' -f $script:GapBase)
+        $Entries | Should -Contain ('Metrics_{0}__0.json' -f $script:GapBase)
+        @(Get-ChildItem -LiteralPath $OutDecoy -Force).Count | Should -Be 0 -Because 'nothing is written to the folder named without the brackets'
     }
 
     It 'warns once, not twice, when the recovery bundle holds two consumption files under -RecoverConsumption' {
