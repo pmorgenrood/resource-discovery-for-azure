@@ -58,9 +58,9 @@ BeforeAll {
             # A folder of a second subscription whose report zip cannot be
             # read, with a real dictionary beside it. The dictionary is the
             # first one with its subscription ids changed to another
-            # placeholder: Reveal reveals only the newest report of each
-            # subscription, so a copy for the same subscription would be left
-            # out as an older run instead of failing.
+            # placeholder: Reveal leaves out every report of a subscription
+            # that is in more than one report, so a copy for the same
+            # subscription would leave out the good report too.
             $Bad = Join-Path $Root 'broken'
             $null = New-Item -ItemType Directory -Path $Bad -Force
             Set-Content -LiteralPath (Join-Path $Bad 'ResourcesReport_20260101000000000abcd.zip') -Value 'not a zip' -Encoding utf8

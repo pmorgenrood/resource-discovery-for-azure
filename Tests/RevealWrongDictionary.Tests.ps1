@@ -29,11 +29,14 @@ BeforeAll {
     $script:Token = 'prod_11111111-2222-3333-4444-555555555555'
     $script:OtherToken = 'prod_99999999-8888-7777-6666-555555555555'
 
-    # A dictionary mapping $Token to the resource group $RgName.
+    # A dictionary mapping $Token to the resource group $RgName of the
+    # placeholder subscription $SubId. Folders of one inventory root get
+    # different subscriptions, as different runs' reports do: Reveal leaves out
+    # every report of a subscription that is in more than one report.
     function Write-TestDictionary
     {
-        param([string]$Path, [string]$Token, [string]$RgName)
-        $Json = '{"ResourceGroupMap":{"' + $Token + '":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/' + $RgName + '"},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":{},"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
+        param([string]$Path, [string]$Token, [string]$RgName, [string]$SubId = '00000000-0000-0000-0000-000000000000')
+        $Json = '{"ResourceGroupMap":{"' + $Token + '":"/subscriptions/' + $SubId + '/resourceGroups/' + $RgName + '"},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":{},"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
         [System.IO.File]::WriteAllText($Path, $Json)
     }
 
@@ -125,12 +128,12 @@ Describe 'Invoke-RdaReveal with a non-empty dictionary' {
 Describe 'Reveal.ps1 over every folder, one folder with the wrong dictionary' {
     BeforeAll {
         $script:Root = Join-Path $script:WorkDir 'root'
-        foreach ($Sub in @(@{ Name = 'good'; DictToken = $script:Token }, @{ Name = 'bad'; DictToken = $script:OtherToken }))
+        foreach ($Sub in @(@{ Name = 'good'; DictToken = $script:Token; SubId = '00000000-0000-0000-0000-000000000000' }, @{ Name = 'bad'; DictToken = $script:OtherToken; SubId = '00000000-0000-0000-0000-000000000001' }))
         {
             $Dir = Join-Path $script:Root $Sub.Name
             $null = New-Item -ItemType Directory -Path $Dir -Force
             Write-TestReportZip -Path (Join-Path $Dir ('ResourcesReport_' + $Sub.Name + '.zip')) -Value $script:Token
-            Write-TestDictionary -Path (Join-Path $Dir ('ObfuscationDictionary_' + $Sub.Name + '.json')) -Token $Sub.DictToken -RgName 'real-rg'
+            Write-TestDictionary -Path (Join-Path $Dir ('ObfuscationDictionary_' + $Sub.Name + '.json')) -Token $Sub.DictToken -RgName 'real-rg' -SubId $Sub.SubId
         }
         $script:Staging = Join-Path $script:WorkDir 'staging'
         $script:Bundle = Join-Path $script:WorkDir 'bundle.zip'

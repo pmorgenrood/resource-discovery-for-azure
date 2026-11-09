@@ -33,13 +33,16 @@ BeforeAll {
     $script:OtherToken = 'prod_99999999-8888-7777-6666-555555555555'
     $script:Text = '{"VirtualMachines":[{"ResourceGroup":"' + $script:Token + '"}]}'
 
-    # A dictionary whose resource group map holds $RgToken, and whose TagMap
-    # holds $TagToken when one is given.
+    # A dictionary whose resource group map holds $RgToken of the placeholder
+    # subscription $SubId, and whose TagMap holds $TagToken when one is given.
+    # Folders of one inventory root get different subscriptions, as different
+    # runs' reports do: Reveal leaves out every report of a subscription that
+    # is in more than one report.
     function Write-TestDictionary
     {
-        param([string]$Path, [string]$RgToken, [string]$TagToken)
+        param([string]$Path, [string]$RgToken, [string]$TagToken, [string]$SubId = '00000000-0000-0000-0000-000000000000')
         $Tags = if ($TagToken) { '{"' + $TagToken + '":"real-tag"}' } else { '{}' }
-        $Json = '{"ResourceGroupMap":{"' + $RgToken + '":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/real-rg"},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":' + $Tags + ',"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
+        $Json = '{"ResourceGroupMap":{"' + $RgToken + '":"/subscriptions/' + $SubId + '/resourceGroups/real-rg"},"SubscriptionMap":{},"SubscriptionNameMap":{},"TagMap":' + $Tags + ',"ResourceIdMap":{},"ResourceNameMap":{},"FreeTextMap":{}}'
         [System.IO.File]::WriteAllText($Path, $Json)
     }
 
@@ -86,12 +89,15 @@ BeforeAll {
     {
         param([string]$Name, [hashtable[]]$Folders, [string[]]$Extra = @())
         $Root = Join-Path $script:WorkDir ($Name + '_root')
+        $Index = 0
         foreach ($Folder in $Folders)
         {
             $Dir = Join-Path $Root $Folder.Name
             $null = New-Item -ItemType Directory -Path $Dir -Force
             Write-TestReportZip -Path (Join-Path $Dir ('ResourcesReport_' + $Folder.Name + '.zip'))
-            Write-TestDictionary -Path (Join-Path $Dir ('ObfuscationDictionary_' + $Folder.Name + '.json')) -RgToken $Folder.RgToken
+            $SubId = '00000000-0000-0000-0000-{0:d12}' -f $Index
+            $Index++
+            Write-TestDictionary -Path (Join-Path $Dir ('ObfuscationDictionary_' + $Folder.Name + '.json')) -RgToken $Folder.RgToken -SubId $SubId
         }
         $Staging = Join-Path $script:WorkDir ($Name + '_staging')
         $Bundle = Join-Path $script:WorkDir ($Name + '_bundle.zip')
