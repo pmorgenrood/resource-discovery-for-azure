@@ -1513,6 +1513,7 @@ function Add-MetricRecord
                             $Throttled = $false
                             $BadRequest = $false
 
+                            # -ThrottleLimit sets the ThreadJob limit for the whole session; it stays at -ConcurrencyLimit after the run.
                             $Job = Start-ThreadJob -ScriptBlock {
                                 param($mArgs)
                                 Get-AzMetric @mArgs
