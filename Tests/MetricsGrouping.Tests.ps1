@@ -783,7 +783,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
-    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }, @{ SingleError = 'Status500Wrapping401' }, @{ SingleError = 'Status500Wrapping403' }, @{ SingleError = 'Status500Wrapping404' }) {
+    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }, @{ SingleError = 'Status500Wrapping401' }, @{ SingleError = 'Status500Wrapping403' }, @{ SingleError = 'Status500Wrapping404' }, @{ SingleError = 'ForbiddenNamed429' }) {
         # No access or a resource that is gone fails the same way on every run.
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-client-' + $SingleError) -SingleError $SingleError
 
@@ -867,6 +867,18 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         $ByText = [System.Net.Http.HttpRequestException]::new('The gateway failed.', [System.Exception]::new('Retry failed.', [System.Exception]::new("Operation returned an invalid status code '$Status'")), [System.Net.HttpStatusCode]::BadGateway)
         Get-MetricErrorStatus -Exception $ByText | Should -Be $Code
         Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $ByText | Should -BeFalse
+    }
+
+    It 'does not count a client error whose message reads like throttling' {
+        # "429" or "throttl" in a resource name sets the throttled flag; the status is read first.
+        $ByCode = [System.Net.Http.HttpRequestException]::new('No access to vm-429-throttled.', $null, [System.Net.HttpStatusCode]::Forbidden)
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception $ByCode | Should -BeFalse
+        $ByText = [System.Exception]::new("Operation returned an invalid status code 'NotFound' for vm-429-throttled")
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception $ByText | Should -BeFalse
+        # Real throttling and a throttled request whose status cannot be read still count.
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status TooManyRequests) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception ([System.Exception]::new('Rate limit reached.')) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception (New-StatusError -Status ServiceUnavailable) | Should -BeTrue
     }
 
     It 'still counts a server error that wraps another server error, a timeout or throttling' {

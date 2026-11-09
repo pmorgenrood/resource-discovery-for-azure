@@ -689,11 +689,14 @@ if ($Task -eq 'Processing')
                 # throttling, a server error (HTTP 5xx), or an error whose status cannot
                 # be read. A client error (HTTP 4xx such as 401, 403 or 404, or
                 # BadRequest anywhere in the chain) fails the same way on every run.
+                # $Throttled comes from the message text, which can hold "429" or
+                # "throttl" in a resource name, so it does not decide alone: a readable
+                # status wins, and with none the request counts whether throttled or not.
                 function Test-MetricRerunCanFix
                 {
                     param([bool]$TimedOut, [bool]$Throttled, [System.Exception]$Exception)
 
-                    if ($TimedOut -or $Throttled) { return $true }
+                    if ($TimedOut) { return $true }
                     if ($null -eq $Exception) { return $true }
                     if (Test-MetricBadRequest -Exception $Exception) { return $false }
                     $Status = Get-MetricErrorStatus -Exception $Exception
