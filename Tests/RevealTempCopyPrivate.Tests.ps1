@@ -40,9 +40,12 @@ BeforeAll {
             $Writer = [System.IO.StreamWriter]::new($Archive.CreateEntry('Consumption_r.csv').Open())
             try
             {
+                # Each row has its own cost, so the report stays within the
+                # ingestion server's 100 to 1 compression limit, which Reveal
+                # holds every zip to; one line repeated would compress far
+                # more than that.
                 $Writer.Write("ResourceGroup,Cost`n")
-                $Line = $script:Token + ",1.5`n"
-                for ($i = 0; $i -lt $Rows; $i++) { $Writer.Write($Line) }
+                for ($i = 0; $i -lt $Rows; $i++) { $Writer.Write($script:Token + ',' + $i + ".5`n") }
             }
             finally { $Writer.Dispose() }
         }
