@@ -3,9 +3,10 @@
 #
 # Under -Obfuscate each masked token starts with prod_ or nonprod_. A zip with
 # only prod resources cannot show the nonprod words, so these tests take the
-# rule from ResourceInventory.ps1 itself: its shared classifier function
-# Get-ObfuscationPrefix when it has one (run as it is), else the rule lines
-# that pick 'nonprod_'. They check that every place that picks a prefix
+# rule from the product itself: the shared classifier function when it has
+# one (the command its subscription token prefix line calls, or
+# Get-ObfuscationPrefix, defined in ResourceInventory.ps1 or Functions/, run
+# as it is), else the rule lines of ResourceInventory.ps1 that pick 'nonprod_'. They check that every place that picks a prefix
 # (resource name, subscription, resource group, fallback id, tag value,
 # consumption id) uses that rule, and run sample values through it. The
 # samples are words every version of the rule treats alike (dev, test, qa,
@@ -20,15 +21,39 @@ Describe "Classifier fidelity: nonprod words and prod default" {
         $script:RuleLines = @($Source | Where-Object { ($_ -match 'nonprod_' -or $_ -match '\$IsNonProd =') -and $_ -match "-match '\\b\(" })
         $script:WordPatterns = @($script:RuleLines | ForEach-Object { if ($_ -match "-match '(\\b\([^']+)'") { $Matches[1] } } | Select-Object -Unique)
         $script:HintPatterns = @($script:RuleLines | ForEach-Object { if ($_ -match "-match '(\(\^[^']+)'") { $Matches[1] } } | Select-Object -Unique)
-        # The shared classifier, when the product has one, is run as it is.
-        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
-        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Get-ObfuscationPrefix' }, $true))
-        $script:HasClassifier = $Fn.Count -eq 1
-        if ($script:HasClassifier) { . ([scriptblock]::Create($Fn[0].Extent.Text)) }
-        if (-not $script:HasClassifier -and ($script:WordPatterns.Count -eq 0 -or $script:HintPatterns.Count -eq 0)) { throw 'No prod/nonprod rule was found in ResourceInventory.ps1.' }
+        # The product's functions, from ResourceInventory.ps1 and Functions/:
+        # name (without a Global: scope) -> its definition.
+        $Root = Split-Path $PSScriptRoot -Parent
+        $script:ProductFunctions = @{}
+        foreach ($File in @((Join-Path $Root 'ResourceInventory.ps1')) + @(Get-ChildItem -Path (Join-Path $Root 'Functions') -Filter '*.ps1' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+        {
+            $FileAst = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$null, [ref]$null)
+            $Defs = @($FileAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+            foreach ($Def in $Defs) { $script:ProductFunctions[($Def.Name -replace '^(?i)global:', '')] = [pscustomobject]@{ Ast = $Def; File = $File } }
+        }
+        # The shared classifier: the command the subscription token prefix
+        # line calls, when the product defines it, else Get-ObfuscationPrefix.
+        $SubLine = @($Source | Where-Object { $_ -match '^\s*\$SubPrefix\s*=\s*([A-Za-z]+-[A-Za-z]+)\b' } | Select-Object -First 1)
+        $Called = if ($SubLine.Count -eq 1 -and $SubLine[0] -match '^\s*\$SubPrefix\s*=\s*([A-Za-z]+-[A-Za-z]+)\b') { $Matches[1] } else { $null }
+        $script:ClassifierName = if ($Called -and $script:ProductFunctions.ContainsKey($Called)) { $Called } elseif ($script:ProductFunctions.ContainsKey('Get-ObfuscationPrefix')) { 'Get-ObfuscationPrefix' } else { $null }
+        $script:HasClassifier = $null -ne $script:ClassifierName
+        if ($script:HasClassifier)
+        {
+            # Run as it is: its definition and the product functions it calls.
+            $Load = [System.Collections.Generic.List[string]]::new(); $Queue = [System.Collections.Generic.Queue[string]]::new(); $Queue.Enqueue($script:ClassifierName)
+            while ($Queue.Count -gt 0)
+            {
+                $Name = $Queue.Dequeue(); if ($Load.Contains($Name)) { continue }; $Load.Add($Name)
+                foreach ($Cmd in $script:ProductFunctions[$Name].Ast.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] }, $true)) { $C = $Cmd.GetCommandName(); if ($C -and $script:ProductFunctions.ContainsKey($C) -and -not $Load.Contains($C)) { $Queue.Enqueue($C) } }
+            }
+            foreach ($Name in $Load) { . ([scriptblock]::Create(($script:ProductFunctions[$Name].Ast.Extent.Text -replace '^(?i)(function|filter)\s+global:', '$1 '))) }
+        }
+        if (-not $script:HasClassifier -and ($script:WordPatterns.Count -eq 0 -or $script:HintPatterns.Count -eq 0)) { throw 'No prod/nonprod rule was found in the product source.' }
+        # The product functions that pick a prefix through the classifier.
+        $script:PrefixFunctions = @($script:ProductFunctions.Keys | Where-Object { $_ -eq $script:ClassifierName -or ($script:HasClassifier -and $script:ProductFunctions[$_].Ast.Body.Extent.Text -match ('\b' + [regex]::Escape($script:ClassifierName) + '\b')) })
         function script:Get-ExpectedObfuscationPrefix([string]$Value)
         {
-            if ($script:HasClassifier) { return (Get-ObfuscationPrefix $Value) }
+            if ($script:HasClassifier) { return (& $script:ClassifierName $Value) }
             if ($Value -match $script:WordPatterns[0] -or $Value -match $script:HintPatterns[0]) { return 'nonprod_' }
             return 'prod_'
         }
@@ -46,15 +71,17 @@ Describe "Classifier fidelity: nonprod words and prod default" {
 
     It "picks every masked token prefix with the rule, never a fixed prefix" {
         # Every '$<name>Prefix =' line of ResourceInventory.ps1 either runs the
-        # rule, calls the shared classifier, uses the flag the rule set, or
-        # keeps the prefix of a token already made. A line that writes a fixed
+        # rule, calls the shared classifier or a product function that calls
+        # it, uses the flag the rule set, or keeps the prefix of a token
+        # already made. A line that writes a fixed
         # 'prod_' would let one kind of token skip the rule.
         $Source = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1')
         $Assignments = @($Source | Where-Object { $_ -match '^\s*\$\w*Prefix\s*=' })
         $Assignments.Count | Should -BeGreaterOrEqual 1
         foreach ($Line in $Assignments)
         {
-            ($Line -match "-match '\\b\(" -or $Line -match 'Get-ObfuscationPrefix' -or $Line -match '\$IsNonProd' -or $Line -match "\.Split\('_'\)\[0\]") | Should -BeTrue -Because "'$($Line.Trim())' must pick the prefix with the rule"
+            $ViaClassifier = @($script:PrefixFunctions | Where-Object { $Line -match ('=\s*' + [regex]::Escape($_) + '\b') }).Count -gt 0
+            ($Line -match "-match '\\b\(" -or $ViaClassifier -or $Line -match '\$IsNonProd' -or $Line -match "\.Split\('_'\)\[0\]") | Should -BeTrue -Because "'$($Line.Trim())' must pick the prefix with the rule"
         }
     }
 
