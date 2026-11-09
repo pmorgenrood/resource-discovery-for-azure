@@ -1372,8 +1372,8 @@ function Get-ConsumptionErrorStatusCode
 # exceptions and an ErrorRecord's exception, at most 10, as
 # Test-MetricBadRequest in Extension/Metrics.ps1 reads them), since a wrapper
 # exception often carries the cause in an inner one: it is permanent when one
-# names one of 400, 401, 403 or 404 (by name, or by number after 'status' or
-# 'HTTP'), says access was denied or that
+# names a status after 'status' or 'HTTP' (decided as a known status), names
+# a bad request, a refusal or not found, says access was denied or that
 # something could not be found, or says the sign-in cannot be used (the same
 # as a 401: a retry signs in no better). A sign-in error code alone (AADSTS...)
 # does not count: some of those are transient. Everything else is 'Transient'
@@ -1413,9 +1413,20 @@ function Get-ConsumptionErrorKind
             $Pending.Enqueue($Ex.ErrorRecord.Exception)
         }
     }
+    # A status the message names (after 'status' or 'HTTP') decides the same way
+    # as one the exception carries.
     foreach ($Ex in $Chain)
     {
-        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|access ?(is )?denied|authorizationfailed)\b|(status|http)\D{0,40}\b40[0134]\b|does not have authorization|could not be found')
+        if ([string]$Ex.Message -match '(?i)\b(status|http)\D{0,40}\b([45]\d\d)\b')
+        {
+            $Named = [int]$Matches[2]
+            if ($Named -eq 408 -or $Named -eq 409 -or $Named -eq 429 -or $Named -ge 500) { return 'Transient' }
+            return 'Permanent'
+        }
+    }
+    foreach ($Ex in $Chain)
+    {
+        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
         {
             return 'Permanent'
         }

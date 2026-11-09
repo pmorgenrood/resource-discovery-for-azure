@@ -1338,9 +1338,12 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception $Outer | Should -Be 'Transient'
     }
 
-    It 'reads 400, 401, 403 or 404 in a message without a status only after status or HTTP' {
+    It 'reads a status in a message without one only after status or HTTP, and lets it decide as a known status' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Too busy, retry after 400 milliseconds.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP 403 returned by the usage API.')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('Response status code does not indicate success: 405 (Method Not Allowed).')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status code does not indicate success: 429 (Too Many Requests). The resource could not be found right now.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP 503: bad request queue is full.')) | Should -Be 'Transient'
     }
 }
 
