@@ -34,13 +34,16 @@ function Get-MaskedIdPattern
     return '^(' + $Scope + $Block + $ScopeBlocks + '|' + $Block + '+)/?$'
 }
 
-# Tells an obfuscated run from a plain one by one of its inventory IDs. Only
-# the start of a masked ID is checked, and a flat prod_/nonprod_ token also
-# counts, so an ID with a leak or the wrong shape still marks the run as
-# obfuscated and turns the leak scans on: a masked subscription
-# (/subscriptions/prod_...), a flat token, or a tenant-scope id
-# (/providers/...) with a token as a name segment.
-function Get-ObfuscatedRunIdPattern
+# Tells an obfuscated run from a plain one. Only the start of a masked ID is
+# checked, and a flat prod_/nonprod_ token also counts, so an ID with a leak
+# or the wrong shape still marks the run as obfuscated and turns the leak
+# scans on. A tenant-scope id (/providers/...) has no subscription to tell by,
+# and a real name there can look like a token, so a run whose IDs are all
+# tenant-scope is told by its dictionary instead: only an -Obfuscate run
+# writes one.
+function Test-ObfuscatedRun
 {
-    return '^((/subscriptions/)?(prod|nonprod)_|/providers/[^/]+(/[^/]+/[^/]+)*/[^/]+/(prod|nonprod)_[0-9a-f]{8}-)'
+    param([string[]]$Ids, [string]$DictionaryPath)
+    foreach ($Id in $Ids) { if ($Id -match '^(/subscriptions/)?(prod|nonprod)_') { return $true } }
+    return (-not [string]::IsNullOrEmpty($DictionaryPath) -and (Test-Path -LiteralPath $DictionaryPath))
 }

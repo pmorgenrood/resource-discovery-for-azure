@@ -27,28 +27,20 @@ BeforeAll {
         $script:AllContent[$file.Name] = Get-Content $file.FullName -Raw
     }
 
-    # Tells an obfuscated run from a plain one by its IDs (see
-    # Helpers/MaskedIdPattern.ps1); Obfuscation.Tests.ps1 checks the full shape.
+    # Detect obfuscation mode by the inventory IDs and the run's dictionary
+    # (see Test-ObfuscatedRun in Helpers/MaskedIdPattern.ps1);
+    # Obfuscation.Tests.ps1 checks the full shape. The PII-leak Describe later
+    # also depends on this signal.
     . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
-    $script:ObfuscationPattern = Get-ObfuscatedRunIdPattern
-
-    # Detect obfuscation mode: if any resource ID is a masked ID, treat the
-    # run as obfuscated. The PII-leak Describe later also depends on this signal.
-    $script:IsObfuscated = $false
+    . (Join-Path $PSScriptRoot 'Helpers/RunDictionaryPath.ps1')
+    $Ids = @()
     if ($null -ne $script:Inventory)
     {
         $script:Inventory.PSObject.Properties |
             Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } |
-            ForEach-Object {
-                @($_.Value) | ForEach-Object {
-                    if ($script:IsObfuscated) { return }
-                    if ($null -ne $_ -and $null -ne $_.ID -and $_.ID -match $script:ObfuscationPattern)
-                    {
-                        $script:IsObfuscated = $true
-                    }
-                }
-            }
+            ForEach-Object { @($_.Value) | ForEach-Object { if ($null -ne $_ -and $null -ne $_.ID) { $Ids += [string]$_.ID } } }
     }
+    $script:IsObfuscated = Test-ObfuscatedRun -Ids $Ids -DictionaryPath (Get-RunDictionaryPath -TestsRoot $PSScriptRoot)
 }
 
 AfterAll {

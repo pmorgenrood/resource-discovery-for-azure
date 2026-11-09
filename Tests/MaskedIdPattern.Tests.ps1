@@ -71,24 +71,31 @@ Describe 'Get-MaskedIdPattern' {
     }
 }
 
-Describe 'Get-ObfuscatedRunIdPattern' {
-    BeforeAll { $script:RunPattern = Get-ObfuscatedRunIdPattern }
+Describe 'Test-ObfuscatedRun' {
+    BeforeAll {
+        $script:Dict = Join-Path ([System.IO.Path]::GetTempPath()) ('ObfuscationDictionary_' + [guid]::NewGuid() + '.json')
+        Set-Content -LiteralPath $script:Dict -Value '{}'
+        $script:Tenant = '/providers/microsoft.capacity/reservationorders/' + $script:T
+    }
+    AfterAll { Remove-Item -LiteralPath $script:Dict -ErrorAction SilentlyContinue }
 
-    It 'marks a run obfuscated by <Label>' -ForEach @(
-        @{ Label = 'a masked resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}' }
-        @{ Label = 'a flat token'; Id = '{T}' }
-        @{ Label = 'a tenant-scope reservation id'; Id = '/providers/microsoft.capacity/reservationorders/{T}' }
-        @{ Label = 'a tenant-scope child id'; Id = '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}' }
-        @{ Label = 'the stand-in path of an id that is not an ARM path'; Id = '/providers/rda.noid/ids/{T}' }
-    ) {
-        $Id.Replace('{T}', $script:T) | Should -Match $script:RunPattern
+    It 'marks a run with a masked subscription id obfuscated' {
+        Test-ObfuscatedRun -Ids @('/subscriptions/' + $script:T + '/resourcegroups/' + $script:T) | Should -BeTrue
     }
 
-    It 'leaves a run plain for <Label>' -ForEach @(
-        @{ Label = 'a real resource id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-demo/providers/Microsoft.Compute/virtualMachines/vm-a' }
-        @{ Label = 'a real tenant-scope id'; Id = '/providers/Microsoft.Capacity/reservationOrders/12345678-1234-1234-1234-123456789012' }
-        @{ Label = 'a real tenant-scope id with a prod_ name'; Id = '/providers/Microsoft.Capacity/reservationOrders/prod_reservations' }
-    ) {
-        $Id | Should -Not -Match $script:RunPattern
+    It 'marks a run with a flat token obfuscated' {
+        Test-ObfuscatedRun -Ids @($script:T) | Should -BeTrue
+    }
+
+    It 'marks a run of tenant-scope ids obfuscated when it has a dictionary' {
+        Test-ObfuscatedRun -Ids @($script:Tenant) -DictionaryPath $script:Dict | Should -BeTrue
+    }
+
+    It 'leaves a run of tenant-scope ids plain with no dictionary, even with a name shaped like a token' {
+        Test-ObfuscatedRun -Ids @($script:Tenant) | Should -BeFalse
+    }
+
+    It 'leaves a run of real ids plain' {
+        Test-ObfuscatedRun -Ids @('/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-demo/providers/Microsoft.Compute/virtualMachines/vm-a') -DictionaryPath (Join-Path $script:Dict 'missing.json') | Should -BeFalse
     }
 }
