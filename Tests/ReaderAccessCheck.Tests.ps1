@@ -1844,6 +1844,8 @@ if (@($Scenario.ConsumptionFailIds) -contains $SubscriptionID)
     if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
     $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = $SubscriptionID; Id = $SubscriptionID; Message = 'stand-in: the usage service failed (stopped at consumption page 2, after 5 record(s); this subscription''s consumption is INCOMPLETE)'; Complete = $false; PageAtFailure = 2; RecordsCollected = 5 }
 }
+# After its billing pull, this subscription's run fails for another cause.
+if (@($Scenario.LateFailIds) -contains $SubscriptionID) { throw 'stand-in: the inventory files could not be written' }
 '@ | Set-Content -LiteralPath (Join-Path $ToolRoot 'ResourceInventory.ps1') -Encoding utf8
 
         # Az.Accounts answers sign-in, context, token and subscription calls, and
@@ -1973,7 +1975,7 @@ exit 1
 
         function script:Set-WrapperScenario
         {
-            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @(), [string[]]$ConsumptionFail = @(), [string[]]$AuthSkip = @())
+            param([object[]]$Subs, [string[]]$Unreadable = @(), [string[]]$Fail = @(), [string[]]$EndSession = @(), [string[]]$Disabled = @(), [string[]]$Hang = @(), [string[]]$Unknown = @(), [string[]]$Disagree = @(), [string[]]$LockRoot = @(), [string[]]$ConsumptionFail = @(), [string[]]$AuthSkip = @(), [string[]]$LateFail = @())
             [pscustomobject]@{
                 Tenant        = $script:WrapperTenant
                 Subscriptions = @($Subs | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Name = $_.Name; State = $(if ($Disabled -contains $_.Id) { 'Disabled' } else { 'Enabled' }) } })
@@ -1985,6 +1987,7 @@ exit 1
                 Disagree      = @($Disagree)
                 LockRoot      = @($LockRoot)
                 ConsumptionFailIds = @($ConsumptionFail)
+                LateFailIds   = @($LateFail)
                 AuthSkipIds   = @($AuthSkip)
             } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:CaseScenario -Encoding utf8
         }
@@ -2558,12 +2561,13 @@ exit 1
     }
 
     It 'gives no -Resume advice for a subscription whose consumption is incomplete (<Label>)' -TestCases @(
-        @{ Label = 'its consumption only'; Fail = @() }
-        @{ Label = 'and another subscription failed'; Fail = @('sub-b') }
+        @{ Label = 'its consumption only'; Fail = @(); LateFail = @() }
+        @{ Label = 'and another subscription failed'; Fail = @('sub-b'); LateFail = @() }
+        @{ Label = 'and its run then failed for another cause'; Fail = @(); LateFail = @('sub-a') }
     ) {
-        param($Label, $Fail)
+        param($Label, $Fail, $LateFail)
         script:Use-WrapperCase
-        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id) -Fail $Fail
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id) -Fail $Fail -LateFail $LateFail
         $Run = script:Invoke-WrapperRun -Streams 1
         $Text = $Run.Text -join "`n"
         $Run.Text | Should -Contain ('1 subscription(s) on the retry list have incomplete consumption ({0}), which -Resume and -ResumeFailedOnly do not fix.' -f $script:SubA.Name) -Because $Text

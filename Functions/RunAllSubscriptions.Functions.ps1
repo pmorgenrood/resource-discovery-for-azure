@@ -468,14 +468,24 @@ function Add-FailedAttempt
 # or -ResumeFailedOnly: that run's report holds only the subscriptions it
 # collects, and with the old report some of the billing rows count twice. So
 # then the advice is a full run again, as Get-ConsumptionRetryAdvice says.
+# Such a subscription is one on the retry list for its consumption, or one this
+# run's consumption entries name ($ConsumptionIncomplete, the FAILED
+# (consumption) lines' entries), also when its run then failed for another cause.
+function Get-ConsumptionIncompleteRetryNames
+{
+    param([object]$FailedAttempts, [object[]]$ConsumptionIncomplete)
+    $ThisRunIds = @(@($ConsumptionIncomplete) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+    @(@($FailedAttempts) | Where-Object { $null -ne $_ -and ([string]$_.Reason -like 'consumption incomplete:*' -or $ThisRunIds -contains [string]$_.Id) } | ForEach-Object { [string]$_.Name } | Select-Object -Unique)
+}
+
 function Get-RetryListAdvice
 {
-    param([object]$FailedAttempts, [switch]$NewFailures)
-    $Incomplete = @(@($FailedAttempts) | Where-Object { $null -ne $_ -and [string]$_.Reason -like 'consumption incomplete:*' })
+    param([object]$FailedAttempts, [switch]$NewFailures, [object[]]$ConsumptionIncomplete)
+    $Incomplete = @(Get-ConsumptionIncompleteRetryNames -FailedAttempts $FailedAttempts -ConsumptionIncomplete $ConsumptionIncomplete)
     if ($Incomplete.Count -gt 0)
     {
         return @(
-            ('{0} subscription(s) on the retry list have incomplete consumption ({1}), which -Resume and -ResumeFailedOnly do not fix.' -f $Incomplete.Count, (@($Incomplete | ForEach-Object { [string]$_.Name }) -join ', '))
+            ('{0} subscription(s) on the retry list have incomplete consumption ({1}), which -Resume and -ResumeFailedOnly do not fix.' -f $Incomplete.Count, ($Incomplete -join ', '))
             'Run the same command again, with the same settings and without -Resume or -ResumeFailedOnly, and upload only the new report.'
         )
     }
