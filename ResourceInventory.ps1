@@ -13,7 +13,7 @@ param ($TenantID,
     [switch]$DeviceLogin,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
-    $ConcurrencyLimit = 6,
+    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6,
     $MetricsLookbackDays = 31,
     $ReportName = 'ResourcesReport',
     $OutputDirectory)
