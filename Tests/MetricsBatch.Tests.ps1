@@ -1136,15 +1136,41 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         $Shown.Answer | Should -Be 'n'
     }
 
-    It 'waits for a subscription already being registered, without asking' {
+    It 'waits for a subscription already being registered only after a y' {
         $script:States['sub-b'] = 'Registering'
-        $script:Reads = 0
-        Mock Get-RdaInsightsProviderState { $script:Reads++; $State = if ($script:Reads -gt 1) { 'Registered' } else { $script:States[$SubscriptionId] }; [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null } }
-        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+        Mock Get-RdaInsightsProviderState {
+            # Once the question is answered, every read finds the provider registered.
+            $State = if ($script:Prompts.Count -gt 0) { 'Registered' } else { $script:States[$SubscriptionId] }
+            [pscustomobject]@{ SubscriptionId = $SubscriptionId; State = $State; Error = $null }
+        }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b', 'sub-c' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
 
-        $script:Prompts.Count | Should -Be 0
+        # The question names only the one not registered.
+        @($script:Prompts) | Should -Be @('Register Microsoft.Insights on these 1 subscription(s) now? [Y/N]')
+        @($script:Registered) | Should -Be @('sub-c')
+        @($Result.Registered | Sort-Object) | Should -Be @('sub-b', 'sub-c')
+        $Result.NotRegistered.Count | Should -Be 0
+    }
+
+    It 'does not wait for a subscription already being registered after n, with no console, or with nothing to ask' {
+        $Cases = @(
+            @{ Subs = @('sub-b', 'sub-c'); Interactive = $true; Answer = 'n' },
+            @{ Subs = @('sub-b', 'sub-c'); Interactive = $false; Answer = 'y' },
+            @{ Subs = @('sub-b'); Interactive = $true; Answer = 'y' }
+        )
+        foreach ($Case in $Cases)
+        {
+            $script:States['sub-b'] = 'Registering'
+            $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds $Case.Subs -Interactive $Case.Interactive -ReadAnswer ([scriptblock]::Create("param(`$P) '$($Case.Answer)'")) -DeadlineSeconds 1 -PollSeconds 10
+
+            @($Result.NotRegistered) | Should -Contain 'sub-b' -Because ($Case | ConvertTo-Json -Compress)
+            @($Result.Registered) | Should -Not -Contain 'sub-b'
+        }
+        # Only the first read per subscription, no wait and no register.
+        Should -Invoke Get-RdaInsightsProviderState -Times 5 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
         Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
-        @($Result.Registered) | Should -Be @('sub-b')
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*being registered on subscription sub-b*one call per resource this run*' } -Times 3 -Exactly
     }
 
     It 'reads, asks and registers nothing outside AzureCloud, where the batch API is not used' {

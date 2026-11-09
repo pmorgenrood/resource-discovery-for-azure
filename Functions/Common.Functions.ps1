@@ -418,7 +418,7 @@ function Invoke-RdaInsightsProviderPreflight
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
     $Missing = [System.Collections.Generic.List[object]]::new()
     # Already being registered (by someone else, or an earlier run): nothing to
-    # ask; it joins the shared wait below.
+    # ask; it joins the shared wait below only after a "y".
     $AlreadyRegistering = [System.Collections.Generic.List[string]]::new()
     foreach ($Id in $Ids)
     {
@@ -446,12 +446,6 @@ function Invoke-RdaInsightsProviderPreflight
     {
         Write-Host '  Microsoft.Insights is registered on every subscription in scope.' -ForegroundColor DarkGray
         return $Result
-    }
-    $Waiting = [System.Collections.Generic.List[string]]::new()
-    foreach ($Id in $AlreadyRegistering)
-    {
-        Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
-        $Waiting.Add($Id)
     }
 
     $Answer = $null
@@ -499,6 +493,26 @@ function Invoke-RdaInsightsProviderPreflight
     else
     {
         $ToRegister = @($Missing)
+    }
+
+    # A subscription already being registered joins the wait only after a "y".
+    # Otherwise (n, no one to answer, or nothing to ask) it uses the per-call
+    # path this run, so a run never pays the wait unasked; a later run reads its
+    # state again.
+    $Waiting = [System.Collections.Generic.List[string]]::new()
+    $SaidYes = $Answer -match '^\s*(y|yes)\s*$'
+    foreach ($Id in $AlreadyRegistering)
+    {
+        if ($SaidYes)
+        {
+            Write-Host ('  Microsoft.Insights is being registered on subscription {0}; waiting for it.' -f $Id) -ForegroundColor DarkGray
+            $Waiting.Add($Id)
+        }
+        else
+        {
+            Write-Host ('  Microsoft.Insights is being registered on subscription {0}; its metrics are collected with one call per resource this run. A later run finds it registered and uses the batch API.' -f $Id) -ForegroundColor Yellow
+            $Result.NotRegistered.Add($Id)
+        }
     }
 
     # Start every registration first, then wait for all of them on one deadline.

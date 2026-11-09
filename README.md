@@ -465,6 +465,7 @@ What it needs:
 - **The `Microsoft.Insights` resource provider registered on the subscription.** The run checks this first, for every subscription in scope (a read). If some are not registered it lists them and asks once: `Register Microsoft.Insights on these N subscription(s) now? [Y/N]`.
   - `Y` registers them together and waits up to 60 seconds for all of them. Registering needs the `/register/action` permission, which the Contributor and Owner roles include ([Microsoft docs](https://learn.microsoft.com/azure/azure-resource-manager/management/resource-providers-and-types#register-resource-provider)). A subscription where the register is refused, or that is not registered within the 60 seconds, has its metrics collected one resource at a time this run.
   - `N`, or a run with no one to answer (scheduled, piped, CI), registers nothing. The run prints the command to register it per subscription and collects those metrics one resource at a time.
+  - A subscription already being registered is waited for only after a `Y`. Otherwise its metrics are collected one resource at a time this run, so a run with no one to answer never waits.
   - The next run finds a registered subscription registered and does not ask again.
   - Nothing is registered without `-UseMetricsBatch` and a `Y`.
 - Azure public cloud (`AzureCloud`). In other clouds the switch has no effect: `Microsoft.Insights` is not checked, nothing is asked or registered, and every metric is collected one resource at a time.
