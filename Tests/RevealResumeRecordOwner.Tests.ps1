@@ -7,10 +7,12 @@
 # plain file name (for example notes.txt) with matching hashes and some source
 # text was kept, and a clean -Resume -RemoveStaging then deleted notes.txt,
 # though Reveal promises to keep anything in staging it did not put there. A
-# record is now kept only when its name is one Reveal assigns to a report pair
-# under the root (the report zip's name, or it with a copy number in front)
-# and it names that pair's folder, report zip and dictionary. Any other record
-# is dropped, and its file is kept.
+# record is now kept only when its name is one Reveal assigns to the report
+# pair it names (the report zip's name, or it with a copy number in front),
+# and, when that pair is under the root, it names the pair's dictionary. Any
+# other record is dropped, and its file is kept. (A record of a pair moved
+# away from the root is kept, so a clean -RemoveStaging still removes that
+# older output; RevealStagingReuse.Tests.ps1 covers that.)
 #
 # The zips and dictionaries are built here with placeholder values; no live
 # Azure and no inventory run.
@@ -52,14 +54,14 @@ BeforeAll {
     # good pair's source fields and the file's own SHA-256.
     function Add-Record
     {
-        param($Case, [string]$Name, [string]$SourceFolder = 'good')
+        param($Case, [string]$Name, [string]$SourceFolder = 'good', [string]$DictionaryName = 'ObfuscationDictionary_good.json')
         $Mark = Get-Content -LiteralPath $Case.Marker -Raw | ConvertFrom-Json -AsHashtable
         $Mark['Outputs'][$Name] = [ordered]@{
             Sha256           = (Get-FileHash -LiteralPath (Join-Path $Case.Staging $Name) -Algorithm SHA256).Hash
             SourceFolder     = $SourceFolder
             SourceName       = 'ResourcesReport_good.zip'
             SourceSha256     = (Get-FileHash -LiteralPath $Case.Source -Algorithm SHA256).Hash
-            DictionaryName   = 'ObfuscationDictionary_good.json'
+            DictionaryName   = $DictionaryName
             DictionarySha256 = (Get-FileHash -LiteralPath $Case.Dict -Algorithm SHA256).Hash
         }
         [System.IO.File]::WriteAllText($Case.Marker, ($Mark | ConvertTo-Json -Depth 5))
@@ -82,16 +84,17 @@ AfterAll {
 
 Describe 'Reveal.ps1 -Resume -RemoveStaging and a record Reveal does not make' -Skip:$IsWindows {
     It 'drops a record of <Name> and keeps its file' -ForEach @(
-        @{ Name = 'notes.txt'; File = 'notes.txt'; SourceFolder = 'good' }
-        @{ Name = 'a report name of another folder'; File = '2_ResourcesReport_good.zip'; SourceFolder = 'elsewhere' }
-        @{ Name = 'a name with a bad copy number'; File = '1_ResourcesReport_good.zip'; SourceFolder = 'good' }
+        @{ Name = 'notes.txt'; File = 'notes.txt'; SourceFolder = 'good'; DictionaryName = 'ObfuscationDictionary_good.json' }
+        @{ Name = 'a report name that is not its own source'; File = 'ResourcesReport_other.zip'; SourceFolder = 'elsewhere'; DictionaryName = 'ObfuscationDictionary_good.json' }
+        @{ Name = 'a name with a bad copy number'; File = '1_ResourcesReport_good.zip'; SourceFolder = 'good'; DictionaryName = 'ObfuscationDictionary_good.json' }
+        @{ Name = 'a pair under the root with another dictionary'; File = '2_ResourcesReport_good.zip'; SourceFolder = 'good'; DictionaryName = 'ObfuscationDictionary_other.json' }
     ) {
         $Case = New-Case -Name ('drop-' + ($Name -replace '\W', ''))
         $First = Invoke-Reveal -Root $Case.Root -Staging $Case.Staging -Bundle (Join-Path $Case.Dir 'first.zip')
         $First.Exit | Should -Be 0 -Because $First.Text
         $Kept = Join-Path $Case.Staging $File
         [System.IO.File]::WriteAllText($Kept, 'not Reveal''s')
-        Add-Record -Case $Case -Name $File -SourceFolder $SourceFolder
+        Add-Record -Case $Case -Name $File -SourceFolder $SourceFolder -DictionaryName $DictionaryName
 
         $Run = Invoke-Reveal -Root $Case.Root -Staging $Case.Staging -Bundle (Join-Path $Case.Dir 'bundle.zip') -Extra @('-Resume', '-RemoveStaging')
 
