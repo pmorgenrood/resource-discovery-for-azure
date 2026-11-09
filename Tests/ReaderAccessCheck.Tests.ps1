@@ -2570,7 +2570,7 @@ exit 1
         script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id) -Fail $Fail -LateFail $LateFail
         $Run = script:Invoke-WrapperRun -Streams 1
         $Text = $Run.Text -join "`n"
-        $Run.Text | Should -Contain ('1 subscription(s) on the retry list have incomplete consumption ({0}), which -Resume and -ResumeFailedOnly do not fix.' -f $script:SubA.Name) -Because $Text
+        $Run.Text | Should -Contain ('1 subscription(s) on the retry list have incomplete consumption ({0} ({1})), which -Resume and -ResumeFailedOnly do not fix.' -f $script:SubA.Name, $script:SubA.Id) -Because $Text
         $Run.Text | Should -Contain 'Run the same command again, with the same settings and without -Resume or -ResumeFailedOnly, and upload only the new report.'
         @($Run.Text | Where-Object { $_ -like 'Re-run with -Resume*' -or $_ -like 'Or re-run with -ResumeFailedOnly*' }) | Should -BeNullOrEmpty -Because $Text
     }

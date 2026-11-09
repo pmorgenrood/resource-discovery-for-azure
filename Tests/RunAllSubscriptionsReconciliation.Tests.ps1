@@ -222,6 +222,17 @@ Describe 'FAILED (consumption) lines of the wrapper' {
     }
 }
 
+Describe 'Get-RetryListAdvice' {
+    It 'counts two subscriptions of the same name whose consumption is incomplete as two' {
+        $Retry = @(
+            [pscustomobject]@{ Id = 'sub-1'; Name = 'Pay-As-You-Go'; Reason = 'consumption incomplete: stand-in' }
+            [pscustomobject]@{ Id = 'sub-2'; Name = 'Pay-As-You-Go'; Reason = 'stand-in: the run failed' }
+        )
+        $Advice = @(Get-RetryListAdvice -FailedAttempts $Retry -ConsumptionIncomplete @([pscustomobject]@{ Id = 'sub-2'; Name = 'sub-2' }))
+        $Advice[0] | Should -Be '2 subscription(s) on the retry list have incomplete consumption (Pay-As-You-Go (sub-1), Pay-As-You-Go (sub-2)), which -Resume and -ResumeFailedOnly do not fix.'
+    }
+}
+
 Describe 'Add-FailedAttempt / Remove-FailedAttempt single-element handling' {
     # Regression: -Existing was typed [System.Collections.IEnumerable], but when
     # the list holds exactly one prior failure PowerShell collapses it to a lone
