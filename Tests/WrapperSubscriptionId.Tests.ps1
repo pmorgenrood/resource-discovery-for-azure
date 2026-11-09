@@ -341,6 +341,32 @@ Describe 'The -SubscriptionID helpers' {
     }
 }
 
+Describe 'Resume state in a folder with brackets in its name' {
+    BeforeAll { . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1') }
+
+    It 'writes, reads and finds the state files there' {
+        $Dir = Join-Path $TestDrive 'home[1]'
+        [void][System.IO.Directory]::CreateDirectory($Dir)
+        $T = 'tenant-a'
+        $Path = Join-Path $Dir (".resume-state-{0}.json" -f $T)
+        Save-CompletedSubscriptionIds -Path $Path -Tenant $T -Ids @('sub-1') -FailedAttempts @([pscustomobject]@{ Id = 'sub-2'; Name = 'n'; Attempts = 1; LastError = 'x'; LastAttempt = '2026-01-01T00:00:00Z' })
+        [System.IO.File]::Exists($Path) | Should -BeTrue
+        @(Get-CompletedSubscriptionIds -Path $Path -Tenant $T) | Should -Be @('sub-1')
+        @(Get-FailedAttempts -Path $Path -Tenant $T).Count | Should -Be 1
+        [System.IO.File]::WriteAllText((Join-Path $Dir (".resume-state-{0}-stream-0.json" -f $T)), '{}')
+        @(Get-StreamResumeStateFiles -InventoryRoot $Dir -Tenant $T).Count | Should -Be 1
+    }
+
+    It 'passes the pre-flight write probe there' {
+        $Dir = Join-Path $TestDrive 'probe[1]'
+        [void][System.IO.Directory]::CreateDirectory($Dir)
+        function Exit-Wrapper { param($Code) throw "exit $Code" }
+        $Said = Invoke-PreFlightChecks -InventoryRoot $Dir 6>&1 | Out-String
+        $Said | Should -BeLike '*Write probe: OK*'
+        @([System.IO.Directory]::GetFiles($Dir, '.write-probe-*')).Count | Should -Be 0
+    }
+}
+
 Describe 'Run-AllSubscriptions.ps1 -SubscriptionID, end to end' -Skip:($IsWindows) {
     AfterEach {
         if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }

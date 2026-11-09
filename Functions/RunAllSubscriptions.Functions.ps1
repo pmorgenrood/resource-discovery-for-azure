@@ -422,13 +422,13 @@ function Invoke-PreFlightChecks
     $ProbePath = Join-Path $InventoryRoot (".write-probe-{0}.tmp" -f ([guid]::NewGuid()))
     try
     {
-        Set-Content -Path $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
-        $ProbeRead = Get-Content -Path $ProbePath -Raw -ErrorAction Stop
+        Set-Content -LiteralPath $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
+        $ProbeRead = Get-Content -LiteralPath $ProbePath -Raw -ErrorAction Stop
         if ($ProbeRead -notmatch 'preflight write probe')
         {
             throw "Write probe content mismatch (read back '$ProbeRead')"
         }
-        Remove-Item -Path $ProbePath -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $ProbePath -Force -ErrorAction Stop
         Write-Host ("Write probe: OK ({0})" -f $InventoryRoot) -ForegroundColor Green
     }
     catch
@@ -437,7 +437,7 @@ function Invoke-PreFlightChecks
         Write-Host "  This usually means: readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle." -ForegroundColor Red
         Write-Host "  Verify the directory is writable and re-run." -ForegroundColor Red
         # Best-effort cleanup in case Set-Content partially succeeded.
-        try { if (Test-Path $ProbePath) { Remove-Item -Path $ProbePath -Force -ErrorAction SilentlyContinue } }
+        try { if (Test-Path -LiteralPath $ProbePath) { Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue } }
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
         Exit-Wrapper -Code 1
     }
@@ -571,10 +571,10 @@ function Get-CompletedSubscriptionIds
 {
     param([string]$Path, [string]$Tenant)
 
-    if (-not (Test-Path -Path $Path -PathType Leaf)) { return @() }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
     try
     {
-        $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $State = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
         if ($State.TenantID -ne $Tenant)
         {
             Write-Host ("Resume state file is for a different tenant ({0}); ignoring." -f $State.TenantID) -ForegroundColor Yellow
@@ -600,10 +600,10 @@ function Get-FailedAttempts
 {
     param([string]$Path, [string]$Tenant)
 
-    if (-not (Test-Path -Path $Path -PathType Leaf)) { return @() }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
     try
     {
-        $State = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $State = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
         if ($State.TenantID -ne $Tenant) { return @() }
         if ($null -eq $State.FailedAttempts) { return @() }
         return @($State.FailedAttempts)
@@ -641,7 +641,7 @@ function Save-CompletedSubscriptionIds
         # a large tenant / Cloud Shell run that gets killed). The temp file shares
         # the target directory so the move stays on the same volume.
         $TmpPath = "$Path.tmp"
-        $State | ConvertTo-Json -Depth 4 | Set-Content -Path $TmpPath -Encoding utf8
+        $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $TmpPath -Encoding utf8
         [System.IO.File]::Move($TmpPath, $Path, $true)
     }
     catch
@@ -719,7 +719,7 @@ function Get-StreamResumeStateFiles
         [Parameter(Mandatory = $true)][string]$InventoryRoot,
         [Parameter(Mandatory = $true)][string]$Tenant
     )
-    return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
+    return @(Get-ChildItem -LiteralPath $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
@@ -874,7 +874,7 @@ function Read-StreamState
     if (-not (Test-Path -Path $Path -PathType Leaf)) { return @{ Completed = @(); Failed = @() } }
     try
     {
-        $Obj = Get-Content -Path $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $Obj = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         return @{
             Completed = if ($null -eq $Obj.Completed) { @() } else { @($Obj.Completed) }
             # Backward-compatible: state files written by an older worker had
