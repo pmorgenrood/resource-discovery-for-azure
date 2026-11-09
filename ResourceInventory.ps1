@@ -1704,8 +1704,9 @@ finally
 
 # The summary reads the Inventory file, so it runs only when that file was
 # written and reads as an object. Otherwise the run makes no zip and exits 2
-# (under the wrapper, that subscription failed); see the zip step below.
-if ($script:InventoryWriteFailed -or -not (Test-RdaReportInventoryWritten -JsonFiles @($Global:JsonFile)))
+# (under the wrapper, that subscription failed); see the zip step below,
+# which reuses this check's result.
+if ($script:InventoryWriteFailed -or -not ($InventoryCheckedWritten = Test-RdaReportInventoryWritten -JsonFiles @($Global:JsonFile)))
 {
     $InventoryNotWritten = $true
 }
@@ -1843,7 +1844,11 @@ $JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Globa
 # no report (exit 2; under the wrapper, that subscription failed).
 # A missing or unreadable Inventory file fails the whole upload, so such a run
 # makes no zip either (exit 2), with or without -SkipMetrics.
-$InventoryNotWritten = ($InventoryNotWritten -eq $true) -or -not (Test-RdaReportInventoryWritten -JsonFiles $JsonFiles)
+# The file checked before the summary is not read again when it is the one
+# that goes in the zip: nothing in the run writes it after that check.
+$InventoryZipFile = @(@($JsonFiles) | Where-Object { -not [string]::IsNullOrEmpty($_) -and (Split-Path -Path $_ -Leaf) -like 'Inventory_*.json' })[0]
+$InventorySameFile = ($InventoryCheckedWritten -eq $true) -and -not [string]::IsNullOrEmpty($InventoryZipFile) -and ([System.IO.Path]::GetFullPath($InventoryZipFile) -eq [System.IO.Path]::GetFullPath($Global:JsonFile))
+$InventoryNotWritten = ($InventoryNotWritten -eq $true) -or (-not $InventorySameFile -and -not (Test-RdaReportInventoryWritten -JsonFiles $JsonFiles))
 $MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and ((@($Global:RdaMetricsWriteFailures | Where-Object { -not [string]::IsNullOrEmpty($_) }).Count -gt 0) -or -not (Test-RdaReportMetricsWritten -JsonFiles $JsonFiles))
 
 if ($Obfuscate.IsPresent)

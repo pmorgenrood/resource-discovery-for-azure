@@ -466,8 +466,8 @@ function Test-RdaReportMetricsWritten
 # True when this run's Inventory file is there and reads as a JSON object.
 # A missing or bad Inventory file fails the whole upload downstream. $JsonFiles
 # is the list Get-RdaReportJsonFiles returns. The file is read with
-# JsonDocument, which checks the whole file without building PowerShell
-# objects, so a large inventory costs little memory.
+# JsonDocument, which checks the whole file in memory about the file size,
+# without building PowerShell objects.
 function Test-RdaReportInventoryWritten
 {
     param([string[]]$JsonFiles)

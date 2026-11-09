@@ -1072,6 +1072,8 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
                 'function Remove-Item { [CmdletBinding()] param([string]$LiteralPath, [string]$Path, [switch]$Force) if ($env:RDA_TEST_REMOVE_FAIL) { Write-Error ''Access to the path is denied.'' } else { Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters } }'
                 '$ErrorActionPreference = ''SilentlyContinue'''
                 '$Runtime = ''0:01''; $ReportingRunTime = ''0:01''; $PlatformOS = ''Linux'''
+                # Counts each read of the Inventory file, then reads it as written.
+                '$script:RdaInventoryCheck = ${function:Test-RdaReportInventoryWritten}; function Test-RdaReportInventoryWritten { param([string[]]$JsonFiles) $Global:RdaTestInventoryChecks++; & $script:RdaInventoryCheck -JsonFiles $JsonFiles }'
                 $Writer.Extent.Text
                 $Finalizer.Extent.Text
                 'ProcessResourceResult'
@@ -1118,7 +1120,7 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         }
 
         $script:SessionValues = @{}
-        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'JsonFile', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'SmaResources', 'Version'))
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'JsonFile', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'SmaResources', 'Version', 'RdaTestInventoryChecks'))
         {
             $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
         }
@@ -1166,6 +1168,15 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         $Result.ZipLeft | Should -BeTrue
         Test-Path -LiteralPath $Global:HtmlFile | Should -BeTrue
         @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 0
+    }
+
+    It 'reads the Inventory file once when the zip step checks the same file' {
+        $Global:RdaTestInventoryChecks = 0
+        $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeTrue
+        $Global:RdaTestInventoryChecks | Should -Be 1
     }
 }
 
