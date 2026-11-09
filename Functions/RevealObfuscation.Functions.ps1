@@ -238,6 +238,146 @@ function Test-RevealZipHasMaskedValue
 }
 
 
+# Every token a dictionary knows: the keys of all its maps, whichever fields
+# are selected. A report whose masked values include one of these belongs to
+# that dictionary.
+function Get-RevealDictionaryTokenSet
+{
+    param($Dictionary)
+    $Tokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($MapName in @('ResourceGroupMap', 'SubscriptionMap', 'SubscriptionNameMap', 'TagMap', 'ResourceIdMap', 'ResourceNameMap', 'FreeTextMap'))
+    {
+        $Map = $Dictionary.$MapName
+        if ($null -eq $Map) { continue }
+        foreach ($Property in $Map.PSObject.Properties) { $null = $Tokens.Add([string]$Property.Name) }
+    }
+    return , $Tokens
+}
+
+# Whether a report zip holds at least one prod_/nonprod_ token that is in
+# $KnownTokens (see Get-RevealDictionaryTokenSet). Read in the same fixed-size
+# chunks as Test-RevealZipHasMaskedValue, with the end of each chunk carried
+# into the next, and stops at the first known token.
+function Test-RevealZipHasKnownToken
+{
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $TokenPattern,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [System.Collections.Generic.HashSet[string]] $KnownTokens
+    )
+    if ($KnownTokens.Count -eq 0) { return $false }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try
+    {
+        $ChunkLength = 65536
+        $CarryLength = 127
+        $Buffer = [char[]]::new($CarryLength + $ChunkLength)
+        foreach ($Entry in $Archive.Entries)
+        {
+            $Reader = [System.IO.StreamReader]::new($Entry.Open())
+            try
+            {
+                $Kept = 0
+                while ($true)
+                {
+                    $Read = $Reader.ReadBlock($Buffer, $Kept, $ChunkLength)
+                    $Filled = $Kept + $Read
+                    if ($Filled -eq 0) { break }
+                    $Text = [string]::new($Buffer, 0, $Filled)
+                    foreach ($M in [regex]::Matches($Text, $TokenPattern))
+                    {
+                        if ($KnownTokens.Contains($M.Value)) { return $true }
+                    }
+                    if ($Read -lt $ChunkLength) { break }
+                    $Kept = [Math]::Min($CarryLength, $Filled)
+                    [Array]::Copy($Buffer, $Filled - $Kept, $Buffer, 0, $Kept)
+                }
+            }
+            finally { $Reader.Dispose() }
+        }
+    }
+    finally
+    {
+        $Archive.Dispose()
+    }
+    return $false
+}
+
+# Whether the dictionary holds any value for the selected fields. When it does
+# not, the selection has nothing to reveal in this report.
+function Test-RevealDictionaryHasSelectedValue
+{
+    param($Dictionary, [string[]] $Fields)
+    $MapOfField = @{
+        ResourceGroup = 'ResourceGroupMap'
+        Subscription  = 'SubscriptionMap'
+        Tag           = 'TagMap'
+        ResourceName  = 'ResourceNameMap'
+        ResourceId    = 'ResourceIdMap'
+        FreeText      = 'FreeTextMap'
+    }
+    foreach ($Field in $Fields)
+    {
+        $Map = $Dictionary.($MapOfField[$Field])
+        if ($null -eq $Map) { continue }
+        foreach ($Property in $Map.PSObject.Properties)
+        {
+            if (-not [string]::IsNullOrEmpty([string]$Property.Value)) { return $true }
+        }
+    }
+    return $false
+}
+
+# One report of an all-subscriptions reveal (Reveal.ps1 runs this in a child
+# job for each folder). The -Fields choice applies to every subscription, and
+# one of them may have no value for a selected field (for example -Fields Tag
+# and a subscription with no tags). When the report's own dictionary has no
+# value for the selected fields, but the report's masked values are in that
+# dictionary (so it is the right dictionary), there is nothing to reveal and
+# the report is written unchanged. Every other case goes to Invoke-RdaReveal,
+# which still fails a report revealed with a dictionary it has no entry in.
+function Invoke-RdaRevealFolder
+{
+    param(
+        [Parameter(Mandatory = $true)] [string]   $InputZip,
+        [Parameter(Mandatory = $true)] [string]   $DictionaryPath,
+        [Parameter(Mandatory = $true)] [string[]] $Fields,
+        [Parameter(Mandatory = $true)] [string]   $OutputZip
+    )
+    $ErrorActionPreference = 'Stop'
+    $Dict = Get-Content -LiteralPath $DictionaryPath -Raw | ConvertFrom-Json
+    if (-not (Test-RevealDictionaryHasSelectedValue -Dictionary $Dict -Fields $Fields))
+    {
+        $TokenPattern = Get-RevealTokenPattern
+        if ((Test-RevealZipHasMaskedValue -Path $InputZip -TokenPattern $TokenPattern) -and
+            (Test-RevealZipHasKnownToken -Path $InputZip -TokenPattern $TokenPattern -KnownTokens (Get-RevealDictionaryTokenSet $Dict)))
+        {
+            Copy-RevealZipUnchanged -InputZip $InputZip -OutputZip $OutputZip
+            Write-Host ("Nothing to reveal: this report's dictionary has no value for the selected field(s) [{0}]. Wrote an unchanged copy." -f ($Fields -join ', ')) -ForegroundColor Yellow
+            return
+        }
+    }
+    Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip
+}
+
+# The prod_/nonprod_ token shapes: plain prod_/nonprod_<guid> and type-hinted
+# name tokens (prod_aks_<guid>, etc.).
+function Get-RevealTokenPattern
+{
+    return '(?:prod|nonprod)_(?:[a-z0-9]+_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+}
+
+# Write an unchanged copy of a report: copy to a sibling .partial.zip, then
+# move it into place, the same atomic swap a revealed zip gets.
+function Copy-RevealZipUnchanged
+{
+    param([string] $InputZip, [string] $OutputZip)
+    $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+    [System.IO.File]::Copy($InputZip, $OutputZipPartial, $true)
+    [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
+}
+
 # =============================================================================
 # Invoke-RdaReveal
 #
@@ -428,7 +568,7 @@ function Invoke-RdaReveal
     # (prod_aks_<guid>, etc.) - the regex matches both; the callback only
     # substitutes tokens present in $Replacements, so non-selected dimensions
     # are left masked.
-    $TokenPattern = '(?:prod|nonprod)_(?:[a-z0-9]+_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $TokenPattern = Get-RevealTokenPattern
 
     if ($Replacements.Count -eq 0)
     {
@@ -446,9 +586,7 @@ function Invoke-RdaReveal
         }
 
         # Same atomic swap as a revealed zip below: copy to .partial.zip, then move.
-        $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
-        [System.IO.File]::Copy($InputZip, $OutputZipPartial, $true)
-        [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
+        Copy-RevealZipUnchanged -InputZip $InputZip -OutputZip $OutputZip
         Write-Host ""
         Write-Host "Nothing to reveal: this report carries no masked values (for example a subscription with no resources). Wrote an unchanged copy." -ForegroundColor Yellow
         Write-Host ("Output: {0}" -f $OutputZip) -ForegroundColor Green
@@ -541,12 +679,17 @@ function Invoke-RdaReveal
             }
         }
 
-        # The dictionary has entries, but none of them was found in the report.
-        # If the report still holds a masked value, the dictionary belongs to
-        # another report (or -Fields picks dimensions this report does not
-        # carry): fail instead of writing the still masked report as revealed.
-        # A report with no masked value at all is written unchanged, as above.
-        if ($TotalHits -eq 0 -and (Test-RevealZipHasMaskedValue -Path $InputZip -TokenPattern $TokenPattern))
+        # The selected fields have entries, but none of them was found in the
+        # report. If the report still holds masked values and none of them is
+        # in any map of this dictionary, the dictionary belongs to another
+        # report: fail instead of writing the still masked report as revealed.
+        # When some masked value is in the dictionary, it is this report's own
+        # dictionary and the selected fields simply have nothing in this
+        # report, so the (unchanged) report is written. A report with no masked
+        # value at all is written unchanged, as above.
+        if ($TotalHits -eq 0 -and
+            (Test-RevealZipHasMaskedValue -Path $InputZip -TokenPattern $TokenPattern) -and
+            -not (Test-RevealZipHasKnownToken -Path $InputZip -TokenPattern $TokenPattern -KnownTokens (Get-RevealDictionaryTokenSet $Dict)))
         {
             if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -Completed }
             throw "Nothing to reveal: the report holds masked values, but the selected field(s) [$($Fields -join ', ')] have no mapping in this dictionary for any of them. Check that the dictionary belongs to this report."
