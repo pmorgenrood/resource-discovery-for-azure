@@ -25,20 +25,19 @@ BeforeAll {
 }
 
 Describe 'The 0-resources warning of a collected subscription' {
-    It 'says in <File> that the subscription passed the up-front role check, and names no permission gap' -ForEach @(
+    It 'says in <File> what 0 resources can mean: empty, or resources the identity cannot read' -ForEach @(
         @{ File = 'Run-AllSubscriptions.ps1' }
         @{ File = 'Run-AllSubscriptions.Stream.ps1' }
     ) {
         $Warnings = @(script:Get-ZeroResourceWarnings -File $File)
         $Warnings.Count | Should -BeGreaterThan 0
-        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' }).Count | Should -Be 1
-        @($Warnings | Where-Object { $_ -match 'permission gap' }) | Should -BeNullOrEmpty
-        # The discovery query leaves some resources out on purpose, so 0 means
-        # it returned none, not that Resource Graph holds none.
-        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'the discovery query.*returned no resource' }) | Should -BeNullOrEmpty
-        @($Warnings | Where-Object { $_ -match 'Resource Graph lists no resource' }) | Should -BeNullOrEmpty
-        # The role check uses the Az PowerShell sign-in, the query the Azure
-        # CLI's, so the warning names a CLI signed in as another account.
-        @($Warnings | Where-Object { $_ -match 'passed the up-front role check' -and $_ -notmatch 'Azure CLI' }) | Should -BeNullOrEmpty
+        # The role check only lists resource groups, and the query runs as the
+        # Azure CLI's account: the warning that names a cause names those, and
+        # never 'Likely permission gap' alone or an empty subscription alone.
+        $Named = @($Warnings | Where-Object { $_ -match 'Reader' })
+        $Named.Count | Should -Be 1
+        $Named[0] | Should -Match 'Azure CLI'
+        $Named[0] | Should -Match 'resource groups'
+        @($Warnings | Where-Object { $_ -match 'Likely permission gap' -or $_ -match 'Resource Graph lists no resource' }) | Should -BeNullOrEmpty
     }
 }

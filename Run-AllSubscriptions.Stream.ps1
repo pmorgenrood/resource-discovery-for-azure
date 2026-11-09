@@ -236,7 +236,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
 
         if ($ResCount -eq 0)
         {
-            Write-Stream ("WARNING: '{0}' returned 0 resources (it passed the up-front role check, so the discovery query returned no resource for it; if the Azure CLI is signed in as another account, check that account's access)" -f $SubName) 'Yellow'
+            Write-Stream ("WARNING: '{0}' returned 0 resources (empty, or its resources cannot be read: the role check only lists resource groups; check Reader, and the Azure CLI's account)" -f $SubName) 'Yellow'
         }
         else
         {
