@@ -79,8 +79,10 @@ Describe "Dictionary Structure" {
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
         foreach ($val in $Values)
         {
-            # A subscription-scoped id, or a tenant-scope one such as a reservation order.
-            $val | Should -Match '^(/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}|/providers/[^/]+)' -Because "Dictionary value should be a real Azure resource ID"
+            # A subscription-scoped id, a tenant-scope one such as a reservation
+            # order, or the tool's stand-in real id for a row with no id (its
+            # subscription part may be a display name or '~nosub').
+            $val | Should -Match '^(/subscriptions/[^/]+/|/providers/[^/]+)' -Because "Dictionary value should be a real Azure resource ID"
         }
     }
 }
