@@ -726,7 +726,9 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+# @(): with one id the function's list comes back as that one string, and
+# '+=' below would then join ids into one string instead of adding to a list.
+$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID)
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.

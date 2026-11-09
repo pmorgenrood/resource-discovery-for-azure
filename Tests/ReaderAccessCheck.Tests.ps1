@@ -2488,6 +2488,19 @@ exit 1
         @(script:Get-WrapperZipEntries | Where-Object { $_.Text.Contains('skipped by the up-front role check') -or $_.Name -like '*.resume-state*' } | ForEach-Object { '{0} {1}' -f $_.Zip, $_.Name }) | Should -BeNullOrEmpty
     }
 
+    It 'skips a completed subscription on -Resume after collecting one listed before it, when the state held one completed id' {
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -Fail @($script:SubA.Id)
+        $First = script:Invoke-WrapperRun -Streams 1
+        (script:Read-WrapperState).Completed | Should -Be @($script:SubB.Id) -Because ($First.Text -join "`n")
+        script:Use-WrapperCase -CaseHome $script:CaseHome
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB)
+        $Second = script:Invoke-WrapperRun -Streams 1 -Arguments @('-Resume')
+        $Second.ExitCode | Should -Be 0 -Because ($Second.Text -join "`n")
+        $Second.Text | Should -Contain ('Skipping (already completed): {0} ({1})' -f $script:SubB.Name, $script:SubB.Id)
+        @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubB.Id)).Count | Should -Be 1
+    }
+
     It 'does not put a subscription without a read role on the retry list' {
         script:Set-WrapperScenario -Subs $script:SubA, $script:SubX -Unreadable $script:SubX.Id
         $R = script:Invoke-WrapperRun
