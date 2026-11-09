@@ -21,7 +21,7 @@ BeforeAll {
 
     function Plan([hashtable]$Over)
     {
-        $P = @{ Attempt = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; Permanent = $false; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
+        $P = @{ Attempt = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
         foreach ($K in $Over.Keys) { $P[$K] = $Over[$K] }
         Get-RdaMetricRetryPlan @P
     }
@@ -94,8 +94,9 @@ Describe 'Get-RdaMetricRetryPlan - unchanged behaviour for other failures' {
         (Plan @{ Attempt = $script:MaxRetries }).Retry | Should -BeFalse
     }
 
-    It 'never retries a permanent failure, even under a Retry-After' {
-        (Plan @{ Permanent = $true; Throttled = $true; ThrottledAttempts = 1; RetryAfterSeconds = 10 }).Retry | Should -BeFalse
+    It 'has no Permanent parameter: a BadRequest leaves the loop before the plan is asked' {
+        (Get-Command Get-RdaMetricRetryPlan).Parameters.Keys | Should -Not -Contain 'Permanent'
+        $script:MetricsSrc | Should -Not -Match '-Permanent \$'
     }
 }
 

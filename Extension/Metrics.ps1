@@ -549,10 +549,9 @@ if ($Task -eq 'Processing')
                 function Get-RdaMetricRetryPlan
                 {
                     param(
-                        [int]$Attempt, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds, [bool]$Permanent,
+                        [int]$Attempt, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds,
                         [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds
                     )
-                    if ($Permanent) { return @{ Retry = $false; SleepSeconds = 0 } }
                     $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $Attempt -lt $MaxRetries }
                     if (-not $Retry) { return @{ Retry = $false; SleepSeconds = 0 } }
                     $Backoff = [math]::Min([math]::Pow(2, $Attempt), 30)
@@ -722,9 +721,8 @@ if ($Task -eq 'Processing')
                                 break
                             }
 
-                            # A BadRequest under -StopOnBadRequest has already left the loop above, so the
-                            # plan sees no permanent failure here.
-                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds -Permanent $false `
+                            # A BadRequest under -StopOnBadRequest has already left the loop above.
+                            $Plan = Get-RdaMetricRetryPlan -Attempt $Attempt -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds `
                                 -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
                             if ($Plan.Retry)
                             {
