@@ -226,7 +226,9 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
         {
             $null = $Host_.AddScript({
                     param($Reveal, $Root, $Staging, $Bundle, $Probe)
-                    function Start-Job
+                    # Reveal calls Start-Job; an alias wins over the cmdlet.
+                    Set-Alias -Name Start-Job -Value Start-StandInJob
+                    function Start-StandInJob
                     {
                         param([scriptblock]$ScriptBlock, [object[]]$ArgumentList)
                         Microsoft.PowerShell.Core\Start-Job -ArgumentList (@($ArgumentList) + $Probe) -ScriptBlock {
