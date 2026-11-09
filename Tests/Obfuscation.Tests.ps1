@@ -72,8 +72,10 @@ BeforeAll {
     # Obfuscation pattern: prod_ or nonprod_ followed by an optional type-tag
     # (databricks_, aks_, vmss_) and a GUID. The type-tagged variants are the
     # name tokens ResourceInventory.ps1 writes for Databricks resources,
-    # resources in AKS-managed resource groups and scale set instances.
-    $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    # resources in AKS-managed resource groups and scale set instances. Tokens
+    # are written in lower case, so the pattern matches letter for letter
+    # ((?-i:...)) under PowerShell's case-blind -match, as the id pattern does.
+    $script:ObfuscationPattern = '^(?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
 
     # A masked resource ID is an ARM-shaped path, never a flat token; the
     # shape is described in Helpers/MaskedIdPattern.ps1.
