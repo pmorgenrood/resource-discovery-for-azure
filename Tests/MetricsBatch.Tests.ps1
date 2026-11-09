@@ -242,13 +242,20 @@ Export-ModuleMember -Function Get-AzMetric
     }
     $Global:RdaTestBatchProviderStates = @{}
     $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
+    # RdaTestBatchArmStallSeconds above 0: every call stalls that long (as a job
+    # with -AsJob, as Az.Accounts does), so only a time limit ends it early.
+    $Global:RdaTestBatchArmStallSeconds = 0
     function Invoke-AzRestMethod
     {
         param([string]$Method, [string]$Path, [string]$Payload, [switch]$AsJob)
-        $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path })
+        $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path; AsJob = [bool]$AsJob })
         $Sub = ($Path -split '/')[2]
         $State = if ($Global:RdaTestBatchProviderStates.ContainsKey($Sub)) { $Global:RdaTestBatchProviderStates[$Sub] } else { 'Registered' }
-        return [PSCustomObject]@{ StatusCode = 200; Content = (@{ namespace = 'Microsoft.Insights'; registrationState = $State } | ConvertTo-Json) }
+        $Response = [PSCustomObject]@{ StatusCode = 200; Content = (@{ namespace = 'Microsoft.Insights'; registrationState = $State } | ConvertTo-Json) }
+        $Stall = [int]$Global:RdaTestBatchArmStallSeconds
+        if ($AsJob) { return Start-ThreadJob -ArgumentList $Response, $Stall -ScriptBlock { param($R, $S) if ($S -gt 0) { Start-Sleep -Seconds $S }; $R } }
+        if ($Stall -gt 0) { [System.Threading.Thread]::Sleep($Stall * 1000) }
+        return $Response
     }
 
     function New-TestResource
@@ -382,7 +389,7 @@ AfterAll {
     $env:PSModulePath = $script:OriginalModulePath
     $Global:DebugLogFile = $script:OriginalDebugLogFile
     Remove-Item -Path 'Env:RDA_TEST_METRIC_CALL_DIR' -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name RdaTestBatchEnvironment, RdaTestBatchTokenCalls, RdaTestBatchProviderStates, RdaTestBatchArmCalls, RdaTestBatchTokenMinutes, RdaTestBatchTokenSecure, RdaTestBatchArmStallSeconds -ErrorAction SilentlyContinue
 }
 
 Describe 'Metrics.ps1 batch work items' {
@@ -656,6 +663,29 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         @($Run.ArmCalls | Where-Object { $_.Method -ne 'GET' }).Count | Should -Be 0
         Assert-SameRecords -Expected $script:PerResource -Actual $Run
         @($Run.DebugLines | Where-Object { $_ -match "Microsoft.Insights is 'NotRegistered'" }).Count | Should -Be 1
+    }
+
+    It 'gives up a provider state read that stalls, and lets the batch call decide' {
+        $Disks = @(New-TestDisk -Name 'disk-001')
+        $Quick = Invoke-MetricsRun -Resources $Disks -RunName 'batch-arm-quick' -Batch -CallTimeout 2
+        $Global:RdaTestBatchArmStallSeconds = 10
+        $JobsBefore = @(Get-Job).Count
+        try
+        {
+            $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-arm-stall' -Batch -CallTimeout 2
+        }
+        finally
+        {
+            $Global:RdaTestBatchArmStallSeconds = 0
+        }
+
+        # The read is given up after the 2 s limit, not held for the 10 s stall.
+        $Run.Seconds | Should -BeLessThan ($Quick.Seconds + 6)
+        $Run.Posts.Count | Should -Be 1
+        $Run.Calls.Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
     }
 
     It 'sends no token to an endpoint that is not Azure Monitor' {
@@ -1131,7 +1161,13 @@ Describe 'The registration wait when one state read stalls' {
         Mock Write-Host { }
         Mock Register-RdaInsightsProvider { $null }
         Mock Invoke-AzRestMethod {
-            if (-not $script:Answered) { return [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' } }
+            if (-not $script:Answered)
+            {
+                # The first read answers at once; with -AsJob as a job, as Az.Accounts gives it.
+                $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+                if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+                return $Read
+            }
             # Every read while waiting stalls far past the deadline.
             $script:WaitReads++
             if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
@@ -1148,6 +1184,58 @@ Describe 'The registration wait when one state read stalls' {
         @($Result.NotRegistered) | Should -Be @('sub-b')
         $Result.Registered.Count | Should -Be 0
         # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
+    }
+}
+
+Describe 'The preflight when a state read or a register stalls' {
+
+    BeforeEach {
+        $script:Answered = $false
+        Mock Write-Host { }
+        Mock Start-Sleep { }
+    }
+
+    It 'gives up a first state read that stalls, and lets the batch call decide' {
+        Mock Invoke-AzRestMethod {
+            # Every read stalls far past the limit.
+            if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+            [System.Threading.Thread]::Sleep(6000)
+            [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registered"}' }
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $false -CallTimeoutSeconds 1
+        $Clock.Stop()
+
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3
+        @($Result.Registered) | Should -Be @('sub-b')
+        $Result.NotRegistered.Count | Should -Be 0
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Could not read*sub-b*Timed out*' } -Times 1 -Exactly
+        @(Get-Job).Count | Should -Be $JobsBefore
+    }
+
+    It 'gives up a register that stalls, and keeps that subscription per call' {
+        Mock Invoke-AzRestMethod {
+            if ($Method -eq 'POST')
+            {
+                if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+                [System.Threading.Thread]::Sleep(6000)
+                return [pscustomobject]@{ StatusCode = 200; Content = '{}' }
+            }
+            $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+            if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+            $Read
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -CallTimeoutSeconds 1 -DeadlineSeconds 5
+        $Clock.Stop()
+
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3.5
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        $Result.Registered.Count | Should -Be 0
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*Could not register*sub-b*Timed out*' } -Times 1 -Exactly
         @(Get-Job).Count | Should -Be $JobsBefore
     }
 }
