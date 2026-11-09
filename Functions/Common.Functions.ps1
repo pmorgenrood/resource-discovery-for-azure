@@ -298,7 +298,9 @@ function Write-MetricsIncompleteBanner
 # data switches of the run. $RunParameters is the run's bound parameters (a
 # direct run) or the switches the wrapper forwards. -Obfuscate is kept, so a
 # masked run is not collected again unmasked, with -ObfuscationDictionary when
-# the run used one. Credentials such as -Secret are never written.
+# the run used one. -MetricsLookbackDays, -ResourceGroup, -Service, -ReportName
+# and -OutputDirectory are kept when the run set them. Credentials such as
+# -Secret are never written.
 function Get-MetricsRetryCommand
 {
     param([string]$TenantID, [string]$SubscriptionId, [System.Collections.IDictionary]$RunParameters)
@@ -322,6 +324,28 @@ function Get-MetricsRetryCommand
     if ($Masked -and $Given.Contains('ObfuscationDictionary') -and -not [string]::IsNullOrEmpty([string]$Given['ObfuscationDictionary']))
     {
         $Parts.Add('-ObfuscationDictionary'); $Parts.Add("'" + ([string]$Given['ObfuscationDictionary']).Replace("'", "''") + "'")
+    }
+    # The run's scope and output, when it set them, so the new report covers the
+    # same resources and lands where the first one did.
+    if ($Given.Contains('MetricsLookbackDays') -and [string]$Given['MetricsLookbackDays'] -match '^\s*-?\d+\s*$')
+    {
+        $Parts.Add('-MetricsLookbackDays'); $Parts.Add(([string]$Given['MetricsLookbackDays']).Trim())
+    }
+    if ($Given.Contains('ResourceGroup') -and -not [string]::IsNullOrEmpty([string]$Given['ResourceGroup']))
+    {
+        $Parts.Add('-ResourceGroup'); $Parts.Add("'" + ([string]$Given['ResourceGroup']).Replace("'", "''") + "'")
+    }
+    $Services = @(if ($Given.Contains('Service')) { @($Given['Service']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) } })
+    if ($Services.Count -gt 0)
+    {
+        $Parts.Add('-Service'); $Parts.Add((@($Services | ForEach-Object { "'" + ([string]$_).Replace("'", "''") + "'" }) -join ','))
+    }
+    foreach ($Name in @('ReportName', 'OutputDirectory'))
+    {
+        if ($Given.Contains($Name) -and -not [string]::IsNullOrEmpty([string]$Given[$Name]))
+        {
+            $Parts.Add('-' + $Name); $Parts.Add("'" + ([string]$Given[$Name]).Replace("'", "''") + "'")
+        }
     }
     return ($Parts -join ' ')
 }

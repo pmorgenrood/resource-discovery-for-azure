@@ -65,6 +65,16 @@ Describe 'Get-MetricsRetryCommand' {
         Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be "./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -SkipConsumption -DeviceLogin -ConcurrencyLimit 12 -ObfuscationDictionary '/data/it''s here.json'"
     }
 
+    It 'keeps the lookback, resource group, services, report name and output folder the run set' {
+        $Run = @{ MetricsLookbackDays = 14; ResourceGroup = 'rg-one'; Service = @('Compute', "It's"); ReportName = 'Report_A'; OutputDirectory = "/data/out's" }
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be "./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -MetricsLookbackDays 14 -ResourceGroup 'rg-one' -Service 'Compute','It''s' -ReportName 'Report_A' -OutputDirectory '/data/out''s'"
+    }
+
+    It 'leaves out a lookback that is not a whole number and empty values' {
+        $Run = @{ MetricsLookbackDays = '14; Remove-Item x'; ResourceGroup = ''; Service = @(); ReportName = $null }
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+    }
+
     It 'never writes a credential or a switch that was turned off' {
         $Run = @{ Obfuscate = [switch]$false; DeviceLogin = $false; Appid = 'app-1'; Secret = (ConvertTo-SecureString 'not-a-real-value' -AsPlainText -Force); SkipMetrics = $true; Debug = $true; ObfuscationDictionary = '/data/d.json' }
         $Command = Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run
@@ -116,6 +126,14 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
         $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
         ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
+    }
+
+    It 'prints the command with the run''s lookback, resource group, services, report name and output folder' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; MetricsLookbackDays = 7; ResourceGroup = 'rg-one'; Service = @('Compute', 'Network'); ReportName = 'Report_A'; OutputDirectory = '/data/out' }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -MetricsLookbackDays 7 -ResourceGroup 'rg-one' -Service 'Compute','Network' -ReportName 'Report_A' -OutputDirectory '/data/out'"
     }
 
     It 'still prints the command but exits 2, not 3, when its zip could not be written' {
