@@ -56,11 +56,16 @@
     are written before consolidation. Defaults to
     <InventoryRoot>/RevealedStaging_<timestamp>. Kept after the run (not
     auto-deleted) so a partial run is recoverable; pass -RemoveStaging to delete
-    it once the outer zip is built.
+    it once the outer zip is built. Must be a new or empty folder, or one a
+    reveal of the same -InventoryRoot staged into before (Reveal marks it with
+    a hidden .reveal-staging.json file); any other folder is refused. Only the
+    zips this run revealed (or, with -Resume, found already revealed) go in the
+    outer zip.
 
 .PARAMETER RemoveStaging
-    ALL-SUBSCRIPTIONS MODE. Delete the staging directory after the outer zip is
-    successfully created (only on a fully clean run).
+    ALL-SUBSCRIPTIONS MODE. After the outer zip is successfully created (only on
+    a fully clean run), delete the revealed zips and the mark from staging, then
+    the staging directory itself if nothing else is left in it.
 
 .PARAMETER Resume
     ALL-SUBSCRIPTIONS MODE. Continue an interrupted run instead of starting
@@ -257,10 +262,49 @@ if ([string]::IsNullOrEmpty($OutputZip))
 {
     $OutputZip = Join-Path $InventoryRoot ("AllSubscriptions_Revealed_" + $Timestamp + ".zip")
 }
+# The staging folder must belong to a reveal of THIS inventory root. Reveal
+# marks each staging folder it uses with a small hidden file naming the
+# inventory root. A folder that already holds files but has no such mark (or a
+# mark for another root) may hold stale or unrelated reports: taking them would
+# put them in the upload, -Resume would read them as done, and -RemoveStaging
+# would delete them. So such a folder is refused before anything is written.
+$StagingMarkerName = '.reveal-staging.json'
+$PathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+if (Test-Path -LiteralPath $StagingDirectory)
+{
+    if (-not (Test-Path -LiteralPath $StagingDirectory -PathType Container))
+    {
+        throw "-StagingDirectory names a file, not a folder: $StagingDirectory. Use a new or empty folder."
+    }
+    $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
+    $StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop).Count -eq 0
+    $MarkedRoot = $null
+    if (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf)
+    {
+        try { $MarkedRoot = [string](Get-Content -LiteralPath $StagingMarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).InventoryRoot }
+        catch { $MarkedRoot = $null }
+    }
+    $MarkedForThisRoot = -not [string]::IsNullOrEmpty($MarkedRoot) -and [string]::Equals($MarkedRoot, $InventoryRoot, $PathComparison)
+    if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
+    {
+        throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
+    }
+}
 New-Item -ItemType Directory -Path $StagingDirectory -Force | Out-Null
 # Canonicalize staging too, so the per-folder exclusion compare below matches
 # the absolute FullName that Get-ChildItem returns.
 $StagingDirectory = (Resolve-Path -LiteralPath $StagingDirectory).Path
+$StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
+if (-not (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf))
+{
+    ([pscustomobject]@{ Purpose = 'Reveal staging folder'; InventoryRoot = $InventoryRoot } | ConvertTo-Json -Compress) |
+        Set-Content -LiteralPath $StagingMarkerPath -Encoding utf8NoBOM
+    if ($IsWindows)
+    {
+        $MarkerItem = Get-Item -LiteralPath $StagingMarkerPath -Force
+        $MarkerItem.Attributes = $MarkerItem.Attributes -bor [System.IO.FileAttributes]::Hidden
+    }
+}
 
 # The output zip must not live inside the staging directory, or it would be
 # swept into itself on the final Compress-Archive.
@@ -290,6 +334,10 @@ $RevealedCount = 0
 $ResumedCount = 0
 $SkippedItems = @()
 $FailedItems = @()
+# The staged zips this run stands for: the ones it revealed and, under -Resume,
+# the ones a prior run of this staging folder already revealed. Only these go
+# in the outer zip, never any other *.zip that happens to sit in staging.
+$RunOutputs = [System.Collections.Generic.List[string]]::new()
 
 # Hard cap on how long a single folder's reveal may run. A pathological report
 # (e.g. an unusually large or malformed zip) can make Expand-Archive /
@@ -335,6 +383,7 @@ foreach ($Folder in $Folders)
         # a resumed run does not redo completed work (and can advance past a
         # folder that previously stalled the batch).
         $ResumedCount++
+        $RunOutputs.Add($OutPath)
         continue
     }
 
@@ -391,6 +440,7 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 if (Test-Path -LiteralPath $R.Item.OutPath)
                 {
                     $RevealedCount++
+                    $RunOutputs.Add($R.Item.OutPath)
                 }
                 else
                 {
@@ -436,11 +486,13 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
 Write-RdaProgress -Activity 'Revealing per-subscription reports' -Completed
 
 # Consolidate the revealed per-sub zips into one outer zip for upload.
-# Exclude *.partial.zip: the single-report engine compresses to a sibling
-# .partial.zip and atomically renames it to the final name on success, so a
-# .partial.zip only ever exists if a reveal was hard-killed mid-compress. Such
-# a truncated file must never be folded into the consolidated outer zip.
-$StagedZips = @(Get-ChildItem -LiteralPath $StagingDirectory -Filter '*.zip' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.partial.zip' })
+# Only this run's outputs (see $RunOutputs) are taken. A *.partial.zip is never
+# among them: the single-report engine compresses to a sibling .partial.zip and
+# renames it to the final name on success, so a .partial.zip only exists if a
+# reveal was hard-killed mid-compress, and must never go in the outer zip.
+$StagedZips = @($RunOutputs | Select-Object -Unique |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        ForEach-Object { Get-Item -LiteralPath $_ })
 $ConsolidationError = $null
 if ($StagedZips.Count -gt 0)
 {
@@ -511,8 +563,25 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
 {
     try
     {
-        Remove-Item -LiteralPath $StagingDirectory -Recurse -Force
-        Write-Host ("Removed staging directory: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
+        # Remove only what Reveal put there: this run's zips, their partial
+        # files and the staging mark. Anything else in the folder is not ours,
+        # so the folder is then kept.
+        foreach ($Staged in $StagedZips)
+        {
+            Remove-Item -LiteralPath $Staged.FullName -Force -ErrorAction Stop
+            Remove-Item -LiteralPath (($Staged.FullName -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $StagingMarkerPath -Force -ErrorAction SilentlyContinue
+        $Leftover = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop)
+        if ($Leftover.Count -eq 0)
+        {
+            Remove-Item -LiteralPath $StagingDirectory -Force -ErrorAction Stop
+            Write-Host ("Removed staging directory: {0}" -f $StagingDirectory) -ForegroundColor DarkGray
+        }
+        else
+        {
+            Write-Host ("Removed the revealed zips from staging, but kept the folder: it holds {0} item(s) Reveal did not put there: {1}" -f $Leftover.Count, $StagingDirectory) -ForegroundColor Yellow
+        }
     }
     catch
     {
