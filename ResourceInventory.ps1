@@ -1580,7 +1580,10 @@ function ExecuteInventoryProcessing()
                         $NewUsageDataExport.Add($UsageDataExport[$Item]) | Out-Null
                     }
 
-                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation
+                    # -ErrorAction Stop: the run's error preference can be SilentlyContinue, and a
+                    # failed write (a full disk, a file that cannot be written) must stop this
+                    # subscription's pull as incomplete, not count the rows as written.
+                    $NewUsageDataExport | Select-Object InstanceData, MeterCategory, MeterId, MeterName, MeterRegion, MeterSubCategory, Quantity, Unit, UsageStartTime, UsageEndTime, ResourceId, ResourceLocation, ConsumptionMeter, ReservationId, ReservationOrderId | Export-Csv $Global:ConsumptionFileCsv -Encoding utf8 -Append -NoTypeInformation -ErrorAction Stop
                     # Rows written to the consumption file: a -ResourceGroup run leaves out the
                     # other resource groups' rows, and a page that fails part-way writes none.
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count

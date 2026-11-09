@@ -254,6 +254,27 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
     }
 
 
+    It 'reports the subscription incomplete when the consumption file cannot be written, also when errors are silenced' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        # The write fails with an error that does not stop by itself, as a full
+        # disk can.
+        function Export-Csv
+        {
+            [CmdletBinding()]
+            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
+            process { Write-Error 'stand-in: there is not enough space on the disk' }
+        }
+        # The run's own error preference can be SilentlyContinue.
+        $ErrorActionPreference = 'SilentlyContinue'
+        GetResorceConsumption
+        $ErrorActionPreference = 'Continue'
+        @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'not enough space on the disk'
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 0
+        $Global:ConsumptionRecordCount | Should -Be 0
+    }
+
     It 'writes a usage row without additionalInfo when the caller runs under Set-StrictMode -Version Latest' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
