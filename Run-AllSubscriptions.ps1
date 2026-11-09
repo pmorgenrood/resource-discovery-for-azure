@@ -2168,10 +2168,10 @@ if ($AuthSkippedPhases.Count -gt 0)
 # A subscription whose Azure Monitor metric request (grouped or for one
 # metric) still failed after its retries (throttling, timeout, server error)
 # has incomplete metrics: listed
-# with the command that collects it again, and exit 3 (5 with collector
-# failures), as for a data phase skipped for the sign-in.
-$MetricsIncompleteEntries = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
-Write-MetricsIncompleteBanner -Entries $MetricsIncompleteEntries -Advice (@('To collect one again, run:') + @($MetricsIncompleteEntries | ForEach-Object { '  ./ResourceInventory.ps1 -TenantID {0} -SubscriptionID {1}' -f $TenantID, $_.Id }))
+# with the command that collects it again, with the switches this run forwards,
+# and exit 3 (5 with collector failures), as for a data phase skipped for the
+# sign-in.
+$MetricsIncomplete = Write-MetricsIncompleteRunEnd -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $InventoryPassthrough
 
 # Machine-facing signal for collector failures (#22), distinct from the auth
 # banner above. A collector failure is not an auth problem - it means one or
@@ -2203,7 +2203,7 @@ if ($WrapperTranscriptStarted)
 
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
-$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -MetricsIncomplete ($MetricsIncompleteEntries.Count -gt 0)
+$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -MetricsIncomplete $MetricsIncomplete
 if ($WrapperExitCode -ne 0)
 {
     exit $WrapperExitCode

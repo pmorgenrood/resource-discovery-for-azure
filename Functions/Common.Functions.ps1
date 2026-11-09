@@ -293,3 +293,60 @@ function Write-MetricsIncompleteBanner
     foreach ($Line in @($Advice)) { Write-Host $Line -ForegroundColor Red }
     Write-Host '========================================================' -ForegroundColor Red
 }
+
+# The command that collects the metrics of one subscription again, with the
+# data switches of the run. $RunParameters is the run's bound parameters (a
+# direct run) or the switches the wrapper forwards. -Obfuscate is kept, so a
+# masked run is not collected again unmasked, with -ObfuscationDictionary when
+# the run used one. Credentials such as -Secret are never written.
+function Get-MetricsRetryCommand
+{
+    param([string]$TenantID, [string]$SubscriptionId, [System.Collections.IDictionary]$RunParameters)
+
+    # A plain copy, so a run's $PSBoundParameters reads the same as a hashtable.
+    $Given = @{}
+    if ($null -ne $RunParameters) { foreach ($Key in @($RunParameters.Keys)) { $Given[[string]$Key] = $RunParameters[$Key] } }
+    $Parts = [System.Collections.Generic.List[string]]::new()
+    $Parts.Add('./ResourceInventory.ps1')
+    if (-not [string]::IsNullOrEmpty($TenantID)) { $Parts.Add('-TenantID'); $Parts.Add($TenantID) }
+    $Parts.Add('-SubscriptionID'); $Parts.Add($SubscriptionId)
+    foreach ($Name in @('Obfuscate', 'SkipConsumption', 'DeviceLogin'))
+    {
+        if ($Given.Contains($Name) -and [bool]$Given[$Name]) { $Parts.Add('-' + $Name) }
+    }
+    if ($Given.Contains('ConcurrencyLimit') -and [string]$Given['ConcurrencyLimit'] -match '^\s*\d+\s*$')
+    {
+        $Parts.Add('-ConcurrencyLimit'); $Parts.Add(([string]$Given['ConcurrencyLimit']).Trim())
+    }
+    $Masked = $Given.Contains('Obfuscate') -and [bool]$Given['Obfuscate']
+    if ($Masked -and $Given.Contains('ObfuscationDictionary') -and -not [string]::IsNullOrEmpty([string]$Given['ObfuscationDictionary']))
+    {
+        $Parts.Add('-ObfuscationDictionary'); $Parts.Add("'" + ([string]$Given['ObfuscationDictionary']).Replace("'", "''") + "'")
+    }
+    return ($Parts -join ' ')
+}
+
+# The end of a run with incomplete metrics, for Run-AllSubscriptions.ps1 and a
+# direct ResourceInventory.ps1 run: the FAILED (metrics) lines, with the command
+# that collects each subscription again. Returns $true when there were any.
+function Write-MetricsIncompleteRunEnd
+{
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters)
+
+    $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return $false }
+    $Advice = @('To collect one again, run:') + @($List | ForEach-Object { '  ' + (Get-MetricsRetryCommand -TenantID $TenantID -SubscriptionId ([string]$_.Id) -RunParameters $RunParameters) })
+    Write-MetricsIncompleteBanner -Entries $List -Advice $Advice
+    return $true
+}
+
+# The exit code at the end of a direct ResourceInventory.ps1 run (not under
+# -RunAllSubs, where the wrapper decides): 3 when its metrics are incomplete,
+# after the FAILED (metrics) lines; 0 otherwise.
+function Get-DirectRunMetricsExitCode
+{
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters)
+
+    if (Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters) { return 3 }
+    return 0
+}

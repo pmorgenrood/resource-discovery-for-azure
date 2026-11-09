@@ -587,7 +587,7 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 
 Codes `3`–`5` still mean the report was produced — they flag that it is **incomplete** in a specific, diagnosable way, rather than silently looking like a clean/empty result.
 
-A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor metric request (grouped or for one metric) of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip.
+A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor metric request (grouped or for one metric) of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip. The command keeps the run's `-Obfuscate`, `-ObfuscationDictionary`, `-SkipConsumption`, `-DeviceLogin` and `-ConcurrencyLimit`, so a masked run is collected again masked; it never holds `-Secret`.
 
 ### Important Notes
 

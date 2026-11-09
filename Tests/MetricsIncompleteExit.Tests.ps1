@@ -50,25 +50,147 @@ Describe 'Write-MetricsIncompleteBanner' {
     }
 }
 
-Describe 'Exit codes for incomplete metrics' {
-    It 'a direct run exits 3 after its zip only when metrics are incomplete, and never under -RunAllSubs' {
-        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
-        $Exits = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.ExitStatementAst] -and $N.Pipeline.Extent.Text -eq '3' }, $true))
-        $Exits.Count | Should -Be 1
-        $Guards = @()
-        $Node = $Exits[0].Parent
-        while ($null -ne $Node) { if ($Node -is [System.Management.Automation.Language.IfStatementAst]) { $Guards += $Node.Clauses[0].Item1.Extent.Text }; $Node = $Node.Parent }
-        $Guards | Should -Contain '$MetricsIncomplete.Count -gt 0'
-        $Guards | Should -Contain '-not $RunAllSubs.IsPresent'
-        # After the report zip is written.
-        $Zip = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Compress-Archive' }, $true))
-        $Zip[-1].Extent.StartOffset | Should -BeLessThan $Exits[0].Extent.StartOffset
+Describe 'Get-MetricsRetryCommand' {
+    It 'names the tenant and the subscription' {
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters @{} | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
     }
 
-    It 'the wrapper passes incomplete metrics to its exit code and leaves them out of the sign-in banner' {
-        $Text = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
-        $Text | Should -Match ([regex]::Escape('-MetricsIncomplete ($MetricsIncompleteEntries.Count -gt 0)'))
-        $Text | Should -Match ([regex]::Escape("if (@(@(`$Global:MetricsFailedSubs) | Where-Object { `$null -ne `$_ -and -not (Test-MetricsIncompleteEntry -Entry `$_) }).Count -gt 0) { `$AuthSkippedPhases += 'Metrics' }"))
-        $Text | Should -Not -Match ([regex]::Escape("if (@(`$Global:MetricsFailedSubs).Count -gt 0) { `$AuthSkippedPhases += 'Metrics' }"))
+    It 'leaves out the tenant when the run had none' {
+        Get-MetricsRetryCommand -TenantID '' -SubscriptionId 'id-2' -RunParameters $null | Should -Be './ResourceInventory.ps1 -SubscriptionID id-2'
+    }
+
+    It 'keeps the data switches of the run, so a masked run is collected again masked' {
+        $Run = @{ Obfuscate = [switch]::Present; SkipConsumption = $true; DeviceLogin = [switch]::Present; ConcurrencyLimit = 12; ObfuscationDictionary = "/data/it's here.json" }
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run | Should -Be "./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -SkipConsumption -DeviceLogin -ConcurrencyLimit 12 -ObfuscationDictionary '/data/it''s here.json'"
+    }
+
+    It 'never writes a credential or a switch that was turned off' {
+        $Run = @{ Obfuscate = [switch]$false; DeviceLogin = $false; Appid = 'app-1'; Secret = (ConvertTo-SecureString 'not-a-real-value' -AsPlainText -Force); SkipMetrics = $true; Debug = $true; ObfuscationDictionary = '/data/d.json' }
+        $Command = Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters $Run
+        $Command | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+    }
+}
+
+Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
+    BeforeAll {
+        # The run's own param block and its last statement (the end of a direct
+        # run), as written, with Common.Functions.ps1 loaded: the rest of the run
+        # needs Azure.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $End = @($Ast.EndBlock.Statements)[-1]
+        $script:DirectRun = Join-Path $TestDrive 'direct-run-end.ps1'
+        Set-Content -LiteralPath $script:DirectRun -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                $End.Extent.Text
+            ) -join "`n")
+
+        function script:Invoke-DirectRunEnd
+        {
+            param([hashtable]$Arguments)
+            $global:LASTEXITCODE = 0
+            $Lines = @(& $script:DirectRun @Arguments 6>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines }
+        }
+
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
+        else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'prints the command with the run''s switches and exits 3' {
+        $Global:MetricsFailedSubs = @($script:SignIn, $script:Incomplete)
+        $Secret = ConvertTo-SecureString 'not-a-real-value' -AsPlainText -Force
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; Obfuscate = $true; ConcurrencyLimit = 9; ObfuscationDictionary = '/data/d.json'; Appid = 'app-1'; Secret = $Secret }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
+        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
+        ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
+    }
+
+    It 'exits 0 and prints nothing when the metrics are complete' {
+        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+    }
+
+    It 'leaves the end of the run to the wrapper under -RunAllSubs' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.Lines.Count | Should -Be 0
+    }
+}
+
+Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
+    BeforeAll {
+        # The wrapper's last statements, from its FAILED (auth) lines to its exit
+        # code, as written: the rest of the run needs Azure.
+        . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Top = @((Get-ScriptAst -File 'Run-AllSubscriptions.ps1').EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$AuthSkippedPhases = @\(\)' })[0]
+        $To = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^if \(\$WrapperExitCode -ne 0\)' })[-1]
+        $script:WrapperEnd = (@($Top[$From..($To - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n'EXIT=' + `$WrapperExitCode"
+
+        function script:Invoke-WrapperEnd
+        {
+            param([hashtable]$InventoryPassthrough, [object[]]$CollectorFailures = @())
+            $TenantID = 'tenant-1'
+            $WrapperTranscriptStarted = $false
+            $Global:CollectorFailures = $CollectorFailures
+            $Global:ConsumptionFailedSubs = @()
+            $Lines = @(. ([scriptblock]::Create($script:WrapperEnd)) 6>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{ ExitCode = [int](($Lines | Where-Object { $_ -like 'EXIT=*' } | Select-Object -Last 1) -replace '^EXIT=', ''); Lines = $Lines }
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('MetricsFailedSubs', 'CollectorFailures', 'ConsumptionFailedSubs'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'prints the command with the switches it forwards and exits 3, with no FAILED (auth) for it' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-WrapperEnd -InventoryPassthrough @{ Obfuscate = $true; SkipConsumption = $true; ConcurrencyLimit = 12; Debug = $true }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -SkipConsumption -ConcurrencyLimit 12'
+        $Result.Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
+    }
+
+    It 'exits 5 with a collector failure too' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 } -CollectorFailures @([pscustomobject]@{ Id = 'id-2'; Module = 'Compute'; Message = 'failed' })
+
+        $Result.ExitCode | Should -Be 5
+        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+    }
+
+    It 'exits 3 with only FAILED (auth) for a sign-in skip' {
+        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Result = Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '===================== FAILED (auth) ====================='
+        $Result.Lines | Should -Not -Contain '=================== FAILED (metrics) ==================='
+    }
+
+    It 'exits 0 when nothing failed' {
+        $Global:MetricsFailedSubs = @()
+        (Invoke-WrapperEnd -InventoryPassthrough @{ ConcurrencyLimit = 6 }).ExitCode | Should -Be 0
     }
 }

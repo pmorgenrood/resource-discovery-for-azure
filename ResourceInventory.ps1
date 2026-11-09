@@ -1836,15 +1836,11 @@ Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severi
 # A direct run whose metrics are incomplete because an Azure Monitor metric
 # request (grouped or for one metric) still failed after its retries
 # (throttling, timeout, server error)
-# names each subscription with the command that collects it again, and exits 3.
-# Under -RunAllSubs the wrapper does this for the whole run.
+# names each subscription with the command that collects it again, with this
+# run's switches, and exits 3. Under -RunAllSubs the wrapper does this for the
+# whole run.
 if (-not $RunAllSubs.IsPresent)
 {
-    $MetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
-    if ($MetricsIncomplete.Count -gt 0)
-    {
-        $RetryTenantArg = if (-not [string]::IsNullOrEmpty($TenantID)) { ' -TenantID {0}' -f $TenantID } else { '' }
-        Write-MetricsIncompleteBanner -Entries $MetricsIncomplete -Advice (@('To collect one again, run:') + @($MetricsIncomplete | ForEach-Object { '  ./ResourceInventory.ps1{0} -SubscriptionID {1}' -f $RetryTenantArg, $_.Id }))
-        exit 3
-    }
+    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters
+    if ($DirectRunExitCode -ne 0) { exit $DirectRunExitCode }
 }
