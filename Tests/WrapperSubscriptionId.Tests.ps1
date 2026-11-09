@@ -852,6 +852,8 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         {
             param([long]$FreeBytes)
             $script:Exited = $null
+            # Set by the run before the block, as it is for a preflight.
+            Set-Variable -Name InventoryRoot -Value $(if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { 'C:\InventoryReports' })
             Mock Get-FolderFreeSpaceBytes { $FreeBytes }
             Mock Set-Content { throw 'a preflight must write nothing' }
             Mock Exit-Wrapper { param($Code) $script:Exited = $Code }
