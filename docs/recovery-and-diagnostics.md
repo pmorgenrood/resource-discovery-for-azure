@@ -102,6 +102,20 @@ Behaviour:
   name, batch suffixes preserved). Each fails loud if the recovery bundle lacks
   the file. Without the switch, the gap bundle's copy is carried forward
   byte-for-byte (the default, unchanged behaviour).
+- **Files downstream would drop stop the merge**, before it writes anything.
+  The consumption file it would zip must have the `ResourceId`,
+  `MeterCategory`, `MeterSubCategory`, `MeterName` and `MeterId` columns, and
+  every `Quantity` must be a number of 0 or more written with a dot and no
+  thousands mark; every `UsageStartTime` and `UsageEndTime` must be a date; and
+  `Cost` and `UnitPrice`, where those columns exist, must be numbers. A file
+  cut mid-row ends in a row that fails this. A row with an empty `ResourceId`
+  or `MeterId` does not stop the merge, as downstream drops only that row. Each
+  metrics file it would zip must be a JSON object with a `Metrics` list whose
+  records are objects with `MetricCount`, `MetricValue` and `MetricPercentile`
+  as numbers, `MetricError` as true or false, and `MetricSeries`, when set, a
+  number or a list of numbers. The error names the file and the first bad row
+  or record; with a bad gap file, run the merge with `-RecoverConsumption` or
+  `-RecoverMetrics` and a recovery bundle whose file is whole.
 - The return object reports `MergedServiceKeys`, `ConsumptionSource`
   (`gap`/`recovery`), and `MetricsSource` (`gap`/`recovery`) for confirmation.
 - The obfuscation dictionaries are merged (local-only, never zipped).
