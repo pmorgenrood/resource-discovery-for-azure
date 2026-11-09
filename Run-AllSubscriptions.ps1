@@ -80,7 +80,12 @@ param (
     # Tenant-scoped Azure Resource Graph rate limits (~15 req/sec/tenant) are
     # the hard ceiling - more than ~6 parallel streams in one tenant will
     # start to throttle and provide no further wall-time benefit.
-    [int]$ParallelStreams = 1
+    [int]$ParallelStreams = 1,
+
+    # Forwarded to ResourceInventory.ps1's -ConsumptionMaxPages: the most usage
+    # pages the consumption phase reads for one subscription (0 or absent:
+    # 10,000). Last, so the positions of the parameters above stay.
+    [ValidateRange(0, [int]::MaxValue)][int]$ConsumptionMaxPages
 )
 
 # ---------------------------------------------------------------------------
@@ -981,6 +986,7 @@ if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 # script's default. Defaults to 6 (the inner script's existing default), so
 # behavior is unchanged for runs that don't pass it.
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
+if ($ConsumptionMaxPages -gt 0) { $InventoryPassthrough['ConsumptionMaxPages'] = $ConsumptionMaxPages }
 if ($PSBoundParameters.ContainsKey('Debug')) { $InventoryPassthrough['Debug'] = $true }
 # The consumption window of the up-front check above, for every subscription.
 $ConsumptionWindowArgs = ConvertTo-ConsumptionWindowArgument -Window $ConsumptionWindow
@@ -1382,6 +1388,7 @@ else
                 if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
+                if ($ConsumptionMaxPages -gt 0) { $WorkerArgs.ConsumptionMaxPages = $ConsumptionMaxPages }
 
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)

@@ -22,7 +22,12 @@ param ($TenantID,
     # this run collects the same window even after midnight. When absent (or
     # not valid) the run computes the window itself.
     [string]$ConsumptionWindowStart,
-    [string]$ConsumptionWindowEnd)
+    [string]$ConsumptionWindowEnd,
+    # The most usage pages the consumption phase reads for one subscription
+    # (0 or absent: 10,000, about 10 million rows). At the limit the
+    # subscription's consumption is reported INCOMPLETE with the advice to run
+    # again with a higher value. Last, so every earlier position stays.
+    [ValidateRange(0, [int]::MaxValue)][int]$ConsumptionMaxPages)
 
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
 if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
@@ -1316,12 +1321,15 @@ function ExecuteInventoryProcessing()
         Write-Log -Message ('Resource Reporting Phase Done.') -Severity 'Info'
     }
 
-    # $MaxPages: the most usage pages read for one subscription. A paging token
-    # that never runs out would otherwise keep the run reading without end; at
-    # the limit the subscription's consumption is reported INCOMPLETE. At the
-    # usage API's page size (up to 1,000 rows a page) 10,000 pages is about 10
-    # million rows for one subscription.
-    function GetResorceConsumption([int]$MaxPages = 10000)
+    # $MaxPages: the most usage pages read for one subscription (the run's
+    # -ConsumptionMaxPages when not given; 10,000 when neither is). A paging
+    # token that never runs out would otherwise keep the run reading without
+    # end; at the limit the subscription's consumption is reported INCOMPLETE,
+    # with the advice to run again with a higher -ConsumptionMaxPages. A page
+    # token the API gives twice for one subscription stops it the same way. At
+    # the usage API's page size (up to 1,000 rows a page) 10,000 pages is about
+    # 10 million rows for one subscription.
+    function GetResorceConsumption([int]$MaxPages = 0)
     {
         $DebugPreference = "SilentlyContinue"
         # A usage row leaves out the InstanceData parts Azure has no value for
@@ -1330,6 +1338,8 @@ function ExecuteInventoryProcessing()
         # a run started from a shell with Set-StrictMode -Version Latest writes such
         # a row with its empty defaults instead of stopping the subscription's pull.
         Set-StrictMode -Off
+        # The page limit: -MaxPages, else the run's -ConsumptionMaxPages, else 10,000.
+        if ($MaxPages -le 0) { $MaxPages = if ($ConsumptionMaxPages -gt 0) { $ConsumptionMaxPages } else { 10000 } }
 
         [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
         [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
@@ -1420,6 +1430,8 @@ function ExecuteInventoryProcessing()
             # from it. A subscription whose pull failed part-way leaves its token
             # there, so each subscription starts with none.
             $UsageData = $null
+            # The page tokens the API gave for this subscription.
+            $SeenPageTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
             try
             {
@@ -1574,10 +1586,17 @@ function ExecuteInventoryProcessing()
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
 
                     $MorePages = ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
+                    # Both stops keep $ConsumptionPageIndex at the last page read: the next
+                    # page was not asked for.
                     if ($MorePages -and $ConsumptionPageIndex -ge $MaxPages)
                     {
-                        $ConsumptionPageIndex++
-                        throw ("Read the limit of {0:N0} usage pages for one subscription; the usage API offered more, which were not read" -f $MaxPages)
+                        throw ("Read the limit of {0:N0} usage pages for one subscription; the usage API offered more, which were not read. To read them, run again with -ConsumptionMaxPages and a higher number (Run-AllSubscriptions.ps1 takes it too)" -f $MaxPages)
+                    }
+                    # A token the API already gave for this subscription would read the same
+                    # pages again without end.
+                    if ($MorePages -and -not $SeenPageTokens.Add([string]$UsageData.ContinuationToken))
+                    {
+                        throw 'The usage API gave a page token it had already given for this subscription; the pages after it were not read'
                     }
                 } while ($MorePages)
             }

@@ -487,9 +487,10 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         @(Import-Csv -Path $Global:ConsumptionFileCsv).Count | Should -Be 3
         @($Global:ConsumptionFailedSubs).Count | Should -Be 1
         $Global:ConsumptionFailedSubs[0].Message | Should -Match 'the limit of 3 usage pages for one subscription'
-        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 4, after 3 record\(s\); this subscription''s consumption is INCOMPLETE'
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'run again with -ConsumptionMaxPages and a higher number'
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'stopped at consumption page 3, after 3 record\(s\); this subscription''s consumption is INCOMPLETE'
         $Global:ConsumptionFailedSubs[0].Complete | Should -BeFalse
-        $Global:ConsumptionFailedSubs[0].PageAtFailure | Should -Be 4
+        $Global:ConsumptionFailedSubs[0].PageAtFailure | Should -Be 3
         $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 3
     }
 
@@ -509,7 +510,41 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
     It 'reads at most 10,000 usage pages for one subscription unless told otherwise' {
         $Limit = @($script:CollectionAst.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'MaxPages' })
         $Limit.Count | Should -Be 1
-        $Limit[0].DefaultValue.Extent.Text | Should -Be '10000'
+        $Limit[0].DefaultValue.Extent.Text | Should -Be '0'
+        $script:CollectionAst.Body.Extent.Text | Should -Match ([regex]::Escape('if ($MaxPages -le 0) { $MaxPages = if ($ConsumptionMaxPages -gt 0) { $ConsumptionMaxPages } else { 10000 } }'))
+    }
+
+    It 'takes the run''s -ConsumptionMaxPages as the page limit' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:ConsumptionMaxPages = 2
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -gt 50) { throw 'stand-in: the pages did not stop' }
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = ('page-{0}' -f ($script:Calls + 1)) }
+        }
+        try { GetResorceConsumption }
+        finally { $script:ConsumptionMaxPages = 0 }
+        Should -Invoke Get-UsageAggregates -Times 2 -Exactly
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'the limit of 2 usage pages'
+    }
+
+    It 'stops a subscription whose page token comes back, and reports it incomplete' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Calls = 0
+        Mock Get-UsageAggregates {
+            $script:Calls++
+            if ($script:Calls -gt 50) { throw 'stand-in: the pages did not stop' }
+            # page-2, page-3, then page-2 again
+            $Next = @('page-2', 'page-3', 'page-2')[[math]::Min($script:Calls - 1, 2)]
+            [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $Next }
+        }
+        GetResorceConsumption
+        Should -Invoke Get-UsageAggregates -Times 3 -Exactly
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'gave a page token it had already given'
+        $Global:ConsumptionFailedSubs[0].PageAtFailure | Should -Be 3
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be 3
     }
 
     It 'does not say a -ResourceGroup run cannot filter consumption by resource group, since it does' {
