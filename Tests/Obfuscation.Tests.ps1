@@ -901,9 +901,8 @@ Describe "Obfuscation Determinism" {
 # 19. Tag tokenization: keys kept, values masked, determinism,
 #     and the mixed-case tag-key regression.
 #
-# The ZIP-content VM Tags test (above) and the TagMap determinism test
-# are the
-# authoritative checks WHEN the fixture carries tagged resources. They are
+# The ZIP-content VM Tags test (above) and the TagMap determinism test are
+# the authoritative checks WHEN the fixture carries tagged resources. They are
 # DATA-DEPENDENT: this fixture's in-scope resources carried no tags, so TagMap
 # is empty (those blocks skip) and the VM Tags loop has no rows to assert
 # against (documented fixture limitation: the dictionary is NOT fabricated).
@@ -918,15 +917,16 @@ Describe "Obfuscation Determinism" {
 #      the same value yields the same token, and the structured Tags is NOT
 #      nulled/dropped.
 #   2. A SOURCE-AUDIT regression that genuinely fails if the lowercase /
-#      case-sensitive tag scrub bug were reintroduced into ResourceInventory.ps1
-#      The malformed-row scrub must clear BOTH the 'tags' and 'Tags' key
+#      case-sensitive tag scrub bug were reintroduced into ResourceInventory.ps1:
+#      the malformed-row scrub must clear BOTH the 'tags' and 'Tags' key
 #      variants (case-insensitive), the structured-tag obfuscation must be
 #      guarded by ContainsKey('Tags') and reassign only $tag.Value, and
 #      $tag.Name must never be reassigned (key kept verbatim).
 # ============================================================
 Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
     BeforeAll {
-        $script:TagTokenPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        # Letter for letter ((?-i:...)): tokens are written in lower case.
+        $script:TagTokenPattern = '^(?-i:(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
         $script:RiSourcePath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'ResourceInventory.ps1'
     }
 
@@ -945,16 +945,16 @@ Describe "Tag Tokenization: keys kept, values masked, mixed-case regression" {
 
         script:Invoke-TagObfuscation -ResourceItem $ResourceItem -TagValueDictionary $Dict
 
-        # 4.5: structured Tags survives (not nulled / not dropped by a scrub)
+        # The structured Tags survives (not nulled / not dropped by a scrub)
         $ResourceItem.Tags | Should -Not -BeNullOrEmpty -Because "structured Tags must survive tokenization, not be nulled"
         @($ResourceItem.Tags).Count | Should -Be 3 -Because "no tag row may be dropped by a mixed-case scrub"
 
         $ExpectedKeys = @('Environment', 'CostCenter', 'Owner')
         for ($i = 0; $i -lt 3; $i++)
         {
-            # 4.1: key kept verbatim, including its original mixed casing
+            # The key is kept verbatim, including its original mixed casing
             $ResourceItem.Tags[$i].Name  | Should -BeExactly $ExpectedKeys[$i] -Because "tag KEY '$($ExpectedKeys[$i])' must be preserved verbatim, casing intact"
-            # 4.2: value replaced with a prod_/nonprod_ token
+            # The value is replaced with a prod_/nonprod_ token
             $ResourceItem.Tags[$i].Value | Should -Match $script:TagTokenPattern -Because "tag VALUE must be a prod_/nonprod_ token, not raw"
         }
     }
