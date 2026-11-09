@@ -2575,6 +2575,15 @@ exit 1
         @($Run.Text | Where-Object { $_ -like 'Re-run with -Resume*' -or $_ -like 'Or re-run with -ResumeFailedOnly*' }) | Should -BeNullOrEmpty -Because $Text
     }
 
+    It 'ends a stream whose subscription''s consumption is incomplete with that count, not as all succeeded' {
+        script:Use-WrapperCase
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id)
+        $Run = script:Invoke-WrapperRun -Streams 2
+        $Text = $Run.Text -join "`n"
+        @($Run.Text | Where-Object { $_ -match '^\[stream-\d+\] complete: 0/1 succeeded, 0 failed, 1 with incomplete consumption$' }).Count | Should -Be 1 -Because $Text
+        @($Run.Text | Where-Object { $_ -match '^\[stream-\d+\] complete: 1/1 succeeded, 0 failed$' }).Count | Should -Be 1 -Because $Text
+    }
+
     It 'counts each subscription of one stream whose consumption was skipped for the sign-in' {
         script:Use-WrapperCase
         $SubC = @{ Id = 'sub-c'; Name = 'Sub C' }

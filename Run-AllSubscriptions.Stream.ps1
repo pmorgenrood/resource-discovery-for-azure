@@ -190,6 +190,9 @@ $ResourceCounts = @()
 # overload resolution against an empty PowerShell array argument.
 $Completed = @($CompletedIds)
 $FailedSubs = @()
+# Subscriptions of this stream whose consumption failed or stopped part-way (they
+# are not completed, and not in FailedSubs, since their report was written).
+$ConsumptionIncompleteIds = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -267,6 +270,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
             $Completed = @($Completed | Where-Object { $_ -ne $SubId })
             $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason ('consumption incomplete: {0}' -f [string]$NewConsumptionFailures[0].Message)
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts
+            if ($ConsumptionIncompleteIds -notcontains $SubId) { $ConsumptionIncompleteIds += $SubId }
         }
         elseif (-not ($Completed -contains $SubId))
         {
@@ -349,7 +353,7 @@ $CollectorFailures = if ($null -ne $Global:CollectorFailures) { @($Global:Collec
 $Summary = [pscustomobject]@{
     StreamId               = $StreamId
     Tenant                 = $TenantID
-    Status                 = if ($FailedSubs.Count -eq 0) { 'ok' } else { 'partial-failure' }
+    Status                 = if ($FailedSubs.Count -eq 0 -and $ConsumptionIncompleteIds.Count -eq 0) { 'ok' } else { 'partial-failure' }
     SubsProcessed          = $PairCount
     Completed              = @($Completed)
     Failed                 = $FailedSubs
@@ -373,5 +377,12 @@ catch
     exit 1
 }
 
-Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $Completed.Count, $PairCount, $FailedSubs.Count) 'Green'
+if ($ConsumptionIncompleteIds.Count -gt 0)
+{
+    Write-Stream ("complete: {0}/{1} succeeded, {2} failed, {3} with incomplete consumption" -f $Completed.Count, $PairCount, $FailedSubs.Count, $ConsumptionIncompleteIds.Count) 'Yellow'
+}
+else
+{
+    Write-Stream ("complete: {0}/{1} succeeded, {2} failed" -f $Completed.Count, $PairCount, $FailedSubs.Count) 'Green'
+}
 exit 0
