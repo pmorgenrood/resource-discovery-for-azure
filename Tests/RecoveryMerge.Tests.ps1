@@ -1025,11 +1025,13 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'the stop comes before anything is written'
     }
 
-    It 'stops when a masked id keeps a real parent name in its <Where> (<Case>)' -ForEach @(
-        @{ Where = 'consumption ResourceId'; Case = 'a SQL database under a real server'; Path = 'microsoft.sql/servers/sql-real/databases/prod_{0}' },
-        @{ Where = 'consumption ResourceId'; Case = 'a scale set VM under a real scale set'; Path = 'microsoft.compute/virtualmachinescalesets/vmss-real/virtualmachines/prod_{0}' },
-        @{ Where = 'inventory ID'; Case = 'an elastic pool under a real server'; Path = 'microsoft.sql/servers/sql-real/elasticpools/prod_{0}' },
-        @{ Where = 'metric ID'; Case = 'a resource under a real parent behind a nested provider'; Path = 'microsoft.compute/virtualmachines/vm-real/providers/microsoft.insights/diagnosticsettings/prod_{0}' }
+    # Parent names are not checked: this base's masked run keeps them real
+    # (see the pass test below), so only a real last name stops the merge.
+    It 'stops when a masked id keeps a real last name in its <Where> (<Case>)' -ForEach @(
+        @{ Where = 'consumption ResourceId'; Case = 'a SQL database with a real name'; Path = 'microsoft.sql/servers/prod_{0}/databases/db-real' },
+        @{ Where = 'consumption ResourceId'; Case = 'a scale set VM with a real name'; Path = 'microsoft.compute/virtualmachinescalesets/prod_{0}/virtualmachines/vm-real' },
+        @{ Where = 'inventory ID'; Case = 'an elastic pool with a real name'; Path = 'microsoft.sql/servers/prod_{0}/elasticpools/pool-real' },
+        @{ Where = 'metric ID'; Case = 'a resource with a real name behind a nested provider'; Path = 'microsoft.compute/virtualmachines/prod_{0}/providers/microsoft.insights/diagnosticsettings/diag-real' }
     ) {
         $C = New-Case
         $Masked = Get-MaskedBundleData -Count 3
@@ -1058,6 +1060,37 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         $Message | Should -BeLike '*masked merge, but in the * bundle*not masked*Nothing was written*'
         $Message | Should -Not -BeLike '*-real*' -Because 'the error names the file and record, never the value'
         Test-Path -LiteralPath $C.Output | Should -BeFalse
+    }
+
+    It 'merges child ids masked the way this base''s masked run masks them, with parent names kept real (<Case>)' -ForEach @(
+        @{ Case = 'a SQL database under a server'; Real = 'Microsoft.Sql/servers/sqlserver01/databases/db01' },
+        @{ Case = 'an elastic pool under a server'; Real = 'Microsoft.Sql/servers/sqlserver01/elasticPools/pool01' },
+        @{ Case = 'a scale set VM'; Real = 'Microsoft.Compute/virtualMachineScaleSets/vmss01/virtualMachines/0' },
+        @{ Case = 'a resource behind a nested provider'; Real = 'Microsoft.Compute/virtualMachines/vm01/providers/Microsoft.Insights/diagnosticSettings/diag01' }
+    ) {
+        $C = New-Case
+        $Masked = Get-MaskedBundleData -Count 3
+        $Seeded = Get-MaskedBundleData -Count 2 -Seed $Masked
+        $RealId = '/subscriptions/{0}/resourceGroups/rg-app/providers/{1}' -f $script:DocsGuid, $Real
+        $NameToken = 'prod_' + [guid]::NewGuid().ToString()
+        # The same -replace steps ResourceInventory.ps1 uses to mask an inventory ID:
+        # subscription and resource group tokens swapped in, then only the last segment.
+        $MaskedId = $RealId -replace '(?i)/subscriptions/[^/]+', ('/subscriptions/' + $Masked.Sub)
+        if ($MaskedId -match '(?i)/resourcegroups/[^/]+') { $MaskedId = $MaskedId -replace '(?i)/resourcegroups/[^/]+', ('/resourcegroups/' + $Masked.Rg) }
+        $MaskedId = $MaskedId -replace '/[^/]+$', ('/' + $NameToken)
+        $Seeded.Dictionary.ResourceIdMap[$MaskedId] = $RealId
+        $Seeded.Dictionary.ResourceNameMap[$NameToken] = ($Real -split '/')[-1]
+        $Csv = "$script:CsvHeader`n{},SQL Database,m1,vCore,eastus,db,1,Hours,2026-01-01,2026-01-02,$MaskedId,eastus,,,"
+        $Metrics = @{ Metrics = @((New-MetricRecord -Id $MaskedId -Name $NameToken)) } | ConvertTo-Json -Depth 5 -Compress
+        $RecRecords = @($Seeded.Records) + @([ordered]@{ Name = $NameToken; Subscription = $Masked.Sub; ResourceGroup = $Masked.Rg; Location = 'eastus'; ID = $MaskedId })
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VMDisk = $Masked.Records }) -ConsumptionCsv $Csv -Dictionary $Masked.Dictionary
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; SQLDB = $RecRecords }) -MetricsFiles @{ '__0' = $Metrics } -Dictionary $Seeded.Dictionary
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverMetrics -WarningAction SilentlyContinue
+
+        Test-Path -LiteralPath $Result.OutputZip | Should -BeTrue
+        $Merged = Get-Content -LiteralPath $Result.OutputInventory -Raw | ConvertFrom-Json
+        @($Merged.SQLDB.ID) | Should -Contain $MaskedId
     }
 
     It 'merges masked nested ids whose every name is a token, and the flat forms this tool writes today' {
