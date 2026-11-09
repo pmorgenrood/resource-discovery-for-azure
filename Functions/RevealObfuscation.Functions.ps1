@@ -109,10 +109,13 @@ function Set-RevealOwnerOnlyDirectory
         # PowerShell 7.0 and 7.1 run on .NET before 7, which has no Unix mode
         # calls. Use the plain chmod form every Unix has, and read the mode
         # back with the stat of this system: BSD stat on macOS, GNU stat on
-        # Linux.
-        & chmod 700 -- $Path
+        # Linux. No '--' before the path: macOS chmod and stat take it as a
+        # file name and fail. The path is made a full path first, so it starts
+        # with '/' and cannot be read as an option.
+        $Path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        & chmod 700 $Path
         if ($LASTEXITCODE -ne 0) { throw "Could not make $Path readable by its owner only (chmod ended with $LASTEXITCODE)." }
-        $Text = if (Test-RevealIsMacOS) { & stat -f '%Lp' -- $Path } else { & stat -c '%a' -- $Path }
+        $Text = if (Test-RevealIsMacOS) { & stat -f '%Lp' $Path } else { & stat -c '%a' $Path }
         if ($LASTEXITCODE -ne 0) { throw "Could not read the mode of $Path (stat ended with $LASTEXITCODE)." }
         $Mode = [Convert]::ToInt32(([string]$Text).Trim(), 8)
     }
