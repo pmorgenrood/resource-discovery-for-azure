@@ -184,6 +184,47 @@ Describe 'Diagnostics log: metrics incomplete apart from metrics auth-skipped' {
         $Lines[$IncompleteAt + 2] | Should -Be ''
     }
 
+    It 'counts only its own subscription''s collector failures and consumption entries when earlier subscriptions left theirs' {
+        $Global:MetricsFailedSubs = @()
+        $Global:CollectorFailures = @(
+            [pscustomobject]@{ Id = 'sub-a'; Module = 'Compute'; Message = 'earlier failure' }
+            [pscustomobject]@{ Id = 'SUB-B'; Module = 'Network'; Message = 'own failure' }
+        )
+        $Global:ConsumptionFailedSubs = @(
+            [pscustomobject]@{ Name = 'sub-a'; Id = 'sub-a'; Message = 'earlier consumption gap'; Complete = $false }
+            [pscustomobject]@{ Name = 'sub-b'; Id = 'sub-b'; Message = 'own consumption gap'; Complete = $false }
+            # A run-wide entry carries no subscription id, so it is kept.
+            [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'consumption skipped for the sign-in' }
+        )
+        $DiagDir = Join-Path $TestDrive 'diagnostics-own-collectors'
+        New-Item -ItemType Directory -Path $DiagDir -Force | Out-Null
+
+        $DiagFile = Write-RdaShareableDiagnosticsLog -DefaultPath ($DiagDir + [IO.Path]::DirectorySeparatorChar) -ReportName 'ResourcesReport' -RunDateTime '20261109000000001' -Version '0.0.0' -PhaseTimings $null -SubscriptionID 'sub-b' 6>$null
+        $DiagFile | Should -Not -BeNullOrEmpty
+        $Lines = @(Get-Content -LiteralPath $DiagFile)
+
+        $CollectorAt = [array]::IndexOf($Lines, 'Collector failures: 1')
+        $CollectorAt | Should -BeGreaterOrEqual 0
+        $Lines[$CollectorAt + 1] | Should -Be '  [sub SUB-B] Network: own failure'
+        $ConsumptionAt = [array]::IndexOf($Lines, 'Consumption failed/incomplete subscriptions: 2')
+        $ConsumptionAt | Should -BeGreaterOrEqual 0
+        @($Lines[($ConsumptionAt + 1)..($ConsumptionAt + 2)]) | Should -Be @('  [sub sub-b] own consumption gap', '  [sub (auth)] consumption skipped for the sign-in')
+        ($Lines -join "`n") | Should -Not -Match 'earlier'
+    }
+
+    It 'counts every subscription''s collector failures and consumption entries for a run over all of them' {
+        $Global:MetricsFailedSubs = @()
+        $Global:CollectorFailures = @([pscustomobject]@{ Id = 'sub-a'; Module = 'Compute'; Message = 'a failure' }, [pscustomobject]@{ Id = 'sub-b'; Module = 'Network'; Message = 'b failure' })
+        $Global:ConsumptionFailedSubs = @([pscustomobject]@{ Name = 'sub-a'; Id = 'sub-a'; Message = 'a gap'; Complete = $false })
+        $DiagDir = Join-Path $TestDrive 'diagnostics-all-collectors'
+        New-Item -ItemType Directory -Path $DiagDir -Force | Out-Null
+
+        $DiagFile = Write-RdaShareableDiagnosticsLog -DefaultPath ($DiagDir + [IO.Path]::DirectorySeparatorChar) -ReportName 'ResourcesReport' -RunDateTime '20261109000000002' -Version '0.0.0' -PhaseTimings $null 6>$null
+        $Lines = @(Get-Content -LiteralPath $DiagFile)
+        $Lines | Should -Contain 'Collector failures: 2'
+        $Lines | Should -Contain 'Consumption failed/incomplete subscriptions: 1'
+    }
+
     It 'is given the subscription of the report by both calls in ResourceInventory.ps1' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
         $Calls = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Write-RdaShareableDiagnosticsLog' }, $true))

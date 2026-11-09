@@ -243,10 +243,10 @@ function Write-RdaShareableDiagnosticsLog
         [string]$Version,
         $PhaseTimings,
         [switch]$Obfuscated,
-        # The subscription of this report. Under -RunAllSubs the metrics entries
-        # of the earlier subscriptions of the run are still in
-        # $Global:MetricsFailedSubs, so only this one's are counted. Empty for a
-        # run over every subscription, which counts them all.
+        # The subscription of this report. Under -RunAllSubs the metrics,
+        # collector and consumption entries of the earlier subscriptions of the
+        # run are still in the globals, so only this one's are counted. Empty
+        # for a run over every subscription, which counts them all.
         [string]$SubscriptionID
     )
 
@@ -318,7 +318,16 @@ function Write-RdaShareableDiagnosticsLog
         # ResourceInventory.ps1 run they can be $null, and @($null) is a ONE-element
         # array (the single $null) that would otherwise render a phantom "failure"
         # line. Filtering nulls yields a genuine "0" when there were none.
-        $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ })
+        # Under -RunAllSubs the earlier subscriptions' collector failures and
+        # consumption entries are still in the globals too, so an entry that
+        # carries another subscription's id is left out. An entry with no id or a
+        # run-wide label such as '(auth)' is kept.
+        $IsThisSub = {
+            param($Entry)
+            $EntryId = [string]$Entry.Id
+            [string]::IsNullOrEmpty($SubscriptionID) -or [string]::IsNullOrEmpty($EntryId) -or $EntryId.StartsWith('(') -or $EntryId -eq $SubscriptionID
+        }
+        $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ -and (& $IsThisSub $_) })
         # Metrics skipped for the sign-in, and metrics left incomplete because Azure
         # Monitor kept failing, each with its own count. An entry is incomplete when
         # it has a Complete property equal to $false; it is told apart here so this
@@ -326,7 +335,7 @@ function Write-RdaShareableDiagnosticsLog
         $MetricsEntries = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or [string]$_.Id -eq $SubscriptionID) })
         $MetricsSkips = @($MetricsEntries | Where-Object { -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
         $MetricsIncomplete = @($MetricsEntries | Where-Object { $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
-        $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+        $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and (& $IsThisSub $_) })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()
         if ($Obfuscated)
