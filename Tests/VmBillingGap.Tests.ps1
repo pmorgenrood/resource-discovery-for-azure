@@ -270,7 +270,8 @@ Describe 'VM billing-coverage banner' {
         $Inv = [pscustomobject]@{ VirtualMachines = @(
                 [pscustomobject]@{ ID = $Ids[0]; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
                 [pscustomobject]@{ ID = $Ids[1]; Name = 'vm2'; Subscription = 'sub'; PowerState = 'vm running' }
-                [pscustomobject]@{ ID = $Ids[2]; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' }) }
+                [pscustomobject]@{ ID = $Ids[2]; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' })
+        }
         $InvPath = Join-Path $script:WorkDir 'inv-swapped.json'
         $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-swapped.csv'
@@ -289,7 +290,8 @@ Describe 'VM billing-coverage banner' {
         $Set = $Sub + '/virtualmachinescalesets/set1'
         $Inv = [pscustomobject]@{ VirtualMachines = @(
                 [pscustomobject]@{ ID = $Sub + '/virtualmachines/vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
-                [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_0'; Set = $Set; Name = 'set1_0'; Subscription = 'sub'; PowerState = 'vm running' }) }
+                [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_0'; Set = $Set; Name = 'set1_0'; Subscription = 'sub'; PowerState = 'vm running' })
+        }
         $InvPath = Join-Path $script:WorkDir 'inv-vmss.json'
         $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-vmss.csv'
@@ -306,7 +308,8 @@ Describe 'VM billing-coverage banner' {
         $Inv = [pscustomobject]@{ VirtualMachines = @(
                 [pscustomobject]@{ ID = $Sub + '/virtualmachines/vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
                 [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_0'; Set = $Set; Name = 'set1_0'; Subscription = 'sub'; PowerState = 'vm running' }
-                [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_1'; Set = $Set; Name = 'set1_1'; Subscription = 'sub'; PowerState = 'vm running' }) }
+                [pscustomobject]@{ ID = $Set + '/virtualmachines/set1_1'; Set = $Set; Name = 'set1_1'; Subscription = 'sub'; PowerState = 'vm running' })
+        }
         $InvPath = Join-Path $script:WorkDir 'inv-vmss2.json'
         $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-vmss2.csv'
@@ -321,7 +324,8 @@ Describe 'VM billing-coverage banner' {
         $Sub = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg/providers/microsoft.compute/virtualmachines/'
         $Inv = [pscustomobject]@{ VirtualMachines = @(
                 [pscustomobject]@{ ID = $Sub + 'vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm running' }
-                [pscustomobject]@{ ID = $Sub + 'vm2'; Name = 'vm2'; Subscription = 'sub'; PowerState = 'vm running' }) }
+                [pscustomobject]@{ ID = $Sub + 'vm2'; Name = 'vm2'; Subscription = 'sub'; PowerState = 'vm running' })
+        }
         $InvPath = Join-Path $script:WorkDir 'inv-zero.json'
         $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-zero.csv'
@@ -349,7 +353,8 @@ Describe 'VM billing-coverage banner' {
         $Inv = [pscustomobject]@{ VirtualMachines = @(
                 [pscustomobject]@{ ID = $Sub + 'vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm starting (transient)' }
                 [pscustomobject]@{ ID = $Sub + 'vm2'; Name = 'vm2'; Subscription = 'sub'; PowerState = '' }
-                [pscustomobject]@{ ID = $Sub + 'vm3'; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' }) }
+                [pscustomobject]@{ ID = $Sub + 'vm3'; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' })
+        }
         $InvPath = Join-Path $script:WorkDir 'inv-states.json'
         $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
         $Csv = Join-Path $script:WorkDir 'cons-states.csv'
