@@ -149,7 +149,8 @@ function Get-AzMetric
         'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource was not found.', $null, [System.Net.HttpStatusCode]::NotFound) }
         # A 404 whose message also holds text the loose throttle match would meet ('429').
         'NotFoundWith429Text' { throw "Operation returned an invalid status code 'NotFound' for request 4291" }
-        # A 5xx that quotes a 404, and a 5xx that wraps one: the status code decides, so both keep their retries.
+        # A 5xx that quotes a 404 keeps its retries: its status code decides over the text.
+        # A 5xx that wraps a 404 is a 404: a client status anywhere in the chain wins over a 5xx wrapper.
         'Status503WithNotFoundText' { throw [System.Net.Http.HttpRequestException]::new("upstream: Operation returned an invalid status code 'NotFound'", $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
         'Status500Wrapping404' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound), [System.Net.HttpStatusCode]::InternalServerError) }
     }
@@ -776,7 +777,7 @@ Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
         $Global:DefaultPath = $script:OriginalDefaultPath
     }
 
-    It 'makes 1 attempt, not 4, for a single-metric request that fails with <SingleError>' -ForEach @(@{ SingleError = 'NotFound' }, @{ SingleError = 'Status404' }, @{ SingleError = 'NotFoundWith429Text' }) {
+    It 'makes 1 attempt, not 4, for a single-metric request that fails with <SingleError>' -ForEach @(@{ SingleError = 'NotFound' }, @{ SingleError = 'Status404' }, @{ SingleError = 'NotFoundWith429Text' }, @{ SingleError = 'Status500Wrapping404' }) {
         # The VM's two metrics are requested one at a time.
         $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-single-' + $SingleError) -SingleError $SingleError
 
@@ -844,7 +845,7 @@ Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
         @($Run.DebugLines | Where-Object { $_ -match 'being deleted' }).Count | Should -Be 0
     }
 
-    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }, @{ SingleError = 'Status503WithNotFoundText'; Calls = 8 }, @{ SingleError = 'Status500Wrapping404'; Calls = 8 }) {
+    It 'keeps the retries of a <SingleError> single-metric request' -ForEach @(@{ SingleError = 'Throttled'; Calls = 14 }, @{ SingleError = 'ServiceUnavailable'; Calls = 8 }, @{ SingleError = 'Status503WithNotFoundText'; Calls = 8 }) {
         $Run = Invoke-MetricsRun -Resources @($script:NotFoundVm) -RunName ('notfound-kept-' + $SingleError) -SingleError $SingleError
 
         $Run.Calls.Count | Should -Be $Calls
