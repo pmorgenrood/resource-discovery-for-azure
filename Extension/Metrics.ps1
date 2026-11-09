@@ -5,7 +5,7 @@ param(
     $Task, # String tracking the script task mode (e.g., 'Processing')
     [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6, # Number of concurrent threads allowed to run simultaneously
     $FilePath, # Root destination directory path for saving JSON data chunks
-    $ResourceIdDictionary, # Map dictionary to replace original Resource IDs with obfuscated GUID values
+    $ResourceIdDictionary, # Map from each original resource id to its masked ARM-shaped id (/subscriptions/<token>/resourcegroups/<token>/providers/<type>/<token>)
     $ResourceNameDictionary, # Map dictionary to mask the actual human-readable names of the items
     [Alias('ResourceSubscriptionDictionary')]$ResourceSubDictionary, # Map dictionary to obfuscate subscription names
     [Alias('ResourceResourceGroupDictionary')]$ResourceGroupDictionary, # Map dictionary to obfuscate resource group names
