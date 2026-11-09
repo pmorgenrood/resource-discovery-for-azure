@@ -90,7 +90,7 @@ Describe 'Reveal under <Culture>' -ForEach $script:Cultures -Skip:$IsWindows {
 
         It 'ends with exit 0 and no failed folder' {
             $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
-            $script:Run.Text | Should -Match 'Failed during reveal\s+: 0'
+            $script:Run.Text | Should -Match 'Failed \(see FAIL lines\)\s+: 0'
             $script:Run.Text | Should -Not -Match 'FAIL: '
         }
 

@@ -138,7 +138,7 @@ Describe 'Reveal.ps1 -Fields Tag over every folder, a subscription with no tags'
         $Run = Invoke-RevealAll -Name 'notags' -Folders @(@{ Name = 'good'; RgToken = $script:Token }) -Extra @('-Fields', 'Tag')
 
         $Run.Exit | Should -Be 0 -Because $Run.Text
-        $Run.Text | Should -Match 'Failed during reveal\s+: 0'
+        $Run.Text | Should -Match 'Failed \(see FAIL lines\)\s+: 0'
         $Run.Text | Should -Not -Match 'FAIL: '
         Get-ZipText (Join-Path $Run.Staging 'ResourcesReport_good.zip') | Should -Be $script:Text
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($Run.Bundle)
