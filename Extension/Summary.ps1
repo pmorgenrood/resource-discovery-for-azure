@@ -165,7 +165,7 @@ if ($Samples.Count -gt 0)
 # same string. Only a masked report whose ids never meet (an older or broken
 # mask), or one with a running VM without an ID, is compared by counts.
 $VmBilling = $null
-if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $ConsumptionFile -PathType Leaf))
+if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -LiteralPath $ConsumptionFile -PathType Leaf))
 {
     $RunningVmCount = 0
     $RunningVms = @()
@@ -194,7 +194,7 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
         # The set ignores case, as Sort-Object -Unique does.
         $ConsumptionRowCount = 0
         $BilledVmIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        Import-Csv -Path $ConsumptionFile -ErrorAction Stop | ForEach-Object {
+        Import-Csv -LiteralPath $ConsumptionFile -ErrorAction Stop | ForEach-Object {
             $ConsumptionRowCount++
             # Import-Csv reads an empty field as '', not $null: a row without a
             # ResourceId names no VM.
