@@ -119,15 +119,18 @@ Describe "Obfuscated ID Uniqueness" {
     # resource's id (a container cluster per node pool, an availability set
     # per member VM), so an id may repeat within a section. Two different
     # resources must never share a masked id: rows of one id in a section
-    # share one Name, ResourceGroup and Subscription, and one id belongs to one
-    # section.
+    # share one Name, ResourceGroup, Subscription and parent, and one id
+    # belongs to one section.
     It "Rows that share a masked ID in a section are rows of one resource" {
         foreach ($Section in @($script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' }))
         {
             $Groups = @(@($Section.Value) | Where-Object { $null -ne $_ -and $null -ne $_.ID } | Group-Object -Property ID | Where-Object { $_.Count -gt 1 })
             foreach ($G in $Groups)
             {
-                @($G.Group | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.ResourceGroup, $_.Subscription } | Select-Object -Unique).Count | Should -Be 1 -Because "rows of masked id '$($G.Name)' in $($Section.Name) are one resource, so they share one Name, ResourceGroup and Subscription"
+                # A child resource also names its parent (a database its server,
+                # a volume its account and pool), and two children of one name
+                # under two parents are two resources.
+                @($G.Group | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $_.Name, $_.ResourceGroup, $_.Subscription, $_.DatabaseServer, $_.ManagedInstance, $_.ParentVirtualMachine, $_.NetAppAccount, $_.CapacityPool } | Select-Object -Unique).Count | Should -Be 1 -Because "rows of masked id '$($G.Name)' in $($Section.Name) are one resource, so they share one name, group, subscription and parent"
             }
         }
     }
