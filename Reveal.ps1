@@ -515,6 +515,9 @@ catch [System.IO.IOException]
 # released however the run stops: a refusal, a failure, any terminating
 # error or Ctrl+C. Without it a stopped run would leave the lock open in the
 # caller's session, and the next run there would be refused as "in use".
+# The reveal jobs in flight, set here so the finally below never reads a
+# variable of that name from the caller's session.
+$Running = [System.Collections.Generic.List[object]]::new()
 try
 {
     # Release the lock and remove the lock file this run made (so a folder Reveal
@@ -1308,6 +1311,26 @@ try
 }
 finally
 {
+    # A run stopped while reveals are in flight (Ctrl+C, or a terminating
+    # error in the loop) leaves their jobs running: a job's child process
+    # outlives the stopped pipeline. So, while the lock is still held, stop
+    # and remove each job left in $Running, and remove its expanded copy and
+    # any output or partial file it wrote that the mark does not record as
+    # finished. Otherwise the next run could take the lock while a child still
+    # writes into staging. A job already reaped is in $Running only when the
+    # run stopped while reaping it; its finished output is recorded and kept.
+    foreach ($R in @($Running))
+    {
+        if ($null -eq $R) { continue }
+        try { Stop-Job -Job $R.Job -ErrorAction SilentlyContinue } catch { $null = $_ }
+        try { Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
+        Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $StagingOutputs.Contains($R.Item.OutName))
+        {
+            Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
+    }
     # The run is done with staging: release its lock (the lock file stays,
     # holding no lock, unless staging was removed).
     if ($null -ne $StagingLock) { $StagingLock.Dispose() }
