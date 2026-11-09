@@ -518,8 +518,11 @@ function Select-OneSubscription
         [Parameter(Mandatory = $true)][string]$SubscriptionID,
         [bool]$IncludeDisabled,
         [string]$Tenant,
-        [string[]]$ListingProblems = @()
+        [string[]]$ListingProblems = @(),
+        # A -PreflightOnly check: the stop lines do not speak of a run.
+        [switch]$Preflight
     )
+    $Stopped = if ($Preflight) { '' } else { ', so this run stopped before collecting anything (exit 1)' }
     $Lines = [System.Collections.Generic.List[object]]::new()
     $Say = { param([string]$Text, [string]$Colour) $Lines.Add([pscustomobject]@{ Text = $Text; Colour = $Colour }) }
     $All = @($Subscriptions | Where-Object { $null -ne $_ })
@@ -527,7 +530,7 @@ function Select-OneSubscription
     $Problems = @($ListingProblems | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($Match.Count -eq 0)
     {
-        & $Say ("ERROR: -SubscriptionID {0} is not among the {1} subscription(s) Get-AzSubscription lists for tenant {2}, so this run stopped before collecting anything (exit 1)." -f $SubscriptionID, $All.Count, $Tenant) 'Red'
+        & $Say ("ERROR: -SubscriptionID {0} is not among the {1} subscription(s) Get-AzSubscription lists for tenant {2}{3}." -f $SubscriptionID, $All.Count, $Tenant, $Stopped) 'Red'
         if ($Problems.Count -gt 0)
         {
             & $Say '  The list came back with warnings, so it may be incomplete:' 'Red'
@@ -543,7 +546,7 @@ function Select-OneSubscription
     $Sub = $Match[0]
     if (-not $IncludeDisabled -and [string]$Sub.State -ne 'Enabled')
     {
-        & $Say ("ERROR: Subscription {0} ({1}) is {2}, not Enabled, so this run stopped before collecting anything (exit 1). A subscription that is not Enabled returns little or no data." -f $Sub.Name, $Sub.Id, $(if ([string]::IsNullOrWhiteSpace([string]$Sub.State)) { 'in no state' } else { [string]$Sub.State })) 'Red'
+        & $Say ("ERROR: Subscription {0} ({1}) is {2}, not Enabled{3}. A subscription that is not Enabled returns little or no data." -f $Sub.Name, $Sub.Id, $(if ([string]::IsNullOrWhiteSpace([string]$Sub.State)) { 'in no state' } else { [string]$Sub.State }), $Stopped) 'Red'
         & $Say '  Next: to collect it anyway, run the same command with -IncludeDisabled.' 'Yellow'
         return [pscustomobject]@{ Subscription = $null; Stop = $true; Lines = $Lines.ToArray() }
     }

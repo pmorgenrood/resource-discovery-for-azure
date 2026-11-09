@@ -823,9 +823,8 @@ if ($AllSubscriptions.Count -eq 0)
 if ($OneSubscription)
 {
     $script:PreflightCheck = 'the subscription'
-    $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @($SubWarnings | Where-Object { $_ } | ForEach-Object { [string]$_ })
-    # The pick's lines speak of a run; a preflight only stops its check.
-    foreach ($Line in @($OnePick.Lines)) { Write-Host $(if ($PreflightOnly) { $Line.Text -replace ', so this run stopped before collecting anything \(exit 1\)', '' } else { $Line.Text }) -ForegroundColor $Line.Colour }
+    $OnePick = Select-OneSubscription -Subscriptions $AllSubscriptions -SubscriptionID $SubscriptionID -IncludeDisabled ([bool]$IncludeDisabled) -Tenant $TenantID -ListingProblems @($SubWarnings | Where-Object { $_ } | ForEach-Object { [string]$_ }) -Preflight:$PreflightOnly
+    foreach ($Line in @($OnePick.Lines)) { Write-Host $Line.Text -ForegroundColor $Line.Colour }
     if ($OnePick.Stop)
     {
         # An earlier run of this subscription may have left its own resume

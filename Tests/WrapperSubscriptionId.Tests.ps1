@@ -786,3 +786,19 @@ Describe 'Every resume state read and write of the wrapper uses the run''s own k
         @($Wrong) | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Select-OneSubscription -Preflight' {
+    BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
+
+    It 'words a stop for a preflight without speaking of a run, and for a run as before (<Case>)' -ForEach @(
+        @{ Case = 'not listed'; Subs = @(); Like = 'ERROR: -SubscriptionID * is not among the 0 subscription(s) Get-AzSubscription lists for tenant t' }
+        @{ Case = 'not Enabled'; Subs = @([pscustomobject]@{ Id = '12345678-1234-1234-1234-123456789012'; Name = 'S'; State = 'Disabled' }); Like = 'ERROR: Subscription S (*) is Disabled, not Enabled' }
+    ) {
+        $Pf = Select-OneSubscription -Subscriptions $Subs -SubscriptionID '12345678-1234-1234-1234-123456789012' -Tenant 't' -Preflight
+        $Run = Select-OneSubscription -Subscriptions $Subs -SubscriptionID '12345678-1234-1234-1234-123456789012' -Tenant 't'
+        $Pf.Stop | Should -BeTrue
+        $Pf.Lines[0].Text | Should -BeLike ($Like + '*')
+        $Pf.Lines[0].Text | Should -Not -BeLike '*this run stopped*'
+        $Run.Lines[0].Text | Should -BeLike ($Like + ', so this run stopped before collecting anything (exit 1)*')
+    }
+}
