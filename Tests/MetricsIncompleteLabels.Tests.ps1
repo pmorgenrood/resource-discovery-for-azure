@@ -88,7 +88,10 @@ Describe 'Run-AllSubscriptions.ps1 console summary: metrics incomplete apart fro
         $Text | Should -Match 'Metrics Auth Failures:\s+1 subscription\(s\)'
         $Text | Should -Match 'Metrics Incomplete:\s+2 subscription\(s\)'
         @($Lines | Where-Object { $_ -like '  - sub-a (sub-a)*' }) | Should -Be @('  - sub-a (sub-a)')
-        @($Lines | Where-Object { $_ -like '  - sub-b (sub-b)*' -or $_ -like '  - sub-c (sub-c)*' }) | Should -Be @("  - sub-b (sub-b): $script:IncompleteTwo", "  - sub-c (sub-c): $script:IncompleteOne")
+        # The incomplete ones are listed once, in the FAILED (metrics) lines at
+        # the end of the run, which this count points to.
+        @($Lines | Where-Object { $_ -like '*sub-b*' -or $_ -like '*sub-c*' }).Count | Should -Be 0
+        $Lines | Should -Contain '  Each one, with the command that collects it again, is in FAILED (metrics) at the end of the run.'
     }
 
     It 'prints only the incomplete count when no subscription was skipped for the sign-in' {

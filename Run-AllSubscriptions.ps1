@@ -1966,16 +1966,14 @@ if ($MetricsFailures.Count -gt 0)
 }
 
 # Metrics left incomplete because Azure Monitor kept failing (Complete = $false),
-# with their own count, apart from the sign-in skips above.
+# with their own count, apart from the sign-in skips above. Each one is listed
+# once, in FAILED (metrics) at the end of the run.
 $MetricsIncompleteList = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs)
 if ($MetricsIncompleteList.Count -gt 0)
 {
     Write-Host ""
     Write-Host ("Metrics Incomplete:      {0} subscription(s)" -f $MetricsIncompleteList.Count) -ForegroundColor Yellow
-    foreach ($m in $MetricsIncompleteList)
-    {
-        Write-Host ("  - {0} ({1}): {2}" -f $m.Name, $m.Id, $m.Message) -ForegroundColor Yellow
-    }
+    Write-Host "  Each one, with the command that collects it again, is in FAILED (metrics) at the end of the run." -ForegroundColor Yellow
     Write-Host "  Note: the failed metrics are in the output report with MetricError set." -ForegroundColor Yellow
     Write-Host ""
 }
