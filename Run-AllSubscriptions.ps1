@@ -1504,7 +1504,9 @@ if ($ParallelStreams -le 1)
             try { $DiagLines | Out-File -FilePath $DiagFile -Append -Encoding utf8 }
             catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
 
-            $FailedSubscriptions += $Sub.Name
+            # By name and id: two subscriptions can share a display name. (An
+            # obfuscated run names none of them outside the console.)
+            $FailedSubscriptions += ('{0} ({1})' -f $Sub.Name, $Sub.Id)
             # A failed attempt ends an earlier run's completion of this sub: take
             # it off the completed list and drop its report record, so a later
             # -Resume collects it again instead of skipping it and carrying the
@@ -1665,7 +1667,9 @@ else
                 }
                 try { $DiagLines | Out-File -FilePath $DiagFile -Append -Encoding utf8 }
                 catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
-                $FailedSubscriptions += $Sub.Name
+                # By name and id: two subscriptions can share a display name. (An
+                # obfuscated run names none of them outside the console.)
+                $FailedSubscriptions += ('{0} ({1})' -f $Sub.Name, $Sub.Id)
                 # Same as the sequential branch: a failed attempt takes the sub
                 # off the completed list and drops its report record.
                 if ($CompletedIds -contains $Sub.Id)
@@ -2586,7 +2590,11 @@ if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)
 if ($ConsumptionFailures.Count -gt 0)
 {
     Write-Host ""
-    Write-Host ("Consumption Failures:    {0} subscription(s)" -f $ConsumptionFailures.Count) -ForegroundColor Yellow
+    # The '(auth)' sentinel of a whole-phase skip is not a subscription, so it
+    # is not counted as one.
+    $ConsumptionFailedSubCount = @($ConsumptionFailures | Where-Object { $_.Id -ne '(auth)' } | Sort-Object Name, Id -Unique).Count
+    $ConsumptionFailedLabel = if ($ConsumptionFailedSubCount -gt 0) { '{0} subscription(s)' -f $ConsumptionFailedSubCount } else { 'the billing phase was skipped (sign-in)' }
+    Write-Host ("Consumption Failures:    {0}" -f $ConsumptionFailedLabel) -ForegroundColor Yellow
     # List the affected subscriptions by name so the operator knows exactly
     # which subs are missing billing data (e.g. to go request Reader access
     # on them). Mirrors the metrics-failure block below. Exclude the '(auth)'

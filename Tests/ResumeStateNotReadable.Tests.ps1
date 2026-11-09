@@ -333,6 +333,19 @@ Describe 'The Eligible and Processed counts at the end of a run' -Skip:$IsWindow
     }
 }
 
+Describe 'Failed subscriptions of the same name at the end of a run' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+
+    It 'are listed apart, each with its id (sequential)' {
+        $S1 = @{ Id = 'sub-same-1'; Name = 'Same Name' }
+        $S2 = @{ Id = 'sub-same-2'; Name = 'Same Name' }
+        script:Set-Scenario -Subs $script:A, $S1, $S2 -Fail $S1.Id, $S2.Id
+        $Run = script:Invoke-Wrapper
+        $Run.ExitCode | Should -Be 2
+        @($Run.Text | Where-Object { $_ -like 'Subscriptions Failed:*' }) | Should -Be @('Subscriptions Failed:    2 (Same Name (sub-same-1), Same Name (sub-same-2))')
+    }
+}
+
 Describe 'Two -Resume runs in a row after a not-readable subscription was skipped' -Skip:$IsWindows {
     BeforeAll {
         # Two -Resume runs; each must exit 0 without an access stop, name

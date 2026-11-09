@@ -66,6 +66,15 @@ AfterAll {
 
 Describe 'Run-AllSubscriptions.ps1 end-of-run failure lists with two subscriptions of the same name' {
 
+    It 'Consumption Failures does not count the sign-in skip of the whole phase as a subscription' {
+        Set-Variable -Name ConsumptionCheck -Value $null
+        $Global:ConsumptionRecordCount = 0
+        $Global:ConsumptionFailedSubs = @([pscustomobject]@{ Name = '(all)'; Id = '(auth)'; Message = 'stand-in: no usable context for the billing phase' })
+        $Lines = Invoke-Block $script:ConsumptionText
+        ($Lines -join "`n") | Should -Match 'Consumption Failures:\s+the billing phase was skipped \(sign-in\)'
+        ($Lines -join "`n") | Should -Not -Match '1 subscription\(s\)'
+    }
+
     It 'Consumption Failures lists both on a line each, as its count does' {
         # Set-Variable: only the lifted text reads it.
         Set-Variable -Name ConsumptionCheck -Value $null
