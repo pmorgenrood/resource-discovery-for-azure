@@ -561,6 +561,15 @@ Describe 'Test-AzPsTokenSilent retries a failed token cache check' {
         $script:TokenCalls | Should -Be 2
     }
 
+    It 'does not retry a first request that only warns that the sign-in cannot be used' {
+        $script:TokenCalls = 0
+        # A stand-in, not a mock, so its warning reaches the caller's -WarningVariable
+        # as a real cmdlet's does.
+        function Get-AzAccessToken { [CmdletBinding()] param($TenantId, $ResourceUrl) $script:TokenCalls++; Write-Warning 'Run Connect-AzAccount to login.' }
+        Test-AzPsTokenSilent -Tenant 'tenant-1' | Should -BeFalse
+        $script:TokenCalls | Should -Be 1
+    }
+
     It 'fails at once on a sign-in that cannot be used' {
         $script:TokenCalls = 0
         Mock Get-AzAccessToken { $script:TokenCalls++; throw 'Run Connect-AzAccount to login.' }
