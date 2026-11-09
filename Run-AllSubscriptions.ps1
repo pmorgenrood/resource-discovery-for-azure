@@ -1626,13 +1626,27 @@ else
                     Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
                 }
             }
-            # A subscription a stream recorded as failed and not as completed failed
-            # in this run: its failure wins over a completion an earlier run
-            # recorded, so Merge-FailedAttempts keeps it and -Resume collects it.
-            $StreamFailedIds = @($AllFailedFromStreams | ForEach-Object { [string]$_.Id } | Where-Object { $_ -and $AllCompletedFromStreams -notcontains $_ })
+            # A subscription a stream recorded as failed in this run (its LastFailedAt
+            # is after this run started) failed now: its failure wins over a
+            # completion an earlier run recorded, in the resume state or in a
+            # per-stream file an interrupted run left behind, so Merge-FailedAttempts
+            # keeps it and -Resume collects it.
+            $RunStartOffset = [datetimeoffset]$RunStartTime
+            $StreamFailedIds = @($AllFailedFromStreams | Where-Object {
+                    $At = $null
+                    if ($null -eq $_) { return $false }
+                    if ($_.LastFailedAt -is [datetime]) { $At = [datetimeoffset]$_.LastFailedAt }
+                    else
+                    {
+                        $Parsed = [datetimeoffset]::MinValue
+                        if ([datetimeoffset]::TryParse([string]$_.LastFailedAt, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$Parsed)) { $At = $Parsed }
+                    }
+                    $null -ne $At -and $At -ge $RunStartOffset
+                } | ForEach-Object { [string]$_.Id } | Where-Object { $_ } | Sort-Object -Unique)
             if ($StreamFailedIds.Count -gt 0)
             {
                 $CompletedIds = @($CompletedIds | Where-Object { $StreamFailedIds -notcontains $_ })
+                $AllCompletedFromStreams = @($AllCompletedFromStreams | Where-Object { $StreamFailedIds -notcontains $_ })
             }
             if ($AllCompletedFromStreams.Count -gt 0)
             {

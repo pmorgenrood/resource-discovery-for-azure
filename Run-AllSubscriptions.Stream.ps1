@@ -355,7 +355,9 @@ $Summary = [pscustomobject]@{
     Failed                 = $FailedSubs
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
-    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
+    # Unique by name and id: Select-Object -Unique compares objects by their text,
+    # which is the same for any two of these, so it kept only the first.
+    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Where-Object { $null -ne $_ } | Sort-Object -Property Name, Id, Message -Unique)
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
 }
