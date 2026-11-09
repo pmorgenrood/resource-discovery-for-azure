@@ -1898,9 +1898,9 @@ if ($ZipWritten)
 # request (grouped or for one metric) still failed after its retries
 # (throttling, a timeout, a server error or an error with no status)
 # names each subscription with the command that collects it again, with this
-# run's switches, and exits 3 when its zip was written. Metrics skipped because
-# the sign-in could not be refreshed print a short FAILED (auth) line and also
-# exit 3. A direct run whose zip
+# run's switches, and exits 3 when its zip was written. Metrics or consumption
+# skipped because the sign-in could not be refreshed print a short FAILED
+# (auth) line naming them and also exit 3. A direct run whose zip
 # could not be written exits 2. Under -RunAllSubs the wrapper does this for the
 # whole run; a run there whose zip could not be written exits 2, so the wrapper
 # counts its subscription as failed, and adds its zip path to
@@ -1908,7 +1908,8 @@ if ($ZipWritten)
 # counted or consolidated.
 if (-not $RunAllSubs.IsPresent)
 {
-    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipWritten $ZipWritten -DictionaryFile $Global:DictionaryFile
+    $ConsumptionEntries = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ } | Select-Object -Skip ([int]$script:HealthEntriesAtStart.ConsumptionFailedSubsFrom))
+    $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipWritten $ZipWritten -DictionaryFile $Global:DictionaryFile -ConsumptionEntries $ConsumptionEntries
     if ($DirectRunExitCode -ne 0) { exit $DirectRunExitCode }
 }
 elseif (-not $ZipWritten)

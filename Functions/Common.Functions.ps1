@@ -470,25 +470,31 @@ function Write-MetricsIncompleteRunEnd
 
 # The exit code at the end of a direct ResourceInventory.ps1 run (not under
 # -RunAllSubs, where the wrapper decides): 2 when its report zip was not
-# written ($ZipWritten false, also when a partial zip is left), which wins; 3 when metrics were skipped because the sign-in
+# written ($ZipWritten false, also when a partial zip is left), which wins; 3 when metrics or consumption
+# ($ConsumptionEntries, this run's entries) were skipped because the sign-in
 # could not be refreshed, after a short FAILED (auth) line, or when its metrics
 # are incomplete, after the FAILED (metrics) lines; 0 otherwise. With no zip
 # the lines are still printed, after the run's own "No report was written" line.
 function Get-DirectRunMetricsExitCode
 {
-    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [bool]$ZipWritten, [string]$DictionaryFile)
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [bool]$ZipWritten, [string]$DictionaryFile, [object[]]$ConsumptionEntries = @())
 
     $AuthSkipped = @(@($Entries) | Where-Object { $null -ne $_ -and -not (Test-MetricsIncompleteEntry -Entry $_) } | Sort-Object Name, Id -Unique)
-    if ($AuthSkipped.Count -gt 0)
+    # Consumption skipped for the sign-in is the '(auth)' entry of this run.
+    $ConsumptionAuthSkipped = @(@($ConsumptionEntries) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
+    $Phases = @()
+    if ($AuthSkipped.Count -gt 0) { $Phases += ('Metrics for {0} subscription(s)' -f $AuthSkipped.Count) }
+    if ($ConsumptionAuthSkipped) { $Phases += 'Consumption' }
+    if ($Phases.Count -gt 0)
     {
         Write-Host ''
         Write-Host '===================== FAILED (auth) =====================' -ForegroundColor Red
-        Write-Host ('Could not collect: Metrics for {0} subscription(s). Reason: no usable Azure context/token (even after one reconnect attempt).' -f $AuthSkipped.Count) -ForegroundColor Red
+        Write-Host ('Could not collect: {0}. Reason: no usable Azure context/token (even after one reconnect attempt).' -f ($Phases -join ' and ')) -ForegroundColor Red
         Write-Host 'Fix: sign in again (Connect-AzAccount), then run the same command again.' -ForegroundColor Red
         Write-Host '=========================================================' -ForegroundColor Red
     }
     $Incomplete = Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters -DictionaryFile $DictionaryFile -ZipWritten $ZipWritten
     if (-not $ZipWritten) { return 2 }
-    if ($Incomplete -or $AuthSkipped.Count -gt 0) { return 3 }
+    if ($Incomplete -or $Phases.Count -gt 0) { return 3 }
     return 0
 }

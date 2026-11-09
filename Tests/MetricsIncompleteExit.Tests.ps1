@@ -277,15 +277,19 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
 
 Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
     BeforeAll {
-        # The run's own param block and its last statement (the end of a direct
+        # The run's own param block, the statement that notes the entries the
+        # session held at its start and its last statement (the end of a direct
         # run), as written, with Common.Functions.ps1 loaded: the rest of the run
         # needs Azure.
         $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
         $End = @($Ast.EndBlock.Statements)[-1]
+        $AtStart = @(@($Ast.EndBlock.Statements) | Where-Object { $_.Extent.Text -match '^\$script:HealthEntriesAtStart = ' })
         $script:DirectRun = Join-Path $TestDrive 'direct-run-end.ps1'
         Set-Content -LiteralPath $script:DirectRun -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                @($AtStart | ForEach-Object { $_.Extent.Text })
+                'if ($null -ne $Global:RdaTestAddEntries) { & $Global:RdaTestAddEntries }'
                 $End.Extent.Text
             ) -join "`n")
 
@@ -308,6 +312,12 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
         $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
         $script:SessionDict = Get-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionConsumption = Get-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:ConsumptionSignIn = [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' }
+    }
+    BeforeEach {
+        $Global:ConsumptionFailedSubs = @()
+        $Global:RdaTestAddEntries = $null
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
@@ -316,6 +326,9 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
         if ($script:SessionDict) { $Global:DictionaryFile = $script:SessionDict.Value }
         else { Remove-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionConsumption) { $Global:ConsumptionFailedSubs = $script:SessionConsumption.Value }
+        else { Remove-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+        Remove-Variable -Name RdaTestAddEntries -Scope Global -ErrorAction SilentlyContinue
     }
 
     It 'seeds the command of a masked run from the dictionary it saved' {
@@ -403,6 +416,37 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 2
         $Result.Lines | Should -Contain '===================== FAILED (auth) ====================='
+    }
+
+    It 'prints a FAILED (auth) line and exits 3 when its consumption was skipped for the sign-in' {
+        $Global:MetricsFailedSubs = @()
+        $Entry = $script:ConsumptionSignIn
+        $Global:RdaTestAddEntries = { $Global:ConsumptionFailedSubs += $Entry }.GetNewClosure()
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain '===================== FAILED (auth) ====================='
+        $Result.Lines | Should -Contain 'Could not collect: Consumption. Reason: no usable Azure context/token (even after one reconnect attempt).'
+    }
+
+    It 'names both phases in the FAILED (auth) line when metrics and consumption were skipped for the sign-in' {
+        $Global:MetricsFailedSubs = @($script:SignIn)
+        $Entry = $script:ConsumptionSignIn
+        $Global:RdaTestAddEntries = { $Global:ConsumptionFailedSubs += $Entry }.GetNewClosure()
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain 'Could not collect: Metrics for 1 subscription(s) and Consumption. Reason: no usable Azure context/token (even after one reconnect attempt).'
+    }
+
+    It 'exits 0 for a consumption failure that is not the sign-in, and for a sign-in skip of an earlier run in the session' {
+        $Global:MetricsFailedSubs = @()
+        $Global:ConsumptionFailedSubs = @($script:ConsumptionSignIn)
+        $Global:RdaTestAddEntries = { $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = 'sub-one'; Id = 'id-1'; Message = 'stopped at page 2' } }
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.Lines | Should -Not -Contain '===================== FAILED (auth) ====================='
     }
 
     It 'leaves the end of the run to the wrapper under -RunAllSubs' {
