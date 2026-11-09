@@ -218,14 +218,18 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
         # id of another VM. Ids that never meet fall back to the counts.
         # A scale set member can be billed under its scale set's id (the VM's
         # Set), so either id counts.
+        $IdRunningVms = @($RunningVms | Where-Object { $_.PSObject.Properties.Name -contains 'ID' -and -not [string]::IsNullOrWhiteSpace([string]$_.ID) })
         $MatchedVmCount = @($RunningVms | Where-Object {
                 $Ids = @(foreach ($Key in 'ID', 'Set') { if ($_.PSObject.Properties.Name -contains $Key -and -not [string]::IsNullOrWhiteSpace([string]$_.$Key)) { [string]$_.$Key } })
                 @($Ids | Where-Object { $BilledVmIds.Contains($_) }).Count -gt 0
             }).Count
-        if ($MatchedVmCount -gt 0)
+        # The ids decide when they can: when they meet, or in a report that is
+        # not masked (real ids are the same string in both files). Only a
+        # masked report whose ids never meet falls back to the counts.
+        if ($IdRunningVms.Count -eq $RunningVmCount -and ($MatchedVmCount -gt 0 -or $ObfuscationStatus -ne 'obfuscated'))
         {
-            $IdGap = $RunningVmCount - $MatchedVmCount
-            if ($IdGap -gt $Gap) { $Gap = $IdGap; $BilledVmCount = $MatchedVmCount }
+            $Gap = $RunningVmCount - $MatchedVmCount
+            $BilledVmCount = $MatchedVmCount
         }
         if ($Gap -gt $VmBillingGapThreshold)
         {
@@ -823,15 +827,14 @@ else
 # more running VMs than the consumption data billed for (see the $VmBilling
 # detection above). Frames the inventory as authoritative and points at
 # consumption-collection completeness, not at the report being inaccurate.
-# When the inventory and consumption ids never meet (in an obfuscated report
-# whose two files were masked apart) it is a count-level signal, and the
-# wording says the VMs cannot be named.
+# The banner gives counts, not the VMs; in an obfuscated report it also says
+# their names are masked.
 $CoverageBanner = ''
 if ($null -ne $VmBilling)
 {
     $IdNote = if ($ObfuscationStatus -eq 'obfuscated')
     {
-        ' Per-VM identification is unavailable in an obfuscated report; re-run without <code>-Obfuscate</code> (locally) to list the specific VMs.'
+        ' The VM names are masked in an obfuscated report; a run without <code>-Obfuscate</code> (locally) shows their real names in the inventory.'
     }
     else
     {

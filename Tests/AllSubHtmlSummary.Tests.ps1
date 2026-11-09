@@ -245,6 +245,7 @@ Describe 'New-RdaAllSubHtmlSummary unreadable inventory' {
         $Html | Should -Match '<b>1 subscription\(s\) have 0 resources in their report\.</b>'
         $Html | Should -Match '<b>1 report\(s\) have an inventory that could not be read\.</b>'
         $Html | Should -Match 'or the Azure CLI is signed in as an account that cannot read them\.'
+        $Html | Should -Match '<span class="tag warn">inventory unreadable</span>'
     }
 }
 
