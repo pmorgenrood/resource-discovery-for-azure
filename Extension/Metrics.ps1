@@ -630,8 +630,8 @@ if ($Task -eq 'Processing')
 
                 # True when Azure answered HTTP 429 (TooManyRequests). The status code is read first,
                 # from the exception and every exception it wraps, because the outer message may not
-                # name it. Only when no exception in the chain carries a status is the outer message
-                # matched, so an id holding '429' does not make another error count as throttled.
+                # name it. Only when no exception in the chain carries a status are the messages of
+                # the same chain matched, so an id holding '429' does not make another error count as throttled.
                 function Test-MetricThrottled
                 {
                     param([System.Exception]$Exception)
@@ -640,11 +640,13 @@ if ($Task -eq 'Processing')
                     $Pending.Enqueue($Exception)
                     $Checked = 0
                     $SawStatus = $false
+                    $Messages = [System.Collections.Generic.List[string]]::new()
                     while ($Pending.Count -gt 0 -and $Checked -lt 10)
                     {
                         $Ex = $Pending.Dequeue()
                         if ($null -eq $Ex) { continue }
                         $Checked++
+                        $Messages.Add([string]$Ex.Message)
 
                         $StatusCode = $null
                         if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
@@ -669,15 +671,20 @@ if ($Task -eq 'Processing')
                     }
 
                     if ($SawStatus) { return $false }
-                    # No status anywhere: read only clear throttling phrases, so a name
-                    # such as rg-429 or rg-throttle-test is not taken for one.
+                    # No status anywhere: read only clear throttling phrases, in each message
+                    # of the chain, so a name such as rg-429 or rg-throttle-test is not taken for one.
                     $Phrases = @(
                         '(?<![\w-])Too ?Many ?Requests(?![\w-])',
                         '\b(?:status|code|HTTP|success)\b[\s:''"=(]*429(?![\w-])',
                         '(?<![\w-])throttl(?:ed|ing)(?![\w-])',
                         '(?<![\w-])rate limit'
                     )
-                    return ([string]$Exception.Message -match ($Phrases -join '|'))
+                    $Pattern = $Phrases -join '|'
+                    foreach ($Message in $Messages)
+                    {
+                        if ($Message -match $Pattern) { return $true }
+                    }
+                    return $false
                 }
 
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.

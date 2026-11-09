@@ -270,6 +270,38 @@ Describe 'Test-MetricThrottled - the status code decides first' {
         Test-MetricThrottled -Exception ([System.Exception]::new('Request was throttled, retry later.')) | Should -BeTrue
     }
 
+    It 'reads the throttling phrases on an InnerException when no exception carries a status' {
+        $Inner = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+        Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Inner)) | Should -BeTrue
+        $Deeper = [System.Exception]::new('still a wrapper', ([System.Exception]::new('The request is being throttled.')))
+        Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Deeper)) | Should -BeTrue
+    }
+
+    It 'reads the throttling phrases on the ErrorRecord an exception carries when no exception carries a status' {
+        $Record = [System.Management.Automation.ErrorRecord]::new([System.Exception]::new('Service request failed. Status: 429 (Too Many Requests)'), 'x', 'NotSpecified', $null)
+        $Outer = [System.Management.Automation.RuntimeException]::new('The operation failed.', $null, $Record)
+        Test-MetricThrottled -Exception $Outer | Should -BeTrue
+    }
+
+    It 'finds the throttle and its Retry-After on an inner exception with no status' {
+        $Inner = [System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")
+        $Inner | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('19') } })
+        $Outer = [System.Exception]::new('The operation failed.', $Inner)
+        Test-MetricThrottled -Exception $Outer | Should -BeTrue
+        Get-RdaRetryAfterSeconds -ErrorRecord $Outer | Should -Be 19
+    }
+
+    It 'does not read a name in an inner message as throttled' {
+        $Inner = [System.Exception]::new("Resource group 'rg-429' could not be found.", ([System.Exception]::new("Resource group 'rg-throttle-test' could not be found.")))
+        Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Inner)) | Should -BeFalse
+    }
+
+    It 'does not read an inner message when an exception in the chain carries a status' {
+        $Inner = [System.Exception]::new('The request is being throttled.')
+        $Middle = New-StatusException 'denied' ([System.Net.HttpStatusCode]::Forbidden) $Inner
+        Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Middle)) | Should -BeFalse
+    }
+
     It 'the retry loop asks it, not a message match, whether an answer was throttled' {
         $script:MetricsSrc | Should -Match 'if \(Test-MetricThrottled -Exception \$_\.Exception\)'
         $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'
