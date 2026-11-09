@@ -483,6 +483,17 @@ Describe 'Metrics.ps1 batch work items' {
         @($Items[0].MetricNames) | Should -Be @('cpu_percent')
     }
 
+    It 'waits what Retry-After asks before a throttled batch request is sent again, up to 120 s' {
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 90 | Should -Be 90
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 120 | Should -Be 120
+        Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter 600 | Should -Be 120
+        # No Retry-After: twice the plain wait.
+        Get-MetricBatchBackoff -Attempt 2 -Kind 'Throttled' | Should -Be 8
+        # Not throttled: 1, 2, 4 ... s, at most 30; Retry-After is not read.
+        Get-MetricBatchBackoff -Attempt 1 -Kind 'Error' -RetryAfter 90 | Should -Be 2
+        Get-MetricBatchBackoff -Attempt 6 -Kind 'Error' | Should -Be 30
+    }
+
     It 'keeps the per-resource path for what it cannot express or may not batch' {
         $Groups = [System.Collections.Generic.List[object]]::new()
         $Groups.Add([object[]]@(New-Def -Id '/subscriptions/abc/providers/Microsoft.Capacity/reservationOrders/x'))
