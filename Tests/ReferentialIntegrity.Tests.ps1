@@ -143,7 +143,8 @@ Describe "Consumption to Inventory Cross-Reference" {
         $RealOf = @{}
         foreach ($P in @($Map.PSObject.Properties)) { $RealOf[$P.Name] = [string]$P.Value }
         $InventoryByReal = @{}
-        foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id)) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
+        # The first inventory row of a real id wins, as downstream takes the first.
+        foreach ($Id in $script:AllIds) { if ($RealOf.ContainsKey($Id) -and -not $InventoryByReal.ContainsKey($RealOf[$Id].ToLowerInvariant())) { $InventoryByReal[$RealOf[$Id].ToLowerInvariant()] = $Id } }
         $Checked = 0
         # Every masked consumption id is in the dictionary: an id the run
         # did not record would be a second, unjoinable id for its resource.
@@ -156,7 +157,8 @@ Describe "Consumption to Inventory Cross-Reference" {
             if ([string]::IsNullOrEmpty($row.ResourceId) -or -not $RealOf.ContainsKey($row.ResourceId)) { continue }
             $Real = $RealOf[$row.ResourceId].ToLowerInvariant()
             if (-not $InventoryByReal.ContainsKey($Real)) { continue }
-            $row.ResourceId | Should -BeExactly $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
+            # Downstream joins the two files by id ignoring case, so case aside.
+            $row.ResourceId | Should -Be $InventoryByReal[$Real] -Because "the consumption row of an inventoried resource carries the inventory's masked id"
             $Checked++
         }
         $Checked | Should -BeGreaterThan 0 -Because 'the fixture bills at least one inventoried resource, so the check must look at a row'
