@@ -81,10 +81,14 @@ a page that still fails is handled by the per-subscription failure path (see
 ### Page limit
 
 One subscription's pull reads at most 10,000 pages (about 10 million rows at the
-usage API's page size of up to 1,000 rows). If the API still offers more, the
-pull stops there, keeps the rows written so far, and reports that subscription's
-consumption INCOMPLETE with a message naming the limit, so a paging token that
-never runs out cannot keep a run going without end.
+usage API's page size of up to 1,000 rows), or the number given with
+`-ConsumptionMaxPages` (on `ResourceInventory.ps1` and on
+`Run-AllSubscriptions.ps1`, which passes it on). If the API still offers more,
+the pull stops there, keeps the rows written so far, and reports that
+subscription's consumption INCOMPLETE with a message naming the limit and the
+parameter, so a paging token that never runs out cannot keep a run going without
+end. A page token the API gives twice for one subscription stops it the same
+way. Either stop records the last page read.
 
 ## The columns
 
