@@ -490,6 +490,11 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Text | Should -Match '-ParallelStreams 4'
     }
 
+    It 'keeps the -ConsumptionMaxPages value under obfuscation: a tuning number, needed to raise it again' {
+        $Text = (Get-RunSummaryLogContent -InvocationParameters @{ ConsumptionMaxPages = 20000 } -Obfuscated) -join "`n"
+        $Text | Should -Match '-ConsumptionMaxPages 20000'
+    }
+
     It 'omits a non-allowlisted valued parameter value under obfuscation but keeps it otherwise' {
         $Params = @{ SomeFutureValuedParam = 'secret-value-123' }
 

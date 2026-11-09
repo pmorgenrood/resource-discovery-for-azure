@@ -891,7 +891,7 @@ function Get-RunSummaryLogContent
     # an obfuscated bundle (tuning knobs, never identifiers). Any other valued
     # parameter has its value omitted under -Obfuscated so a future value-carrying
     # parameter cannot leak into a shared log.
-    $SafeValueParamNames = @('ParallelStreams', 'ConcurrencyLimit')
+    $SafeValueParamNames = @('ParallelStreams', 'ConcurrencyLimit', 'ConsumptionMaxPages')
 
     # Normalise possibly-$null collections to real arrays so .Count is stable.
     $NoAccess = @(@($EmptyNoAccess) | Where-Object { $null -ne $_ })
