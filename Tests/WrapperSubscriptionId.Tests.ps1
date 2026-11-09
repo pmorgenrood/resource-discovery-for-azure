@@ -757,6 +757,7 @@ Describe 'The preflight and the run check the same subscriptions' -Skip:($IsWind
         $PfProbes = @(script:Get-Probes)
         Remove-Item -LiteralPath (Join-Path $script:CaseHome 'access-probes.log') -Force -ErrorAction SilentlyContinue
         $Run = script:Invoke-Wrapper -Arguments (@('-SkipConsumption', '-SkipMetrics') + $Extra)
+        $Run.ExitCode | Should -Be 0
         $RunProbes = @(script:Get-Probes)
         ($PfProbes -join ',') | Should -Be ($RunProbes -join ',') -Because 'the preflight checks the subscriptions the run checks'
     }
