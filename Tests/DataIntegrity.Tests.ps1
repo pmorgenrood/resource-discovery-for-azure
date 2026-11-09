@@ -55,7 +55,7 @@ BeforeAll {
 }
 
 AfterAll {
-    if (Test-Path $script:ExtractPath) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
+    if ($script:ExtractPath -and (Test-Path $script:ExtractPath)) { Remove-Item -Path $script:ExtractPath -Recurse -Force }
 }
 
 # ============================================================
