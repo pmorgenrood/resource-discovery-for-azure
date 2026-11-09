@@ -411,7 +411,7 @@ if (Test-Path -LiteralPath $StagingDirectory)
     $MarkedForThisRoot = $false
     if (-not [string]::IsNullOrEmpty($MarkedRoot))
     {
-        try { $MarkedForThisRoot = [string]::Equals((ConvertTo-RevealComparablePath $MarkedRoot), $InventoryRoot, $PathComparison) }
+        try { $MarkedForThisRoot = Test-RevealSamePath -Left $MarkedRoot -Right $InventoryRoot -PathComparison $PathComparison }
         catch { $MarkedForThisRoot = $false }
     }
     if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
@@ -508,11 +508,18 @@ Write-Host ("Staging        : {0}" -f $StagingDirectory) -ForegroundColor Cyan
 Write-Host ("Output zip     : {0}" -f $OutputZip) -ForegroundColor Cyan
 Write-Host ""
 
-# Compared as the file system does (case-sensitive except on Windows), so on
-# Linux a report folder whose name differs from staging only by case is still
-# read.
+# The staging folder is left out by its identity (see Get-RevealPathIdentity),
+# not its name: a report folder whose name differs from staging only by case
+# is still read, also in a case-sensitive Windows folder, and staging reached
+# through a link is still left out. A folder whose identity cannot be read is
+# compared by name, as the platform does.
+$StagingIdentity = Get-RevealPathIdentity $StagingDirectory
 $Folders = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { -not [string]::Equals((ConvertTo-RevealComparablePath $_.FullName), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison) })
+        Where-Object {
+            $FolderIdentity = if ($null -ne $StagingIdentity) { Get-RevealPathIdentity $_.FullName } else { $null }
+            if ($null -ne $FolderIdentity) { $FolderIdentity -cne $StagingIdentity }
+            else { -not [string]::Equals((ConvertTo-RevealComparablePath $_.FullName), (ConvertTo-RevealComparablePath $StagingDirectory), $PathComparison) }
+        })
 
 $PairedCount = 0
 $RevealedCount = 0
@@ -1067,9 +1074,11 @@ elseif ($RemoveStaging -and -not $CleanRun)
     # have more than one.
     $FolderCount = {
         param([string]$Kind)
-        # Folder names compared as the file system does, as $PathComparison
-        # does: on Linux 'bad' and 'BAD' are two folders.
-        $Distinct = [System.Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
+        # The names come from one listing of the inventory root, in which two
+        # names are two folders, so they are compared exactly: 'bad' and 'BAD'
+        # are two folders on Linux and in a case-sensitive Windows folder, and
+        # a case-insensitive folder cannot list both.
+        $Distinct = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         foreach ($Name in @($FailedItems | Where-Object { $_.Kind -eq $Kind } | ForEach-Object { $_.Folders })) { $null = $Distinct.Add([string]$Name) }
         $Distinct.Count
     }

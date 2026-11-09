@@ -48,6 +48,162 @@ function ConvertTo-RevealComparablePath
     return $Trimmed
 }
 
+# The Windows calls that give a file's identity (its volume serial number and
+# file id) and its final path, links followed. Loaded once, on Windows only.
+function Initialize-RevealWindowsFileId
+{
+    if ($null -ne ('RevealWindowsFileId' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class RevealWindowsFileId
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+    // FILE_READ_ATTRIBUTES; share read, write and delete; OPEN_EXISTING;
+    // FILE_FLAG_BACKUP_SEMANTICS so a folder can be opened. Links are followed.
+    private static SafeFileHandle Open(string path)
+    {
+        return CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+    }
+    public static string GetIdentity(string path)
+    {
+        using (SafeFileHandle handle = Open(path))
+        {
+            if (handle.IsInvalid) { return null; }
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(handle, out info)) { return null; }
+            return info.VolumeSerialNumber.ToString("X8") + ":" + info.FileIndexHigh.ToString("X8") + info.FileIndexLow.ToString("X8");
+        }
+    }
+    public static string GetFinalPath(string path)
+    {
+        using (SafeFileHandle handle = Open(path))
+        {
+            if (handle.IsInvalid) { return null; }
+            StringBuilder text = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandleW(handle, text, (uint)text.Capacity, 0);
+            if (length == 0 || length >= text.Capacity) { return null; }
+            string final = text.ToString();
+            if (final.StartsWith(@"\\?\UNC\")) { return @"\\" + final.Substring(8); }
+            if (final.StartsWith(@"\\?\")) { return final.Substring(4); }
+            return final;
+        }
+    }
+}
+'@
+}
+
+# The identity of an existing file or folder, links followed, as text: the
+# device and inode on Unix, the volume serial number and file id on Windows.
+# Two paths with the same identity name the same file or folder, whatever
+# their names and whether the folder they are in is case-sensitive (on
+# Windows a folder can be made case-sensitive, so a name compare cannot tell).
+# $null when the path does not exist or cannot be read.
+function Get-RevealPathIdentity
+{
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    if ($IsWindows)
+    {
+        Initialize-RevealWindowsFileId
+        return [RevealWindowsFileId]::GetIdentity($Path)
+    }
+    # No '--' before the path: macOS stat takes it as a file name. The path is
+    # made a full path first, so it starts with '/' and cannot be read as an
+    # option. A full path is passed as it is: GetFullPath would drop a '..'
+    # by name, where the system reads it from the folder a link leads to.
+    $Full = if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) }
+    $Text = if (Test-RevealIsMacOS) { & stat -L -f '%d:%i' $Full 2>$null } else { & stat -L -c '%d:%i' $Full 2>$null }
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Text)) { return $null }
+    return ([string]$Text).Trim()
+}
+
+# Whether two paths name the same file or folder. When both exist they are
+# compared by identity (Get-RevealPathIdentity); otherwise by their full
+# names, as $PathComparison says (the platform default).
+function Test-RevealSamePath
+{
+    param(
+        [Parameter(Mandatory = $true)] [string] $Left,
+        [Parameter(Mandatory = $true)] [string] $Right,
+        [System.StringComparison] $PathComparison = $(if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal })
+    )
+    if ((Test-Path -LiteralPath $Left) -and (Test-Path -LiteralPath $Right))
+    {
+        $LeftId = Get-RevealPathIdentity $Left
+        $RightId = Get-RevealPathIdentity $Right
+        if ($null -ne $LeftId -and $null -ne $RightId) { return $LeftId -ceq $RightId }
+    }
+    return [string]::Equals((ConvertTo-RevealComparablePath $Left), (ConvertTo-RevealComparablePath $Right), $PathComparison)
+}
+
+# Whether $Path (which need not exist) is $Folder itself or anywhere inside
+# it, links followed. The nearest existing folder on $Path's way up is found
+# by name; from there each folder up to the root is compared with $Folder by
+# identity. On Unix the way up is taken through '..', which the system reads
+# from the folder a link leads to; on Windows it is taken from the folder's
+# final path, links followed.
+function Test-RevealPathInside
+{
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $Folder
+    )
+    $FolderId = Get-RevealPathIdentity $Folder
+    if ($null -eq $FolderId) { return $false }
+    $Current = [System.IO.Path]::GetFullPath($Path)
+    while (-not (Test-Path -LiteralPath $Current))
+    {
+        $Current = [System.IO.Path]::GetDirectoryName($Current)
+        if ([string]::IsNullOrEmpty($Current)) { return $false }
+    }
+    if ($IsWindows)
+    {
+        Initialize-RevealWindowsFileId
+        $Final = [RevealWindowsFileId]::GetFinalPath($Current)
+        if (-not [string]::IsNullOrEmpty($Final)) { $Current = $Final }
+        while (-not [string]::IsNullOrEmpty($Current))
+        {
+            if ((Get-RevealPathIdentity $Current) -ceq $FolderId) { return $true }
+            $Current = [System.IO.Path]::GetDirectoryName($Current)
+        }
+        return $false
+    }
+    $Id = Get-RevealPathIdentity $Current
+    # A folder tree is far less than 4096 deep; the cap only makes sure the
+    # loop ends.
+    for ($Depth = 0; $Depth -lt 4096 -and $null -ne $Id; $Depth++)
+    {
+        if ($Id -ceq $FolderId) { return $true }
+        $Current = $Current.TrimEnd('/') + '/..'
+        $Up = Get-RevealPathIdentity $Current
+        # The root is its own parent.
+        if ($Up -ceq $Id) { return $false }
+        $Id = $Up
+    }
+    return $false
+}
+
 # True when .NET has File.SetUnixFileMode and GetUnixFileMode (.NET 7 and
 # later, so PowerShell 7.3 and later). Its own function so a test can take the
 # chmod and stat path on a newer runtime.
