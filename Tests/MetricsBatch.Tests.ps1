@@ -571,6 +571,31 @@ Describe 'Metrics.ps1 batch work items' {
         $Ex = if ($Code) { [System.Net.Http.HttpRequestException]::new($Message, $null, [System.Net.HttpStatusCode]$Code) } else { [System.Exception]::new($Message) }
         (Get-MetricBatchFailure -Exception $Ex).Kind | Should -Be $Kind
     }
+
+    It 'reads Retry-After from a wrapped 429 whose header is only on the inner exception (<Label>), and waits that long, capped' -ForEach @(
+        @{ Label = '90 s'; Seconds = 90; Date = $false; Wait = 90 }
+        @{ Label = '600 s, capped at 120'; Seconds = 600; Date = $false; Wait = 120 }
+        @{ Label = 'an HTTP date 60 s ahead'; Seconds = 60; Date = $true; Wait = 60 }
+    ) {
+        $Response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::TooManyRequests)
+        if ($Date) { $Response.Headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([DateTimeOffset]::UtcNow.AddSeconds($Seconds)) }
+        else { $Response.Headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds($Seconds)) }
+        $Inner = [System.Net.Http.HttpRequestException]::new('Too many requests.', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        $Inner | Add-Member -NotePropertyName Response -NotePropertyValue $Response
+        $Outer = [System.Exception]::new('The operation failed.', $Inner)
+
+        (Get-MetricBatchFailure -Exception $Outer).Kind | Should -Be 'Throttled'
+        $RetryAfter = Get-MetricBatchRetryAfter -Exception $Outer
+        # An HTTP date has whole seconds, so it can read up to 1 s short.
+        $RetryAfter | Should -BeGreaterThan ($Seconds - 1.5)
+        $RetryAfter | Should -BeLessOrEqual $Seconds
+        [math]::Round((Get-MetricBatchBackoff -Attempt 0 -Kind 'Throttled' -RetryAfter $RetryAfter)) | Should -Be $Wait
+    }
+
+    It 'reads no Retry-After when no exception in the chain carries one' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('Too many requests.', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        Get-MetricBatchRetryAfter -Exception ([System.Exception]::new('The operation failed.', $Inner)) | Should -Be 0
+    }
 }
 
 Describe 'Metrics.ps1 without -UseMetricsBatch' {

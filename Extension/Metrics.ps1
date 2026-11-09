@@ -514,6 +514,29 @@ function Get-MetricBatchFailure
     return [pscustomobject]@{ Kind = $Kind; Status = $Status }
 }
 
+# The seconds a 429 answer asks to wait (Retry-After), or 0. Read on the same walk
+# as Get-MetricBatchFailure, so a wrapped 429 gives its own header: the first
+# exception in the chain whose response has one decides.
+function Get-MetricBatchRetryAfter
+{
+    param([System.Exception]$Exception)
+
+    foreach ($Ex in (Get-MetricExceptionChain -Exception $Exception))
+    {
+        try
+        {
+            if ($null -eq $Ex.PSObject.Properties['Response'] -or $null -eq $Ex.Response) { continue }
+            # Retry-After is either a number of seconds or an HTTP date.
+            $Header = $Ex.Response.Headers.RetryAfter
+            if ($null -eq $Header) { continue }
+            if ($null -ne $Header.Delta) { return [math]::Max(0, $Header.Delta.TotalSeconds) }
+            if ($null -ne $Header.Date) { return [math]::Max(0, ($Header.Date - [DateTimeOffset]::UtcNow).TotalSeconds) }
+        }
+        catch { continue }
+    }
+    return 0
+}
+
 if ($Task -eq 'Processing')
 {
     function Write-MetricsDiag([string]$Line)
@@ -963,7 +986,7 @@ if ($Task -eq 'Processing')
 
     # The text of Get-MetricFailure and its helpers, for the parallel runspaces (a
     # script block cannot be handed over), so every request path reads an error the same way.
-    $MetricFailureSource = (@('Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure', 'Get-MetricBatchFailure') | ForEach-Object {
+    $MetricFailureSource = (@('Get-MetricExceptionChain', 'Get-MetricExceptionStatus', 'Get-MetricFailure', 'Get-MetricBatchFailure', 'Get-MetricBatchRetryAfter') | ForEach-Object {
             "function $_`n{`n" + (Get-Item -LiteralPath ('function:' + $_)).ScriptBlock.ToString() + "`n}`n"
         }) -join "`n"
 
@@ -1215,7 +1238,7 @@ function Add-MetricRecord
                         $null = $DiagBag, $MetricBag
                         . ([scriptblock]::Create($using:AddMetricRecordSource))
                         ${function:Get-MetricBatchBackoff} = [scriptblock]::Create($using:BatchBackoffSource)
-                        # Get-MetricBatchFailure and the helpers it reads, from their one copy at the top of this file.
+                        # Get-MetricBatchFailure, Get-MetricBatchRetryAfter and the helpers they read, from their one copy at the top of this file.
                         . ([scriptblock]::Create($using:MetricFailureSource))
 
                         function Add-BatchCount([int]$Index, [long]$By)
@@ -1241,20 +1264,6 @@ function Add-MetricRecord
                         function Send-AllGroupsOn
                         {
                             foreach ($Group in $Unit.Groups) { Send-GroupOn $Group }
-                        }
-
-                        # The seconds a 429 answer asks to wait (Retry-After), or 0.
-                        function Get-BatchRetryAfter([System.Exception]$Exception)
-                        {
-                            try
-                            {
-                                # Retry-After is either a number of seconds or an HTTP date.
-                                $Header = $Exception.Response.Headers.RetryAfter
-                                if ($null -ne $Header.Delta) { return [math]::Max(0, $Header.Delta.TotalSeconds) }
-                                if ($null -ne $Header.Date) { return [math]::Max(0, ($Header.Date - [DateTimeOffset]::UtcNow).TotalSeconds) }
-                            }
-                            catch { }
-                            return 0
                         }
 
                         # Reads one batch answer with System.Text.Json into small objects: per resource
@@ -1413,7 +1422,7 @@ function Add-MetricRecord
                                     $Read = Get-MetricBatchFailure -Exception $Failure.Exception
                                     $Status = $Read.Status
                                     $Kind = $Read.Kind
-                                    $RetryAfter = Get-BatchRetryAfter -Exception $Failure.Exception
+                                    $RetryAfter = Get-MetricBatchRetryAfter -Exception $Failure.Exception
                                     if ($null -ne $Status) { $LastError = ('HTTP {0}: {1}' -f $Status, $LastError) }
                                 }
                                 else
