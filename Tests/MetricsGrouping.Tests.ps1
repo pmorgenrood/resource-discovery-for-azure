@@ -686,9 +686,9 @@ Describe 'Metrics.ps1 a Metrics file that cannot be written' {
     BeforeAll {
         # A stand-in Out-File that, for the second Metrics file, writes part of
         # it and then fails as a full disk does (an error, not a throw). Every
-        # other file is written as the real one writes it.
-        function Out-File
-        {
+        # other file is written as the real one writes it. It is set for the
+        # tests of this block only and removed after them.
+        Set-Item -Path 'function:script:Out-File' -Value {
             [CmdletBinding()]
             param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject)
             begin { $Items = [System.Collections.Generic.List[object]]::new() }
@@ -710,6 +710,7 @@ Describe 'Metrics.ps1 a Metrics file that cannot be written' {
         $script:SessionWriteFailures = Get-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue
     }
     AfterAll {
+        Remove-Item -Path 'function:script:Out-File' -ErrorAction SilentlyContinue
         Remove-Item -Path 'Env:RDA_TEST_METRICS_CHUNK_FAIL' -ErrorAction SilentlyContinue
         if ($script:SessionWriteFailures) { $Global:RdaMetricsWriteFailures = $script:SessionWriteFailures.Value }
         else { Remove-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue }
