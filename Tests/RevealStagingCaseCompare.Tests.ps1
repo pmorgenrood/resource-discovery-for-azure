@@ -42,7 +42,7 @@ BeforeAll {
         [System.IO.File]::WriteAllText((Join-Path $Folder ('ObfuscationDictionary_ResourcesReport_' + $Stamp + '.json')), $Dict)
     }
 
-    function Get-ZipNames
+    function Get-ZipEntryName
     {
         param([string]$Path)
         if (-not (Test-Path -LiteralPath $Path)) { return @() }
@@ -73,7 +73,7 @@ Describe 'Reveal.ps1 with staging named as a report folder in another case' -Ski
 
     It 'reads the report folder that differs from staging only by case, and ships both reports' {
         $script:Exit | Should -Be 0 -Because $script:Text
-        Get-ZipNames $script:Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001bbbb.zip')
+        Get-ZipEntryName $script:Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000001bbbb.zip')
     }
 }
 
@@ -93,6 +93,6 @@ Describe 'Reveal.ps1 with -OutputZip in a folder named as staging in another cas
     It 'accepts it and writes the bundle there' {
         $script:Text | Should -Not -Match '-OutputZip must not be inside the staging directory'
         $script:Exit | Should -Be 0 -Because $script:Text
-        Get-ZipNames $script:Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip')
+        Get-ZipEntryName $script:Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip')
     }
 }
