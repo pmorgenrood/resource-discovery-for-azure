@@ -324,6 +324,111 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
     }
 }
 
+Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
+    BeforeAll {
+        # The run's param block and its top-level statements from the one that
+        # picks the zip's files up to the one that writes the zip, as written,
+        # with both function files loaded and the real Compress-Archive.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$JsonWildCard =|^\$JsonFiles = Get-RdaReportJsonFiles|Write-RdaShareableDiagnosticsLog' })[0]
+        $To = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$ZipWritten = Write-RdaReportZip' })[0]
+        $script:ZipFiles = Join-Path $TestDrive 'zip-files.ps1'
+        Set-Content -LiteralPath $script:ZipFiles -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                @($Top[$From..$To] | ForEach-Object { $_.Extent.Text })
+            ) -join "`n")
+
+        # Writes the files a run leaves in its report folder, sets the names
+        # the run sets, runs the lifted statements and returns the zip's entries.
+        function script:Invoke-ZipFiles
+        {
+            param([string]$Folder, [string]$Stamp, [switch]$Obfuscate)
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            $Global:DefaultPath = $Folder.TrimEnd('/') + '/'
+            $Global:ReportName = 'ResourcesReport'
+            $Global:CurrentDateTime = $Stamp
+            $Global:HtmlFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.html'
+            $Global:ConsumptionFileCsv = $Global:DefaultPath + 'Consumption_ResourcesReport_' + $Stamp + '.csv'
+            $Global:ZipOutputFile = $Global:DefaultPath + 'ResourcesReport_' + $Stamp + '.zip'
+            $Global:MetricsFailedSubs = @()
+            foreach ($Name in @(
+                    ('ResourcesReport_{0}.html' -f $Stamp)
+                    ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)
+                    ('Inventory_ResourcesReport_{0}.json' -f $Stamp)
+                    ('Metrics_ResourcesReport_{0}_1.json' -f $Stamp)
+                    ('Metrics_ResourcesReport_{0}_2.json' -f $Stamp)
+                    ('Transcript_Log_ResourcesReport_{0}.txt' -f $Stamp)))
+            {
+                Set-Content -LiteralPath ($Global:DefaultPath + $Name) -Value $Name
+            }
+            if ($Obfuscate) { Set-Content -LiteralPath ($Global:DefaultPath + ('ObfuscationDictionary_ResourcesReport_{0}.json' -f $Stamp)) -Value '{}' }
+            $Arguments = @{ TenantID = 'tenant-1' }
+            if ($Obfuscate) { $Arguments['Obfuscate'] = $true }
+            $null = & $script:ZipFiles @Arguments *>&1
+            $Zip = [System.IO.Compression.ZipFile]::OpenRead($Global:ZipOutputFile)
+            try { return @($Zip.Entries | ForEach-Object { $_.FullName } | Sort-Object) }
+            finally { $Zip.Dispose() }
+        }
+
+        # What a clean run's zip holds.
+        function script:Get-CleanZipEntries
+        {
+            param([string]$Stamp)
+            @(
+                ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)
+                ('Diagnostics_ResourcesReport_{0}.log' -f $Stamp)
+                ('Inventory_ResourcesReport_{0}.json' -f $Stamp)
+                ('Metrics_ResourcesReport_{0}_1.json' -f $Stamp)
+                ('Metrics_ResourcesReport_{0}_2.json' -f $Stamp)
+                ('ResourcesReport_{0}.html' -f $Stamp)
+            ) | Sort-Object
+        }
+
+        # The files an earlier run, or someone else, left in a shared folder.
+        function script:Add-OtherRunFiles
+        {
+            param([string]$Folder)
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            foreach ($Name in @('Inventory_ResourcesReport_20260101000000000aaaa.json', 'Metrics_ResourcesReport_20260101000000000aaaa_1.json', 'ObfuscationDictionary_ResourcesReport_20260101000000000aaaa.json', 'notes.json'))
+            {
+                Set-Content -LiteralPath (Join-Path $Folder $Name) -Value $Name
+            }
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsFailedSubs'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'holds the same files as before for a clean folder (<Mode>)' -ForEach @(@{ Mode = 'plain' }, @{ Mode = 'masked' }) {
+        $Stamp = '20261109120000000' + $(if ($Mode -eq 'plain') { 'b001' } else { 'b002' })
+        $Entries = Invoke-ZipFiles -Folder (Join-Path $TestDrive ('clean-' + $Mode)) -Stamp $Stamp -Obfuscate:($Mode -eq 'masked')
+
+        $Entries | Should -Be (Get-CleanZipEntries -Stamp $Stamp)
+    }
+
+    It 'leaves out the files of another run and other JSON files in a shared folder (<Mode>)' -ForEach @(@{ Mode = 'plain' }, @{ Mode = 'masked' }) {
+        $Folder = Join-Path $TestDrive ('shared-' + $Mode)
+        Add-OtherRunFiles -Folder $Folder
+        $Stamp = '20261109120000000' + $(if ($Mode -eq 'plain') { 'c001' } else { 'c002' })
+        $Entries = Invoke-ZipFiles -Folder $Folder -Stamp $Stamp -Obfuscate:($Mode -eq 'masked')
+
+        $Entries | Should -Be (Get-CleanZipEntries -Stamp $Stamp)
+    }
+}
+
 Describe 'Two direct ResourceInventory.ps1 runs in one PowerShell session' {
     BeforeAll {
         # The run's param block, the top-level statement that clears the metrics

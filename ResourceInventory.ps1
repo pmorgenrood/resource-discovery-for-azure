@@ -1796,13 +1796,14 @@ if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
     "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File $Global:ConsumptionFileCsv -Encoding utf8
 }
 
-$JsonWildCard = $DefaultPath + "*.json"
+# Only this run's Inventory and Metrics files go in the zip: a folder given
+# with -OutputDirectory can also hold another run's files.
+$JsonFiles = Get-RdaReportJsonFiles -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime
 
 if ($Obfuscate.IsPresent)
 {
     $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -Obfuscated:$Obfuscate.IsPresent -SubscriptionID $SubscriptionID
 
-    $JsonFiles = Get-ChildItem -Path $DefaultPath -Filter "*.json" | Where-Object { $_.Name -notlike "ObfuscationDictionary_*" -and $_.Name -notlike "Full_*" -and $_.Name -notlike "Heartbeat_*" -and $_.Name -notlike "DebugLog_*" -and $_.Name -notlike "ErrorLog_*" } | Select-Object -ExpandProperty FullName
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
     $CompressionOutput = @{
@@ -1819,7 +1820,7 @@ else
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
 
     $CompressionOutput = @{
-        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv, $JsonWildCard) + $ShareableExtras
+        Path = @($Global:HtmlFile, $Global:ConsumptionFileCsv) + $JsonFiles + $ShareableExtras
         CompressionLevel = 'Fastest'
         DestinationPath = $Global:ZipOutputFile
     }

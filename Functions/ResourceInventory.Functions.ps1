@@ -401,6 +401,25 @@ function Write-RdaShareableDiagnosticsLog
     }
 }
 
+# The JSON files of this run that go in its zip: its Inventory file and its
+# Metrics files, found by the report name and the run's time stamp. A folder
+# given with -OutputDirectory can hold the files of other runs (or other JSON
+# files), so the zip never takes every *.json in it.
+function Get-RdaReportJsonFiles
+{
+    param([string]$DefaultPath, [string]$ReportName, [string]$RunDateTime)
+
+    $Files = [System.Collections.Generic.List[string]]::new()
+    $InventoryFile = $DefaultPath + 'Inventory_' + $ReportName + '_' + $RunDateTime + '.json'
+    if (Test-Path -LiteralPath $InventoryFile -PathType Leaf) { $Files.Add($InventoryFile) }
+    $MetricsPattern = ('Metrics_{0}_{1}*.json' -f $ReportName, $RunDateTime)
+    foreach ($MetricsFile in @(Get-ChildItem -LiteralPath $DefaultPath -Filter $MetricsPattern -File -ErrorAction SilentlyContinue | Sort-Object Name))
+    {
+        $Files.Add($MetricsFile.FullName)
+    }
+    return @($Files)
+}
+
 # Writes the report zip with Compress-Archive. Returns $true only when the zip
 # is there afterwards. When it fails, the error is shown, any partial zip it
 # left is removed (so a half report is never uploaded or counted as written by
