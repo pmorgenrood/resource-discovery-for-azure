@@ -527,9 +527,10 @@ if ($Task -eq 'Processing')
     $MetricRequestCounts = [long[]]::new(2)
 
     # The resource id of every request, grouped or for one metric, that still failed
-    # after its retries for a reason other than BadRequest (throttling, timeout,
-    # server error). Their subscriptions are recorded as metrics incomplete at the
-    # end of the phase.
+    # after its retries for a reason a re-run can fix (throttling, timeout, server
+    # error, or an error whose status cannot be read; not a 4xx client error such
+    # as BadRequest, 403 or 404). Their subscriptions are recorded as metrics
+    # incomplete at the end of the phase.
     $MetricFailedGroupIds = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
     # $MetricCount is the number of definitions to send, as it was when the batch
@@ -628,6 +629,74 @@ if ($Task -eq 'Processing')
                     return $false
                 }
 
+                # The HTTP status Azure answered with, as a number, from the first
+                # exception in the chain that holds one: its status code, or the
+                # "status code 'Forbidden'" text of the Az message. $null when none can
+                # be read.
+                function Get-MetricErrorStatus
+                {
+                    param([System.Exception]$Exception)
+
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    $Checked = 0
+                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Checked++
+
+                        $Found = @()
+                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                        {
+                            $Found += $Ex.Response.StatusCode
+                        }
+                        if ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                        {
+                            $Found += $Ex.StatusCode
+                        }
+                        if ([string]$Ex.Message -match "(?i)status code\s*'?([A-Za-z]+|\d{3})'?")
+                        {
+                            $Found += $Matches[1]
+                        }
+                        foreach ($Value in $Found)
+                        {
+                            if ($null -eq $Value) { continue }
+                            $Text = [string]$Value
+                            if ($Text -match '^\d{3}$') { return [int]$Text }
+                            $Parsed = [System.Net.HttpStatusCode]::OK
+                            if ([System.Enum]::TryParse([System.Net.HttpStatusCode], $Text, $true, [ref]$Parsed)) { return [int]$Parsed }
+                        }
+
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+
+                    return $null
+                }
+
+                # True when a request that still failed after its retries can work on a
+                # re-run, so its subscription's metrics are incomplete: a timeout,
+                # throttling, a server error (HTTP 5xx), or an error whose status cannot
+                # be read. A client error (HTTP 4xx such as 401, 403 or 404, or
+                # BadRequest anywhere in the chain) fails the same way on every run.
+                function Test-MetricRerunCanFix
+                {
+                    param([bool]$TimedOut, [bool]$Throttled, [System.Exception]$Exception)
+
+                    if ($TimedOut -or $Throttled) { return $true }
+                    if ($null -eq $Exception) { return $true }
+                    if (Test-MetricBadRequest -Exception $Exception) { return $false }
+                    $Status = Get-MetricErrorStatus -Exception $Exception
+                    if ($null -eq $Status) { return $true }
+                    # 408 (request timeout) and 429 (too many requests) pass with time.
+                    if ($Status -in @(408, 429)) { return $true }
+                    return -not ($Status -ge 400 -and $Status -lt 500)
+                }
+
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
                 # failure is recorded for each definition. BadRequest is true when the
@@ -650,7 +719,7 @@ if ($Task -eq 'Processing')
                     }
                     $CallOutcome = 'Success'
                     $CallAttempts = 0
-                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false }
+                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false; Incomplete = $false }
 
                     $MetricArgs = @{
                         ResourceId      = $Def.Id
@@ -672,6 +741,8 @@ if ($Task -eq 'Processing')
                         $Attempt = 0
                         $Succeeded = $false
                         $LastError = $null
+                        $LastException = $null
+                        $Classified = $false
                         $MetricQuery = $null
 
                         while (-not $Succeeded -and $Attempt -le $CallMaxRetries)
@@ -697,6 +768,7 @@ if ($Task -eq 'Processing')
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
+                                    $LastException = $_.Exception
                                     if ($LastError -match '429|throttl|TooManyRequests|rate limit')
                                     {
                                         $Throttled = $true
@@ -716,6 +788,7 @@ if ($Task -eq 'Processing')
                                 # Timed out: stop the hung job and treat as a failed attempt.
                                 $TimedOut = $true
                                 $LastError = ("Timed out after {0}s" -f $CallTimeoutSeconds)
+                                $LastException = $null
                                 Stop-Job -Job $Job -ErrorAction SilentlyContinue
                                 Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                             }
@@ -752,6 +825,9 @@ if ($Task -eq 'Processing')
                         if (-not $Succeeded)
                         {
                             $Request.BadRequest = $BadRequest
+                            # Its subscription's metrics are incomplete only when a re-run can fix it.
+                            $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $TimedOut -Throttled $Throttled -Exception $LastException
+                            $Classified = $true
                             throw ("Get-AzMetric failed after {0} attempt(s): {1}" -f $CallAttempts, $LastError)
                         }
 
@@ -760,6 +836,8 @@ if ($Task -eq 'Processing')
                     }
                     catch
                     {
+                        # Any other failure of the request is read the same way.
+                        if (-not $Classified) { $Request.Incomplete = Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $_.Exception }
                         if ($CallOutcome -eq 'Success') { $CallOutcome = 'Error' }
                         $Request.ErrorMessage = $_.Exception.Message
                     }
@@ -911,7 +989,7 @@ if ($Task -eq 'Processing')
                 if ($GroupDefs.Count -eq 1)
                 {
                     $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $GroupDefs[0].MetricName -Kind 'Request'
-                    if (-not $Request.Succeeded -and -not $Request.BadRequest)
+                    if (-not $Request.Succeeded -and $Request.Incomplete)
                     {
                         $FailedGroupIds.Add([string]$GroupDefs[0].Id)
                     }
@@ -925,7 +1003,7 @@ if ($Task -eq 'Processing')
                     # reports this time even when it is recorded after a fallback request
                     # for another metric of the group.
                     $GroupSeconds = $CallStopwatch.Elapsed.TotalSeconds
-                    if (-not $Request.Succeeded -and -not $Request.BadRequest)
+                    if (-not $Request.Succeeded -and $Request.Incomplete)
                     {
                         $FailedGroupIds.Add([string]$GroupDefs[0].Id)
                     }
@@ -967,7 +1045,7 @@ if ($Task -eq 'Processing')
                             # requested on its own too. Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
-                            if (-not $SingleRequest.Succeeded -and -not $SingleRequest.BadRequest)
+                            if (-not $SingleRequest.Succeeded -and $SingleRequest.Incomplete)
                             {
                                 $FailedGroupIds.Add([string]$Def.Id)
                             }
@@ -1069,8 +1147,8 @@ if ($Task -eq 'Processing')
         }
     }
 
-    # A subscription with a request that still failed after its retries (not
-    # BadRequest) is metrics incomplete: one entry in $Global:MetricsFailedSubs,
+    # A subscription with a request that still failed after its retries, for a
+    # reason a re-run can fix, is metrics incomplete: one entry in $Global:MetricsFailedSubs,
     # as for metrics skipped for the sign-in, with Complete = $false so the wrapper
     # tells the two apart. The wrapper (or a direct run) lists it at the end of the
     # run with the command that collects it again, and exits 3; the failed records

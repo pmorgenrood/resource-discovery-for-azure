@@ -103,6 +103,7 @@ function Get-AzMetric
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        'Forbidden' { throw "Operation returned an invalid status code 'Forbidden'" }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -110,6 +111,13 @@ function Get-AzMetric
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'ServiceUnavailable' { throw "Operation returned an invalid status code 'ServiceUnavailable'" }
         'Throttled' { throw "Operation returned an invalid status code 'TooManyRequests'" }
+        'Unauthorized' { throw "Operation returned an invalid status code 'Unauthorized'" }
+        'Forbidden' { throw "Operation returned an invalid status code 'Forbidden'" }
+        'NotFound' { throw "Operation returned an invalid status code 'NotFound'" }
+        'Status403' { throw [System.Net.Http.HttpRequestException]::new('The client has no access.', $null, [System.Net.HttpStatusCode]::Forbidden) }
+        'Status404' { throw [System.Net.Http.HttpRequestException]::new('The resource is gone.', $null, [System.Net.HttpStatusCode]::NotFound) }
+        'Status503' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        'NoStatus' { throw 'The connection was closed before the answer came.' }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -758,6 +766,36 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
+    It 'records it when a single-metric request fails on every attempt with an error a re-run can fix (<SingleError>)' -ForEach @(@{ SingleError = 'Status503' }, @{ SingleError = 'NoStatus' }) {
+        # A server error, or an error whose HTTP status cannot be read.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-fixable-' + $SingleError) -SingleError $SingleError
+
+        $Entries = @($Global:MetricsFailedSubs)
+        $Entries.Count | Should -Be 1
+        $Entries[0].Id | Should -Be $script:SubscriptionId
+        $Entries[0].Complete | Should -BeFalse
+        $Run.Calls.Count | Should -Be 8
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
+    }
+
+    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }) {
+        # No access or a resource that is gone fails the same way on every run.
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-client-' + $SingleError) -SingleError $SingleError
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        # The retries and the error records are unchanged.
+        $Run.Calls.Count | Should -Be 8
+        $Run.Records.Count | Should -Be 2
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
+    }
+
+    It 'does not record it when the grouped request fails on every attempt with a client error' {
+        $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'group-client-forbidden' -MultiError 'Forbidden'
+
+        @($Global:MetricsFailedSubs).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+    }
+
     It 'does not record it when the request for a metric Azure rejects fails with BadRequest' {
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteDisk) -RunName 'fallback-single-badrequest' -Invalid 'disk-incomplete|Composite Disk Write Bytes/sec'
 
@@ -765,5 +803,53 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Errors = @($Run.Records | Where-Object { $_.MetricError })
         $Errors.Count | Should -Be 1
         $Errors[0].Metric | Should -Be 'Composite Disk Write Bytes/sec'
+    }
+}
+
+Describe 'Metrics.ps1 failures that a re-run can fix' {
+    BeforeAll {
+        # The helpers live inside the parallel block of Metrics.ps1, so they are
+        # lifted from its AST and defined here as written.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:MetricsScript, [ref]$null, [ref]$null)
+        $script:HelperNames = @('Test-MetricBadRequest', 'Get-MetricErrorStatus', 'Test-MetricRerunCanFix')
+        $script:Helpers = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -in $script:HelperNames }, $true))
+        foreach ($Helper in $script:Helpers)
+        {
+            Set-Item -Path ('function:script:' + $Helper.Name) -Value $Helper.Body.GetScriptBlock()
+        }
+
+        function script:New-StatusError
+        {
+            param([System.Net.HttpStatusCode]$Status)
+            [System.Net.Http.HttpRequestException]::new('Azure answered.', $null, $Status)
+        }
+    }
+
+    It 'finds each helper once' {
+        @($script:Helpers | ForEach-Object { $_.Name } | Sort-Object) | Should -Be @($script:HelperNames | Sort-Object)
+    }
+
+    It 'counts a timeout and throttling' {
+        Test-MetricRerunCanFix -TimedOut $true -Throttled $false -Exception $null | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $true -Exception ([System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")) | Should -BeTrue
+    }
+
+    It 'counts a server error and an error whose status cannot be read' {
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status InternalServerError) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status GatewayTimeout) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'ServiceUnavailable'")) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new('The connection was reset.')) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $null | Should -BeTrue
+    }
+
+    It 'does not count a client error' {
+        foreach ($Status in @('BadRequest', 'Unauthorized', 'Forbidden', 'NotFound', 'Conflict'))
+        {
+            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception (New-StatusError -Status $Status) | Should -BeFalse -Because $Status
+            Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception ([System.Exception]::new("Operation returned an invalid status code '$Status'")) | Should -BeFalse -Because $Status
+        }
+        # A client error wrapped in a server error is still the client's.
+        $Wrapped = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status BadRequest), [System.Net.HttpStatusCode]::InternalServerError)
+        Test-MetricRerunCanFix -TimedOut $false -Throttled $false -Exception $Wrapped | Should -BeFalse
     }
 }
