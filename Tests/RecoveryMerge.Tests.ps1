@@ -1505,4 +1505,3 @@ Describe 'Merge-RecoveryData with no report generator next to it' {
         Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'nothing is written before the stop'
     }
 }
-
