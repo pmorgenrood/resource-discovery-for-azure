@@ -16,8 +16,11 @@
 function Get-MaskedIdPattern
 {
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $Scope = '(/subscriptions/(prod|nonprod)_(sub_)?' + $Guid + '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $Guid + ')?)?'
-    $Name = '((prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '|\$system)'
+    # Tokens are written in lower case, so the token parts match letter for
+    # letter ((?-i:...)) even under PowerShell's case-blind -match; Azure's
+    # keywords, namespaces and types keep any case.
+    $Scope = '(/subscriptions/(?-i:(prod|nonprod)_(sub_)?' + $Guid + ')(/resourcegroups/(?-i:(prod|nonprod)_(rg_)?(mc_)?' + $Guid + '))?)?'
+    $Name = '((?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + ')|\$system)'
     $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)+'
     return '^' + $Scope + $Block + '/?$'
 }

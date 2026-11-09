@@ -24,6 +24,7 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'consumption-only token'; Id = '/subscriptions/prod_sub_11111111-2222-4333-8444-555555555555/resourcegroups/prod_rg_mc_11111111-2222-4333-8444-555555555555/providers/microsoft.compute/disks/prod_aks_11111111-2222-4333-8444-555555555555' }
         @{ Label = '$system name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.servicebus/namespaces/{T}/topics/$system' }
         @{ Label = 'tenant-scope id with a type and no name'; Id = '/providers/Microsoft.Capacity/reservationOrders' }
+        @{ Label = 'resource id with Azure keywords in mixed case'; Id = '/subscriptions/{T}/resourceGroups/{T}/providers/Microsoft.Compute/virtualMachines/{T}' }
         @{ Label = 'stand-in path of an id that is not an ARM path'; Id = '/providers/rda.noid/ids/{T}' }
         @{ Label = 'tenant-scope id with a trailing slash'; Id = '/providers/Microsoft.Capacity/reservationOrders/{T}/' }
     ) {
@@ -42,6 +43,8 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'a real name after an empty segment'; Id = '/providers/microsoft.capacity/reservationorders//reservations/res-a' }
         @{ Label = 'a real name before a trailing slash'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/' }
         @{ Label = 'an empty segment inside the path'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
+        @{ Label = 'a token in upper case'; Id = '/subscriptions/PROD_11111111-2222-4333-8444-555555555555/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}' }
+        @{ Label = 'a name token in upper case'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/NONPROD_11111111-2222-4333-8444-555555555555' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T)
         $Masked | Should -Not -Match $script:Pattern
