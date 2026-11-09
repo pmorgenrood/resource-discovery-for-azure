@@ -431,6 +431,12 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Text | Should -Match 'no usable token'
     }
 
+    It 'labels a 0-resource subscription whose resource groups can be listed for what the probe proved, not as empty' {
+        $Lines = Get-RunSummaryLogContent -Visible 1 -Excluded 0 -Eligible 1 -Processed 1 -Skipped 0 -EmptyGenuinelyEmpty @([pscustomobject]@{ Name = 's'; Id = '44444444-4444-4444-4444-444444444444' })
+        @($Lines | Where-Object { $_ -eq '  0 resources - groups listable, report empty: 1' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -match '0 resources - empty\s*:' }) | Should -BeNullOrEmpty
+    }
+
     It 'drops TenantID / SubscriptionID / InventoryRoot from the parameter list' {
         $Params = @{
             TenantID        = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'

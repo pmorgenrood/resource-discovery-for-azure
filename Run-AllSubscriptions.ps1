@@ -1819,9 +1819,10 @@ if ($SubResourceCounts.Count -gt 0)
 }
 if ($EmptySubs.Count -gt 0)
 {
-    # A sub that returned 0 resources is either a permission gap (no role on the
-    # sub) or genuinely empty. Probe each one to label it precisely so the user
-    # knows whether to fix access or ignore it. The probe is one cheap ARM call
+    # A sub that returned 0 resources is a permission gap (no role on the sub),
+    # or one whose resource groups the identity can list (empty, or a role that
+    # cannot read the resources). Probe each one to label it so the user knows
+    # whether to fix access or check Reader. The probe is one cheap ARM call
     # per empty sub (only empties, so no cost on normal runs).
     $NoAccessSubs = @()
     $GenuinelyEmptySubs = @()
@@ -1862,7 +1863,7 @@ if ($EmptySubs.Count -gt 0)
     # outlives the console/transcript and can be attached to a ticket or e-mail.
     # This is the durable record behind the on-screen labels above: which
     # 0-resource subs are a permission gap (fix: grant Reader, re-run -Resume)
-    # vs genuinely empty (no action). Reuses the run's $DiagFile if one already
+    # vs resource groups listable (empty, or check Reader). Reuses the run's $DiagFile if one already
     # exists (e.g. from a failure), otherwise creates one.
     if ($null -eq $DiagFile)
     {

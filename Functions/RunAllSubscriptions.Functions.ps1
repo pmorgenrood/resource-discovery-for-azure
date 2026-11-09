@@ -160,9 +160,10 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
     }
 }
 
-# Classify a subscription that returned 0 resources as either a genuine
-# permission gap (the signed-in identity has NO role on the subscription) or a
-# genuinely empty subscription. This distinction is impossible to make from the
+# Classify a subscription that returned 0 resources as a permission gap (the
+# signed-in identity has NO role on the subscription), or one whose resource
+# groups it can list (most likely empty; a role that reads resource groups only
+# looks the same, so the label asks to check Reader). This is impossible to make from the
 # resource-discovery phase alone: Azure Resource Graph queries at the tenant
 # level and returns reduced/empty results rather than a 403 when the identity
 # lacks a role, so "no access" and "empty" look identical there.
@@ -1064,7 +1065,9 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
-    $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
+    # Only the resource groups were proven listable: empty, or a role that
+    # cannot read the resources (the console asks to check Reader).
+    $Lines.Add(('  0 resources - groups listable, report empty: {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
 
     # --- Health --------------------------------------------------------------
