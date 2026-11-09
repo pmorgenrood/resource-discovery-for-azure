@@ -89,6 +89,154 @@ function Convert-RevealString
         })
 }
 
+# Whether one scan window of a .json or .csv member holds the sentinel as a
+# WHOLE value: a JSON string value exactly equal to it, or a CSV cell exactly
+# equal to it (quoted or not). The bare word in other text (a longer string,
+# a JSON key, part of a quoted CSV cell) does not count.
+#   $AtStart      - the window starts at the start of the member
+#   $AtEnd        - the window ends at the end of the member
+#   $QuotesBefore - CSV only: the number of '"' in the member before the window
+# A match that touches the start or end of a window that is not the member's
+# start or end is skipped: the scan carries the end of each window into the
+# next one, so such a match is checked there with the characters around it.
+function Test-RevealSentinelInText
+{
+    param(
+        [string] $Text,
+        [ValidateSet('Json', 'Csv')]
+        [string] $Kind,
+        [bool]   $AtStart,
+        [bool]   $AtEnd,
+        [long]   $QuotesBefore = 0
+    )
+    if (-not $Text.Contains('obfuscated')) { return $false }
+
+    # The value -Obfuscate writes for an id or name it could not mask: the word
+    # 'obfuscated', or 'obfuscated_' + a GUID. It has no dictionary entry.
+    $Sentinel = 'obfuscated(?:_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?'
+
+    if ($Kind -eq 'Json')
+    {
+        # A string value: an opening quote that is not escaped, the sentinel, a
+        # closing quote, then (after any white space) the ',' ']' or '}' that
+        # ends a value. A key is followed by ':' instead.
+        $Pattern = '(?<!\\)"' + $Sentinel + '"(?=\s*[,\]}])'
+        foreach ($M in [regex]::Matches($Text, $Pattern))
+        {
+            if ($M.Index -eq 0 -and -not $AtStart) { continue }
+            return $true
+        }
+        return $false
+    }
+
+    # CSV: the cell must start at the start of a line or after ',', end at ','
+    # or the end of a line, and lie outside a quoted field (an even number of
+    # '"' before it in the member; an escaped '""' keeps the count even).
+    $Pattern = '(?<q>"?)' + $Sentinel + '\k<q>'
+    $Counted = 0
+    $Quotes = $QuotesBefore
+    foreach ($M in [regex]::Matches($Text, $Pattern))
+    {
+        $Start = $M.Index
+        $End = $M.Index + $M.Length
+        if ($Start -eq 0)
+        {
+            if (-not $AtStart) { continue }
+        }
+        elseif (@(',', "`n", "`r") -notcontains [string]$Text[$Start - 1]) { continue }
+        if ($End -eq $Text.Length)
+        {
+            if (-not $AtEnd) { continue }
+        }
+        elseif (@(',', "`n", "`r") -notcontains [string]$Text[$End]) { continue }
+
+        $Between = $Text.Substring($Counted, $Start - $Counted)
+        $Quotes += $Between.Length - $Between.Replace('"', '').Length
+        $Counted = $Start
+        if ($Quotes % 2 -eq 0) { return $true }
+    }
+    return $false
+}
+
+# Whether a report zip holds any masked value: a prod_/nonprod_ token in any
+# member, or the 'obfuscated' sentinel as a whole value in a .json or .csv
+# member (see Test-RevealSentinelInText). Used when the dictionary gives
+# nothing to reveal, to tell a report with no masked values (a subscription
+# with no resources) from one revealed with the wrong dictionary or -Fields.
+function Test-RevealZipHasMaskedValue
+{
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $TokenPattern
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try
+    {
+        # Each entry is read in fixed chunks of 64 KB characters, not line by
+        # line: Inventory_*.json and Metrics_*.json are written on one line, so a
+        # line can be the whole entry. Each chunk is scanned with the last
+        # ($MaxTokenLength - 1) characters of the previous chunk in front of it,
+        # so a value split across two chunks is still found. $MaxTokenLength
+        # (128) covers 'nonprod_' + a type hint of up to 83 characters + '_' + a
+        # GUID; the longest hint the tool writes is 'databricks'. The quoted
+        # sentinel with a GUID is 49 characters. The scan stops at the first
+        # masked value, so at most one chunk plus the carry-over is held in memory.
+        $ChunkLength = 65536
+        $MaxTokenLength = 128
+        $CarryLength = $MaxTokenLength - 1
+        $Buffer = [char[]]::new($CarryLength + $ChunkLength)
+        foreach ($Entry in $Archive.Entries)
+        {
+            $Kind = switch ([System.IO.Path]::GetExtension($Entry.FullName).ToLowerInvariant())
+            {
+                '.json' { 'Json' }
+                '.csv' { 'Csv' }
+                default { $null }
+            }
+            $Reader = [System.IO.StreamReader]::new($Entry.Open())
+            try
+            {
+                $Kept = 0
+                $AtStart = $true
+                $QuotesBefore = [long]0
+                while ($true)
+                {
+                    $Read = $Reader.ReadBlock($Buffer, $Kept, $ChunkLength)
+                    $Filled = $Kept + $Read
+                    if ($Filled -eq 0) { break }
+                    # ReadBlock returns less than asked only at the end of the
+                    # stream. A full read is followed by one more, so a stream
+                    # that ends on a chunk boundary rescans its carry-over with
+                    # $AtEnd set.
+                    $AtEnd = $Read -lt $ChunkLength
+                    $Text = [string]::new($Buffer, 0, $Filled)
+                    if ([regex]::IsMatch($Text, $TokenPattern)) { return $true }
+                    if ($null -ne $Kind -and (Test-RevealSentinelInText -Text $Text -Kind $Kind -AtStart $AtStart -AtEnd $AtEnd -QuotesBefore $QuotesBefore))
+                    {
+                        return $true
+                    }
+                    if ($AtEnd) { break }
+                    $Kept = [Math]::Min($CarryLength, $Filled)
+                    if ($Kind -eq 'Csv')
+                    {
+                        $Dropped = $Text.Substring(0, $Filled - $Kept)
+                        $QuotesBefore += $Dropped.Length - $Dropped.Replace('"', '').Length
+                    }
+                    [Array]::Copy($Buffer, $Filled - $Kept, $Buffer, 0, $Kept)
+                    $AtStart = $false
+                }
+            }
+            finally { $Reader.Dispose() }
+        }
+    }
+    finally
+    {
+        $Archive.Dispose()
+    }
+    return $false
+}
+
 
 # =============================================================================
 # Invoke-RdaReveal
@@ -286,46 +434,7 @@ function Invoke-RdaReveal
         # every subscription. A report that does carry masked values with no
         # mapping for the selected fields is still an error (wrong dictionary
         # or wrong -Fields).
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $HasToken = $false
-        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZip)
-        try
-        {
-            # Each entry is read in fixed chunks of 64 KB characters, not line by
-            # line: Inventory_*.json and Metrics_*.json are written on one line,
-            # so a line can be the whole entry. Each chunk is scanned with the
-            # last ($MaxTokenLength - 1) characters of the previous chunk in
-            # front of it, so a token split across two chunks is still found.
-            # $MaxTokenLength (128) covers 'nonprod_' + a type hint of up to 83
-            # characters + '_' + a GUID; the longest hint the tool writes is
-            # 'databricks'. The scan stops at the first token, so at most one
-            # chunk plus the carry-over is held in memory.
-            $ChunkLength = 65536
-            $MaxTokenLength = 128
-            $CarryLength = $MaxTokenLength - 1
-            $Buffer = [char[]]::new($CarryLength + $ChunkLength)
-            foreach ($Entry in $Archive.Entries)
-            {
-                $Reader = [System.IO.StreamReader]::new($Entry.Open())
-                try
-                {
-                    $Kept = 0
-                    while (($Read = $Reader.ReadBlock($Buffer, $Kept, $ChunkLength)) -gt 0)
-                    {
-                        $Filled = $Kept + $Read
-                        if ([regex]::IsMatch([string]::new($Buffer, 0, $Filled), $TokenPattern)) { $HasToken = $true; break }
-                        $Kept = [Math]::Min($CarryLength, $Filled)
-                        [Array]::Copy($Buffer, $Filled - $Kept, $Buffer, 0, $Kept)
-                    }
-                }
-                finally { $Reader.Dispose() }
-                if ($HasToken) { break }
-            }
-        }
-        finally
-        {
-            $Archive.Dispose()
-        }
+        $HasToken = Test-RevealZipHasMaskedValue -Path $InputZip -TokenPattern $TokenPattern
 
         if ($HasToken)
         {

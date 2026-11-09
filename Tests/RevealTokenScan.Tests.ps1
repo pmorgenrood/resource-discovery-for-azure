@@ -159,3 +159,102 @@ Describe 'Invoke-RdaReveal with a dictionary that maps nothing' {
         Test-Path -LiteralPath (Join-Path $script:WorkDir 'oneline_clean_out.partial.zip') | Should -BeFalse
     }
 }
+
+# -Obfuscate writes 'obfuscated' or 'obfuscated_<guid>' for an id or name it
+# could not mask, with no dictionary entry. The scan only knew prod_/nonprod_
+# tokens, so a report whose only masked values were such sentinels was copied
+# as having no masked values. The sentinel now counts too, but only as a whole
+# value in a data file: a JSON string value equal to it in a .json member, or
+# a CSV cell equal to it in a .csv member. The bare word in other text (the
+# HTML report's privacy banner, a longer string, a key, part of a quoted cell)
+# does not count.
+Describe 'Invoke-RdaReveal with a dictionary that maps nothing: the obfuscated sentinel' {
+    BeforeAll {
+        $script:SentinelGuid = 'obfuscated_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+        # Writes a zip with the given entries (an ordered name -> text map).
+        function Build-EntriesZip
+        {
+            param([string]$Name, [System.Collections.Specialized.OrderedDictionary]$Entries)
+            $Path = Join-Path $script:WorkDir $Name
+            $Archive = [System.IO.Compression.ZipFile]::Open($Path, 'Create')
+            try
+            {
+                foreach ($Key in $Entries.Keys)
+                {
+                    $Entry = $Archive.CreateEntry($Key, [System.IO.Compression.CompressionLevel]::Fastest)
+                    $Writer = [System.IO.StreamWriter]::new($Entry.Open())
+                    try { $Writer.Write([string]$Entries[$Key]) } finally { $Writer.Dispose() }
+                }
+            }
+            finally { $Archive.Dispose() }
+            return $Path
+        }
+
+        function Assert-Fails([string]$Zip)
+        {
+            $Out = $Zip -replace '\.zip$', '_out.zip'
+            { Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null } |
+                Should -Throw '*Nothing to reveal: the selected field*'
+            Test-Path -LiteralPath $Out | Should -BeFalse
+        }
+
+        function Assert-CopiedUnchanged([string]$Zip)
+        {
+            $Out = $Zip -replace '\.zip$', '_out.zip'
+            Invoke-RdaReveal -InputZip $Zip -DictionaryPath $script:EmptyDict -OutputZip $Out 6>$null
+            (Get-FileHash -LiteralPath $Out).Hash | Should -Be (Get-FileHash -LiteralPath $Zip).Hash
+        }
+    }
+
+    It 'fails on a JSON value that is exactly "obfuscated"' {
+        Assert-Fails (Build-EntriesZip -Name 's_json_word.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = '{"VMDisk":[{"Name":"disk","AssociatedResource":"obfuscated"}]}'
+                }))
+    }
+
+    It 'fails on a JSON value that is exactly "obfuscated_<guid>", pretty printed' {
+        Assert-Fails (Build-EntriesZip -Name 's_json_guid.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = "{`n  `"Resources`": [`n    {`n      `"ID`": `"$($script:SentinelGuid)`"`n    }`n  ]`n}"
+                }))
+    }
+
+    It 'fails on a CSV cell that is exactly obfuscated, unquoted and quoted' {
+        Assert-Fails (Build-EntriesZip -Name 's_csv_bare.zip' -Entries ([ordered]@{
+                    'Consumption_test.csv' = "ResourceId,ReservationId,Cost`n/x,obfuscated,1.5`n"
+                }))
+        Assert-Fails (Build-EntriesZip -Name 's_csv_quoted.zip' -Entries ([ordered]@{
+                    'Consumption_test.csv' = "`"ResourceId`",`"ReservationId`",`"Cost`"`n`"/x`",`"$($script:SentinelGuid)`",`"1.5`""
+                }))
+    }
+
+    It 'fails on a JSON sentinel value split across two chunks' {
+        $Pad = '{"Name":"' + ('a' * ($script:ChunkLength - 20)) + '","ID":"'
+        Assert-Fails (Build-EntriesZip -Name 's_json_straddle.zip' -Entries ([ordered]@{
+                    'Inventory_test.json' = $Pad + $script:SentinelGuid + '"}'
+                }))
+    }
+
+    It 'fails on a CSV that ends with a sentinel cell exactly on a chunk boundary' {
+        $Head = "ResourceId,ReservationId`n/" + ('a' * $script:ChunkLength) + ','
+        $Text = $Head + $script:SentinelGuid
+        $Text = $Text.Substring($Text.Length % $script:ChunkLength)
+        $Text.Length % $script:ChunkLength | Should -Be 0
+        $Text | Should -Match ',obfuscated_[0-9a-f-]{36}$'
+        Assert-Fails (Build-EntriesZip -Name 's_csv_boundary.zip' -Entries ([ordered]@{ 'Consumption_test.csv' = $Text }))
+    }
+
+    It 'copies a report whose only "obfuscated" is ordinary text unchanged' {
+        Assert-CopiedUnchanged (Build-EntriesZip -Name 's_text.zip' -Entries ([ordered]@{
+                    'ResourcesReport_test.html' = '<p class="banner">This report is obfuscated. Names show as "obfuscated" where they could not be masked.</p><td>obfuscated</td>'
+                    'Inventory_test.json'       = '{"Note":"this report is obfuscated","obfuscated":1,"Quote":"say \"obfuscated\", then","Tail":"obfuscated_"}'
+                    'Consumption_test.csv'      = "A,B,C`n`"a,obfuscated,b`",not obfuscated,`"{`"`"ResourceUri`"`":`"`"obfuscated`"`"}`"`nobfuscatedx,xobfuscated,`"`"`"obfuscated`"`"`"`n"
+                    'Readme.txt'                = 'obfuscated'
+                }))
+    }
+
+    It 'copies a CSV whose quoted cell spans a chunk boundary and holds ,obfuscated, unchanged' {
+        $Text = "A,B`n`"" + ('a' * $script:ChunkLength) + ',obfuscated,' + 'b",c' + "`n"
+        Assert-CopiedUnchanged (Build-EntriesZip -Name 's_csv_span.zip' -Entries ([ordered]@{ 'Consumption_test.csv' = $Text }))
+    }
+}
