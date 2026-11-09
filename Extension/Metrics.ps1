@@ -1551,7 +1551,6 @@ function Add-MetricRecord
                                 Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
                             }
 
-
                             if ($Succeeded)
                             {
                                 break
