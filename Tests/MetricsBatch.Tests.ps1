@@ -1047,6 +1047,21 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         @($Result.Registered) | Should -Be @('sub-b')
     }
 
+    It 'reads, asks and registers nothing outside AzureCloud, where the batch API is not used' {
+        foreach ($Cloud in 'AzureChinaCloud', 'AzureUSGovernment', $null)
+        {
+            Mock Get-AzContext { if ($Cloud) { [pscustomobject]@{ Environment = [pscustomobject]@{ Name = $Cloud } } } }
+            $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-a', 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }
+
+            $Result.NotRegistered.Count | Should -Be 0 -Because $Cloud
+            $Result.Registered.Count | Should -Be 0 -Because $Cloud
+        }
+        $script:Prompts.Count | Should -Be 0
+        Should -Invoke Get-RdaInsightsProviderState -Times 0 -Exactly
+        Should -Invoke Register-RdaInsightsProvider -Times 0 -Exactly
+        Should -Invoke Write-Host -ParameterFilter { $Object -like '*not AzureCloud*Microsoft.Insights is not checked*' } -Times 3 -Exactly
+    }
+
     It 'lets the batch call decide for a subscription whose state cannot be read' {
         $script:States['sub-b'] = 'Unknown'
         $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Prompts.Add($P); 'y' }

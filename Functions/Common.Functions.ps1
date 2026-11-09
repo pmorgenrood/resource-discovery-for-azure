@@ -387,6 +387,13 @@ function Invoke-RdaInsightsProviderPreflight
     $Ids = @($SubscriptionIds | Where-Object { -not [string]::IsNullOrEmpty($_) } | Sort-Object -Unique)
     $Result = [pscustomobject]@{ Registered = [System.Collections.Generic.List[string]]::new(); NotRegistered = [System.Collections.Generic.List[string]]::new(); Asked = $false; Answer = $null }
     if ($Ids.Count -eq 0) { return $Result }
+    # Metrics.ps1 batches only in AzureCloud; elsewhere there is nothing to check, ask or register.
+    $Environment = try { [string](Get-AzContext -ErrorAction Stop).Environment.Name } catch { '' }
+    if ($Environment -ne 'AzureCloud')
+    {
+        Write-Host ('-UseMetricsBatch: the Azure environment is ''{0}'', not AzureCloud; the batch API is not used there, so Microsoft.Insights is not checked.' -f $Environment) -ForegroundColor DarkGray
+        return $Result
+    }
     if ($null -eq $Interactive) { $Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected }
 
     Write-Host ('-UseMetricsBatch: checking the Microsoft.Insights resource provider on {0} subscription(s)...' -f $Ids.Count) -ForegroundColor Cyan
