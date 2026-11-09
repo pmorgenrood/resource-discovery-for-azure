@@ -884,7 +884,8 @@ if ($ScopeForProbe.Count -gt 0)
 # them on the per-resource path for this whole run, even if the provider gets
 # registered meanwhile; the next run reads the state again.
 $MetricsBatchPerCallIds = @()
-$InsightsScope = @($Subscriptions | ForEach-Object { [string]$_.Id } | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })
+$RunSubscriptionIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+$InsightsScope = @($RunSubscriptionIds | Where-Object { -not ($Resume -and $CompletedIds -contains $_) })
 if ($UseMetricsBatch -and -not $SkipMetrics -and $InsightsScope.Count -gt 0)
 {
     $MetricsBatchPerCallIds = @((Invoke-RdaInsightsProviderPreflight -SubscriptionIds $InsightsScope).NotRegistered)
