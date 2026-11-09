@@ -847,24 +847,86 @@ Describe 'Callers use the message and the switch' {
         else { $Line[0] | Should -Be 'Network resources skipped: 3 (network costs still come from the consumption data; -IncludeNetworkResources keeps them)' }
     }
 
-    It 'the stream worker builds its line from it, loads Common.Functions.ps1 and reports the skipped count' {
-        $script:Stream | Should -Match 'Get-RdaResourceCountMessage'
+    # The count line itself (Get-RdaResourceCountMessage in the wrapper, the
+    # stream worker and the direct run) is run by the count-line tests above.
+    It 'the stream worker loads Common.Functions.ps1' {
         $script:Stream | Should -Match "Functions/Common\.Functions\.ps1"
-        $script:Stream | Should -Match 'Skipped\s*=\s*\$'
     }
 
-    It 'the direct run logs it' {
-        $script:Inventory | Should -Match 'Get-RdaResourceCountMessage'
+    It 'every per-subscription row (2 in the wrapper, 1 in the stream worker) carries the skipped count, unknown kept as unknown' {
+        # Each '$SkipCount = ...' statement and the row it feeds, lifted so
+        # the real code runs.
+        $Blocks = @(@($script:WrapperAst, $script:StreamAst) | ForEach-Object {
+                $_.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq '$SkipCount' }, $true)
+            } | ForEach-Object {
+                $Statements = @($_.Parent.Statements)
+                $Row = $Statements[[array]::IndexOf($Statements, $_) + 1]
+                $Row.Left.Extent.Text | Should -BeIn @('$SubResourceCounts', '$ResourceCounts') -Because 'the row is written right after the count'
+                [scriptblock]::Create($_.Extent.Text + "`n" + $Row.Extent.Text)
+            })
+        $Blocks.Count | Should -Be 3
+        # The lifted rows read these through dynamic scope.
+        $Sub = [pscustomobject]@{ Name = 'sub-a'; Id = $script:Sub }
+        Set-Variable -Name SubName -Value 'sub-a'
+        Set-Variable -Name SubId -Value $script:Sub
+        Set-Variable -Name ResCount -Value 0
+        foreach ($Block in $Blocks)
+        {
+            foreach ($Skipped in @(4, $null))
+            {
+                $SubResourceCounts = @()
+                $ResourceCounts = @()
+                $Global:SkippedResourceCount = $Skipped
+                . $Block
+                $Rows = @($SubResourceCounts + $ResourceCounts)
+                $Rows.Count | Should -Be 1
+                if ($null -eq $Skipped) { $null -eq $Rows[0].Skipped | Should -BeTrue -Because "a failed count query is unknown in the row: $Block" }
+                else { $Rows[0].Skipped | Should -Be 4 -Because "the row carries the skipped count: $Block" }
+            }
+        }
     }
 
-    It '-IncludeNetworkResources is a switch on all three scripts and is passed on' {
+    It '-IncludeNetworkResources is a switch on all three scripts' {
         foreach ($Text in @($script:Inventory, $script:Wrapper, $script:Stream))
         {
             $Text | Should -Match '\[switch\]\s*\$IncludeNetworkResources'
         }
-        $script:Wrapper | Should -Match "InventoryPassthrough\['IncludeNetworkResources'\]"
-        $script:Wrapper | Should -Match 'WorkerArgs\.IncludeNetworkResources'
-        $script:Stream | Should -Match "InventoryPassthrough\['IncludeNetworkResources'\]"
+    }
+
+    It '-IncludeNetworkResources is passed on only when it is set (<Target> in the <Script>, switch <On>)' -TestCases @(
+        @{ Script = 'wrapper'; Target = 'InventoryPassthrough'; On = $true }
+        @{ Script = 'wrapper'; Target = 'InventoryPassthrough'; On = $false }
+        @{ Script = 'wrapper'; Target = 'WorkerArgs'; On = $true }
+        @{ Script = 'wrapper'; Target = 'WorkerArgs'; On = $false }
+        @{ Script = 'stream worker'; Target = 'InventoryPassthrough'; On = $true }
+        @{ Script = 'stream worker'; Target = 'InventoryPassthrough'; On = $false }
+    ) {
+        param($Script, $Target, $On)
+        $Ast = if ($Script -eq 'wrapper') { $script:WrapperAst } else { $script:StreamAst }
+        # Every 'if (...) { $<Target>... = ... }' statement, lifted so the
+        # real code runs.
+        $Ifs = @($Ast.FindAll({
+                    param($Node)
+                    if ($Node -isnot [System.Management.Automation.Language.IfStatementAst] -or $Node.Clauses.Count -ne 1 -or $null -ne $Node.ElseClause) { return $false }
+                    $Body = @($Node.Clauses[0].Item2.Statements)
+                    $Body.Count -eq 1 -and $Body[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Body[0].Left.Extent.Text -match ('^\$' + $Target + '(\[|\.)')
+                }, $true))
+        @($Ifs | Where-Object { $_.Clauses[0].Item2.Extent.Text -match 'IncludeNetworkResources' }).Count | Should -Be 1 -Because "the $Script sets it in one place"
+        # -IncludeNetworkResources on and every other switch off, or the other
+        # way round, so a line keyed to the wrong switch fails.
+        $Names = @($Ifs | ForEach-Object { $_.Clauses[0].Item1.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) } |
+                ForEach-Object { $_.VariablePath.UserPath } | Where-Object { $_ -ne 'PSBoundParameters' } | Select-Object -Unique)
+        $Names | Should -Contain 'IncludeNetworkResources'
+        foreach ($Name in $Names)
+        {
+            $Set = if ($Name -eq 'IncludeNetworkResources') { $On } else { -not $On }
+            Set-Variable -Name $Name -Value ([switch]$Set)
+        }
+        Set-Variable -Name $Target -Value @{}
+        foreach ($If in $Ifs) { . ([scriptblock]::Create($If.Extent.Text)) }
+        $Result = Get-Variable -Name $Target -ValueOnly
+        $Result.ContainsKey('IncludeNetworkResources') | Should -Be $On
+        if ($On) { $Result['IncludeNetworkResources'] | Should -BeTrue }
     }
 
     It 'the README''s wrapper summary names every switch the wrapper forwards' {
