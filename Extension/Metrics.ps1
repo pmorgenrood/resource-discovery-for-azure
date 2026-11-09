@@ -853,8 +853,8 @@ if ($Task -eq 'Processing')
     # lock (Monitor) on the array itself.
     $MetricRequestCounts = [long[]]::new(2)
 
-    # $MetricCount is the number of definitions to send, as it was when the batch
-    # loop counted definitions: with none to send, no group and no call is made.
+    # $MetricCount is $MetricDefs.Count, set above. The guard keeps a run with no
+    # definitions from building groups or making any Get-AzMetric call.
     if ($MetricCount -gt 0)
     {
         $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
@@ -1912,7 +1912,7 @@ function Add-MetricRecord
             $BatchDefCount = 0
 
             $BatchStopwatch.Stop()
-            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} call record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $MetricDiagnostics.Count)
+            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} metric definition record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $MetricDiagnostics.Count)
 
             if ($Obfuscate)
             {
@@ -1987,7 +1987,7 @@ function Add-MetricRecord
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
-        Write-MetricsDiag ("Non-success calls (where it got stuck):")
+        Write-MetricsDiag ("Non-success metric definitions (where it got stuck):")
         $DiagNonSuccess = @($DiagRecords | Where-Object { $_.Outcome -ne 'Success' })
         # A 404 (NotFound, not retried) on a resource Resource Graph lists as being deleted is said so.
         $DeletingStates = Get-MetricDeletingState -Resources $Resources -Ids @($DiagNonSuccess | Where-Object { $_.NotFound } | ForEach-Object { [string]$_.Id } | Select-Object -Unique)
@@ -2005,7 +2005,7 @@ function Add-MetricRecord
     if ($DiagRecords.Count -gt 0)
     {
         $Slowest = $DiagRecords | Sort-Object ElapsedSec -Descending | Select-Object -First 5
-        Write-MetricsDiag ("Slowest 5 calls:")
+        Write-MetricsDiag ("Slowest 5 metric definitions:")
         foreach ($rec in $Slowest)
         {
             Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6}) waited={7}s" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome, $rec.WaitedSec)
