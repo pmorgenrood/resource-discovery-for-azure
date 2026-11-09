@@ -468,6 +468,7 @@ Compress-Archive -Path ./* -DestinationPath "CompanyName_ResourcesReport_$(Get-D
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
 | `SkipConsumption` | Switch | Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front) | False | `-SkipConsumption` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
+| `ConsumptionMaxPages` | Integer | Most usage pages read for one subscription (about 1,000 rows each); at the limit the subscription's consumption is reported incomplete. `Run-AllSubscriptions.ps1` takes it too and passes it on. | 10000 | `-ConsumptionMaxPages 20000` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
 
 ### Metrics Lookback Window

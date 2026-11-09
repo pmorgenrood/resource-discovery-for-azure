@@ -54,7 +54,10 @@ param (
     # The parent's consumption window ('yyyy-MM-dd'), forwarded to every
     # ResourceInventory.ps1 so each collects the window the parent checked.
     [string] $ConsumptionWindowStart,
-    [string] $ConsumptionWindowEnd
+    [string] $ConsumptionWindowEnd,
+    # The parent's -ConsumptionMaxPages (0: not given), forwarded to every
+    # ResourceInventory.ps1. Last, so every earlier position stays.
+    [ValidateRange(0, [int]::MaxValue)][int] $ConsumptionMaxPages = 0
 )
 
 # ---------------------------------------------------------------------------
@@ -171,6 +174,7 @@ if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
+if ($ConsumptionMaxPages -gt 0) { $InventoryPassthrough['ConsumptionMaxPages'] = $ConsumptionMaxPages }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowStart)) { $InventoryPassthrough['ConsumptionWindowStart'] = $ConsumptionWindowStart }
 if (-not [string]::IsNullOrEmpty($ConsumptionWindowEnd)) { $InventoryPassthrough['ConsumptionWindowEnd'] = $ConsumptionWindowEnd }
 
