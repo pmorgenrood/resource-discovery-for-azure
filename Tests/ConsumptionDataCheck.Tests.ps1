@@ -275,6 +275,43 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Global:ConsumptionRecordCount | Should -Be 0
     }
 
+    It 'leaves in the consumption file only the rows it counts when a write fails part-way through a page: <Case>' -ForEach @(
+        @{ Case = 'on the first page'; FailAt = 2; Rows = 0 }
+        @{ Case = 'on a later page'; FailAt = 3; Rows = 1 }
+    ) {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        $script:Pages = 0
+        $script:FailAt = $FailAt
+        # A first page of one row, then a page of two rows.
+        Mock Get-UsageAggregates {
+            $script:Pages++
+            $Uri = '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-{0}'
+            if ($script:Pages -eq 1 -and $script:FailAt -eq 3) { return [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri ($Uri -f 0)); ContinuationToken = 'page-2' } }
+            [pscustomobject]@{ UsageAggregations = @((New-UsageRow -ResourceUri ($Uri -f 1)), (New-UsageRow -ResourceUri ($Uri -f 2))); ContinuationToken = $null }
+        }
+        # The real writer, which fails on the given row after the rows before it
+        # are in the file.
+        $script:CsvRows = 0
+        function Export-Csv
+        {
+            [CmdletBinding()]
+            param([Parameter(ValueFromPipeline = $true)]$InputObject, [Parameter(Position = 0)]$Path, $Encoding, [switch]$Append, [switch]$NoTypeInformation)
+            process
+            {
+                $script:CsvRows++
+                if ($script:CsvRows -eq $script:FailAt) { throw 'stand-in: there is not enough space on the disk' }
+                $InputObject | Microsoft.PowerShell.Utility\Export-Csv -Path $Path -Encoding utf8 -Append -NoTypeInformation
+            }
+        }
+        GetResorceConsumption
+        $script:CsvRows | Should -Be $FailAt
+        $Global:ConsumptionFailedSubs[0].Message | Should -Match 'not enough space on the disk'
+        $Global:ConsumptionFailedSubs[0].RecordsCollected | Should -Be $Rows
+        $Global:ConsumptionRecordCount | Should -Be $Rows
+        $Written = if (Test-Path -LiteralPath $Global:ConsumptionFileCsv) { @(Import-Csv -LiteralPath $Global:ConsumptionFileCsv) } else { @() }
+        $Written.Count | Should -Be $Rows
+    }
+
     It 'writes a usage row without additionalInfo when the caller runs under Set-StrictMode -Version Latest' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
         Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
