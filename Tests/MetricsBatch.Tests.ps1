@@ -1036,6 +1036,16 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         Should -Invoke Write-Host -ParameterFilter { $Object -like '*No one can answer a prompt*' } -Times 1 -Exactly
     }
 
+    It 'says it asked only when the question was shown and answered' {
+        $Failed = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) Write-Error 'PowerShell is in NonInteractive mode. Read and Prompt functionality is not available.' }
+        $Failed.Asked | Should -BeFalse
+        $Failed.Answer | Should -BeNullOrEmpty
+
+        $Shown = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'n' }
+        $Shown.Asked | Should -BeTrue
+        $Shown.Answer | Should -Be 'n'
+    }
+
     It 'waits for a subscription already being registered, without asking' {
         $script:States['sub-b'] = 'Registering'
         $script:Reads = 0

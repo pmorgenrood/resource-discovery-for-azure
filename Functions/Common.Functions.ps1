@@ -369,7 +369,8 @@ function Register-RdaInsightsProvider
 
 # The preflight. Reads every subscription's state, asks once for those not
 # registered, registers on "y" and waits for them on one deadline. Returns
-# { Registered; NotRegistered; Asked; Answer }: Registered holds the ids that
+# { Registered; NotRegistered; Asked; Answer } (Asked: the question was shown
+# and answered): Registered holds the ids that
 # batch may use (registered, or whose state could not be read, so the batch
 # call decides and falls back on its own), NotRegistered the ids that stay on
 # the per-call path. $Interactive, $ReadAnswer, $DeadlineSeconds and
@@ -443,10 +444,9 @@ function Invoke-RdaInsightsProviderPreflight
         foreach ($Entry in $Missing) { Write-Host ('    {0} ({1})' -f $Entry.SubscriptionId, $Entry.State) -ForegroundColor Yellow }
         if ($Interactive)
         {
-            $Result.Asked = $true
             # Under pwsh -NonInteractive with a terminal attached, Read-Host writes an
             # error instead of asking. With errors stopping here, that is caught and
-            # read as "no one can answer".
+            # read as "no one can answer", and Asked stays false.
             $SavedPreference = $ErrorActionPreference
             $ErrorActionPreference = 'Stop'
             try
@@ -462,6 +462,7 @@ function Invoke-RdaInsightsProviderPreflight
             {
                 $ErrorActionPreference = $SavedPreference
             }
+            $Result.Asked = $Answered
             $Result.Answer = $Answer
         }
     }
