@@ -628,6 +628,50 @@ if ($Task -eq 'Processing')
                     return $false
                 }
 
+                # True when Azure answered HTTP 429 (TooManyRequests). The status code is read first,
+                # from the exception and every exception it wraps, because the outer message may not
+                # name it. Only when no exception in the chain carries a status is the outer message
+                # matched, so an id holding '429' does not make another error count as throttled.
+                function Test-MetricThrottled
+                {
+                    param([System.Exception]$Exception)
+
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    $Checked = 0
+                    $SawStatus = $false
+                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Checked++
+
+                        $StatusCode = $null
+                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.Response.StatusCode
+                        }
+                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.StatusCode
+                        }
+                        if ($null -ne $StatusCode)
+                        {
+                            $SawStatus = $true
+                            if ("$StatusCode" -in @('429', 'TooManyRequests')) { return $true }
+                        }
+
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+
+                    if ($SawStatus) { return $false }
+                    return ([string]$Exception.Message -match '429|throttl|TooManyRequests|rate limit')
+                }
+
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
                 # failure is recorded for each definition. With -StopOnBadRequest a
@@ -702,7 +746,7 @@ if ($Task -eq 'Processing')
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    if ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    if (Test-MetricThrottled -Exception $_.Exception)
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++

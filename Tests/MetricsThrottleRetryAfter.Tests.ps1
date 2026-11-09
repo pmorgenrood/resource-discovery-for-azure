@@ -191,6 +191,66 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
     }
 }
 
+Describe 'Test-MetricThrottled - the status code decides first' {
+    BeforeAll {
+        $Tokens = $null; $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseInput($script:MetricsSrc, [ref]$Tokens, [ref]$Errors)
+        $FnAst = $Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Test-MetricThrottled' }, $true) | Select-Object -First 1
+        if (-not $FnAst) { throw 'Test-MetricThrottled was not found in Extension/Metrics.ps1' }
+        . ([scriptblock]::Create($FnAst.Extent.Text))
+
+        function New-StatusException([string]$Message, $StatusCode, $Inner = $null)
+        {
+            $Ex = if ($Inner) { [System.Exception]::new($Message, $Inner) } else { [System.Exception]::new($Message) }
+            $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $StatusCode })
+            return $Ex
+        }
+    }
+
+    It 'finds a wrapped 429 known only by its status code' {
+        $Inner = New-StatusException 'The service asked the client to wait.' ([System.Net.HttpStatusCode]::TooManyRequests)
+        Test-MetricThrottled -Exception ([System.Exception]::new('The operation failed.', $Inner)) | Should -BeTrue
+    }
+
+    It 'reads a numeric 429 status and a status on the exception itself' {
+        Test-MetricThrottled -Exception (New-StatusException 'failed' 429) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Net.Http.HttpRequestException]::new('failed', $null, [System.Net.HttpStatusCode]::TooManyRequests)) | Should -BeTrue
+    }
+
+    It 'finds a 429 under an outer exception that reports another status' {
+        $Inner = [System.Net.Http.HttpRequestException]::new('wait', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        Test-MetricThrottled -Exception ([System.Net.Http.HttpRequestException]::new('The server failed.', $Inner, [System.Net.HttpStatusCode]::InternalServerError)) | Should -BeTrue
+    }
+
+    It 'finds a 429 on the ErrorRecord an exception carries' {
+        $Status = [System.Net.Http.HttpRequestException]::new('wait', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        $Record = [System.Management.Automation.ErrorRecord]::new($Status, 'x', 'NotSpecified', $null)
+        $Outer = [System.Management.Automation.RuntimeException]::new('The operation failed.', $null, $Record)
+        Test-MetricThrottled -Exception $Outer | Should -BeTrue
+    }
+
+    It 'does not treat a 403 as throttled when its message holds 429 or throttl in an id' {
+        $Ex = [System.Net.Http.HttpRequestException]::new("No authorization over scope '/subscriptions/00000000-0000-0000-0000-000000004290/resourceGroups/rg-throttle-test'.", $null, [System.Net.HttpStatusCode]::Forbidden)
+        Test-MetricThrottled -Exception $Ex | Should -BeFalse
+    }
+
+    It 'does not treat a wrapped 403 as throttled when the outer message names 429' {
+        $Inner = New-StatusException 'denied' ([System.Net.HttpStatusCode]::Forbidden)
+        Test-MetricThrottled -Exception ([System.Exception]::new('Request for vm-429 failed.', $Inner)) | Should -BeFalse
+    }
+
+    It 'matches the message only when no exception in the chain carries a status' {
+        Test-MetricThrottled -Exception ([System.Exception]::new("Operation returned an invalid status code 'TooManyRequests'")) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new('Rate limit reached, try later.')) | Should -BeTrue
+        Test-MetricThrottled -Exception ([System.Exception]::new("Operation returned an invalid status code 'InternalServerError'")) | Should -BeFalse
+    }
+
+    It 'the retry loop asks it, not a message match, whether an answer was throttled' {
+        $script:MetricsSrc | Should -Match 'if \(Test-MetricThrottled -Exception \$_\.Exception\)'
+        $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'
+    }
+}
+
 Describe 'Retry-After reaches the runspace' {
     It 'Get-RdaRetryAfterSeconds reads the header from a real TooManyRequests CloudException' {
         if (-not $script:RealTypesAvailable) { Set-ItResult -Skipped -Because 'Az.Monitor (Microsoft.Rest types) is not installed here' }

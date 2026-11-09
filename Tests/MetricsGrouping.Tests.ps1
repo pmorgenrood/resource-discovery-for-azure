@@ -122,6 +122,19 @@ function Get-AzMetric
             $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ Headers = @{ 'Retry-After' = @('100') } })
             throw $Ex
         }
+        'Status429WrappedRetryAfter100'
+        {
+            # A 429 known only by its status code, with Retry-After: 100, wrapped in an exception
+            # whose message names no status.
+            $Inner = [System.Exception]::new('The service asked the client to wait.')
+            $Inner | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = [System.Net.HttpStatusCode]::TooManyRequests; Headers = @{ 'Retry-After' = @('100') } })
+            throw [System.Exception]::new('The operation failed.', $Inner)
+        }
+        'Status403With429InId'
+        {
+            # A 403 whose message holds '429' and 'throttl' only inside a scope id.
+            throw [System.Net.Http.HttpRequestException]::new("The client has no authorization over scope '/subscriptions/00000000-0000-0000-0000-000000004290/resourceGroups/rg-throttle-test'.", $null, [System.Net.HttpStatusCode]::Forbidden)
+        }
     }
 
     $Omitted = @($env:RDA_TEST_METRIC_OMIT -split ';' | Where-Object { $_ })
@@ -585,6 +598,36 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
             [double]$Matches['Waited'] | Should -BeGreaterOrEqual 200
             [double]$Matches['Waited'] | Should -BeLessThan 202
         }
+    }
+
+    It 'treats a wrapped 429 known only by its status code as throttled and waits its Retry-After' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'throttled-status-wrapped' -MultiError 'Status429WrappedRetryAfter100'
+
+        # The same plan as a 429 the message names: two waits of 100 s, then the 300 s cap stops it.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 3
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            $Line = @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=3 ' -f [regex]::Escape($Name)) })
+            $Line.Count | Should -Be 1
+            $Line[0] -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 200
+            [double]$Matches['Waited'] | Should -BeLessThan 202
+        }
+    }
+
+    It 'does not treat a 403 as throttled when its message holds 429 in an id' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'forbidden-429-in-id' -MultiError 'Status403With429InId'
+
+        # The generic budget: 1 + 3 retries, recorded as an error.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
     }
 
     It 'retries a server error that follows 3 throttled answers' {
