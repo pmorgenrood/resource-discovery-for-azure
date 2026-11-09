@@ -336,7 +336,10 @@ function New-RdaAllSubHtmlSummary
     }
     if ($EmptyCount -gt 0)
     {
-        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) returned 0 resources.</b> Often a Reader-permission gap rather than a genuinely empty subscription.</div>', $EmptyCount)
+        # A report lists only the types a collector covers, so 0 here is not the
+        # subscription's Resource Graph count. Read access is not the cause: a
+        # subscription the identity cannot read is skipped before it is collected.
+        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) have 0 resources in their report.</b> They hold no resources of the types this tool reports (only virtual networks, for example), or none at all.</div>', $EmptyCount)
     }
     if ($ConsumpList.Count -gt 0)
     {

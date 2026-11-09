@@ -118,7 +118,7 @@ everything" question is answered on the same page:
 | Source collection | Meaning | Main summary rendering |
 |---|---|---|
 | `$FailedSubscriptions` | subs whose run failed | red banner + list |
-| `$SubResourceCounts` Count == 0 | subs that returned 0 resources | amber banner + list (often a Reader-permission gap) |
+| report with 0 resources | subs whose report lists no resource (none of the types a collector covers, or none at all; read access was checked before collection) | amber banner (count) |
 | `$Global:ConsumptionFailedSubs` | consumption phase auth issues | amber note (per-sub) |
 | `$Global:MetricsFailedSubs` | metrics phase auth issues | amber note (per-sub) |
 | `$Global:CollectorFailures` | per-(sub, collector) throws | amber note grouped by sub |
