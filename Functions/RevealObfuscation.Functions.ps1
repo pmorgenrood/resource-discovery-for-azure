@@ -48,6 +48,24 @@ function ConvertTo-RevealComparablePath
     return $Trimmed
 }
 
+# True when .NET has File.SetUnixFileMode and GetUnixFileMode (.NET 7 and
+# later, so PowerShell 7.3 and later). Its own function so a test can take the
+# chmod and stat path on a newer runtime.
+function Test-RevealUnixModeApi
+{
+    $ModeType = 'System.IO.UnixFileMode' -as [type]
+    if ($null -eq $ModeType) { return $false }
+    return ($null -ne [System.IO.File].GetMethod('SetUnixFileMode', [type[]]@([string], $ModeType)) -and
+        $null -ne [System.IO.File].GetMethod('GetUnixFileMode', [type[]]@([string])))
+}
+
+# True on macOS, whose stat is the BSD one. Its own function so a test can take
+# the macOS path on Linux.
+function Test-RevealIsMacOS
+{
+    return [bool]$IsMacOS
+}
+
 # Make a folder readable and writable by its owner only: mode 0700 on Unix,
 # and on Windows a protected ACL (no inherited rules) that gives only the
 # current user full control. Reveal's staging folder holds real names and ids,
@@ -81,18 +99,22 @@ function Set-RevealOwnerOnlyDirectory
         return
     }
 
-    $ModeType = 'System.IO.UnixFileMode' -as [type]
-    if ($null -ne $ModeType -and $null -ne [System.IO.File].GetMethod('SetUnixFileMode', [type[]]@([string], $ModeType)))
+    if (Test-RevealUnixModeApi)
     {
         [System.IO.File]::SetUnixFileMode($Path, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
         $Mode = [int][System.IO.File]::GetUnixFileMode($Path)
     }
     else
     {
-        # .NET before 7 has no Unix mode calls; use chmod and stat instead.
+        # PowerShell 7.0 and 7.1 run on .NET before 7, which has no Unix mode
+        # calls. Use the plain chmod form every Unix has, and read the mode
+        # back with the stat of this system: BSD stat on macOS, GNU stat on
+        # Linux.
         & chmod 700 -- $Path
         if ($LASTEXITCODE -ne 0) { throw "Could not make $Path readable by its owner only (chmod ended with $LASTEXITCODE)." }
-        $Mode = [Convert]::ToInt32((& stat -c '%a' -- $Path), 8)
+        $Text = if (Test-RevealIsMacOS) { & stat -f '%Lp' -- $Path } else { & stat -c '%a' -- $Path }
+        if ($LASTEXITCODE -ne 0) { throw "Could not read the mode of $Path (stat ended with $LASTEXITCODE)." }
+        $Mode = [Convert]::ToInt32(([string]$Text).Trim(), 8)
     }
     if (($Mode -band 0x1FF) -ne 0x1C0)
     {
