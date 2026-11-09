@@ -538,6 +538,7 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
 
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
         $Run.Seconds | Should -BeGreaterOrEqual 7
+        @($Run.DebugLines | Where-Object { $_ -match '  Error idx=[0-9]+ .* waited=([7-9]|10)(\.[0-9]+)?s ' }).Count | Should -Be 4
     }
 
     It 'retries a throttled grouped request and does not fall back to one request per metric' {
@@ -553,6 +554,11 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         foreach ($Name in $script:DiskMetricNames)
         {
             @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+            # The line shows the time spent waiting between attempts: 2 + 4 + 8 + 16 + 32 + 60 = 122 s plus under 1 s of jitter each.
+            $Line = @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=' -f [regex]::Escape($Name)) })[0]
+            $Line -match ' waited=(?<Waited>[0-9]+(\.[0-9]+)?)s ' | Should -BeTrue
+            [double]$Matches['Waited'] | Should -BeGreaterOrEqual 122
+            [double]$Matches['Waited'] | Should -BeLessThan 128
         }
     }
 

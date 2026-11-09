@@ -483,6 +483,8 @@ if ($Task -eq 'Processing')
     # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
     $MetricMaxThrottleRetries = 6
     $MetricMaxRetryAfterSeconds = 120
+    # Total wait cap for the throttled retries of one request: a retry whose sleep would take the total past it is not made.
+    $MetricMaxThrottleWaitSeconds = 300
     # Test hook: offline tests set RDA_TEST_METRIC_NO_SLEEP=1 to skip the real wait between retries.
     # Real runs never set it, so they wait as planned.
     $MetricSkipRetrySleep = ($env:RDA_TEST_METRIC_NO_SLEEP -eq '1')
@@ -508,7 +510,7 @@ if ($Task -eq 'Processing')
     }
 
     $PhaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, throttle retries={5} (honours Retry-After up to {6}s), lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays), $MetricMaxThrottleRetries, $MetricMaxRetryAfterSeconds)
+    Write-MetricsDiag ("Starting metrics collection: {0} metric definition(s), ThrottleLimit={1}, per-call timeout={2}s, max retries={3}, throttle retries={5} (honours Retry-After up to {6}s, at most {7}s of waiting per request), lookback={4} day(s)." -f $MetricCount, $ConcurrencyLimit, $MetricTimeoutSeconds, $MetricMaxRetries, [math]::Abs($MetricsLookbackPeriodDays), $MetricMaxThrottleRetries, $MetricMaxRetryAfterSeconds, $MetricMaxThrottleWaitSeconds)
 
     $RangeBatch = [math]::Min($MetricCount , 250)
     $RangeIdx = 1
@@ -540,6 +542,7 @@ if ($Task -eq 'Processing')
                 $CallMaxRetries = $using:MetricMaxRetries
                 $CallMaxThrottleRetries = $using:MetricMaxThrottleRetries
                 $CallMaxRetryAfterSeconds = $using:MetricMaxRetryAfterSeconds
+                $CallMaxThrottleWaitSeconds = $using:MetricMaxThrottleWaitSeconds
                 $RetryAfterFnDef = $using:MetricRetryAfterFnDef
                 $SkipRetrySleep = $using:MetricSkipRetrySleep
                 if ($RetryAfterFnDef) { Set-Item -Path function:Get-RdaRetryAfterSeconds -Value ([scriptblock]::Create($RetryAfterFnDef)) }
@@ -550,13 +553,16 @@ if ($Task -eq 'Processing')
                 # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
                 # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
                 # other failure uses the generic budget and 2^(failures-1) backoff. Each count includes the current
-                # failure, and one kind never spends the other's budget. Returns @{ Retry; SleepSeconds } (no jitter).
+                # failure, and one kind never spends the other's budget. A throttled retry is not made when its sleep
+                # would take the request's total throttle wait past MaxThrottleWaitSeconds.
+                # Returns @{ Retry; SleepSeconds }; SleepSeconds includes the given jitter.
                 function Get-RdaMetricRetryPlan
                 {
                     [CmdletBinding()]
                     param(
                         [int]$GenericFailures, [bool]$Throttled, [int]$ThrottledAttempts, [double]$RetryAfterSeconds,
-                        [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds
+                        [double]$ThrottleWaitedSeconds, [double]$Jitter,
+                        [int]$MaxRetries, [int]$MaxThrottleRetries, [double]$MaxRetryAfterSeconds, [double]$MaxThrottleWaitSeconds
                     )
                     $Retry = if ($Throttled) { $ThrottledAttempts -le $MaxThrottleRetries } else { $GenericFailures -le $MaxRetries }
                     if (-not $Retry) { return @{ Retry = $false; SleepSeconds = 0 } }
@@ -567,7 +573,9 @@ if ($Task -eq 'Processing')
                         $Backoff = [math]::Min($Backoff * 2, 60)
                         if ($RetryAfterSeconds -gt 0) { $Backoff = [math]::Min([math]::Max($RetryAfterSeconds, $Backoff), $MaxRetryAfterSeconds) }
                     }
-                    return @{ Retry = $true; SleepSeconds = $Backoff }
+                    $SleepSeconds = [math]::Round($Backoff + $Jitter, 2)
+                    if ($Throttled -and ($ThrottleWaitedSeconds + $SleepSeconds) -gt $MaxThrottleWaitSeconds) { return @{ Retry = $false; SleepSeconds = 0 } }
+                    return @{ Retry = $true; SleepSeconds = $SleepSeconds }
                 }
 
                 # True when Azure answered HTTP 400 (BadRequest), as it does when a requested
@@ -636,7 +644,7 @@ if ($Task -eq 'Processing')
                     }
                     $CallOutcome = 'Success'
                     $CallAttempts = 0
-                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false }
+                    $Request = [PSCustomObject]@{ Succeeded = $false; Query = $null; Outcome = $null; Attempts = 0; ErrorMessage = $null; BadRequest = $false; WaitedSeconds = 0 }
 
                     $MetricArgs = @{
                         ResourceId      = $Def.Id
@@ -658,6 +666,9 @@ if ($Task -eq 'Processing')
                         $Attempt = 0
                         $ThrottledAttempts = 0
                         $GenericFailures = 0
+                        # Seconds of waiting between attempts: in all, and for throttled answers only (the capped part).
+                        $WaitedSeconds = 0
+                        $ThrottleWaitedSeconds = 0
                         $Succeeded = $false
                         $LastError = $null
                         $MetricQuery = $null
@@ -732,13 +743,17 @@ if ($Task -eq 'Processing')
                             # A BadRequest under -StopOnBadRequest has already left the loop above.
                             # Timeouts and other errors count against the generic budget; throttled answers do not.
                             if (-not $Throttled) { $GenericFailures++ }
+                            # Jitter so a wave of throttled calls does not retry in lockstep.
+                            $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
                             $Plan = Get-RdaMetricRetryPlan -GenericFailures $GenericFailures -Throttled $Throttled -ThrottledAttempts $ThrottledAttempts -RetryAfterSeconds $RetryAfterSeconds `
-                                -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds
+                                -ThrottleWaitedSeconds $ThrottleWaitedSeconds -Jitter $Jitter `
+                                -MaxRetries $CallMaxRetries -MaxThrottleRetries $CallMaxThrottleRetries -MaxRetryAfterSeconds $CallMaxRetryAfterSeconds -MaxThrottleWaitSeconds $CallMaxThrottleWaitSeconds
                             if ($Plan.Retry)
                             {
-                                # Jitter so a wave of throttled calls does not retry in lockstep.
-                                $Jitter = (Get-Random -Minimum 0 -Maximum 1000) / 1000.0
-                                $SleepSeconds = [math]::Round($Plan.SleepSeconds + $Jitter, 2)
+                                $SleepSeconds = $Plan.SleepSeconds
+                                # The planned wait is counted even when the test hook skips the real sleep.
+                                $WaitedSeconds += $SleepSeconds
+                                if ($Throttled) { $ThrottleWaitedSeconds += $SleepSeconds }
                                 if (-not $SkipRetrySleep) { Start-Sleep -Seconds $SleepSeconds }
                             }
                             else
@@ -767,6 +782,7 @@ if ($Task -eq 'Processing')
 
                     $Request.Outcome = $CallOutcome
                     $Request.Attempts = $CallAttempts
+                    $Request.WaitedSeconds = $WaitedSeconds
                     return $Request
                 }
 
@@ -777,7 +793,7 @@ if ($Task -eq 'Processing')
                 # $CallStopwatch when the record is added.
                 function Add-MetricRecord
                 {
-                    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0)
+                    param($Def, $Request, $MetricQuery, [System.Diagnostics.Stopwatch]$CallStopwatch, [double]$ExtraSeconds = 0, [double]$ExtraWaitedSeconds = 0)
 
                     $ElapsedSeconds = $ExtraSeconds
                     $MetricError = $false
@@ -880,6 +896,7 @@ if ($Task -eq 'Processing')
                             Outcome     = $CallOutcome
                             Attempts    = $Request.Attempts
                             ElapsedSec  = [math]::Round($ElapsedSeconds, 2)
+                            WaitedSec   = [math]::Round($Request.WaitedSeconds + $ExtraWaitedSeconds, 2)
                             Error       = $CallErrorMsg
                         })
 
@@ -960,7 +977,7 @@ if ($Task -eq 'Processing')
                             # requested on its own too. Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
                             $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
-                            Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds
+                            Add-MetricRecord -Def $Def -Request $SingleRequest -MetricQuery $SingleRequest.Query -CallStopwatch $SingleStopwatch -ExtraSeconds $GroupSeconds -ExtraWaitedSeconds $Request.WaitedSeconds
                         }
                     }
                 }
@@ -1044,7 +1061,7 @@ if ($Task -eq 'Processing')
         Write-MetricsDiag ("Non-success calls (where it got stuck):")
         foreach ($rec in ($DiagRecords | Where-Object { $_.Outcome -ne 'Success' } | Sort-Object ElapsedSec -Descending))
         {
-            Write-MetricsDiag ("  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error)
+            Write-MetricsDiag ("  {0} idx={1} {2}/{3}/{4} interval={5} attempts={6} {7}s waited={9}s {8}" -f $rec.Outcome, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Attempts, $rec.ElapsedSec, $rec.Error, $rec.WaitedSec)
         }
     }
 
@@ -1054,7 +1071,7 @@ if ($Task -eq 'Processing')
         Write-MetricsDiag ("Slowest 5 calls:")
         foreach ($rec in $Slowest)
         {
-            Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6})" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome)
+            Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6}) waited={7}s" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome, $rec.WaitedSec)
         }
     }
 

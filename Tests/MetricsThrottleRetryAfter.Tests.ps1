@@ -18,10 +18,11 @@ BeforeAll {
     $script:MaxRetries = [int]([regex]::Match($script:MetricsSrc, '(?m)^\s*\$MetricMaxRetries\s*=\s*(\d+)').Groups[1].Value)
     $script:MaxThrottle = [int]([regex]::Match($script:MetricsSrc, '(?m)^\s*\$MetricMaxThrottleRetries\s*=\s*(\d+)').Groups[1].Value)
     $script:MaxRetryAfter = [double]([regex]::Match($script:MetricsSrc, '(?m)^\s*\$MetricMaxRetryAfterSeconds\s*=\s*(\d+)').Groups[1].Value)
+    $script:MaxThrottleWait = [double]([regex]::Match($script:MetricsSrc, '(?m)^\s*\$MetricMaxThrottleWaitSeconds\s*=\s*(\d+)').Groups[1].Value)
 
     function Plan([hashtable]$Over)
     {
-        $P = @{ GenericFailures = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter }
+        $P = @{ GenericFailures = 0; Throttled = $false; ThrottledAttempts = 0; RetryAfterSeconds = 0; MaxRetries = $script:MaxRetries; MaxThrottleRetries = $script:MaxThrottle; MaxRetryAfterSeconds = $script:MaxRetryAfter; ThrottleWaitedSeconds = 0; MaxThrottleWaitSeconds = $script:MaxThrottleWait; Jitter = 0 }
         foreach ($K in $Over.Keys) { $P[$K] = $Over[$K] }
         Get-RdaMetricRetryPlan @P
     }
@@ -46,6 +47,7 @@ Describe 'Get-RdaMetricRetryPlan - production defaults' {
         $script:MaxRetries | Should -Be 3
         $script:MaxThrottle | Should -BeGreaterOrEqual 6
         $script:MaxRetryAfter | Should -BeGreaterOrEqual 60
+        $script:MaxThrottleWait | Should -Be 300
     }
 }
 
@@ -76,6 +78,21 @@ Describe 'Get-RdaMetricRetryPlan - throttled attempts' {
 
     It 'gives up once the throttle budget is exhausted' {
         (Plan @{ Throttled = $true; ThrottledAttempts = $script:MaxThrottle + 1 }).Retry | Should -BeFalse
+    }
+
+    It 'stops retrying a throttled request once the next sleep would pass the total wait cap' {
+        (Plan @{ Throttled = $true; ThrottledAttempts = 3; RetryAfterSeconds = 120; ThrottleWaitedSeconds = 180 }).Retry | Should -BeTrue -Because '180 + 120 = 300 does not pass the cap'
+        (Plan @{ Throttled = $true; ThrottledAttempts = 3; RetryAfterSeconds = 120; ThrottleWaitedSeconds = 240 }).Retry | Should -BeFalse -Because '240 + 120 = 360 passes the cap'
+    }
+
+    It 'counts the jitter toward the total wait cap and returns it in the sleep' {
+        $P = Plan @{ Throttled = $true; ThrottledAttempts = 1; RetryAfterSeconds = 10; Jitter = 0.25 }
+        $P.SleepSeconds | Should -Be 10.25
+        (Plan @{ Throttled = $true; ThrottledAttempts = 3; RetryAfterSeconds = 120; ThrottleWaitedSeconds = 180; Jitter = 0.5 }).Retry | Should -BeFalse
+    }
+
+    It 'the cap does not limit generic failures' {
+        (Plan @{ GenericFailures = 1; ThrottleWaitedSeconds = 1000 }).Retry | Should -BeTrue
     }
 
     It 'a sustained 429 wave now waits out the directed delay instead of failing inside 30 seconds' {
