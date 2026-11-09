@@ -140,6 +140,13 @@ function Get-AzMetric
             # A 403 whose message holds '429' and 'throttl' only inside a scope id.
             throw [System.Net.Http.HttpRequestException]::new("The client has no authorization over scope '/subscriptions/00000000-0000-0000-0000-000000004290/resourceGroups/rg-throttle-test'.", $null, [System.Net.HttpStatusCode]::Forbidden)
         }
+        'StatusLess429InId'
+        {
+            # No status anywhere, so the text is read; it holds '429' and 'throttle' only inside a scope id.
+            throw [System.Exception]::new('The request failed for scope /subscriptions/00000000-0000-0000-0000-000000004290/resourceGroups/rg-throttle-test, status 4290.', [System.Exception]::new('Request 429-01 for rg-429 could not be read.'))
+        }
+        # A token refused for the whole group, known by its status code.
+        'Status401' { throw [System.Net.Http.HttpRequestException]::new('The token was refused.', $null, [System.Net.HttpStatusCode]::Unauthorized) }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -677,7 +684,35 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         }
     }
 
-    It 'does not treat a 403 as throttled when its message holds 429 in an id' {
+    It 'refuses a grouped 401 at once: 1 attempt, no request per metric, 4 error records' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'refused-401-grouped' -MultiError 'Status401'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        $Run.Records.Count | Should -Be 4
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=1 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'does not read a status-less error as throttled when 429 is only in an id or a name' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'statusless-429-in-id' -MultiError 'StatusLess429InId'
+
+        # Not throttled and not refused: the plain 4 attempts, recorded as an error, no request per metric.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 4
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '  Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'gives a grouped 403 one attempt, recorded as an error: its status decides before any text is read' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'forbidden-429-in-id' -MultiError 'Status403With429InId'
 
         # A 403 is refused the same way on every retry: 1 attempt, recorded as an error.
