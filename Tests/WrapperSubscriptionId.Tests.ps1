@@ -741,6 +741,8 @@ Describe 'The Windows PowerShell re-launch of Run-AllSubscriptions.ps1' {
     It 'takes a GUID with spaces around it and in any letter case' {
         $Out = & $script:Pwsh -NoProfile -NonInteractive -File $script:Probe -TenantID 't' -SubscriptionID ' AAAAAAAA-0000-4000-8000-000000000001 '
         $LASTEXITCODE | Should -Be 0
+        # Accepted: the run goes on with it.
+        @($Out | Where-Object { $_ -like 'ARGS *-SubscriptionID*' }).Count | Should -Be 1
     }
 
     It 'forwards -SubscriptionID with its value and -PreflightOnly as a bare switch' {
