@@ -470,3 +470,46 @@ AfterAll {
     [System.Globalization.CultureInfo]::CurrentCulture = $script:SavedCulture
     [System.Globalization.CultureInfo]::CurrentUICulture = $script:SavedUICulture
 }
+
+# The speed change itself: each database id and each subscription id is read
+# a fixed number of times, not once per instance. A counting property stands in
+# for the field, so a scan per instance shows up as instances x rows reads.
+Describe 'SQLMI lookups read each row once' {
+    BeforeAll {
+        function New-CountedValue
+        {
+            param($Target, [string]$Name, $Value, [hashtable]$Count)
+            $Target | Add-Member -MemberType ScriptProperty -Name $Name -Value { $Count.Reads++; $Value }.GetNewClosure() -Force
+            $Target
+        }
+    }
+
+    It 'reads each database id a fixed number of times, not once per instance' {
+        $Count = @{ Reads = 0 }
+        $Instances = @(1..20 | ForEach-Object { New-TestInstance -Id (Get-MiId -Name "mi-r$_") -Name "mi-r$_" })
+        $Dbs = @(1..20 | ForEach-Object {
+                $D = New-TestDatabase -Id $null
+                New-CountedValue -Target $D -Name 'id' -Value "$(Get-MiId -Name "mi-r$_")/databases/db-r$_" -Count $Count
+            })
+        $Recs = @(Invoke-TestCollector -Resources ($Instances + $Dbs))
+        $Recs.Count | Should -Be 20
+        foreach ($R in $Recs) { $R['Databases'] | Should -Be 1 }
+        $Count.Reads | Should -BeLessOrEqual 60 -Because 'a scan per instance reads 20 x 20 = 400 database ids'
+    }
+
+    It 'reads each subscription id a fixed number of times, not once per instance' {
+        $Count = @{ Reads = 0 }
+        $Subs = @(1..20 | ForEach-Object {
+                $S = [pscustomobject]@{ Name = "sub-r$_" }
+                New-CountedValue -Target $S -Name 'id' -Value ('{0:d8}-1234-1234-1234-123456789012' -f $_) -Count $Count
+            })
+        $Instances = @(1..20 | ForEach-Object {
+                $I = New-TestInstance -Id (Get-MiId -Name "mi-q$_") -Name "mi-q$_"
+                $I.subscriptionId = '{0:d8}-1234-1234-1234-123456789012' -f $_
+                $I
+            })
+        $Recs = @(Invoke-TestCollector -Resources $Instances -Subs $Subs)
+        for ($i = 0; $i -lt 20; $i++) { $Recs[$i]['Subscription'] | Should -Be "sub-r$($i + 1)" }
+        $Count.Reads | Should -BeLessOrEqual 100 -Because 'a scan per instance reads 20 x 20 = 400 ids'
+    }
+}
