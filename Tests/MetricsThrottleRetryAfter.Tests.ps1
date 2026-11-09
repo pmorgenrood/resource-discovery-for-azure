@@ -334,7 +334,7 @@ Describe 'Test-MetricThrottled - the status code decides first' {
     }
 
     It 'the retry loop asks it, not a message match, whether an answer was throttled' {
-        $script:MetricsSrc | Should -Match 'if \(Test-MetricThrottled -Exception \$_\.Exception\)'
+        $script:MetricsSrc | Should -Match 'if \(-not \$BadRequest -and \(Test-MetricThrottled -Exception \$_\.Exception\)\)'
         $script:MetricsSrc | Should -Not -Match '\$LastError -match ''429'
     }
 }
