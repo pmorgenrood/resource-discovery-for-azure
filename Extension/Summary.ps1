@@ -148,7 +148,7 @@ foreach ($svc in $ServiceSummary | Select-Object -First 5)
 }
 if ($Samples.Count -gt 0)
 {
-    $ObfHits = ($Samples | Where-Object { $_ -match $ObfPattern }).Count
+    $ObfHits = @($Samples | Where-Object { $_ -match $ObfPattern }).Count
     if ($ObfHits -gt ($Samples.Count * 0.7))
     {
         $ObfuscationStatus = 'obfuscated'
@@ -169,7 +169,8 @@ if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -Path $C
 {
     $RunningVmCount = 0
     $RunningVms = @()
-    $VmRecords = $Inventory.VirtualMachines
+    # A section may be missing (read as empty), also under Set-StrictMode.
+    $VmRecords = if ($Inventory.PSObject.Properties.Name -contains 'VirtualMachines') { $Inventory.VirtualMachines } else { $null }
     if ($VmRecords)
     {
         $RunningVms = @($VmRecords | Where-Object { $_.PowerState -match 'running' })
