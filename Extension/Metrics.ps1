@@ -1504,7 +1504,7 @@ function Add-MetricRecord
                 # exception carries a status is the text read: Get-AzMetric reports a 404 as
                 # "invalid status code 'NotFound'" with no status code on the exception (quotes
                 # optional, the literal 'invalid status code ' prefix is the anchor), and a newer
-                # SDK may give the error code 'ResourceNotFound' instead. Ported from fork old-main.
+                # SDK may give the error code 'ResourceNotFound' instead.
                 function Test-MetricNotFound
                 {
                     param([System.Exception]$Exception)

@@ -631,8 +631,8 @@ Describe 'Metrics.ps1 batches' {
 Describe 'Metrics.ps1 requests Azure Monitor answers with NotFound (404)' {
     # A 404 cannot turn into data on a retry: the resource is gone (or being deleted) or is not
     # in this subscription. It used to take all 4 attempts and their backoff (~100 s per request
-    # on a live run); it now ends after 1. The records, the incomplete entry and the exit code
-    # stay as they were: a 404 is still an Error.
+    # on a live run); it now ends after 1. The records and the Error outcome stay as they
+    # were: a 404 is still an Error.
     BeforeAll {
         $script:NotFoundVm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-notfound'
         $script:NotFoundDisk = New-TestDisk -Name 'disk-notfound'
