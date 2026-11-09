@@ -239,6 +239,26 @@ Describe 'Get-MetricFailure decides in one order for the whole chain' {
         (Get-MetricFailure -Exception $Ex).Kind | Should -Be 'NotFound'
     }
 
+    It 'counts an exception reached twice only once: four wrappers whose inner exception and error record are the same still reach a 404' {
+        # Each wrapper holds the next one both as its InnerException and as its error record's
+        # exception, so a walk that does not skip what it has seen fills its 10 places with copies.
+        $Ex = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        $All = @($Ex)
+        for ($i = 1; $i -le 4; $i++)
+        {
+            $Wrapper = [System.Exception]::new(('wrapper ' + $i), $Ex)
+            $Wrapper | Add-Member -NotePropertyName ErrorRecord -NotePropertyValue ([System.Management.Automation.ErrorRecord]::new($Ex, 'Metric', 'NotSpecified', $null))
+            $Ex = $Wrapper
+            $All += $Ex
+        }
+        $Chain = Get-MetricExceptionChain -Exception $Ex
+        $Chain.Count | Should -Be 5
+        foreach ($Item in $All) { @($Chain | Where-Object { [object]::ReferenceEquals($_, $Item) }).Count | Should -Be 1 }
+        $Failure = Get-MetricFailure -Exception $Ex
+        $Failure.Kind | Should -Be 'NotFound'
+        $Failure.Status | Should -Be 404
+    }
+
     It 'gives no status for an error with none, and Other' {
         $Failure = Get-MetricFailure -Exception ([System.Exception]::new('Timed out after 120s'))
         $Failure.Kind | Should -Be 'Other'
