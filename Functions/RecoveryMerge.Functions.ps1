@@ -171,6 +171,57 @@ function Merge-RecoveryData
         }
     }
 
+    # -- Read an ObfuscationDictionary and check its shape: a JSON object whose
+    #    properties, GeneratedAt aside, are token maps (JSON objects or null)
+    #    holding plain values. Throws a plain message otherwise, so a broken
+    #    dictionary stops the merge before anything is written. ---------------
+    function Read-MergeDictionary
+    {
+        param($File, [string]$Label)
+        $Problem = $null
+        $Parsed = $null
+        try
+        {
+            $Text = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($Text)) { $Problem = 'the file is empty' }
+            else { $Parsed = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop }
+        }
+        catch
+        {
+            $Problem = $_.Exception.Message
+        }
+        if ($null -eq $Problem -and $Parsed -isnot [System.Management.Automation.PSCustomObject])
+        {
+            $Problem = 'it is not a JSON object'
+        }
+        if ($null -eq $Problem)
+        {
+            foreach ($MapProp in $Parsed.PSObject.Properties)
+            {
+                if ($MapProp.Name -eq 'GeneratedAt' -or $null -eq $MapProp.Value) { continue }
+                if ($MapProp.Value -isnot [System.Management.Automation.PSCustomObject])
+                {
+                    $Problem = ("its '{0}' is not a map of tokens" -f $MapProp.Name)
+                    break
+                }
+                foreach ($Entry in $MapProp.Value.PSObject.Properties)
+                {
+                    if ($Entry.Value -is [System.Management.Automation.PSCustomObject] -or $Entry.Value -is [System.Array])
+                    {
+                        $Problem = ("its '{0}' holds a value that is not plain text" -f $MapProp.Name)
+                        break
+                    }
+                }
+                if ($null -ne $Problem) { break }
+            }
+        }
+        if ($null -ne $Problem)
+        {
+            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' cannot be read: {2}. Nothing was written to '{3}'. Put back the dictionary that run wrote, or re-run that bundle into a new folder, then run this merge again." -f $Label, $File.FullName, $Problem, $OutputPath)
+        }
+        return $Parsed
+    }
+
     # -- Locate the newest file matching a filter in a bundle folder ----------
     function Get-BundleFile
     {
@@ -247,32 +298,24 @@ function Merge-RecoveryData
     # otherwise looks complete. We cannot repair that here, but we CAN detect the
     # tell-tale: a seeded recovery's ResourceIdMap shares (almost) all of the gap's
     # tokens, whereas an unseeded one shares none. Zero overlap STOPS the merge.
-    # Both guards in this block run before the output folder is created, so a
+    # Every guard in this block runs before the output folder is created, so a
     # stopped merge writes, zips and leaves nothing; the way out is to fix the
-    # named bundle and run the same merge again.
+    # named bundle and run the same merge again. Both dictionaries are read and
+    # checked first; one that cannot be read stops the merge here.
+    $GapDictionary = if ($GapDictionaryFile) { Read-MergeDictionary -File $GapDictionaryFile -Label 'gap' } else { $null }
+    $RecoveryDictionary = if ($RecoveryDictionaryFile) { Read-MergeDictionary -File $RecoveryDictionaryFile -Label 'recovery' } else { $null }
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
-        # Counted inside the try, thrown after it, so the stop is never turned
-        # into the "could not compare" warning below.
+        # Drop the $null that an empty or missing map yields, so an empty
+        # ResourceIdMap (a run that found no resources) counts as 0 keys and
+        # the check below is skipped instead of stopping a merge that no
+        # re-run could ever get past.
         $SharedIdKeyCount = $null
-        try
+        $GapIdKeys = @($GapDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
+        $RecoveryIdKeys = @($RecoveryDictionary.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
+        if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
         {
-            $GapDictCheck = Get-Content -LiteralPath $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
-            $RecoveryDictCheck = Get-Content -LiteralPath $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
-            # Drop the $null that an empty or missing map yields, so an empty
-            # ResourceIdMap (a run that found no resources) counts as 0 keys and
-            # the check below is skipped instead of stopping a merge that no
-            # re-run could ever get past.
-            $GapIdKeys = @($GapDictCheck.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
-            $RecoveryIdKeys = @($RecoveryDictCheck.ResourceIdMap.PSObject.Properties.Name | Where-Object { $_ })
-            if (@($GapIdKeys).Count -gt 0 -and @($RecoveryIdKeys).Count -gt 0)
-            {
-                $SharedIdKeyCount = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys }).Count
-            }
-        }
-        catch
-        {
-            Add-MergeWarning ('could not compare the gap/recovery obfuscation dictionaries for compatibility (seed check skipped): {0}' -f $_.Exception.Message)
+            $SharedIdKeyCount = @($RecoveryIdKeys | Where-Object { $_ -in $GapIdKeys }).Count
         }
         if ($SharedIdKeyCount -eq 0)
         {
@@ -555,10 +598,10 @@ function Merge-RecoveryData
     $DictionaryMerged = $false
     if ($GapDictionaryFile)
     {
-        $MergedDictionary = Get-Content -LiteralPath $GapDictionaryFile.FullName -Raw | ConvertFrom-Json
+        # Read and checked before anything was written (above).
+        $MergedDictionary = $GapDictionary
         if ($RecoveryDictionaryFile)
         {
-            $RecoveryDictionary = Get-Content -LiteralPath $RecoveryDictionaryFile.FullName -Raw | ConvertFrom-Json
             foreach ($MapProp in $RecoveryDictionary.PSObject.Properties)
             {
                 $MapName = $MapProp.Name

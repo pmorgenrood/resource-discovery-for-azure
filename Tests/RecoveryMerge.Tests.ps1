@@ -585,6 +585,27 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $Result.OutputZip | Should -BeTrue
     }
 
+    It 'stops before writing anything when the <Which> dictionary <Case>' -ForEach @(
+        @{ Which = 'gap'; Case = 'is not valid JSON'; Text = '{ "ResourceIdMap": { "prod_shared": ' },
+        @{ Which = 'recovery'; Case = 'is not valid JSON'; Text = '{ "ResourceIdMap": { "prod_shared": ' },
+        @{ Which = 'gap'; Case = 'is empty'; Text = '' },
+        @{ Which = 'recovery'; Case = 'is a JSON list, not an object'; Text = '[{ "ResourceIdMap": { "prod_shared": "/id/shared" } }]' },
+        @{ Which = 'gap'; Case = 'has a map that is not an object'; Text = '{ "GeneratedAt": "2026-01-01 00:00:00", "ResourceIdMap": "prod_shared" }' },
+        @{ Which = 'recovery'; Case = 'has a map value that is an object'; Text = '{ "ResourceIdMap": { "prod_shared": { "x": 1 } } }' }
+    ) {
+        $C = New-Case
+        $Good = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_shared' = '/id/shared' } }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary $Good
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary $Good
+        $Dir = if ($Which -eq 'gap') { $C.Gap } else { $C.Recovery }
+        $DictFile = (Get-ChildItem -LiteralPath $Dir -Filter 'ObfuscationDictionary_*.json').FullName
+        Set-Content -LiteralPath $DictFile -Value $Text -NoNewline -Encoding utf8
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage ("*the $Which bundle's dictionary*cannot be read*Nothing was written*")
+        Test-Path -LiteralPath $C.Output | Should -BeFalse -Because 'a dictionary that cannot be read stops the merge before any file is written'
+    }
+
     It 'leaves an existing output folder untouched when it stops' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
