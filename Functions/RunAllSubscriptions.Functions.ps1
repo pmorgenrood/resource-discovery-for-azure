@@ -306,6 +306,20 @@ function Resolve-AccessPreflight
 # same checks (it deliberately differs: it honors -OutputDirectory, throws
 # instead of calling Exit-Wrapper, and is gated on -not $RunAllSubs). Keep the
 # two behaviorally in sync - if you change a check here, mirror it there.
+# Free bytes on the volume that holds the folder $Path, or $null when they
+# cannot be read. On Linux and macOS PowerShell has one file system drive, /,
+# whose free space is the root volume's, so the folder's own volume is read
+# (statvfs, through DriveInfo); on Windows the drive of the path is.
+function Get-FolderFreeSpaceBytes
+{
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($IsWindows -or $PSVersionTable.PSVersion.Major -lt 6)
+    {
+        return (Get-Item -LiteralPath $Path -ErrorAction Stop).PSDrive.Free
+    }
+    return [System.IO.DriveInfo]::new($Path).AvailableFreeSpace
+}
+
 function Invoke-PreFlightChecks
 {
     param(
@@ -372,11 +386,10 @@ function Invoke-PreFlightChecks
     }
     try
     {
-        $RootItem = Get-Item -LiteralPath $SpacePath -ErrorAction Stop
-        $Drive = $RootItem.PSDrive
-        if ($null -ne $Drive -and $null -ne $Drive.Free)
+        $FreeBytes = Get-FolderFreeSpaceBytes -Path $SpacePath
+        if ($null -ne $FreeBytes)
         {
-            $FreeMB = [math]::Round($Drive.Free / 1MB, 0)
+            $FreeMB = [math]::Round($FreeBytes / 1MB, 0)
             if ($FreeMB -lt 100)
             {
                 Write-Host ("ERROR: Free disk space at {0} is {1} MB. The script needs at least 100 MB to start. Free space and re-run." -f $SpacePath, $FreeMB) -ForegroundColor Red

@@ -769,7 +769,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         {
             param([long]$FreeBytes)
             $script:Exited = $null
-            Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = $FreeBytes } } }
+            Mock Get-FolderFreeSpaceBytes { $FreeBytes }
             Mock Set-Content { throw 'a preflight must write nothing' }
             Mock Exit-Wrapper { param($Code) $script:Exited = $Code }
             @(. $script:DiskBlock 6>&1 | ForEach-Object { [string]$_ })
@@ -782,7 +782,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly free-space check' {
         $script:Exited | Should -Be 1
         $script:PreflightCheck | Should -Be 'free disk space'
         @($Lines | Where-Object { $_ -like 'ERROR: Free disk space at * is 50 MB. The script needs at least 100 MB to start.*' }).Count | Should -Be 1
-        Should -Invoke Get-Item -Times 1 -Exactly
+        Should -Invoke Get-FolderFreeSpaceBytes -Times 1 -Exactly
         Should -Invoke Set-Content -Times 0 -Exactly
     }
 
@@ -843,10 +843,22 @@ Describe 'Invoke-PreFlightChecks -ReadOnly in Cloud Shell without storage' {
 
     It 'does not say a preflight continues or writes a zip' {
         function Get-CloudDrive { $null }
-        Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 2GB } } }
+        Mock Get-FolderFreeSpaceBytes { 2GB }
         $Lines = @(Invoke-PreFlightChecks -InventoryRoot $TestDrive -ReadOnly 6>&1 | ForEach-Object { [string]$_ })
         @($Lines | Where-Object { $_ -like '*Cloud Shell detected, but no storage account is mounted.*' }).Count | Should -Be 1
         @($Lines | Where-Object { $_ -like '*Continuing in ephemeral mode*' }) | Should -BeNullOrEmpty
         @($Lines | Where-Object { $_ -like '*A run here would keep its report ZIP only until the shell closes*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Get-FolderFreeSpaceBytes' {
+    BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
+
+    It 'reads the free space of the volume that holds the folder, not of the drive root (on Linux and macOS)' -Skip:($IsWindows) {
+        # PowerShell's drive / would give the root volume's: it is not read.
+        Mock Get-Item { [pscustomobject]@{ PSDrive = [pscustomobject]@{ Free = 1 } } }
+        $Free = Get-FolderFreeSpaceBytes -Path $TestDrive
+        $Free | Should -BeGreaterThan 1
+        Should -Invoke Get-Item -Times 0 -Exactly
     }
 }
