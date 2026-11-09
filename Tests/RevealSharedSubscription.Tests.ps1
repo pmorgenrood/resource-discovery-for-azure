@@ -84,10 +84,10 @@ BeforeAll {
 
     function Invoke-Reveal
     {
-        param([string]$Root, [string]$Name)
+        param([string]$Root, [string]$Name, [string[]]$Extra = @())
         $Staging = Join-Path $script:WorkDir ($Name + '_staging')
         $Bundle = Join-Path $script:WorkDir ($Name + '_bundle.zip')
-        $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Reveal -InventoryRoot $Root -StagingDirectory $Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 2>&1 | ForEach-Object { [string]$_ })
+        $Console = @(& pwsh -NoProfile -NonInteractive -File $script:Reveal -InventoryRoot $Root -StagingDirectory $Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 @Extra 2>&1 | ForEach-Object { [string]$_ })
         return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = ($Console -join "`n"); Lines = $Console; Bundle = $Bundle; Staging = $Staging }
     }
 
@@ -315,6 +315,11 @@ Describe 'Reveal.ps1 with an empty report whose run log names a subscription no 
     }
 }
 
+# A report zip with no dictionary of its stamp, or a dictionary with no
+# report zip, is a report that cannot be revealed. It was only skipped, so the
+# run could exit 0, -RemoveStaging could remove staging, and the console said
+# to upload a bundle that lacked it. It is now counted as failed. A folder
+# with neither is only noted, as is a staging folder of an earlier reveal.
 Describe 'Reveal.ps1 with two stamps in one folder' {
     BeforeAll {
         $script:Root = Join-Path $script:WorkDir 'onefolder'
@@ -322,17 +327,67 @@ Describe 'Reveal.ps1 with two stamps in one folder' {
         # The older stamp's dictionary is missing; the newer stamp has its own.
         Add-Report -Folder $Folder -Stamp '20260101000000000eeee' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-old') -NoDictionary
         Add-Report -Folder $Folder -Stamp '20260202000000000ffff' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-new')
-        $script:Run = Invoke-Reveal -Root $script:Root -Name 'onefolder'
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'onefolder' -Extra @('-RemoveStaging')
     }
 
-    It 'never pairs a report with another stamp''s dictionary' {
-        $script:Run.Text | Should -Match 'SKIP: reused/ResourcesReport_20260101000000000eeee\.zip - no dictionary with the same stamp'
-        $script:Run.Text | Should -Not -Match 'FAIL: '
-        $script:Run.Exit | Should -Be 0 -Because $script:Run.Text
+    It 'never pairs a report with another stamp''s dictionary, and fails the report that has none' {
+        $script:Run.Text | Should -Match 'FAIL: reused/ResourcesReport_20260101000000000eeee\.zip - no dictionary with the same stamp'
+        $script:Run.Text | Should -Not -Match 'SKIP: reused'
+        $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
+    }
+
+    It 'keeps staging under -RemoveStaging' {
+        $script:Run.Text | Should -Match '-RemoveStaging skipped: 1 folder\(s\) failed'
+        Test-Path -LiteralPath (Join-Path $script:Run.Staging 'ResourcesReport_20260202000000000ffff.zip') | Should -BeTrue
     }
 
     It 'reveals the report that has its own dictionary' {
         Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260202000000000ffff.zip')
         Get-InnerText (Join-Path $script:Run.Staging 'ResourcesReport_20260202000000000ffff.zip') | Should -Match 'rg-new'
+    }
+}
+
+Describe 'Reveal.ps1 with half a report pair in a folder' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'halfpair'
+        Add-Report -Folder (Join-Path $script:Root 'good') -Stamp '20260101000000000aaaa' -Subs @(New-Sub -Id $script:SubA -RgName 'rg-a')
+        # Only a report zip, only a dictionary, and a dictionary beside a
+        # report of another stamp.
+        Add-Report -Folder (Join-Path $script:Root 'zip-only') -Stamp '20260101000000001bbbb' -Subs @(New-Sub -Id $script:SubB -RgName 'rg-b') -NoDictionary
+        Add-Report -Folder (Join-Path $script:Root 'dict-only') -Stamp '20260101000000002cccc' -Subs @(New-Sub -Id $script:SubC -RgName 'rg-c')
+        Remove-Item -LiteralPath (Join-Path $script:Root 'dict-only/ResourcesReport_20260101000000002cccc.zip') -Force
+        $Mixed = Join-Path $script:Root 'mixed'
+        Add-Report -Folder $Mixed -Stamp '20260101000000003dddd' -Subs @(New-Sub -Id '00000000-0000-0000-0000-00000000000d' -RgName 'rg-d')
+        Add-Report -Folder $Mixed -Stamp '20260101000000004eeee' -Subs @(New-Sub -Id '00000000-0000-0000-0000-00000000000e' -RgName 'rg-e')
+        Remove-Item -LiteralPath (Join-Path $Mixed 'ResourcesReport_20260101000000004eeee.zip') -Force
+        # Neither: an unrelated folder, and a staging folder of an earlier reveal.
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:Root 'notes') -Force
+        [System.IO.File]::WriteAllText((Join-Path $script:Root 'notes/readme.txt'), 'x')
+        $OldStaging = Join-Path $script:Root 'RevealedStaging_2026-01-01_00-00-00'
+        $null = New-Item -ItemType Directory -Path $OldStaging -Force
+        Copy-Item -LiteralPath (Join-Path $script:Root 'good/ResourcesReport_20260101000000000aaaa.zip') -Destination $OldStaging
+        [System.IO.File]::WriteAllText((Join-Path $OldStaging '.reveal-staging.json'), '{}')
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'halfpair' -Extra @('-RemoveStaging')
+    }
+
+    It 'fails each half pair, names it and exits non-zero' {
+        $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
+        $script:Run.Text | Should -Match 'FAIL: zip-only - an obfuscated report zip but no obfuscation dictionary'
+        $script:Run.Text | Should -Match 'FAIL: dict-only - an obfuscation dictionary but no obfuscated report zip'
+        $script:Run.Text | Should -Match 'FAIL: mixed/ObfuscationDictionary_ResourcesReport_20260101000000004eeee\.json - an obfuscation dictionary with no report zip of the same stamp'
+        $script:Run.Text | Should -Match 'Failed during reveal\s+: 3'
+    }
+
+    It 'only notes a folder with neither, and an earlier staging folder' {
+        $script:Run.Text | Should -Match 'SKIP: notes - no obfuscated report zip and no obfuscation dictionary'
+        $script:Run.Text | Should -Match 'SKIP: RevealedStaging_2026-01-01_00-00-00 - a staging folder of an earlier reveal'
+        $script:Run.Text | Should -Not -Match 'FAIL: notes'
+        $script:Run.Text | Should -Not -Match 'FAIL: RevealedStaging'
+    }
+
+    It 'ships the whole pairs and keeps staging' {
+        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000000aaaa.zip', 'ResourcesReport_20260101000000003dddd.zip')
+        $script:Run.Text | Should -Match '-RemoveStaging skipped: 3 folder\(s\) failed'
+        Test-Path -LiteralPath $script:Run.Staging | Should -BeTrue
     }
 }

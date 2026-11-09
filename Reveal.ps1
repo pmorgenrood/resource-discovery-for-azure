@@ -473,8 +473,8 @@ $RunOutputs = [System.Collections.Generic.List[string]]::new()
 # (e.g. 0.5) at a whole >=1s Wait-Job timeout.
 $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 
-# Find the reports to reveal, handling the cheap cases synchronously (missing
-# pair -> skip; already revealed under -Resume -> skip). Everything that needs
+# Find the reports to reveal, handling the cheap cases synchronously (half a
+# pair -> failed; already revealed under -Resume -> skip). Everything that needs
 # the reveal engine becomes a queued work item, drained by the bounded pool
 # below.
 #
@@ -486,7 +486,8 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 # So:
 #  - every report zip in a folder is paired only with the dictionary of the
 #    SAME stamp (never with another stamp's dictionary next to it), and a
-#    report with no such dictionary is skipped;
+#    report with no such dictionary, or a dictionary with no such report, is
+#    counted as failed (a folder with neither is only noted as skipped);
 #  - Reveal never guesses which of two reports of one subscription is right.
 #    The newer report is not always the fuller one: a recovery run of one
 #    service (no consumption, no metrics) is newer than the full run it
@@ -537,12 +538,30 @@ foreach ($Folder in $Folders)
             Sort-Object Name)
     $Dicts = @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
 
-    if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
+    # A staging folder of an earlier reveal holds revealed zips under the
+    # report names and no dictionary. It is not a report folder.
+    if ((Test-Path -LiteralPath (Join-Path $Folder.FullName $StagingMarkerName) -PathType Leaf) -or $Folder.Name -like 'RevealedStaging_*')
     {
-        $Reason = if ($Zips.Count -eq 0) { 'no obfuscated report zip in folder' } else { 'no obfuscation dictionary in folder' }
-        $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason }
+        $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'a staging folder of an earlier reveal, not a report folder' }
         continue
     }
+    # A folder with neither a report zip nor a dictionary may be anything,
+    # so it is only noted. A folder with only one of them is a report that
+    # cannot be revealed: it is counted as failed, so the run does not look
+    # complete without it.
+    if ($Zips.Count -eq 0 -and $Dicts.Count -eq 0)
+    {
+        $SkippedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = 'no obfuscated report zip and no obfuscation dictionary in folder' }
+        continue
+    }
+    if ($Zips.Count -eq 0 -or $Dicts.Count -eq 0)
+    {
+        $Reason = if ($Zips.Count -eq 0) { 'an obfuscation dictionary but no obfuscated report zip (ResourcesReport_<stamp>.zip) in folder, so its report is not in the bundle' } else { 'an obfuscated report zip but no obfuscation dictionary in folder, so it cannot be revealed and is not in the bundle (a report made without -Obfuscate does not belong under this inventory root)' }
+        $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = $Reason }
+        continue
+    }
+    # The dictionaries some report zip of this folder pairs with.
+    $PairedDictNames = [System.Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
 
     foreach ($Zip in $Zips)
     {
@@ -552,10 +571,11 @@ foreach ($Folder in $Folders)
         $Stamp = $Zip.BaseName.Substring('ResourcesReport_'.Length)
         $DictNames = @(('ObfuscationDictionary_' + $Zip.BaseName + '.json'), ('ObfuscationDictionary_' + $Stamp + '.json'))
         $Matched = @($Dicts | Where-Object { $Name = $_.Name; @($DictNames | Where-Object { [string]::Equals($_, $Name, $PathComparison) }).Count -gt 0 })
+        foreach ($M in $Matched) { $null = $PairedDictNames.Add($M.Name) }
         if ($Matched.Count -ne 1)
         {
-            $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0]))" } else { 'more than one dictionary with the same stamp' }
-            $SkippedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason }
+            $Reason = if ($Matched.Count -eq 0) { "no dictionary with the same stamp ($($DictNames[0])), so it cannot be revealed and is not in the bundle" } else { 'more than one dictionary with the same stamp, so it is not revealed and is not in the bundle' }
+            $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Zip.Name); Reason = $Reason }
             continue
         }
         $Dict = $Matched[0]
@@ -602,6 +622,12 @@ foreach ($Folder in $Folders)
                 Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
                 SubIds = @($SubIds | Sort-Object); SubTokens = $SubTokens
             })
+    }
+    # A dictionary no report zip of its stamp pairs with: its report is
+    # missing from the folder.
+    foreach ($Lone in @($Dicts | Where-Object { -not $PairedDictNames.Contains($_.Name) } | Sort-Object Name))
+    {
+        $FailedItems += [pscustomobject]@{ Folder = ('{0}/{1}' -f $Folder.Name, $Lone.Name); Reason = 'an obfuscation dictionary with no report zip of the same stamp in its folder, so its report is not in the bundle' }
     }
 }
 
@@ -853,7 +879,7 @@ Write-Host ("Per-subscription folders scanned : {0}" -f $Folders.Count) -Foregro
 Write-Host ("Paired (zip + dictionary)        : {0}" -f $PairedCount) -ForegroundColor Green
 Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -ForegroundColor Green
 Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
-Write-Host ("Skipped (missing zip or dict)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host ("Skipped (not a report folder)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Left out (sub in >1 report)      : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Failed during reveal             : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
 
