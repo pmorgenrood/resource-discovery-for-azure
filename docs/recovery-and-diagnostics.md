@@ -104,12 +104,15 @@ Behaviour:
   byte-for-byte (the default, unchanged behaviour).
 - **Files downstream would drop stop the merge**, before it writes anything.
   The consumption file it would zip must have the `ResourceId`,
-  `MeterCategory`, `MeterSubCategory`, `MeterName` and `MeterId` columns, and
-  every `Quantity` must be a number of 0 or more written with a dot and no
-  thousands mark; every `UsageStartTime` and `UsageEndTime` must be a date; and
-  `Cost` and `UnitPrice`, where those columns exist, must be numbers. A file
-  cut mid-row ends in a row that fails this. A row with an empty `ResourceId`
-  or `MeterId` does not stop the merge, as downstream drops only that row. Each
+  `MeterCategory`, `MeterSubCategory`, `MeterName`, `MeterId`, `Quantity`,
+  `UsageStartTime` and `UsageEndTime` columns, and every `Quantity` must be a
+  number written with a dot and no thousands mark; every `UsageStartTime` and
+  `UsageEndTime` must be a date; and `Cost` and `UnitPrice`, where those
+  columns exist, must be numbers. A file cut mid-row ends in a row that fails
+  this. A row with an empty `ResourceId` or `MeterId`, or a negative
+  `Quantity`, does not stop the merge, as downstream drops only that row and
+  the tool's own run can write such rows; the merge prints one warning naming
+  the file and how many such rows it has. Each
   metrics file it would zip must be a JSON object with a `Metrics` list whose
   records are objects with `MetricCount`, `MetricValue` and `MetricPercentile`
   as numbers, `MetricError` as true or false, and `MetricSeries`, when set, a
