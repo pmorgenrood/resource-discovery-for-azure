@@ -138,6 +138,14 @@ Describe 'VM billing-coverage banner' {
         $Html | Should -Match '<b>Service Types:</b> 1</div>'
     }
 
+    It 'shows a total of 0 for a report with no resources, also under strict mode' {
+        $Inv = New-TestInventory -RunningVms 0 -DeallocatedVms 0
+        $Html = Invoke-Summary -Inventory $Inv
+        $Html | Should -Match '<b>Total Resources:</b> 0</div>'
+        try { Set-StrictMode -Version Latest; $Strict = Invoke-Summary -Inventory $Inv } finally { Set-StrictMode -Off }
+        $Strict | Should -Match '<b>Total Resources:</b> 0</div>'
+    }
+
     It 'reports the gap percentage' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_pct.csv'

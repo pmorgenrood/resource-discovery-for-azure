@@ -296,7 +296,8 @@ function New-RdaAllSubHtmlSummary
     $IsObfuscated = $Obfuscated.IsPresent -or ($ObfuscationStatus -eq 'obfuscated')
 
     $SubReports = @($SubReports | Sort-Object -Property Total -Descending)
-    $RunTotalResources = [int](($SubReports | Measure-Object -Property Total -Sum).Sum)
+    # A plain sum: 0 with no reports, also under strict mode.
+    $RunTotalResources = 0; foreach ($SubRow in $SubReports) { $RunTotalResources += [int]$SubRow.Total }
     $SubCount = $SubReports.Count
     # An inventory that could not be read is not an empty one: it is counted
     # and named apart.

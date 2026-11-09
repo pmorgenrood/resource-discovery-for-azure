@@ -457,3 +457,18 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
         $Html | Should -Match 'Fabrikam-Billing' -Because 'an identifiable bundle names the affected subs'
     }
 }
+
+Describe 'New-RdaAllSubHtmlSummary with no reports under strict mode' {
+    It 'renders the main summary with a total of 0' {
+        $Run = Join-Path ([System.IO.Path]::GetTempPath()) ('NoReportsStrict_' + [guid]::NewGuid().ToString('N'))
+        [void][System.IO.Directory]::CreateDirectory($Run)
+        try
+        {
+            $Html = Join-Path $Run 'MainSummary.html'
+            try { Set-StrictMode -Version Latest; { New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Html 6>$null } | Should -Not -Throw }
+            finally { Set-StrictMode -Off }
+            [System.IO.File]::ReadAllText($Html) | Should -BeLike '*No per-subscription reports*'
+        }
+        finally { [System.IO.Directory]::Delete($Run, $true) }
+    }
+}
