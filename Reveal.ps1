@@ -449,7 +449,10 @@ if ($StagedZips.Count -gt 0)
         # -LiteralPath (not -Path): staged names are taken verbatim. -Path treats
         # each value as a wildcard, so a report name containing '[' or ']' would
         # silently fail to match and abort the archive.
-        Compress-Archive -LiteralPath $StagedZips.FullName -DestinationPath $OutputZip -Force
+        # -DestinationPath has no literal form and also reads '[' and ']' as a
+        # wildcard, so an inventory root 'Reports[1]' would write the outer zip
+        # into a neighbour 'Reports1'. Escape it so it is taken as written.
+        Compress-Archive -LiteralPath $StagedZips.FullName -DestinationPath ([WildcardPattern]::Escape($OutputZip)) -Force
     }
     catch
     {
