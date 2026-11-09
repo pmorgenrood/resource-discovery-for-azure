@@ -168,27 +168,7 @@ Describe "Consumption to Inventory Cross-Reference" {
     }
 }
 
-Describe "ResourceGroup Consistency" {
-    It "Resources with the same obfuscated ResourceGroup should be grouped together" {
-        $RgGroups = @{}
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | ForEach-Object {
-                if ($null -ne $_ -and $null -ne $_.ResourceGroup)
-                {
-                    if (-not $RgGroups.ContainsKey($_.ResourceGroup)) { $RgGroups[$_.ResourceGroup] = @() }
-                    $RgGroups[$_.ResourceGroup] += $_.ID
-                }
-            }
-        }
-        # Each RG should have at least one resource
-        foreach ($rg in $RgGroups.Keys)
-        {
-            $RgGroups[$rg].Count | Should -BeGreaterThan 0 -Because "ResourceGroup '$rg' should have at least one resource"
-        }
-    }
-}
-
-Describe "Subscription Determinism" {
+Describe "Subscription and Resource Group Determinism" {
     It "One real subscription has one subscription token, and one token one real subscription" {
         $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
         {
@@ -210,20 +190,28 @@ Describe "Subscription Determinism" {
         foreach ($Real in $TokensOf.Keys) { $TokensOf[$Real].Count | Should -Be 1 -Because 'a real subscription keeps one token in every id' }
         foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real subscription' }
     }
-}
 
-Describe "ResourceGroup Determinism" {
-    It "Fewer unique ResourceGroup values than total resources (deterministic mapping)" {
-        $RgValues = @{}
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | ForEach-Object {
-                if ($null -ne $_ -and $null -ne $_.ResourceGroup)
-                {
-                    $RgValues[$_.ResourceGroup] = $true
-                }
-            }
+    It "One real resource group has one resource group token, and one token one real resource group" {
+        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
+        {
+            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
+            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
-        $RgValues.Keys.Count | Should -BeLessOrEqual $script:AllIds.Count -Because "ResourceGroup values should be reused across resources in the same RG"
+        if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because 'no obfuscation dictionary for this zip'; return }
+        $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
+        $TokensOf = @{}; $RealsOf = @{}
+        foreach ($P in @($Map.PSObject.Properties))
+        {
+            $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
+            if ($M.Count -lt 5 -or $R.Count -lt 5 -or $M[3] -ine 'resourcegroups' -or $R[3] -ine 'resourcegroups') { continue }
+            # A group is one group within its subscription, letter case aside.
+            $Real = ($R[2] + '/' + $R[4]).ToLowerInvariant()
+            if (-not $TokensOf.ContainsKey($Real)) { $TokensOf[$Real] = @{} }; $TokensOf[$Real][$M[4]] = $true
+            if (-not $RealsOf.ContainsKey($M[4])) { $RealsOf[$M[4]] = @{} }; $RealsOf[$M[4]][$Real] = $true
+        }
+        if ($TokensOf.Count -eq 0) { Set-ItResult -Skipped -Because 'no masked resource group path in the dictionary'; return }
+        foreach ($Real in $TokensOf.Keys) { $TokensOf[$Real].Count | Should -Be 1 -Because 'a real resource group keeps one token in every id' }
+        foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real resource group' }
     }
 }
 
