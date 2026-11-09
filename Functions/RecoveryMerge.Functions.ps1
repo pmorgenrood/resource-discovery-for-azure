@@ -256,7 +256,7 @@ function Merge-RecoveryData
     #    dictionary stops the merge before anything is written. ---------------
     function Read-MergeDictionary
     {
-        param($File, [string]$Label)
+        param($File, [string]$Label, [string]$Way)
         $Problem = $null
         $Parsed = $null
         try
@@ -296,7 +296,7 @@ function Merge-RecoveryData
         }
         if ($null -ne $Problem)
         {
-            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' cannot be read: {2}. Nothing was written to '{3}'. Put back the dictionary that run wrote, or re-run that bundle into a new folder, then run this merge again." -f $Label, $File.FullName, $Problem, $OutputPath)
+            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' cannot be read: {2}. Nothing was written to '{3}'. Put back the dictionary that run wrote, or {4}." -f $Label, $File.FullName, $Problem, $OutputPath, $Way)
         }
         return $Parsed
     }
@@ -330,6 +330,19 @@ function Merge-RecoveryData
     $GapConsumptionFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Consumption_*.csv'  -Optional
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
+
+    # The ways out that the stops below name. Each one must lead to a merge
+    # that passes. A recovery is re-run with the masking the gap has: seeded
+    # with the gap's dictionary, or without -Obfuscate when the gap has none.
+    # A gap that must be re-run masked takes the recovery with it: a gap
+    # seeded with the recovery's dictionary still mints tokens for every
+    # resource the recovery did not see, so the recovery's map would lack
+    # them and the merge would stop on the missing-token check. So the gap is
+    # re-run first and the recovery is then re-run seeded with that new gap
+    # run's dictionary.
+    $NewFolderNote = 'into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files)'
+    $RecoveryMasking = if ($GapDictionaryFile) { "with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { 'without -Obfuscate' }
+    $MaskedGapRerunWay = "re-run the gap with -Obfuscate $NewFolderNote, then re-run the recovery with -Obfuscate -ObfuscationDictionary set to the ObfuscationDictionary_*.json that new gap run wrote, also into a new folder, then run this merge again with -GapBundlePath and -RecoveryBundlePath pointing at the two new folders"
 
     # The merge writes a new bundle; written into a source folder it would
     # replace that bundle's own files. An output folder that does not exist
@@ -382,8 +395,8 @@ function Merge-RecoveryData
     # stopped merge writes, zips and leaves nothing; the way out is to fix the
     # named bundle and run the same merge again. Both dictionaries are read and
     # checked first; one that cannot be read stops the merge here.
-    $GapDictionary = if ($GapDictionaryFile) { Read-MergeDictionary -File $GapDictionaryFile -Label 'gap' } else { $null }
-    $RecoveryDictionary = if ($RecoveryDictionaryFile) { Read-MergeDictionary -File $RecoveryDictionaryFile -Label 'recovery' } else { $null }
+    $GapDictionary = if ($GapDictionaryFile) { Read-MergeDictionary -File $GapDictionaryFile -Label 'gap' -Way $MaskedGapRerunWay } else { $null }
+    $RecoveryDictionary = if ($RecoveryDictionaryFile) { Read-MergeDictionary -File $RecoveryDictionaryFile -Label 'recovery' -Way ("re-run the recovery {0} {1}, then run this merge again with -RecoveryBundlePath pointing at it" -f $RecoveryMasking, $NewFolderNote) } else { $null }
     if ($GapDictionaryFile -and $RecoveryDictionaryFile)
     {
         # Drop the $null that an empty or missing map yields, so an empty
@@ -425,7 +438,7 @@ function Merge-RecoveryData
     {
         # Masked recovery, gap without a dictionary: the gap inventory may hold
         # real names and ids next to masked recovered rows.
-        throw ("Merge-RecoveryData: the gap bundle '{0}' has no ObfuscationDictionary_*.json, but the recovery bundle has '{1}'. The gap run was probably not masked, so real names and ids would sit next to masked rows in one bundle. Nothing was written to '{2}'. If the gap run was masked and its dictionary was moved, put it back in that folder. Otherwise the quickest way out is to re-run the recovery without -Obfuscate into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it. To ship a masked bundle instead, re-run the gap with -Obfuscate -ObfuscationDictionary '{3}' into a new folder, so its tokens match the recovery's, then run this merge again with -GapBundlePath pointing at it." -f $GapBundlePath, $RecoveryDictionaryFile.Name, $OutputPath, $RecoveryDictionaryFile.FullName)
+        throw ("Merge-RecoveryData: the gap bundle '{0}' has no ObfuscationDictionary_*.json, but the recovery bundle has '{1}'. The gap run was probably not masked, so real names and ids would sit next to masked rows in one bundle. Nothing was written to '{2}'. If the gap run was masked and its dictionary was moved, put it back in that folder. Otherwise the quickest way out is to re-run the recovery without -Obfuscate into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again with -RecoveryBundlePath pointing at it. To ship a masked bundle instead, {3}. Do not seed the gap with the recovery's dictionary: that gap run mints tokens for the resources the recovery did not see, so the merge would stop again." -f $GapBundlePath, $RecoveryDictionaryFile.Name, $OutputPath, $MaskedGapRerunWay)
     }
 
     # -- Guard: dictionary-belongs-to-its-inventory (HARD FAIL) ---------------
@@ -542,7 +555,7 @@ function Merge-RecoveryData
         $RecoveryConsumptionFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Consumption_*.csv' -Optional
         if (-not $RecoveryConsumptionFile)
         {
-            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Re-run the recovery WITHOUT -SkipConsumption. Nothing was written." -f $RecoveryBundlePath)
+            throw ("Merge-RecoveryData: -RecoverConsumption was requested but the recovery bundle '{0}' has no Consumption_*.csv. Nothing was written. Re-run the recovery WITHOUT -SkipConsumption, {1} {2}, then run this merge again with -RecoveryBundlePath pointing at it." -f $RecoveryBundlePath, $RecoveryMasking, $NewFolderNote)
         }
     }
     $RecoveryMetricsFiles = @()
@@ -551,7 +564,7 @@ function Merge-RecoveryData
         $RecoveryMetricsFiles = @(Get-ChildItem -LiteralPath $RecoveryBundlePath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue)
         if ($RecoveryMetricsFiles.Count -eq 0)
         {
-            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Re-run the recovery WITHOUT -SkipMetrics. Nothing was written." -f $RecoveryBundlePath)
+            throw ("Merge-RecoveryData: -RecoverMetrics was requested but the recovery bundle '{0}' has no Metrics_*.json. Nothing was written. Re-run the recovery WITHOUT -SkipMetrics, {1} {2}, then run this merge again with -RecoveryBundlePath pointing at it." -f $RecoveryBundlePath, $RecoveryMasking, $NewFolderNote)
         }
     }
     # The gap bundle's metrics files, carried forward when -RecoverMetrics is not set.
@@ -593,7 +606,7 @@ function Merge-RecoveryData
         $MissingColumns = @('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId', 'Quantity', 'UsageStartTime', 'UsageEndTime' | Where-Object { $_ -notin $HeaderNames })
         if ($MissingColumns.Count -gt 0)
         {
-            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
+            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { "Re-run the recovery WITHOUT -SkipConsumption, $RecoveryMasking $NewFolderNote, then run this merge again with -RecoveryBundlePath pointing at it." }
             throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' has no {2} column, which downstream needs to read its rows, so they would be dropped. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, ($MissingColumns -join ', '), $OutputPath, $Hint)
         }
 
@@ -669,7 +682,7 @@ function Merge-RecoveryData
         $ConsumptionHasRows = ($RowIndex -gt 0)
         if ($null -ne $BadCell)
         {
-            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { 'Re-run the recovery WITHOUT -SkipConsumption into a new folder, then run this merge again pointed at it.' }
+            $Hint = if ($ConsumptionSource -eq 'gap') { 'Run this merge with -RecoverConsumption and a recovery bundle whose consumption file is whole.' } else { "Re-run the recovery WITHOUT -SkipConsumption, $RecoveryMasking $NewFolderNote, then run this merge again with -RecoveryBundlePath pointing at it." }
             throw ("Merge-RecoveryData: the {0} bundle's consumption file '{1}' cannot be used: {2}. Downstream would drop the whole file, and with it every cost. Nothing was written to '{3}'. {4}" -f $ConsumptionSource, $ConsumptionSourceFile.FullName, $BadCell, $OutputPath, $Hint)
         }
         if ($DroppedRowCount -gt 0)
@@ -713,7 +726,7 @@ function Merge-RecoveryData
         }
         if ($null -ne $Problem)
         {
-            $Hint = if ($MetricsSourceLabel -eq 'gap') { 'Run this merge with -RecoverMetrics and a recovery bundle whose metrics are whole.' } else { 'Re-run the recovery WITHOUT -SkipMetrics into a new folder, then run this merge again pointed at it.' }
+            $Hint = if ($MetricsSourceLabel -eq 'gap') { 'Run this merge with -RecoverMetrics and a recovery bundle whose metrics are whole.' } else { "Re-run the recovery WITHOUT -SkipMetrics, $RecoveryMasking $NewFolderNote, then run this merge again with -RecoveryBundlePath pointing at it." }
             throw ("Merge-RecoveryData: the {0} bundle's metrics file '{1}' cannot be used: {2}. Downstream would drop every metric in the zip. Nothing was written to '{3}'. {4}" -f $MetricsSourceLabel, $MetricsFile.FullName, $Problem, $OutputPath, $Hint)
         }
     }
@@ -743,8 +756,8 @@ function Merge-RecoveryData
             if ($ConsumptionHasRows -and $ConsumptionSource -eq $Side.Label) { $Given.Add('consumption rows') }
             if ($SelectedMetricsCount -gt 0 -and $MetricsSourceLabel -eq $Side.Label) { $Given.Add(('{0} metric(s)' -f $SelectedMetricsCount)) }
             if ($Given.Count -eq 0) { continue }
-            $Way = if ($Side.Label -eq 'recovery') { "Re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { "Re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'" -f $RecoveryDictionaryFile.FullName }
-            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' has an empty ResourceIdMap, so that run masked no resource, but the {0} bundle gives this merge {2}. They were not masked with that dictionary, so real names and ids would ship inside a masked bundle. Nothing was written to '{3}'. If that run's own dictionary was moved, put it back in that folder. Otherwise {4} into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at it." -f $Side.Label, $Side.Dict.Name, ($Given -join ', '), $OutputPath, $Way)
+            $Way = if ($Side.Label -eq 'recovery') { "re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}' {1}, then run this merge again with -RecoveryBundlePath pointing at it" -f $GapDictionaryFile.FullName, $NewFolderNote } else { $MaskedGapRerunWay }
+            throw ("Merge-RecoveryData: the {0} bundle's dictionary '{1}' has an empty ResourceIdMap, so that run masked no resource, but the {0} bundle gives this merge {2}. They were not masked with that dictionary, so real names and ids would ship inside a masked bundle. Nothing was written to '{3}'. If that run's own dictionary was moved, put it back in that folder. Otherwise {4}." -f $Side.Label, $Side.Dict.Name, ($Given -join ', '), $OutputPath, $Way)
         }
 
         # -- Guard: plain records in a masked merge. A dictionary whose
@@ -764,7 +777,7 @@ function Merge-RecoveryData
                 @{ Label = 'recovery'; Inventory = $RecoveryInventory; Keys = $MergeKeys; InventoryFile = $RecoveryInventoryFile }
             ))
         {
-            $Way = if ($Side.Label -eq 'recovery') { "re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}'" -f $GapDictionaryFile.FullName } else { "re-run the gap with -Obfuscate -ObfuscationDictionary '{0}'" -f $RecoveryDictionaryFile.FullName }
+            $Way = if ($Side.Label -eq 'recovery') { "re-run the recovery with -Obfuscate -ObfuscationDictionary '{0}' {1}, then run this merge again with -RecoveryBundlePath pointing at it" -f $GapDictionaryFile.FullName, $NewFolderNote } else { $MaskedGapRerunWay }
             $Found = $null
             $RecordCount = 0
             $SawMasked = $false
@@ -811,7 +824,7 @@ function Merge-RecoveryData
                 }
             }
             if ($null -eq $Found) { continue }
-            throw ("Merge-RecoveryData: both bundles have a dictionary, so this is a masked merge, but in the {0} bundle {1}. That run was not masked, so real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. If that folder holds a plain run next to an old masked run's dictionary, {3} into a new folder (the default when -OutputDirectory is not set; a reused folder still holds the old files), then run this merge again pointed at it." -f $Side.Label, $Found, $OutputPath, $Way)
+            throw ("Merge-RecoveryData: both bundles have a dictionary, so this is a masked merge, but in the {0} bundle {1}. That run was not masked, so real names and ids would ship inside a masked bundle. Nothing was written to '{2}'. If that folder holds a plain run next to an old masked run's dictionary, {3}." -f $Side.Label, $Found, $OutputPath, $Way)
         }
     }
 
