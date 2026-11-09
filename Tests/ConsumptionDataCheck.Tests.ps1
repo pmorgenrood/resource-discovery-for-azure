@@ -1330,6 +1330,14 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception (New-StatusException -Message $Message -Status $Status) | Should -Be $Kind
     }
 
+    It 'reads the status of an error that an ErrorRecord carries, before any message' {
+        $Http = [System.Net.Http.HttpRequestException]::new('The resource could not be found right now', $null, [System.Net.HttpStatusCode]::TooManyRequests)
+        $Record = [System.Management.Automation.ErrorRecord]::new($Http, 'Throttled', 'LimitsExceeded', $null)
+        $Outer = [System.Management.Automation.RuntimeException]::new('Operation failed.', $null, $Record)
+        Get-ConsumptionErrorStatusCode -Exception $Outer | Should -Be 429
+        Get-ConsumptionErrorKind -Exception $Outer | Should -Be 'Transient'
+    }
+
     It 'reads 400, 401, 403 or 404 in a message without a status only after status or HTTP' {
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Too busy, retry after 400 milliseconds.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP 403 returned by the usage API.')) | Should -Be 'Permanent'

@@ -1318,16 +1318,23 @@ function Test-ConsumptionRowsHavePositiveQuantity
     return $false
 }
 
-# Pure: the HTTP status carried by an exception or any inner exception
-# (Hyak/Rest exceptions expose .Response.StatusCode, HttpRequestException
-# exposes .StatusCode). Returns an [int] or $null when none is present.
+# Pure: the HTTP status carried by an exception, any inner exception, or the
+# exception of an ErrorRecord one carries (Hyak/Rest exceptions expose
+# .Response.StatusCode, HttpRequestException exposes .StatusCode). Returns an
+# [int] or $null when none is present.
 function Get-ConsumptionErrorStatusCode
 {
     param([object]$Exception)
-    $Current = $Exception
-    $Depth = 0
-    while ($null -ne $Current -and $Depth -lt 6)
+    # The same errors Get-ConsumptionErrorKind reads the messages of: the
+    # exception, its inner exceptions and an ErrorRecord's exception, at most 10.
+    $Pending = [System.Collections.Generic.Queue[object]]::new()
+    $Pending.Enqueue($Exception)
+    $Seen = 0
+    while ($Pending.Count -gt 0 -and $Seen -lt 10)
     {
+        $Current = $Pending.Dequeue()
+        if ($null -eq $Current) { continue }
+        $Seen++
         # Only some exceptions carry Response or StatusCode; read them only when
         # present, so Set-StrictMode allows an exception without them.
         $Props = $Current.PSObject.Properties
@@ -1349,8 +1356,11 @@ function Get-ConsumptionErrorStatusCode
                 Write-Verbose ('Unrecognised status code value: {0}' -f $Candidate)
             }
         }
-        $Current = if ($null -ne $Props['InnerException']) { $Current.InnerException } else { $null }
-        $Depth++
+        if ($null -ne $Props['InnerException']) { $Pending.Enqueue($Current.InnerException) }
+        if ($null -ne $Props['ErrorRecord'] -and $null -ne $Current.ErrorRecord -and -not [object]::ReferenceEquals($Current.ErrorRecord.Exception, $Current))
+        {
+            $Pending.Enqueue($Current.ErrorRecord.Exception)
+        }
     }
     return $null
 }
