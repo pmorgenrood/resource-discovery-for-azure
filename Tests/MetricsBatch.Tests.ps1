@@ -1320,3 +1320,16 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
         }
     }
 }
+
+Describe 'The batch code runs on PowerShell 7.0' {
+
+    # The scripts accept PowerShell 7.0 (#requires -Version 7.0), which runs on
+    # .NET Core 3.1. ReferenceEqualityComparer came with .NET 5, so 7.0 fails on it.
+    It 'uses no ReferenceEqualityComparer, which .NET Core 3.1 does not have' {
+        foreach ($File in 'Extension/Metrics.ps1', 'Functions/Common.Functions.ps1')
+        {
+            $Lines = @(Select-String -LiteralPath (Join-Path $script:RepoRoot $File) -Pattern 'ReferenceEqualityComparer' | ForEach-Object { $_.LineNumber })
+            $Lines | Should -BeNullOrEmpty -Because $File
+        }
+    }
+}
