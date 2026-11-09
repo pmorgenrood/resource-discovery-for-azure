@@ -117,7 +117,8 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
     return $Result
 }
 
-# Best-effort extraction of a SERVER-DIRECTED retry delay (seconds) from a failed Azure cmdlet's error (consumption-retry-after header, else the standard Retry-After) so a throttled caller waits exactly as long as the service asks.
+# Reads the server-directed retry delay (seconds) from a failed Get-AzMetric call, so the Azure Monitor retry loop in
+# Extension/Metrics.ps1 waits as long as the service asks. It reads the standard Retry-After header.
 # Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws - a diagnostics aid must not break the retry loop.
 function Get-RdaRetryAfterSeconds
 {
@@ -125,8 +126,8 @@ function Get-RdaRetryAfterSeconds
         [Parameter(Mandatory = $true)]$ErrorRecord
     )
 
-    # Priority order: the consumption/billing-specific header first (that is what
-    # the Cost Management throttle emits), then the standard HTTP Retry-After.
+    # Azure Monitor sends the standard Retry-After. The consumption header is read first
+    # only so a later Cost Management caller can share this reader; Azure Monitor never sends it.
     $HeaderNames = @('x-ms-ratelimit-microsoft.consumption-retry-after', 'Retry-After')
 
     try
@@ -223,9 +224,9 @@ function Invoke-AzGraphQuerySafe
     # network mid-run, VPN switch, ARM throttling, 5xx). Without this a single
     # transient blip during discovery throws and fails the whole subscription
     # (recorded to FailedAttempts and resumable, but the entire sub restarts).
-    # Mirrors the Get-AzMetric wrapper in Extension/Metrics.ps1: up to 3 retries
-    # (4 attempts total) with exponential backoff + jitter, longer backoff when
-    # throttled. Stable internals, deliberately NOT promoted to script params.
+    # Up to 3 retries (4 attempts in all) with exponential backoff + jitter,
+    # doubled when throttled; throttling shares the same 3 retries here.
+    # Stable internals, deliberately NOT promoted to script params.
     # A CLEARLY-PERMANENT failure (authorization denied, malformed KQL / bad
     # request) is NOT retried - it throws immediately, matching the project's
     # fail-loud-fast stance for genuine access denial rather than burning ~30s

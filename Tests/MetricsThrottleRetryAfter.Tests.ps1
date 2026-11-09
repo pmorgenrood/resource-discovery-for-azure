@@ -203,6 +203,14 @@ Describe 'Retry-After reaches the runspace' {
         $script:MetricsSrc | Should -Match 'Get-RdaRetryAfterSeconds -ErrorRecord \$_'
             }
 
+    It 'the comments describe the real callers and retry policies' {
+        $FunctionsSrc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/ResourceInventory.Functions.ps1') -Raw
+        # The reader serves the Azure Monitor retry loop.
+        $FunctionsSrc | Should -Match '(?m)^# .*Azure Monitor.*\r?\n(# .*\r?\n)*function Get-RdaRetryAfterSeconds'
+        # The Resource Graph retry no longer matches the Get-AzMetric loop, which now has its own throttle budget.
+        $FunctionsSrc | Should -Not -Match 'Mirrors the Get-AzMetric wrapper'
+    }
+
     It 'the retry loop has an explicit exit when the budget is exhausted (the while is no longer bounded by attempts)' {
         $script:MetricsSrc | Should -Match '(?s)while \(-not \$Succeeded\)\s*\{.*?Budget exhausted.*?break'
     }
