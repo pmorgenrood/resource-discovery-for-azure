@@ -350,6 +350,44 @@ function Get-RevealFileSha256
     param([string]$Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
+
+# Why a staging mark's Outputs cannot be used, or $null when every record has
+# the shape Save-RevealStagingMarker writes: a plain file name that stays
+# directly in staging, mapped to its output's SHA-256 and the name and SHA-256
+# of the report and dictionary it came from. No Outputs at all is an empty
+# record.
+function Get-RevealBadOutputRecord
+{
+    param($Outputs, [string]$StagingDirectory, [System.StringComparison]$PathComparison)
+    if ($null -eq $Outputs) { return $null }
+    if ($Outputs -isnot [System.Collections.IDictionary]) { return 'its Outputs is not a list of named records' }
+    $StagingFull = ConvertTo-RevealComparablePath ([System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StagingDirectory)))
+    $Separators = @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar, '/', '\') | Select-Object -Unique
+    foreach ($Key in @($Outputs.Keys))
+    {
+        $Name = [string]$Key
+        $Shown = "'" + $Name + "'"
+        if ($Key -isnot [string] -or [string]::IsNullOrWhiteSpace($Name)) { return ('an output with no file name') }
+        if ($Name -eq '.' -or $Name -eq '..') { return ('the output name {0} is not a file name' -f $Shown) }
+        if ($Name.IndexOfAny([char[]]$Separators) -ge 0 -or $Name.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) { return ('the output name {0} has a folder part or a character a file name cannot hold' -f $Shown) }
+        if ([System.IO.Path]::IsPathRooted($Name)) { return ('the output name {0} is a rooted path' -f $Shown) }
+        $Parent = ConvertTo-RevealComparablePath ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath((Join-Path $StagingFull $Name))))
+        if (-not [string]::Equals($Parent, $StagingFull, $PathComparison)) { return ('the output name {0} is not in the staging folder' -f $Shown) }
+        $Record = $Outputs[$Key]
+        if ($Record -isnot [System.Collections.IDictionary]) { return ('the record of {0} is not a record' -f $Shown) }
+        foreach ($Field in @('Sha256', 'SourceSha256', 'DictionarySha256'))
+        {
+            $Value = $Record[$Field]
+            if ($Value -isnot [string] -or $Value -notmatch '^[0-9A-Fa-f]{64}\z') { return ('the record of {0} has no SHA-256 of 64 hex characters in {1}' -f $Shown, $Field) }
+        }
+        foreach ($Field in @('SourceFolder', 'SourceName', 'DictionaryName'))
+        {
+            $Value = $Record[$Field]
+            if ($Value -isnot [string] -or [string]::IsNullOrEmpty($Value)) { return ('the record of {0} has no text in {1}' -f $Shown, $Field) }
+        }
+    }
+    return $null
+}
 $PathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 if (Test-Path -LiteralPath $StagingDirectory)
 {
@@ -411,7 +449,19 @@ if (Test-Path -LiteralPath $StagingDirectory)
         {
             throw ("Cannot resume from {0}: the reveal recorded in {1} used the fields [{2}], but this run asks for [{3}]. Run -Resume again with the same -Fields (or -All), or run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $MarkedFieldsKey, $FieldsKey)
         }
+        # The recorded outputs are read from a file anyone who can write to
+        # staging can change, and -RemoveStaging deletes each one whose bytes
+        # match its record. So every record is checked before any is used: its
+        # name is a plain file name directly in staging (no folder part, not
+        # '.' or '..', not a rooted path), and its fields have the types Reveal
+        # writes, with each SHA-256 as 64 hex characters. One bad record
+        # refuses the whole mark, before anything is written or deleted.
         $RecordedOutputs = $MarkerData['Outputs']
+        $BadRecord = Get-RevealBadOutputRecord -Outputs $RecordedOutputs -StagingDirectory $StagingDirectory -PathComparison $PathComparison
+        if ($null -ne $BadRecord)
+        {
+            throw ("Cannot resume from {0}: its Reveal mark {1} has a record of a finished output that Reveal did not write ({2}), so Reveal will not use it and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $BadRecord)
+        }
         if ($RecordedOutputs -is [System.Collections.IDictionary])
         {
             foreach ($Name in @($RecordedOutputs.Keys)) { $StagingOutputs[[string]$Name] = $RecordedOutputs[$Name] }
