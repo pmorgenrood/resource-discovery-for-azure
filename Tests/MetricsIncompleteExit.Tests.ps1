@@ -56,6 +56,10 @@ Describe 'Get-MetricsRetryCommand' {
         Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId 'id-2' -RunParameters @{} | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
     }
 
+    It 'gives the run''s own command over every subscription when no subscription is given' {
+        Get-MetricsRetryCommand -TenantID 'tenant-1' -SubscriptionId '' -RunParameters @{ ConcurrencyLimit = 6 } | Should -Be './ResourceInventory.ps1 -TenantID tenant-1 -ConcurrencyLimit 6'
+    }
+
     It 'leaves out the tenant when the run had none' {
         Get-MetricsRetryCommand -TenantID '' -SubscriptionId 'id-2' -RunParameters $null | Should -Be './ResourceInventory.ps1 -SubscriptionID id-2'
     }
@@ -101,6 +105,7 @@ Describe 'Write-MetricsIncompleteRunEnd after a masked run' {
         $script:DictFile = Join-Path $script:WithDict 'ObfuscationDictionary_ResourcesReport_with.json'
         Set-Content -LiteralPath $script:DictFile -Value '{}'
         $script:Replace = "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
+        $script:WrapperReplace = "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
     }
     BeforeEach {
         $script:Lines = [System.Collections.Generic.List[string]]::new()
@@ -112,7 +117,7 @@ Describe 'Write-MetricsIncompleteRunEnd after a masked run' {
         Write-MetricsIncompleteRunEnd -Entries @($Entry) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -ReportRoot $script:ReportRoot | Should -BeTrue
 
         $script:Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $script:DictFile.Replace("'", "''"))
-        $script:Lines | Should -Contain $script:Replace
+        $script:Lines | Should -Contain $script:WrapperReplace
     }
 
     It 'says so when that subscription''s dictionary cannot be found' {
@@ -121,21 +126,75 @@ Describe 'Write-MetricsIncompleteRunEnd after a masked run' {
 
         $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-3 -Obfuscate'
         $script:Lines | Should -Contain "  The dictionary of the first run was not found for sub-three (id-3): pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids."
-        $script:Lines | Should -Contain $script:Replace
+        $script:Lines | Should -Contain $script:WrapperReplace
     }
 
     It 'uses the dictionary file it is given for a direct run' {
-        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -DictionaryFile $script:DictFile
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true; SubscriptionID = 'id-2' } -DictionaryFile $script:DictFile
 
         $script:Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $script:DictFile.Replace("'", "''"))
     }
 
-    It 'adds no dictionary and no upload line after a run that was not masked' {
+    It 'adds no dictionary after a run that was not masked' {
         $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{} -DictionaryFile $script:DictFile -ReportRoot $script:ReportRoot
 
         $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
-        $script:Lines | Should -Not -Contain $script:Replace
         @($script:Lines | Where-Object { $_ -like '*dictionary*' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
+    BeforeAll {
+        $script:Dict = Join-Path $TestDrive 'ObfuscationDictionary_direct-all.json'
+        Set-Content -LiteralPath $script:Dict -Value '{}'
+        $script:Third = [pscustomobject]@{ Name = 'sub-three'; Id = 'id-3'; Message = 'still failed'; ReportFolder = 'ResourcesReport_x'; Complete = $false }
+        $script:WholeZip = '  The new zip replaces the whole first zip in the upload: upload it instead of the first one, not as well, or every resource is counted twice.'
+        $script:SubZip = "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
+        $script:InnerZip = "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
+    }
+    BeforeEach {
+        $script:Lines = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Host { $script:Lines.Add([string]$Object) }
+    }
+
+    It 'gives a direct run without -SubscriptionID its own command, once, and says the new zip replaces the whole first zip' {
+        $Run = @{ ConcurrencyLimit = 9; Service = @('Compute'); MetricsLookbackDays = 7; OutputDirectory = '/data/out' }
+        Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete, $script:Third) -TenantID 'tenant-1' -RunParameters $Run | Should -BeTrue
+
+        $script:Lines | Should -Contain '  - sub-two (id-2)'
+        $script:Lines | Should -Contain '  - sub-three (id-3)'
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -ConcurrencyLimit 9 -MetricsLookbackDays 7 -Service ''Compute'' -OutputDirectory ''/data/out'''
+        @($script:Lines | Where-Object { $_ -like '*./ResourceInventory.ps1*' }).Count | Should -Be 1
+        @($script:Lines | Where-Object { $_ -like '*-SubscriptionID*' }).Count | Should -Be 0
+        $script:Lines | Should -Contain $script:WholeZip
+        $script:Lines | Should -Not -Contain $script:SubZip
+    }
+
+    It 'seeds that command of a masked run from the dictionary it saved, or says it was not found' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete, $script:Third) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -DictionaryFile $script:Dict
+        $script:Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -Obfuscate -ObfuscationDictionary '{0}'" -f $script:Dict.Replace("'", "''"))
+        $script:Lines | Should -Contain $script:WholeZip
+
+        $script:Lines.Clear()
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ Obfuscate = $true } -DictionaryFile (Join-Path $TestDrive 'gone.json')
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -Obfuscate'
+        $script:Lines | Should -Contain "  The dictionary of the first run was not found: pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids."
+    }
+
+    It 'says the new zip replaces that subscription''s zip after a plain direct run with -SubscriptionID' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{ SubscriptionID = 'id-2' }
+
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+        $script:Lines | Should -Contain $script:SubZip
+    }
+
+    It 'names the outer zip and its inner zip under the wrapper, after a plain run too' {
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete, $script:Third) -TenantID 'tenant-1' -RunParameters @{ ConcurrencyLimit = 6 } -ReportRoot (Join-Path $TestDrive 'no-reports')
+
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+        $script:Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-3 -ConcurrencyLimit 6'
+        $script:Lines | Should -Contain $script:InnerZip
+        $script:Lines | Should -Not -Contain $script:SubZip
     }
 }
 
@@ -186,7 +245,17 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; Obfuscate = $true; ObfuscationDictionary = '/data/seed.json' } -DictionaryFile $Dict
 
         $Result.ExitCode | Should -Be 3
-        $Result.Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ObfuscationDictionary '{0}'" -f $Dict.Replace("'", "''"))
+        $Result.Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -Obfuscate -ObfuscationDictionary '{0}'" -f $Dict.Replace("'", "''"))
+        $Result.Lines | Should -Contain '  The new zip replaces the whole first zip in the upload: upload it instead of the first one, not as well, or every resource is counted twice.'
+    }
+
+    It 'prints the command for its one subscription when it ran with -SubscriptionID' {
+        $Sub = '00000000-0000-0000-0000-0000000000a2'
+        $Global:MetricsFailedSubs = @([pscustomobject]@{ Name = 'sub-two'; Id = $Sub; Message = 'still failed'; ReportFolder = 'ResourcesReport_x'; Complete = $false })
+        $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; SubscriptionID = $Sub; ConcurrencyLimit = 9 }
+
+        $Result.ExitCode | Should -Be 3
+        $Result.Lines | Should -Contain ('  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID {0} -ConcurrencyLimit 9' -f $Sub)
         $Result.Lines | Should -Contain "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
     }
 
@@ -197,7 +266,7 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 3
         $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
-        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
+        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -Obfuscate -ConcurrencyLimit 9 -ObfuscationDictionary '/data/d.json'"
         ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
     }
 
@@ -206,7 +275,7 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1'; MetricsLookbackDays = 7; ResourceGroup = 'rg-one'; Service = @('Compute', 'Network'); ReportName = 'Report_A'; OutputDirectory = '/data/out' }
 
         $Result.ExitCode | Should -Be 3
-        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -MetricsLookbackDays 7 -ResourceGroup 'rg-one' -Service 'Compute','Network' -ReportName 'Report_A' -OutputDirectory '/data/out'"
+        $Result.Lines | Should -Contain "  ./ResourceInventory.ps1 -TenantID tenant-1 -MetricsLookbackDays 7 -ResourceGroup 'rg-one' -Service 'Compute','Network' -ReportName 'Report_A' -OutputDirectory '/data/out'"
     }
 
     It 'still prints the command but exits 2, not 3, when its zip could not be written' {
@@ -214,7 +283,7 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' } -NoZip
 
         $Result.ExitCode | Should -Be 2
-        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+        $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1'
     }
 
     It 'exits 2 when its zip could not be written and the metrics are complete' {
@@ -548,7 +617,7 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 3
         $Result.Lines | Should -Contain ("  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -Obfuscate -ConcurrencyLimit 6 -ObfuscationDictionary '{0}'" -f $Dict.Replace("'", "''"))
-        $Result.Lines | Should -Contain "  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice."
+        $Result.Lines | Should -Contain "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
     }
 
     It 'still reads an entry as incomplete and exits 3 after it went through a stream summary file' {
@@ -588,6 +657,8 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 5
         $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2 -ConcurrencyLimit 6'
+        # A plain run is told which zip the new one replaces too.
+        $Result.Lines | Should -Contain "  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice."
     }
 
     It 'exits 3 with only FAILED (auth) for a sign-in skip' {

@@ -295,7 +295,8 @@ function Write-MetricsIncompleteBanner
 }
 
 # The command that collects the metrics of one subscription again, with the
-# data switches of the run. $RunParameters is the run's bound parameters (a
+# data switches of the run. With no $SubscriptionId it is the run's own command
+# over every subscription. $RunParameters is the run's bound parameters (a
 # direct run) or the switches the wrapper forwards. -Obfuscate is kept, so a
 # masked run is not collected again unmasked, with -ObfuscationDictionary when
 # the run used one. -MetricsLookbackDays, -ResourceGroup, -Service, -ReportName
@@ -315,7 +316,7 @@ function Get-MetricsRetryCommand
     $Parts = [System.Collections.Generic.List[string]]::new()
     $Parts.Add('./ResourceInventory.ps1')
     if (-not [string]::IsNullOrEmpty($TenantID)) { $Parts.Add('-TenantID'); $Parts.Add($TenantID) }
-    $Parts.Add('-SubscriptionID'); $Parts.Add($SubscriptionId)
+    if (-not [string]::IsNullOrEmpty($SubscriptionId)) { $Parts.Add('-SubscriptionID'); $Parts.Add($SubscriptionId) }
     foreach ($Name in @('Obfuscate', 'SkipConsumption', 'DeviceLogin'))
     {
         if ($Given.Contains($Name) -and [bool]$Given[$Name]) { $Parts.Add('-' + $Name) }
@@ -357,11 +358,16 @@ function Get-MetricsRetryCommand
 
 # The end of a run with incomplete metrics, for Run-AllSubscriptions.ps1 and a
 # direct ResourceInventory.ps1 run: the FAILED (metrics) lines, with the command
-# that collects each subscription again. Returns $true when there were any.
+# that collects the metrics again. Returns $true when there were any.
+# The wrapper (it passes $ReportRoot) and a direct run with -SubscriptionID
+# write one zip per subscription, so each subscription gets its own command. A
+# direct run without -SubscriptionID covers every subscription in one zip, so
+# it gets the run's own command, with the same scope and settings.
 # After a masked run each command is seeded with the dictionary that run saved:
 # $DictionaryFile for a direct run, else the one ObfuscationDictionary_*.json
 # in the entry's report folder under $ReportRoot (the wrapper). When it cannot
-# be found a line says so, and one line says the new zip replaces the old one.
+# be found a line says so. One line says which zip the new zip replaces in the
+# upload, after a plain run too: uploading both counts the resources twice.
 function Write-MetricsIncompleteRunEnd
 {
     param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot)
@@ -369,34 +375,60 @@ function Write-MetricsIncompleteRunEnd
     $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
     if ($List.Count -eq 0) { return $false }
     $Masked = $null -ne $RunParameters -and @($RunParameters.Keys) -contains 'Obfuscate' -and [bool]$RunParameters['Obfuscate']
+    $Wrapper = -not [string]::IsNullOrEmpty($ReportRoot)
+    $OneSubscription = $null -ne $RunParameters -and @($RunParameters.Keys) -contains 'SubscriptionID' -and -not [string]::IsNullOrEmpty([string]$RunParameters['SubscriptionID'])
     $Advice = [System.Collections.Generic.List[string]]::new()
-    $Advice.Add('To collect one again, run:')
     $NotFound = [System.Collections.Generic.List[string]]::new()
-    foreach ($Entry in $List)
+    if ($Wrapper -or $OneSubscription)
     {
+        $Advice.Add('To collect one again, run:')
+        foreach ($Entry in $List)
+        {
+            $Dict = ''
+            if ($Masked)
+            {
+                if (-not [string]::IsNullOrEmpty($DictionaryFile) -and (Test-Path -LiteralPath $DictionaryFile -PathType Leaf))
+                {
+                    $Dict = $DictionaryFile
+                }
+                elseif ($Wrapper -and -not [string]::IsNullOrEmpty([string]$Entry.ReportFolder))
+                {
+                    $Found = @(Get-ChildItem -LiteralPath (Join-Path $ReportRoot ([string]$Entry.ReportFolder)) -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
+                    if ($Found.Count -eq 1) { $Dict = $Found[0].FullName }
+                }
+                if ([string]::IsNullOrEmpty($Dict))
+                {
+                    $NotFound.Add(("  The dictionary of the first run was not found for {0} ({1}): pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids." -f $Entry.Name, $Entry.Id))
+                }
+            }
+            $Advice.Add('  ' + (Get-MetricsRetryCommand -TenantID $TenantID -SubscriptionId ([string]$Entry.Id) -RunParameters $RunParameters -DictionaryFile $Dict))
+        }
+    }
+    else
+    {
+        # One zip for every subscription: a command for one of them would make a
+        # zip that, uploaded in place of the first, drops all the others.
         $Dict = ''
         if ($Masked)
         {
-            if (-not [string]::IsNullOrEmpty($DictionaryFile) -and (Test-Path -LiteralPath $DictionaryFile -PathType Leaf))
-            {
-                $Dict = $DictionaryFile
-            }
-            elseif (-not [string]::IsNullOrEmpty($ReportRoot) -and -not [string]::IsNullOrEmpty([string]$Entry.ReportFolder))
-            {
-                $Found = @(Get-ChildItem -LiteralPath (Join-Path $ReportRoot ([string]$Entry.ReportFolder)) -Filter 'ObfuscationDictionary_*.json' -File -ErrorAction SilentlyContinue)
-                if ($Found.Count -eq 1) { $Dict = $Found[0].FullName }
-            }
-            if ([string]::IsNullOrEmpty($Dict))
-            {
-                $NotFound.Add(("  The dictionary of the first run was not found for {0} ({1}): pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids." -f $Entry.Name, $Entry.Id))
-            }
+            if (-not [string]::IsNullOrEmpty($DictionaryFile) -and (Test-Path -LiteralPath $DictionaryFile -PathType Leaf)) { $Dict = $DictionaryFile }
+            else { $NotFound.Add("  The dictionary of the first run was not found: pass that run's ObfuscationDictionary_*.json as -ObfuscationDictionary, or the new zip gets new masked ids.") }
         }
-        $Advice.Add('  ' + (Get-MetricsRetryCommand -TenantID $TenantID -SubscriptionId ([string]$Entry.Id) -RunParameters $RunParameters -DictionaryFile $Dict))
+        $Advice.Add('To collect them again, run the same command again:')
+        $Advice.Add('  ' + (Get-MetricsRetryCommand -TenantID $TenantID -SubscriptionId '' -RunParameters $RunParameters -DictionaryFile $Dict))
     }
-    if ($Masked)
+    foreach ($Line in $NotFound) { $Advice.Add($Line) }
+    if ($Wrapper)
     {
-        foreach ($Line in $NotFound) { $Advice.Add($Line) }
+        $Advice.Add("  Each new zip replaces that subscription's inner zip in the AllSubscriptions_ResourcesReport_*.zip: swap it in for the first one, do not add it next to it, or its resources are counted twice.")
+    }
+    elseif ($OneSubscription)
+    {
         $Advice.Add("  Each new zip replaces that subscription's zip in the upload: upload it instead of the first one, not as well, or its resources are counted twice.")
+    }
+    else
+    {
+        $Advice.Add('  The new zip replaces the whole first zip in the upload: upload it instead of the first one, not as well, or every resource is counted twice.')
     }
     Write-MetricsIncompleteBanner -Entries $List -Advice @($Advice)
     return $true
