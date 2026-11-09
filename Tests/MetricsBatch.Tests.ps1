@@ -1035,6 +1035,24 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
         Should -Invoke Write-Host -ParameterFilter { $Object -like '*sub-b*/register/action*Contributor and Owner*' } -Times 1 -Exactly
     }
 
+    It 'names the permission only when a register is refused for lack of rights' {
+        $script:RegisterErrors = @{ 'sub-b' = 'HTTP 403'; 'sub-c' = 'Operation failed: AuthorizationFailed for the client'; 'sub-d' = 'HTTP 500 InternalServerError'; 'sub-e' = 'Timed out after 30 s' }
+        foreach ($Sub in 'sub-d', 'sub-e') { $script:States[$Sub] = 'NotRegistered' }
+        Mock Register-RdaInsightsProvider { $script:RegisterErrors[$SubscriptionId] }
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b', 'sub-c', 'sub-d', 'sub-e' -Interactive $true -ReadAnswer { param($P) 'y' }
+
+        @($Result.NotRegistered | Sort-Object) | Should -Be @('sub-b', 'sub-c', 'sub-d', 'sub-e')
+        foreach ($Sub in 'sub-b', 'sub-c')
+        {
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*Could not register*$Sub*/register/action*Contributor and Owner*one call per resource*" } -Times 1 -Exactly
+        }
+        foreach ($Sub in 'sub-d', 'sub-e')
+        {
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*Could not register*$Sub*$($script:RegisterErrors[$Sub])*one call per resource*" } -Times 1 -Exactly
+            Should -Invoke Write-Host -ParameterFilter { $Object -like "*$Sub*/register/action*" } -Times 0 -Exactly
+        }
+    }
+
     It 'stops waiting at the deadline for a registration that never completes' {
         Mock Register-RdaInsightsProvider { $null }
         $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) 'y' } -DeadlineSeconds 0 -PollSeconds 0
