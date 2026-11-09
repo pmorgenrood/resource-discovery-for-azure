@@ -344,9 +344,10 @@ function New-RdaAllSubHtmlSummary
     if ($EmptyCount -gt 0)
     {
         # A report lists only the types a collector covers, so 0 here is not the
-        # subscription's Resource Graph count. Read access is not the cause: a
-        # subscription the identity cannot read is skipped before it is collected.
-        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) have 0 resources in their report.</b> They hold no resources of the types this tool reports (only virtual networks, for example), or none at all.</div>', $EmptyCount)
+        # subscription's Resource Graph count. The up-front role check uses the
+        # Az PowerShell sign-in and collection the Azure CLI's, so a CLI signed
+        # in as another account is named too.
+        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) have 0 resources in their report.</b> They hold no resources of the types this tool reports (only virtual networks, for example), or none at all, or the Azure CLI is signed in as an account that cannot read them.</div>', $EmptyCount)
     }
     if ($ConsumpList.Count -gt 0)
     {
