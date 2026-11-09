@@ -284,10 +284,12 @@ function Get-RdaInsightsRegisterCommand
 
 # The registration state of Microsoft.Insights on one subscription:
 # 'Registered', 'NotRegistered', 'Registering', 'Unregistering', or 'Unknown'
-# when the state could not be read (the error is in Error).
+# when the state could not be read (the error is in Error). With
+# $TimeoutSeconds above 0, each GET runs as a job and is given up after that
+# many seconds (a GET that stalls reads as Unknown); 0 waits for the answer.
 function Get-RdaInsightsProviderState
 {
-    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3)
+    param([Parameter(Mandatory = $true)][string]$SubscriptionId, [int]$MaxRetries = 3, [double]$TimeoutSeconds = 0)
 
     $Path = '/subscriptions/{0}/providers/Microsoft.Insights?api-version={1}' -f $SubscriptionId, (Get-RdaInsightsProviderApiVersion)
     # One ARM GET, sent again at most $MaxRetries times (1, 2, 4 s apart) after a
@@ -299,7 +301,29 @@ function Get-RdaInsightsProviderState
         if ($Attempt -gt 0) { Start-Sleep -Seconds ([math]::Min([math]::Pow(2, $Attempt - 1), 4)) }
         try
         {
-            $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+            if ($TimeoutSeconds -gt 0)
+            {
+                $Job = Invoke-AzRestMethod -Method GET -Path $Path -AsJob -ErrorAction Stop
+                try
+                {
+                    if (-not $Job.Finished.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)))
+                    {
+                        $LastError = 'Timed out after {0:0.#} s' -f $TimeoutSeconds
+                        continue
+                    }
+                    $Response = Receive-Job -Job $Job -ErrorAction Stop
+                }
+                finally
+                {
+                    # A job that is still running is stopped, so nothing is left behind.
+                    Stop-Job -Job $Job -ErrorAction SilentlyContinue
+                    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else
+            {
+                $Response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+            }
         }
         catch
         {
@@ -469,12 +493,14 @@ function Invoke-RdaInsightsProviderPreflight
     $Deadline = (Get-Date).AddSeconds([math]::Max(0, $DeadlineSeconds))
     # Every read checks the time first, so the wait ends at the deadline however many
     # subscriptions there are; a read while waiting is not retried (a failed one means
-    # not registered yet).
+    # not registered yet), and is given up when the time left runs out, so one GET
+    # that stalls cannot hold the wait past the deadline.
     while ($Waiting.Count -gt 0 -and (Get-Date) -lt $Deadline)
     {
         for ($Idx = $Waiting.Count - 1; $Idx -ge 0 -and (Get-Date) -lt $Deadline; $Idx--)
         {
-            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0).State -eq 'Registered')
+            $ReadLeft = [math]::Max(0.001, ($Deadline - (Get-Date)).TotalSeconds)
+            if ((Get-RdaInsightsProviderState -SubscriptionId $Waiting[$Idx] -MaxRetries 0 -TimeoutSeconds $ReadLeft).State -eq 'Registered')
             {
                 Write-Host ('  Microsoft.Insights is now registered on subscription {0}.' -f $Waiting[$Idx]) -ForegroundColor Green
                 $Result.Registered.Add($Waiting[$Idx])

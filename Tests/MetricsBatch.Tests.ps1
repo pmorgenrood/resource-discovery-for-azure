@@ -244,7 +244,7 @@ Export-ModuleMember -Function Get-AzMetric
     $Global:RdaTestBatchArmCalls = [System.Collections.Generic.List[object]]::new()
     function Invoke-AzRestMethod
     {
-        param([string]$Method, [string]$Path, [string]$Payload)
+        param([string]$Method, [string]$Path, [string]$Payload, [switch]$AsJob)
         $Global:RdaTestBatchArmCalls.Add([PSCustomObject]@{ Method = $Method; Path = $Path })
         $Sub = ($Path -split '/')[2]
         $State = if ($Global:RdaTestBatchProviderStates.ContainsKey($Sub)) { $Global:RdaTestBatchProviderStates[$Sub] } else { 'Registered' }
@@ -1053,6 +1053,35 @@ Describe 'Invoke-RdaInsightsProviderPreflight' {
 
         $script:Prompts.Count | Should -Be 0
         @($Result.Registered) | Should -Be @('sub-b')
+    }
+}
+
+Describe 'The registration wait when one state read stalls' {
+
+    It 'ends at the deadline and keeps the subscription per call' {
+        $script:Answered = $false
+        $script:WaitReads = 0
+        Mock Write-Host { }
+        Mock Register-RdaInsightsProvider { $null }
+        Mock Invoke-AzRestMethod {
+            if (-not $script:Answered) { return [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' } }
+            # Every read while waiting stalls far past the deadline.
+            $script:WaitReads++
+            if ($AsJob) { return Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 30 } }
+            [System.Threading.Thread]::Sleep(6000)
+            [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"Registering"}' }
+        }
+        $JobsBefore = @(Get-Job).Count
+        $Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $Result = Invoke-RdaInsightsProviderPreflight -SubscriptionIds 'sub-b' -Interactive $true -ReadAnswer { param($P) $script:Answered = $true; 'y' } -DeadlineSeconds 2 -PollSeconds 10
+        $Clock.Stop()
+
+        $script:WaitReads | Should -BeGreaterOrEqual 1
+        $Clock.Elapsed.TotalSeconds | Should -BeLessThan 3.5
+        @($Result.NotRegistered) | Should -Be @('sub-b')
+        $Result.Registered.Count | Should -Be 0
+        # The stalled read is stopped and removed, not left running.
+        @(Get-Job).Count | Should -Be $JobsBefore
     }
 }
 
