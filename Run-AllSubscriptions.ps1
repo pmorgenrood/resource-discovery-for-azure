@@ -893,7 +893,7 @@ if ($ParallelStreams -le 1)
                 Skipped = $SkipCount
             }
 
-            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+            $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
             if ($CountMessage.Kind -eq 'Empty')
             {
                 # Loud yellow signal so this stands out in the per-iteration narration
@@ -1087,7 +1087,7 @@ else
                 $ResCount = if ($null -ne $Global:Resources) { @($Global:Resources).Count } else { 0 }
                 $SkipCount = if ($null -ne $Global:SkippedResourceCount) { [long]$Global:SkippedResourceCount } else { [long]0 }
                 $SubResourceCounts += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = $ResCount; Skipped = $SkipCount }
-                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+                $CountMessage = Get-RdaResourceCountMessage -Collected $ResCount -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
                 if ($CountMessage.Kind -eq 'Empty')
                 {
                     Write-Host ("WARNING: '{0}' returned 0 resources." -f $Sub.Name) -ForegroundColor Yellow
@@ -1747,7 +1747,10 @@ if ($SubResourceCounts.Count -gt 0)
     $TotalSkipped = [long](($SubResourceCounts | ForEach-Object { [long]$_.Skipped } | Measure-Object -Sum).Sum)
     if ($TotalSkipped -gt 0)
     {
-        Write-Host ("Network resources skipped: {0:N0} (network costs still come from the consumption data; -IncludeNetworkResources keeps them)" -f $TotalSkipped) -ForegroundColor DarkGreen
+        # With -SkipConsumption no consumption data is collected, so the line
+        # does not say that network costs come from it.
+        $CostNote = if ($SkipConsumption) { '' } else { 'network costs still come from the consumption data; ' }
+        Write-Host ("Network resources skipped: {0:N0} ({1}-IncludeNetworkResources keeps them)" -f $TotalSkipped, $CostNote) -ForegroundColor DarkGreen
     }
     if ($NetworkOnlySubs.Count -gt 0)
     {

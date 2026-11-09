@@ -958,7 +958,7 @@ Function RunInventorySetup()
     ResourceInventoryLoop
     ResourceInventoryAvd
 
-    $CountMessage = Get-RdaResourceCountMessage -Collected @($Global:Resources).Count -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes
+    $CountMessage = Get-RdaResourceCountMessage -Collected @($Global:Resources).Count -Skipped $Global:SkippedResourceCount -SkippedByType $Global:SkippedResourceTypes -SkipConsumption:$SkipConsumption.IsPresent
     if ($CountMessage.Kind -eq 'Empty') { Write-Log -Message 'Resources collected: 0' -Severity 'Info' }
     else { Write-Log -Message $CountMessage.Text -Severity 'Success' }
 
