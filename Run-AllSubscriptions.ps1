@@ -551,16 +551,16 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# Inventory root (used for resume state, consolidated output, and the wrapper
+# transcript). Computed up front so the transcript can be started before
+# anything else writes to the host.
+$InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
+
 # A -PreflightOnly run skips all of this: it creates no inventory folder, starts
 # no transcript, and runs only the read-only checks of Invoke-PreFlightChecks
-# (its write probe writes a file there). Nothing on its path below uses
-# $InventoryRoot.
+# (its write probe writes a file there). It only reads $InventoryRoot.
 if (-not $PreflightOnly)
 {
-    # Inventory root (used for resume state, consolidated output, and the wrapper
-    # transcript). Computed up front so the transcript can be started before
-    # anything else writes to the host.
-    $InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
     if (-not (Test-Path -Path $InventoryRoot -PathType Container))
     {
         try { New-Item -Path $InventoryRoot -ItemType Directory -Force | Out-Null }
@@ -609,8 +609,7 @@ else
     # disk space on the inventory folder or the nearest folder above it); the
     # write probe is left out, because it writes. A preflight creates nothing.
     $script:PreflightCheck = 'free disk space'
-    $PfDiskRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
-    Invoke-PreFlightChecks -InventoryRoot $PfDiskRoot -ReadOnly
+    Invoke-PreFlightChecks -InventoryRoot $InventoryRoot -ReadOnly
 }
 
 
@@ -884,8 +883,7 @@ if ($PreflightOnly)
     }
     if ($Resume -or $ResumeFailedOnly)
     {
-        $PfRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
-        $PfStateFile = Join-Path $PfRoot (".resume-state-{0}.json" -f $ResumeKey)
+        $PfStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $ResumeKey)
         $PfBefore = $Subscriptions.Count
         # The lists the run would work from, after it folds in the per-stream
         # state files of an interrupted parallel run as it does at its start
@@ -894,7 +892,7 @@ if ($PreflightOnly)
         $PfFailed = @(Get-FailedAttempts -Path $PfStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ })
         $PfStreamCompleted = @()
         $PfStreamFailed = @()
-        $PfStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $PfRoot -Tenant $ResumeKey)
+        $PfStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeKey)
         foreach ($PfStreamFile in $PfStreamFiles)
         {
             try
@@ -966,7 +964,11 @@ if ($PreflightOnly)
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey
+# @() keeps it an array: an empty or one-id result comes back from the
+# function as $null or a bare string, and `+=` on a string joins the next id
+# onto it. Where-Object drops the null entry that a state file saved after a
+# failed first subscription can hold.
+$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ })
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.

@@ -97,6 +97,9 @@ function Invoke-AzRestMethod
     [CmdletBinding()] param([string]$Method = 'GET', [string]$Path, [string]$Payload)
     if ($Path -match '^/subscriptions/([^/?]+)/resourcegroups\?')
     {
+        # Each subscription the read access check asks about, for the tests
+        # that compare the preflight's check with the run's.
+        Add-Content -LiteralPath (Join-Path $env:HOME 'access-probes.log') -Value $Matches[1]
         if (@((Get-RdaStandInScenario).DeniedIds) -contains $Matches[1]) { return [pscustomobject]@{ StatusCode = 403; Content = '{"error":{"code":"AuthorizationFailed"}}' } }
         return [pscustomobject]@{ StatusCode = 200; Content = '{"value":[]}' }
     }
@@ -704,6 +707,58 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly, end to end' -Skip:($IsWindows
         $Run.ExitCode | Should -Be 1 -Because 'the run retries A and stops at its read access check'
         $Pf.ExitCode | Should -Be $Run.ExitCode -Because 'the preflight checks the subscription the run would collect'
         @($Pf.Text | Where-Object { $_ -like 'Preflight failed: *' }).Count | Should -Be 1
+    }
+}
+
+Describe 'The preflight and the run check the same subscriptions' -Skip:($IsWindows) {
+    # A guard: the preflight works out which subscriptions the run would
+    # collect on its own (the run's selection is inline in the wrapper). When a
+    # change to the run's selection is not made to the preflight too, these
+    # cases see the two check different subscriptions and fail.
+    BeforeAll {
+        function script:Get-Probes
+        {
+            $Log = Join-Path $script:CaseHome 'access-probes.log'
+            if (-not (Test-Path -LiteralPath $Log)) { return @() }
+            @(Get-Content -LiteralPath $Log | Where-Object { $_ } | Sort-Object -Unique)
+        }
+        function script:Write-State
+        {
+            param([string[]]$Completed = @(), [string[]]$Failed = @(), [string]$Path = $script:State, [switch]$Stream)
+            New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+            $FailedAttempts = @($Failed | ForEach-Object { [pscustomobject]@{ Id = $script:Subs[$_].Id; Name = ('Sub ' + $_); LastFailedAt = '2026-11-01T00:00:00.0000000Z'; Reason = 'x'; Attempts = 1 } })
+            $Ids = @($Completed | ForEach-Object { $script:Subs[$_].Id })
+            $Obj = if ($Stream) { [pscustomobject]@{ Completed = $Ids; FailedAttempts = $FailedAttempts } } else { [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = $Ids; FailedAttempts = $FailedAttempts; LastUpdated = '2026-11-01T00:00:00.0000000Z' } }
+            $Obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding utf8
+        }
+    }
+    AfterEach {
+        if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
+    }
+
+    It '<Case>' -ForEach @(
+        @{ Case = 'a fresh run'; Extra = @(); Completed = @(); Failed = @(); StreamCompleted = @(); StreamFailed = @() }
+        @{ Case = '-Resume after an earlier run completed one'; Extra = @('-Resume'); Completed = @('A'); Failed = @('B'); StreamCompleted = @(); StreamFailed = @() }
+        @{ Case = '-ResumeFailedOnly with one on the retry list'; Extra = @('-ResumeFailedOnly'); Completed = @('A'); Failed = @('B'); StreamCompleted = @(); StreamFailed = @() }
+        @{ Case = '-Resume -ResumeFailedOnly with a retry also completed'; Extra = @('-Resume', '-ResumeFailedOnly'); Completed = @('A'); Failed = @('A', 'B'); StreamCompleted = @(); StreamFailed = @() }
+        @{ Case = '-ResumeFailedOnly with a retry also completed, no per-stream state'; Extra = @('-ResumeFailedOnly'); Completed = @('A'); Failed = @('A'); StreamCompleted = @(); StreamFailed = @() }
+        @{ Case = '-Resume after an interrupted parallel run'; Extra = @('-Resume'); Completed = @('A'); Failed = @(); StreamCompleted = @('C'); StreamFailed = @('B') }
+        @{ Case = '-ResumeFailedOnly after an interrupted parallel run'; Extra = @('-ResumeFailedOnly'); Completed = @(); Failed = @('A'); StreamCompleted = @('A'); StreamFailed = @('B') }
+    ) {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        script:Write-State -Completed $Completed -Failed $Failed
+        if ($StreamCompleted.Count -gt 0 -or $StreamFailed.Count -gt 0)
+        {
+            script:Write-State -Completed $StreamCompleted -Failed $StreamFailed -Stream -Path (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant))
+        }
+        $Pf = script:Invoke-Wrapper -Arguments (@('-PreflightOnly', '-SkipConsumption') + $Extra)
+        $Pf.ExitCode | Should -Be 0
+        $PfProbes = @(script:Get-Probes)
+        Remove-Item -LiteralPath (Join-Path $script:CaseHome 'access-probes.log') -Force -ErrorAction SilentlyContinue
+        $Run = script:Invoke-Wrapper -Arguments (@('-SkipConsumption', '-SkipMetrics') + $Extra)
+        $RunProbes = @(script:Get-Probes)
+        ($PfProbes -join ',') | Should -Be ($RunProbes -join ',') -Because 'the preflight checks the subscriptions the run checks'
     }
 }
 
