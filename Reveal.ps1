@@ -703,6 +703,11 @@ foreach ($Folder in $Folders)
             continue
         }
         $Dict = $Matched[0]
+        # Every whole pair (one report zip and the one dictionary of its
+        # stamp) is counted, also one whose dictionary then cannot be read
+        # and one later left out because its subscription is in another
+        # report.
+        $PairedCount++
 
         # The subscriptions: every real subscription id in the dictionary's
         # four id maps (token -> the real id of a resource), and the masked
@@ -749,9 +754,6 @@ foreach ($Folder in $Folders)
                 foreach ($LogSubId in $RunLogSubIds[$LogKey]) { $null = $SubIds.Add($LogSubId) }
             }
         }
-        # Every whole pair is counted, also one later left out because its
-        # subscription is in another report.
-        $PairedCount++
         $Candidates.Add([pscustomobject]@{
                 Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp
                 Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
