@@ -73,7 +73,9 @@
     -Resume) one a reveal of the same -InventoryRoot staged into before (Reveal
     marks it with a hidden .reveal-staging.json file that records the fields
     and each finished output); any other folder is refused. Reveal makes the
-    folder readable by its owner only before writing into it. Only the zips
+    folder readable by its owner only before writing into it, and expands
+    each report while it reveals it into a hidden .reveal-tmp folder inside
+    it, which it removes, also after a folder times out. Only the zips
     this run revealed (or, with -Resume, found already revealed and matching
     the record) go in the outer zip.
 
@@ -289,6 +291,10 @@ if ([string]::IsNullOrEmpty($OutputZip))
 # put them in the upload, -Resume would read them as done, and -RemoveStaging
 # would delete them. So such a folder is refused before anything is written.
 $StagingMarkerName = '.reveal-staging.json'
+# Each reveal expands its report, with the real values, into a folder inside
+# this one, so the copy stays in the owner-only staging folder. A job stopped
+# at its time limit cannot remove its copy, so Reveal removes it.
+$RevealTempName = '.reveal-tmp'
 # The fields this run reveals, in one form, recorded in the mark and compared
 # by -Resume.
 $FieldsKey = (@($Fields | Sort-Object -Unique) -join ', ')
@@ -367,7 +373,7 @@ if (Test-Path -LiteralPath $StagingDirectory)
         # leave the earlier files without their mark, so the folder could not
         # be resumed or reused). Say plainly what to do instead.
         $Held = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop |
-                Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') })
+                Where-Object { $_.Name -ne $StagingMarkerName -and $_.Name -ne ($StagingMarkerName + '.tmp') -and $_.Name -ne $RevealTempName })
         if ($Held.Count -gt 0)
         {
             throw ("The staging folder {0} holds {1} item(s) from an earlier reveal of {2}. Pass -Resume to continue that reveal (its finished reports are checked and kept), or use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $Held.Count, $InventoryRoot)
@@ -405,6 +411,13 @@ try { Set-RevealOwnerOnlyDirectory -Path $StagingDirectory }
 catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $StagingDirectory, $_.Exception.Message) }
 $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
 Save-RevealStagingMarker
+# Expanded copies go here. Any left by an earlier run of this folder that was
+# stopped are removed first.
+$RevealTempRoot = Join-Path $StagingDirectory $RevealTempName
+if (Test-Path -LiteralPath $RevealTempRoot) { Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction Stop }
+New-Item -ItemType Directory -Path $RevealTempRoot -Force | Out-Null
+try { Set-RevealOwnerOnlyDirectory -Path $RevealTempRoot }
+catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $RevealTempRoot, $_.Exception.Message) }
 
 # The output zip must not live inside the staging directory, or it would be
 # swept into itself on the final Compress-Archive.
@@ -672,11 +685,15 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
     while ($Running.Count -lt $ParallelStreams -and $Queue.Count -gt 0)
     {
         $Item = $Queue.Dequeue()
+        # This job's own folder for its expanded copy, removed when the job is
+        # reaped or stopped.
+        $Item | Add-Member -NotePropertyName TempDir -NotePropertyValue (Join-Path $RevealTempRoot ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $Item.TempDir -Force | Out-Null
         $Job = Start-Job -ScriptBlock {
-            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip)
+            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory)
             . $RevealFunctions
-            Invoke-RdaRevealFolder -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip *> $null
-        } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath
+            Invoke-RdaRevealFolder -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip -TempDirectory $TempDirectory *> $null
+        } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath, $Item.TempDir
         $LaunchUtc = [DateTime]::UtcNow
         $Running.Add([pscustomobject]@{ Item = $Item; Job = $Job; StartUtc = $LaunchUtc; Deadline = $LaunchUtc.AddSeconds($RevealTimeoutSeconds) })
     }
@@ -723,14 +740,18 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = $_.Exception.Message }
             }
             Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
             $DoneCount++
         }
         elseif ([DateTime]::UtcNow -ge $R.Deadline)
         {
             # Exceeded this folder's cap. Kill the child so it cannot hold a slot,
-            # clean any partial output, record the timeout, free the slot.
+            # clean any partial output and the child's expanded copy (its own
+            # cleanup never runs once it is killed), record the timeout, free
+            # the slot.
             Stop-Job -Job $R.Job -ErrorAction SilentlyContinue
             Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (($R.Item.OutPath -replace '\.zip$', '') + '.partial.zip') -Force -ErrorAction SilentlyContinue
             $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = ("timed out after {0:0.##} minutes" -f ($RevealTimeoutSeconds / 60)) }
@@ -751,6 +772,8 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
 }
 
 Write-RdaProgress -Activity 'Revealing per-subscription reports' -Completed
+# Every job is reaped, so no expanded copy is still in use.
+Remove-Item -LiteralPath $RevealTempRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # Consolidate the revealed per-sub zips into one outer zip for upload.
 # Only this run's outputs (see $RunOutputs) are taken. A *.partial.zip is never

@@ -428,7 +428,8 @@ function Invoke-RdaRevealFolder
         [Parameter(Mandatory = $true)] [string]   $InputZip,
         [Parameter(Mandatory = $true)] [string]   $DictionaryPath,
         [Parameter(Mandatory = $true)] [string[]] $Fields,
-        [Parameter(Mandatory = $true)] [string]   $OutputZip
+        [Parameter(Mandatory = $true)] [string]   $OutputZip,
+        [string] $TempDirectory
     )
     $ErrorActionPreference = 'Stop'
     $Dict = Get-Content -LiteralPath $DictionaryPath -Raw | ConvertFrom-Json
@@ -443,7 +444,7 @@ function Invoke-RdaRevealFolder
             return
         }
     }
-    Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip
+    Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip -TempDirectory $TempDirectory
 }
 
 # The prod_/nonprod_ token shapes: plain prod_/nonprod_<guid> and type-hinted
@@ -502,7 +503,11 @@ function Invoke-RdaReveal
 
         [switch]   $All,
 
-        [string]   $OutputZip
+        [string]   $OutputZip,
+
+        # Where the report is expanded while it is revealed (in a new
+        # owner-only Reveal_<guid> folder). Defaults to the system temp folder.
+        [string]   $TempDirectory
     )
 
     $ErrorActionPreference = 'Stop'
@@ -682,11 +687,19 @@ function Invoke-RdaReveal
 
     # ---- Extract, rewrite, re-zip ------------------------------------------
 
-    $TmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("Reveal_" + [guid]::NewGuid().ToString())
+    # The expanded copy gets the real values, so its folder is owner-only
+    # before anything is written into it (the system temp folder is shared on
+    # Linux). The all-subscriptions run passes a folder inside its owner-only
+    # staging folder, and removes it itself if this job is stopped.
+    $TempParent = if ([string]::IsNullOrEmpty($TempDirectory)) { [System.IO.Path]::GetTempPath() } else { $TempDirectory }
+    $TmpRoot = Join-Path $TempParent ("Reveal_" + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $TmpRoot -Force | Out-Null
 
     try
     {
+        try { Set-RevealOwnerOnlyDirectory -Path $TmpRoot }
+        catch { throw ("Reveal will not write real names and ids into {0}: {1}" -f $TmpRoot, $_.Exception.Message) }
+
         # Phase progress (Expanding -> Scanning -> Compressing) so a single
         # report's reveal is not a black box while the opaque extract / compress
         # steps run. Uses the shared Write-RdaProgress when it is
