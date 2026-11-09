@@ -1016,11 +1016,11 @@ function ExecuteInventoryProcessing()
 
         if ($PSScriptRoot -like '*\*')
         {
-            $Modules = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse
+            $Modules = Get-ChildItem -Path ([WildcardPattern]::Escape($PSScriptRoot) + '\Services\*.ps1') -Recurse
         }
         else
         {
-            $Modules = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'Services') -Filter '*.ps1' -Recurse
+            $Modules = Get-ChildItem -Path ([WildcardPattern]::Escape($PSScriptRoot) + '/Services/*.ps1') -Recurse
         }
 
         if ($Service -and @($Service).Count -gt 0)
