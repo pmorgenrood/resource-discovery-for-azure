@@ -310,6 +310,7 @@ if ([System.IO.Path]::GetExtension($OutputZip) -ne '.zip') { $OutputZip += '.zip
 # put them in the upload, -Resume would read them as done, and -RemoveStaging
 # would delete them. So such a folder is refused before anything is written.
 $StagingMarkerName = '.reveal-staging.json'
+$StagingMarkerPurpose = 'Reveal staging folder'
 # Each reveal expands its report, with the real values, into a folder inside
 # this one, so the copy stays in the owner-only staging folder. A job stopped
 # at its time limit cannot remove its copy, so Reveal removes it.
@@ -329,7 +330,7 @@ $MarkerData = $null
 function Save-RevealStagingMarker
 {
     $Json = [ordered]@{
-        Purpose       = 'Reveal staging folder'
+        Purpose       = $StagingMarkerPurpose
         InventoryRoot = $InventoryRoot
         Fields        = @($Fields | Sort-Object -Unique)
         All           = [bool]$All
@@ -390,6 +391,55 @@ function Get-RevealBadOutputRecord
     return $null
 }
 $PathComparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+
+# Read a staging mark. Its Root is set only when the mark is one Reveal wrote:
+# a JSON object whose Purpose is the one Reveal writes and whose
+# InventoryRoot is a path. A look-alike file (no Purpose, or another one) is
+# not a Reveal mark, so the folder that holds it is not taken as Reveal's.
+function Read-RevealStagingMarker
+{
+    param([string]$Path)
+    $Result = [pscustomobject]@{ Data = $null; Root = $null }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $Result }
+    try { $Data = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+    catch { return $Result }
+    if ($Data -isnot [System.Collections.IDictionary]) { return $Result }
+    if ($Data['Purpose'] -isnot [string] -or $Data['Purpose'] -cne $StagingMarkerPurpose) { return $Result }
+    if ($Data['InventoryRoot'] -isnot [string] -or [string]::IsNullOrEmpty($Data['InventoryRoot'])) { return $Result }
+    $Result.Data = $Data
+    $Result.Root = $Data['InventoryRoot']
+    return $Result
+}
+
+# Whether a mark read by Read-RevealStagingMarker is for this inventory root
+# (the same folder, see Test-RevealSamePath).
+function Test-RevealMarkerForThisRoot
+{
+    param($Marker)
+    if ([string]::IsNullOrEmpty($Marker.Root)) { return $false }
+    try { return [bool](Test-RevealSamePath -Left $Marker.Root -Right $InventoryRoot -PathComparison $PathComparison) }
+    catch { return $false }
+}
+
+# Why the rest of a Reveal mark that records its fields does not have the
+# shape Save-RevealStagingMarker writes, or $null when it does: Fields a list
+# of field names Reveal knows, All true or false, and Outputs a set of named
+# records (checked one by one by Get-RevealBadOutputRecord).
+function Get-RevealMarkerShapeProblem
+{
+    param([System.Collections.IDictionary]$Data)
+    $Known = @('ResourceGroup', 'Subscription', 'Tag', 'ResourceName', 'ResourceId', 'FreeText')
+    $MarkedFields = $Data['Fields']
+    if ($MarkedFields -isnot [System.Collections.IList] -or $MarkedFields.Count -eq 0) { return 'its Fields is not a list of field names' }
+    foreach ($Field in $MarkedFields)
+    {
+        if ($Field -isnot [string] -or $Known -cnotcontains $Field) { return 'its Fields names a field Reveal does not know' }
+    }
+    if (-not $Data.Contains('All') -or $Data['All'] -isnot [bool]) { return 'its All is not true or false' }
+    if (-not $Data.Contains('Outputs') -or $Data['Outputs'] -isnot [System.Collections.IDictionary]) { return 'its Outputs is not a set of named records' }
+    return $null
+}
+
 if (Test-Path -LiteralPath $StagingDirectory)
 {
     if (-not (Test-Path -LiteralPath $StagingDirectory -PathType Container))
@@ -398,27 +448,15 @@ if (Test-Path -LiteralPath $StagingDirectory)
     }
     $StagingMarkerPath = Join-Path $StagingDirectory $StagingMarkerName
     $StagingIsEmpty = @(Get-ChildItem -LiteralPath $StagingDirectory -Force -ErrorAction Stop).Count -eq 0
-    $MarkedRoot = $null
-    if (Test-Path -LiteralPath $StagingMarkerPath -PathType Leaf)
-    {
-        try
-        {
-            $MarkerData = Get-Content -LiteralPath $StagingMarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-            $MarkedRoot = [string]$MarkerData['InventoryRoot']
-        }
-        catch { $MarkerData = $null; $MarkedRoot = $null }
-    }
-    $MarkedForThisRoot = $false
-    if (-not [string]::IsNullOrEmpty($MarkedRoot))
-    {
-        try { $MarkedForThisRoot = Test-RevealSamePath -Left $MarkedRoot -Right $InventoryRoot -PathComparison $PathComparison }
-        catch { $MarkedForThisRoot = $false }
-    }
+    $Marker = Read-RevealStagingMarker -Path $StagingMarkerPath
+    $MarkerData = $Marker.Data
+    $MarkedRoot = $Marker.Root
+    $MarkedForThisRoot = Test-RevealMarkerForThisRoot $Marker
     if (-not $StagingIsEmpty -and -not $MarkedForThisRoot)
     {
         if ($Resume)
         {
-            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
+            $Why = if ([string]::IsNullOrEmpty($MarkedRoot)) { 'it has no readable Reveal mark {2} (for example a staging folder made by an older Reveal, which did not write one, or a file of that name that Reveal did not write)' } else { 'its Reveal mark {2} names another inventory root, {3}' }
             throw (("Cannot resume from {0}: it holds files and is not a Reveal staging folder for {1}: " + $Why + ". Point -StagingDirectory at the staging folder a reveal of {1} used, or run without -Resume to start a new reveal into a new or empty folder.") -f $StagingDirectory, $InventoryRoot, $StagingMarkerPath, $MarkedRoot)
         }
         throw ("The staging folder {0} already holds files and is not a Reveal staging folder for {1}. Its files could be stale or unrelated reports, so Reveal will not use it. Use a new or empty folder for -StagingDirectory." -f $StagingDirectory, $InventoryRoot)
@@ -444,6 +482,13 @@ if (Test-Path -LiteralPath $StagingDirectory)
         if ($null -eq $MarkedFields)
         {
             throw ("Cannot resume from {0}: its Reveal mark {1} does not record which fields that reveal used (it was made by an older Reveal), so the resumed bundle could mix reports revealed for different fields. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath)
+        }
+        # The rest of the mark must have the shape Reveal writes, or it is not
+        # Reveal's, and the folder is refused before anything in it changes.
+        $ShapeProblem = Get-RevealMarkerShapeProblem -Data $MarkerData
+        if ($null -ne $ShapeProblem)
+        {
+            throw ("Cannot resume from {0}: its Reveal mark {1} is not one Reveal wrote ({2}), so Reveal will not use the folder and has changed nothing. Run without -Resume into a new or empty folder." -f $StagingDirectory, $StagingMarkerPath, $ShapeProblem)
         }
         $MarkedFieldsKey = (@($MarkedFields | ForEach-Object { [string]$_ } | Sort-Object -Unique) -join ', ')
         if ($MarkedFieldsKey -cne $FieldsKey)
