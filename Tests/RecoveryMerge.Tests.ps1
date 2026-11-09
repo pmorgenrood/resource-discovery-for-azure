@@ -590,6 +590,21 @@ Describe 'Merge-RecoveryData masking guards (stop before anything is written)' {
         Test-Path -Path $C.Output | Should -BeFalse -Because 'the stop comes before the output folder is made, so nothing is left for the next run to trip on'
     }
 
+    It 'compares two ResourceIdMaps of 20000 ids each in a few seconds' {
+        $C = New-Case
+        $GapMap = [ordered]@{}; $RecMap = [ordered]@{}
+        for ($i = 0; $i -lt 20000; $i++) { $GapMap["prod_gap$i"] = "/id/gap$i"; $RecMap["prod_rec$i"] = "/id/rec$i" }
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -Dictionary ([ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = $GapMap })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) }) -Dictionary ([ordered]@{ GeneratedAt = '2026-01-02 00:00:00'; ResourceIdMap = $RecMap })
+
+        # No id is shared, so every recovery id is looked up before the stop.
+        $Watch = [System.Diagnostics.Stopwatch]::StartNew()
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue } |
+            Should -Throw -ExpectedMessage '*share no ResourceIdMap token*'
+        $Watch.Stop()
+        $Watch.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'the shared-token check is a set lookup, not a list scan per id'
+    }
+
     It 'stops even under -ErrorAction SilentlyContinue when no ResourceIdMap token is shared' {
         $C = New-Case
         $GapDict = [ordered]@{ GeneratedAt = '2026-01-01 00:00:00'; ResourceIdMap = [ordered]@{ 'prod_gapTok' = '/id/gap' } }
