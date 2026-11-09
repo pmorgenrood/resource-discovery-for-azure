@@ -120,8 +120,11 @@ Describe 'Reveal.ps1 -Resume -RemoveStaging with an older output the mark record
         $Sub = '00000000-0000-0000-0000-00000000000b'
         Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000000bbbb') -Stamp '20260101000000000bbbb' -SubId $Sub
         $script:Run1 = Invoke-Reveal -Root $script:Root -Staging $script:Staging -Bundle (Join-Path $script:WorkDir 'old.zip')
-        # A newer run of the same subscription arrives; the resumed reveal
-        # takes it and leaves the older report out.
+        # A newer run of the same subscription arrives, and the older report
+        # is moved away (Reveal leaves out every report of a subscription
+        # that is in more than one report); the resumed reveal takes the newer
+        # one, and the mark still records the older output.
+        Move-Item -LiteralPath (Join-Path $script:Root 'ResourcesReport20260101000000000bbbb') -Destination (Join-Path $script:WorkDir 'moved-away-bbbb')
         Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260202000000000cccc') -Stamp '20260202000000000cccc' -SubId $Sub
         $script:Run2 = Invoke-Reveal -Root $script:Root -Staging $script:Staging -Bundle (Join-Path $script:WorkDir 'new.zip') -Extra @('-Resume', '-RemoveStaging')
         $script:StagingAfterRun2 = Test-Path -LiteralPath $script:Staging

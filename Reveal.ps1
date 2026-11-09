@@ -30,9 +30,20 @@
     + Resource Group); everything else stays masked. Pairing in all-mode is done
     WITHIN each folder, and only between a report zip and the dictionary of the
     same <stamp>, so it never crosses one report's tokens against another's
-    dictionary. When the root holds more than one run of the same subscription
-    (Run-AllSubscriptions.ps1 run twice into it), only the newest report of each
-    subscription is revealed; the older ones are listed as left out.
+    dictionary. Reveal never guesses which of two reports of one subscription
+    is right (a newer recovery run of one service is not the fuller report).
+    When a subscription id named in one report's dictionary is also named in
+    another report under the root (for example Run-AllSubscriptions.ps1 run
+    twice into it, or a recovery run of one subscription), or two reports have
+    the same stamp, none of those reports is revealed, whichever other
+    subscriptions they hold: each such subscription is named by its masked
+    token with the report folders that hold it, counted as failed, and the run
+    exits non-zero. Pass -InventoryRoot pointing at one run's folders, or move
+    the extra report away. Every subscription with exactly one report is still
+    revealed and shipped. A report whose dictionary names no subscription (a
+    subscription with no resources has an empty dictionary) cannot be matched,
+    so it is revealed on its own, even beside an older report of the same
+    subscription.
 
     HANDLE WITH CARE. The output contains the real values you chose to reveal.
     Share it only with the party meant to ingest it. Dictionaries and any
@@ -451,14 +462,23 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 #  - every report zip in a folder is paired only with the dictionary of the
 #    SAME stamp (never with another stamp's dictionary next to it), and a
 #    report with no such dictionary is skipped;
-#  - for each subscription (read from the real subscription ids in its
-#    dictionary) only the NEWEST report is revealed. Shipping an older run's
-#    report too would put the same resources in the bundle twice under
-#    different tokens, and downstream would count them twice. The older ones
-#    are listed in the summary as left out.
+#  - Reveal never guesses which of two reports of one subscription is right.
+#    The newer report is not always the fuller one: a recovery run of one
+#    service (no consumption, no metrics) is newer than the full run it
+#    repairs. So each report's subscriptions are read from the real ids in its
+#    dictionary's four id maps (the inventory's subscription values are tokens
+#    that resolve through these same maps), and any report that shares a
+#    subscription id with another report, or has the same stamp as another
+#    report, is left out together with that other report, whichever
+#    subscriptions it also holds. Each such subscription is named by its masked
+#    token, with the report folders that hold it, and counted as failed, so
+#    the run exits non-zero. The user passes -InventoryRoot pointing at one
+#    run's folders, or moves the extra report away. Every subscription with
+#    exactly one report is still revealed and shipped.
 # A report whose dictionary names no subscription (a subscription with no
 # resources has an empty dictionary) cannot be matched to one, so it is
-# revealed on its own; it carries no resources or costs to count twice.
+# revealed on its own. That is a limit: an older non-empty report of the same
+# subscription is then revealed beside it.
 $Candidates = [System.Collections.Generic.List[object]]::new()
 foreach ($Folder in $Folders)
 {
@@ -492,19 +512,30 @@ foreach ($Folder in $Folders)
         }
         $Dict = $Matched[0]
 
-        # The subscription: the real subscription ids in the dictionary's
-        # SubscriptionMap (token -> the real id of a resource of that
-        # subscription).
-        $SubIds = @()
+        # The subscriptions: every real subscription id in the dictionary's
+        # four id maps (token -> the real id of a resource), and the masked
+        # subscription tokens of each id (SubscriptionMap keys), used to name
+        # it without printing the real id.
+        $SubIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $SubTokens = @{}
         try
         {
             $DictJson = Get-Content -LiteralPath $Dict.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            if ($null -ne $DictJson.SubscriptionMap)
+            foreach ($MapName in @('SubscriptionMap', 'ResourceGroupMap', 'ResourceIdMap', 'ResourceNameMap'))
             {
-                foreach ($Property in $DictJson.SubscriptionMap.PSObject.Properties)
+                $Map = $DictJson.$MapName
+                if ($null -eq $Map) { continue }
+                foreach ($Property in $Map.PSObject.Properties)
                 {
                     $SubId = Get-SubGuidFromResourceId ([string]$Property.Value)
-                    if (-not [string]::IsNullOrEmpty($SubId)) { $SubIds += $SubId.ToLowerInvariant() }
+                    if ([string]::IsNullOrEmpty($SubId)) { continue }
+                    $SubId = $SubId.ToLowerInvariant()
+                    $null = $SubIds.Add($SubId)
+                    if ($MapName -eq 'SubscriptionMap')
+                    {
+                        if (-not $SubTokens.ContainsKey($SubId)) { $SubTokens[$SubId] = [System.Collections.Generic.List[string]]::new() }
+                        if (-not $SubTokens[$SubId].Contains($Property.Name)) { $SubTokens[$SubId].Add($Property.Name) }
+                    }
                 }
             }
         }
@@ -513,26 +544,56 @@ foreach ($Folder in $Folders)
             $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message) }
             continue
         }
-        $SubIds = @($SubIds | Sort-Object -Unique)
-        $Key = if ($SubIds.Count -gt 0) { 'subscription:' + ($SubIds -join ',') } else { 'report:' + $Zip.FullName }
-        # Newest first: by the stamp's date and time (yyyyMMddHHmmssfff), else
-        # by the zip's write time in the same form.
-        $Order = if ($Stamp -match '^(\d{17})') { $Matches[1] } else { $Zip.LastWriteTime.ToString('yyyyMMddHHmmssfff', [System.Globalization.CultureInfo]::InvariantCulture) }
-        $Candidates.Add([pscustomobject]@{ Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Key = $Key; Order = $Order })
+        $Candidates.Add([pscustomobject]@{
+                Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp
+                Report = ('{0}/{1}' -f $Folder.Name, $Zip.Name)
+                SubIds = @($SubIds | Sort-Object); SubTokens = $SubTokens
+            })
     }
+}
+
+# Which reports hold each subscription id, and which share a stamp.
+$ReportsBySub = @{}
+foreach ($Candidate in $Candidates)
+{
+    foreach ($SubId in $Candidate.SubIds)
+    {
+        if (-not $ReportsBySub.ContainsKey($SubId)) { $ReportsBySub[$SubId] = [System.Collections.Generic.List[object]]::new() }
+        $ReportsBySub[$SubId].Add($Candidate)
+    }
+}
+$Ambiguous = [System.Collections.Generic.HashSet[int]]::new()
+$AdviceText = 'Reveal does not guess which report is right, so it reveals none of them. Pass -InventoryRoot pointing at one run''s folders, or move the extra report away.'
+foreach ($SubId in @($ReportsBySub.Keys | Sort-Object))
+{
+    $Holders = @($ReportsBySub[$SubId] | Sort-Object -Property Report)
+    if ($Holders.Count -lt 2) { continue }
+    foreach ($Holder in $Holders) { $null = $Ambiguous.Add($Holder.Index) }
+    # Name the subscription by its masked token in each report (never the
+    # real id), with the report that holds it.
+    $Named = @($Holders | ForEach-Object {
+            $Tokens = if ($_.SubTokens.ContainsKey($SubId)) { @($_.SubTokens[$SubId]) -join ', ' } else { 'no subscription token' }
+            '{0} in {1}' -f $Tokens, $_.Report
+        })
+    $FailedItems += [pscustomobject]@{ Folder = ('subscription masked as ' + ($Named -join '; ')); Reason = ('this subscription is in {0} reports. {1}' -f $Holders.Count, $AdviceText) }
+}
+foreach ($Group in @($Candidates | Group-Object -Property Stamp | Where-Object { $_.Count -gt 1 } | Sort-Object Name))
+{
+    $Holders = @($Group.Group | Sort-Object -Property Report)
+    foreach ($Holder in $Holders) { $null = $Ambiguous.Add($Holder.Index) }
+    $FailedItems += [pscustomobject]@{ Folder = ('reports with the same stamp ' + $Group.Name + ': ' + (@($Holders.Report) -join ', ')); Reason = ('{0} reports have this stamp. {1}' -f $Holders.Count, $AdviceText) }
 }
 
 $LeftOutItems = @()
 $Selected = [System.Collections.Generic.List[object]]::new()
-foreach ($Group in ($Candidates | Group-Object -Property Key))
+foreach ($Candidate in $Candidates)
 {
-    $Newest = @($Group.Group | Sort-Object -Property @{ Expression = 'Order'; Descending = $true }, @{ Expression = { $_.Zip.FullName }; Descending = $true })
-    $Selected.Add($Newest[0])
-    foreach ($Older in @($Newest | Select-Object -Skip 1))
-    {
-        $LeftOutItems += [pscustomobject]@{ Report = ('{0}/{1}' -f $Older.Folder, $Older.Zip.Name); Newer = ('{0}/{1}' -f $Newest[0].Folder, $Newest[0].Zip.Name) }
-    }
+    if (-not $Ambiguous.Contains($Candidate.Index)) { $Selected.Add($Candidate); continue }
+    $Tokens = @($Candidate.SubIds | ForEach-Object { if ($Candidate.SubTokens.ContainsKey($_)) { @($Candidate.SubTokens[$_]) } } | Select-Object -Unique)
+    $Holds = if ($Tokens.Count -gt 0) { 'its subscription(s) masked as ' + ($Tokens -join ', ') } else { 'its subscription(s) (no subscription token in its dictionary)' }
+    $LeftOutItems += [pscustomobject]@{ Report = $Candidate.Report; Holds = $Holds }
 }
+$LeftOutItems = @($LeftOutItems | Sort-Object -Property Report)
 
 $Queue = [System.Collections.Generic.Queue[object]]::new()
 $UsedOutNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -549,8 +610,9 @@ foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression
     $OutName = $Zip.Name
     if (-not $UsedOutNames.Add($OutName))
     {
-        # Two selected reports with the same file name (stamps are unique, so
-        # only a copied folder does this): never let one overwrite the other.
+        # Two selected reports with the same file name. Reports that share a
+        # stamp are left out above, so this is only a guard: never let one
+        # overwrite the other.
         $OutName = $Folder + '_' + $Zip.Name
         $null = $UsedOutNames.Add($OutName)
     }
@@ -729,7 +791,7 @@ Write-Host ("Paired (zip + dictionary)        : {0}" -f $PairedCount) -Foregroun
 Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -ForegroundColor Green
 Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
 Write-Host ("Skipped (missing zip or dict)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
-Write-Host ("Left out (older, same sub)       : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Host ("Left out (sub in >1 report)      : {0}" -f $LeftOutItems.Count) -ForegroundColor $(if ($LeftOutItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Failed during reveal             : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
 
 foreach ($s in $SkippedItems)
@@ -738,7 +800,7 @@ foreach ($s in $SkippedItems)
 }
 foreach ($o in $LeftOutItems)
 {
-    Write-Host ("  OLDER: {0} - left out: {1} is a newer report of the same subscription" -f $o.Report, $o.Newer) -ForegroundColor Yellow
+    Write-Host ("  LEFT OUT: {0} - not revealed with {1}: it shares a subscription or its stamp with another report (see FAIL)" -f $o.Report, $o.Holds) -ForegroundColor Yellow
 }
 foreach ($f in $FailedItems)
 {
@@ -775,8 +837,8 @@ if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
     {
         # Remove only what Reveal put there: this run's zips, the other
         # finished outputs the mark records (when their bytes still match the
-        # record, for example an older report of a subscription that this run
-        # left out), their partial files and the staging mark. Anything else
+        # record, for example a report that an earlier run revealed and this
+        # run left out), their partial files and the staging mark. Anything else
         # in the folder is not ours, so the folder is then kept.
         foreach ($Staged in $StagedZips)
         {
