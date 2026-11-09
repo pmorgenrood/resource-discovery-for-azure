@@ -95,10 +95,11 @@ Describe "Dictionary Structure" {
         $Values = $script:Dictionary.ResourceIdMap.PSObject.Properties.Value
         foreach ($val in $Values)
         {
-            # A subscription-scoped id, a tenant-scope one such as a reservation
-            # order, or the tool's stand-in real id for a row with no id (its
-            # subscription part may be a display name or '~nosub').
-            $val | Should -Match '^(/subscriptions/[^/]+/|/providers/[^/]+)' -Because "Dictionary value should be a real Azure resource ID"
+            # A real id as Azure or the tool wrote it: never empty and never
+            # holding a masked token. Its form is not checked here, since a row
+            # with no id or an id that is not an ARM path is recorded too.
+            [string]::IsNullOrEmpty([string]$val) | Should -BeFalse -Because 'every masked id stands for a real id'
+            $val | Should -Not -Match $script:MaskedTokenPattern -Because "Dictionary value '$val' should be a real id, not a masked one"
         }
     }
 }
