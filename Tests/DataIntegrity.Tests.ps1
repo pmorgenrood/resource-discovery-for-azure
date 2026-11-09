@@ -153,31 +153,33 @@ Describe "Cross-Reference Integrity" {
 }
 
 # ============================================================
-# 3. Deterministic Mapping: same real sub/RG = same obfuscated value
+# 3. Deterministic Mapping: a row's Subscription and ResourceGroup are
+#    the tokens of its own masked ID
 # ============================================================
 Describe "Deterministic Mapping" {
-    It "All resources should share the same subscription value per real subscription" {
-        $Subs = @()
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | ForEach-Object { if ($null -ne $_ -and $null -ne $_.Subscription) { $Subs += $_.Subscription } }
-        }
-        $UniqueSubs = $Subs | Select-Object -Unique
-        # Unique subs should be far fewer than total resources
-        $UniqueSubs.Count | Should -BeLessOrEqual $Subs.Count -Because "Subscription values should be reused (deterministic)"
-        # For a single-subscription environment, should be exactly 1
-        if ($Subs.Count -gt 1)
-        {
-            $UniqueSubs.Count | Should -BeLessThan $Subs.Count -Because "Multiple resources should share subscription values"
-        }
+    BeforeAll {
+        # Rows whose ID is a masked subscription path, with the ID's parts.
+        $script:PathRows = @(foreach ($Section in @($script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' }))
+            {
+                foreach ($Row in @($Section.Value))
+                {
+                    if ($null -ne $Row -and [string]$Row.ID -match '^/subscriptions/[^/]+/') { [pscustomobject]@{ Row = $Row; Parts = ([string]$Row.ID).Split('/') } }
+                }
+            })
     }
 
-    It "ResourceGroup values should be reused across resources in the same RG" {
-        $Rgs = @()
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | ForEach-Object { if ($null -ne $_ -and $null -ne $_.ResourceGroup) { $Rgs += $_.ResourceGroup } }
-        }
-        $UniqueRGs = $Rgs | Select-Object -Unique
-        $UniqueRGs.Count | Should -BeLessOrEqual $Rgs.Count -Because "ResourceGroup values should be reused (deterministic)"
+    It "Each row's Subscription is the subscription token of its own masked ID" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run; Subscription is the display name'; return }
+        $Rows = @($script:PathRows | Where-Object { -not [string]::IsNullOrEmpty([string]$_.Row.Subscription) })
+        if ($Rows.Count -eq 0) { Set-ItResult -Skipped -Because 'no row with a masked subscription path and a Subscription value'; return }
+        foreach ($R in $Rows) { [string]$R.Row.Subscription | Should -BeExactly $R.Parts[2] -Because "one subscription has one token in the ID and in the Subscription field ('$($R.Row.ID)')" }
+    }
+
+    It "Each row's ResourceGroup is the resource group token of its own masked ID" {
+        if (-not $script:IsObfuscated) { Set-ItResult -Skipped -Because 'not an obfuscated run; ResourceGroup is the real name'; return }
+        $Rows = @($script:PathRows | Where-Object { $_.Parts.Count -gt 4 -and $_.Parts[3] -ieq 'resourcegroups' -and -not [string]::IsNullOrEmpty([string]$_.Row.ResourceGroup) })
+        if ($Rows.Count -eq 0) { Set-ItResult -Skipped -Because 'no row with a masked resource group path and a ResourceGroup value'; return }
+        foreach ($R in $Rows) { [string]$R.Row.ResourceGroup | Should -Be $R.Parts[4] -Because "one resource group has one token in the ID and in the ResourceGroup field ('$($R.Row.ID)')" }
     }
 }
 

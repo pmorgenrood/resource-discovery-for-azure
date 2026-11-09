@@ -189,20 +189,26 @@ Describe "ResourceGroup Consistency" {
 }
 
 Describe "Subscription Determinism" {
-    It "Resources sharing the same obfuscated Subscription should all have the same value" {
-        # Collect all subscription values
-        $SubValues = @{}
-        $script:Inventory.PSObject.Properties | Where-Object { $null -ne $_.Value -and $_.Name -ne 'Version' } | ForEach-Object {
-            @($_.Value) | ForEach-Object {
-                if ($null -ne $_ -and $null -ne $_.Subscription)
-                {
-                    $SubValues[$_.Subscription] = $true
-                }
-            }
+    It "One real subscription has one subscription token, and one token one real subscription" {
+        $DictPath = if ($env:TEST_DICT_PATH) { $env:TEST_DICT_PATH } else
+        {
+            $DictDir = if ($env:TEST_ZIP_PATH) { Split-Path $env:TEST_ZIP_PATH -Parent } else { $PSScriptRoot }
+            Get-ChildItem -Path $DictDir -Filter 'ObfuscationDictionary_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
         }
-        # There should be fewer unique subscription values than total resources
-        # (deterministic = same real sub maps to same obfuscated sub)
-        $SubValues.Keys.Count | Should -BeLessOrEqual $script:AllIds.Count -Because "Subscription values should be reused across resources in the same subscription"
+        if ([string]::IsNullOrEmpty($DictPath) -or -not (Test-Path -LiteralPath $DictPath)) { Set-ItResult -Skipped -Because 'no obfuscation dictionary for this zip'; return }
+        $Map = (Get-Content -LiteralPath $DictPath -Raw | ConvertFrom-Json).ResourceIdMap
+        $TokensOf = @{}; $RealsOf = @{}
+        foreach ($P in @($Map.PSObject.Properties))
+        {
+            $M = ([string]$P.Name).Split('/'); $R = ([string]$P.Value).Split('/')
+            if ($M.Count -lt 3 -or $R.Count -lt 3 -or $M[1] -ine 'subscriptions' -or $R[1] -ine 'subscriptions') { continue }
+            $Real = $R[2].ToLowerInvariant()
+            if (-not $TokensOf.ContainsKey($Real)) { $TokensOf[$Real] = @{} }; $TokensOf[$Real][$M[2]] = $true
+            if (-not $RealsOf.ContainsKey($M[2])) { $RealsOf[$M[2]] = @{} }; $RealsOf[$M[2]][$Real] = $true
+        }
+        if ($TokensOf.Count -eq 0) { Set-ItResult -Skipped -Because 'no masked subscription path in the dictionary'; return }
+        foreach ($Real in $TokensOf.Keys) { $TokensOf[$Real].Count | Should -Be 1 -Because 'a real subscription keeps one token in every id' }
+        foreach ($Tok in $RealsOf.Keys) { $RealsOf[$Tok].Count | Should -Be 1 -Because 'a token stands for one real subscription' }
     }
 }
 
