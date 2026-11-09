@@ -499,8 +499,9 @@ $RevealTimeoutSeconds = [int][math]::Ceiling($FolderTimeoutMinutes * 60)
 #    service (no consumption, no metrics) is newer than the full run it
 #    repairs. So each report's subscriptions are read from the real ids in its
 #    dictionary's four id maps (the inventory's subscription values are tokens
-#    that resolve through these same maps) and from the name of its run's
-#    DebugLog_ or ErrorLog_ file in the inventory root (see $RunLogSubIds), and
+#    that resolve through these same maps), or, when its dictionary names
+#    none, from the name of its run's DebugLog_ or ErrorLog_ file in the
+#    inventory root (see $RunLogSubIds), and
 #    any report that shares a subscription id with another report is left out
 #    together with that other report, whichever subscriptions it also holds.
 #    Each such subscription is named by its masked token, with the report
@@ -527,15 +528,21 @@ $Candidates = [System.Collections.Generic.List[object]]::new()
 # report zip's name without '.zip'. The run writes the debug log for every
 # subscription, also one with no resources, whose dictionary is empty and
 # names none. So an empty report is matched to its subscription when that
-# log is there.
+# log is there. The log is used ONLY for a report whose dictionary names no
+# subscription: the stamp is not unique to one report (two folders can hold
+# reports of one stamp, for example a copied folder), so for a report whose
+# dictionary names its subscriptions, the logs of another report of the same
+# stamp would wrongly add that report's subscription to it. Logs are keyed by
+# the folder that holds them and the report name, and a report reads only the
+# logs in the folder that holds its own report folder.
 $RunLogSubIds = [System.Collections.Generic.Dictionary[string, object]]::new($(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal }))
 foreach ($Log in @(Get-ChildItem -LiteralPath $InventoryRoot -File -ErrorAction SilentlyContinue))
 {
     if ($Log.Name -notmatch '^(?:DebugLog|ErrorLog)_(?<report>.+)_(?<sub>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.log$') { continue }
-    $ReportBase = $Matches['report']
-    if (-not $RunLogSubIds.ContainsKey($ReportBase)) { $RunLogSubIds[$ReportBase] = [System.Collections.Generic.List[string]]::new() }
+    $LogKey = (ConvertTo-RevealComparablePath $Log.DirectoryName) + [System.IO.Path]::DirectorySeparatorChar + $Matches['report']
+    if (-not $RunLogSubIds.ContainsKey($LogKey)) { $RunLogSubIds[$LogKey] = [System.Collections.Generic.List[string]]::new() }
     $LogSubId = $Matches['sub'].ToLowerInvariant()
-    if (-not $RunLogSubIds[$ReportBase].Contains($LogSubId)) { $RunLogSubIds[$ReportBase].Add($LogSubId) }
+    if (-not $RunLogSubIds[$LogKey].Contains($LogSubId)) { $RunLogSubIds[$LogKey].Add($LogSubId) }
 }
 foreach ($Folder in $Folders)
 {
@@ -620,10 +627,18 @@ foreach ($Folder in $Folders)
             $FailedItems += [pscustomobject]@{ Folder = $Folder.Name; Reason = ('the dictionary {0} could not be read: {1}' -f $Dict.Name, $_.Exception.Message) }
             continue
         }
-        # And the subscription the run's own logs name (see $RunLogSubIds).
-        if ($RunLogSubIds.ContainsKey($Zip.BaseName))
+        # A dictionary that names no subscription: the subscription the run's
+        # own logs name, in the folder that holds this report's folder (see
+        # $RunLogSubIds). Two such reports of one stamp both take every
+        # subscription those logs name, so they are left out together rather
+        # than either being shipped as the other's subscription.
+        if ($SubIds.Count -eq 0)
         {
-            foreach ($LogSubId in $RunLogSubIds[$Zip.BaseName]) { $null = $SubIds.Add($LogSubId) }
+            $LogKey = (ConvertTo-RevealComparablePath $Folder.Parent.FullName) + [System.IO.Path]::DirectorySeparatorChar + $Zip.BaseName
+            if ($RunLogSubIds.ContainsKey($LogKey))
+            {
+                foreach ($LogSubId in $RunLogSubIds[$LogKey]) { $null = $SubIds.Add($LogSubId) }
+            }
         }
         $Candidates.Add([pscustomobject]@{
                 Index = $Candidates.Count; Folder = $Folder.Name; Zip = $Zip; Dict = $Dict; Stamp = $Stamp

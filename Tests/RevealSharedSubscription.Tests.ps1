@@ -222,6 +222,14 @@ Describe 'Reveal.ps1 with two reports of the same stamp and different subscripti
         Add-Report -Folder (Join-Path $script:Root 'first') -Stamp '20260101000000000dddd' -Subs @($script:S1)
         Add-Report -Folder (Join-Path $script:Root 'second') -Stamp '20260101000000000dddd' -Subs @($script:S2)
         Add-Report -Folder (Join-Path $script:Root 'third') -Stamp '20260101000000001eeee' -Subs @($script:S3)
+        # The debug logs each run writes into the inventory root. The two
+        # runs of the shared stamp write two logs with that one stamp, one per
+        # subscription. A report whose dictionary names its subscription must
+        # not take the other report's subscription from them.
+        foreach ($Log in @(('DebugLog_ResourcesReport_20260101000000000dddd_' + $script:SubA + '.log'), ('DebugLog_ResourcesReport_20260101000000000dddd_' + $script:SubB + '.log'), ('DebugLog_ResourcesReport_20260101000000001eeee_' + $script:SubC + '.log')))
+        {
+            [System.IO.File]::WriteAllText((Join-Path $script:Root $Log), "Service processing started`n")
+        }
         $script:Run = Invoke-Reveal -Root $script:Root -Name 'samestamp'
     }
 
@@ -295,6 +303,33 @@ Describe 'Reveal.ps1 with an older report of a subscription and a newer empty re
     }
 
     It 'never prints a real subscription id' {
+        $script:Run.Text | Should -Not -Match $script:SubA
+        $script:Run.Text | Should -Not -Match $script:SubB
+    }
+}
+
+# Two empty reports of one stamp, with the two runs' logs in the root: which
+# log belongs to which report cannot be told, so both take both subscriptions
+# and are left out together, and the run fails.
+Describe 'Reveal.ps1 with two empty reports of the same stamp and their run logs' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'emptysamestamp'
+        Add-Report -Folder (Join-Path $script:Root 'first') -Stamp '20260101000000000dddd' -Empty
+        Add-Report -Folder (Join-Path $script:Root 'second') -Stamp '20260101000000000dddd' -Empty
+        Add-Report -Folder (Join-Path $script:Root 'third') -Stamp '20260101000000001eeee' -Subs @(New-Sub -Id $script:SubC -RgName 'rg-c')
+        foreach ($Sub in @($script:SubA, $script:SubB))
+        {
+            [System.IO.File]::WriteAllText((Join-Path $script:Root ('DebugLog_ResourcesReport_20260101000000000dddd_' + $Sub + '.log')), "Service processing started`n")
+        }
+        $script:Run = Invoke-Reveal -Root $script:Root -Name 'emptysamestamp'
+    }
+
+    It 'leaves both empty reports out, exits non-zero and still ships the other report' {
+        $script:Run.Exit | Should -Not -Be 0 -Because $script:Run.Text
+        $script:Run.Text | Should -Match 'Left out \(sub in >1 report\)\s+: 2'
+        $script:Run.Text | Should -Match 'LEFT OUT: first/ResourcesReport_20260101000000000dddd\.zip'
+        $script:Run.Text | Should -Match 'LEFT OUT: second/ResourcesReport_20260101000000000dddd\.zip'
+        Get-ZipNames $script:Run.Bundle | Should -Be @('ResourcesReport_20260101000000001eeee.zip')
         $script:Run.Text | Should -Not -Match $script:SubA
         $script:Run.Text | Should -Not -Match $script:SubB
     }
