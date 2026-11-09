@@ -247,7 +247,14 @@ function Write-RdaShareableDiagnosticsLog
         # collector and consumption entries of the earlier subscriptions of the
         # run are still in the globals, so only this one's are counted. Empty
         # for a run over every subscription, which counts them all.
-        [string]$SubscriptionID
+        [string]$SubscriptionID,
+        # How many entries each health global held when this run started. Only
+        # the entries added after them are counted, so an earlier run in the
+        # same PowerShell session (a direct run, or an earlier subscription
+        # under -RunAllSubs) never shows in this run's log.
+        [int]$CollectorFailuresFrom = 0,
+        [int]$MetricsFailedSubsFrom = 0,
+        [int]$ConsumptionFailedSubsFrom = 0
     )
 
     try
@@ -318,24 +325,24 @@ function Write-RdaShareableDiagnosticsLog
         # ResourceInventory.ps1 run they can be $null, and @($null) is a ONE-element
         # array (the single $null) that would otherwise render a phantom "failure"
         # line. Filtering nulls yields a genuine "0" when there were none.
-        # Under -RunAllSubs the earlier subscriptions' collector failures and
-        # consumption entries are still in the globals too, so an entry that
-        # carries another subscription's id is left out. An entry with no id or a
-        # run-wide label such as '(auth)' is kept.
+        # The entries of earlier runs in the session are skipped first (the
+        # *From counts). Of the rest, an entry that carries another
+        # subscription's id is left out. An entry with no id or a run-wide label
+        # such as '(auth)' is kept.
         $IsThisSub = {
             param($Entry)
             $EntryId = [string]$Entry.Id
             [string]::IsNullOrEmpty($SubscriptionID) -or [string]::IsNullOrEmpty($EntryId) -or $EntryId.StartsWith('(') -or $EntryId -eq $SubscriptionID
         }
-        $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ -and (& $IsThisSub $_) })
+        $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ } | Select-Object -Skip $CollectorFailuresFrom | Where-Object { & $IsThisSub $_ })
         # Metrics skipped for the sign-in, and metrics left incomplete because Azure
         # Monitor kept failing, each with its own count. An entry is incomplete when
         # it has a Complete property equal to $false; it is told apart here so this
         # library needs no other file.
-        $MetricsEntries = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ -and ([string]::IsNullOrEmpty($SubscriptionID) -or [string]$_.Id -eq $SubscriptionID) })
+        $MetricsEntries = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ } | Select-Object -Skip $MetricsFailedSubsFrom | Where-Object { [string]::IsNullOrEmpty($SubscriptionID) -or [string]$_.Id -eq $SubscriptionID })
         $MetricsSkips = @($MetricsEntries | Where-Object { -not ($null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false) })
         $MetricsIncomplete = @($MetricsEntries | Where-Object { $null -ne $_.PSObject.Properties['Complete'] -and $_.Complete -eq $false } | Sort-Object Name, Id -Unique)
-        $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and (& $IsThisSub $_) })
+        $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ } | Select-Object -Skip $ConsumptionFailedSubsFrom | Where-Object { & $IsThisSub $_ })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()
         if ($Obfuscated)

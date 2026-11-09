@@ -49,6 +49,15 @@ if (-not $RunAllSubs.IsPresent)
 # write never fails the next one.
 $Global:RdaMetricsWriteFailures = @()
 
+# How many collector, metrics and consumption entries the session held when
+# this run started. The Diagnostics log counts only the entries added after
+# them, so an earlier run or subscription in the session never shows in it.
+$script:HealthEntriesAtStart = @{
+    CollectorFailuresFrom     = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ }).Count
+    MetricsFailedSubsFrom     = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ }).Count
+    ConsumptionFailedSubsFrom = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ }).Count
+}
+
 if ($Debug.IsPresent) { $DebugPreference = 'Continue' }
 
 if ($Debug.IsPresent) { $ErrorActionPreference = "Continue" }Else { $ErrorActionPreference = "silentlycontinue" }
@@ -1839,7 +1848,7 @@ $MetricsNotWritten = (-not $SkipMetrics.IsPresent) -and ((@($Global:RdaMetricsWr
 
 if ($Obfuscate.IsPresent)
 {
-    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -Obfuscated:$Obfuscate.IsPresent -SubscriptionID $SubscriptionID
+    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -Obfuscated:$Obfuscate.IsPresent -SubscriptionID $SubscriptionID @script:HealthEntriesAtStart
 
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
@@ -1852,7 +1861,7 @@ if ($Obfuscate.IsPresent)
 }
 else
 {
-    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -SubscriptionID $SubscriptionID
+    $DiagnosticsFile = Write-RdaShareableDiagnosticsLog -DefaultPath $DefaultPath -ReportName $Global:ReportName -RunDateTime $Global:CurrentDateTime -Version $Global:Version -PhaseTimings $script:PhaseTimings -SubscriptionID $SubscriptionID @script:HealthEntriesAtStart
     $ShareableExtras = @()
     if (-not [string]::IsNullOrEmpty($DiagnosticsFile) -and (Test-Path -LiteralPath $DiagnosticsFile)) { $ShareableExtras += $DiagnosticsFile }
 

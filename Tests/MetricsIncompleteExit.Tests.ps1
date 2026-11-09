@@ -1101,6 +1101,105 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
     }
 }
 
+Describe 'The Diagnostics log of each ResourceInventory.ps1 run in one PowerShell session' {
+    BeforeAll {
+        # The run's param block, its top-level statements before the inventory
+        # setup that read or clear the health entries, and the statement that
+        # writes the Diagnostics log, as written, with both function files. In
+        # between, a stand-in for the collection adds the entries it is given.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $Setup = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$Global:Runtime = Measure-Command' })[0]
+        $Start = @($Top[0..($Setup - 1)] | Where-Object { $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Extent.Text -match 'MetricsFailedSubs|CollectorFailures|ConsumptionFailedSubs' })
+        $Writes = @($Top | Where-Object { $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Extent.Text -match 'Write-RdaShareableDiagnosticsLog' })
+        $script:DiagRun = Join-Path $TestDrive 'diagnostics-run.ps1'
+        Set-Content -LiteralPath $script:DiagRun -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                @($Start | ForEach-Object { $_.Extent.Text })
+                'if ($null -ne $Global:RdaTestAddEntries) { & $Global:RdaTestAddEntries }'
+                @($Writes | ForEach-Object { $_.Extent.Text })
+                '$DiagnosticsFile'
+            ) -join "`n")
+
+        # Runs the lifted statements once and returns the counts of its log.
+        function script:Invoke-DiagRun
+        {
+            param([hashtable]$Arguments, [scriptblock]$Add)
+            $Stamp = '20261109150000000' + ([guid]::NewGuid().ToString('N').Substring(0, 4))
+            $Folder = Join-Path $TestDrive ('diag-' + $Stamp)
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            $Global:DefaultPath = $Folder.TrimEnd('/') + '/'
+            $Global:ReportName = 'ResourcesReport'
+            $Global:CurrentDateTime = $Stamp
+            $Global:Version = '1.0'
+            $Global:RdaTestAddEntries = $Add
+            $Log = @(& $script:DiagRun @Arguments 6>$null | Where-Object { $_ -is [string] -and $_ -like '*Diagnostics_*.log' })[-1]
+            $Text = Get-Content -LiteralPath $Log -Raw
+            $Counts = @{}
+            foreach ($Label in @('Collector failures', 'Metrics auth-skipped subscriptions', 'Metrics incomplete subscriptions', 'Consumption failed/incomplete subscriptions'))
+            {
+                if ($Text -match ('(?m)^{0}: (\d+)' -f [regex]::Escape($Label))) { $Counts[$Label] = [int]$Matches[1] }
+            }
+            $Counts
+        }
+
+        $script:SessionValues = @{}
+        foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'Version', 'CollectorFailures', 'MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaMetricsWriteFailures', 'RdaTestAddEntries'))
+        {
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    AfterAll {
+        foreach ($Name in $script:SessionValues.Keys)
+        {
+            if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
+            else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'counts only subscription B''s entries after subscription A''s run under -RunAllSubs' {
+        # The wrapper starts the session with empty lists.
+        $Global:CollectorFailures = @()
+        $Global:MetricsFailedSubs = @()
+        $Global:ConsumptionFailedSubs = @()
+        $A = Invoke-DiagRun -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true; SubscriptionID = '00000000-0000-0000-0000-00000000000a' } -Add {
+            $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped.' }
+            $Global:CollectorFailures += [pscustomobject]@{ Module = 'VM'; Message = 'failed' }
+            $Global:MetricsFailedSubs += [pscustomobject]@{ Name = '(subscription)'; Id = '00000000-0000-0000-0000-00000000000a'; Message = 'Metrics skipped.' }
+        }
+        $B = Invoke-DiagRun -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true; SubscriptionID = '00000000-0000-0000-0000-00000000000b' } -Add $null
+
+        $A['Consumption failed/incomplete subscriptions'] | Should -Be 1
+        $A['Collector failures'] | Should -Be 1
+        $A['Metrics auth-skipped subscriptions'] | Should -Be 1
+        $B['Consumption failed/incomplete subscriptions'] | Should -Be 0
+        $B['Collector failures'] | Should -Be 0
+        $B['Metrics auth-skipped subscriptions'] | Should -Be 0
+        # The wrapper keeps the entries for its own end of run.
+        @($Global:ConsumptionFailedSubs).Count | Should -Be 1
+    }
+
+    It 'counts only the second run''s entries after two direct runs' {
+        $Global:CollectorFailures = $null
+        $Global:MetricsFailedSubs = $null
+        $Global:ConsumptionFailedSubs = $null
+        $First = Invoke-DiagRun -Arguments @{ TenantID = 'tenant-1' } -Add {
+            $Global:CollectorFailures = @([pscustomobject]@{ Id = 'id-1'; Module = 'VM'; Message = 'failed' })
+            $Global:ConsumptionFailedSubs = @([pscustomobject]@{ Name = 'sub-one'; Id = 'id-1'; Message = 'stopped' })
+        }
+        $Second = Invoke-DiagRun -Arguments @{ TenantID = 'tenant-1' } -Add {
+            $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Message = 'stopped' }
+        }
+
+        $First['Collector failures'] | Should -Be 1
+        $First['Consumption failed/incomplete subscriptions'] | Should -Be 1
+        $Second['Collector failures'] | Should -Be 0
+        $Second['Consumption failed/incomplete subscriptions'] | Should -Be 1
+    }
+}
+
 Describe 'The Metrics files an earlier ResourceInventory.ps1 run could not write' {
     BeforeAll {
         # The run's param block and its top-level statements before the
