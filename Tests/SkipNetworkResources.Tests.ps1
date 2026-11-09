@@ -564,6 +564,14 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         # that answers from AllRows by the query's type filter.
         function script:Invoke-Discovery
         {
+            # The lifted Variables, ResourceInventoryLoop and RunInventorySetup
+            # code reads these through dynamic scope, which the analyzer cannot
+            # follow.
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ReportName', Justification = 'Read by the lifted Variables through dynamic scope.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'IncludeNetworkResources', Justification = 'Read by the lifted ResourceInventoryLoop through dynamic scope.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'RunAllSubs', Justification = 'Read by the lifted ResourceInventoryLoop through dynamic scope.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ResourceGroup', Justification = 'Read by the lifted ResourceInventoryLoop through dynamic scope.')]
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ObfuscationDictionary', Justification = 'Read by the lifted RunInventorySetup statements through dynamic scope.')]
             param([switch]$Obfuscate, [switch]$Include, [string]$FailToken = '')
             $script:Sent = [System.Collections.Generic.List[object]]::new()
             $script:FailTokenMode = $FailToken
