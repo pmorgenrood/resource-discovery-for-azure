@@ -113,7 +113,15 @@ Behaviour:
   skips the shared-token check, but then that bundle must give the merge no
   inventory record, consumption row or metric; otherwise the merge stops,
   because those were not masked with that dictionary (for example a plain run
-  written into a folder that still holds an old masked run's dictionary). It
+  written into a folder that still holds an old masked run's dictionary). A
+  dictionary that is not empty proves nothing about the files beside it either,
+  so when both bundles have a dictionary every id the merge takes must be
+  masked: each inventory record's `ID`, each consumption row's `ResourceId`
+  (an empty one is skipped, as downstream drops that row) and each metric's
+  `ID`. Masked means a `prod_`/`nonprod_` token, `obfuscated`, or an ARM path
+  whose subscription, resource group and name segments are such tokens. One
+  plain id stops the merge, as does a bundle whose inventory records hold no
+  token at all; the error names the file and the record, never the value. It
   also stops when a dictionary cannot be read. The error names the bundle to fix.
   If a dictionary was moved, put it back in its folder. A recovery that was not
   masked, or not seeded, is re-run with `-Obfuscate -ObfuscationDictionary
