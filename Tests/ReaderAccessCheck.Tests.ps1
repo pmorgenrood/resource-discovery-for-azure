@@ -2524,6 +2524,32 @@ exit 1
         @(Get-ChildItem -LiteralPath $script:CaseRoot -Directory -Filter ('ResourcesReport*{0}' -f $script:SubA.Id)).Count | Should -Be ($Before + 1)
     }
 
+    It 'keeps this run''s failure when a per-stream file an interrupted run left behind lists the subscription as completed' {
+        script:Use-WrapperCase
+        New-Item -ItemType Directory -Path $script:CaseRoot -Force | Out-Null
+        # An interrupted four-stream run left stream 3's file, with Sub A completed.
+        $Stale = Join-Path $script:CaseRoot ('.resume-state-{0}-stream-3.json' -f $script:WrapperTenant)
+        @{ Tenant = $script:WrapperTenant; StreamId = '3'; Completed = @($script:SubA.Id); FailedAttempts = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Stale -Encoding utf8
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -ConsumptionFail @($script:SubA.Id)
+        $Run = script:Invoke-WrapperRun -Streams 2
+        $Run.ExitCode | Should -Be 3 -Because ($Run.Text -join "`n")
+        $State = script:Read-WrapperState
+        $State.Failed | Should -Contain $script:SubA.Id
+        @($State.Completed) | Should -Not -Contain $script:SubA.Id
+    }
+
+    It 'names every subscription of one stream whose consumption is incomplete in the FAILED (consumption) lines' {
+        script:Use-WrapperCase
+        $SubC = @{ Id = 'sub-c'; Name = 'Sub C' }
+        # Two streams: Sub A and Sub C share stream 0.
+        script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB, $SubC) -ConsumptionFail @($script:SubA.Id, $SubC.Id)
+        $Run = script:Invoke-WrapperRun -Streams 2
+        $Run.ExitCode | Should -Be 3 -Because ($Run.Text -join "`n")
+        $Run.Text | Should -Contain 'Consumption (billing) data is missing or incomplete for 2 subscription(s):'
+        $Run.Text | Should -Contain ('  - {0} ({0})' -f $script:SubA.Id)
+        $Run.Text | Should -Contain ('  - {0} ({0})' -f $SubC.Id)
+    }
+
     It 'skips a completed subscription on -Resume after collecting one listed before it, when the state held one completed id' {
         script:Use-WrapperCase
         script:Set-WrapperScenario -Subs @($script:SubA, $script:SubB) -Fail @($script:SubA.Id)
