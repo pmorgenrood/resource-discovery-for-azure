@@ -771,13 +771,17 @@ if ($Task -eq 'Processing')
                                 {
                                     $LastError = $_.Exception.Message
                                     $LastException = $_.Exception
-                                    if ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    # BadRequest is read from the status first, so a 400 whose
+                                    # message holds "429" or "throttl" (a resource name) still
+                                    # falls back to one request per metric. A readable status
+                                    # decides throttling too (only 429 is); the message text is
+                                    # read only when no status can be read.
+                                    $BadRequest = Test-MetricBadRequest -Exception $_.Exception
+                                    if (-not $BadRequest)
                                     {
-                                        $Throttled = $true
-                                    }
-                                    else
-                                    {
-                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
+                                        $ErrorStatus = Get-MetricErrorStatus -Exception $_.Exception
+                                        if ($null -ne $ErrorStatus) { $Throttled = ($ErrorStatus -eq 429) }
+                                        else { $Throttled = ($LastError -match '429|throttl|TooManyRequests|rate limit') }
                                     }
                                 }
                                 finally

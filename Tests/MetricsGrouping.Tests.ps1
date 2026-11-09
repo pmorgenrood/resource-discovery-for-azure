@@ -106,6 +106,13 @@ function Get-AzMetric
         'Forbidden' { throw "Operation returned an invalid status code 'Forbidden'" }
         # A server error whose text holds "BadRequest" in a resource name.
         'Status503NamedBadRequest' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable for disk-BadRequest-01.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        # A 400 (status or Az text) whose text holds "429" and "throttle" in a resource name.
+        'Status400Named429' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected for vm-429-throttle.', $null, [System.Net.HttpStatusCode]::BadRequest) }
+        'BadRequestNamed429' { throw "Operation returned an invalid status code 'BadRequest' for vm-429-throttle" }
+        # A server error whose text holds "429" and "throttle" in a resource name.
+        'Status503Named429' { throw [System.Net.Http.HttpRequestException]::new('The service is unavailable for vm-429-throttle.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        # Throttling with no status anywhere: only the text says so.
+        'NoStatusThrottled' { throw 'The request was throttled; rate limit exceeded.' }
     }
     # RDA_TEST_METRIC_SINGLE_ERROR makes every single-name request fail in a chosen way.
     switch ($(if ($Names.Count -eq 1) { $env:RDA_TEST_METRIC_SINGLE_ERROR } else { '' }))
@@ -549,6 +556,44 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         $Run.Records.Count | Should -Be 4
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+    }
+
+    It 'falls back to one request per metric when a grouped 400 has 429 or throttle in its message (<MultiError>)' -ForEach @(@{ MultiError = 'Status400Named429' }, @{ MultiError = 'BadRequestNamed429' }) {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName ('fallback-' + $MultiError) -MultiError $MultiError
+
+        # A BadRequest: the group is not retried and each metric is requested on its own.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        @($RunMap.Keys | Sort-Object) | Should -Be @($CleanMap.Keys | Sort-Object)
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
+    }
+
+    It 'does not read a server error with 429 or throttle in its message as throttled' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-503-named-429' -MultiError 'Status503Named429'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
+        foreach ($Name in $script:DiskMetricNames)
+        {
+            @($Run.DebugLines | Where-Object { $_ -match ('  Error idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+        }
+        @($Run.DebugLines | Where-Object { $_ -match '^\s*Throttled idx=' }).Count | Should -Be 0
+    }
+
+    It 'still reads throttling from the message when no status can be read' {
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-nostatus-throttled' -MultiError 'NoStatusThrottled'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         foreach ($Name in $script:DiskMetricNames)
         {
             @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
