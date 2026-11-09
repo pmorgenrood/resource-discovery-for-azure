@@ -154,6 +154,13 @@ Two logs help diagnose partial failures (also summarised in the README):
   pull stopped** (`PageAtFailure` / `RecordsCollected`), so a truncated billing
   sheet is obvious rather than inferred. It is a plain `.log` (not `.json`) on
   purpose so the ingestion pipeline treats it as an attachment, not report data.
+  Its **"Metrics incomplete subscriptions"** section lists each subscription
+  whose Azure Monitor metric requests still failed after their retries
+  (throttling, a timeout, a server error or an error with no status); those
+  metrics are in the report with `MetricError` true.
+- A direct `ResourceInventory.ps1` run with incomplete metrics still writes its
+  zip, prints a "FAILED (metrics)" banner with the command that collects them
+  again, and **exits 3**; it exits 2 instead when no zip was written.
 
 If a subscription is **not** listed under a failure heading, that dimension
 completed cleanly.
