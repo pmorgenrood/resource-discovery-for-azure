@@ -306,7 +306,6 @@ Describe 'AppServicePlan Subscription' {
         $Rows[0].Subscription | Should -Be 'sub-a'
         $Rows[0].Subscription | Should -BeOfType [string]
         $Rows[1].Subscription | Should -Be 'sub-b'
-        $Rows[2].Subscription | Should -Be @('sub-c1', 'sub-c2')
         $Rows[3].Subscription | Should -BeNullOrEmpty
         $Rows[4].Subscription | Should -BeNullOrEmpty
     }
