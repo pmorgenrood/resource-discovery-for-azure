@@ -1752,9 +1752,14 @@ Describe 'Test-DataPlaneAuthReady (ResourceInventory.ps1) retries a failed token
 
     It 'is ready when the first token request only warns and gives no token, and the next one works' {
         $script:TokenCalls = 0
-        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
+        # A stand-in, not a mock, so its warning reaches the caller's -WarningVariable
+        # as a real cmdlet's does.
+        function Get-AzAccessToken { [CmdletBinding()] param($ResourceUrl, [switch]$AsSecureString) $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed. Data was written but it could not be read.'; return $null }; [pscustomobject]@{ Token = 'tok' } }
         Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeTrue
         $script:TokenCalls | Should -Be 2
+        # The retry rule reads the warning's text, as with the real cmdlet.
+        $script:TokenCalls = 0
+        { Get-RdaAccessToken } | Should -Throw '*Persistence check failed*'
     }
 }
 
@@ -1766,8 +1771,13 @@ Describe 'Get-RoleCheckCallerObjectId retries a token request that only warns' {
         $script:TokenCalls = 0
         $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"caller-1"}')).TrimEnd('=')
         $script:Jwt = 'e30.{0}.sig' -f $Claims
-        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed.'; return $null }; [pscustomobject]@{ Token = $script:Jwt } }
+        # A stand-in, not a mock, so its warning reaches the caller's -WarningVariable
+        # as a real cmdlet's does.
+        function Get-AzAccessToken { [CmdletBinding()] param($ResourceUrl, [switch]$AsSecureString) $script:TokenCalls++; if ($script:TokenCalls -eq 1) { Write-Warning 'Persistence check failed.'; return $null }; [pscustomobject]@{ Token = $script:Jwt } }
         Get-RoleCheckCallerObjectId | Should -Be 'caller-1'
         $script:TokenCalls | Should -Be 2
+        # The retry rule reads the warning's text, as with the real cmdlet.
+        $script:TokenCalls = 0
+        { Get-RdaAccessToken } | Should -Throw '*Persistence check failed*'
     }
 }
