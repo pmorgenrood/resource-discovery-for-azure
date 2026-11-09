@@ -1355,13 +1355,15 @@ function Get-ConsumptionErrorStatusCode
     return $null
 }
 
-# Pure: 'Permanent' for the failures a retry cannot change: 400 (malformed
-# request), 401/403 (no permission) and 404 (not found). Otherwise the
-# messages decide, of the exception and of each one in its chain (inner
+# Pure: a known HTTP status decides first: 408 (timeout), 409 (conflict), 429
+# (throttling) and 5xx are 'Transient'; any other 4xx, such as 400 (malformed
+# request), 401/403 (no permission), 404 (not found) or 405, is 'Permanent',
+# since a retry cannot change it. Without a status the messages decide, of the exception and of each one in its chain (inner
 # exceptions and an ErrorRecord's exception, at most 10, as
 # Test-MetricBadRequest in Extension/Metrics.ps1 reads them), since a wrapper
 # exception often carries the cause in an inner one: it is permanent when one
-# names a status above (by name or number), says access was denied or that
+# names one of 400, 401, 403 or 404 (by name, or by number after 'status' or
+# 'HTTP'), says access was denied or that
 # something could not be found, or says the sign-in cannot be used (the same
 # as a 401: a retry signs in no better). A sign-in error code alone (AADSTS...)
 # does not count: some of those are transient. Everything else is 'Transient'
@@ -1382,7 +1384,11 @@ function Get-ConsumptionErrorKind
 {
     param([object]$Exception)
     $Status = Get-ConsumptionErrorStatusCode -Exception $Exception
-    if ($null -ne $Status -and ($Status -eq 400 -or $Status -eq 401 -or $Status -eq 403 -or $Status -eq 404)) { return 'Permanent' }
+    if ($null -ne $Status)
+    {
+        if ($Status -eq 408 -or $Status -eq 409 -or $Status -eq 429 -or $Status -ge 500) { return 'Transient' }
+        if ($Status -ge 400) { return 'Permanent' }
+    }
     $Chain = [System.Collections.Generic.List[object]]::new()
     $Pending = [System.Collections.Generic.Queue[object]]::new()
     $Pending.Enqueue($Exception)
@@ -1399,7 +1405,7 @@ function Get-ConsumptionErrorKind
     }
     foreach ($Ex in $Chain)
     {
-        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|40[0134]|access ?(is )?denied|authorizationfailed)\b|does not have authorization|could not be found')
+        if ([string]$Ex.Message -match '(?i)\b(bad ?request|unauthorized|forbidden|not ?found|access ?(is )?denied|authorizationfailed)\b|(status|http)\D{0,40}\b40[0134]\b|does not have authorization|could not be found')
         {
             return 'Permanent'
         }
