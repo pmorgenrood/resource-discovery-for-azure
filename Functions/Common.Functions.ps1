@@ -2010,20 +2010,29 @@ function Get-ConsumptionMissingEntries
 # The lines under the FAILED (consumption) banner: how to collect the cost
 # data again. A report holds one or more subscriptions, and downstream adds up
 # the consumption rows of every report it is given, so the safe way is to run
-# the same command again, with the same settings, and upload only the new
-# report: uploading both would count the rows this run did write twice, and
-# uploading a new report of one subscription in place of a report of several
-# would drop the others. Nothing is printed when there are no entries.
+# the same command again, with the same settings and without -Resume or
+# -ResumeFailedOnly (which would collect only some subscriptions), and upload
+# only the new report: uploading both would count the rows this run did write
+# twice, and uploading a new report of fewer subscriptions in place of this
+# one would drop the others. When the page limit stopped a pull, the same
+# settings would stop it again, so the line names a higher
+# -ConsumptionMaxPages. Nothing is printed when there are no entries.
 function Get-ConsumptionRetryAdvice
 {
     param([object[]]$Entries)
-    if (@(Get-ConsumptionIncompleteEntries -Entries $Entries).Count -eq 0) { return @() }
-    return @('To collect it again, fix the cause and run the same command again, with the same settings. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.')
+    $List = @(Get-ConsumptionIncompleteEntries -Entries $Entries)
+    if ($List.Count -eq 0) { return @() }
+    $Lines = @('To collect it again, fix the cause and run the same command again, with the same settings and without -Resume or -ResumeFailedOnly. Upload only the new report, not this one: this one is missing that cost data, and both together would count some of its rows twice.')
+    if (@($List | Where-Object { [string]$_.Message -like '*usage pages for one subscription*' }).Count -gt 0)
+    {
+        $Lines += 'The page limit stopped a pull: give that run a higher -ConsumptionMaxPages than this one used.'
+    }
+    return $Lines
 }
 
 # The last lines of a run in which the billing download of one or more
 # subscriptions failed or stopped part-way: each subscription, then $Advice
-# (the command that collects them again). Shared by Run-AllSubscriptions.ps1
+# (how to collect them again, Get-ConsumptionRetryAdvice). Shared by Run-AllSubscriptions.ps1
 # and direct runs of ResourceInventory.ps1, which then exit 3 (the wrapper
 # exits 5 when a collector failed too). Prints nothing when there are none.
 function Write-ConsumptionFailedBanner
