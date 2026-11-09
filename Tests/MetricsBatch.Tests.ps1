@@ -517,6 +517,60 @@ Describe 'Metrics.ps1 batch work items' {
         @($Items | Where-Object { $_ -is [System.Array] }).Count | Should -Be 4
         $Items[4].RdaBatchUnit | Should -BeTrue
     }
+
+    It 'reads a failed batch request <Label> as <Kind>' -ForEach @(
+        @{ Label = '401'; Chain = 'Unauthorized'; Kind = 'TokenRefused'; Status = 401 }
+        @{ Label = '403'; Chain = 'Forbidden'; Kind = 'Refused'; Status = 403 }
+        @{ Label = '400'; Chain = 'BadRequest'; Kind = 'BadRequest'; Status = 400 }
+        @{ Label = '404'; Chain = 'NotFound'; Kind = 'BadRequest'; Status = 404 }
+        @{ Label = '409, a client status a retry cannot change'; Chain = 'Conflict'; Kind = 'BadRequest'; Status = 409 }
+        @{ Label = 'a 429 that wraps a 400'; Chain = 'TooManyRequests>BadRequest'; Kind = 'BadRequest'; Status = 400 }
+        @{ Label = 'a 403 that wraps a 429'; Chain = 'Forbidden>TooManyRequests'; Kind = 'Refused'; Status = 403 }
+        @{ Label = 'a 500 that wraps a 401'; Chain = 'InternalServerError>Unauthorized'; Kind = 'TokenRefused'; Status = 401 }
+        @{ Label = 'a 500 that wraps a 429'; Chain = 'InternalServerError>TooManyRequests'; Kind = 'Throttled'; Status = 429 }
+        @{ Label = '529'; Chain = '529'; Kind = 'Throttled'; Status = 529 }
+        @{ Label = '503'; Chain = 'ServiceUnavailable'; Kind = 'Error'; Status = 503 }
+        @{ Label = '408'; Chain = 'RequestTimeout'; Kind = 'Error'; Status = 408 }
+    ) {
+        $Codes = $Chain -split '>'
+        $Ex = $null
+        for ($i = $Codes.Count - 1; $i -ge 0; $i--)
+        {
+            # 529 is not a named HttpStatusCode, so it is made from its number.
+            $Code = if ($Codes[$i] -match '^\d+$') { [System.Enum]::ToObject([System.Net.HttpStatusCode], [int]$Codes[$i]) } else { [System.Net.HttpStatusCode]$Codes[$i] }
+            $Ex = [System.Net.Http.HttpRequestException]::new('failed', $Ex, $Code)
+        }
+        $Failure = Get-MetricBatchFailure -Exception $Ex
+        $Failure.Kind | Should -Be $Kind
+        $Failure.Status | Should -Be $Status
+    }
+
+    It 'reads a status that is a plain number, also one .NET has no name for (<Value>)' -ForEach @(@{ Value = 529; Kind = 'Throttled' }, @{ Value = 404; Kind = 'BadRequest' }, @{ Value = '529'; Kind = 'Throttled' }) {
+        $Ex = [System.Exception]::new('failed')
+        $Ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{ StatusCode = $Value })
+        $Failure = Get-MetricBatchFailure -Exception $Ex
+        $Failure.Kind | Should -Be $Kind
+        $Failure.Status | Should -Be ([int]$Value)
+    }
+
+    It 'reads a 404 on the error record an exception carries' {
+        $Status = [System.Net.Http.HttpRequestException]::new('gone', $null, [System.Net.HttpStatusCode]::NotFound)
+        $Record = [System.Management.Automation.ErrorRecord]::new($Status, 'x', 'NotSpecified', $null)
+        $Outer = [System.Management.Automation.RuntimeException]::new('The operation failed.', $null, $Record)
+        (Get-MetricBatchFailure -Exception $Outer).Kind | Should -Be 'BadRequest'
+    }
+
+    It 'reads throttling text only in its strict form and only when no status is given (<Message>)' -ForEach @(
+        @{ Message = 'The request is being throttled.'; Code = $null; Kind = 'Throttled' }
+        @{ Message = 'Rate limit reached, try later.'; Code = $null; Kind = 'Throttled' }
+        @{ Message = "Resource group 'rg-throttle-test' could not be read."; Code = $null; Kind = 'Error' }
+        @{ Message = 'Request for vm-TooManyRequests-01 failed.'; Code = $null; Kind = 'Error' }
+        @{ Message = 'The request is being throttled.'; Code = 'InternalServerError'; Kind = 'Error' }
+        @{ Message = 'The request is being throttled.'; Code = 'Forbidden'; Kind = 'Refused' }
+    ) {
+        $Ex = if ($Code) { [System.Net.Http.HttpRequestException]::new($Message, $null, [System.Net.HttpStatusCode]$Code) } else { [System.Exception]::new($Message) }
+        (Get-MetricBatchFailure -Exception $Ex).Kind | Should -Be $Kind
+    }
 }
 
 Describe 'Metrics.ps1 without -UseMetricsBatch' {
@@ -658,6 +712,18 @@ Describe 'Metrics.ps1 with -UseMetricsBatch' {
         }
         @($Run.Records | Where-Object { $_.ID -notlike '*/disk-002' -and $_.MetricError }).Count | Should -Be 0
         @($Run.DebugLines | Where-Object { $_ -match 'disk-002/.* attempts=1 .*Get-AzMetric failed after 1 attempt\(s\)' }).Count | Should -Be 4
+    }
+
+    It 'gives a batch request refused with another client status (409) 1 attempt, and loses nothing' {
+        $Disks = @(1..3 | ForEach-Object { New-TestDisk -Name ('disk-{0:d3}' -f $_) })
+        $Expected = Invoke-MetricsRun -Resources $Disks -RunName 'per-409'
+        $Run = Invoke-MetricsRun -Resources $Disks -RunName 'batch-409' -Batch -Control @{ Status = 409 }
+
+        $Run.Posts.Count | Should -Be 1 -Because 'a retry is refused the same way'
+        $Run.Calls.Count | Should -Be 3
+        Assert-SameRecords -Expected $Expected -Actual $Run
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch request failed after 1 attempt\(s\) \(HTTP 409: ' }).Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'Batch turned off for subscription' }).Count | Should -Be 0
     }
 
     It 'retries a throttled request and then uses its answer' {
