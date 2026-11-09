@@ -146,8 +146,8 @@ Describe 'Public IP rows that do not involve a NAT gateway' {
         @{ Case = 'unattached'; Nic = $false; Nat = $false }
     ) {
         $Ip = if ($Nic) { New-PublicIp -IpConfiguration ([pscustomobject]@{ id = $script:NicCfgId }) -NoNatGateway }
-              elseif ($Nat) { New-PublicIp -NoIpConfiguration -NatGateway ([pscustomobject]@{ id = $script:NatId }) }
-              else { New-PublicIp -NoIpConfiguration -NoNatGateway }
+        elseif ($Nat) { New-PublicIp -NoIpConfiguration -NatGateway ([pscustomobject]@{ id = $script:NatId }) }
+        else { New-PublicIp -NoIpConfiguration -NoNatGateway }
         $Row = (Invoke-Collector @($Ip))[0]
         $Row.ID | Should -BeExactly "$($script:Rg)/Microsoft.Network/publicIPAddresses/pip-a"
         $Row.Subscription | Should -BeExactly 'sub-placeholder'
