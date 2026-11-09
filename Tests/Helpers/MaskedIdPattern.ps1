@@ -5,6 +5,8 @@
 #     [/providers/<namespace>(/<type>/<name token>)+ ...]
 # - The subscription part is left out only for a tenant-scope id, such as a
 #   reservation order (/providers/microsoft.capacity/reservationorders/...).
+# - A subscription or a group itself, with no provider block, is a masked id
+#   too (a charge billed at that scope).
 # - An extension resource adds a second /providers/<namespace> block.
 # - Every subscription, resource group and name segment is a prod_/nonprod_
 #   token. Consumption-only tokens carry sub_, rg_ or rg_mc_; a name token may
@@ -19,8 +21,11 @@ function Get-MaskedIdPattern
     # Tokens are written in lower case, so the token parts match letter for
     # letter ((?-i:...)) even under PowerShell's case-blind -match; Azure's
     # keywords, namespaces and types keep any case.
-    $Scope = '(/subscriptions/(?-i:(prod|nonprod)_(sub_)?' + $Guid + ')(/resourcegroups/(?-i:(prod|nonprod)_(rg_)?(mc_)?' + $Guid + '))?)?'
+    $Scope = '/subscriptions/(?-i:(prod|nonprod)_(sub_)?' + $Guid + ')(/resourcegroups/(?-i:(prod|nonprod)_(rg_)?(mc_)?' + $Guid + '))?'
     $Name = '((?-i:(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + ')|\$system)'
-    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)+'
-    return '^' + $Scope + $Block + '/?$'
+    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)'
+    # A subscription or group scope with any number of provider blocks
+    # (none: a charge billed to the subscription or the group itself), or a
+    # tenant-scope id of provider blocks only.
+    return '^(' + $Scope + $Block + '*|' + $Block + '+)/?$'
 }

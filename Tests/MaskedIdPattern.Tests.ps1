@@ -18,6 +18,8 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'resource id'; Id = '/subscriptions/{T}/resourcegroups/{N}/providers/microsoft.compute/virtualmachines/{T}' }
         @{ Label = 'child resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/{T}/databases/{N}' }
         @{ Label = 'subscription-level id'; Id = '/subscriptions/{T}/providers/microsoft.security/pricings/{T}' }
+        @{ Label = 'subscription-scope id'; Id = '/subscriptions/{T}' }
+        @{ Label = 'group-scope id'; Id = '/subscriptions/{T}/resourcegroups/{N}' }
         @{ Label = 'tenant-scope reservation id'; Id = '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}' }
         @{ Label = 'tenant-scope management group id'; Id = '/providers/Microsoft.Management/managementGroups/{T}' }
         @{ Label = 'extension resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/{T}' }
@@ -39,7 +41,8 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'a real parent name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/srv-a/databases/{T}' }
         @{ Label = 'a real tenant-scope name'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/reservations/{T}' }
         @{ Label = 'a real name in an extension block'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/ds-a' }
-        @{ Label = 'a path with no provider block'; Id = '/subscriptions/{T}/resourcegroups/{T}' }
+        @{ Label = 'a real group in a group-scope id'; Id = '/subscriptions/{T}/resourcegroups/rg-demo' }
+        @{ Label = 'a real subscription in a subscription-scope id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012' }
         @{ Label = 'a real name after an empty segment'; Id = '/providers/microsoft.capacity/reservationorders//reservations/res-a' }
         @{ Label = 'a real name before a trailing slash'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/' }
         @{ Label = 'an empty segment inside the path'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
