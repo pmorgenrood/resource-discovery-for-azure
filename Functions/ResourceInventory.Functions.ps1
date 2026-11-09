@@ -119,7 +119,7 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
 
 # Reads the server-directed retry delay (seconds) from a failed Get-AzMetric call, so the Azure Monitor retry loop in
 # Extension/Metrics.ps1 waits as long as the service asks. It reads the standard Retry-After header.
-# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws: a failure to read the header must not break the retry loop.
+# Handles both RFC 7231 forms (delta-seconds and HTTP-date, parsed strictly, invariant/AssumeUniversal); returns >= 0, else 0 so the caller uses its own backoff. NEVER throws: a failure to read the header must not break the retry loop.
 function Get-RdaRetryAfterSeconds
 {
     param(
@@ -132,12 +132,19 @@ function Get-RdaRetryAfterSeconds
 
     try
     {
-        # PowerShell may surface the CloudException directly as .Exception or nested
-        # under one or more .InnerException levels; walk the chain (bounded).
-        $Ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
-        $Depth = 0
-        while ($null -ne $Ex -and $Depth -lt 5)
+        # PowerShell may surface the CloudException directly as .Exception, under
+        # .InnerException, or on the ErrorRecord a wrapper carries. Walk them all,
+        # the same bounded way Test-MetricThrottled does (at most 10).
+        $Start = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        $Pending = [System.Collections.Generic.Queue[object]]::new()
+        $Pending.Enqueue($Start)
+        $Checked = 0
+        while ($Pending.Count -gt 0 -and $Checked -lt 10)
         {
+            $Ex = $Pending.Dequeue()
+            if ($null -eq $Ex) { continue }
+            $Checked++
+
             $Headers = $null
             $ResponseProp = $Ex.PSObject.Properties['Response']
             if ($ResponseProp -and $null -ne $ResponseProp.Value)
@@ -166,29 +173,41 @@ function Get-RdaRetryAfterSeconds
                     $Raw = ([string]$Raw).Trim()
 
                     # delta-seconds form (Retry-After and the consumption header).
-                    $Seconds = 0
-                    if ([int]::TryParse($Raw, [ref]$Seconds))
+                    # Parsed as a double so a value past [int]::MaxValue still reads as
+                    # a long wait, then clamped back into an int.
+                    $Seconds = [double]0
+                    if ([double]::TryParse($Raw, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Seconds))
                     {
                         if ($Seconds -lt 0) { $Seconds = 0 }
-                        return $Seconds
+                        return [int][math]::Min($Seconds, [int]::MaxValue)
                     }
 
                     # HTTP-date form: wait until that instant. Parse with the
                     # invariant culture and AssumeUniversal - RFC 7231 HTTP-dates are
                     # English/GMT, so a non-English-culture host must not fail to parse
                     # them (which would silently degrade to blind backoff).
+                    # Only the three RFC 7231 date forms are accepted (RFC 1123, RFC 850
+                    # and asctime), so text such as "12.31" or "23:00" is not read as a date.
+                    $DateForms = [string[]]@('r', "dddd, dd-MMM-yy HH':'mm':'ss 'GMT'", "ddd MMM d HH':'mm':'ss yyyy")
+                    $DateStyles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AllowInnerWhite
                     $When = [datetimeoffset]::MinValue
-                    if ([datetimeoffset]::TryParse($Raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When))
+                    if ([datetimeoffset]::TryParseExact($Raw, $DateForms, [System.Globalization.CultureInfo]::InvariantCulture, $DateStyles, [ref]$When))
                     {
-                        $Delta = [int][math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
+                        # Clamped before the int cast, so a far-future date cannot overflow it.
+                        $Delta = [math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
                         if ($Delta -lt 0) { $Delta = 0 }
-                        return $Delta
+                        return [int][math]::Min($Delta, [int]::MaxValue)
                     }
                 }
             }
 
-            $Ex = $Ex.InnerException
-            $Depth++
+            $InnerProp = $Ex.PSObject.Properties['InnerException']
+            if ($InnerProp) { $Pending.Enqueue($InnerProp.Value) }
+            $RecordProp = $Ex.PSObject.Properties['ErrorRecord']
+            if ($RecordProp -and $null -ne $RecordProp.Value -and -not [object]::ReferenceEquals($RecordProp.Value.Exception, $Ex))
+            {
+                $Pending.Enqueue($RecordProp.Value.Exception)
+            }
         }
     }
     catch
