@@ -530,7 +530,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 - Tenant-domain-style `-TenantID` (e.g. `contoso.onmicrosoft.com`) is resolved via Microsoft's public OIDC discovery endpoint, no sign-in needed. Pass the tenant GUID directly if discovery fails.
 
 **Subscription returned 0 resources:**
-- The up-front role check only shows that the identity can list the subscription's resource groups. So 0 resources means the subscription is empty (or holds only types the report does not list), or the identity cannot read its resources: a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account than Az PowerShell. The wrapper prints a `Search-AzGraph` command to check what Resource Graph returns.
+- The up-front role check only shows that the identity can list the subscription's resource groups. So 0 resources means the subscription is empty (or holds only types the report does not list), or the identity cannot read its resources: a role without Reader, a role on only some resource groups, or an Azure CLI signed in as another account than Az PowerShell. With one stream (the default), the wrapper prints a `Search-AzGraph` command to check what Resource Graph returns for the Az PowerShell account; check the Azure CLI's account (`az account show`) apart, since the discovery query runs as that one.
 - Failed subs are listed at the end of the wrapper transcript and in `InventoryReports/RunAllSubscriptions_failures_<timestamp>.log`.
 
 **Run stops immediately with "not authorized to read consumption/billing data":**
