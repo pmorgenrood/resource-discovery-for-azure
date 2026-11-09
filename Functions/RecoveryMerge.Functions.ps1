@@ -658,8 +658,9 @@ function Merge-RecoveryData
                     }
                 }
             }
-            # A row with an empty ResourceId is dropped downstream and names nothing.
-            if ($CheckMaskedRows -and $ConsumptionUnmaskedRow -eq 0 -and -not [string]::IsNullOrEmpty($RowId) -and -not (Test-MergeMaskedId $RowId))
+            # A row with an empty or whitespace-only ResourceId is dropped
+            # downstream (counted above) and names nothing.
+            if ($CheckMaskedRows -and $ConsumptionUnmaskedRow -eq 0 -and -not [string]::IsNullOrWhiteSpace($RowId) -and -not (Test-MergeMaskedId $RowId))
             {
                 $ConsumptionUnmaskedRow = $RowIndex
             }
