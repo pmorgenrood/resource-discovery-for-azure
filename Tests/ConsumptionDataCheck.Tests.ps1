@@ -1344,6 +1344,11 @@ Describe 'Get-ConsumptionErrorKind' {
         Get-ConsumptionErrorKind -Exception ([System.Net.Http.HttpRequestException]::new('Response status code does not indicate success: 405 (Method Not Allowed).')) | Should -Be 'Permanent'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Response status code does not indicate success: 429 (Too Many Requests). The resource could not be found right now.')) | Should -Be 'Transient'
         Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP 503: bad request queue is full.')) | Should -Be 'Transient'
+        # A timeout or a port near 'http' is not a status.
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('The request was canceled due to the configured HttpClient.Timeout of 400 seconds elapsing.')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('An error occurred while sending the request to https://login.example:443/token')) | Should -Be 'Transient'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('Status: 404 for this request.')) | Should -Be 'Permanent'
+        Get-ConsumptionErrorKind -Exception ([System.Exception]::new('HTTP/1.1 503 Service Unavailable; the resource could not be found right now.')) | Should -Be 'Transient'
     }
 }
 
