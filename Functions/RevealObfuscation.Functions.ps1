@@ -48,6 +48,58 @@ function ConvertTo-RevealComparablePath
     return $Trimmed
 }
 
+# Make a folder readable and writable by its owner only: mode 0700 on Unix,
+# and on Windows a protected ACL (no inherited rules) that gives only the
+# current user full control. Reveal's staging folder holds real names and ids,
+# so it must not stay open to other users of the machine. Throws when the
+# folder cannot be set, or does not read back as owner-only.
+function Set-RevealOwnerOnlyDirectory
+{
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    if ($IsWindows)
+    {
+        $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $Security = [System.Security.AccessControl.DirectorySecurity]::new()
+        $Security.SetAccessRuleProtection($true, $false)
+        $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $User,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $Security.AddAccessRule($Rule)
+        $Directory = [System.IO.DirectoryInfo]::new($Path)
+        [System.IO.FileSystemAclExtensions]::SetAccessControl($Directory, $Security)
+
+        $Check = [System.IO.FileSystemAclExtensions]::GetAccessControl($Directory)
+        $Rules = @($Check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        $Others = @($Rules | Where-Object { $_.IdentityReference.Value -ne $User.Value })
+        if (-not $Check.AreAccessRulesProtected -or $Rules.Count -eq 0 -or $Others.Count -gt 0)
+        {
+            throw "Could not make $Path readable by its owner only."
+        }
+        return
+    }
+
+    $ModeType = 'System.IO.UnixFileMode' -as [type]
+    if ($null -ne $ModeType -and $null -ne [System.IO.File].GetMethod('SetUnixFileMode', [type[]]@([string], $ModeType)))
+    {
+        [System.IO.File]::SetUnixFileMode($Path, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
+        $Mode = [int][System.IO.File]::GetUnixFileMode($Path)
+    }
+    else
+    {
+        # .NET before 7 has no Unix mode calls; use chmod and stat instead.
+        & chmod 700 -- $Path
+        if ($LASTEXITCODE -ne 0) { throw "Could not make $Path readable by its owner only (chmod ended with $LASTEXITCODE)." }
+        $Mode = [Convert]::ToInt32((& stat -c '%a' -- $Path), 8)
+    }
+    if (($Mode -band 0x1FF) -ne 0x1C0)
+    {
+        throw ("Could not make {0} readable by its owner only: its mode is {1}." -f $Path, [Convert]::ToString($Mode -band 0x1FF, 8))
+    }
+}
+
 function Get-JsonEscaped
 {
     # Return the input string escaped for placement INSIDE a JSON string literal
