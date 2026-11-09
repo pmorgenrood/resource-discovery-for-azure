@@ -1340,23 +1340,41 @@ function Test-ConsumptionRowsHavePositiveQuantity
     return $false
 }
 
-# Pure: the HTTP status carried by an exception, any inner exception, or the
-# exception of an ErrorRecord one carries (Hyak/Rest exceptions expose
+# Pure: every error in an error's chain, the error first: its inner exception,
+# the inner exceptions of an AggregateException, and the exception of an
+# ErrorRecord one carries, each once (a reference seen before is not read
+# again, so a chain that loops ends), at most 200.
+function Get-ConsumptionErrorChain
+{
+    param([object]$Exception)
+    $Chain = [System.Collections.Generic.List[object]]::new()
+    $Pending = [System.Collections.Generic.Queue[object]]::new()
+    $Pending.Enqueue($Exception)
+    while ($Pending.Count -gt 0 -and $Chain.Count -lt 200)
+    {
+        $Ex = $Pending.Dequeue()
+        if ($null -eq $Ex) { continue }
+        $Again = $false
+        foreach ($Known in $Chain) { if ([object]::ReferenceEquals($Known, $Ex)) { $Again = $true; break } }
+        if ($Again) { continue }
+        $Chain.Add($Ex)
+        $Props = $Ex.PSObject.Properties
+        if ($null -ne $Props['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
+        if ($null -ne $Props['InnerExceptions'] -and $Ex.InnerExceptions -is [System.Collections.IEnumerable]) { foreach ($Inner in $Ex.InnerExceptions) { $Pending.Enqueue($Inner) } }
+        if ($null -ne $Props['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and $null -ne $Ex.ErrorRecord.PSObject.Properties['Exception']) { $Pending.Enqueue($Ex.ErrorRecord.Exception) }
+    }
+    return $Chain.ToArray()
+}
+
+# Pure: the HTTP status carried by an error of the chain Get-ConsumptionErrorChain
+# reads, the first one that has one (Hyak/Rest exceptions expose
 # .Response.StatusCode, HttpRequestException exposes .StatusCode). Returns an
 # [int] or $null when none is present.
 function Get-ConsumptionErrorStatusCode
 {
     param([object]$Exception)
-    # The same errors Get-ConsumptionErrorKind reads the messages of: the
-    # exception, its inner exceptions and an ErrorRecord's exception, at most 10.
-    $Pending = [System.Collections.Generic.Queue[object]]::new()
-    $Pending.Enqueue($Exception)
-    $Seen = 0
-    while ($Pending.Count -gt 0 -and $Seen -lt 10)
+    foreach ($Current in @(Get-ConsumptionErrorChain -Exception $Exception))
     {
-        $Current = $Pending.Dequeue()
-        if ($null -eq $Current) { continue }
-        $Seen++
         # Only some exceptions carry Response or StatusCode; read them only when
         # present, so Set-StrictMode allows an exception without them.
         $Props = $Current.PSObject.Properties
@@ -1378,11 +1396,6 @@ function Get-ConsumptionErrorStatusCode
                 Write-Verbose ('Unrecognised status code value: {0}' -f $Candidate)
             }
         }
-        if ($null -ne $Props['InnerException']) { $Pending.Enqueue($Current.InnerException) }
-        if ($null -ne $Props['ErrorRecord'] -and $null -ne $Current.ErrorRecord -and -not [object]::ReferenceEquals($Current.ErrorRecord.Exception, $Current))
-        {
-            $Pending.Enqueue($Current.ErrorRecord.Exception)
-        }
     }
     return $null
 }
@@ -1390,9 +1403,8 @@ function Get-ConsumptionErrorStatusCode
 # Pure: a known HTTP status decides first: 408 (timeout), 409 (conflict), 429
 # (throttling) and 5xx are 'Transient'; any other 4xx, such as 400 (malformed
 # request), 401/403 (no permission), 404 (not found) or 405, is 'Permanent',
-# since a retry cannot change it. Without a status the messages decide, of the exception and of each one in its chain (inner
-# exceptions and an ErrorRecord's exception, at most 10, as
-# Test-MetricBadRequest in Extension/Metrics.ps1 reads them), since a wrapper
+# since a retry cannot change it. Without a status the messages decide, of
+# the exception and of each one in its chain (Get-ConsumptionErrorChain), since a wrapper
 # exception often carries the cause in an inner one: it is permanent when one
 # names a status after 'status' or 'HTTP' (decided as a known status), names
 # a bad request, a refusal or not found, says access was denied or that
@@ -1421,27 +1433,14 @@ function Get-ConsumptionErrorKind
         if ($Status -eq 408 -or $Status -eq 409 -or $Status -eq 429 -or $Status -ge 500) { return 'Transient' }
         if ($Status -ge 400) { return 'Permanent' }
     }
-    $Chain = [System.Collections.Generic.List[object]]::new()
-    $Pending = [System.Collections.Generic.Queue[object]]::new()
-    $Pending.Enqueue($Exception)
-    while ($Pending.Count -gt 0 -and $Chain.Count -lt 10)
-    {
-        $Ex = $Pending.Dequeue()
-        if ($null -eq $Ex) { continue }
-        $Chain.Add($Ex)
-        if ($null -ne $Ex.PSObject.Properties['InnerException']) { $Pending.Enqueue($Ex.InnerException) }
-        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
-        {
-            $Pending.Enqueue($Ex.ErrorRecord.Exception)
-        }
-    }
+    $Chain = @(Get-ConsumptionErrorChain -Exception $Exception)
     # A status the message names (after 'status' or 'HTTP') decides the same way
     # as one the exception carries.
     foreach ($Ex in $Chain)
     {
         # Only a number right after 'status code ... success:', 'status' or
         # 'HTTP' (not 'https' or 'HttpClient', and not a port or a timeout).
-        if ([string]$Ex.Message -match '(?i)(status code does not indicate success:\s*|\b(http)?status(\s*code)?\s*[:=]?\s*|\bhttp(/\d(\.\d)?)?\s*:?\s*)(?<code>[45]\d\d)\b(?!\s*(seconds?|ms|milliseconds?)\b)')
+        if ([string]$Ex.Message -match '(?i)(status code does not indicate success:\s*|\b(http)?status(\s*code)?(\s+(is|was|of))?\s*[:=]?\s*|\bhttp(/\d(\.\d)?)?(\s+code)?\s*:?\s*)(?<code>[45]\d\d)\b(?!\s*(seconds?|ms|milliseconds?)\b)')
         {
             $Named = [int]$Matches['code']
             if ($Named -eq 408 -or $Named -eq 409 -or $Named -eq 429 -or $Named -ge 500) { return 'Transient' }
