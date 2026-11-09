@@ -879,13 +879,15 @@ Function RunInventorySetup()
             $TokenQueryTimer = [System.Diagnostics.Stopwatch]::StartNew()
             $TokenMemoryBefore = [System.GC]::GetTotalMemory($false)
             $TokenFailure = $null
+            # What a failure costs, and the ways round it.
+            $TokenLoss = 'Without it the skipped network rows would get no masked ids or dictionary entries (the inventory rows themselves are complete). Fix the cause and re-run, or run with -IncludeNetworkResources (the pull then holds those rows, with no extra query) or without -Obfuscate (no masked ids are needed).'
             try { $TokenResult = Invoke-AzGraphQuerySafe -Query (Get-RdaNetworkTokenQuery -Where $Where) -SubscriptionId $ScopeIds -Lowercase -HideRawOutput:$Obfuscate.IsPresent }
-            catch { $TokenResult = $null; $TokenFailure = 'The id query for the skipped network types failed, so their masked ids cannot be made. {0}' -f $_.Exception.Message }
+            catch { $TokenResult = $null; $TokenFailure = 'The id query for the skipped network types failed. {0} Cause: {1}' -f $TokenLoss, $_.Exception.Message }
             if ($null -eq $TokenResult -or $null -eq $TokenResult.PSObject.Properties['data'])
             {
-                if ($null -eq $TokenFailure) { $TokenFailure = 'Resource Graph gave no answer to the id query for the skipped network types, so their masked ids cannot be made.' }
+                if ($null -eq $TokenFailure) { $TokenFailure = 'Resource Graph gave no answer to the id query for the skipped network types. {0}' -f $TokenLoss }
                 if ($RunAllSubs.IsPresent) { throw $TokenFailure }
-                Write-Log -Message ("Resource discovery failed, so the inventory would be incomplete. No report was written; fix the cause below and re-run. {0}" -f $TokenFailure) -Severity 'Error'
+                Write-Log -Message ("Resource discovery failed. No report was written. {0}" -f $TokenFailure) -Severity 'Error'
                 exit 1
             }
             $script:NetworkTokenRows = @($TokenResult.data)
