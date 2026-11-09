@@ -1206,6 +1206,7 @@ function Add-MetricRecord
                                 # The whole request, body included, runs in a thread job bounded by Wait-Job, as
                                 # one Get-AzMetric request is: -TimeoutSec alone does not cover reading the body.
                                 $Failure = $null
+                                # -ThrottleLimit sets one limit for the whole process, not for this call: the batch and per-resource paths both pass -ConcurrencyLimit, the number of runspaces that start jobs, so no job waits in a queue against its timeout.
                                 $Job = Start-ThreadJob -ScriptBlock { param($RequestArgs) Invoke-WebRequest @RequestArgs } -ArgumentList @{ Method = 'Post'; Uri = $Uri; Headers = @{ Authorization = 'Bearer ' + $Token }; ContentType = 'application/json'; Body = $Body; TimeoutSec = $CallTimeoutSeconds; ErrorAction = 'Stop' } -ThrottleLimit $ThreadJobLimit
                                 if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                                 {
