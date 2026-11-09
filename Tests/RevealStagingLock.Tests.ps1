@@ -239,7 +239,9 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
                                 {
                                     try { [System.IO.File]::WriteAllText($Path, 'still writing') } catch { $null = $_ }
                                 }
-                                Start-Sleep -Milliseconds 100
+                                # When it last wrote.
+                                [System.IO.File]::AppendAllText((Join-Path $Probe 'writes'), ([string][DateTime]::UtcNow.Ticks + "`n"))
+                                Start-Sleep -Milliseconds 50
                             }
                         }
                     }
@@ -252,15 +254,23 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
             Test-Path -LiteralPath $PidFile | Should -BeTrue -Because 'the reveal job must be running before the run is stopped'
             $ChildPid = [int](Get-Content -LiteralPath $PidFile -Raw)
             Start-Sleep -Milliseconds 500
-            # Stop the run as Ctrl+C does.
+            # Stop the run as Ctrl+C does. Stop returns once the run's finally
+            # has run, so the lock is free from then on.
             $Host_.Stop()
+            $StoppedTicks = [DateTime]::UtcNow.Ticks
             $null = $Async.AsyncWaitHandle.WaitOne(30000)
         }
         finally { $Host_.Dispose() }
 
+        # The job's process ends shortly after the job is stopped; a job left
+        # running keeps it alive.
+        $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Get-Process -Id $ChildPid -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 100 }
         Get-Process -Id $ChildPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty -Because 'no reveal job may outlive the run'
         # Anything still writing would put its files back.
         Start-Sleep -Seconds 2
+        $LastWrite = [long](@(Get-Content -LiteralPath (Join-Path $Probe 'writes')) | Select-Object -Last 1)
+        $LastWrite | Should -BeLessOrEqual $StoppedTicks -Because 'nothing may write in staging once the lock is free'
         $Left = @(Get-ChildItem -LiteralPath $Case.Staging -Recurse -Force -File | Where-Object { $_.Name -ne '.reveal-lock' -and $_.Name -ne '.reveal-staging.json' } | ForEach-Object { $_.FullName.Substring($Case.Staging.Length) })
         $Left | Should -BeNullOrEmpty
         Test-Path -LiteralPath (Join-Path $Case.Dir 'bundle.zip') | Should -BeFalse
