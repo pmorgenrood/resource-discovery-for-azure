@@ -803,6 +803,38 @@ foreach ($Candidate in $Candidates)
 }
 $LeftOutItems = @($LeftOutItems | Sort-Object -Property Report)
 
+# A resumed run keeps a recorded output only when it is one Reveal assigns to
+# a report pair under the root now: its name is the pair's report zip name, or
+# that name with a copy number in front (2_, 3_ and so on, see $UsedOutNames
+# below), and its record names that pair's folder, report zip and dictionary.
+# Any other record (for example one for notes.txt, which Reveal never writes)
+# is dropped from the mark, and its file is kept: -RemoveStaging deletes only
+# recorded outputs, so it never deletes a file Reveal did not write.
+$DroppedRecords = @()
+foreach ($Name in @($StagingOutputs.Keys | Sort-Object))
+{
+    $Record = $StagingOutputs[$Name]
+    $Owners = @($Candidates | Where-Object {
+            [string]$Record['SourceFolder'] -ceq $_.Folder -and
+            [string]$Record['SourceName'] -ceq $_.Zip.Name -and
+            [string]$Record['DictionaryName'] -ceq $_.Dict.Name -and
+            ($Name -ceq $_.Zip.Name -or $Name -cmatch ('\A(?:[2-9]|[1-9][0-9]+)_' + [regex]::Escape($_.Zip.Name) + '\z'))
+        })
+    if ($Owners.Count -eq 0)
+    {
+        $DroppedRecords += $Name
+        $null = $StagingOutputs.Remove($Name)
+    }
+}
+if ($DroppedRecords.Count -gt 0)
+{
+    foreach ($Name in $DroppedRecords)
+    {
+        Write-Host ("Resume: dropped the staging mark's record of {0}: it is not an output Reveal makes for a report pair under {1}. Its file, if any, is kept." -f $Name, $InventoryRoot) -ForegroundColor Yellow
+    }
+    Save-RevealStagingMarker
+}
+
 $Queue = [System.Collections.Generic.Queue[object]]::new()
 $UsedOutNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($Candidate in @($Selected | Sort-Object -Property Folder, @{ Expression = { $_.Zip.Name } }))
