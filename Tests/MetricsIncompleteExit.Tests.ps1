@@ -221,6 +221,30 @@ Describe 'Write-MetricsIncompleteRunEnd: which command and which zip' {
         $script:Lines | Should -Not -Contain $script:InnerZip
     }
 
+    It 'says no zip was made and -ResumeFailedOnly collects it again for a subscription whose zip was not written, when the wrapper made no outer zip' {
+        $Root = Join-Path $TestDrive 'unwritten-reports'
+        $Unwritten = @((Join-Path (Join-Path $Root 'ResourcesReport_x') 'ResourcesReport_x.zip'))
+        $Other = [pscustomobject]@{ Name = 'sub-four'; Id = 'id-4'; Message = 'still failed'; ReportFolder = 'ResourcesReport_y'; Complete = $false }
+        $NoZip = "  No zip was made for sub-two (id-2): its command's zip is that subscription's report, or run the wrapper again with -ResumeFailedOnly, which collects it again."
+
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete) -TenantID 'tenant-1' -RunParameters @{} -ReportRoot $Root -NoAllSubscriptionsZip -Unwritten $Unwritten
+        $script:Lines | Should -Contain $NoZip
+        $script:Lines | Should -Not -Contain $script:FolderZip
+
+        # A subscription whose zip was written still gets the replace line.
+        $script:Lines.Clear()
+        $null = Write-MetricsIncompleteRunEnd -Entries @($script:Incomplete, $Other) -TenantID 'tenant-1' -RunParameters @{} -ReportRoot $Root -NoAllSubscriptionsZip -Unwritten $Unwritten
+        $script:Lines | Should -Contain $NoZip
+        $script:Lines | Should -Contain ('  For the others:' + $script:FolderZip.Substring(1))
+    }
+
+    It 'passes the zips that were not written to the FAILED (metrics) lines when the wrapper made no outer zip' {
+        $Text = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
+        $Calls = @([regex]::Matches($Text, '(?m)^.*Write-MetricsIncompleteRunEnd .*-NoAllSubscriptionsZip.*$') | ForEach-Object { $_.Value })
+        $Calls.Count | Should -Be 1
+        $Calls[0] | Should -Match '-Unwritten \$Global:RdaUnwrittenReportZips'
+    }
+
     It 'says to add -Appid and -Secret, with neither value, after a run that signed in with them (<Kind>)' -ForEach @(
         @{ Kind = 'one command'; Run = @{} },
         @{ Kind = 'one command per subscription'; Run = @{ SubscriptionID = 'id-2' } }

@@ -374,13 +374,15 @@ function Get-MetricsRetryCommand
 # upload, after a plain run too: uploading both counts the resources twice.
 # With -NoAllSubscriptionsZip (the wrapper exits before it makes its outer
 # zip) that line names the subscription's zip in its report folder instead.
+# A subscription whose zip could not be written (in $Unwritten) has none, so
+# its line says no zip was made and that -ResumeFailedOnly collects it again.
 # After a run that signed in with -Appid, one line says to add -Appid and
 # -Secret, since the commands hold neither; their values are never written.
 # A direct run that wrote no zip ($ZipWritten false) has no first zip to
 # replace, so that line says the new zip is the report instead.
 function Write-MetricsIncompleteRunEnd
 {
-    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot, [switch]$NoAllSubscriptionsZip, [bool]$ZipWritten = $true)
+    param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$DictionaryFile, [string]$ReportRoot, [switch]$NoAllSubscriptionsZip, [bool]$ZipWritten = $true, [string[]]$Unwritten = @())
 
     $List = @(Get-MetricsIncompleteEntries -Entries $Entries)
     if ($List.Count -eq 0) { return $false }
@@ -434,7 +436,17 @@ function Write-MetricsIncompleteRunEnd
     }
     if ($Wrapper -and $NoAllSubscriptionsZip)
     {
-        $Advice.Add("  Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice.")
+        # A subscription whose zip could not be written ($Unwritten, by its
+        # report folder) has no first zip to replace.
+        $UnwrittenFolders = @(@($Unwritten) | Where-Object { -not [string]::IsNullOrEmpty($_) } | ForEach-Object { Split-Path -Path (Split-Path -Path $_ -Parent) -Leaf })
+        $NoZip = @($List | Where-Object { -not [string]::IsNullOrEmpty([string]$_.ReportFolder) -and $UnwrittenFolders -contains [string]$_.ReportFolder })
+        if ($NoZip.Count -gt 0)
+        {
+            $Advice.Add(("  No zip was made for {0}: its command's zip is that subscription's report, or run the wrapper again with -ResumeFailedOnly, which collects it again." -f (@($NoZip | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', ')))
+        }
+        $FolderZip = "Each new zip replaces that subscription's zip in its report folder (no AllSubscriptions_ResourcesReport_*.zip was made): put it there in place of the first one, do not keep both, or its resources are counted twice."
+        if ($NoZip.Count -eq 0) { $Advice.Add('  ' + $FolderZip) }
+        elseif ($NoZip.Count -lt $List.Count) { $Advice.Add('  For the others: ' + $FolderZip) }
     }
     elseif ($Wrapper)
     {
