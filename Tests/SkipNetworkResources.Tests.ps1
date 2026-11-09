@@ -259,7 +259,7 @@ Describe 'The skip list' {
                 $Negated = $false
                 $Up = $P.Parent
                 while ($null -ne $Up -and $Up -isnot [System.Management.Automation.Language.ScriptBlockAst] -and $Up -isnot [System.Management.Automation.Language.StatementBlockAst] -and
-                    ($Up -isnot [System.Management.Automation.Language.StatementAst] -or $Up -is [System.Management.Automation.Language.PipelineAst]))
+                    ($Up -isnot [System.Management.Automation.Language.StatementAst] -or $Up -is [System.Management.Automation.Language.PipelineAst] -or $Up -is [System.Management.Automation.Language.CommandExpressionAst]))
                 {
                     if ($Up -is [System.Management.Automation.Language.UnaryExpressionAst] -and $Up.TokenKind -in @([System.Management.Automation.Language.TokenKind]::Not, [System.Management.Automation.Language.TokenKind]::Exclaim)) { $Negated = $true; break }
                     $Up = $Up.Parent
@@ -401,6 +401,15 @@ Describe 'The skip list' {
         # A quoted list on the right is read as literals.
         @{ Label = 'by -in a quoted list'; Text = '$Resources | Where-Object { $_.type -in @(''microsoft.compute/virtualmachines'', ''microsoft.network/routetables'') }'; Expect = 'hit' }
         @{ Label = 'by -in a list with a variable'; Text = '$Resources | Where-Object { $_.type -in @(''microsoft.compute/virtualmachines'', $Other) }'; Expect = 'unchecked' }
+        # A -not or ! above a comparison reads every type but the named ones.
+        @{ Label = 'by -not a kept type'; Text = '$Resources | Where-Object { -not ($_.type -eq ''microsoft.compute/virtualmachines'') }'; Expect = 'unchecked' }
+        @{ Label = 'by ! a kept type'; Text = '$Resources | Where-Object { !($_.TYPE -eq ''microsoft.compute/virtualmachines'') }'; Expect = 'unchecked' }
+        # The type passed into a method.
+        @{ Label = 'by a set''s .Contains of the type'; Text = '$Net = Get-RdaNetworkSkipList; $Resources | Where-Object { $Net.Contains($_.TYPE) }'; Expect = 'unchecked' }
+        @{ Label = 'by a map''s .ContainsKey of the type'; Text = '$Resources | Where-Object { $Kept.ContainsKey($_.type) }'; Expect = 'unchecked' }
+        @{ Label = 'by [string]::Equals of the type'; Text = '$Resources | Where-Object { [string]::Equals($_.type, $T) }'; Expect = 'unchecked' }
+        # The type kept in a variable and compared later.
+        @{ Label = 'by the type kept in a variable'; Text = '$Resources | Where-Object { $T = $_.type; $Net.Contains($T) }'; Expect = 'unchecked' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         if ($Expect -eq 'hit') { @($Read.Hits) | Should -Not -BeNullOrEmpty }
@@ -414,6 +423,8 @@ Describe 'The skip list' {
         @{ Label = 'by a quoted list -contains the type'; Text = '$Resources | Where-Object { @(''microsoft.compute/virtualmachines'', ''microsoft.compute/disks'') -contains $_.type }' }
         @{ Label = 'by the id of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.id -like ''*/networkwatchers/*/connectionmonitors/*'' }' }
         @{ Label = 'by the type of a kept child of a skipped parent'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/networkwatchers/connectionmonitors'' }' }
+        # The type copied into an output field selects no rows.
+        @{ Label = 'and copies the type into an output field'; Text = '$Resources | Where-Object { $_.TYPE -eq ''microsoft.network/frontdoors'' } | ForEach-Object { @{ ''ResourceType'' = $_.TYPE; ''Policy'' = $_.properties.backupPolicy.type } }' }
     ) {
         $Read = script:Get-CollectorTypeRead -Text $Text -SkipList @(Get-RdaNetworkSkipList)
         @($Read.Hits) | Should -BeNullOrEmpty
