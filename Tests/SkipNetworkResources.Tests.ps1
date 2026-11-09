@@ -122,49 +122,74 @@ Describe 'The skip list' {
     }
 
     BeforeAll {
-        # What a collector's text says about the resource types it reads:
-        # every type comparison (.type / TYPE with -eq, -like, -match, -in,
-        # -contains and their case forms, with the type on either side), every
-        # spelled-out provider type, and every skipped type named by its id
-        # segment ('/networkinterfaces/'). A -like or -match pattern counts as
-        # reading each skip-list type it matches. A comparison that cannot be
-        # checked is reported on its own: a negated one (-ne, -notlike,
-        # -notmatch, -notin, -notcontains reads every type but the named ones),
-        # or one whose other side is not a quoted literal or a list of them (a
-        # variable, an expression, an interpolated string, a joined string).
+        # What a collector's code says about the resource types it reads. The
+        # file is parsed, and every read of a '.type' member (any case) is
+        # followed to where it is used:
+        #   - a comparison (-eq, -like, -match, -in, -contains and their case
+        #     forms) with a quoted literal or a list of them on the other side
+        #     is checked: a -like or -match pattern reads each skip-list type
+        #     it matches, any other operator reads the named types. Brackets,
+        #     .ToLower(), .ToLowerInvariant() and "$(...)" around the type are
+        #     allowed. With the type on the right only -eq, -in and -contains
+        #     can be checked;
+        #   - the type as the whole value of a hashtable entry is copied into
+        #     an output field and selects nothing, so it is left alone;
+        #   - every other use cannot be checked and is reported on its own: a
+        #     negated operator (-ne, -notlike, -notmatch, -notin, -notcontains
+        #     read every type but the named ones), a -not or ! above the
+        #     comparison, a variable or expression on the other side, a method
+        #     call on the type or with the type as an argument, a switch, a
+        #     -split, a string with other text around the type, an assignment.
+        # Where-Object -Property type with an operator switch is judged the
+        # same way. Every spelled-out provider type, and every skipped type
+        # named by its id segment ('/networkinterfaces/'), anywhere in the
+        # file, is read from the text as well.
         function script:Get-CollectorTypeRead
         {
             param([string]$Text, [string[]]$SkipList)
             $Hits = [System.Collections.Generic.List[string]]::new()
             $Unchecked = [System.Collections.Generic.List[string]]::new()
             $Literals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $Ops = 'eq|ne|like|notlike|match|notmatch|in|notin|contains|notcontains'
-            # The other side: an @( ) list, a quoted string, or any one word.
-            $Side = '(@\((?:[^()]|\([^()]*\))*\)|''[^'']*''|"[^"]*"|\S+)'
-            # The quoted strings of the other side, or $null when it is
-            # anything else (a variable, an expression, a string with $ in it,
-            # a list with any of those in it).
+            $Ops = @('eq', 'ne', 'like', 'notlike', 'match', 'notmatch', 'in', 'notin', 'contains', 'notcontains')
+
+            $ParseErrors = $null
+            $Ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$ParseErrors)
+            foreach ($E in @($ParseErrors)) { if ($null -ne $E) { $Unchecked.Add("does not parse: $($E.Message)") } }
+
+            # The quoted strings of an expression, or $null when it is
+            # anything else (a variable, an expression, a string with $ in
+            # it, a list with any of those in it).
+            $GetQuoted = $null
             $GetQuoted = {
-                param([string]$S)
-                if ($S -match '^''[^'']*''$' -or $S -match '^"[^"$]*"$') { return , @($S.Substring(1, $S.Length - 2)) }
-                if ($S -match '^@\((?<Inner>[\s\S]*)\)$')
+                param($Node)
+                $Values = [System.Collections.Generic.List[string]]::new()
+                if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $Values.Add($Node.Value); return , $Values }
+                $Parts = $null
+                if ($Node -is [System.Management.Automation.Language.ArrayLiteralAst]) { $Parts = @($Node.Elements) }
+                elseif ($Node -is [System.Management.Automation.Language.ParenExpressionAst]) { $Parts = @($Node.Pipeline) }
+                elseif ($Node -is [System.Management.Automation.Language.ArrayExpressionAst]) { $Parts = @($Node.SubExpression.Statements) }
+                elseif ($Node -is [System.Management.Automation.Language.PipelineAst] -and $Node.PipelineElements.Count -eq 1 -and $Node.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) { $Parts = @($Node.PipelineElements[0].Expression) }
+                if ($null -eq $Parts) { return $null }
+                foreach ($P in $Parts)
                 {
-                    $Inner = $Matches['Inner']
-                    if (($Inner -replace '''[^'']*''|"[^"$]*"', '') -notmatch '^[\s,]*$') { return $null }
-                    return , @([regex]::Matches($Inner, '''([^'']*)''|"([^"]*)"') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+                    $Inner = & $GetQuoted $P
+                    if ($null -eq $Inner) { return $null }
+                    $Values.AddRange($Inner)
                 }
-                return $null
+                return , $Values
             }
-            $Compare = '(?i)\btype\b[''"]?(?:\.ToLower(?:Invariant)?\(\))?(?:\s*\))?[''"]?\s*-[ic]?(' + $Ops + ')\s*' + $Side + '(\s*\+)?'
-            $Reverse = '(?i)' + $Side + '\s*-[ic]?(' + $Ops + ')\s*\(?\s*"?\$\(?[\w:]*(?:\.\w+)*\.type\b'
-            foreach ($M in [regex]::Matches($Text, $Compare))
-            {
-                $Op = $M.Groups[1].Value.ToLowerInvariant()
-                $Values = & $GetQuoted $M.Groups[2].Value
-                if ($Op -match '^(ne|not)' -or $M.Groups[3].Success -or $null -eq $Values)
+
+            # One type comparison: the operator (case and i/c forms folded),
+            # whether the type is on the left, the other side's node, and the
+            # text to report.
+            $Judge = {
+                param([string]$Op, [bool]$TypeLeft, $Other, [string]$Where)
+                $Values = if ($null -ne $Other) { & $GetQuoted $Other } else { $null }
+                $Allowed = if ($TypeLeft) { @('eq', 'like', 'match', 'in', 'contains') } else { @('eq', 'in', 'contains') }
+                if ($Op -notin $Allowed -or $null -eq $Values)
                 {
-                    $Unchecked.Add($M.Value)
-                    continue
+                    $Unchecked.Add($Where)
+                    return
                 }
                 foreach ($Value in $Values)
                 {
@@ -176,18 +201,108 @@ Describe 'The skip list' {
                     }
                 }
             }
-            # The type on the right: only a quoted literal or a quoted list on
-            # the left, with -eq, -in or -contains, can be checked.
-            foreach ($M in [regex]::Matches($Text, $Reverse))
+            $FoldOp = {
+                param([string]$Name)
+                $N = $Name.ToLowerInvariant()
+                if ($N -match '^[ic](.+)$' -and $Ops -contains $Matches[1]) { $N = $Matches[1] }
+                $N
+            }
+
+            # Every '.type' member read (a method named type is not one).
+            $Reads = @($Ast.FindAll({
+                        param($Node)
+                        $Node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $Node -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                        $Node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                        $Node.Member.Value -eq 'type'
+                    }, $true))
+            foreach ($Read in $Reads)
             {
-                $Op = $M.Groups[2].Value.ToLowerInvariant()
-                $Values = & $GetQuoted $M.Groups[1].Value
-                if ($Op -notin @('eq', 'in', 'contains') -or $null -eq $Values)
+                # Climb through what keeps the value the type itself.
+                $Cur = $Read
+                while ($true)
                 {
-                    $Unchecked.Add($M.Value)
+                    $P = $Cur.Parent
+                    $Single = $P -is [System.Management.Automation.Language.CommandExpressionAst] -and $P.Parent -is [System.Management.Automation.Language.PipelineAst] -and $P.Parent.PipelineElements.Count -eq 1
+                    if ($Single -and $P.Parent.Parent -is [System.Management.Automation.Language.ParenExpressionAst]) { $Cur = $P.Parent.Parent; continue }
+                    if ($Single -and $P.Parent.Parent -is [System.Management.Automation.Language.StatementBlockAst] -and $P.Parent.Parent.Statements.Count -eq 1 -and $P.Parent.Parent.Parent -is [System.Management.Automation.Language.SubExpressionAst])
+                    {
+                        $Cur = $P.Parent.Parent.Parent
+                        continue
+                    }
+                    if ($P -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $Cur -is [System.Management.Automation.Language.SubExpressionAst] -and $P.NestedExpressions.Count -eq 1 -and $P.Value -eq $Cur.Extent.Text)
+                    {
+                        $Cur = $P
+                        continue
+                    }
+                    if ($P -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [object]::ReferenceEquals($P.Expression, $Cur) -and
+                        $P.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $P.Member.Value -in @('ToLower', 'ToLowerInvariant') -and ($null -eq $P.Arguments -or $P.Arguments.Count -eq 0))
+                    {
+                        $Cur = $P
+                        continue
+                    }
+                    break
+                }
+                $P = $Cur.Parent
+                # The whole value of a hashtable entry: an output field.
+                if ($P -is [System.Management.Automation.Language.CommandExpressionAst] -and $P.Parent -is [System.Management.Automation.Language.PipelineAst] -and $P.Parent.PipelineElements.Count -eq 1 -and
+                    $P.Parent.Parent -is [System.Management.Automation.Language.HashtableAst] -and @($P.Parent.Parent.KeyValuePairs | Where-Object { [object]::ReferenceEquals($_.Item2, $P.Parent) }).Count -eq 1)
+                {
                     continue
                 }
-                foreach ($Value in $Values) { [void]$Literals.Add($Value) }
+                if ($P -isnot [System.Management.Automation.Language.BinaryExpressionAst])
+                {
+                    $Unchecked.Add($P.Extent.Text)
+                    continue
+                }
+                # A -not or ! above the comparison, in the same statement.
+                $Negated = $false
+                $Up = $P.Parent
+                while ($null -ne $Up -and $Up -isnot [System.Management.Automation.Language.ScriptBlockAst] -and $Up -isnot [System.Management.Automation.Language.StatementBlockAst] -and
+                    ($Up -isnot [System.Management.Automation.Language.StatementAst] -or $Up -is [System.Management.Automation.Language.PipelineAst]))
+                {
+                    if ($Up -is [System.Management.Automation.Language.UnaryExpressionAst] -and $Up.TokenKind -in @([System.Management.Automation.Language.TokenKind]::Not, [System.Management.Automation.Language.TokenKind]::Exclaim)) { $Negated = $true; break }
+                    $Up = $Up.Parent
+                }
+                if ($Negated)
+                {
+                    $Unchecked.Add($Up.Extent.Text)
+                    continue
+                }
+                $TypeLeft = [object]::ReferenceEquals($P.Left, $Cur)
+                $Other = if ($TypeLeft) { $P.Right } else { $P.Left }
+                & $Judge (& $FoldOp $P.Operator.ToString()) $TypeLeft $Other $P.Extent.Text
+            }
+
+            # Where-Object -Property type (or type first) with an operator
+            # switch and its value.
+            $Wheres = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -in @('Where-Object', 'where', '?') }, $true))
+            foreach ($Cmd in $Wheres)
+            {
+                $El = @($Cmd.CommandElements)
+                $OnType = $false
+                for ($i = 1; $i -lt $El.Count; $i++)
+                {
+                    $Value = $null
+                    if ($El[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and $El[$i].ParameterName -like 'p*')
+                    {
+                        $Value = if ($null -ne $El[$i].Argument) { $El[$i].Argument } elseif ($i + 1 -lt $El.Count) { $El[$i + 1] } else { $null }
+                    }
+                    elseif ($i -eq 1) { $Value = $El[$i] }
+                    if ($Value -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $Value.Value -eq 'type') { $OnType = $true }
+                }
+                if (-not $OnType) { continue }
+                $Found = $false
+                for ($i = 1; $i -lt $El.Count; $i++)
+                {
+                    if ($El[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+                    $Op = & $FoldOp $El[$i].ParameterName
+                    if ($Ops -notcontains $Op) { continue }
+                    $Found = $true
+                    $Value = if ($null -ne $El[$i].Argument) { $El[$i].Argument } elseif ($i + 1 -lt $El.Count -and $El[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $El[$i + 1] } else { $null }
+                    & $Judge $Op $true $Value $Cmd.Extent.Text
+                }
+                if (-not $Found) { $Unchecked.Add($Cmd.Extent.Text) }
             }
             # A skipped type named by its id segment in any quoted string with
             # a / in it ('*/providers/microsoft.network/networkinterfaces/*',
@@ -222,13 +337,6 @@ Describe 'The skip list' {
             {
                 foreach ($T in $SkipList) { if ($T -like $M.Groups[1].Value) { $Hits.Add("$T (by wildcard literal '$($M.Groups[1].Value)')") } }
             }
-            # A switch on the type, and a method call on it (.StartsWith and
-            # the like), cannot be checked as a comparison.
-            foreach ($M in [regex]::Matches($Text, '(?i)\bswitch\b(\s+-\w+)*\s*\([^)]*\btype\b[^)]*\)')) { $Unchecked.Add($M.Value) }
-            foreach ($M in [regex]::Matches($Text, '(?i)\.type\.(?!ToLower(Invariant)?\(\)\s*-)[a-z]+\s*\(')) { $Unchecked.Add($M.Value) }
-            # The type in brackets with a method call on it, and a -split of it.
-            foreach ($M in [regex]::Matches($Text, '(?i)\.type\s*\)\s*\.\s*[a-z]+\s*\(')) { $Unchecked.Add($M.Value) }
-            foreach ($M in [regex]::Matches($Text, '(?i)\btype\b(?:\.ToLower(?:Invariant)?\(\))?\s*-[ic]?split\b')) { $Unchecked.Add($M.Value) }
             foreach ($T in $SkipList) { if ($Literals.Contains($T)) { $Hits.Add($T) } }
             [pscustomobject]@{ Literals = $Literals; Hits = @($Hits); Unchecked = @($Unchecked) }
         }
