@@ -126,8 +126,8 @@ Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDicti
 # wrapper checks the actual exit code and throws with the real Azure CLI
 # error text, so a Resource Graph failure surfaces as a loud, actionable
 # subscription failure instead of a silent "0 resources found". -Lowercase
-# preserves the exact `.tolower()` behavior the original data-fetching call
-# sites relied on (collectors compare against lowercase type strings).
+# lowercases the text, as the original data-fetching call sites relied on
+# (collectors compare against lowercase type strings), with invariant rules.
 function Invoke-AzGraphQuerySafe
 {
     param(
@@ -199,7 +199,9 @@ function Invoke-AzGraphQuerySafe
     }
 
     $Text = $StdOut -join "`n"
-    if ($Lowercase) { $Text = $Text.ToLower() }
+    # Invariant rules: on a tr-TR or az-Latn host ToLower() turns 'I' into a
+    # dotless i, so keys such as subscriptionId would no longer be found.
+    if ($Lowercase) { $Text = $Text.ToLowerInvariant() }
 
     try
     {
