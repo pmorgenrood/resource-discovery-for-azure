@@ -73,19 +73,10 @@ BeforeAll {
     # 1030-1034 for where these are produced.
     $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
-    # Masked resource ID (inventory ID, metric ID, consumption ResourceId,
-    # dictionary ResourceIdMap key): an ARM-shaped path, never a flat token.
-    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
-    # Every subscription, resource group and name segment is a prod_/nonprod_
-    # token, so a real name left in any of them fails. Provider and type
-    # segments stay as written. Consumption-only tokens carry sub_ / rg_ / rg_mc_,
-    # and a '$system' child name stays as written.
-    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = @(
-        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
-        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
-    ) -join ''
+    # A masked resource ID is an ARM-shaped path, never a flat token; the
+    # shape is described in Helpers/MaskedIdPattern.ps1.
+    . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    $script:MaskedIdPattern = Get-MaskedIdPattern
 
     # Helper: get all resources from inventory as flat list
     $script:AllResources = @()

@@ -1,0 +1,44 @@
+# Masked id pattern tests
+# Run with: Invoke-Pester ./Tests/MaskedIdPattern.Tests.ps1 -Output Detailed
+#
+# The zip-backed tests check every masked id against Get-MaskedIdPattern
+# (Helpers/MaskedIdPattern.ps1). These tests pin that pattern on made-up ids, so
+# it neither refuses a shape -Obfuscate writes nor lets a flat token or a real
+# name through. No zip and no live Azure; the GUIDs are made up.
+
+BeforeAll {
+    . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    $script:Pattern = Get-MaskedIdPattern
+    $script:T = 'prod_11111111-2222-4333-8444-555555555555'
+    $script:N = 'nonprod_66666666-7777-4888-9999-000000000000'
+}
+
+Describe 'Get-MaskedIdPattern' {
+    It 'accepts a masked <Label>' -ForEach @(
+        @{ Label = 'resource id'; Id = '/subscriptions/{T}/resourcegroups/{N}/providers/microsoft.compute/virtualmachines/{T}' }
+        @{ Label = 'child resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/{T}/databases/{N}' }
+        @{ Label = 'subscription-level id'; Id = '/subscriptions/{T}/providers/microsoft.security/pricings/{T}' }
+        @{ Label = 'tenant-scope reservation id'; Id = '/providers/microsoft.capacity/reservationorders/{T}/reservations/{T}' }
+        @{ Label = 'tenant-scope management group id'; Id = '/providers/Microsoft.Management/managementGroups/{T}' }
+        @{ Label = 'extension resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/{T}' }
+        @{ Label = 'consumption-only token'; Id = '/subscriptions/prod_sub_11111111-2222-4333-8444-555555555555/resourcegroups/prod_rg_mc_11111111-2222-4333-8444-555555555555/providers/microsoft.compute/disks/prod_aks_11111111-2222-4333-8444-555555555555' }
+        @{ Label = '$system name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.servicebus/namespaces/{T}/topics/$system' }
+    ) {
+        $Masked = $Id.Replace('{T}', $script:T).Replace('{N}', $script:N)
+        $Masked | Should -Match $script:Pattern
+    }
+
+    It 'refuses <Label>' -ForEach @(
+        @{ Label = 'a flat token'; Id = '{T}' }
+        @{ Label = 'a real subscription id'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}' }
+        @{ Label = 'a real resource group name'; Id = '/subscriptions/{T}/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/{T}' }
+        @{ Label = 'a real parent name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.sql/servers/srv-a/databases/{T}' }
+        @{ Label = 'a real tenant-scope name'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/reservations/{T}' }
+        @{ Label = 'a real name in an extension block'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/ds-a' }
+        @{ Label = 'a path with no provider block'; Id = '/subscriptions/{T}/resourcegroups/{T}' }
+        @{ Label = 'a type with no name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines' }
+    ) {
+        $Masked = $Id.Replace('{T}', $script:T)
+        $Masked | Should -Not -Match $script:Pattern
+    }
+}

@@ -44,18 +44,10 @@ BeforeAll {
     }
     $script:MetricRows = @($MetricRows)
 
-    # Masked resource ID grammar (same shape used by Obfuscation.Tests.ps1):
-    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
-    # Every subscription, resource group and name segment is a prod_/nonprod_
-    # token (name tokens may carry a databricks_/aks_/vmss_ hint); provider and
-    # type segments stay as written. Used to prove that a cross-reference /
-    # cached metric value is a masked ID, never a raw id or a flat token.
-    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = @(
-        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
-        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
-    ) -join ''
+    # A masked resource ID is an ARM-shaped path, never a flat token; the
+    # shape is described in Helpers/MaskedIdPattern.ps1.
+    . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    $script:MaskedIdPattern = Get-MaskedIdPattern
 }
 
 AfterAll {

@@ -25,18 +25,10 @@ BeforeAll {
         @($_.Value) | ForEach-Object { if ($null -ne $_) { $script:AllResources += $_ } }
     }
 
-    # Masked resource ID (inventory ID, consumption ResourceId): an ARM-shaped
-    # path, never a flat token.
-    #   /subscriptions/<sub token>[/resourcegroups/<rg token>]/providers/<namespace>/<type>/<name token>[/<type>/<name token>...]
-    # Every subscription, resource group and name segment is a prod_/nonprod_
-    # token; provider and type segments stay as written. Consumption-only
-    # tokens carry sub_ / rg_ / rg_mc_, and a '$system' child name stays as written.
-    $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $script:MaskedIdPattern = @(
-        '^/subscriptions/(prod|nonprod)_(sub_)?' + $MaskedGuid
-        '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $MaskedGuid + ')?'
-        '/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $MaskedGuid + '|\$system))+$'
-    ) -join ''
+    # A masked resource ID is an ARM-shaped path, never a flat token; the
+    # shape is described in Helpers/MaskedIdPattern.ps1.
+    . (Join-Path $PSScriptRoot 'Helpers/MaskedIdPattern.ps1')
+    $script:MaskedIdPattern = Get-MaskedIdPattern
 }
 
 AfterAll {
