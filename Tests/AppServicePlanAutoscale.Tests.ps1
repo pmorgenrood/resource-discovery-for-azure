@@ -333,3 +333,48 @@ Describe 'AppServicePlan Subscription' {
         $Rows[0].Subscription | Should -BeNullOrEmpty
     }
 }
+
+# The speed change itself: each autoscale target and each subscription id is
+# read a fixed number of times, not once per plan. A counting property stands
+# in for the field, so a scan per plan shows up as plans x rows reads.
+Describe 'AppServicePlan lookups read each row once' {
+    BeforeAll {
+        function New-CountedValue
+        {
+            param($Target, [string]$Name, $Value, [hashtable]$Count)
+            $Target | Add-Member -MemberType ScriptProperty -Name $Name -Value { $Count.Reads++; $Value }.GetNewClosure() -Force
+            $Target
+        }
+    }
+
+    It 'reads each autoscale target a fixed number of times, not once per plan' {
+        $Count = @{ Reads = 0 }
+        $Plans = @(1..20 | ForEach-Object { New-TestPlan -Name "plan-r$_" })
+        $Settings = @(1..20 | ForEach-Object {
+                $S = New-TestAutoscale -Name "as-r$_" -Target $null
+                $Target = $Plans[$_ - 1].id
+                [void](New-CountedValue -Target $S.Properties -Name 'targetResourceUri' -Value $Target -Count $Count)
+                $S
+            })
+        $Rows = @(Invoke-TestCollector -Resources ($Plans + $Settings))
+        $Rows.Count | Should -Be 20
+        @($Rows | Where-Object { $_.AutoscaleEnabled -eq $true }).Count | Should -Be 20
+        $Count.Reads | Should -BeLessOrEqual 40 -Because 'a scan per plan reads 20 x 20 = 400 targets'
+    }
+
+    It 'reads each subscription id a fixed number of times, not once per plan' {
+        $Count = @{ Reads = 0 }
+        $Subs = @(1..20 | ForEach-Object {
+                $S = [pscustomobject]@{ Name = "sub-r$_" }
+                New-CountedValue -Target $S -Name 'id' -Value ('{0:d8}-1234-1234-1234-123456789012' -f $_) -Count $Count
+            })
+        $Plans = @(1..20 | ForEach-Object {
+                $P = New-TestPlan -Name "plan-q$_"
+                $P.subscriptionId = '{0:d8}-1234-1234-1234-123456789012' -f $_
+                $P
+            })
+        $Rows = @(Invoke-TestCollector -Resources $Plans -Subs $Subs)
+        for ($i = 0; $i -lt 20; $i++) { $Rows[$i].Subscription | Should -Be "sub-r$($i + 1)" }
+        $Count.Reads | Should -BeLessOrEqual 100 -Because 'a scan per plan reads 20 x 20 = 400 ids'
+    }
+}
