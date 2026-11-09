@@ -3,7 +3,7 @@ param(
     $Subscriptions,
     $Resources, # The massive list of raw discovered infrastructure items (VMs, Disks, DBs)
     $Task, # String tracking the script task mode (e.g., 'Processing')
-    $ConcurrencyLimit, # Number of concurrent threads allowed to run simultaneously
+    [ValidateRange(1, [int]::MaxValue)][int]$ConcurrencyLimit = 6, # Number of concurrent threads allowed to run simultaneously
     $FilePath, # Root destination directory path for saving JSON data chunks
     $ResourceIdDictionary, # Map dictionary to replace original Resource IDs with obfuscated GUID values
     $ResourceNameDictionary, # Map dictionary to mask the actual human-readable names of the items
@@ -657,7 +657,7 @@ if ($Task -eq 'Processing')
     $MetricTimeoutSeconds = $MetricsCallTimeoutSeconds
     $MetricMaxRetries = 3
     # Throttling (429) has its OWN retry budget and honours the server's Retry-After: a throttle wave used to exhaust
-    # the 3 generic retries in ~28s and record the metric as failed, when waiting the directed few seconds would have succeeded.
+    # the 3 generic retries in ~14s and record the metric as failed, when waiting the directed few seconds would have succeeded.
     $MetricMaxThrottleRetries = 6
     $MetricMaxRetryAfterSeconds = 120
     # Total wait cap for the throttled retries of one request: a retry whose sleep would take the total past it is not made.
@@ -1462,6 +1462,10 @@ function Add-MetricRecord
                 $DiagBag = $using:MetricDiagnostics
                 $MetricBag = ($using:Tmp).Metrics
                 $RequestCounts = $using:MetricRequestCounts
+                # Start-ThreadJob has its own process-wide throttle (5 by default), so the
+                # run's limit is passed to it too; otherwise no more than 5 calls are in
+                # flight whatever -ConcurrencyLimit says.
+                $ThreadJobLimit = $using:ConcurrencyLimit
 
                 # Retry decision for one failed Get-AzMetric attempt. Pure (no sleeping) so it is unit-testable.
                 # Throttled attempts draw on their own budget and wait at least the server's Retry-After (bounded); every
@@ -1592,6 +1596,65 @@ function Add-MetricRecord
                     return $false
                 }
 
+                # True when Azure answered HTTP 429 (TooManyRequests). The status code is read first,
+                # from the exception and every exception it wraps, because the outer message may not
+                # name it. Only when no exception in the chain carries a status are the messages of
+                # the same chain matched, so an id holding '429' does not make another error count as throttled.
+                function Test-MetricThrottled
+                {
+                    param([System.Exception]$Exception)
+
+                    $Pending = [System.Collections.Generic.Queue[object]]::new()
+                    $Pending.Enqueue($Exception)
+                    $Checked = 0
+                    $SawStatus = $false
+                    $Messages = [System.Collections.Generic.List[string]]::new()
+                    while ($Pending.Count -gt 0 -and $Checked -lt 10)
+                    {
+                        $Ex = $Pending.Dequeue()
+                        if ($null -eq $Ex) { continue }
+                        $Checked++
+                        $Messages.Add([string]$Ex.Message)
+
+                        $StatusCode = $null
+                        if ($null -ne $Ex.PSObject.Properties['Response'] -and $null -ne $Ex.Response -and $null -ne $Ex.Response.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.Response.StatusCode
+                        }
+                        elseif ($null -ne $Ex.PSObject.Properties['StatusCode'])
+                        {
+                            $StatusCode = $Ex.StatusCode
+                        }
+                        if ($null -ne $StatusCode)
+                        {
+                            $SawStatus = $true
+                            if ("$StatusCode" -in @('429', 'TooManyRequests')) { return $true }
+                        }
+
+                        $Pending.Enqueue($Ex.InnerException)
+                        if ($null -ne $Ex.PSObject.Properties['ErrorRecord'] -and $null -ne $Ex.ErrorRecord -and -not [object]::ReferenceEquals($Ex.ErrorRecord.Exception, $Ex))
+                        {
+                            $Pending.Enqueue($Ex.ErrorRecord.Exception)
+                        }
+                    }
+
+                    if ($SawStatus) { return $false }
+                    # No status anywhere: read only clear throttling phrases, in each message
+                    # of the chain, so a name such as rg-429 or rg-throttle-test is not taken for one.
+                    $Phrases = @(
+                        '(?<![\w-])Too ?Many ?Requests(?![\w-])',
+                        '\b(?:status|code|HTTP|success)\b[\s:''"=(]*429(?![\w-])',
+                        '(?<![\w-])throttl(?:ed|ing)(?![\w-])',
+                        '(?<![\w-])rate limit'
+                    )
+                    $Pattern = $Phrases -join '|'
+                    foreach ($Message in $Messages)
+                    {
+                        if ($Message -match $Pattern) { return $true }
+                    }
+                    return $false
+                }
+
                 # One Get-AzMetric request with the per-call timeout and retry/backoff.
                 # Returns the outcome rather than throwing, so the caller decides how a
                 # failure is recorded for each definition. With -StopOnBadRequest a
@@ -1652,10 +1715,11 @@ function Add-MetricRecord
                             $BadRequest = $false
                             $NotFound = $false
 
+                            # -ThrottleLimit sets the ThreadJob limit for the whole session; it stays at -ConcurrencyLimit after the run.
                             $Job = Start-ThreadJob -ScriptBlock {
                                 param($mArgs)
                                 Get-AzMetric @mArgs
-                            } -ArgumentList $MetricArgs
+                            } -ArgumentList $MetricArgs -ThrottleLimit $ThreadJobLimit
 
                             if (Wait-Job -Job $Job -Timeout $CallTimeoutSeconds)
                             {
@@ -1667,13 +1731,12 @@ function Add-MetricRecord
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    # NotFound first: the throttle match below is a loose substring
-                                    # test that text inside a 404 message could meet by chance.
+                                    # NotFound first: a 404 is permanent, so it is not retried as throttled.
                                     if (Test-MetricNotFound -Exception $_.Exception)
                                     {
                                         $NotFound = $true
                                     }
-                                    elseif ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    elseif (Test-MetricThrottled -Exception $_.Exception)
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++
