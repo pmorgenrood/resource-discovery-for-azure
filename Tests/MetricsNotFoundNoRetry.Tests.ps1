@@ -140,6 +140,22 @@ Describe 'Test-MetricBadRequest on the shared status helper' {
         $Inner = [System.Exception]::new("Operation returned an invalid status code 'BadRequest'")
         Test-MetricBadRequest -Exception ([System.Exception]::new('The request failed.', $Inner)) | Should -BeTrue
     }
+
+    It 'reads the BadRequest text Az writes, quoted or not (<Label>)' -ForEach @(
+        @{ Label = 'quoted, as Az.Monitor 8 writes it'; Message = "Microsoft.Azure.Management.Monitor.Models.ErrorResponseException: Operation returned an invalid status code 'BadRequest'" }
+        @{ Label = 'unquoted'; Message = 'Operation returned an invalid status code BadRequest' }
+        @{ Label = 'wrapped in the ErrorActionPreference text'; Message = "The running command stopped because the preference variable `"ErrorActionPreference`" or common parameter is set to Stop: Exception type: ErrorResponseException, Message: Operation returned an invalid status code 'BadRequest', Code: Null" }
+    ) {
+        Test-MetricBadRequest -Exception ([System.Exception]::new($Message)) | Should -BeTrue
+    }
+
+    It 'does not take a status-less message for a BadRequest when only a name holds the word (<Label>)' -ForEach @(
+        @{ Label = 'a 5xx for a resource named after it'; Message = "Operation returned an invalid status code 'InternalServerError' for vm-BadRequest-01" }
+        @{ Label = 'a timeout in a group named after it'; Message = 'Timed out after 120s on rg-badrequest-test' }
+    ) {
+        Test-MetricBadRequest -Exception ([System.Exception]::new($Message)) | Should -BeFalse
+        Test-MetricBadRequest -Exception ([System.Exception]::new('The request failed.', ([System.Exception]::new($Message)))) | Should -BeFalse
+    }
 }
 
 Describe 'Get-MetricDeletingState' {
