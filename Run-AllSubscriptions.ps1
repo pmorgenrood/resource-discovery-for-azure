@@ -897,7 +897,7 @@ if ($PreflightOnly)
         {
             try
             {
-                $PfObj = Get-Content -Path $PfStreamFile.FullName -Raw | ConvertFrom-Json
+                $PfObj = Get-Content -LiteralPath $PfStreamFile.FullName -Raw | ConvertFrom-Json
                 if ($null -ne $PfObj.Completed) { $PfStreamCompleted += @($PfObj.Completed | ForEach-Object { [string]$_ }) }
                 if ($null -ne $PfObj.FailedAttempts) { $PfStreamFailed += @($PfObj.FailedAttempts) }
             }

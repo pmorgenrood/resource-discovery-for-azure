@@ -763,6 +763,53 @@ Describe 'The preflight and the run check the same subscriptions' -Skip:($IsWind
     }
 }
 
+Describe 'A -PreflightOnly -Resume under a home folder with brackets in its name' -Skip:($IsWindows) {
+    AfterEach {
+        if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
+    }
+
+    It 'reads the per-stream state of an interrupted parallel run there' {
+        script:New-Case
+        # The same case under a home whose name holds brackets.
+        $script:CaseHome = Join-Path $script:TestBase ('home[' + [guid]::NewGuid().ToString().Substring(0, 4) + ']')
+        [void][System.IO.Directory]::CreateDirectory($script:CaseHome)
+        $script:Root = Join-Path $script:CaseHome 'InventoryReports'
+        $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
+        $script:State = Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)
+        [void][System.IO.Directory]::CreateDirectory($script:Root)
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id); FailedAttempts = @(); LastUpdated = '2026-11-01T00:00:00.0000000Z' } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:State -Encoding utf8
+        [pscustomobject]@{ Completed = @($script:Subs['C'].Id); FailedAttempts = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
+        $Pf = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-Resume', '-SkipConsumption')
+        $Pf.ExitCode | Should -Be 0
+        @($Pf.Text | Where-Object { $_ -like '  The run would collect 1 of these 3 subscription(s)*' }).Count | Should -Be 1
+    }
+}
+
+Describe 'ResourceInventory.ps1 pre-flight in an output folder with brackets in its name' {
+    BeforeAll {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $If = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '-not $RunAllSubs.IsPresent' })
+        if ($If.Count -ne 1) { throw 'the direct-run block was not found in ResourceInventory.ps1' }
+        $Body = @($If[0].Clauses[0].Item2.Statements)
+        # The free-space check and the write probe, with the line that names the probe file.
+        $Space = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('$PreFlightInventoryRoot -ErrorAction Stop') })
+        $Name = @($Body | Where-Object { $_.Extent.Text -like '$ProbePath = Join-Path $PreFlightInventoryRoot*' })
+        $Probe = @($Body | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('preflight write probe') })
+        if ($Space.Count -ne 1 -or $Name.Count -ne 1 -or $Probe.Count -ne 1) { throw 'the pre-flight checks were not found in ResourceInventory.ps1' }
+        $script:DirectChecks = [scriptblock]::Create(($Space[0].Extent.Text, $Name[0].Extent.Text, $Probe[0].Extent.Text) -join "`n")
+    }
+
+    It 'reads the free space and passes the write probe' {
+        $PreFlightInventoryRoot = Join-Path $TestDrive 'direct[1]'
+        [void][System.IO.Directory]::CreateDirectory($PreFlightInventoryRoot)
+        $Said = @(. $script:DirectChecks 6>&1 | ForEach-Object { [string]$_ })
+        @($Said | Where-Object { $_ -like 'WARNING: Could not determine free disk space*' }) | Should -BeNullOrEmpty
+        @($Said | Where-Object { $_ -like 'Write probe: OK*' }).Count | Should -Be 1
+        @([System.IO.Directory]::GetFiles($PreFlightInventoryRoot, '.write-probe-*')).Count | Should -Be 0
+    }
+}
+
 Describe 'A one-subscription retry that succeeds on the inline path' -Skip:($IsWindows) {
     It 'takes the subscription off the retry list when it was also listed as completed, and clears the state' {
         script:New-Case
