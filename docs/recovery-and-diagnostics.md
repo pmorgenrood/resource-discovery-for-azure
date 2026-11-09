@@ -114,11 +114,17 @@ Behaviour:
   inventory record, consumption row or metric; otherwise the merge stops,
   because those were not masked with that dictionary (for example a plain run
   written into a folder that still holds an old masked run's dictionary). It
-  also stops when a dictionary cannot be read. The error names the bundle to fix. Re-run that bundle with
-  `-Obfuscate` (for the recovery run, also `-ObfuscationDictionary <gap dict>`)
-  into a new folder, or put a moved dictionary back in its folder, then run the
-  merge again pointed at it. A reused `-OutputDirectory` still holds the old
-  run's files, including its dictionary, so the merge would stop again.
+  also stops when a dictionary cannot be read. The error names the bundle to fix.
+  If a dictionary was moved, put it back in its folder. A recovery that was not
+  masked, or not seeded, is re-run with `-Obfuscate -ObfuscationDictionary
+  <gap dict>`. When the gap run was not masked but the recovery was, re-run
+  the recovery without `-Obfuscate` (the quick way out); or, to ship a masked
+  bundle, re-run the gap with `-Obfuscate -ObfuscationDictionary <recovery
+  dict>` so its tokens match the recovery's (a gap re-run with `-Obfuscate`
+  alone mints new tokens, and the merge then stops on the shared-token check).
+  Re-run into a new folder, then run the merge again pointed at it. A reused
+  `-OutputDirectory` still holds the old run's files, including its
+  dictionary, so the merge would stop again.
 
 ## Recovery recipes
 
