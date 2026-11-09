@@ -173,11 +173,13 @@ function Get-RdaRetryAfterSeconds
                     $Raw = ([string]$Raw).Trim()
 
                     # delta-seconds form (Retry-After and the consumption header).
-                    $Seconds = 0
-                    if ([int]::TryParse($Raw, [ref]$Seconds))
+                    # Parsed as a double so a value past [int]::MaxValue still reads as
+                    # a long wait, then clamped back into an int.
+                    $Seconds = [double]0
+                    if ([double]::TryParse($Raw, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Seconds))
                     {
                         if ($Seconds -lt 0) { $Seconds = 0 }
-                        return $Seconds
+                        return [int][math]::Min($Seconds, [int]::MaxValue)
                     }
 
                     # HTTP-date form: wait until that instant. Parse with the
@@ -187,9 +189,10 @@ function Get-RdaRetryAfterSeconds
                     $When = [datetimeoffset]::MinValue
                     if ([datetimeoffset]::TryParse($Raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$When))
                     {
-                        $Delta = [int][math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
+                        # Clamped before the int cast, so a far-future date cannot overflow it.
+                        $Delta = [math]::Ceiling(($When - [datetimeoffset]::UtcNow).TotalSeconds)
                         if ($Delta -lt 0) { $Delta = 0 }
-                        return $Delta
+                        return [int][math]::Min($Delta, [int]::MaxValue)
                     }
                 }
             }

@@ -195,6 +195,17 @@ Describe 'Get-RdaRetryAfterSeconds - offline' {
         Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @('-5') }) | Should -Be 0
     }
 
+    It 'gives a large wait, not 0, for a Retry-After of <Value>, and the plan then waits the cap' -TestCases @(
+        @{ Value = '2147483648' }
+        @{ Value = '99999999999' }
+        @{ Value = 'Fri, 31 Dec 9999 23:59:59 GMT' }
+    ) {
+        param($Value)
+        $Seconds = Get-RdaRetryAfterSeconds -ErrorRecord (New-FakeThrottle @{ 'Retry-After' = @($Value) })
+        $Seconds | Should -BeGreaterOrEqual $script:MaxRetryAfter
+        (Plan @{ Throttled = $true; ThrottledAttempts = 1; RetryAfterSeconds = $Seconds }).SleepSeconds | Should -Be $script:MaxRetryAfter
+    }
+
     It 'gives 0 when there is no response at all' {
         Get-RdaRetryAfterSeconds -ErrorRecord ([System.Management.Automation.ErrorRecord]::new([System.Exception]::new('TooManyRequests'), 'x', 'NotSpecified', $null)) | Should -Be 0
     }
