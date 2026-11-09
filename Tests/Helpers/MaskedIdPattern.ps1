@@ -9,11 +9,14 @@
 # - Every subscription, resource group and name segment is a prod_/nonprod_
 #   token. Consumption-only tokens carry sub_, rg_ or rg_mc_; a name token may
 #   carry a databricks_, aks_ or vmss_ hint; a '$system' name stays as written.
-# - Namespace and type segments stay as written.
+# - Namespace and type segments stay as written. A path Azure wrote oddly
+#   keeps its shape: an empty name segment, a type with no name after it at
+#   the end, or a trailing '/' hold no real name, so they pass.
 function Get-MaskedIdPattern
 {
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(/subscriptions/(prod|nonprod)_(sub_)?' + $Guid + '(/resourcegroups/(prod|nonprod)_(rg_)?(mc_)?' + $Guid + ')?)?'
-    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/((prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '|\$system))+)+'
-    return '^' + $Scope + $Block + '$'
+    $Name = '((prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '|\$system|)'
+    $Block = '(/providers/[a-z][a-z0-9.]*(/[a-z][a-z0-9.]*/' + $Name + ')*(/[a-z][a-z0-9.]*)?)+'
+    return '^' + $Scope + $Block + '/?$'
 }

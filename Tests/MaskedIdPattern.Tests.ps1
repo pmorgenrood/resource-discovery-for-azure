@@ -23,6 +23,9 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'extension resource id'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/{T}' }
         @{ Label = 'consumption-only token'; Id = '/subscriptions/prod_sub_11111111-2222-4333-8444-555555555555/resourcegroups/prod_rg_mc_11111111-2222-4333-8444-555555555555/providers/microsoft.compute/disks/prod_aks_11111111-2222-4333-8444-555555555555' }
         @{ Label = '$system name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.servicebus/namespaces/{T}/topics/$system' }
+        @{ Label = 'tenant-scope id with a type and no name'; Id = '/providers/Microsoft.Capacity/reservationOrders' }
+        @{ Label = 'tenant-scope id with an empty segment'; Id = '/providers/Microsoft.Capacity/reservationOrders//reservations/{T}' }
+        @{ Label = 'tenant-scope id with a trailing slash'; Id = '/providers/Microsoft.Capacity/reservationOrders/{T}/' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T).Replace('{N}', $script:N)
         $Masked | Should -Match $script:Pattern
@@ -36,7 +39,8 @@ Describe 'Get-MaskedIdPattern' {
         @{ Label = 'a real tenant-scope name'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/reservations/{T}' }
         @{ Label = 'a real name in an extension block'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines/{T}/providers/microsoft.insights/diagnosticsettings/ds-a' }
         @{ Label = 'a path with no provider block'; Id = '/subscriptions/{T}/resourcegroups/{T}' }
-        @{ Label = 'a type with no name'; Id = '/subscriptions/{T}/resourcegroups/{T}/providers/microsoft.compute/virtualmachines' }
+        @{ Label = 'a real name after an empty segment'; Id = '/providers/microsoft.capacity/reservationorders//reservations/res-a' }
+        @{ Label = 'a real name before a trailing slash'; Id = '/providers/microsoft.capacity/reservationorders/ro-a/' }
     ) {
         $Masked = $Id.Replace('{T}', $script:T)
         $Masked | Should -Not -Match $script:Pattern
