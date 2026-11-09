@@ -316,6 +316,21 @@ Describe 'VM billing-coverage banner' {
         Test-Path -LiteralPath $Html | Should -BeTrue
     }
 
+    It 'counts a VM whose state is transient or empty as running, as pricing does' {
+        $Sub = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg/providers/microsoft.compute/virtualmachines/'
+        $Inv = [pscustomobject]@{ VirtualMachines = @(
+                [pscustomobject]@{ ID = $Sub + 'vm1'; Name = 'vm1'; Subscription = 'sub'; PowerState = 'vm starting (transient)' }
+                [pscustomobject]@{ ID = $Sub + 'vm2'; Name = 'vm2'; Subscription = 'sub'; PowerState = '' }
+                [pscustomobject]@{ ID = $Sub + 'vm3'; Name = 'vm3'; Subscription = 'sub'; PowerState = 'vm deallocated' }) }
+        $InvPath = Join-Path $script:WorkDir 'inv-states.json'
+        $Inv | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $InvPath -Encoding utf8
+        $Csv = Join-Path $script:WorkDir 'cons-states.csv'
+        @([pscustomobject]@{ MeterCategory = 'Virtual Machines'; ResourceId = $Sub + 'vm3' }) | Export-Csv -Path $Csv -Encoding utf8 -NoTypeInformation
+        $Html = Join-Path $script:WorkDir 'states.html'
+        & $script:SummaryScript -JsonFile $InvPath -HtmlFile $Html -ConsumptionFile $Csv -VmBillingGapThreshold 0 *> $null
+        Get-Content -LiteralPath $Html -Raw | Should -Match '2 running VMs were discovered in the inventory, but only 0 VMs have compute-usage records'
+    }
+
     It 'respects the VmBillingGapThreshold (suppresses small gaps)' {
         $Inv = New-TestInventory -RunningVms 10 -DeallocatedVms 0
         $Csv = Join-Path $script:WorkDir 'con_thresh.csv'
