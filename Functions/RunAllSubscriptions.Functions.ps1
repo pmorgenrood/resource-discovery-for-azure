@@ -725,7 +725,19 @@ function Test-AzPsTokenSilent
     $Warnings = @()
     try
     {
-        $Token = Get-AzAccessToken -TenantId $Tenant -ErrorAction Stop -WarningVariable warnings -WarningAction SilentlyContinue
+        # Retried as the billing calls are (Invoke-ConsumptionCallWithRetry, in
+        # Common.Functions.ps1): a failed token cache check, when two token
+        # requests run at once, passes on a retry; a sign-in that cannot be used
+        # is not retried.
+        $Call = Invoke-ConsumptionCallWithRetry -Argument $Tenant -Operation {
+            param($ForTenant)
+            $Seen = @()
+            $Value = Get-AzAccessToken -TenantId $ForTenant -ErrorAction Stop -WarningVariable Seen -WarningAction SilentlyContinue
+            [pscustomobject]@{ Token = $Value; Warnings = @($Seen) }
+        }
+        if ($null -ne $Call.Error) { return $false }
+        $Token = $Call.Value.Token
+        $Warnings = @($Call.Value.Warnings)
         if ($null -eq $Token -or [string]::IsNullOrWhiteSpace($Token.Token)) { return $false }
         # Filter out known-benign warnings before deciding the call failed.
         # Az.Accounts >= 4.x emits a deprecation banner about the plain-string

@@ -1658,3 +1658,27 @@ exit $LASTEXITCODE
         $Run.InventoryReached | Should -BeTrue
     }
 }
+
+Describe 'Test-DataPlaneAuthReady (ResourceInventory.ps1) retries a failed token cache check' {
+    BeforeAll {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
+        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Test-DataPlaneAuthReady' }, $true))
+        if ($Fn.Count -ne 1) { throw 'Test-DataPlaneAuthReady was not found in ResourceInventory.ps1.' }
+        . ([scriptblock]::Create($Fn[0].Extent.Text))
+        function Get-AzAccessToken { param([switch]$AsSecureString) }
+        function Connect-AzAccount { param([switch]$UseDeviceAuthentication) }
+    }
+    BeforeEach {
+        Mock Start-Sleep { }
+        Mock Write-Log { }
+        Mock Get-AzContext { [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'operator' }; Tenant = [pscustomobject]@{ Id = 't' } } }
+        $script:RunAllSubs = [switch]$true
+    }
+
+    It 'is ready when the first token request fails the token cache check and the next one works' {
+        $script:TokenCalls = 0
+        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { throw 'Persistence check failed. Data was written but it could not be read.' }; [pscustomobject]@{ Token = 'tok' } }
+        Test-DataPlaneAuthReady -Phase 'Consumption' | Should -BeTrue
+        $script:TokenCalls | Should -Be 2
+    }
+}

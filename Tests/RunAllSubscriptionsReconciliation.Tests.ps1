@@ -540,3 +540,24 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
                 -MetricsFailedSubs $null -ConsumptionFailedSubs $null } | Should -Not -Throw
     }
 }
+
+Describe 'Test-AzPsTokenSilent retries a failed token cache check' {
+    BeforeAll {
+        function Get-AzAccessToken { param($TenantId, [switch]$AsSecureString) }
+    }
+    BeforeEach { Mock Start-Sleep { } }
+
+    It 'passes when the first token request fails the token cache check and the next one works' {
+        $script:TokenCalls = 0
+        Mock Get-AzAccessToken { $script:TokenCalls++; if ($script:TokenCalls -eq 1) { throw 'Persistence check failed. Data was written but it could not be read.' }; [pscustomobject]@{ Token = 'tok' } }
+        Test-AzPsTokenSilent -Tenant 'tenant-1' | Should -BeTrue
+        $script:TokenCalls | Should -Be 2
+    }
+
+    It 'fails at once on a sign-in that cannot be used' {
+        $script:TokenCalls = 0
+        Mock Get-AzAccessToken { $script:TokenCalls++; throw 'Run Connect-AzAccount to login.' }
+        Test-AzPsTokenSilent -Tenant 'tenant-1' | Should -BeFalse
+        $script:TokenCalls | Should -Be 1
+    }
+}
