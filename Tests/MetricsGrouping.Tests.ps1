@@ -517,13 +517,14 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
     It 'retries a throttled grouped request and does not fall back to one request per metric' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-throttled' -MultiError 'Throttled'
 
-        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 4
+        # Throttled attempts have their own budget: 1 + 6 retries.
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 7
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 0
         $Run.Records.Count | Should -Be 4
         @($Run.Records | Where-Object { -not $_.MetricError }).Count | Should -Be 0
         foreach ($Name in $script:DiskMetricNames)
         {
-            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=4 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
+            @($Run.DebugLines | Where-Object { $_ -match ('  Throttled idx=[0-9]+ .*/{0} interval=.* attempts=7 ' -f [regex]::Escape($Name)) }).Count | Should -Be 1
         }
     }
 
