@@ -39,7 +39,7 @@ Describe "Prefix Consistency Per Resource" {
     It "ID and Name should have the same prefix for each resource" {
         foreach ($r in $script:AllResources)
         {
-            # Only check ID and Name — Subscription/ResourceGroup are shared across
+            # Only check ID and Name: Subscription/ResourceGroup are shared across
             # resources and their prefix is derived from the subscription/RG name
             # itself, so they may differ from the resource's own prefix in mixed environments.
             # The ID is a masked ARM path, so its prefix is the one on its last
@@ -100,87 +100,13 @@ Describe "Consumption Prefix Consistency" {
 }
 
 # ---------------------------------------------------------------------------
-# Task 3 additive coverage (Property P7 — prefix fidelity + type hints).
-# Requirements 3.1, 3.2, 3.3, 3.4.
-#
-# The existing Describe blocks above validate that whatever prefix appears in
-# the fixture is well-formed and consistent, but they cannot exercise the
-# non-prod pattern set or the d-/t-/s- segment hints when the fixture contains
-# only prod-classified resources (empty TagMap/FreeTextMap, prod-only sample
-# data). These blocks close that gap two ways, without weakening anything above:
-#   1. Classifier-logic assertions that exercise the EXACT prefix regex the
-#      source uses, so the full non-prod set (3.1) and the prod default (3.2)
-#      are verified independently of fixture contents. The same regex literal is
-#      used per class in ResourceInventory.ps1 (resource name L639, subscription
-#      L659, resource group L668, tag value L1011), which is Requirement 3.3.
-#   2. Fixture-content assertions that lock the type-hint contract (3.4): the
-#      databricks/aks/vmss hints appear only on the obfuscated NAME, which is
-#      the last segment of the masked ID path, never on the subscription or
-#      resource group token.
+# Type hints. The databricks/aks/vmss hints appear only on the masked name,
+# the last segment of the masked ID path, never on the subscription or
+# resource group token. The prod/nonprod rule itself is tested without a zip
+# in ProdNonprodRule.Tests.ps1.
 # ---------------------------------------------------------------------------
 
-Describe "Classifier Fidelity — non-prod set and prod default (P7)" {
-    BeforeAll {
-        # Mirror of the prod/nonprod classifier used identically across all four
-        # classes in ResourceInventory.ps1 (L639 name, L659 subscription,
-        # L668 resource group, L1011 tag value; also Protect-FreeTextValue L107).
-        # Replicated here because a prod-only fixture cannot supply non-prod
-        # sample data to drive the classification through the ZIP.
-        function script:Get-ExpectedObfuscationPrefix([string]$Value)
-        {
-            if ($Value -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $Value -match '(^|-)([dts])-')
-            {
-                return 'nonprod_'
-            }
-            return 'prod_'
-        }
-    }
-
-    It "classifies non-prod keyword '<Keyword>' as nonprod_ (Req 3.1)" -ForEach @(
-        @{ Keyword = 'dev'; Sample = 'app-dev-01' }
-        @{ Keyword = 'test'; Sample = 'test-db-01' }
-        @{ Keyword = 'qa'; Sample = 'qa-web-01' }
-        @{ Keyword = 'tst'; Sample = 'tst-app-01' }
-        @{ Keyword = 'development'; Sample = 'development-team' }
-        @{ Keyword = 'non-prod'; Sample = 'non-prod' }
-        @{ Keyword = 'uat'; Sample = 'uat-app-01' }
-        @{ Keyword = 'nonprod'; Sample = 'nonprod-app' }
-    ) {
-        (script:Get-ExpectedObfuscationPrefix $Sample) | Should -Be 'nonprod_' -Because "'$Sample' matches the non-prod set member '$Keyword'"
-    }
-
-    It "classifies segment hint '<Hint>' as nonprod_ (Req 3.1)" -ForEach @(
-        @{ Hint = 'd- (start)'; Sample = 'd-app01' }
-        @{ Hint = 't- (start)'; Sample = 't-svc01' }
-        @{ Hint = 's- (start)'; Sample = 's-node01' }
-        @{ Hint = 'd- (mid)'; Sample = 'rg-d-01' }
-        @{ Hint = 't- (mid)'; Sample = 'rg-t-01' }
-        @{ Hint = 's- (mid)'; Sample = 'rg-s-01' }
-    ) {
-        (script:Get-ExpectedObfuscationPrefix $Sample) | Should -Be 'nonprod_' -Because "'$Sample' matches the '(^|-)([dts])-' segment hint ($Hint)"
-    }
-
-    It "classifies neutral value '<Sample>' as prod_ (Req 3.2)" -ForEach @(
-        @{ Sample = 'webapp01' }
-        @{ Sample = 'storageacct' }
-        @{ Sample = 'sqlserver1' }
-        @{ Sample = 'contosoapp' }
-    ) {
-        (script:Get-ExpectedObfuscationPrefix $Sample) | Should -Be 'prod_' -Because "'$Sample' matches no non-prod set member or segment hint"
-    }
-
-    It "applies the same classifier to all four classes (Req 3.3) — class '<Class>'" -ForEach @(
-        @{ Class = 'ResourceID/Name'; NonProd = 'app-dev-01'; Prod = 'app-prod-01' }
-        @{ Class = 'Subscription'; NonProd = 'test-sub'; Prod = 'core-sub' }
-        @{ Class = 'ResourceGroup'; NonProd = 'rg-uat-01'; Prod = 'rg-shared-01' }
-        @{ Class = 'Tag'; NonProd = 'qa'; Prod = 'owner-team' }
-    ) {
-        (script:Get-ExpectedObfuscationPrefix $NonProd) | Should -Be 'nonprod_' -Because "the $Class classifier flags '$NonProd' non-prod"
-        (script:Get-ExpectedObfuscationPrefix $Prod)    | Should -Be 'prod_'    -Because "the $Class classifier leaves '$Prod' prod"
-    }
-}
-
-Describe "Type Hint Fidelity — name token only, never subscription or resource group token (P7 / Req 3.4)" {
+Describe "Type hint fidelity: name token only, never the subscription or resource group token" {
     It "obfuscated IDs never carry a databricks/aks/vmss type hint on the subscription or resource group token" {
         # The ID is a masked ARM path whose last segment is the obfuscated NAME,
         # so a hinted name shows up there. The subscription and resource group
