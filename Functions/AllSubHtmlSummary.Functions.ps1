@@ -395,6 +395,8 @@ function New-RdaAllSubHtmlSummary
         $CountText = '{0:N0}' -f $Sr.Total
         $HealthCell = if ($Sr.Total -eq 0) { '<span class="tag warn">0 resources</span>' } else { '<span class="tag ok">ok</span>' }
         $LinkCell = if ($Sr.Link) { ('<a href="{0}">open &#8599;</a>' -f (ConvertTo-HtmlSafe $Sr.Link)) } else { '<span class="muted">no report</span>' }
+        # An inventory that could not be read is not a report with 0 resources.
+        if ($Sr.PSObject.Properties.Name -contains 'Unreadable') { $HealthCell = '<span class="tag warn">inventory unreadable</span>' }
         [void]$Rows.AppendFormat('<tr><td>{0}</td><td class="num">{1}</td><td>{2}</td><td>{3}</td></tr>', $NameSafe, $CountText, $HealthCell, $LinkCell)
     }
     if ($SubReports.Count -eq 0)
