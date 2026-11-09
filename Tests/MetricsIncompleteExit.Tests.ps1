@@ -118,12 +118,17 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         ($Result.Lines -join "`n") | Should -Not -Match 'Secret|app-1'
     }
 
-    It 'still prints the command but does not exit 3 when its zip could not be written' {
+    It 'still prints the command but exits 2, not 3, when its zip could not be written' {
         $Global:MetricsFailedSubs = @($script:Incomplete)
         $Result = Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' } -NoZip
 
-        $Result.ExitCode | Should -Be 0
+        $Result.ExitCode | Should -Be 2
         $Result.Lines | Should -Contain '  ./ResourceInventory.ps1 -TenantID tenant-1 -SubscriptionID id-2'
+    }
+
+    It 'exits 2 when its zip could not be written and the metrics are complete' {
+        $Global:MetricsFailedSubs = @()
+        (Invoke-DirectRunEnd -Arguments @{ TenantID = 'tenant-1' } -NoZip).ExitCode | Should -Be 2
     }
 
     It 'exits 0 and prints nothing when the metrics are complete' {
@@ -140,6 +145,91 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
 
         $Result.ExitCode | Should -Be 0
         $Result.Lines.Count | Should -Be 0
+    }
+}
+
+Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
+    BeforeAll {
+        # The run's param block and its top-level statements from the one that
+        # makes the zip to the end, as written, with both function files loaded.
+        # A stand-in Compress-Archive writes a partial zip and fails when asked.
+        $Ast = Get-ScriptAst -File 'ResourceInventory.ps1'
+        $Top = @($Ast.EndBlock.Statements)
+        $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match 'Compress-Archive|Write-RdaReportZip' })[0]
+        $script:ZipEnd = Join-Path $TestDrive 'zip-end.ps1'
+        Set-Content -LiteralPath $script:ZipEnd -Encoding utf8 -Value (@(
+                $Ast.ParamBlock.Extent.Text
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
+                ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
+                'function Compress-Archive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) Set-Content -LiteralPath $DestinationPath -Value ''part''; if ($env:RDA_TEST_ZIP_FAIL) { throw ''The disk is full.'' } }'
+                '$CompressionOutput = @{ Path = @(''x''); CompressionLevel = ''Fastest''; DestinationPath = $Global:ZipOutputFile }'
+                '$Runtime = ''0:01''; $ReportingRunTime = ''0:01'''
+                @($Top[$From..($Top.Count - 1)] | ForEach-Object { $_.Extent.Text })
+            ) -join "`n")
+
+        function script:Invoke-ZipEnd
+        {
+            param([hashtable]$Arguments, [switch]$Fail)
+            $Global:ZipOutputFile = Join-Path $TestDrive ('ResourcesReport_{0}.zip' -f [guid]::NewGuid())
+            $env:RDA_TEST_ZIP_FAIL = $(if ($Fail) { '1' } else { '' })
+            try
+            {
+                $global:LASTEXITCODE = 0
+                $Lines = @(& $script:ZipEnd @Arguments *>&1 | ForEach-Object { [string]$_ })
+                [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines; ZipLeft = (Test-Path -LiteralPath $Global:ZipOutputFile) }
+            }
+            finally
+            {
+                Remove-Item -Path 'Env:RDA_TEST_ZIP_FAIL' -ErrorAction SilentlyContinue
+            }
+        }
+
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
+    }
+    AfterAll {
+        if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
+        else { Remove-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue }
+        if ($script:SessionZip) { $Global:ZipOutputFile = $script:SessionZip.Value }
+        else { Remove-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue }
+    }
+
+    It 'names the zip and exits 0 when it was written' {
+        $Global:MetricsFailedSubs = @()
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1' }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeTrue
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 1
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 0
+    }
+
+    It 'removes a partial zip, says no report was written and exits 2 when the zip fails' {
+        $Global:MetricsFailedSubs = @()
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1' } -Fail
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 1
+    }
+
+    It 'exits 2, not 3, when the zip fails and the metrics are incomplete' {
+        $Global:MetricsFailedSubs = @($script:Incomplete)
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1' } -Fail
+
+        $Result.ExitCode | Should -Be 2
+        $Result.Lines | Should -Contain '=================== FAILED (metrics) ==================='
+    }
+
+    It 'removes a partial zip under -RunAllSubs and leaves the exit to the wrapper' {
+        $Global:MetricsFailedSubs = @()
+        $Result = Invoke-ZipEnd -Arguments @{ TenantID = 'tenant-1'; RunAllSubs = $true } -Fail
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*Reporting Data File:*' }).Count | Should -Be 0
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 1
     }
 }
 

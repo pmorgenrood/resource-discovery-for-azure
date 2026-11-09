@@ -391,3 +391,37 @@ function Write-RdaShareableDiagnosticsLog
         return $null
     }
 }
+
+# Writes the report zip with Compress-Archive. Returns $true only when the zip
+# is there afterwards. When it fails, the error is shown, any partial zip it
+# left is removed (so a half report is never uploaded or counted as written by
+# the wrapper), and a "No report was written" line says where the files are.
+function Write-RdaReportZip
+{
+    param([hashtable]$CompressionOutput)
+
+    $ZipFile = [string]$CompressionOutput['DestinationPath']
+    $Failure = $null
+    try
+    {
+        # Stop, so a failure reaches the catch also when the run's error
+        # preference is SilentlyContinue.
+        Compress-Archive @CompressionOutput -ErrorAction Stop
+        if (-not [string]::IsNullOrEmpty($ZipFile) -and (Test-Path -LiteralPath $ZipFile -PathType Leaf)) { return $true }
+        $Failure = 'the zip is not there after compression'
+    }
+    catch
+    {
+        $_ | Format-List -Force | Out-Host
+        $Failure = $_.Exception.Message
+    }
+
+    Write-Log -Message ("Error Compressing Output File: {0}: {1}" -f $ZipFile, $Failure) -Severity 'Error'
+    if (-not [string]::IsNullOrEmpty($ZipFile) -and (Test-Path -LiteralPath $ZipFile))
+    {
+        Remove-Item -LiteralPath $ZipFile -Force -ErrorAction SilentlyContinue
+    }
+    $ReportFolder = if ([string]::IsNullOrEmpty($ZipFile)) { '' } else { Split-Path -Path $ZipFile -Parent }
+    Write-Log -Message ("No report was written: the report zip could not be made. The report files are still in {0}; zip them by hand or run again." -f $ReportFolder) -Severity 'Error'
+    return $false
+}

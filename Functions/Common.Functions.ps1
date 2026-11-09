@@ -341,15 +341,16 @@ function Write-MetricsIncompleteRunEnd
 }
 
 # The exit code at the end of a direct ResourceInventory.ps1 run (not under
-# -RunAllSubs, where the wrapper decides): 3 when its metrics are incomplete
-# and its report zip ($ZipFile) was written, after the FAILED (metrics) lines;
-# 0 otherwise. With no zip the lines are still printed, after the run's own
-# error about the zip.
+# -RunAllSubs, where the wrapper decides): 2 when its report zip ($ZipFile)
+# was not written, which wins; 3 when its metrics are incomplete, after the
+# FAILED (metrics) lines; 0 otherwise. With no zip the lines are still printed,
+# after the run's own "No report was written" line.
 function Get-DirectRunMetricsExitCode
 {
     param([object[]]$Entries, [string]$TenantID, [System.Collections.IDictionary]$RunParameters, [string]$ZipFile)
 
     $Incomplete = Write-MetricsIncompleteRunEnd -Entries $Entries -TenantID $TenantID -RunParameters $RunParameters
-    if ($Incomplete -and -not [string]::IsNullOrEmpty($ZipFile) -and (Test-Path -LiteralPath $ZipFile -PathType Leaf)) { return 3 }
+    if ([string]::IsNullOrEmpty($ZipFile) -or -not (Test-Path -LiteralPath $ZipFile -PathType Leaf)) { return 2 }
+    if ($Incomplete) { return 3 }
     return 0
 }

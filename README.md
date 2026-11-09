@@ -587,7 +587,9 @@ The wrapper script sets a process exit code so automation/CI can detect problems
 
 Codes `3`–`5` still mean the report was produced — they flag that it is **incomplete** in a specific, diagnosable way, rather than silently looking like a clean/empty result.
 
-A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor metric request (grouped or for one metric) of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip (when the zip could not be written it prints the lines but does not exit `3`). The command keeps the run's `-Obfuscate`, `-ObfuscationDictionary`, `-SkipConsumption`, `-DeviceLogin` and `-ConcurrencyLimit`, so a masked run is collected again masked; it never holds `-Secret`.
+A direct `ResourceInventory.ps1` run (without `-RunAllSubs`) whose Azure Monitor metric request (grouped or for one metric) of a subscription still failed after its retries prints the same "FAILED (metrics)" lines, with the `ResourceInventory.ps1 -SubscriptionID` command that collects it again, and exits `3` after writing its report and zip. The command keeps the run's `-Obfuscate`, `-ObfuscationDictionary`, `-SkipConsumption`, `-DeviceLogin` and `-ConcurrencyLimit`, so a masked run is collected again masked; it never holds `-Secret`.
+
+A direct `ResourceInventory.ps1` run whose report zip could not be written (for example a full disk) removes any partial zip, prints a "No report was written" line that names the folder that still holds the report files, and exits `2`. This wins over `3`: the "FAILED (metrics)" lines are still printed. Under `-RunAllSubs` the partial zip is removed too, and the wrapper's per-subscription output check then exits `2`.
 
 ### Important Notes
 

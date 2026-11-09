@@ -1826,27 +1826,24 @@ else
     Write-Log -Message ('Transcript log excluded from zip (kept locally for debug)') -Severity 'Info'
 }
 
-try
-{
-    Compress-Archive @CompressionOutput
-}
-catch
-{
-    $_ | Format-List -Force
-    Write-Error ("Error Compressing Output File: {0}." -f $Global:ZipOutputFile)
-    Write-Error ("Please zip the output files manually.")
-}
+# A failed zip is removed and reported; the report file is named only when the
+# zip was written. A direct run then exits 2 at its end.
+$ZipWritten = Write-RdaReportZip -CompressionOutput $CompressionOutput
 
 Write-Log -Message ("Execution Time: {0}" -f $Runtime) -Severity 'Success'
 Write-Log -Message ("Reporting Time: {0}" -f $ReportingRunTime) -Severity 'Success'
-Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+if ($ZipWritten)
+{
+    Write-Log -Message ("Reporting Data File: {0}" -f $Global:ZipOutputFile) -Severity 'Success'
+}
 
 # A direct run whose metrics are incomplete because an Azure Monitor metric
 # request (grouped or for one metric) still failed after its retries
 # (throttling, a timeout, a server error or an error with no status)
 # names each subscription with the command that collects it again, with this
-# run's switches, and exits 3 when its zip was written. Under -RunAllSubs the
-# wrapper does this for the whole run.
+# run's switches, and exits 3 when its zip was written. A direct run whose zip
+# could not be written exits 2. Under -RunAllSubs the wrapper does this for the
+# whole run.
 if (-not $RunAllSubs.IsPresent)
 {
     $DirectRunExitCode = Get-DirectRunMetricsExitCode -Entries $Global:MetricsFailedSubs -TenantID $TenantID -RunParameters $PSBoundParameters -ZipFile $Global:ZipOutputFile
