@@ -55,6 +55,22 @@ Describe 'Reading a failed call''s status under Set-StrictMode -Version Latest' 
         Get-ConsumptionErrorStatusCode -Exception ([System.Exception]::new('outer', $Http)) | Should -Be 429
     }
 
+    It 'retries a role check call that answered 409 once, and reads the next answer' {
+        Mock Start-Sleep { }
+        $script:RestCalls = 0
+        function global:Invoke-AzRestMethod { param([string]$Method, [string]$Path, [string]$Payload) $script:RestCalls++; if ($script:RestCalls -eq 1) { [pscustomobject]@{ StatusCode = 409; Content = '{}' } } else { [pscustomobject]@{ StatusCode = 200; Content = '{"value":[{"id":"a"}]}' } } }
+        try
+        {
+            $R = Invoke-RoleCheckGet -Path '/subscriptions/x/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01'
+        }
+        finally
+        {
+            function global:Invoke-AzRestMethod { param([string]$Method, [string]$Path, [string]$Payload) $script:ArmAnswer }
+        }
+        $R.Status | Should -Be 200
+        $script:RestCalls | Should -Be 2
+    }
+
     It 'retries a role check call that was throttled once, and reads the next answer' {
         Mock Start-Sleep { }
         $script:RestCalls = 0

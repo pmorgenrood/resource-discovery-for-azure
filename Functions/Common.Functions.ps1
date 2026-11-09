@@ -494,7 +494,8 @@ function Invoke-RoleCheckGet
             param($Request)
             $Response = Invoke-AzRestMethod -Method GET @Request -ErrorAction Stop
             $Status = [int]$Response.StatusCode
-            if ($Status -eq 408 -or $Status -eq 429 -or $Status -ge 500)
+            # The statuses Get-ConsumptionErrorKind retries: 408, 409, 429 and 5xx.
+            if ($Status -eq 408 -or $Status -eq 409 -or $Status -eq 429 -or $Status -ge 500)
             {
                 throw [System.Net.Http.HttpRequestException]::new(('HTTP {0}' -f $Status), $null, [System.Net.HttpStatusCode]$Status)
             }
