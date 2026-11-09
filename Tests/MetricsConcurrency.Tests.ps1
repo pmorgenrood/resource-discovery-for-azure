@@ -13,8 +13,9 @@
 #
 # The Start-ThreadJob throttle is process-wide, so each run is a fresh pwsh
 # process: one run's limit cannot leak into the next. The stand-in Az.Monitor
-# module waits a while in every call and counts calls in flight in a static
-# counter shared by all runspaces of the process.
+# module counts calls in flight in a static counter shared by all runspaces of
+# the process, and holds each call until the expected number are in flight at
+# once (or 20 s pass), so the peak is exact on a slow or busy host.
 #
 # No live Azure. Run with:
 #   Invoke-Pester ./Tests/MetricsConcurrency.Tests.ps1 -Output Detailed
@@ -46,6 +47,15 @@ function Get-AzMetric
     [RdaInFlightProbe]::Enter()
     try
     {
+        # A bounded barrier: each call holds until RDA_TEST_BARRIER calls have been
+        # in flight at once, or 20 s pass, so the peak does not depend on how fast
+        # the host starts the calls. A limit that lets fewer calls run at once
+        # never fills it, and each call is released by the 20 s bound.
+        $Deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([RdaInFlightProbe]::Peak -lt [int]$env:RDA_TEST_BARRIER -and [DateTime]::UtcNow -lt $Deadline)
+        {
+            Start-Sleep -Milliseconds 10
+        }
         Start-Sleep -Milliseconds ([int]$env:RDA_TEST_CALL_MS)
     }
     finally
@@ -130,18 +140,19 @@ catch
 
     function Invoke-ConcurrencyRun
     {
-        param([string]$RunName, $ConcurrencyLimit, [int]$DiskCount, [int]$CallMs = 1500)
+        param([string]$RunName, $ConcurrencyLimit, [int]$DiskCount, [int]$CallMs = 100, [int]$Barrier = 0)
 
         $OutDir = Join-Path $TestDrive $RunName
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
         $env:RDA_TEST_CALL_MS = [string]$CallMs
+        $env:RDA_TEST_BARRIER = [string]$Barrier
         try
         {
             $Output = & $script:PwshPath -NoProfile -NonInteractive -File $script:Runner -MetricsScript $script:MetricsScript -CommonFunctions (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -ModuleRoot $script:ModuleRoot -OutDir $OutDir -ConcurrencyLimit $ConcurrencyLimit -DiskCount $DiskCount 2>&1
         }
         finally
         {
-            Remove-Item -Path 'Env:RDA_TEST_CALL_MS' -ErrorAction SilentlyContinue
+            Remove-Item -Path 'Env:RDA_TEST_CALL_MS', 'Env:RDA_TEST_BARRIER' -ErrorAction SilentlyContinue
         }
         $Json = @($Output | ForEach-Object { [string]$_ } | Where-Object { $_ -like '{*"Peak"*' }) | Select-Object -Last 1
         if (-not $Json) { throw ("The metrics run printed no result: {0}" -f (($Output | ForEach-Object { [string]$_ }) -join ' | ')) }
@@ -152,25 +163,25 @@ catch
 Describe 'Metrics.ps1 metric calls in flight follow -ConcurrencyLimit' {
 
     It 'runs one call at a time with -ConcurrencyLimit 1' {
-        $Result = Invoke-ConcurrencyRun -RunName 'limit-1' -ConcurrencyLimit 1 -DiskCount 6 -CallMs 500
+        $Result = Invoke-ConcurrencyRun -RunName 'limit-1' -ConcurrencyLimit 1 -DiskCount 6 -CallMs 500 -Barrier 1
         $Result.Calls | Should -Be 6
         $Result.Peak | Should -Be 1
     }
 
     It 'runs 6 calls at once with the default -ConcurrencyLimit 6' {
-        $Result = Invoke-ConcurrencyRun -RunName 'limit-6' -ConcurrencyLimit 6 -DiskCount 12
+        $Result = Invoke-ConcurrencyRun -RunName 'limit-6' -ConcurrencyLimit 6 -DiskCount 12 -Barrier 6
         $Result.Calls | Should -Be 12
         $Result.Peak | Should -Be 6
     }
 
     It 'runs 16 calls at once with -ConcurrencyLimit 16' {
-        $Result = Invoke-ConcurrencyRun -RunName 'limit-16' -ConcurrencyLimit 16 -DiskCount 32
+        $Result = Invoke-ConcurrencyRun -RunName 'limit-16' -ConcurrencyLimit 16 -DiskCount 32 -Barrier 16
         $Result.Calls | Should -Be 32
         $Result.Peak | Should -Be 16
     }
 
     It 'reads a limit given as text the same as the number' {
-        $Result = Invoke-ConcurrencyRun -RunName 'limit-text-8' -ConcurrencyLimit '8' -DiskCount 16
+        $Result = Invoke-ConcurrencyRun -RunName 'limit-text-8' -ConcurrencyLimit '8' -DiskCount 16 -Barrier 8
         $Result.Calls | Should -Be 16
         $Result.Peak | Should -Be 8
     }
