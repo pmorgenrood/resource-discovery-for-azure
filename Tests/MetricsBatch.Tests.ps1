@@ -1366,6 +1366,124 @@ function global:Read-Host { Add-Content -LiteralPath $CallLog -Value 'Read-Host'
     }
 }
 
+Describe 'Run-AllSubscriptions.ps1 when the consumption gate stops the run' {
+
+    # The wrapper runs in its own pwsh with a private HOME. Aliases stand in for
+    # the sign-in, the subscription list and the two up-front gates (an alias wins
+    # over the functions the wrapper dot-sources). Invoke-AzRestMethod and
+    # Read-Host stand-ins log each provider read, register and prompt.
+    BeforeAll {
+        function script:Invoke-WrapperUpToRun
+        {
+            param([string]$Consumption)
+            $Work = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-wrap-gate-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $Work | Out-Null
+            try
+            {
+                $CallLog = Join-Path $Work 'calls.txt'
+                $Runner = Join-Path $Work 'run.ps1'
+                Set-Content -LiteralPath $Runner -Encoding utf8 -Value @'
+param($Script, $CallLog, $Consumption)
+$Global:RdaCallLog = $CallLog
+$Global:RdaConsumption = $Consumption
+function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }; Environment = [pscustomobject]@{ Name = 'AzureCloud' } } }
+function global:Invoke-AzRestMethod
+{
+    param($Method, $Path, [switch]$AsJob)
+    Add-Content -LiteralPath $Global:RdaCallLog -Value ('Invoke-AzRestMethod {0} {1}' -f $Method, $Path)
+    $Read = [pscustomobject]@{ StatusCode = 200; Content = '{"registrationState":"NotRegistered"}' }
+    if ($AsJob) { return Start-ThreadJob -ArgumentList $Read -ScriptBlock { param($R) $R } }
+    $Read
+}
+function global:Read-Host { Add-Content -LiteralPath $Global:RdaCallLog -Value 'Read-Host'; 'y' }
+function global:RdaStubNothing { }
+function global:RdaStubTenant { 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+function global:RdaStubTrue { $true }
+function global:RdaStubSubscriptions
+{
+    [pscustomobject]@{ Id = '11111111-1111-1111-1111-111111111111'; Name = 'sub-one'; State = 'Enabled'; TenantId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+    [pscustomobject]@{ Id = '22222222-2222-2222-2222-222222222222'; Name = 'sub-two'; State = 'Enabled'; TenantId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
+}
+function global:RdaStubAccessDecision { [pscustomobject]@{ Inaccessible = @(); InaccessibleIds = @(); ShouldBlock = $false } }
+function global:RdaStubConsumption
+{
+    Add-Content -LiteralPath $Global:RdaCallLog -Value 'Test-ConsumptionAccess'
+    [pscustomobject]@{ Outcome = $Global:RdaConsumption; Detail = '' }
+}
+# The first subscription of the run: stop here, so nothing is collected.
+function global:RdaStubStop { Add-Content -LiteralPath $Global:RdaCallLog -Value 'run started'; exit 7 }
+Set-Alias -Scope Global -Name Invoke-PreFlightChecks -Value RdaStubNothing
+Set-Alias -Scope Global -Name Get-AzCliSignedInTenant -Value RdaStubTenant
+Set-Alias -Scope Global -Name Get-AzPsSignedInTenant -Value RdaStubTenant
+Set-Alias -Scope Global -Name Test-AzCliTokenSilent -Value RdaStubTrue
+Set-Alias -Scope Global -Name Test-AzPsTokenSilent -Value RdaStubTrue
+Set-Alias -Scope Global -Name Get-AzSubscription -Value RdaStubSubscriptions
+Set-Alias -Scope Global -Name Test-SubscriptionAccessAll -Value RdaStubNothing
+Set-Alias -Scope Global -Name Resolve-AccessPreflight -Value RdaStubAccessDecision
+Set-Alias -Scope Global -Name Test-ConsumptionAccess -Value RdaStubConsumption
+Set-Alias -Scope Global -Name Write-RdaProgress -Value RdaStubStop
+& $Script -TenantID 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' -UseMetricsBatch -ParallelStreams 1
+exit $LASTEXITCODE
+'@
+                # The wrapper looks for an az program on PATH before anything else; the
+                # stand-ins above answer every sign-in question, so it is never run.
+                $Bin = Join-Path $Work 'bin'
+                New-Item -ItemType Directory -Path $Bin | Out-Null
+                Set-Content -LiteralPath (Join-Path $Bin 'az') -Value "#!/bin/sh`nexit 0"
+                Set-Content -LiteralPath (Join-Path $Bin 'az.cmd') -Value '@exit /b 0'
+                if (-not $IsWindows) { & chmod +x (Join-Path $Bin 'az') }
+                $Pwsh = Join-Path $PSHOME 'pwsh'
+                $OldHome = $env:HOME
+                $OldPath = $env:PATH
+                try
+                {
+                    $env:HOME = $Work
+                    $env:PATH = $Bin + [System.IO.Path]::PathSeparator + $env:PATH
+                    $Output = & $Pwsh -NoProfile -NonInteractive -File $Runner -Script (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -CallLog $CallLog -Consumption $Consumption 2>&1 | Out-String
+                    $ExitCode = $LASTEXITCODE
+                }
+                finally
+                {
+                    $env:HOME = $OldHome
+                    $env:PATH = $OldPath
+                }
+                [pscustomobject]@{
+                    Output   = $Output
+                    ExitCode = $ExitCode
+                    Calls    = @(if (Test-Path -LiteralPath $CallLog) { Get-Content -LiteralPath $CallLog })
+                }
+            }
+            finally
+            {
+                Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'stops before the Microsoft.Insights preflight reads, asks or registers anything' {
+        $Run = Invoke-WrapperUpToRun -Consumption 'Denied'
+
+        $Run.ExitCode | Should -Be 1 -Because $Run.Output
+        $Run.Output | Should -Match 'not authorized to read consumption/billing data'
+        $Run.Calls | Should -Contain 'Test-ConsumptionAccess'
+        @($Run.Calls | Where-Object { $_ -like 'Invoke-AzRestMethod*' }) | Should -BeNullOrEmpty
+        @($Run.Calls | Where-Object { $_ -eq 'Read-Host' }) | Should -BeNullOrEmpty
+        $Run.Output | Should -Not -Match 'Microsoft\.Insights'
+    }
+
+    It 'runs the preflight after the consumption gate lets the run go on' {
+        $Run = Invoke-WrapperUpToRun -Consumption 'Allowed'
+
+        $Run.ExitCode | Should -Be 7 -Because $Run.Output
+        $Gate = [array]::IndexOf($Run.Calls, 'Test-ConsumptionAccess')
+        $FirstRead = @(for ($i = 0; $i -lt $Run.Calls.Count; $i++) { if ($Run.Calls[$i] -like 'Invoke-AzRestMethod GET*Microsoft.Insights*') { $i } })
+        $Gate | Should -BeGreaterOrEqual 0
+        $FirstRead.Count | Should -BeGreaterThan 0
+        $FirstRead[0] | Should -BeGreaterThan $Gate
+        $Run.Calls[-1] | Should -Be 'run started'
+    }
+}
+
 Describe 'Get-RdaInsightsProviderState' {
 
     BeforeEach {
