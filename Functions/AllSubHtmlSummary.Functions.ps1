@@ -247,7 +247,7 @@ function New-RdaAllSubHtmlSummary
         catch
         {
             # A single unreadable inventory must not abort the whole summary.
-            $SubReports += [pscustomobject]@{ Name = ('(unreadable inventory: {0})' -f $Folder.Name); Total = 0; Link = $null; Folder = $Folder.Name }
+            $SubReports += [pscustomobject]@{ Name = ('(unreadable inventory: {0})' -f $Folder.Name); Total = 0; Link = $null; Folder = $Folder.Name; Unreadable = $true }
             continue
         }
 
@@ -298,7 +298,10 @@ function New-RdaAllSubHtmlSummary
     $SubReports = @($SubReports | Sort-Object -Property Total -Descending)
     $RunTotalResources = [int](($SubReports | Measure-Object -Property Total -Sum).Sum)
     $SubCount = $SubReports.Count
-    $EmptyCount = @($SubReports | Where-Object { $_.Total -eq 0 }).Count
+    # An inventory that could not be read is not an empty one: it is counted
+    # and named apart.
+    $EmptyCount = @($SubReports | Where-Object { $_.Total -eq 0 -and -not ($_.PSObject.Properties.Name -contains 'Unreadable') }).Count
+    $UnreadableCount = @($SubReports | Where-Object { $_.PSObject.Properties.Name -contains 'Unreadable' }).Count
 
     # --- Render --------------------------------------------------------------
     $Generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
@@ -333,6 +336,10 @@ function New-RdaAllSubHtmlSummary
         {
             [void]$Banners.AppendFormat('<div class="banner err"><b>{0} subscription(s) failed to process.</b> These are missing from the totals below: {1}</div>', $FailedList.Count, (ConvertTo-HtmlSafe (($FailedList | ForEach-Object { [string]$_ }) -join ', ')))
         }
+    }
+    if ($UnreadableCount -gt 0)
+    {
+        [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} report(s) have an inventory that could not be read.</b> Their resources are not counted here; open the report folder to check the inventory file.</div>', $UnreadableCount)
     }
     if ($EmptyCount -gt 0)
     {

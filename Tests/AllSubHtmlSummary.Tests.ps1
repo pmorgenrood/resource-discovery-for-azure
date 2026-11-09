@@ -233,6 +233,20 @@ Describe 'Extension/Summary.ps1 privacy banner' {
     }
 }
 
+Describe 'New-RdaAllSubHtmlSummary unreadable inventory' {
+    It 'counts an unreadable inventory apart from an empty report, and says so' {
+        $Run = New-Run
+        New-SubFolder -Root $Run -Services @{} -SubName 'Empty Sub' | Out-Null
+        New-SubFolder -Root $Run -BadInventory | Out-Null
+        $Out = Join-Path $Run 'main.html'
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out 6>$null | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        (Get-Card $Html 'Empty (0 resources)') | Should -Be '1'
+        $Html | Should -Match '<b>1 subscription\(s\) have 0 resources in their report\.</b>'
+        $Html | Should -Match '<b>1 report\(s\) have an inventory that could not be read\.</b>'
+    }
+}
+
 Describe 'New-RdaAllSubHtmlSummaryFromZip (rebuild from consolidated zip)' {
 
     BeforeAll {
