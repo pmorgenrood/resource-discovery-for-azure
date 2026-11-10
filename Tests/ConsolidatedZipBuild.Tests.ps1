@@ -48,8 +48,13 @@ BeforeAll {
         $null = New-Item -ItemType Directory -Path $Dir -Force
         $Json = Join-Path $Dir ('Inventory_ResourcesReport_' + $Stamp + '.json')
         Set-Content -LiteralPath $Json -Value '{"resources":[]}'
+        # As the collector does: an empty metrics list and the consumption header.
+        $Metrics = Join-Path $Dir ('Metrics_ResourcesReport_' + $Stamp + '.json')
+        Set-Content -LiteralPath $Metrics -Value '{"Metrics":[]}'
+        $Csv = Join-Path $Dir ('Consumption_ResourcesReport_' + $Stamp + '.csv')
+        Set-Content -LiteralPath $Csv -Value 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId'
         $Zip = Join-Path $Dir ('ResourcesReport_' + $Stamp + '.zip')
-        Compress-Archive -LiteralPath $Json -DestinationPath $Zip -Force
+        Compress-Archive -LiteralPath $Json, $Metrics, $Csv -DestinationPath $Zip -Force
         $Zip
     }
 

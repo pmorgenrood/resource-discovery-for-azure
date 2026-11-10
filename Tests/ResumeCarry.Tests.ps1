@@ -38,6 +38,9 @@ BeforeAll {
         New-Item -ItemType Directory -Path $Folder, $Stage -Force | Out-Null
         $Inv = @{ VirtualMachines = @(@{ Name = 'vm1'; Subscription = $SubName }, @{ Name = 'vm2'; Subscription = $SubName }) } | ConvertTo-Json -Depth 4
         Set-Content -LiteralPath (Join-Path $Stage ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value $Inv -Encoding utf8
+        # As the collector does: an empty metrics list and the consumption header.
+        Set-Content -LiteralPath (Join-Path $Stage ('Metrics_ResourcesReport_{0}.json' -f $Stamp)) -Value '{"Metrics":[]}' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $Stage ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)) -Value 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId' -Encoding utf8
         Set-Content -LiteralPath (Join-Path $Stage ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
         $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
         Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
@@ -78,6 +81,9 @@ New-Item -ItemType Directory -Path $Folder -Force | Out-Null
 $Stage = Join-Path $Root ('.stage-' + $Stamp)
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $Stage ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value ('{"VirtualMachines":[{"Name":"vm","Subscription":"' + $SubscriptionID + '"}]}') -Encoding utf8
+# As the collector does: an empty metrics list and the consumption header.
+Set-Content -LiteralPath (Join-Path $Stage ('Metrics_ResourcesReport_{0}.json' -f $Stamp)) -Value '{"Metrics":[]}' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $Stage ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)) -Value 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId' -Encoding utf8
 Set-Content -LiteralPath (Join-Path $Stage ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
@@ -391,6 +397,36 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         foreach ($K in $Start..($Start + 300)) { $Bytes[$K] = 255 }
         [System.IO.File]::WriteAllBytes($Damaged, $Bytes)
         Test-ReportZipReadable -Path $Damaged | Should -BeFalse
+    }
+
+    It 'counts a report zip as unreadable when <Case>' -ForEach @(
+        @{ Case = 'it has no metrics file'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'it has no consumption file'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":[]}'; 'Metrics_R_7.json' = '{"Metrics":[]}' } }
+        @{ Case = 'its inventory is cut short'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":[{"Name":"vm"'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'its metrics file is not JSON'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = 'Metrics'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'its consumption file lacks a column downstream needs'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterName,MeterId' } }
+    ) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $OddZip = Join-Path $script:Root ('odd7-{0}.zip' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Z = [System.IO.Compression.ZipFile]::Open($OddZip, 'Create')
+        try { foreach ($Name in $Files.Keys) { $W = [System.IO.StreamWriter]::new($Z.CreateEntry($Name, 'Optimal').Open()); try { $W.Write($Files[$Name]) } finally { $W.Dispose() } } }
+        finally { $Z.Dispose() }
+        Test-ReportZipReadable -Path $OddZip | Should -BeFalse
+    }
+
+    It 'reads a report zip whose three files have the collector''s shape, a byte-order mark and white space included' {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $GoodZip = Join-Path $script:Root 'good7.zip'
+        $Z = [System.IO.Compression.ZipFile]::Open($GoodZip, 'Create')
+        try
+        {
+            foreach ($Pair in @(@('Inventory_R_7.json', ([char]0xFEFF + '  {"VirtualMachines":[]}' + "`r`n")), @('Metrics_R_7.json', '{"Metrics":[]}'), @('Consumption_R_7.csv', ('"InstanceData","MeterCategory","MeterId","MeterName","MeterRegion","MeterSubCategory","Quantity","Unit","UsageStartTime","UsageEndTime","ResourceId"' + "`r`n" + 'x,y,z'))))
+            {
+                $W = [System.IO.StreamWriter]::new($Z.CreateEntry($Pair[0], 'Optimal').Open(), [System.Text.UTF8Encoding]::new($false)); try { $W.Write($Pair[1]) } finally { $W.Dispose() }
+            }
+        }
+        finally { $Z.Dispose() }
+        Test-ReportZipReadable -Path $GoodZip | Should -BeTrue
     }
 
     It 'reads a report zip once per run when given the same cache' {
