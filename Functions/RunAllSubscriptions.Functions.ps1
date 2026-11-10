@@ -351,7 +351,7 @@ function Invoke-PreFlightChecks
     # Catch it now.
     try
     {
-        $RootItem = Get-Item -Path $InventoryRoot -ErrorAction Stop
+        $RootItem = Get-Item -LiteralPath $InventoryRoot -ErrorAction Stop
         $Drive = $RootItem.PSDrive
         if ($null -ne $Drive -and $null -ne $Drive.Free)
         {
@@ -387,13 +387,13 @@ function Invoke-PreFlightChecks
     $ProbePath = Join-Path $InventoryRoot (".write-probe-{0}.tmp" -f ([guid]::NewGuid()))
     try
     {
-        Set-Content -Path $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
-        $ProbeRead = Get-Content -Path $ProbePath -Raw -ErrorAction Stop
+        Set-Content -LiteralPath $ProbePath -Value 'preflight write probe' -Encoding utf8 -ErrorAction Stop
+        $ProbeRead = Get-Content -LiteralPath $ProbePath -Raw -ErrorAction Stop
         if ($ProbeRead -notmatch 'preflight write probe')
         {
             throw "Write probe content mismatch (read back '$ProbeRead')"
         }
-        Remove-Item -Path $ProbePath -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $ProbePath -Force -ErrorAction Stop
         Write-Host ("Write probe: OK ({0})" -f $InventoryRoot) -ForegroundColor Green
     }
     catch
@@ -402,7 +402,7 @@ function Invoke-PreFlightChecks
         Write-Host "  This usually means: readonly directory, denied permissions, antivirus or DLP product blocking writes, or a stale handle." -ForegroundColor Red
         Write-Host "  Verify the directory is writable and re-run." -ForegroundColor Red
         # Best-effort cleanup in case Set-Content partially succeeded.
-        try { if (Test-Path $ProbePath) { Remove-Item -Path $ProbePath -Force -ErrorAction SilentlyContinue } }
+        try { if (Test-Path -LiteralPath $ProbePath) { Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue } }
         catch { Write-Verbose ("Probe cleanup failed at {0}: {1}" -f $ProbePath, $_.Exception.Message) }
         Exit-Wrapper -Code 1
     }
@@ -484,6 +484,35 @@ function Read-ResumeStateText
         Write-Host ('ERROR: The resume state file {0} exists but could not be read: {1}' -f $Path, $_.Exception.Message) -ForegroundColor Red
         Write-Host '  It holds the subscriptions already done and the failures still to retry, so this run stops rather than write over them.' -ForegroundColor Red
         Write-Host '  Close the program that holds it open, or fix its permissions, then run again. To start fresh instead, move the file away first.' -ForegroundColor Yellow
+        Exit-Wrapper -Code 1
+    }
+}
+
+# The text of a stream resume state file that is there. As for the resume
+# state (Read-ResumeStateText), a file that cannot be opened (locked, no
+# access) may hold failures still to retry that are kept nowhere else: a run
+# that went on without them would end clean and clear the resume state, so
+# they would never be retried and nothing would say so. So the run stops
+# here with exit 1, before it writes the resume state, naming the file and
+# the way out. Once the file can be read, or is moved away (which drops its
+# records), the next run goes on, so this stop never repeats by itself.
+# -AfterStreams: the stop comes after the streams ran, so it says where
+# their reports are. A file that opens but is not valid JSON is not stopped
+# on here; the caller warns about it.
+function Read-StreamResumeStateText
+{
+    param([string]$Path, [string]$InventoryRoot = '', [switch]$AfterStreams)
+
+    try { return Get-Content -LiteralPath $Path -Raw -ErrorAction Stop }
+    catch
+    {
+        Write-Host ('ERROR: The stream resume state file {0} exists but could not be read: {1}' -f $Path, $_.Exception.Message) -ForegroundColor Red
+        Write-Host '  It may hold failures still to retry that are kept nowhere else, so this run stops before it writes the resume state.' -ForegroundColor Red
+        if ($AfterStreams)
+        {
+            Write-Host ('  The streams'' reports are kept in their folders under {0} and their records in their stream resume state files, but no consolidated zip was made.' -f $InventoryRoot) -ForegroundColor Red
+        }
+        Write-Host '  Fix its permissions (or close the program that holds it open), then run again. To drop its records instead, move the file away first.' -ForegroundColor Yellow
         Exit-Wrapper -Code 1
     }
 }
@@ -661,7 +690,7 @@ function Get-StreamResumeStateFiles
         [Parameter(Mandatory = $true)][string]$InventoryRoot,
         [Parameter(Mandatory = $true)][string]$Tenant
     )
-    return @(Get-ChildItem -Path $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
+    return @(Get-ChildItem -LiteralPath $InventoryRoot -Filter (".resume-state-{0}-stream-*.json" -f $Tenant) -File -Force -ErrorAction SilentlyContinue)
 }
 
 # Reconcile FailedAttempts entries gathered from multiple streams (plus any
@@ -1418,4 +1447,64 @@ function Get-RunSummaryLogContent
     }
 
     return $Lines.ToArray()
+}
+
+# Add files and folders to a zip that is there, as Compress-Archive -Update
+# does: a file goes in under its name, a folder under its name with the
+# '/'-separated paths of the files under it (hidden ones left out), and an
+# empty folder under it as '<path>/' (an empty folder given on its own adds
+# nothing). An entry with the same name (in any case) is replaced.
+# Compress-Archive -Update cannot be used for this: it reads the zip's own
+# path as a wildcard pattern, so for a zip in a folder whose path holds [ or ]
+# (a Unix home such as /home/u[1]) it fails and nothing is added.
+function Add-ItemsToZipArchive
+{
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][string[]]$Items
+    )
+
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $Adds = [System.Collections.Generic.List[object]]::new()
+    foreach ($Item in $Items)
+    {
+        if (Test-Path -LiteralPath $Item -PathType Leaf)
+        {
+            $Adds.Add([pscustomobject]@{ Source = $Item; Name = [System.IO.Path]::GetFileName($Item) })
+            continue
+        }
+        $Dir = [System.IO.DirectoryInfo]::new($Item)
+        $Base = $Dir.Parent.FullName.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        foreach ($Child in @(Get-ChildItem -LiteralPath $Item -Recurse))
+        {
+            $Relative = $Child.FullName.Substring($Base.Length).Replace([System.IO.Path]::DirectorySeparatorChar, '/')
+            if ($Child -is [System.IO.DirectoryInfo])
+            {
+                if (@($Child.GetFiles()).Count -eq 0) { $Adds.Add([pscustomobject]@{ Source = $null; Name = $Relative + '/' }) }
+            }
+            else
+            {
+                $Adds.Add([pscustomobject]@{ Source = $Child.FullName; Name = $Relative })
+            }
+        }
+    }
+
+    $Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Update)
+    try
+    {
+        foreach ($Add in $Adds)
+        {
+            $Old = @($Zip.Entries | Where-Object { [string]::Equals($_.FullName.Replace([System.IO.Path]::DirectorySeparatorChar, '/'), $Add.Name, [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+            if ($null -ne $Old) { $Old.Delete() }
+            if ($null -eq $Add.Source)
+            {
+                $null = $Zip.CreateEntry($Add.Name, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+            else
+            {
+                $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Add.Source, $Add.Name, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        }
+    }
+    finally { $Zip.Dispose() }
 }

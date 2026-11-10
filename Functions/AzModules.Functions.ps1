@@ -87,16 +87,17 @@ function Test-RdaAzAccountsVersion
         $Status = 'LoadedTooOld'
         $Messages += ('Az.Accounts {0} is already loaded in this PowerShell session. This tool needs Az.Accounts {1} or newer.' -f $Loaded, $Required)
         $Messages += 'An older Az.Accounts that is already loaded cannot be replaced in a running session.'
-        if (-not $Installed -or $Installed -lt $Required)
-        {
-            $Messages += 'Install a supported version first:'
-            $Messages += ('  ' + $InstallCommand)
-        }
         # The submodules whose manifest pins an older Az.Accounts.
         # PowerShell loads that older Az.Accounts for them in every new
-        # session, so the new session alone would stop again.
+        # session, so the new session alone would stop again. Their update
+        # comes first, as in the Missing and TooOld advice below.
         $Pinning = @(Get-RdaAzAccountsPinning -SubModule $SubModule -Minimum $Required)
         $Messages += @(Get-RdaAzAccountsPinMessage -Pinning $Pinning)
+        if (-not $Installed -or $Installed -lt $Required)
+        {
+            $Messages += $(if ($Pinning.Count -gt 0) { 'Then install a supported Az.Accounts:' } else { 'Install a supported version first:' })
+            $Messages += ('  ' + $InstallCommand)
+        }
         $Messages += 'Then open a new PowerShell session and run again.'
         $Messages += 'If your PowerShell profile loads Az.Accounts, start the new session with: pwsh -NoProfile'
         # -NoProfile also drops a sign-in the profile makes (Cloud Shell does).
@@ -105,26 +106,33 @@ function Test-RdaAzAccountsVersion
     elseif ($Installed -lt $Required -or -not $Installed)
     {
         # A submodule copy that pins an older Az.Accounts would stop the run
-        # after the install too, so this one stop names that fix as well.
+        # after the install too, so this one stop names that fix as well:
+        # the submodule's update first, then the Az.Accounts step, each
+        # naming its module.
         $Pinning = @(Get-RdaAzAccountsPinning -SubModule $SubModule -Minimum $Required)
-        $Then = if ($Pinning.Count -gt 0) { ':' } else { ', then run again:' }
         if (-not $Installed)
         {
             $Status = 'Missing'
             $Messages += ('Az.Accounts is not installed. This tool needs Az.Accounts {0} or newer.' -f $Required)
-            $Messages += ('Install it' + $Then)
+            $Verb = 'install'
         }
         else
         {
             $Status = 'TooOld'
             $Messages += ('Az.Accounts {0} is installed. This tool needs Az.Accounts {1} or newer.' -f $Installed, $Required)
-            $Messages += ('Update it' + $Then)
+            $Verb = 'update'
         }
-        $Messages += ('  ' + $InstallCommand)
         if ($Pinning.Count -gt 0)
         {
             $Messages += @(Get-RdaAzAccountsPinMessage -Pinning $Pinning -Effect 'so loading it would load that older copy, or fail when that copy is not installed')
+            $Messages += ('Then {0} Az.Accounts:' -f $Verb)
+            $Messages += ('  ' + $InstallCommand)
             $Messages += 'Then run again.'
+        }
+        else
+        {
+            $Messages += ('{0}{1} it, then run again:' -f $Verb.Substring(0, 1).ToUpperInvariant(), $Verb.Substring(1))
+            $Messages += ('  ' + $InstallCommand)
         }
     }
     else
@@ -267,7 +275,7 @@ function Get-RdaAzAccountsPinMessage
         $Lines += ('{0} {1} asks for Az.Accounts {2}, {3}.' -f $P.Name, $P.Version, $P.Accounts, $Effect)
     }
     $PinnedNames = @($Pinning | ForEach-Object { $_.Name } | Select-Object -Unique)
-    $Lines += 'Update it first:'
+    $Lines += ('Update {0} first:' -f ($PinnedNames -join ', '))
     $Lines += ('  Install-Module -Name {0} -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck' -f ($PinnedNames -join ','))
     foreach ($P in $Pinning)
     {
