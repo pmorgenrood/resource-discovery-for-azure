@@ -808,7 +808,7 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $Entries[0].Complete | Should -BeOfType [bool]
         $Entries[0].Complete | Should -BeFalse
         $Entries[0].ReportFolder | Should -Be 'ResourcesReport_incomplete'
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
         @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
 
         # The grouped request is kept: no request for one metric is made.
@@ -868,8 +868,8 @@ Describe 'Metrics.ps1 subscriptions whose grouped request still fails after its 
         $Second.Count | Should -Be 1
         $First[0].Name | Should -Be 'test-subscription'
         $Second[0].Name | Should -Be 'second-subscription'
-        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
-        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $First[0].Message | Should -Be 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
+        $Second[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
         # The phase line covers the whole run.
         @($Run.DebugLines | Where-Object { $_ -like '*Metrics incomplete for 2 subscription(s): Azure Monitor requests for 3 resource(s) still failed after their retries*' }).Count | Should -Be 1
     }
@@ -901,7 +901,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Entries[0].Complete | Should -BeOfType [bool]
         $Entries[0].Complete | Should -BeFalse
         $Entries[0].ReportFolder | Should -Be 'ResourcesReport_single'
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
         @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count | Should -Be 1
 
         # Each request keeps its retries: 4 attempts for each of the 2 metrics.
@@ -918,7 +918,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Entries.Count | Should -Be 1
         $Entries[0].Id | Should -Be $script:SubscriptionId
         $Entries[0].Complete | Should -BeFalse
-        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $Entries[0].Message | Should -Be 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
 
         # One rejected grouped request, then 4 attempts for each of the 4 metrics.
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
@@ -935,8 +935,9 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
-    It 'records it when a single-metric request fails on every attempt with an error a re-run can fix (<SingleError>)' -ForEach @(@{ SingleError = 'Status503' }, @{ SingleError = 'NoStatus' }, @{ SingleError = 'Status503NamedBadRequest' }) {
-        # A server error, or an error whose HTTP status cannot be read.
+    It 'records it when a single-metric request fails on every attempt with an error a re-run can fix (<SingleError>)' -ForEach @(@{ SingleError = 'Status503' }, @{ SingleError = 'NoStatus' }, @{ SingleError = 'Status503NamedBadRequest' }, @{ SingleError = 'Unauthorized' }, @{ SingleError = 'Status500Wrapping401' }) {
+        # A server error, an error whose HTTP status cannot be read, or a 401
+        # (an expired sign-in, which a fresh sign-in fixes).
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-fixable-' + $SingleError) -SingleError $SingleError
 
         $Entries = @($Global:MetricsFailedSubs)
@@ -947,7 +948,7 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 
-    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Unauthorized' }, @{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }, @{ SingleError = 'Status500Wrapping401' }, @{ SingleError = 'Status500Wrapping403' }, @{ SingleError = 'Status500Wrapping404' }, @{ SingleError = 'ForbiddenNamed429' }) {
+    It 'does not record it when a single-metric request fails on every attempt with a client error (<SingleError>)' -ForEach @(@{ SingleError = 'Forbidden' }, @{ SingleError = 'NotFound' }, @{ SingleError = 'Status403' }, @{ SingleError = 'Status404' }, @{ SingleError = 'Status500Wrapping403' }, @{ SingleError = 'Status500Wrapping404' }, @{ SingleError = 'ForbiddenNamed429' }) {
         # No access or a resource that is gone fails the same way on every run.
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName ('single-client-' + $SingleError) -SingleError $SingleError
 
@@ -1015,8 +1016,15 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricRerunCanFix -TimedOut $false -Exception $null | Should -BeTrue
     }
 
+    It 'counts a 401, which a fresh sign-in fixes, but not a 403' {
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status Unauthorized) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'Unauthorized'")) | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status Forbidden) | Should -BeFalse
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code 'Forbidden'")) | Should -BeFalse
+    }
+
     It 'does not count a client error' {
-        foreach ($Status in @('BadRequest', 'Unauthorized', 'Forbidden', 'NotFound', 'Conflict'))
+        foreach ($Status in @('BadRequest', 'Forbidden', 'NotFound', 'Conflict'))
         {
             Test-MetricRerunCanFix -TimedOut $false -Exception (New-StatusError -Status $Status) | Should -BeFalse -Because $Status
             Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new("Operation returned an invalid status code '$Status'")) | Should -BeFalse -Because $Status
@@ -1026,7 +1034,16 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricRerunCanFix -TimedOut $false -Exception $Wrapped | Should -BeFalse
     }
 
-    It 'does not count a <Status> wrapped in a server error' -ForEach @(@{ Status = 'Unauthorized'; Code = 401 }, @{ Status = 'Forbidden'; Code = 403 }, @{ Status = 'NotFound'; Code = 404 }) {
+    It 'counts a 401 wrapped in a server error' {
+        $ByCode = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status Unauthorized), [System.Net.HttpStatusCode]::InternalServerError)
+        Get-MetricErrorStatus -Exception $ByCode | Should -Be 401
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByCode | Should -BeTrue
+        $ByText = [System.Net.Http.HttpRequestException]::new('The gateway failed.', [System.Exception]::new('Retry failed.', [System.Exception]::new("Operation returned an invalid status code 'Unauthorized'")), [System.Net.HttpStatusCode]::BadGateway)
+        Get-MetricErrorStatus -Exception $ByText | Should -Be 401
+        Test-MetricRerunCanFix -TimedOut $false -Exception $ByText | Should -BeTrue
+    }
+
+    It 'does not count a <Status> wrapped in a server error' -ForEach @(@{ Status = 'Forbidden'; Code = 403 }, @{ Status = 'NotFound'; Code = 404 }) {
         # By the inner status code.
         $ByCode = [System.Net.Http.HttpRequestException]::new('The server failed.', (New-StatusError -Status $Status), [System.Net.HttpStatusCode]::InternalServerError)
         Get-MetricErrorStatus -Exception $ByCode | Should -Be $Code
@@ -1061,7 +1078,18 @@ Describe 'Metrics.ps1 failures that a re-run can fix' {
         Test-MetricBadRequest -Exception $Wrapped | Should -BeTrue
     }
 
-    It 'does not count a <Code> with the integer Status of a RequestFailedException' -ForEach @(@{ Code = 401 }, @{ Code = 403 }, @{ Code = 404 }) {
+    It 'counts a 401 with the integer Status of a RequestFailedException' {
+        if (-not ('RdaTest.RequestFailedException' -as [type]))
+        {
+            Add-Type -TypeDefinition 'namespace RdaTest { public class RequestFailedException : System.Exception { public RequestFailedException(int status, string message, System.Exception inner) : base(message, inner) { Status = status; } public int Status { get; private set; } } }'
+        }
+        $Failed = [RdaTest.RequestFailedException]::new(401, "Service request failed.`nStatus: 401", $null)
+        Get-MetricErrorStatus -Exception $Failed | Should -Be 401
+        Test-MetricRerunCanFix -TimedOut $false -Exception $Failed | Should -BeTrue
+        Test-MetricRerunCanFix -TimedOut $false -Exception ([System.Exception]::new('Get-AzMetric failed.', $Failed)) | Should -BeTrue
+    }
+
+    It 'does not count a <Code> with the integer Status of a RequestFailedException' -ForEach @(@{ Code = 403 }, @{ Code = 404 }) {
         # Azure.Core's RequestFailedException gives its status as an integer
         # Status, and its message has no "status code" text.
         if (-not ('RdaTest.RequestFailedException' -as [type]))

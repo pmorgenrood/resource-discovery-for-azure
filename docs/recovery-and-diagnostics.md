@@ -159,7 +159,7 @@ Two logs help diagnose partial failures (also summarised in the README):
   purpose so the ingestion pipeline treats it as an attachment, not report data.
   Its **"Metrics incomplete subscriptions"** section lists each subscription
   whose Azure Monitor metric requests still failed after their retries
-  (throttling, a timeout, a server error or an error with no status); those
+  (throttling, a timeout, an expired sign-in, a server error or an error with no status); those
   metrics are in the report with `MetricError` true.
 - A direct `ResourceInventory.ps1` run with incomplete metrics still writes its
   zip, prints a "FAILED (metrics)" banner with the command that collects them

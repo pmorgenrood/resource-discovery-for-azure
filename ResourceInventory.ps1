@@ -1901,7 +1901,7 @@ if ($ZipWritten)
 
 # A direct run whose metrics are incomplete because an Azure Monitor metric
 # request (grouped or for one metric) still failed after its retries
-# (throttling, a timeout, a server error or an error with no status)
+# (throttling, a timeout, an expired sign-in, a server error or an error with no status)
 # names each subscription with the command that collects it again, with this
 # run's switches, and exits 3 when its zip was written. Metrics or consumption
 # skipped because the sign-in could not be refreshed print a short FAILED
