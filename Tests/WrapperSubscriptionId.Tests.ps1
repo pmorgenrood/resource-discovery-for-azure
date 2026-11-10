@@ -790,7 +790,7 @@ Describe 'A home folder with a wildcard character in its name' -Skip:($IsWindows
         @{ Label = 'a run under a home with * in its name'; Arguments = @('-Resume'); HomeName = 'home*{0}' }
     ) {
         script:New-Case
-        # The same case under a home whose name holds brackets.
+        # The same case under a home whose name holds [ ], * or ?.
         $script:CaseHome = Join-Path $script:TestBase ($HomeName -f [guid]::NewGuid().ToString().Substring(0, 4))
         [void][System.IO.Directory]::CreateDirectory($script:CaseHome)
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
