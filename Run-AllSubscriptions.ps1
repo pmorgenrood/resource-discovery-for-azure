@@ -2952,7 +2952,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -RetryLimited $RetryLimited `
             -NotInRun $RetryOwedNotInRun `
             -ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `
-            -MissingReportCount $MissingReportCount -MissingReports $MissingReports -MissingStateNotSaved:($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))) `
+            -MissingReportCount $MissingReportCount -MissingReports $MissingReports -MissingStateNotSaved:$MissingStateNotSaved `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `

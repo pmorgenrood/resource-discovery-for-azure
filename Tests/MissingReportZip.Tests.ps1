@@ -353,9 +353,17 @@ Describe 'RunSummary.log advice for a missing report' {
         @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
     }
 
+    It 'says the state may still list them after a failed save alone, as the console does' {
+        $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
+        $Lines = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -ResumeStateNotSaved)
+        @($Lines | Where-Object { $_ -like '  Report missing      : 1 (*the resume state may still list some as completed, so run again without -Resume)' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like '*a -Resume collects them*' -or $_ -like '*still lists some*' }) | Should -BeNullOrEmpty
+    }
+
     It 'the wrapper passes the flag, raised by a failed save of the resume state too, and the console says the same' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))) `'))
+        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
+        $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `'))
         $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)))'))
         $Src | Should -Match ([regex]::Escape("'may still list some of them as completed, so a -Resume could skip them'"))
     }

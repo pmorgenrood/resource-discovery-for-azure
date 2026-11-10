@@ -1632,7 +1632,8 @@ function Get-RunSummaryLogContent
     if ($ResumeStateNotSaved) { $Lines.Add('  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)') }
     if ($MissingTotal -gt 0)
     {
-        $MissingAdvice = if ($MissingStateNotSaved) { 'the resume state still lists some as completed, so run again without -Resume' } else { 'a -Resume collects them' }
+        # After a failed save alone the state may list them (the console says the same).
+        $MissingAdvice = if ($MissingStateNotSaved) { 'the resume state still lists some as completed, so run again without -Resume' } elseif ($ResumeStateNotSaved) { 'the resume state may still list some as completed, so run again without -Resume' } else { 'a -Resume collects them' }
         $Lines.Add(('  Report missing      : {0} (completed, but their report zip is not in this zip; {1})' -f $MissingTotal, $MissingAdvice))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
@@ -1683,7 +1684,7 @@ function Get-RunSummaryLogContent
         if ($Missing.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add(('Report missing (detail; not in this zip, {0}):' -f $(if ($MissingStateNotSaved) { 'run again without -Resume' } else { 'a -Resume collects them' })))
+            $Lines.Add(('Report missing (detail; not in this zip, {0}):' -f $(if ($MissingStateNotSaved -or $ResumeStateNotSaved) { 'run again without -Resume' } else { 'a -Resume collects them' })))
             foreach ($MissingSub in $Missing) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
