@@ -1004,9 +1004,12 @@ $CompletedIds = @($CompletedIds | Where-Object { $FailedIdsAtStart -notcontains 
 # Cloud Shell timeout), the failures live ONLY in the per-stream files while the
 # unified file is stale. Without this, -ResumeFailedOnly reads the unified file,
 # sees no failures, and wrongly reports "Nothing to retry" - silently dropping
-# the retry set. Read (do NOT delete) the per-stream files here so BOTH -Resume
-# (skip-completed) and -ResumeFailedOnly (retry list) see the full picture; the
-# end-of-run merge still owns per-stream cleanup. Safe on non-interrupted runs: a
+# the retry set. Read the per-stream files here so BOTH -Resume (skip-completed)
+# and -ResumeFailedOnly (retry list) see the full picture, write what they hold
+# into the unified file, and then remove the files that were read: a run that
+# does not reach the streams merge (sequential or one subscription) would
+# otherwise leave them, and every later run would fold the same old failure in
+# again and collect that subscription again. Safe on non-interrupted runs: a
 # cleanly-finished parallel run deletes its per-stream files, so this finds none.
 # Runs at startup before any stream is launched, so it cannot race live streams.
 if ($Resume -or $ResumeFailedOnly)
@@ -1016,13 +1019,16 @@ if ($Resume -or $ResumeFailedOnly)
     {
         $StrandedCompleted = @()
         $StrandedFailed = @()
+        # The files read: only these are removed once their records are saved.
+        $FoldedStreamFiles = @()
         foreach ($StreamFile in $StrandedStreamFiles)
         {
             try
             {
-                $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
+                $Obj = Get-Content -LiteralPath $StreamFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
+                $FoldedStreamFiles += $StreamFile
             }
             catch
             {
@@ -1043,10 +1049,38 @@ if ($Resume -or $ResumeFailedOnly)
         if ($StrandedCompleted.Count -gt 0 -or @($StrandedFailed).Count -gt 0)
         {
             Write-Host ("Recovered per-stream state from an interrupted parallel run: {0} completed, {1} failed subscription record(s)." -f $StrandedCompleted.Count, @($StrandedFailed).Count) -ForegroundColor Cyan
+        }
+        if ($FoldedStreamFiles.Count -gt 0)
+        {
             # Heal the unified file immediately so even a re-interrupted run keeps
-            # the recovered picture. Per-stream files are intentionally left for
-            # the end-of-run merge to reconcile and clean up.
+            # the recovered picture.
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            # The files read are removed only when the unified file on disk holds
+            # what they were folded into; otherwise they are kept, and the next
+            # run folds them in again.
+            $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            if ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+            {
+                foreach ($StreamFile in $FoldedStreamFiles)
+                {
+                    try { Remove-Item -LiteralPath $StreamFile.FullName -Force -ErrorAction Stop }
+                    catch
+                    {
+                        # A file left would be folded in again by every later run,
+                        # so its old failure would win over a newer completion and
+                        # the same subscription would be collected run after run.
+                        Write-Host ("ERROR: Could not remove the per-stream resume state file {0}: {1}. Its records are saved in {2}. Remove the file, then run again. Nothing was collected (exit 1)." -f $StreamFile.FullName, $_.Exception.Message, $ResumeStateFile) -ForegroundColor Red
+                        exit 1
+                    }
+                }
+            }
+            else
+            {
+                Write-Host ("WARNING: The resume state file {0} does not hold every record of the per-stream files of the interrupted run, so they are kept for the next run: {1}" -f $ResumeStateFile, (@($FoldedStreamFiles | ForEach-Object { $_.FullName }) -join ', ')) -ForegroundColor Yellow
+            }
         }
     }
 }
