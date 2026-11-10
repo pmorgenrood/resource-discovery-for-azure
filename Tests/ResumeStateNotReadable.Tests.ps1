@@ -58,6 +58,9 @@ $Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
 $Stage = Join-Path $Root ('stage-' + $Stamp)
 New-Item -ItemType Directory -Path $Folder, $Stage -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $Stage ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value ('{"VirtualMachines":[{"Name":"vm","Subscription":"' + $SubscriptionID + '"}]}') -Encoding utf8
+# As the collector does: an empty metrics list and the consumption header.
+Set-Content -LiteralPath (Join-Path $Stage ('Metrics_ResourcesReport_{0}.json' -f $Stamp)) -Value '{"Metrics":[]}' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $Stage ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)) -Value 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId' -Encoding utf8
 Set-Content -LiteralPath (Join-Path $Stage ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force

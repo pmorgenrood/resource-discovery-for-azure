@@ -47,6 +47,9 @@ $Stamp = (Get-Date -Format 'yyyyMMddHHmmssfff') + '-' + $SubscriptionID
 $Folder = Join-Path $Root ('ResourcesReport' + $Stamp)
 New-Item -ItemType Directory -Path $Folder -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $Folder ('Inventory_ResourcesReport_{0}.json' -f $Stamp)) -Value ('{"VirtualMachines":[{"Name":"vm","Subscription":"' + $SubscriptionID + '"}]}') -Encoding utf8
+# As the collector does: an empty metrics list and the consumption header.
+Set-Content -LiteralPath (Join-Path $Folder ('Metrics_ResourcesReport_{0}.json' -f $Stamp)) -Value '{"Metrics":[]}' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $Folder ('Consumption_ResourcesReport_{0}.csv' -f $Stamp)) -Value 'InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId' -Encoding utf8
 Set-Content -LiteralPath (Join-Path $Folder ('ResourcesReport_{0}.html' -f $Stamp)) -Value '<html></html>' -Encoding utf8
 $Global:Resources = @(1)
 $Global:ResourceCount = 1
@@ -62,7 +65,7 @@ if ([string]$Scenario.GoneBy -eq $SubscriptionID)
 if ([string]$Scenario.LockBy -eq $SubscriptionID) { & chmod 555 $Root }
 if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; return }
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
-Compress-Archive -Path (Join-Path $Folder '*.json') -DestinationPath $Zip -Force
+Compress-Archive -Path (Join-Path $Folder '*.json'), (Join-Path $Folder '*.csv') -DestinationPath $Zip -Force
 $Global:ZipOutputFile = $Zip
 # A subscription that writes its zip and then fails.
 if (@($Scenario.FailAfterZip) -contains $SubscriptionID) { throw 'stand-in failure after the report zip was written' }
