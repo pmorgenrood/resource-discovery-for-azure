@@ -999,8 +999,7 @@ Describe 'Get-RdaReportJsonFiles' {
         $Found | Should -Not -Contain ('Metrics_R_{0}__1_old.json' -f $Stamp)
         $Found | Should -Contain ('Metrics_R_{0}.json' -f $Stamp)
         $Found | Should -Contain ('Metrics_R_{0}__1.json' -f $Stamp)
-        if (-not $IsWindows) { $Found | Should -Contain ('METRICS_R_{0}_12.JSON' -f $Stamp) }
-        function Write-Log { param($Message, $Severity) }
+        $Found | Should -Contain ('METRICS_R_{0}_12.JSON' -f $Stamp)
         Test-RdaReportMetricsWritten -JsonFiles $Files | Should -BeTrue
     }
 }
@@ -1008,8 +1007,6 @@ Describe 'Get-RdaReportJsonFiles' {
 Describe 'Test-RdaReportInventoryWritten' {
     BeforeAll {
         . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
-        # A quiet stand-in, only for this block.
-        function Write-Log { param($Message, $Severity) }
     }
 
     It 'reads an Inventory file nested deeper than 64 levels, as ConvertTo-Json -Depth 100 can write it' {
