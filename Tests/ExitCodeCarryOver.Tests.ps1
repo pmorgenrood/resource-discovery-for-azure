@@ -276,7 +276,35 @@ function Import-AzContext
     }
     Get-RdaStandInContext
 }
-function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
+function Save-AzContext
+{
+    [CmdletBinding()] param($Path, [switch]$Force)
+    # With SnapshotPartialFail, the write stops part way (as on a full disk):
+    # part of the file is there, and the call throws.
+    if ((Get-RdaStandInScenario).SnapshotPartialFail)
+    {
+        Set-Content -LiteralPath $Path -Value '{"Contexts":' -NoNewline
+        throw 'stand-in: the disk is full'
+    }
+    Set-Content -LiteralPath $Path -Value '{}'
+}
+# With SnapshotPartialFail, the wrapper also cannot remove that part of the
+# context snapshot: Remove-Item fails as it does on a locked file, with a
+# non-terminating error, which a catch sees only with -ErrorAction Stop.
+if ((Get-RdaStandInScenario).SnapshotPartialFail)
+{
+    function Remove-Item
+    {
+        [CmdletBinding()] param([Parameter(Position = 0)]$Path, $LiteralPath, [switch]$Force, [switch]$Recurse)
+        $Target = if ($PSBoundParameters.ContainsKey('LiteralPath')) { [string]$LiteralPath } else { [string]$Path }
+        if ($Target -like '*.rda-stream-azcontext-*' -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1')
+        {
+            $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new([System.IO.IOException]::new('stand-in: the file is locked by another process'), 'RemoveFileSystemItemIOError', [System.Management.Automation.ErrorCategory]::WriteError, $Target))
+            return
+        }
+        Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+    }
+}
 function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
 function Get-AzContextAutosaveSetting { [CmdletBinding()] param($Scope) [pscustomobject]@{ Mode = 'Process'; ContextFile = 'None'; CacheFile = 'None' } }
 function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
@@ -412,7 +440,7 @@ function Get-UsageAggregates
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool)
+            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool, [switch]$SnapshotPartialFail, [switch]$Stream0Unparseable, [string]$Stream1StateJson = '')
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             # ReuseHome: the next run on the same machine, with the resume
             # state the run before left.
@@ -528,6 +556,21 @@ function Get-UsageAggregates
                 $Reports = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports') -Force
                 Set-Content -LiteralPath (Join-Path $Reports.FullName ('.resume-state-{0}-stream-7.json' -f $script:Tenant)) -Value '{"Tenant": "cut' -Encoding utf8
             }
+            if ($Stream0Unparseable)
+            {
+                # Stream 0's resume file from an earlier run, cut short: it
+                # can be read but is not valid JSON. This run's stream 0 then
+                # writes its own state over it.
+                $Reports = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports') -Force
+                Set-Content -LiteralPath (Join-Path $Reports.FullName ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Value '{"Tenant": "cut' -Encoding utf8
+            }
+            if ($Stream1StateJson)
+            {
+                # Stream 1's resume file from an earlier parallel run, as
+                # this text.
+                $Reports = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports') -Force
+                Set-Content -LiteralPath (Join-Path $Reports.FullName ('.resume-state-{0}-stream-1.json' -f $script:Tenant)) -Value $Stream1StateJson -Encoding utf8
+            }
             if ($Stream7LockedDuringRun.Count -gt 0)
             {
                 # Stream 7's resume file, holding these failures, is written
@@ -569,7 +612,7 @@ function Get-UsageAggregates
             }
             $RunWrapper = Join-Path $RunTool 'Run-AllSubscriptions.ps1'
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked; SnapshotPartialFail = [bool]$SnapshotPartialFail } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             # ConsumptionPageFail runs the consumption phase (see
             # Get-UsageAggregates in the stand-in), MetricsTokenFail the
@@ -794,11 +837,14 @@ function Get-UsageAggregates
     }
 
     It 'two streams: the verification-gap stop prints the Exit code lines, naming the sign-in skip and collector failures it hides' {
-        # Stream 0 (Sub A) reports Sub A and two more subscriptions that
+        # Stream 0 (Sub A, Sub X, Sub Y) reports its three subscriptions as
         # worked, with a collector failure and a Metrics sign-in skip, and
-        # names no zip for any of them, so reports are missing.
+        # names no zip for any of them, so reports are missing. (A summary
+        # holds a row only for the subscriptions its stream ran, so Sub X and
+        # Sub Y are in the run; Sub C fills stream 1.)
         $SubX = [guid]::new(('0' * 31) + 'e').ToString()
         $SubY = [guid]::new(('0' * 31) + 'f').ToString()
+        $RunSubs = @($script:SubA, $script:SubB, [pscustomobject]@{ Id = $SubX; Name = 'Sub X' }, $script:SubC, [pscustomobject]@{ Id = $SubY; Name = 'Sub Y' })
         $Forged = [pscustomobject]@{
             RunId             = '{RunId}'
             StreamId          = '0'
@@ -808,7 +854,7 @@ function Get-UsageAggregates
             CollectorFailures = @([pscustomobject]@{ Id = $SubX; Name = 'Sub X'; Module = 'StandIn'; Message = 'stand-in: this collector failed' })
             MetricsFailedSubs = @([pscustomobject]@{ Id = $SubX; Name = 'Sub X'; Message = 'stand-in: no token' })
         } | ConvertTo-Json -Depth 5
-        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamSummaryJson $Forged
+        $Run = Invoke-CarryOverRun -Subs $RunSubs -Streams 2 -StreamSummaryJson $Forged
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
         $Gap = 'Exit code 2: a report is missing (verification gap, see Per-subscription output verification failed); no consolidated zip was made.'
@@ -908,13 +954,14 @@ function Get-UsageAggregates
 
     It 'two streams: the zips of a stream whose summary could not be read do not hide the missing zip of a subscription that reported success' {
         # Stream-0 (Sub A, Sub C) writes two zips but its summary cannot be
-        # read; stream 1 runs Sub B (one zip) but reports Sub X too, which has
-        # no zip (Sub B's row names none either). Three zips for two
-        # successes must not pass the check.
+        # read; stream 1 runs Sub B and Sub X (two zips) but its summary
+        # names no zip for either. Four fresh zips for two successes must not
+        # pass the check. (A summary holds a row only for the subscriptions
+        # its stream ran, so Sub X is in the run.)
         $SubX = [pscustomobject]@{ Name = 'Sub X'; Id = [guid]::new(('0' * 31) + 'e').ToString(); Count = 1 }
         $RowB = [pscustomobject]@{ Name = $script:SubB.Name; Id = $script:SubB.Id; Count = 1 }
         $Forged = [pscustomobject]@{ RunId = '{RunId}'; StreamId = '1'; Status = 'ok'; ResourceCounts = @($RowB, $SubX); Failed = @() } | ConvertTo-Json -Depth 5
-        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -CorruptStreamSummary -Stream1SummaryJson $Forged
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC, [pscustomobject]@{ Id = $SubX.Id; Name = $SubX.Name }) -Streams 2 -CorruptStreamSummary -Stream1SummaryJson $Forged
         $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console
         $Run.Console | Should -Not -Match 'verification: OK' -Because $Run.Console
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
@@ -925,15 +972,16 @@ function Get-UsageAggregates
     }
 
     It 'two streams: a subscription whose named zip is gone fails the check, though other fresh zips are present' {
-        # Stream 1 runs Sub B but also reports Sub X with the zip its inner
-        # script named, and that zip is not on disk (as when antivirus
+        # Stream 1 runs Sub B and Sub X, and reports Sub X with the zip its
+        # inner script named, and that zip is not on disk (as when antivirus
         # removes it after it was written). Stream-0's zips (Sub A, Sub C,
-        # summary unreadable) and Sub B's zip are fresh, so only the path
-        # match can find Sub X's gap.
+        # summary unreadable) and stream 1's zips are fresh, so only the path
+        # match can find Sub X's gap. (A summary holds a row only for the
+        # subscriptions its stream ran, so Sub X is in the run.)
         $SubX = [pscustomobject]@{ Name = 'Sub X'; Id = [guid]::new(('0' * 31) + 'e').ToString(); Count = 1; Zip = '{Reports}/SubX/ResourcesReport_gone.zip' }
         $RowB = [pscustomobject]@{ Name = $script:SubB.Name; Id = $script:SubB.Id; Count = 1 }
         $Forged = [pscustomobject]@{ RunId = '{RunId}'; StreamId = '1'; Status = 'ok'; ResourceCounts = @($RowB, $SubX); Failed = @() } | ConvertTo-Json -Depth 5
-        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -CorruptStreamSummary -Stream1SummaryJson $Forged
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC, [pscustomobject]@{ Id = $SubX.Id; Name = $SubX.Name }) -Streams 2 -CorruptStreamSummary -Stream1SummaryJson $Forged
         $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console
         $Run.Console | Should -Not -Match 'verification: OK' -Because $Run.Console
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
@@ -1002,12 +1050,12 @@ function Get-UsageAggregates
     }
 
     It 'two streams: the verification-gap stop does not count a stream with no summary file as a failed subscription' {
-        # Stream 1 (Sub B) reports Sub B and four more subscriptions that
-        # worked, with no zip named, so the run stops at the output
-        # verification.
-        $Phantoms = @('6', '7', '8', '9' | ForEach-Object { [pscustomobject]@{ Name = ('Sub {0}' -f $_); Id = [guid]::new(('0' * 31) + $_).ToString(); Count = 1 } })
+        # Stream 1 (Sub B) reports Sub B as worked, with no zip named, so
+        # the run stops at the output verification. Its one success is not
+        # the 2 subscriptions of stream 0, whose summary is missing. (A
+        # summary holds a row only for the subscriptions its stream ran.)
         $RowB = [pscustomobject]@{ Name = $script:SubB.Name; Id = $script:SubB.Id; Count = 1 }
-        $Forged = [pscustomobject]@{ RunId = '{RunId}'; StreamId = '1'; Status = 'ok'; ResourceCounts = @($RowB) + $Phantoms; Failed = @() } | ConvertTo-Json -Depth 5
+        $Forged = [pscustomobject]@{ RunId = '{RunId}'; StreamId = '1'; Status = 'ok'; ResourceCounts = @($RowB); Failed = @() } | ConvertTo-Json -Depth 5
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -MissingStreamSummary -Stream1SummaryJson $Forged
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
         $Run.Console | Should -Not -Match 'Subscriptions Failed:' -Because $Run.Console
@@ -1369,6 +1417,44 @@ function Get-UsageAggregates
         $Run.Console | Should -Not -Match 'WARNING: kept [02-9]\d* stream resume state file' -Because $Run.Console
         $Run.Console | Should -Not -Match 'as the resume state could not be written' -Because 'this file was kept because it could not be parsed, not because a save failed'
         $Run.Console | Should -Not -Match 'were written to the stream resume state file' -Because 'the clean-up removed the summary-only file'
+    }
+
+    It 'two streams: a stream resume state file the start could not parse, which this run''s stream then wrote and the merge read, is named as kept for the failed resume state write, not as one this run could not read' {
+        # Stream 0's file from an earlier run is cut short, so the start
+        # cannot parse it. This run's stream 0 (Sub A, which fails) writes
+        # its state over it, and the merge reads it. The resume state cannot
+        # be written, and the run is not clean, so the kept files are named
+        # at once: both for the failed write.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -FailSub $script:SubA.Id -Stream0Unparseable -UnifiedStateBlocked
+        $Stream0 = Join-Path $Run.Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)
+        $Run.Console | Should -Match ([regex]::Escape(('WARNING: Could not read the stream resume state file {0}' -f $Stream0))) -Because 'the start could not parse it'
+        $Run.Console | Should -Match 'WARNING: Failed to persist resume state to ' -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        @((Get-Content -LiteralPath $Stream0 -Raw | ConvertFrom-Json).FailedAttempts.Id) | Should -Be @($script:SubA.Id) -Because 'stream 0 wrote its own state over the cut file'
+        $Run.Console | Should -Match ([regex]::Escape(('WARNING: kept 2 stream resume state file(s) in {0}, as the resume state could not be written' -f $Run.Root))) -Because $Run.Console
+        $Run.Console | Should -Not -Match 'that this run could not read' -Because 'this run read the file in its merge'
+    }
+
+    It 'sequential: the start reads a kept stream resume state file that holds [null] in its failures, from a stream where every subscription worked, as no failure' {
+        $Json = '{{"Tenant":"{0}","StreamId":"1","Completed":["{1}"],"FailedAttempts":[null]}}' -f $script:Tenant, $script:SubB.Id
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Stream1StateJson $Json
+        $Run.Console | Should -Match 'Read per-stream resume state left by an earlier parallel run \(stopped, or its resume state could not be written\): 1 completed, 0 failed subscription record\(s\)\.' -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0
+    }
+
+    It 'two streams: a context snapshot that is cut short and cannot then be removed is named with a warning, and the run stops with exit 1' {
+        # Save-AzContext writes part of the file and throws; Remove-Item on
+        # that file fails with a non-terminating error. The file can hold an
+        # Azure token cache, so the run must say it is still there.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -SnapshotPartialFail
+        $Run.ExitCode | Should -Be 1 -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('ERROR: could not snapshot Az context for stream workers: stand-in: the disk is full')) -Because $Run.Console
+        $Snapshot = @(Get-ChildItem -LiteralPath $Run.Root -Filter '.rda-stream-azcontext-*.json' -File -Force)
+        $Snapshot.Count | Should -Be 1 -Because 'the removal failed, so the part of the file is still there'
+        $Run.Console | Should -Match ([regex]::Escape(('WARNING: could not remove partial Az context snapshot at {0}: stand-in: the file is locked by another process' -f $Snapshot[0].FullName))) -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('  This file can contain an Azure token cache and should be deleted manually.')) -Because $Run.Console
+        $Run.Console | Should -Not -Match '\[stream-\d+\] queued' -Because 'no stream starts'
     }
 
     It 'two streams: when the resume state cannot be written, the old one is left as it was and every stream state file is kept; once it can be written, -ResumeFailedOnly retries the new failure only, and the run after has nothing to retry' {
