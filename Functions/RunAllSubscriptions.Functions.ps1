@@ -993,8 +993,9 @@ function New-PathTable
 # written with the same -Obfuscate setting as this run, so one bundle never mixes
 # obfuscated and real identifiers, and is not a file another subscription's
 # record already carried. Everything else is returned under Missing with the
-# reason. Cost: one file-exists check and one zip read per skipped
-# subscription; no Azure calls. Returns { Carried = @({ Id, Name, Zip, Folder }),
+# reason. Cost per skipped subscription: one file-exists check, one read of
+# the zip's directory, and Test-ReportZipReadable's read of the zip (every file
+# decoded, the three report files parsed); no Azure calls. Returns { Carried = @({ Id, Name, Zip, Folder }),
 # Missing = @({ Id, Name, Reason }) }, where Zip is the full path.
 function Get-ResumeCarriedReports
 {
@@ -1800,7 +1801,7 @@ function Test-ReportFileShape
 # each entry's Crc32 with one computed over its data if that must be caught.
 function Test-ReportZipReadable
 {
-    param([Parameter(Mandatory = $true)][string]$Path, [hashtable]$Cache)
+    param([Parameter(Mandatory = $true)][string]$Path, [System.Collections.IDictionary]$Cache)
     $Key = $null
     if ($null -ne $Cache)
     {
