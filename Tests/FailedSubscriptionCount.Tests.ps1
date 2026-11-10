@@ -10,6 +10,7 @@
 BeforeAll {
     $RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+    . (Join-Path $RepoRoot 'Functions/AllSubHtmlSummary.Functions.ps1')
     $script:WrapperText = Get-Content -LiteralPath (Join-Path $RepoRoot 'Run-AllSubscriptions.ps1') -Raw
     $script:Streams = @(
         [pscustomobject]@{ StreamId = 0; SummaryPath = 'x'; FailuresPath = 'y'; SubCount = 3 },
@@ -56,8 +57,8 @@ Describe 'RunSummary.log and the console line count subscriptions, not entries' 
     }
 
     It 'the wrapper passes the count to RunSummary.log and prints it on the console line' {
-        $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds)'))
-        $script:WrapperText | Should -Match ([regex]::Escape('Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds)'))
+        $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams)'))
+        $script:WrapperText | Should -Match ([regex]::Escape('Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams)'))
     }
 
     It 'the wrapper sets the stream lists before the sequential and parallel paths split, so a sequential run reads them under strict mode' {
@@ -65,10 +66,29 @@ Describe 'RunSummary.log and the console line count subscriptions, not entries' 
         $Top = @($Ast.EndBlock.Statements)
         $Split = @(0..($Top.Count - 1) | Where-Object { $Top[$_] -is [System.Management.Automation.Language.IfStatementAst] -and $Top[$_].Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' })
         $Split.Count | Should -Be 1
-        foreach ($Name in @('StreamSummaries', 'Slices'))
+        foreach ($Name in @('StreamSummaries', 'Slices', 'AllCompletedFromStreams'))
         {
             $Set = @(0..($Split[0] - 1) | Where-Object { $Top[$_].Extent.Text -eq ('${0} = @()' -f $Name) })
             $Set.Count | Should -Be 1 -Because ('${0} must be set before the split' -f $Name)
         }
+    }
+}
+
+Describe 'MainSummary.html counts subscriptions, not entries' {
+    It 'shows the count given in the Failed card, the banner and the console line, with the entries still named' {
+        $Run = Join-Path $TestDrive 'run'
+        New-Item -ItemType Directory -Path $Run -Force | Out-Null
+        $Out = Join-Path $Run 'main.html'
+        $Lines = @(New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -FailedSubscriptions @('stream-0 (no summary)') -FailedSubscriptionCount 3 6>&1 | ForEach-Object { [string]$_ })
+        $Html = Get-Content -LiteralPath $Out -Raw
+        $Html | Should -Match '<div class="n">3</div><div class="l">Failed</div>'
+        $Html | Should -Match '<b>3 subscription\(s\) failed to process\.</b>'
+        $Html | Should -Match 'stream-0 \(no summary\)'
+        @($Lines | Where-Object { $_ -like '*3 failed.*' }).Count | Should -Be 1
+    }
+
+    It 'the wrapper passes the same count to MainSummary.html' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams) `'))
+        ([regex]::Matches($script:WrapperText, [regex]::Escape('Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions'))).Count | Should -Be 3
     }
 }

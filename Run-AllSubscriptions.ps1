@@ -1331,6 +1331,9 @@ $SubResourceCounts = @()
 # run (Get-FailedSubscriptionCount); they stay empty on the sequential path.
 $StreamSummaries = @()
 $Slices = @()
+# What the streams' own state files record as completed this run (the
+# parallel end-of-run merge fills it).
+$AllCompletedFromStreams = @()
 
 if ($ParallelStreams -le 1)
 {
@@ -2394,6 +2397,7 @@ if ($null -ne $OuterZipFile)
         catch { Write-Verbose ("MainSummary: could not read Version.json: {0}" -f $_.Exception.Message) }
         New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime -IncludeFolders $CarriedFolderNames `
             -FailedSubscriptions $FailedSubscriptions `
+            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams) `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -CollectorFailures $Global:CollectorFailures `
@@ -2679,7 +2683,7 @@ if ($CollectorFailuresList.Count -gt 0)
 
 if ($FailedSubscriptions.Count -gt 0)
 {
-    Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds), ($FailedSubscriptions -join ', ')) -ForegroundColor Red
+    Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams), ($FailedSubscriptions -join ', ')) -ForegroundColor Red
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     Write-Host "Re-run with -Resume to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
     Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
@@ -2770,7 +2774,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -Eligible $EligibleCount -Processed ($EligibleCount - $SkippedCount) -Skipped $SkippedCount `
             -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined $UnknownSubs `
             -FailedSubscriptions $FailedSubscriptions `
-            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds) `
+            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams) `
             -CollectorFailures $Global:CollectorFailures `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
