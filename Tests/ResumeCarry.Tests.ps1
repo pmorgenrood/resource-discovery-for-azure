@@ -506,6 +506,25 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $Took.TotalSeconds | Should -BeLessThan 60
     }
 
+    It 'keeps two report zips apart in the wrapper''s cache when their paths differ only in case, on Linux' -Skip:(-not $IsLinux) {
+        $Dir = Join-Path $script:Root 'case-cache'
+        $null = New-Item -ItemType Directory -Path $Dir -Force
+        $Good = Join-Path $Dir 'R.zip'
+        $Bad = Join-Path $Dir 'r.zip'
+        Copy-Item -LiteralPath $script:Zip -Destination $Good -Force
+        # The same length and write time, its packed data spoiled.
+        $Bytes = [System.IO.File]::ReadAllBytes($Good)
+        foreach ($K in 40..([math]::Min(400, $Bytes.Length - 30))) { $Bytes[$K] = 255 }
+        [System.IO.File]::WriteAllBytes($Bad, $Bytes)
+        (Get-Item -LiteralPath $Bad).LastWriteTimeUtc = (Get-Item -LiteralPath $Good).LastWriteTimeUtc
+        # The cache the wrapper makes for its zip checks.
+        $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Src | Should -Match ([regex]::Escape('$ReportZipChecks = New-PathTable'))
+        $Cache = New-PathTable
+        Test-ReportZipReadable -Path $Good -Cache $Cache | Should -BeTrue
+        Test-ReportZipReadable -Path $Bad -Cache $Cache | Should -BeFalse
+    }
+
     It 'reads a report zip once per run when given the same cache' {
         $Copy = Join-Path $script:Root 'cache-check.zip'
         Copy-Item -LiteralPath $script:Zip -Destination $Copy -Force

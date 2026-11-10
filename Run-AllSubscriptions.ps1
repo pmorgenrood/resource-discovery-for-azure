@@ -2323,7 +2323,8 @@ $MissingReportCount = 0
 # completed (the save did not reach the disk): a -Resume would skip it.
 $MissingStateNotSaved = $false
 # Each report zip is read once in this run (see Test-ReportZipReadable).
-$ReportZipChecks = @{}
+# Keyed by path, compared as the file system does (New-PathTable).
+$ReportZipChecks = New-PathTable
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
     $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
