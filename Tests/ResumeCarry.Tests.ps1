@@ -359,6 +359,20 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport5dddd/ResourcesReport_5dddd.zip'; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false
         @($R.Carried).Count | Should -Be 0
         @($R.Missing).Count | Should -Be 1
+
+        # The same for an empty metrics or consumption file beside a good inventory.
+        foreach ($Odd in 'Metrics_ResourcesReport_6eeee.json', 'Consumption_ResourcesReport_6eeee.csv')
+        {
+            $OddZip = Join-Path $script:Root ('odd-{0}.zip' -f ($Odd -replace '\W', ''))
+            $Z = [System.IO.Compression.ZipFile]::Open($OddZip, 'Create')
+            try
+            {
+                $W = [System.IO.StreamWriter]::new($Z.CreateEntry('Inventory_ResourcesReport_6eeee.json', 'Optimal').Open()); try { $W.Write('{}') } finally { $W.Dispose() }
+                $null = $Z.CreateEntry($Odd, 'Optimal')
+            }
+            finally { $Z.Dispose() }
+            Test-ReportZipReadable -Path $OddZip | Should -BeFalse -Because ('{0} is empty' -f $Odd)
+        }
     }
 
     It 'counts a report zip whose metrics or consumption file is damaged as unreadable, though its inventory reads' -ForEach @(@{ Member = 'Metrics_ResourcesReport_5dddd.json' }, @{ Member = 'Consumption_ResourcesReport_5dddd.csv' }) {
