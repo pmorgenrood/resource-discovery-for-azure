@@ -1358,18 +1358,28 @@ function Test-ConsumptionAccess
 
 # How many subscriptions the end-of-run failure list stands for. A
 # 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry stands for the
-# subscriptions of that stream's slice (SubCount in -StreamSummaries); every
-# other entry is one subscription.
+# subscriptions of that stream's slice (-Slices, by stream number) that are not
+# completed (-CompletedIds: its own state file can record some it finished
+# before it stopped), at least one; without the slice, for SubCount in
+# -StreamSummaries. Every other entry is one subscription.
 function Get-FailedSubscriptionCount
 {
-    param($FailedSubscriptions = @(), $StreamSummaries = @())
+    param($FailedSubscriptions = @(), $StreamSummaries = @(), $Slices = @(), $CompletedIds = @())
+    $Done = @(@($CompletedIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $SliceList = @($Slices)
     $Count = 0
     foreach ($Entry in @(@($FailedSubscriptions) | Where-Object { $null -ne $_ }))
     {
         if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no|corrupt) summary\)$')
         {
-            $Id = $Matches[1]
-            $Stream = @(@($StreamSummaries) | Where-Object { $null -ne $_ -and [string]$_.StreamId -eq $Id }) | Select-Object -First 1
+            $Id = [int]$Matches[1]
+            if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
+            {
+                $Left = @(@($SliceList[$Id]) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
+                $Count += [math]::Max(1, $Left.Count)
+                continue
+            }
+            $Stream = @(@($StreamSummaries) | Where-Object { $null -ne $_ -and [string]$_.StreamId -eq [string]$Id }) | Select-Object -First 1
             if ($null -ne $Stream -and $Stream.PSObject.Properties['SubCount'] -and [int]$Stream.SubCount -gt 0) { $Count += [int]$Stream.SubCount; continue }
         }
         $Count++

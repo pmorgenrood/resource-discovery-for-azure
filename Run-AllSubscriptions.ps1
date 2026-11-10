@@ -1327,6 +1327,10 @@ $DiagFile = $null
 # explanation is that the signed-in identity does not have Reader on the
 # subscription, but it can also legitimately mean the subscription is empty).
 $SubResourceCounts = @()
+# The streams of the parallel path and their slices, read at the end of every
+# run (Get-FailedSubscriptionCount); they stay empty on the sequential path.
+$StreamSummaries = @()
+$Slices = @()
 
 if ($ParallelStreams -le 1)
 {
@@ -2675,7 +2679,7 @@ if ($CollectorFailuresList.Count -gt 0)
 
 if ($FailedSubscriptions.Count -gt 0)
 {
-    Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries), ($FailedSubscriptions -join ', ')) -ForegroundColor Red
+    Write-Host ("Subscriptions Failed:    {0} ({1})" -f (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds), ($FailedSubscriptions -join ', ')) -ForegroundColor Red
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     Write-Host "Re-run with -Resume to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
     Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
@@ -2766,7 +2770,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -Eligible $EligibleCount -Processed ($EligibleCount - $SkippedCount) -Skipped $SkippedCount `
             -EmptyNoAccess $NoAccessSubs -EmptyGenuinelyEmpty $GenuinelyEmptySubs -EmptyUndetermined $UnknownSubs `
             -FailedSubscriptions $FailedSubscriptions `
-            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries) `
+            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $CompletedIds) `
             -CollectorFailures $Global:CollectorFailures `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
