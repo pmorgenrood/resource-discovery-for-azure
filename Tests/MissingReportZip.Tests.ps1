@@ -353,7 +353,9 @@ Describe 'RunSummary.log advice for a missing report' {
         @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
     }
 
-    It 'the wrapper passes the flag' {
-        (Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw) | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
+    It 'the wrapper passes the flag, raised by a failed save of the resume state too, and the console says the same' {
+        $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:($MissingStateNotSaved -or $ResumeStateSaveFailed) `'))
+        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved -or $ResumeStateSaveFailed)'))
     }
 }
