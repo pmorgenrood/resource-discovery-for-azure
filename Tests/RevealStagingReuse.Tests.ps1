@@ -148,3 +148,46 @@ Describe 'Reveal.ps1 -Resume -RemoveStaging with an older output the mark record
         Get-ZipNames (Join-Path $script:WorkDir 'again.zip') | Should -Be @('ResourcesReport_20260202000000000cccc.zip')
     }
 }
+
+# -RemoveStaging took any file at the -OutputZip path as proof that this run
+# built the outer zip. A resumed run whose recorded report was moved out of
+# the inventory root builds no bundle, so with an -OutputZip that already
+# existed (an older, possibly stale bundle) it deleted the staged output the
+# mark records and the mark itself, and the next -Resume had nothing to
+# recover. Staging is now removed only after this run moved its own outer zip
+# into place.
+Describe 'Reveal.ps1 -Resume -RemoveStaging that builds no outer zip, with an -OutputZip that already exists' {
+    BeforeAll {
+        $script:Root = Join-Path $script:WorkDir 'root3'
+        $script:Staging = Join-Path $script:WorkDir 'staging3'
+        $script:Bundle = Join-Path $script:WorkDir 'existing.zip'
+        Add-Report -Folder (Join-Path $script:Root 'ResourcesReport20260101000000000dddd') -Stamp '20260101000000000dddd' -SubId '00000000-0000-0000-0000-00000000000d'
+        $script:Run1 = Invoke-Reveal -Root $script:Root -Staging $script:Staging -Bundle $script:Bundle
+        $script:StagedBefore = Get-FolderNames $script:Staging
+        # The report folder is moved away; the root is left with a folder that
+        # holds no report, and the bundle from run 1 stays at the -OutputZip path.
+        Move-Item -LiteralPath (Join-Path $script:Root 'ResourcesReport20260101000000000dddd') -Destination (Join-Path $script:WorkDir 'moved-away-dddd')
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:Root 'notes') -Force
+        $script:BundleHashBefore = (Get-FileHash -LiteralPath $script:Bundle -Algorithm SHA256).Hash
+        $script:Run2 = Invoke-Reveal -Root $script:Root -Staging $script:Staging -Bundle $script:Bundle -Extra @('-Resume', '-RemoveStaging')
+    }
+
+    It 'run 1 reveals the report and writes the bundle' {
+        $script:Run1.Exit | Should -Be 0 -Because $script:Run1.Text
+        $script:StagedBefore | Should -Contain 'ResourcesReport_20260101000000000dddd.zip'
+        $script:StagedBefore | Should -Contain '.reveal-staging.json'
+    }
+
+    It 'run 2 removes nothing from staging and keeps the mark' {
+        Test-Path -LiteralPath $script:Staging | Should -BeTrue -Because $script:Run2.Text
+        Test-Path -LiteralPath (Join-Path $script:Staging 'ResourcesReport_20260101000000000dddd.zip') | Should -BeTrue -Because $script:Run2.Text
+        Test-Path -LiteralPath (Join-Path $script:Staging '.reveal-staging.json') | Should -BeTrue -Because $script:Run2.Text
+        $script:Run2.Text | Should -Not -Match 'Removed staging directory'
+        $script:Run2.Text | Should -Not -Match 'Removed the revealed zips from staging'
+    }
+
+    It 'run 2 leaves the existing -OutputZip as it was and does not say it is ready to upload' {
+        (Get-FileHash -LiteralPath $script:Bundle -Algorithm SHA256).Hash | Should -Be $script:BundleHashBefore
+        $script:Run2.Text | Should -Not -Match 'Upload this single zip'
+    }
+}
