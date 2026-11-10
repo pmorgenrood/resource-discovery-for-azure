@@ -974,14 +974,26 @@ function Get-LatestCompletedReports
     return $ById
 }
 
+# A table keyed by file path that compares paths the way the platform's usual
+# file system does: exact case on Linux, case ignored on Windows and macOS.
+# shortcut: a case-sensitive macOS volume or a case-folding Linux folder is
+# compared the other way; read the volume's own rule if one must be supported.
+function New-PathTable
+{
+    if ($IsLinux) { return [hashtable]::new([System.StringComparer]::Ordinal) }
+    return [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+}
+
 # Decide, for each subscription a -Resume run skipped because an earlier run
 # completed it, whether that earlier run's report zip can go into this run's
 # consolidated zip. A record is carried only when its path is a relative path
 # inside the inventory root, names a .zip that is not a de-obfuscated
-# (*_revealed*) copy, exists, opens as a zip with at least one entry, and was
+# (*_revealed*) copy, exists, opens as a zip with at least one entry, passes
+# Test-ReportZipReadable (its three report files are there and readable), was
 # written with the same -Obfuscate setting as this run, so one bundle never mixes
-# obfuscated and real identifiers. Everything else is returned under Missing with
-# the reason. Cost: one file-exists check and one zip-directory read per skipped
+# obfuscated and real identifiers, and is not a file another subscription's
+# record already carried. Everything else is returned under Missing with the
+# reason. Cost: one file-exists check and one zip read per skipped
 # subscription; no Azure calls. Returns { Carried = @({ Id, Name, Zip, Folder }),
 # Missing = @({ Id, Name, Reason }) }, where Zip is the full path.
 function Get-ResumeCarriedReports
@@ -1000,7 +1012,7 @@ function Get-ResumeCarriedReports
     # subscription's report, so a second record naming the same file is not
     # carried (Join-CarriedReportZips would add the file once, and the count of
     # expected reports would never match).
-    $SeenZips = @{}
+    $SeenZips = New-PathTable
     foreach ($Sub in @($SkippedSubscriptions))
     {
         if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
@@ -1117,7 +1129,7 @@ function Get-ResumeCarriedReports
 function Join-CarriedReportZips
 {
     param([object]$Zips = @(), [object]$CarriedReports = @())
-    $Seen = @{}
+    $Seen = New-PathTable
     $Result = @()
     $CarriedItems = @(foreach ($C in @($CarriedReports)) { if ($null -ne $C -and -not [string]::IsNullOrWhiteSpace([string]$C.Zip)) { Get-Item -LiteralPath $C.Zip -ErrorAction SilentlyContinue } })
     foreach ($Item in @(@($Zips) + $CarriedItems))

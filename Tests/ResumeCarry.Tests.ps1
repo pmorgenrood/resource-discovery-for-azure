@@ -346,6 +346,20 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $R.Missing[0].Reason | Should -Be ('its report zip is the one recorded for sub-a, and one zip holds one subscription''s report: {0}' -f $script:Rel)
     }
 
+    It 'carries two report zips whose paths differ only in case on Linux, where they are two files' -Skip:(-not $IsLinux) {
+        $Upper = script:New-TestReport -Root $script:Root -Stamp '2AAAA'
+        $UpperRel = Join-Path 'ResourcesReport2AAAA' 'ResourcesReport_2AAAA.zip'
+        $SubB = [pscustomobject]@{ Id = 'sub-b'; Name = 'B' }
+        $Recs = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = $script:Rel; Obfuscated = $false }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = $UpperRel; Obfuscated = $false }
+        )
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA, $SubB) -Reports $Recs -InventoryRoot $script:Root -Obfuscated $false
+        @($R.Carried | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b')
+        @($R.Missing) | Should -BeNullOrEmpty
+        @(Join-CarriedReportZips -CarriedReports $R.Carried).Count | Should -Be 2
+    }
+
     It 'names a recorded zip that holds no Inventory_*.json, or one whose inventory cannot be read to its end' {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $HtmlOnly = Join-Path $script:Root 'ResourcesReport3bbbb/ResourcesReport_3bbbb.zip'
