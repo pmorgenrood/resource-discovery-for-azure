@@ -3105,7 +3105,7 @@ if ($null -ne $BundleBuildError)
     # A zip that failed after the clean-run clear above (when it took its name,
     # or while the run summary was added): the state is saved again, so the
     # next -Resume carries the completed reports into a new zip.
-    if (-not $InventoryFolderGone -and (Test-Path -LiteralPath $InventoryRoot -PathType Container) -and -not (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) -and @($CompletedIds).Count -gt 0)
+    if (@($CompletedIds).Count -gt 0 -and -not [string]::IsNullOrEmpty($ResumeStateFile) -and -not $InventoryFolderGone -and (Test-Path -LiteralPath $InventoryRoot -PathType Container) -and -not (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
     {
         Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) { Write-Host 'The resume state is kept (written again): run again with -Resume to carry the completed reports into a new consolidated zip.' -ForegroundColor Yellow }
