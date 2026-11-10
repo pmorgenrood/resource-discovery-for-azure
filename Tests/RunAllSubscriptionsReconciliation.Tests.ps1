@@ -442,6 +442,13 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Lines | Should -Not -Contain '  -  ()'
     }
 
+    It 'does not count the sign-in skip of the whole consumption phase as a failed subscription, and says the phase was skipped' {
+        $Lines = @(Get-RunSummaryLogContent -ConsumptionFailedSubs @([pscustomobject]@{ Name = '(all)'; Id = '(auth)'; Message = 'stand-in' }))
+        $Lines | Should -Contain '  Consumption failed subs       : 0'
+        $Lines | Should -Contain '  Consumption phase skipped     : yes (sign-in)'
+        $Lines | Should -Not -Contain '  - (all) ((auth)): stand-in'
+    }
+
     It 'still names a failed subscription given as an object with Name and Id' {
         $Lines = @(Get-RunSummaryLogContent -FailedSubscriptions $script:Failed)
         $Lines | Should -Contain '  - Contoso-Prod-Sub (11111111-1111-1111-1111-111111111111)'

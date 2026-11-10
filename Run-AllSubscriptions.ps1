@@ -1918,7 +1918,8 @@ else
                 {
                     foreach ($f in $StreamSummary.Failed)
                     {
-                        $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $f.Name, $S.StreamId, $f.Reason)
+                        # By name and id, as on the sequential path.
+                        $FailedSubscriptions += ("{0} ({1}) (stream-{2}: {3})" -f $f.Name, $f.Id, $S.StreamId, $f.Reason)
                     }
                     # The subs this stream attempted and failed this run, for the
                     # merge of per-stream state below. A stream that did not start

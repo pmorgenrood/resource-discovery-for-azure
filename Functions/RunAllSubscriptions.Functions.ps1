@@ -1427,7 +1427,10 @@ function Get-RunSummaryLogContent
     $Failed = @(@($FailedSubscriptions) | Where-Object { $null -ne $_ })
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
-    $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+    # The '(auth)' marker of a whole-phase sign-in skip is not a subscription
+    # (that skip is counted under the phases skipped for the sign-in).
+    $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -ne '(auth)' })
+    $ConsumptionPhaseSkipped = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
     $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
@@ -1548,6 +1551,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
+    if ($ConsumptionPhaseSkipped) { $Lines.Add('  Consumption phase skipped     : yes (sign-in)') }
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where
     # real names already appear throughout the report. An obfuscated bundle stops

@@ -344,6 +344,16 @@ Describe 'Failed subscriptions of the same name at the end of a run' -Skip:$IsWi
         $Run.ExitCode | Should -Be 2
         @($Run.Text | Where-Object { $_ -like 'Subscriptions Failed:*' }) | Should -Be @('Subscriptions Failed:    2 (Same Name (sub-same-1), Same Name (sub-same-2))')
     }
+
+    It 'are listed apart, each with its id (two streams)' {
+        $S1 = @{ Id = 'sub-same-1'; Name = 'Same Name' }
+        $S2 = @{ Id = 'sub-same-2'; Name = 'Same Name' }
+        script:Set-Scenario -Subs $script:A, $S1, $S2 -Fail $S1.Id, $S2.Id
+        $Run = script:Invoke-Wrapper -Streams 2
+        $Line = @($Run.Text | Where-Object { $_ -like 'Subscriptions Failed:*' })[0]
+        $Line | Should -BeLike '*Same Name (sub-same-1) (stream-*'
+        $Line | Should -BeLike '*Same Name (sub-same-2) (stream-*'
+    }
 }
 
 Describe 'Two -Resume runs in a row after a not-readable subscription was skipped' -Skip:$IsWindows {
