@@ -1141,6 +1141,10 @@ try
             Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
             ForEach-Object { Get-Item -LiteralPath $_ })
     $ConsolidationError = $null
+    # Set only once this run has moved its own outer zip into place. A file
+    # already at the -OutputZip path is not proof of that: it can be an older
+    # bundle, and a resumed run that built none must not then clear staging.
+    $OuterZipBuilt = $false
     if ($StagedZips.Count -gt 0)
     {
         try
@@ -1157,6 +1161,7 @@ try
             # and the run does not say it is ready to upload.
             Assert-RevealZipWithinLimits -Path $OutputZipPartial -What 'outer zip'
             [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
+            $OuterZipBuilt = $true
         }
         catch
         {
@@ -1194,7 +1199,7 @@ try
     }
 
     Write-Host ""
-    if ($null -eq $ConsolidationError -and $StagedZips.Count -gt 0 -and (Test-Path -LiteralPath $OutputZip))
+    if ($OuterZipBuilt)
     {
         Write-Host ("Consolidated {0} revealed report(s) into:" -f $StagedZips.Count) -ForegroundColor Green
         Write-Host ("  {0}" -f $OutputZip) -ForegroundColor Green
@@ -1217,7 +1222,7 @@ try
     # staged zips are the only record of what already completed - deleting them
     # would defeat a later -Resume. So keep staging and say why.
     $CleanRun = ($FailedItems.Count -eq 0 -and $null -eq $ConsolidationError)
-    if ($RemoveStaging -and $CleanRun -and (Test-Path -LiteralPath $OutputZip))
+    if ($RemoveStaging -and $CleanRun -and $OuterZipBuilt)
     {
         try
         {
@@ -1302,6 +1307,13 @@ try
         {
             Write-Host "-RemoveStaging skipped: the outer zip could not be built (see above). Staging kept: fix the cause, then re-run with -Resume, or zip the revealed reports by hand:" -ForegroundColor Yellow
         }
+        Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
+    }
+    elseif ($RemoveStaging)
+    {
+        # A clean run that built no outer zip (no report revealed or resumed):
+        # staging may still hold finished outputs a later -Resume can use.
+        Write-Host "-RemoveStaging skipped: this run built no outer zip, so staging is kept for a later -Resume:" -ForegroundColor Yellow
         Write-Host ("  {0}" -f $StagingDirectory) -ForegroundColor Yellow
     }
     else
