@@ -406,6 +406,9 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         @{ Case = 'its metrics file is not JSON'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = 'Metrics'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'its consumption file lacks a column downstream needs'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterName,MeterId' } }
         @{ Case = 'its inventory is not JSON though it starts and ends with braces'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'a needed consumption header is in another case'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'resourceid,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'a needed consumption header has a space around it'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId, MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'a quoted needed consumption header has a space inside the quotes'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = '"ResourceId","MeterCategory ","MeterSubCategory","MeterName","MeterId"' } }
         @{ Case = 'its metrics file has no Metrics list'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
     ) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
