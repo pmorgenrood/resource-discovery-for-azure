@@ -1318,14 +1318,34 @@ finally
     # any output or partial file it wrote that the mark does not record as
     # finished. Otherwise the next run could take the lock while a child still
     # writes into staging. A job already reaped is in $Running only when the
-    # run stopped while reaping it; its finished output is recorded and kept.
+    # run stopped while reaping it. Its output is kept only when the mark saved
+    # on disk (read again here, through the one ownership check) records it
+    # with the file's current SHA-256: the in-memory record is filled before
+    # the mark is saved, so a stop in between must not keep an output the
+    # saved mark does not record.
+    $SavedOutputs = $null
+    if (@($Running | Where-Object { $null -ne $_ }).Count -gt 0)
+    {
+        try
+        {
+            $SavedMarker = Read-RevealStagingMarker -Path $StagingMarkerPath
+            if ($null -eq (Get-RevealOwnMarkerProblem -Marker $SavedMarker -Folder $StagingDirectory)) { $SavedOutputs = $SavedMarker.Data['Outputs'] }
+        }
+        catch { $SavedOutputs = $null }
+    }
     foreach ($R in @($Running))
     {
         if ($null -eq $R) { continue }
         try { Stop-Job -Job $R.Job -ErrorAction SilentlyContinue } catch { $null = $_ }
         try { Remove-Job -Job $R.Job -Force -ErrorAction SilentlyContinue } catch { $null = $_ }
         Remove-Item -LiteralPath $R.Item.TempDir -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not $StagingOutputs.Contains($R.Item.OutName))
+        $KeepOutput = $false
+        if ($null -ne $SavedOutputs -and $SavedOutputs.Contains($R.Item.OutName) -and (Test-Path -LiteralPath $R.Item.OutPath -PathType Leaf))
+        {
+            try { $KeepOutput = (Get-RevealFileSha256 $R.Item.OutPath) -ceq [string]$SavedOutputs[$R.Item.OutName]['Sha256'] }
+            catch { $KeepOutput = $false }
+        }
+        if (-not $KeepOutput)
         {
             Remove-Item -LiteralPath $R.Item.OutPath -Force -ErrorAction SilentlyContinue
         }

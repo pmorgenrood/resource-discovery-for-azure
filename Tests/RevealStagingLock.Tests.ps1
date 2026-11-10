@@ -279,6 +279,109 @@ Describe 'Reveal.ps1 releases the staging lock on every stop' -Skip:$IsWindows {
         Assert-LockFree $Case
         Get-Process -Id $ChildPid -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
+
+    It 'after the run is stopped while it saves the mark of a finished output, and removes the output the saved mark does not record' {
+        $Case = New-Case -Name 'stop-save'
+        $Probe = Join-Path $Case.Dir 'probe'
+        $null = New-Item -ItemType Directory -Path $Probe -Force
+        $Host_ = [powershell]::Create()
+        try
+        {
+            $null = $Host_.AddScript({
+                    param($Reveal, $Root, $Staging, $Bundle, $Probe)
+                    # A quick stand-in for the reveal job: it writes the staged
+                    # output and ends, so the run records it as finished.
+                    Set-Alias -Name Start-Job -Value Start-StandInJob
+                    function Start-StandInJob
+                    {
+                        param([scriptblock]$ScriptBlock, [object[]]$ArgumentList)
+                        Microsoft.PowerShell.Core\Start-Job -ArgumentList $ArgumentList -ScriptBlock {
+                            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory)
+                            [System.IO.File]::WriteAllText($OutputZip, 'finished output')
+                        }
+                    }
+                    # A stand-in for the mark save: the first save (no outputs
+                    # yet) is the real one; the save of the finished output
+                    # stops after the run has put it in its in-memory record and
+                    # before the mark on disk records it, until the run is stopped.
+                    Set-Alias -Name Save-RevealStagingMarker -Value Save-StandInMarker
+                    function Save-StandInMarker
+                    {
+                        if ($StagingOutputs.Count -eq 0)
+                        {
+                            & (Get-Command -Name Save-RevealStagingMarker -CommandType Function)
+                            return
+                        }
+                        [System.IO.File]::WriteAllText((Join-Path $Probe 'saving'), 'saving')
+                        while ($true) { Start-Sleep -Milliseconds 50 }
+                    }
+                    & $Reveal -InventoryRoot $Root -StagingDirectory $Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 *> $null
+                }).AddArgument($script:Reveal).AddArgument($Case.Root).AddArgument($Case.Staging).AddArgument((Join-Path $Case.Dir 'bundle.zip')).AddArgument($Probe)
+            $Async = $Host_.BeginInvoke()
+            $SavingFile = Join-Path $Probe 'saving'
+            $Deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $SavingFile) -and [DateTime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 200 }
+            Test-Path -LiteralPath $SavingFile | Should -BeTrue -Because 'the run must be saving the mark of its finished output before it is stopped'
+            # Stop the run as Ctrl+C does; Stop returns once its finally has run.
+            $Host_.Stop()
+            $null = $Async.AsyncWaitHandle.WaitOne(30000)
+        }
+        finally { $Host_.Dispose() }
+
+        $Saved = Get-Content -LiteralPath (Join-Path $Case.Staging '.reveal-staging.json') -Raw | ConvertFrom-Json -AsHashtable
+        $Saved['Outputs'].Count | Should -Be 0 -Because 'the stand-in kept the mark on disk from recording the output'
+        $Left = @(Get-ChildItem -LiteralPath $Case.Staging -Recurse -Force -File | Where-Object { $_.Name -ne '.reveal-lock' -and $_.Name -ne '.reveal-staging.json' } | ForEach-Object { $_.FullName.Substring($Case.Staging.Length) })
+        $Left | Should -BeNullOrEmpty -Because 'an output the saved mark does not record must not be kept'
+        Test-Path -LiteralPath (Join-Path $Case.Dir 'bundle.zip') | Should -BeFalse
+        # A fresh run into the folder is accepted.
+        Assert-LockFree $Case
+    }
+
+    It 'after the run is stopped just after it saved the mark of a finished output, and keeps that recorded output' {
+        $Case = New-Case -Name 'stop-saved'
+        $Probe = Join-Path $Case.Dir 'probe'
+        $null = New-Item -ItemType Directory -Path $Probe -Force
+        $Host_ = [powershell]::Create()
+        try
+        {
+            $null = $Host_.AddScript({
+                    param($Reveal, $Root, $Staging, $Bundle, $Probe)
+                    Set-Alias -Name Start-Job -Value Start-StandInJob
+                    function Start-StandInJob
+                    {
+                        param([scriptblock]$ScriptBlock, [object[]]$ArgumentList)
+                        Microsoft.PowerShell.Core\Start-Job -ArgumentList $ArgumentList -ScriptBlock {
+                            param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip, $TempDirectory)
+                            [System.IO.File]::WriteAllText($OutputZip, 'finished output')
+                        }
+                    }
+                    # Every save is the real one; after the save that records
+                    # the finished output, the run waits until it is stopped.
+                    Set-Alias -Name Save-RevealStagingMarker -Value Save-StandInMarker
+                    function Save-StandInMarker
+                    {
+                        & (Get-Command -Name Save-RevealStagingMarker -CommandType Function)
+                        if ($StagingOutputs.Count -eq 0) { return }
+                        [System.IO.File]::WriteAllText((Join-Path $Probe 'saved'), 'saved')
+                        while ($true) { Start-Sleep -Milliseconds 50 }
+                    }
+                    & $Reveal -InventoryRoot $Root -StagingDirectory $Staging -OutputZip $Bundle -FolderTimeoutMinutes 5 *> $null
+                }).AddArgument($script:Reveal).AddArgument($Case.Root).AddArgument($Case.Staging).AddArgument((Join-Path $Case.Dir 'bundle.zip')).AddArgument($Probe)
+            $Async = $Host_.BeginInvoke()
+            $SavedFile = Join-Path $Probe 'saved'
+            $Deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $SavedFile) -and [DateTime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 200 }
+            Test-Path -LiteralPath $SavedFile | Should -BeTrue -Because 'the run must have saved the mark of its finished output before it is stopped'
+            $Host_.Stop()
+            $null = $Async.AsyncWaitHandle.WaitOne(30000)
+        }
+        finally { $Host_.Dispose() }
+
+        $Output = Join-Path $Case.Staging 'ResourcesReport_good.zip'
+        Test-Path -LiteralPath $Output -PathType Leaf | Should -BeTrue -Because 'an output the saved mark records with its SHA-256 is kept'
+        $Saved = Get-Content -LiteralPath (Join-Path $Case.Staging '.reveal-staging.json') -Raw | ConvertFrom-Json -AsHashtable
+        $Saved['Outputs']['ResourcesReport_good.zip']['Sha256'] | Should -BeExactly (Get-FileHash -LiteralPath $Output -Algorithm SHA256).Hash
+    }
 }
 
 Describe 'Remove-RevealStagingLock' -Skip:$IsWindows {
