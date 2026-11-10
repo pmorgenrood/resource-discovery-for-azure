@@ -58,6 +58,8 @@ if ([string]$Scenario.GoneBy -eq $SubscriptionID)
     # The resume state can no longer be written (as on a full disk).
     if ($Scenario.LockState) { & chmod 555 $Root }
 }
+# The resume state can no longer be written from this subscription on (as on a full disk).
+if ([string]$Scenario.LockBy -eq $SubscriptionID) { & chmod 555 $Root }
 if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; return }
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Folder '*.json') -DestinationPath $Zip -Force
@@ -155,8 +157,8 @@ exit 1
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState, [string[]]$FailAfterZip = @())
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState; FailAfterZip = @($FailAfterZip) } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState, [string[]]$FailAfterZip = @(), [string]$LockBy = '')
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState; FailAfterZip = @($FailAfterZip); LockBy = $LockBy } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -314,6 +316,27 @@ Describe 'A report zip lost when the resume state cannot be written either' -Ski
             $R1.ExitCode | Should -Be 2
             @($R1.Text | Where-Object { $_ -like 'The resume state file * could not be updated and still lists some of them as completed*run again without -Resume*' }).Count | Should -Be 1
             @($R1.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
+        }
+        finally { & chmod 755 $script:Root }
+    }
+}
+
+Describe 'A subscription that wrote no zip while the resume state cannot be updated' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
+    It 'says to run again without -Resume, since the state still lists it as completed' {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        # An earlier run completed A and B and failed C, so its state is kept.
+        script:Set-Scenario -FailAfterZip @($C.Id)
+        $null = script:Invoke-Wrapper -Streams 1
+        # This run, without -Resume: A writes no zip, and the state cannot be written from A on.
+        script:Set-Scenario -NoZip @($A.Id) -LockBy $A.Id
+        try
+        {
+            $R2 = script:Invoke-Wrapper -Streams 1
+            $R2.ExitCode | Should -Be 2
+            @($R2.Text | Where-Object { $_ -like 'The resume state file * could not be updated and still lists some of them as completed*run again without -Resume*' }).Count | Should -Be 1
+            @($R2.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
         }
         finally { & chmod 755 $script:Root }
     }
