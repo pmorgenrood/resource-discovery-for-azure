@@ -363,7 +363,7 @@ Describe 'RunSummary.log advice for a missing report' {
         @($Lines | Where-Object { $_ -like '*a -Resume collects them*' -or $_ -like '*still lists some*' }) | Should -BeNullOrEmpty
     }
 
-    It 'the wrapper passes the flag, raised by a failed save of the resume state too, and the console says the same' {
+    It 'the wrapper passes the read-back flag and the NOT SAVED switch apart, and the console uses both' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
         $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
         $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `'))
