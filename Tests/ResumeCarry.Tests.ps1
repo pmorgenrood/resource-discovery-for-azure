@@ -347,7 +347,7 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
     }
 
     It 'carries two report zips whose paths differ only in case on Linux, where they are two files' -Skip:(-not $IsLinux) {
-        $Upper = script:New-TestReport -Root $script:Root -Stamp '2AAAA'
+        $null = script:New-TestReport -Root $script:Root -Stamp '2AAAA'
         $UpperRel = Join-Path 'ResourcesReport2AAAA' 'ResourcesReport_2AAAA.zip'
         $SubB = [pscustomobject]@{ Id = 'sub-b'; Name = 'B' }
         $Recs = @(
