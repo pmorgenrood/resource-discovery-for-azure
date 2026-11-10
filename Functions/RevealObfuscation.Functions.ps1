@@ -948,6 +948,120 @@ function Copy-RevealZipUnchanged
     [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
 }
 
+# Copy the revealed sibling $From over the member $To and remove $From. The
+# member is truncated and written in place, so it keeps its own permissions,
+# as the earlier in-place rewrite did.
+function Copy-RevealSiblingOver
+{
+    param([Parameter(Mandatory = $true)] [string] $From, [Parameter(Mandatory = $true)] [string] $To)
+    $Source = [System.IO.FileStream]::new($From, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try
+    {
+        $Target = [System.IO.FileStream]::new($To, [System.IO.FileMode]::Truncate, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try { $Source.CopyTo($Target) } finally { $Target.Dispose() }
+    }
+    finally { $Source.Dispose() }
+    [System.IO.File]::Delete($From)
+}
+
+# Reveal one CSV member, row by row. Field-aware: the rows go back through the
+# CSV writer, so a revealed value holding a comma or a quote is quoted and
+# cannot break the columns, as a raw text replace could. Import-Csv streams
+# each row through ForEach-Object to Export-Csv, which writes the same bytes
+# as exporting all rows at once, into an owner-only sibling. The member is
+# replaced only when a token was revealed. Counts in $script:FileHits, read by
+# the caller; $Replacements and $TokenPattern come from the caller's scope
+# (see Convert-RevealString).
+function Convert-RevealCsvFile
+{
+    param([Parameter(Mandatory = $true)] [string] $Path)
+    # A new name, so no member of the report is ever taken for it.
+    $Sibling = $Path + '.' + [guid]::NewGuid().ToString('N') + '.reveal-partial'
+    New-RevealOwnerOnlyFile -Path $Sibling
+    try
+    {
+        Import-Csv -LiteralPath $Path | ForEach-Object {
+            foreach ($prop in $_.PSObject.Properties)
+            {
+                if ($null -ne $prop.Value -and $prop.Value -is [string] -and $prop.Value.Length -gt 0)
+                {
+                    $prop.Value = Convert-RevealString -Text $prop.Value -EscapeMode 'None'
+                }
+            }
+            $_
+        } | Export-Csv -LiteralPath $Sibling -NoTypeInformation -Encoding utf8
+        if ($script:FileHits -gt 0) { Copy-RevealSiblingOver -From $Sibling -To $Path }
+    }
+    finally
+    {
+        if ([System.IO.File]::Exists($Sibling)) { [System.IO.File]::Delete($Sibling) }
+    }
+}
+
+# Reveal one text member (.json, .html or other) in chunks of 64 KB
+# characters, so a member written on one line is never held whole. The text
+# is decoded as Get-Content does (UTF-8, or the encoding its byte order mark
+# names) and written as UTF-8 with no byte order mark and nothing added, as
+# Set-Content -Encoding utf8 -NoNewline did, into an owner-only sibling. Each
+# chunk is revealed up to a cut point 127 characters before its end, moved
+# back to the start of a token that crosses it; the text after the cut is
+# carried in front of the next chunk. So a token of up to 128 characters (the
+# longest the tool writes, as in Test-RevealZipHasMaskedValue) is never split,
+# and the result equals revealing the whole text at once. The member is replaced
+# only when a token was revealed.
+function Convert-RevealTextFile
+{
+    param([Parameter(Mandatory = $true)] [string] $Path, [string] $EscapeMode = 'None')
+    $ChunkLength = 65536
+    $CarryLength = 127
+    # A new name, so no member of the report is ever taken for it.
+    $Sibling = $Path + '.' + [guid]::NewGuid().ToString('N') + '.reveal-partial'
+    New-RevealOwnerOnlyFile -Path $Sibling
+    try
+    {
+        $Reader = [System.IO.StreamReader]::new($Path, [System.Text.UTF8Encoding]::new($false), $true)
+        try
+        {
+            $Out = [System.IO.FileStream]::new($Sibling, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try { $Writer = [System.IO.StreamWriter]::new($Out, [System.Text.UTF8Encoding]::new($false)) }
+            catch { $Out.Dispose(); throw }
+            try
+            {
+                $Buffer = [char[]]::new($ChunkLength)
+                $Pending = ''
+                while ($true)
+                {
+                    # ReadBlock returns less than asked only at the end of the text.
+                    $Read = $Reader.ReadBlock($Buffer, 0, $ChunkLength)
+                    $AtEnd = $Read -lt $ChunkLength
+                    $Text = $Pending + [string]::new($Buffer, 0, $Read)
+                    $Cut = $Text.Length
+                    if (-not $AtEnd)
+                    {
+                        $Cut = $Text.Length - $CarryLength
+                        # Move the cut back to the start of a token that crosses it.
+                        foreach ($M in [regex]::Matches($Text, $TokenPattern))
+                        {
+                            if ($M.Index -ge $Cut) { break }
+                            if ($M.Index + $M.Length -gt $Cut) { $Cut = $M.Index; break }
+                        }
+                    }
+                    if ($Cut -gt 0) { $Writer.Write((Convert-RevealString -Text $Text.Substring(0, $Cut) -EscapeMode $EscapeMode)) }
+                    $Pending = $Text.Substring($Cut)
+                    if ($AtEnd) { break }
+                }
+            }
+            finally { $Writer.Dispose() }
+        }
+        finally { $Reader.Dispose() }
+        if ($script:FileHits -gt 0) { Copy-RevealSiblingOver -From $Sibling -To $Path }
+    }
+    finally
+    {
+        if ([System.IO.File]::Exists($Sibling)) { [System.IO.File]::Delete($Sibling) }
+    }
+}
+
 # =============================================================================
 # Invoke-RdaReveal
 #
@@ -1224,35 +1338,16 @@ function Invoke-RdaReveal
             $script:FileHits = 0
             $Ext = $file.Extension.ToLowerInvariant()
 
+            # Each member is revealed as a stream into an owner-only sibling
+            # file and copied back over the member only after the whole pass
+            # succeeded, so a large consumption CSV or a one-line inventory or
+            # HTML member is never held in memory at once.
             if ($Ext -eq '.csv')
             {
-                # Field-aware reveal: re-export through the CSV writer so a
-                # revealed value containing a comma/quote is correctly quoted and
-                # cannot break the column structure a raw text replace could.
-                $Rows = @(Import-Csv -LiteralPath $file.FullName)
-                if ($Rows.Count -gt 0)
-                {
-                    foreach ($row in $Rows)
-                    {
-                        foreach ($prop in $row.PSObject.Properties)
-                        {
-                            if ($null -ne $prop.Value -and $prop.Value -is [string] -and $prop.Value.Length -gt 0)
-                            {
-                                $prop.Value = Convert-RevealString -Text $prop.Value -EscapeMode 'None'
-                            }
-                        }
-                    }
-                    if ($script:FileHits -gt 0)
-                    {
-                        $Rows | Export-Csv -LiteralPath $file.FullName -NoTypeInformation -Encoding utf8
-                    }
-                }
+                Convert-RevealCsvFile -Path $file.FullName
             }
             else
             {
-                $Content = Get-Content -LiteralPath $file.FullName -Raw
-                if ([string]::IsNullOrEmpty($Content)) { continue }
-
                 $EscapeMode = switch ($Ext)
                 {
                     '.json' { 'Json' }
@@ -1260,12 +1355,7 @@ function Invoke-RdaReveal
                     '.htm' { 'Html' }
                     default { 'None' }
                 }
-                $NewContent = Convert-RevealString -Text $Content -EscapeMode $EscapeMode
-
-                if ($script:FileHits -gt 0)
-                {
-                    Set-Content -LiteralPath $file.FullName -Value $NewContent -Encoding utf8 -NoNewline
-                }
+                Convert-RevealTextFile -Path $file.FullName -EscapeMode $EscapeMode
             }
 
             if ($script:FileHits -gt 0)
