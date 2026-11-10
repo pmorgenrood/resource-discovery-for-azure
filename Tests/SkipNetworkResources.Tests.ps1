@@ -977,6 +977,15 @@ Describe 'Callers use the message and the switch' {
         $Shared.Groups[1].Value | Should -Match '`-IncludeNetworkResources`'
     }
 
+    It 'the README''s direct-run resource group example also gives -SubscriptionID' {
+        $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
+        # ResourceInventory.ps1 stops when -ResourceGroup comes without
+        # -SubscriptionID, so every example line with one has both.
+        $Lines = @([regex]::Matches($Readme, '(?m)^\./ResourceInventory\.ps1 .*-ResourceGroup .*$') | ForEach-Object { $_.Value })
+        $Lines.Count | Should -BeGreaterThan 0 -Because 'the README shows a resource group run'
+        foreach ($Line in $Lines) { $Line | Should -Match '-SubscriptionID ' -Because $Line }
+    }
+
     It 'the README''s wrapper summary names every switch the wrapper forwards' {
         $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
         $Summary = [regex]::Match($Readme, '(?s)The wrapper forwards (.*?) to the inner')
