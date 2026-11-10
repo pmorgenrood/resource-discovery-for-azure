@@ -276,6 +276,32 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
     }
 }
 
+Describe 'The resume state after a consolidated zip that could not be built' {
+    It 'is kept, so the next -Resume carries the completed reports into a new zip' {
+        $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Src | Should -Match ([regex]::Escape('-and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))'))
+    }
+
+    It 'is written again when the zip fails after the clean-run clear (when it takes its name or gets the run summary)' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Banner = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$null -ne $BundleBuildError' -and $_.Extent.Text.Contains('FAILED (consolidated zip)') })
+        $Banner.Count | Should -Be 1
+        $Root = Join-Path $TestDrive 'rebundle'
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+        function Save-CompletedSubscriptionIds { param($Path, $Tenant, $Ids, $FailedAttempts, $Reports) Set-Content -LiteralPath $Path -Value 'saved' }
+        Mock Write-Host { }
+        Set-Variable -Name InventoryFolderGone -Value $false
+        Set-Variable -Name InventoryRoot -Value $Root
+        Set-Variable -Name ResumeStateFile -Value (Join-Path $Root '.resume-state-t.json')
+        Set-Variable -Name CompletedIds -Value @('sub-a')
+        Set-Variable -Name BundleBuildError -Value 'stand-in'
+        Set-Variable -Name ActualSubZips -Value @()
+        Set-Variable -Name TenantID -Value 't'; Set-Variable -Name FailedAttempts -Value @(); Set-Variable -Name CompletedReports -Value @()
+        . ([scriptblock]::Create($Banner[0].Extent.Text))
+        Test-Path -LiteralPath (Join-Path $Root '.resume-state-t.json') | Should -BeTrue
+    }
+}
+
 Describe 'A subscription whose collector never leaves a readable zip' -Skip:$IsWindows {
     It 'counts each such run as a failed run, so -Resume stops collecting it at the retry limit and names it' {
         script:New-Case
