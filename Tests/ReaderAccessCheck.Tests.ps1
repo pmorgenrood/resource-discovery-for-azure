@@ -2602,8 +2602,11 @@ exit 1
         }
         # The run also saves the not-readable list (#62) while the folder is
         # read-only: that save fails, so the run names it and ends with exit 2 (#61).
+        # -Resume carries the two earlier reports into a consolidated zip, which
+        # the read-only folder refuses too, and the run names it (#48, #63).
         $R1.ExitCode | Should -Be 2
         $R1.Text | Should -Contain '============== FAILED (resume state not saved) =============='
+        $R1.Text | Should -Contain '================ FAILED (consolidated zip) ================'
         $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
         foreach ($Name in $StreamNames)
         {
