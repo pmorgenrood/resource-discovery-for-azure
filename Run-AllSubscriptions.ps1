@@ -2375,11 +2375,17 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         if ($GoneRecords.Count -gt 0)
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
-            # Read back: the same disk problem that lost a zip can stop the save.
-            $SavedCompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ } | ForEach-Object { [string]$_ })
-            $MissingStateNotSaved = @($GoneRecords | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0
         }
         $MissingReports = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
+        # Read back for every missing one, those that wrote no zip too: the same
+        # disk problem that lost a zip can stop the save above, or the one the
+        # run made when it took a no-zip subscription off the completed list.
+        # A -Resume would then skip it and carry an earlier report of it.
+        if ($MissingReports.Count -gt 0 -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+        {
+            $SavedCompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $MissingStateNotSaved = @($MissingReports | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0
+        }
         $MissingReportCount = [math]::Max($MissingCount, $MissingReports.Count)
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
         Write-Host "The consolidated zip is built from the reports that exist; the missing ones are named under FAILED (report missing) at the end." -ForegroundColor Yellow
