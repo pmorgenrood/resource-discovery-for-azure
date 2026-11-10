@@ -67,6 +67,8 @@ if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $nul
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Folder '*.json'), (Join-Path $Folder '*.csv') -DestinationPath $Zip -Force
 $Global:ZipOutputFile = $Zip
+# A subscription whose collector writes a zip that cannot be read (cut short).
+if (@($Scenario.Corrupt) -contains $SubscriptionID) { [System.IO.File]::WriteAllBytes($Zip, [byte[]](0x50, 0x4B, 0x03)) }
 # A subscription that writes its zip and then fails.
 if (@($Scenario.FailAfterZip) -contains $SubscriptionID) { throw 'stand-in failure after the report zip was written' }
 '@ | Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Encoding utf8
@@ -160,8 +162,8 @@ exit 1
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState, [string[]]$FailAfterZip = @(), [string]$LockBy = '')
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState; FailAfterZip = @($FailAfterZip); LockBy = $LockBy } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState, [string[]]$FailAfterZip = @(), [string]$LockBy = '', [string[]]$Corrupt = @())
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState; FailAfterZip = @($FailAfterZip); LockBy = $LockBy; Corrupt = @($Corrupt) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -300,6 +302,32 @@ Describe 'The resume state after a consolidated zip that could not be built' {
         . ([scriptblock]::Create($Banner[0].Extent.Text))
         Test-Path -LiteralPath (Join-Path $Root '.resume-state-t.json') | Should -BeTrue
     }
+
+    It 'is written again without the older completions once the clean run removed the put-aside file kept for them' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Banner = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$null -ne $BundleBuildError' -and $_.Extent.Text.Contains('FAILED (consolidated zip)') })
+        $Banner.Count | Should -Be 1
+        $Root = Join-Path $TestDrive 'rebundle-aside'
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+        $script:SavedIds = $null; $script:SavedReports = $null
+        function Save-CompletedSubscriptionIds { param($Path, $Tenant, $Ids, $FailedAttempts, $Reports) $script:SavedIds = @($Ids); $script:SavedReports = @($Reports); Set-Content -LiteralPath $Path -Value 'saved' }
+        Mock Write-Host { }
+        Set-Variable -Name InventoryFolderGone -Value $false
+        Set-Variable -Name InventoryRoot -Value $Root
+        Set-Variable -Name ResumeStateFile -Value (Join-Path $Root '.resume-state-t.json')
+        # sub-old: completed by an earlier run, not in this run's set; the file
+        # kept for it (it may hold a newer failure of it) was removed after the clear.
+        Set-Variable -Name CompletedIds -Value @('sub-a', 'sub-old')
+        Set-Variable -Name OlderCompletions -Value @('sub-old')
+        Set-Variable -Name KeptAsideRemoved -Value $true
+        Set-Variable -Name BundleBuildError -Value 'stand-in'
+        Set-Variable -Name ActualSubZips -Value @()
+        Set-Variable -Name TenantID -Value 't'; Set-Variable -Name FailedAttempts -Value @()
+        Set-Variable -Name CompletedReports -Value @([pscustomobject]@{ Id = 'sub-a' }, [pscustomobject]@{ Id = 'sub-old' })
+        . ([scriptblock]::Create($Banner[0].Extent.Text))
+        $script:SavedIds | Should -Be @('sub-a') -Because 'a -Resume must collect sub-old again, not skip it as completed'
+        @($script:SavedReports | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
+    }
 }
 
 Describe 'A subscription whose collector never leaves a readable zip' -Skip:$IsWindows {
@@ -315,6 +343,27 @@ Describe 'A subscription whose collector never leaves a readable zip' -Skip:$IsW
         $R3 = script:Invoke-Wrapper -Streams 1 -Arguments '-Resume'
         [int](@($R3.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3
         $R4 = script:Invoke-Wrapper -Streams 1 -Arguments '-Resume'
+        $R4.ExitCode | Should -Be 2
+        @($R4.Text | Where-Object { $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 1 -Because 'the cycle ends at the limit, named'
+        [int](@($R4.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3 -Because 'the fourth run did not collect it'
+    }
+
+    It 'counts a written zip that cannot be read the same way (<Case>): the success path does not reset the count' -TestCases @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'two streams'; Streams = 2 }
+    ) {
+        param($Case, $Streams)
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -Corrupt @($B.Id)
+        $R1 = script:Invoke-Wrapper -Streams $Streams
+        $R1.ExitCode | Should -Be 2
+        [int](@($R1.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 1
+        $R2 = script:Invoke-Wrapper -Streams $Streams -Arguments '-Resume'
+        [int](@($R2.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 2
+        $R3 = script:Invoke-Wrapper -Streams $Streams -Arguments '-Resume'
+        [int](@($R3.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3
+        $R4 = script:Invoke-Wrapper -Streams $Streams -Arguments '-Resume'
         $R4.ExitCode | Should -Be 2
         @($R4.Text | Where-Object { $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 1 -Because 'the cycle ends at the limit, named'
         [int](@($R4.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3 -Because 'the fourth run did not collect it'

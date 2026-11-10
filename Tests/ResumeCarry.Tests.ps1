@@ -340,7 +340,7 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $Z = [System.IO.Compression.ZipFile]::Open($HtmlOnly, 'Create'); try { $E = $Z.CreateEntry('ResourcesReport_3bbbb.html'); $W = [System.IO.StreamWriter]::new($E.Open()); try { $W.Write('<html></html>') } finally { $W.Dispose() } } finally { $Z.Dispose() }
         $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport3bbbb/ResourcesReport_3bbbb.zip'; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false
         @($R.Carried).Count | Should -Be 0
-        $R.Missing[0].Reason | Should -Match 'holds no readable Inventory_'
+        $R.Missing[0].Reason | Should -Match 'cannot be read, or lacks one of its three report files'
 
         # The directory is whole, but the inventory's packed data is spoiled.
         $Damaged = Join-Path $script:Root 'ResourcesReport4cccc/ResourcesReport_4cccc.zip'
@@ -421,6 +421,7 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
     It 'still reads a report zip when <Case>' -ForEach @(
         @{ Case = 'a metric value is text'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[{"MetricValue":"1.5"}]}'; 'Consumption_R_9.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'one consumption row has a comma for the decimal mark'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[]}'; 'Consumption_R_9.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,"1,5",2026-11-01T00:00:00Z,2026-11-02T00:00:00Z' + "`n" + '/subscriptions/s/y,Compute,D,Hours,m1,2.5,2026-11-01T00:00:00Z,2026-11-02T00:00:00Z') } }
+        @{ Case = 'the inventory nests 80 levels deep (the collector writes it with -Depth 100)'; Files = @{ 'Inventory_R_9.json' = (('{"a":' * 80) + '1' + ('}' * 80)); 'Metrics_R_9.json' = '{"Metrics":[]}'; 'Consumption_R_9.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'one consumption row is cut short'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[]}'; 'Consumption_R_9.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5') } }
     ) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem

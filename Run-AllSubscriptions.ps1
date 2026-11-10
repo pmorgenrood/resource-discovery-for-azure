@@ -1166,6 +1166,12 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     }
 }
 
+# The retry list as it stands before any subscription is collected. A run that
+# writes a zip takes the entry off on success, before the output check can
+# find that zip unreadable; the check counts from this copy, so such a zip
+# still reaches the retry limit.
+$FailedAttemptsBeforeCollect = @($FailedAttempts | Where-Object { $null -ne $_ })
+
 # The access check's result. Set by the check below, which does not run when
 # nothing is left to probe; the end of the run reads it either way.
 $AccessDecision = $null
@@ -2385,7 +2391,13 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             $Entry = @($FailedAttempts | Where-Object { $null -ne $_ -and [string]$_.Id -eq [string]$M.Id }) | Select-Object -First 1
             $FailedThisRun = $null -ne $Entry -and $Entry.PSObject.Properties['LastFailedAt'] -and $(try { ([datetime]$Entry.LastFailedAt).ToUniversalTime() -ge $RunStartTime.ToUniversalTime() } catch { $false })
-            if (-not $FailedThisRun) { $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$M.Id) -Name ([string]$M.Name) -Reason 'its report zip is missing or cannot be read' }
+            if (-not $FailedThisRun)
+            {
+                # Gone by this run's success path: count on from the entry it had.
+                $Before = if ($null -eq $Entry) { @($FailedAttemptsBeforeCollect | Where-Object { [string]$_.Id -eq [string]$M.Id }) | Select-Object -First 1 }
+                if ($null -ne $Before) { $FailedAttempts = @(@($FailedAttempts | Where-Object { $null -ne $_ }) + @($Before)) }
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$M.Id) -Name ([string]$M.Name) -Reason 'its report zip is missing or cannot be read'
+            }
         }
         if ($MissingReports.Count -gt 0)
         {
@@ -2647,6 +2659,9 @@ if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollect
 # A put-aside file kept above for an older completion: once a clean run has
 # cleared the resume state there is no completion left for a -Resume to skip,
 # so it goes too, and no later -Resume names it.
+# Set when one is removed: a later write-back of the state (the FAILED
+# (consolidated zip) banner) then leaves out the completions it was kept for.
+$KeptAsideRemoved = $false
 if (-not ($Resume -or $ResumeFailedOnly) -and @($KeptAsideFiles).Count -gt 0 -and -not (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
 {
     foreach ($Aside in @($KeptAsideFiles | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }))
@@ -2654,6 +2669,7 @@ if (-not ($Resume -or $ResumeFailedOnly) -and @($KeptAsideFiles).Count -gt 0 -an
         try
         {
             Remove-Item -LiteralPath $Aside -Force -ErrorAction Stop
+            $KeptAsideRemoved = $true
             Write-Host ("Removed: {0}, kept above. The resume state is cleared, so no completion is left for a -Resume to skip." -f $Aside) -ForegroundColor Green
         }
         catch { Write-Host ("WARNING: Could not remove {0}, a per-stream resume state file put aside as unreadable that this run makes stale: {1}. Delete it; do not rename it back." -f $Aside, $_.Exception.Message) -ForegroundColor Yellow }
@@ -3107,7 +3123,17 @@ if ($null -ne $BundleBuildError)
     # next -Resume carries the completed reports into a new zip.
     if (@($CompletedIds).Count -gt 0 -and -not [string]::IsNullOrEmpty($ResumeStateFile) -and -not $InventoryFolderGone -and (Test-Path -LiteralPath $InventoryRoot -PathType Container) -and -not (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
     {
-        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+        # A put-aside file kept for older completions (see $KeptAsideFiles) was
+        # removed once the state was cleared, and it may hold a newer failure of
+        # one: those are left out, so a -Resume collects them again.
+        $WriteBackIds = @($CompletedIds)
+        $WriteBackReports = @($CompletedReports)
+        if ($KeptAsideRemoved)
+        {
+            $WriteBackIds = @($WriteBackIds | Where-Object { @($OlderCompletions) -notcontains [string]$_ })
+            $WriteBackReports = @($WriteBackReports | Where-Object { $null -ne $_ -and @($OlderCompletions) -notcontains [string]$_.Id })
+        }
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $WriteBackIds -FailedAttempts $FailedAttempts -Reports $WriteBackReports
         if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) { Write-Host 'The resume state is kept (written again): run again with -Resume to carry the completed reports into a new consolidated zip.' -ForegroundColor Yellow }
     }
     # Read now: the folder can go while the zip is built, summarised or checked.

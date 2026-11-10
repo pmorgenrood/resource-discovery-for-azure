@@ -1070,9 +1070,9 @@ function Get-ResumeCarriedReports
                     }
                     elseif (-not (Test-ReportZipReadable -Path $FullPath))
                     {
-                        # As for a zip of this run: one without a whole
-                        # Inventory_*.json is no report a reader can use.
-                        $Reason = ('its report zip holds no readable Inventory_*.json: {0}' -f $Rel)
+                        # As for a zip of this run: one that fails
+                        # Test-ReportZipReadable is no report a reader can use.
+                        $Reason = ('its report zip cannot be read, or lacks one of its three report files: {0}' -f $Rel)
                     }
                     elseif ($Obf.Value -ne $Obfuscated)
                     {
@@ -1738,7 +1738,13 @@ function Test-ReportFileShape
             $Columns = @($Header -split ',' | ForEach-Object { $_.Trim().Trim('"') })
             return (@('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $Columns -notcontains $_ }).Count -eq 0)
         }
-        $Doc = [System.Text.Json.JsonDocument]::Parse($Stream)
+        # shortcut: the parse holds the whole file in memory (Test-ReportZipReadable
+        # has read it once already); stream it with Utf8JsonReader if report files
+        # grow past what one run can hold. MaxDepth matches the collector's
+        # ConvertTo-Json -Depth 100 (the default, 64, would refuse a good file).
+        $Options = [System.Text.Json.JsonDocumentOptions]::new()
+        $Options.MaxDepth = 100
+        $Doc = [System.Text.Json.JsonDocument]::Parse($Stream, $Options)
         try
         {
             $Root = $Doc.RootElement
