@@ -753,8 +753,9 @@ function Get-WrapperExitCode
         [bool]$AuthSkipped,
         [bool]$CollectorsFailed,
         # A subscription's Azure Monitor metric request (grouped or for one
-        # metric) still failed after its retries (throttling, a timeout, a server
-        # error or an error with no status): its metrics are incomplete, so 3,
+        # metric) still failed after its retries (throttling, a timeout, an expired
+        # sign-in, a server error or an error with no status): its metrics are
+        # incomplete, so 3,
         # as for a data phase skipped for the sign-in.
         [bool]$MetricsIncomplete = $false
     )
