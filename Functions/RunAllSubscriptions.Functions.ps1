@@ -1068,6 +1068,12 @@ function Get-ResumeCarriedReports
                     {
                         $Reason = ('its report zip is empty: {0}' -f $Rel)
                     }
+                    elseif (-not (Test-ReportZipReadable -Path $FullPath))
+                    {
+                        # As for a zip of this run: one without a whole
+                        # Inventory_*.json is no report a reader can use.
+                        $Reason = ('its report zip holds no readable Inventory_*.json: {0}' -f $Rel)
+                    }
                     elseif ($Obf.Value -ne $Obfuscated)
                     {
                         $WasText = if ($Obf.Value) { 'with' } else { 'without' }
@@ -1706,15 +1712,11 @@ function Get-RunSummaryLogContent
 
 # ---- Consolidated zip check -------------------------------------------------
 
-# Returns $null when the consolidated zip at $Path opens and holds every
-# per-subscription zip named in $SubZipNames, otherwise one line saying why not.
-# Compress-Archive removes its destination when a write fails (a full disk does
-# this, also during -Update), so "the command finished" does not mean the zip is
-# there. Reads only the zip's directory, not the reports in it.
-# Whether the report zip at $Path is one a reader can use: it opens as a zip
-# and holds an Inventory_*.json. A file of a report zip's name that is cut
-# short or damaged is counted as missing, so it is named and collected again
-# instead of being put into the consolidated zip as a report.
+# Whether the report zip at $Path is one a reader can use: it opens as a zip,
+# holds an Inventory_*.json, and that entry reads to its end (its packed data
+# and checksum are whole). A file of a report zip's name that is cut short or
+# damaged is counted as missing, so it is named and collected again instead of
+# being put into the consolidated zip as a report.
 function Test-ReportZipReadable
 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -1722,12 +1724,27 @@ function Test-ReportZipReadable
     try
     {
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
-        try { return (@($Archive.Entries | Where-Object { $_.Name -like 'Inventory_*.json' }).Count -gt 0) }
+        try
+        {
+            $Inventory = @($Archive.Entries | Where-Object { $_.Name -like 'Inventory_*.json' })
+            if ($Inventory.Count -eq 0) { return $false }
+            foreach ($Entry in $Inventory)
+            {
+                $Stream = $Entry.Open()
+                try { $Stream.CopyTo([System.IO.Stream]::Null) } finally { $Stream.Dispose() }
+            }
+            return $true
+        }
         finally { $Archive.Dispose() }
     }
     catch { return $false }
 }
 
+# Returns $null when the consolidated zip at $Path opens and holds every
+# per-subscription zip named in $SubZipNames, otherwise one line saying why not.
+# Compress-Archive removes its destination when a write fails (a full disk does
+# this, also during -Update), so "the command finished" does not mean the zip is
+# there. Reads only the zip's directory, not the reports in it.
 function Get-ConsolidatedZipProblem
 {
     param(

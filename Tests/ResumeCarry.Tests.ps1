@@ -327,6 +327,29 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $R.Missing[0].Reason | Should -Match 'not true/false'
     }
 
+    It 'names a recorded zip that holds no Inventory_*.json, or one whose inventory cannot be read to its end' {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $HtmlOnly = Join-Path $script:Root 'ResourcesReport3bbbb/ResourcesReport_3bbbb.zip'
+        New-Item -ItemType Directory -Path (Split-Path $HtmlOnly -Parent) -Force | Out-Null
+        $Z = [System.IO.Compression.ZipFile]::Open($HtmlOnly, 'Create'); try { $E = $Z.CreateEntry('ResourcesReport_3bbbb.html'); $W = [System.IO.StreamWriter]::new($E.Open()); try { $W.Write('<html></html>') } finally { $W.Dispose() } } finally { $Z.Dispose() }
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport3bbbb/ResourcesReport_3bbbb.zip'; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false
+        @($R.Carried).Count | Should -Be 0
+        $R.Missing[0].Reason | Should -Match 'holds no readable Inventory_'
+
+        # The directory is whole, but the inventory's packed data is spoiled.
+        $Damaged = Join-Path $script:Root 'ResourcesReport4cccc/ResourcesReport_4cccc.zip'
+        New-Item -ItemType Directory -Path (Split-Path $Damaged -Parent) -Force | Out-Null
+        $Z = [System.IO.Compression.ZipFile]::Open($Damaged, 'Create')
+        try { $E = $Z.CreateEntry('Inventory_ResourcesReport_4cccc.json', 'Optimal'); $W = [System.IO.StreamWriter]::new($E.Open()); try { $Rnd = [Random]::new(7); foreach ($N in 1..20000) { $W.Write([char](65 + $Rnd.Next(26))) } } finally { $W.Dispose() } }
+        finally { $Z.Dispose() }
+        $Bytes = [System.IO.File]::ReadAllBytes($Damaged)
+        $Start = [System.Text.Encoding]::ASCII.GetString($Bytes).IndexOf('Inventory_ResourcesReport_4cccc.json') + 60
+        foreach ($K in $Start..($Start + 300)) { $Bytes[$K] = 255 }
+        [System.IO.File]::WriteAllBytes($Damaged, $Bytes)
+        Test-ReportZipReadable -Path $Damaged | Should -BeFalse
+        Test-ReportZipReadable -Path $script:Zip | Should -BeTrue
+    }
+
     It 'names a recorded file that is not a zip, and a zip with no entries' {
         $Bad = Join-Path $script:Root 'ResourcesReport3bbbb'
         New-Item -ItemType Directory -Path $Bad -Force | Out-Null
