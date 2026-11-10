@@ -899,11 +899,17 @@ function Write-StreamState
             StreamId       = $StreamId
             Completed      = $Completed
             FailedAttempts = @($FailedAttempts)
-        } | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$Path.tmp" -Encoding utf8
+        # Swapped into place in one rename, as Save-CompletedSubscriptionIds
+        # does: a stream stopped during the write (Ctrl+C, a killed process)
+        # leaves the file it had, never an empty or cut-short one, which the
+        # next run could not read and would stop on.
+        [System.IO.File]::Move("$Path.tmp", $Path, $true)
     }
     catch
     {
         Write-Stream ("WARNING: failed to persist stream state to {0}: {1}" -f $Path, $_.Exception.Message) 'Yellow'
+        Remove-Item -LiteralPath "$Path.tmp" -Force -ErrorAction SilentlyContinue
     }
 }
 

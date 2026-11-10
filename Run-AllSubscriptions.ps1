@@ -910,7 +910,9 @@ if ($PreflightOnly)
         {
             try
             {
-                $PfObj = Get-Content -LiteralPath $PfStreamFile.FullName -Raw | ConvertFrom-Json
+                $PfObj = Get-Content -LiteralPath $PfStreamFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                # As the run does: an empty file (a write stopped part-way) holds no record to use.
+                if ($null -eq $PfObj) { throw 'the file is empty' }
                 if ($null -ne $PfObj.Completed) { $PfStreamCompleted += @($PfObj.Completed | ForEach-Object { [string]$_ }) }
                 if ($null -ne $PfObj.FailedAttempts) { $PfStreamFailed += @($PfObj.FailedAttempts) }
             }
@@ -1029,6 +1031,8 @@ if ($Resume -or $ResumeFailedOnly)
             try
             {
                 $Obj = Get-Content -LiteralPath $StreamFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                # An empty file (a write stopped part-way) cannot be read either.
+                if ($null -eq $Obj) { throw 'the file is empty' }
                 if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
                 if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
                 $FoldedStreamFiles += $StreamFile
@@ -1885,6 +1889,7 @@ else
                 try
                 {
                     $Obj = Get-Content -LiteralPath $PerStreamFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    if ($null -eq $Obj) { throw 'the file is empty' }
                     $MergedStreamFiles += $StreamFile
                     if ($null -ne $Obj.Completed)
                     {
@@ -1932,9 +1937,22 @@ else
                 $EntryReason = if ($FailedEntry.PSObject.Properties['Reason']) { [string]$FailedEntry.Reason } else { '' }
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$FailedEntry.Id) -Name $EntryName -Reason $EntryReason
             }
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
+            if ($MergedStreamFiles.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
+            }
+            # The files read are removed only when the unified file on disk holds
+            # what they were merged into, as at the start of a run: a save that
+            # failed (a full disk) only warns, and they hold the only copy.
+            $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            $StreamStateSaved = ($MergedStreamFiles.Count -eq 0) -or ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+            if (-not $StreamStateSaved)
+            {
+                Write-Host ("WARNING: The resume state file {0} does not hold every record of this run's per-stream files, so they are kept: {1}. The next -Resume or -ResumeFailedOnly folds them in." -f $ResumeStateFile, (@($MergedStreamFiles | ForEach-Object { $_.FullName }) -join ', ')) -ForegroundColor Yellow
+                $MergedStreamFiles = @()
             }
             # Also delete per-stream resume files now that the unified file holds
             # the truth - this prevents drift if a future run uses a different
@@ -1944,7 +1962,8 @@ else
             foreach ($StreamFile in $MergedStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
-                try { Remove-Item -LiteralPath $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
+                try { Remove-Item -LiteralPath $PerStreamFile -Force -ErrorAction Stop }
+                catch { Write-Host ("WARNING: Could not remove the per-stream resume state file {0}: {1}. Its records are saved; remove it before the next -Resume or -ResumeFailedOnly, which stops on it." -f $PerStreamFile, $_.Exception.Message) -ForegroundColor Yellow }
             }
         }
         finally

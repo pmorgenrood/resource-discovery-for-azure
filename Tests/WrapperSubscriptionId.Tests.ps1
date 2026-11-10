@@ -86,7 +86,7 @@ function Get-AzContext { [CmdletBinding()] param() Get-RdaStandInContext }
 function Set-AzContext { [CmdletBinding()] param($Subscription, $Tenant, $Context) Get-RdaStandInContext }
 # A parallel run snapshots the context for its stream workers, which import it.
 function Save-AzContext { [CmdletBinding()] param($Path, [switch]$Force) Set-Content -LiteralPath $Path -Value '{}' }
-function Import-AzContext { [CmdletBinding()] param($Path) Get-RdaStandInContext }
+function Import-AzContext { [CmdletBinding()] param($Path) if ($env:RDA_STANDIN_IMPORT_FAIL) { throw 'stand-in: the context did not load' }; Get-RdaStandInContext }
 function Disable-AzContextAutosave { [CmdletBinding()] param($Scope) }
 function Connect-AzAccount { [CmdletBinding()] param($Tenant, [switch]$UseDeviceAuthentication) throw 'stand-in: no sign-in expected' }
 function Get-AzAccessToken { [CmdletBinding()] param($TenantId, $ResourceUrl, [switch]$AsSecureString) [pscustomobject]@{ Token = 'stand-in-token'; Type = 'Bearer'; ExpiresOn = (Get-Date).AddHours(1) } }
@@ -977,6 +977,64 @@ Describe 'A resume state that lists a subscription as both completed and failed'
         @(Get-ChildItem -LiteralPath $script:Root -Force -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) | ForEach-Object { $_.FullName }) | Should -Be @($Bad)
     }
 
+    It 'stops -Resume on an empty per-stream file (a write stopped part-way), as on one it cannot read' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Empty = Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)
+        Set-Content -LiteralPath $Empty -Value '' -NoNewline
+        $Run = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume')
+        $Run.ExitCode | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like ('ERROR: Could not read the per-stream resume state file {0} of an interrupted run: the file is empty*' -f $Empty) }).Count | Should -Be 1
+        @(script:Get-Calls).Count | Should -Be 0
+        $Pf = script:Invoke-Wrapper -Streams 1 -Arguments @('-PreflightOnly', '-Resume')
+        $Pf.ExitCode | Should -Be 1
+    }
+
+    It 'fails the preflight on a per-stream file it cannot open, as the run stops on it' -Skip:([Environment]::UserName -eq 'root') {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Locked = Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)
+        @{ Tenant = $script:Tenant; StreamId = 0; Completed = @(); FailedAttempts = @() } | ConvertTo-Json | Set-Content -LiteralPath $Locked -Encoding utf8
+        & chmod 000 $Locked
+        try
+        {
+            $Pf = script:Invoke-Wrapper -Streams 1 -Arguments @('-PreflightOnly', '-Resume')
+            $Pf.ExitCode | Should -Be 1
+            @($Pf.Text | Where-Object { $_ -like 'Preflight failed: the resume state*' }).Count | Should -Be 1
+        }
+        finally { & chmod 644 $Locked }
+    }
+
+    It 'keeps the per-stream files of a parallel run when the resume state cannot be written, and says so' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        # A folder at the state file's name: the save fails, as on a full disk.
+        New-Item -ItemType Directory -Path $script:State -Force | Out-Null
+        $Run = script:Invoke-Wrapper -Streams 2
+        $Kept = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant))
+        $Kept.Count | Should -BeGreaterThan 0 -Because 'they hold the only copy of the run''s records'
+        @($Run.Text | Where-Object { $_ -like "WARNING: The resume state file * does not hold every record of this run's per-stream files, so they are kept*" }).Count | Should -Be 1
+    }
+
+    It 'puts the subscriptions of streams that could not load the sign-in on the retry list, from their summaries, so -ResumeFailedOnly collects them' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $env:RDA_STANDIN_IMPORT_FAIL = '1'
+        try { $R1 = script:Invoke-Wrapper -Streams 2 }
+        finally { Remove-Item Env:\RDA_STANDIN_IMPORT_FAIL -ErrorAction SilentlyContinue }
+        @(script:Get-Calls).Count | Should -Be 0
+        $State = script:Read-StateAt -Path $script:State
+        $State.Failed | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Clear-Calls
+        $R2 = script:Invoke-Wrapper -Streams 1 -Arguments @('-ResumeFailedOnly')
+        script:Get-Calls | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R2.ExitCode | Should -Be 0
+        $null = $R1
+    }
+
     It 'keeps a subscription a parallel run failed off the completed list, so -Resume -ResumeFailedOnly collects it' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
@@ -1227,5 +1285,21 @@ Describe 'The start-of-run fold when a per-stream file it folded in cannot be re
         @($script:FoldOut | Where-Object { $_ -like ('ERROR: Could not remove the per-stream resume state file {0}:*Nothing was collected (exit 1).' -f $Stream) }).Count | Should -Be 1
         @(Get-FailedAttempts -Path $ResumeStateFile -Tenant 't' | ForEach-Object Id) | Should -Be @('sub-x')
         Test-Path -LiteralPath $Stream | Should -BeTrue
+    }
+}
+
+Describe 'Write-StreamState' {
+    It 'leaves the file it had when the write is stopped part-way, never an empty or cut-short one, and no .tmp' {
+        . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1')
+        $TenantID = 't'
+        $StreamId = 0
+        $null = $TenantID, $StreamId
+        $Path = Join-Path $TestDrive '.resume-state-t-stream-0.json'
+        Write-StreamState -Path $Path -Completed @('sub-a') -FailedAttempts @() 6>$null
+        $Before = Get-Content -LiteralPath $Path -Raw
+        Mock Set-Content { $Target = if ($LiteralPath) { $LiteralPath } else { $Path }; [System.IO.File]::WriteAllText([string]$Target, '{ "Ten'); throw 'stand-in: stopped during the write' }
+        Write-StreamState -Path $Path -Completed @('sub-a', 'sub-b') -FailedAttempts @() 6>$null
+        Get-Content -LiteralPath $Path -Raw | Should -Be $Before
+        Test-Path -LiteralPath ($Path + '.tmp') | Should -BeFalse
     }
 }
