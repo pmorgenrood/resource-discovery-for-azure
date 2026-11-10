@@ -350,6 +350,39 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         Test-ReportZipReadable -Path $script:Zip | Should -BeTrue
     }
 
+    It 'counts a report zip whose metrics or consumption file is damaged as unreadable, though its inventory reads' -ForEach @(@{ Member = 'Metrics_ResourcesReport_5dddd.json' }, @{ Member = 'Consumption_ResourcesReport_5dddd.csv' }) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Damaged = Join-Path $script:Root ('ResourcesReport5dddd-{0}/ResourcesReport_5dddd.zip' -f $Member.Substring(0, 4))
+        New-Item -ItemType Directory -Path (Split-Path $Damaged -Parent) -Force | Out-Null
+        $Z = [System.IO.Compression.ZipFile]::Open($Damaged, 'Create')
+        try
+        {
+            $E = $Z.CreateEntry('Inventory_ResourcesReport_5dddd.json', 'Optimal'); $W = [System.IO.StreamWriter]::new($E.Open()); try { $W.Write('{"VirtualMachines":[]}') } finally { $W.Dispose() }
+            $E = $Z.CreateEntry($Member, 'Optimal'); $W = [System.IO.StreamWriter]::new($E.Open()); try { $Rnd = [Random]::new(7); foreach ($N in 1..20000) { $W.Write([char](65 + $Rnd.Next(26))) } } finally { $W.Dispose() }
+        }
+        finally { $Z.Dispose() }
+        $Bytes = [System.IO.File]::ReadAllBytes($Damaged)
+        $Start = [System.Text.Encoding]::ASCII.GetString($Bytes).IndexOf($Member) + 60
+        foreach ($K in $Start..($Start + 300)) { $Bytes[$K] = 255 }
+        [System.IO.File]::WriteAllBytes($Damaged, $Bytes)
+        Test-ReportZipReadable -Path $Damaged | Should -BeFalse
+    }
+
+    It 'reads a report zip once per run when given the same cache' {
+        $Copy = Join-Path $script:Root 'cache-check.zip'
+        Copy-Item -LiteralPath $script:Zip -Destination $Copy -Force
+        $Cache = @{}
+        Test-ReportZipReadable -Path $Copy -Cache $Cache | Should -BeTrue
+        $Cache.Count | Should -Be 1
+        # Spoil it in place with the same size and write time: the cached answer is used.
+        $When = (Get-Item -LiteralPath $Copy).LastWriteTimeUtc
+        $Size = (Get-Item -LiteralPath $Copy).Length
+        [System.IO.File]::WriteAllBytes($Copy, [byte[]]::new($Size))
+        (Get-Item -LiteralPath $Copy).LastWriteTimeUtc = $When
+        Test-ReportZipReadable -Path $Copy -Cache $Cache | Should -BeTrue
+        Test-ReportZipReadable -Path $Copy | Should -BeFalse -Because 'without the cache it is read again'
+    }
+
     It 'names a recorded file that is not a zip, and a zip with no entries' {
         $Bad = Join-Path $script:Root 'ResourcesReport3bbbb'
         New-Item -ItemType Directory -Path $Bad -Force | Out-Null

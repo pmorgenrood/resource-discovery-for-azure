@@ -62,6 +62,8 @@ if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $nul
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Folder '*.json') -DestinationPath $Zip -Force
 $Global:ZipOutputFile = $Zip
+# A subscription that writes its zip and then fails.
+if (@($Scenario.FailAfterZip) -contains $SubscriptionID) { throw 'stand-in failure after the report zip was written' }
 '@ | Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Encoding utf8
 
     # Stand-in Az.Accounts: sign-in, context, token and subscription calls, the
@@ -153,8 +155,8 @@ exit 1
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState)
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [switch]$Damage, [switch]$LockState, [string[]]$FailAfterZip = @())
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; Damage = [bool]$Damage; LockState = [bool]$LockState; FailAfterZip = @($FailAfterZip) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -266,6 +268,23 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A missing report zip while a failed subscription left a zip' -Skip:$IsWindows {
+    It 'names the missing one: the failed subscription''s zip does not stand in for it, though the counts match' {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        # A writes its zip; B writes its zip and fails; C removes A's zip.
+        script:Set-Scenario -GoneSub $A.Id -GoneBy $C.Id -FailAfterZip @($B.Id)
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 2
+        $R1.Text | Should -Contain 'ERROR: Per-subscription output verification failed.'
+        script:Get-Banner $R1 | Select-Object -Skip 1 -First 1 | Should -Be ('  - {0} ({1})' -f $A.Name, $A.Id)
+        @($R1.State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id
+        @($R1.Text | Where-Object { $_ -like 'Per-subscription output verification: OK*' }) | Should -BeNullOrEmpty
     }
 }
 

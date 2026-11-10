@@ -1713,31 +1713,49 @@ function Get-RunSummaryLogContent
 # ---- Consolidated zip check -------------------------------------------------
 
 # Whether the report zip at $Path is one a reader can use: it opens as a zip,
-# holds an Inventory_*.json, and that entry reads to its end (its packed data
-# and checksum are whole). A file of a report zip's name that is cut short or
-# damaged is counted as missing, so it is named and collected again instead of
-# being put into the consolidated zip as a report.
+# holds an Inventory_*.json, and every file in it (the inventory, metrics and
+# consumption files included) reads to its end, so its packed data decodes. A
+# file of a report zip's name that is cut short or damaged is counted as
+# missing, so it is named and collected again instead of being put into the
+# consolidated zip as a report. With -Cache (one hashtable per run), a zip of
+# the same path, size and write time is read only once.
+# shortcut: .NET checks an entry's CRC-32 on read only from .NET 11 on
+# (PowerShell 7.4 to 7.6 run on .NET 8 to 10), so damage that still decodes,
+# or damage to an entry stored without compression, is not seen there; compare
+# each entry's Crc32 with one computed over its data if that must be caught.
 function Test-ReportZipReadable
 {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([Parameter(Mandatory = $true)][string]$Path, [hashtable]$Cache)
+    $Key = $null
+    if ($null -ne $Cache)
+    {
+        $Info = [System.IO.FileInfo]::new($Path)
+        if ($Info.Exists) { $Key = '{0}|{1}|{2}' -f $Info.FullName, $Info.Length, $Info.LastWriteTimeUtc.Ticks }
+        if ($null -ne $Key -and $Cache.ContainsKey($Key)) { return $Cache[$Key] }
+    }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Readable = $false
     try
     {
         $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
         try
         {
-            $Inventory = @($Archive.Entries | Where-Object { $_.Name -like 'Inventory_*.json' })
-            if ($Inventory.Count -eq 0) { return $false }
-            foreach ($Entry in $Inventory)
+            $Files = @($Archive.Entries | Where-Object { $_.Name -ne '' })
+            if (@($Files | Where-Object { $_.Name -like 'Inventory_*.json' }).Count -gt 0)
             {
-                $Stream = $Entry.Open()
-                try { $Stream.CopyTo([System.IO.Stream]::Null) } finally { $Stream.Dispose() }
+                foreach ($Entry in $Files)
+                {
+                    $Stream = $Entry.Open()
+                    try { $Stream.CopyTo([System.IO.Stream]::Null) } finally { $Stream.Dispose() }
+                }
+                $Readable = $true
             }
-            return $true
         }
         finally { $Archive.Dispose() }
     }
-    catch { return $false }
+    catch { $Readable = $false }
+    if ($null -ne $Key) { $Cache[$Key] = $Readable }
+    return $Readable
 }
 
 # Returns $null when the consolidated zip at $Path opens and holds every

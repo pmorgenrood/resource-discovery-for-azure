@@ -2312,16 +2312,35 @@ $MissingReportCount = 0
 # Set when the resume state on disk still lists a missing subscription as
 # completed (the save did not reach the disk): a -Resume would skip it.
 $MissingStateNotSaved = $false
+# Each report zip is read once in this run (see Test-ReportZipReadable).
+$ReportZipChecks = @{}
 if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container))
 {
     $ActualSubZips = @(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
     # A report zip of this run that cannot be read counts as missing.
-    $ActualSubZips = @($ActualSubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName })
+    $ActualSubZips = @($ActualSubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName -Cache $ReportZipChecks })
     $ActualSubZips = @(Join-CarriedReportZips -Zips $ActualSubZips -CarriedReports $CarriedReports)
     $ActualZipCount = $ActualSubZips.Count
-    if ($ActualZipCount -lt $ExpectedZipCount)
+    # Each subscription completed this run is checked by the zip it recorded,
+    # not only by the count: a zip another subscription left (one that wrote
+    # its zip and then failed) must not stand in for a missing one. Those
+    # completed this run whose recorded zip is gone or cannot be read are taken
+    # off the completed list below, so the next -Resume collects them again
+    # instead of failing to carry their report. The latest record of a
+    # subscription completed this run is the one this run wrote.
+    $LatestReports = Get-LatestCompletedReports -Reports $CompletedReports
+    $GoneRecords = @(foreach ($S in @($SubResourceCounts))
+        {
+            $Id = [string]$S.Id
+            if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
+            $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
+            if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
+            $ZipPath = Join-Path $InventoryRoot ([string]$ZipProp.Value)
+            if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf) -or -not (Test-ReportZipReadable -Path $ZipPath -Cache $ReportZipChecks)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
+        })
+    if ($ActualZipCount -lt $ExpectedZipCount -or $GoneRecords.Count -gt 0)
     {
-        $MissingCount = $ExpectedZipCount - $ActualZipCount
+        $MissingCount = [math]::Max(($ExpectedZipCount - $ActualZipCount), $GoneRecords.Count)
         $CarriedNote = if ($CarriedReports.Count -gt 0) { ', plus {0} carried from an earlier run' -f $CarriedReports.Count } else { '' }
         Write-Host ""
         Write-Host "ERROR: Per-subscription output verification failed." -ForegroundColor Red
@@ -2343,20 +2362,7 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         Write-Host ""
         # The subscriptions whose report is missing, by name: those whose run wrote
         # no zip (not completed already), and those completed this run whose
-        # recorded zip is gone since. A gone one is taken off the completed list
-        # the same way, so the next -Resume collects it again instead of failing
-        # to carry its report. The latest record of a subscription completed this
-        # run is the one this run wrote.
-        $LatestReports = Get-LatestCompletedReports -Reports $CompletedReports
-        $GoneRecords = @(foreach ($S in @($SubResourceCounts))
-            {
-                $Id = [string]$S.Id
-                if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
-                $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
-                if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
-                $ZipPath = Join-Path $InventoryRoot ([string]$ZipProp.Value)
-                if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf) -or -not (Test-ReportZipReadable -Path $ZipPath)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
-            })
+        # recorded zip is gone since (checked above).
         foreach ($Gone in $GoneRecords)
         {
             $CompletedIds = @($CompletedIds | Where-Object { $_ -ne [string]$Gone.Id })
@@ -2410,7 +2416,7 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
     $SubZips = @(Get-ChildItem -Path $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
     # Only report zips a reader can use go into the consolidated zip; one that
     # cannot be read is named as missing above.
-    $SubZips = @($SubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName })
+    $SubZips = @($SubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName -Cache $ReportZipChecks })
     $SubZips = @(Join-CarriedReportZips -Zips $SubZips -CarriedReports $CarriedReports)
     if ($SubZips.Count -gt 0)
     {
