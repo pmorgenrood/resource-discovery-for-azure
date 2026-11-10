@@ -420,10 +420,12 @@ function Get-RdaReportJsonFiles
     $InventoryFile = $DefaultPath + 'Inventory_' + $ReportName + '_' + $RunDateTime + '.json'
     if (Test-Path -LiteralPath $InventoryFile -PathType Leaf) { $Files.Add($InventoryFile) }
     # The report name is matched as text, so a '*' or '?' in it never picks up
-    # another run's files.
-    $MetricsPrefix = ('Metrics_{0}_{1}' -f $ReportName, $RunDateTime)
+    # another run's files. Only the run's own names are taken: the empty file
+    # <prefix>.json and the batch files <prefix>_<n>.json or <prefix>__<n>.json.
+    # A lookalike such as <prefix>_backup.json stays out of the zip.
+    $MetricsPattern = ('^{0}(__?[0-9]+)?\.json$' -f [regex]::Escape(('Metrics_{0}_{1}' -f $ReportName, $RunDateTime)))
     foreach ($MetricsFile in @(Get-ChildItem -LiteralPath $DefaultPath -Filter 'Metrics_*.json' -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name.StartsWith($MetricsPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and $_.Name.EndsWith('.json', [System.StringComparison]::OrdinalIgnoreCase) } | Sort-Object Name))
+                Where-Object { [regex]::IsMatch($_.Name, $MetricsPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) } | Sort-Object Name))
     {
         $Files.Add($MetricsFile.FullName)
     }

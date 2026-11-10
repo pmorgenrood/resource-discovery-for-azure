@@ -977,6 +977,32 @@ Describe 'Get-RdaReportJsonFiles' {
 
         $Found | Should -Be @(('Inventory_{0}_{1}.json' -f $Name, $Stamp), ('Metrics_{0}_{1}_1.json' -f $Name, $Stamp))
     }
+
+    It 'takes only the run''s own Metrics file names, not a lookalike that holds <Content>' -ForEach @(
+        @{ Content = '{"Metrics":[]}' }
+        @{ Content = 'not json' }
+    ) {
+        $Folder = Join-Path $TestDrive ('lookalike-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        $Stamp = '20261109120000000e001'
+        Set-Content -LiteralPath (Join-Path $Folder ('Inventory_R_{0}.json' -f $Stamp)) -Value '{}'
+        Set-Content -LiteralPath (Join-Path $Folder ('Metrics_R_{0}.json' -f $Stamp)) -Value '{"Metrics":[]}'
+        Set-Content -LiteralPath (Join-Path $Folder ('Metrics_R_{0}__1.json' -f $Stamp)) -Value '{"Metrics":[]}'
+        Set-Content -LiteralPath (Join-Path $Folder ('METRICS_R_{0}_12.JSON' -f $Stamp)) -Value '{"Metrics":[]}'
+        Set-Content -LiteralPath (Join-Path $Folder ('Metrics_R_{0}_backup.json' -f $Stamp)) -Value $Content
+        Set-Content -LiteralPath (Join-Path $Folder ('Metrics_R_{0}__1_old.json' -f $Stamp)) -Value $Content
+
+        $Files = @(Get-RdaReportJsonFiles -DefaultPath ($Folder + '/') -ReportName 'R' -RunDateTime $Stamp)
+        $Found = @($Files | ForEach-Object { Split-Path -Path $_ -Leaf })
+
+        $Found | Should -Not -Contain ('Metrics_R_{0}_backup.json' -f $Stamp)
+        $Found | Should -Not -Contain ('Metrics_R_{0}__1_old.json' -f $Stamp)
+        $Found | Should -Contain ('Metrics_R_{0}.json' -f $Stamp)
+        $Found | Should -Contain ('Metrics_R_{0}__1.json' -f $Stamp)
+        if (-not $IsWindows) { $Found | Should -Contain ('METRICS_R_{0}_12.JSON' -f $Stamp) }
+        function Write-Log { param($Message, $Severity) }
+        Test-RdaReportMetricsWritten -JsonFiles $Files | Should -BeTrue
+    }
 }
 
 Describe 'The Inventory file of a ResourceInventory.ps1 run' {
