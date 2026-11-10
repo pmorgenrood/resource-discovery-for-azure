@@ -203,7 +203,7 @@ A run asks you to sign in at most once: the parallel collectors and the `Run-All
 
 ### Advanced Usage Examples
 
-For most runs, use the `Run-AllSubscriptions.ps1` wrapper (recommended) — it inventories the whole tenant and forwards the common options (`-SkipConsumption`, `-SkipMetrics`, `-ConcurrencyLimit`, `-Obfuscate`, `-DeviceLogin`), so they behave exactly as they would on the inner script:
+For most runs, use the `Run-AllSubscriptions.ps1` wrapper (recommended) — it inventories the whole tenant and forwards the common options (`-SkipConsumption`, `-SkipMetrics`, `-ConcurrencyLimit`, `-Obfuscate`, `-IncludeNetworkResources`, `-DeviceLogin`), so they behave exactly as they would on the inner script:
 
 **Skip consumption (billing) data:**
 ```powershell
@@ -224,7 +224,7 @@ To mask identifying details before sharing externally, add `-Obfuscate` — see 
 
 #### Targeting a single subscription or resource group
 
-The wrapper always covers the whole tenant. To scope a run to **one** subscription or a **single** resource group (producing one consolidated report), call `ResourceInventory.ps1` directly — the wrapper does not expose `-SubscriptionID` or `-ResourceGroup`. It accepts the same `-SkipConsumption`, `-SkipMetrics`, and `-Obfuscate` switches.
+The wrapper always covers the whole tenant. To scope a run to **one** subscription or a **single** resource group (producing one consolidated report), call `ResourceInventory.ps1` directly — the wrapper does not expose `-SubscriptionID` or `-ResourceGroup`. It accepts the same `-SkipConsumption`, `-SkipMetrics`, `-Obfuscate`, and `-IncludeNetworkResources` switches.
 
 **Scan a specific subscription:**
 ```powershell

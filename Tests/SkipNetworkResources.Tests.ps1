@@ -958,6 +958,18 @@ Describe 'Callers use the message and the switch' {
         if ($On) { $Result['IncludeNetworkResources'] | Should -BeTrue }
     }
 
+    It 'the README''s earlier summaries name -IncludeNetworkResources too' {
+        $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
+        # The advanced-usage line on the options the wrapper forwards, and the
+        # line on the switches a direct run shares with it.
+        $Common = [regex]::Match($Readme, 'forwards the common options \(([^)]*)\)')
+        $Common.Success | Should -BeTrue
+        $Common.Groups[1].Value | Should -Match '`-IncludeNetworkResources`'
+        $Shared = [regex]::Match($Readme, 'It accepts the same ([^.]*) switches')
+        $Shared.Success | Should -BeTrue
+        $Shared.Groups[1].Value | Should -Match '`-IncludeNetworkResources`'
+    }
+
     It 'the README''s wrapper summary names every switch the wrapper forwards' {
         $Readme = Get-Content -Path (Join-Path $script:RepoRoot 'README.md') -Raw
         $Summary = [regex]::Match($Readme, '(?s)The wrapper forwards (.*?) to the inner')
