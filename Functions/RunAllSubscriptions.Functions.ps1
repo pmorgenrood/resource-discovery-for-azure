@@ -1793,8 +1793,9 @@ function Test-ReportFileShape
 # data decodes. A
 # file of a report zip's name that is cut short or damaged is counted as
 # missing, so it is named and collected again instead of being put into the
-# consolidated zip as a report. With -Cache (one hashtable per run), a zip of
-# the same path, size and write time is read only once.
+# consolidated zip as a report. With -Cache (one per run, made with
+# New-PathTable so paths compare as the file system does; a plain @{} ignores
+# case), a zip of the same path, size and write time is read only once.
 # shortcut: .NET checks an entry's CRC-32 on read only from .NET 11 on
 # (PowerShell 7.4 to 7.6 run on .NET 8 to 10), so damage that still decodes,
 # or damage to an entry stored without compression, is not seen there; compare
