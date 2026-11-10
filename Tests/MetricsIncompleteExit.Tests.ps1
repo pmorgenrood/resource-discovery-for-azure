@@ -1005,6 +1005,31 @@ Describe 'Get-RdaReportJsonFiles' {
     }
 }
 
+Describe 'Test-RdaReportInventoryWritten' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
+        # A quiet stand-in, only for this block.
+        function Write-Log { param($Message, $Severity) }
+    }
+
+    It 'reads an Inventory file nested deeper than 64 levels, as ConvertTo-Json -Depth 100 can write it' {
+        # The run writes the Inventory file with ConvertTo-Json -Depth 100.
+        $Nested = @{ Leaf = 'x' }
+        foreach ($Level in 1..70) { $Nested = @{ Inner = $Nested } }
+        $File = Join-Path $TestDrive 'Inventory_Deep_20261109120000000e001.json'
+        @{ VirtualMachines = @($Nested) } | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath $File -Encoding utf8
+
+        Test-RdaReportInventoryWritten -JsonFiles @($File) | Should -BeTrue
+    }
+
+    It 'still refuses a file that is not a JSON object' {
+        $File = Join-Path $TestDrive 'Inventory_Cut_20261109120000000e001.json'
+        Set-Content -LiteralPath $File -Value '{"Virtual' -Encoding utf8
+
+        Test-RdaReportInventoryWritten -JsonFiles @($File) | Should -BeFalse
+    }
+}
+
 Describe 'The Inventory file of a ResourceInventory.ps1 run' {
     BeforeAll {
         # The function that writes the Inventory file, as written, run with the
