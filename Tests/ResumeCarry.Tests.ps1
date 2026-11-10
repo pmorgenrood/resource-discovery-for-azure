@@ -435,6 +435,19 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         Test-ReportZipReadable -Path $RowZip | Should -BeTrue
     }
 
+    It 'still reads an inventory as deep as the collector writes it (ConvertTo-Json -Depth 100 of a deeper object)' {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Deep = @{ v = 1 }
+        foreach ($N in 1..105) { $Deep = @{ a = $Deep } }
+        $Inventory = ConvertTo-Json -InputObject $Deep -Depth 100 -Compress -WarningAction SilentlyContinue
+        ([regex]::Matches($Inventory, '\{')).Count | Should -Be 101 -Because 'the root plus 100 levels'
+        $DeepZip = Join-Path $script:Root ('deep-{0}.zip' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Z = [System.IO.Compression.ZipFile]::Open($DeepZip, 'Create')
+        try { foreach ($Pair in @(@('Inventory_R_9.json', $Inventory), @('Metrics_R_9.json', '{"Metrics":[]}'), @('Consumption_R_9.csv', 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId'))) { $W = [System.IO.StreamWriter]::new($Z.CreateEntry($Pair[0], 'Optimal').Open()); try { $W.Write($Pair[1]) } finally { $W.Dispose() } } }
+        finally { $Z.Dispose() }
+        Test-ReportZipReadable -Path $DeepZip | Should -BeTrue
+    }
+
     It 'reads a report zip of the collector''s shape, a byte-order mark, white space and a quoted JSON cell included' {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $GoodZip = Join-Path $script:Root 'good7.zip'

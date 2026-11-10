@@ -1743,10 +1743,11 @@ function Test-ReportFileShape
         }
         # shortcut: the parse holds the whole file in memory (Test-ReportZipReadable
         # has read it once already); stream it with Utf8JsonReader if report files
-        # grow past what one run can hold. MaxDepth matches the collector's
-        # ConvertTo-Json -Depth 100 (the default, 64, would refuse a good file).
+        # grow past what one run can hold. MaxDepth fits the collector's
+        # ConvertTo-Json -Depth 100, which writes the root plus 100 levels (101;
+        # the default, 64, would refuse a good file).
         $Options = [System.Text.Json.JsonDocumentOptions]::new()
-        $Options.MaxDepth = 100
+        $Options.MaxDepth = 101
         $Doc = [System.Text.Json.JsonDocument]::Parse($Stream, $Options)
         try
         {
