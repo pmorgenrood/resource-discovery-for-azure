@@ -74,7 +74,7 @@ if (-not (Test-Path -LiteralPath $FunctionsFile -PathType Leaf))
 # The per-subscription count line (Get-RdaResourceCountMessage) is shared with
 # the wrapper and the inner script.
 $CommonFunctionsFile = Join-Path $PSScriptRoot 'Functions/Common.Functions.ps1'
-if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
+if (-not (Test-Path -LiteralPath $CommonFunctionsFile -PathType Leaf))
 {
     Write-Host "ERROR: Required functions file not found: $CommonFunctionsFile" -ForegroundColor Red
     Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
