@@ -115,7 +115,7 @@ Describe 'RunSummary.log records a resume state that was not saved' {
         @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 | Where-Object { $_ -like '  Resume state *' }) | Should -BeNullOrEmpty
     }
 
-    It 'the wrapper passes the flag a failed save sets' {
-        $script:WrapperText | Should -Match ([regex]::Escape('-ResumeStateNotSaved:$ResumeStateSaveFailed `'))
+    It 'the wrapper passes the flag a failed save sets, while the resume state file is there' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `'))
     }
 }
