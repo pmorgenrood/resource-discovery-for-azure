@@ -873,6 +873,41 @@ Describe 'A resume state that lists a subscription as both completed and failed'
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 
+    It 'lets a parallel run''s failure win over a stale per-stream completion of the same subscription, and the next two -Resume runs end it' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        # An older interrupted run with more streams left Sub B completed in its stream 3.
+        @{ Tenant = $script:Tenant; StreamId = 3; Completed = @($script:Subs['B'].Id); FailedAttempts = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-3.json' -f $script:Tenant)) -Encoding utf8
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B'
+        $null = script:Invoke-Wrapper -Streams 2
+        $State = script:Read-StateAt -Path $script:State
+        $State.Completed | Should -Not -Contain $script:Subs['B'].Id
+        $State.Failed | Should -Be (script:Get-Ids 'B')
+        script:Clear-Calls
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $R2 = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume')
+        script:Get-Calls | Should -Be (script:Get-Ids 'B')
+        $R2.ExitCode | Should -Be 0
+        script:Clear-Calls
+        $R3 = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume')
+        script:Get-Calls | Should -Be (script:Get-Ids 'A', 'B', 'C') -Because 'the clean run 2 removed the state, so a -Resume starts again'
+        $R3.ExitCode | Should -Be 0
+    }
+
+    It 'lets a failure in the per-stream file of an interrupted run win over the unified completion at the start of -Resume' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        [pscustomobject]@{ TenantID = $script:Tenant; CompletedSubscriptionIds = @($script:Subs['A'].Id, $script:Subs['B'].Id); FailedAttempts = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:State -Encoding utf8
+        @{ Tenant = $script:Tenant; StreamId = 0; Completed = @(); FailedAttempts = @(@{ Id = $script:Subs['B'].Id; Name = $script:Subs['B'].Name; LastFailedAt = '2026-11-09T00:00:00Z'; Reason = 'stand-in'; Attempts = 1 }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}-stream-0.json' -f $script:Tenant)) -Encoding utf8
+        $Pf = script:Invoke-Wrapper -Streams 1 -Arguments @('-PreflightOnly', '-Resume')
+        $Pf.ExitCode | Should -Be 0
+        $Run = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume')
+        script:Get-Calls | Should -Be (script:Get-Ids 'B')
+        $Run.ExitCode | Should -Be 0
+    }
+
     It 'keeps a subscription a parallel run failed off the completed list, so -Resume -ResumeFailedOnly collects it' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'

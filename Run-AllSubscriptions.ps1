@@ -919,7 +919,11 @@ if ($PreflightOnly)
                 Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $PfStreamFile.FullName, $_.Exception.Message)
             }
         }
-        if ($PfStreamCompleted.Count -gt 0) { $PfCompleted = @($PfCompleted + $PfStreamCompleted | Sort-Object -Unique) }
+        # As the run does: a subscription a per-stream file lists as failed is
+        # not completed (the failure wins).
+        $PfStreamFailedIds = @($PfStreamFailed | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+        $PfCompleted = @($PfCompleted | Where-Object { $PfStreamFailedIds -notcontains $_ })
+        if ($PfStreamCompleted.Count -gt 0) { $PfCompleted = @($PfCompleted + @($PfStreamCompleted | Where-Object { $PfStreamFailedIds -notcontains $_ }) | Sort-Object -Unique) }
         # As the run does: the retry list is reconciled with the completed list
         # only when per-stream state files are there; otherwise the run keeps
         # it as the file holds it, so the preflight checks the same list.
@@ -1025,9 +1029,13 @@ if ($Resume -or $ResumeFailedOnly)
                 Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
             }
         }
+        # As the end-of-run merge: a subscription a per-stream file lists as
+        # failed is not completed (the failure wins).
+        $StrandedFailedIds = @($StrandedFailed | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+        $CompletedIds = @($CompletedIds | Where-Object { $StrandedFailedIds -notcontains [string]$_ })
         if ($StrandedCompleted.Count -gt 0)
         {
-            $CompletedIds = @($CompletedIds + $StrandedCompleted | Sort-Object -Unique)
+            $CompletedIds = @($CompletedIds + @($StrandedCompleted | Where-Object { $StrandedFailedIds -notcontains [string]$_ }) | Sort-Object -Unique)
         }
         # Same recency-wins / prune-on-completed reconciliation the end-of-run
         # merge uses, so a sub that later succeeded in another stream is dropped.
@@ -1851,15 +1859,16 @@ else
                     Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
                 }
             }
-            # A subscription a stream failed and did not complete this run is not
-            # completed, whatever an earlier run recorded: otherwise the merge
-            # below drops its new failure, and -Resume skips it.
-            $StreamCompletedIds = @($AllCompletedFromStreams | Where-Object { $_ } | ForEach-Object { [string]$_ })
-            $StreamFailedIds = @($AllFailedFromStreams | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Where-Object { $StreamCompletedIds -notcontains $_ })
+            # A subscription a per-stream file lists as failed is not completed,
+            # whatever an earlier run or another (older) stream file recorded:
+            # the files carry no completion time, so the failure wins, and the
+            # worst case is one more collection. Otherwise the merge below drops
+            # the failure, and every later -Resume skips the subscription.
+            $StreamFailedIds = @($AllFailedFromStreams | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
             $CompletedIds = @($CompletedIds | Where-Object { $StreamFailedIds -notcontains [string]$_ })
             if ($AllCompletedFromStreams.Count -gt 0)
             {
-                $CompletedIds = @($CompletedIds + $AllCompletedFromStreams | Sort-Object -Unique)
+                $CompletedIds = @($CompletedIds + @($AllCompletedFromStreams | Where-Object { $StreamFailedIds -notcontains [string]$_ }) | Sort-Object -Unique)
             }
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
