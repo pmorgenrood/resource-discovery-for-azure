@@ -1356,6 +1356,27 @@ function Test-ConsumptionAccess
     }
 }
 
+# How many subscriptions the end-of-run failure list stands for. A
+# 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry stands for the
+# subscriptions of that stream's slice (SubCount in -StreamSummaries); every
+# other entry is one subscription.
+function Get-FailedSubscriptionCount
+{
+    param($FailedSubscriptions = @(), $StreamSummaries = @())
+    $Count = 0
+    foreach ($Entry in @(@($FailedSubscriptions) | Where-Object { $null -ne $_ }))
+    {
+        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no|corrupt) summary\)$')
+        {
+            $Id = $Matches[1]
+            $Stream = @(@($StreamSummaries) | Where-Object { $null -ne $_ -and [string]$_.StreamId -eq $Id }) | Select-Object -First 1
+            if ($null -ne $Stream -and $Stream.PSObject.Properties['SubCount'] -and [int]$Stream.SubCount -gt 0) { $Count += [int]$Stream.SubCount; continue }
+        }
+        $Count++
+    }
+    return $Count
+}
+
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation
 # timestamp (no file I/O, no Azure calls) so it is unit-testable offline: the
@@ -1396,6 +1417,9 @@ function Get-RunSummaryLogContent
         # Retry-list entries past the retry limit ({ Name; Id; Attempts; Reason }),
         # from Get-RetryLimitedAttempts.
         $RetryLimited = @(),
+        # How many subscriptions failed, from Get-FailedSubscriptionCount; when
+        # not given, one per entry of -FailedSubscriptions.
+        [int]$FailedSubscriptionCount = -1,
         [int]$ConsumptionRecordCount = 0,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
@@ -1425,6 +1449,7 @@ function Get-RunSummaryLogContent
     $Empty = @(@($EmptyGenuinelyEmpty) | Where-Object { $null -ne $_ })
     $Undetermined = @(@($EmptyUndetermined) | Where-Object { $null -ne $_ })
     $Failed = @(@($FailedSubscriptions) | Where-Object { $null -ne $_ })
+    $FailedCount = if ($FailedSubscriptionCount -ge 0) { $FailedSubscriptionCount } else { $Failed.Count }
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
     # The '(auth)' marker of a whole-phase sign-in skip is not a subscription
@@ -1537,7 +1562,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Eligible  : {0}' -f $Eligible))
     $Lines.Add(('  Skipped   : {0} (already completed / resume)' -f $Skipped))
     $Lines.Add(('  Processed : {0}' -f $Processed))
-    $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
+    $Lines.Add(('  Failed    : {0}' -f $FailedCount))
     $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
@@ -1547,7 +1572,7 @@ function Get-RunSummaryLogContent
     $Lines.Add('')
     $Lines.Add('Health:')
     $Lines.Add(('  Consumption records collected : {0}' -f $ConsumptionRecordCount))
-    $Lines.Add(('  Failed subscriptions          : {0}' -f $Failed.Count))
+    $Lines.Add(('  Failed subscriptions          : {0}' -f $FailedCount))
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
@@ -1562,9 +1587,10 @@ function Get-RunSummaryLogContent
         {
             $Lines.Add('')
             $Lines.Add('Failed subscriptions (detail):')
-            # Run-AllSubscriptions.ps1 collects each failure as a line of text (the
-            # subscription name, '<name> (stream-N: <reason>)', or 'stream-N (no
-            # summary)'), which has no Name or Id; an object carries both.
+            # Run-AllSubscriptions.ps1 collects each failure as a line of text
+            # ('<name> (<id>)', '<name> (<id>) (stream-N: <reason>)', 'stream-N
+            # (no summary)' or 'stream-N (corrupt summary)'), which has no Name
+            # or Id; an object carries both.
             foreach ($FailedSub in $Failed)
             {
                 if ($FailedSub -is [string]) { $Lines.Add(('  - {0}' -f $FailedSub)) }
