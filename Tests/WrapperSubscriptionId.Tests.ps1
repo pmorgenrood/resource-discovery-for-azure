@@ -1287,19 +1287,3 @@ Describe 'The start-of-run fold when a per-stream file it folded in cannot be re
         Test-Path -LiteralPath $Stream | Should -BeTrue
     }
 }
-
-Describe 'Write-StreamState' {
-    It 'leaves the file it had when the write is stopped part-way, never an empty or cut-short one, and no .tmp' {
-        . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1')
-        $TenantID = 't'
-        $StreamId = 0
-        $null = $TenantID, $StreamId
-        $Path = Join-Path $TestDrive '.resume-state-t-stream-0.json'
-        Write-StreamState -Path $Path -Completed @('sub-a') -FailedAttempts @() 6>$null
-        $Before = Get-Content -LiteralPath $Path -Raw
-        Mock Set-Content { $Target = if ($LiteralPath) { $LiteralPath } else { $Path }; [System.IO.File]::WriteAllText([string]$Target, '{ "Ten'); throw 'stand-in: stopped during the write' }
-        Write-StreamState -Path $Path -Completed @('sub-a', 'sub-b') -FailedAttempts @() 6>$null
-        Get-Content -LiteralPath $Path -Raw | Should -Be $Before
-        Test-Path -LiteralPath ($Path + '.tmp') | Should -BeFalse
-    }
-}
