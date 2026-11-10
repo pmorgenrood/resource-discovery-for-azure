@@ -643,8 +643,9 @@ catch
 # .resume-state-<tenant>-subscription-<id>.json, never the whole tenant's
 # .resume-state-<tenant>.json or its per-stream files, nor they its own.
 $ResumeKey = Get-ResumeStateKey -Tenant $TenantID -SubscriptionID $(if ($OneSubscription) { $SubscriptionID } else { '' })
-# A -PreflightOnly run has no inventory folder and stops before any resume
-# state is read or written.
+# A -PreflightOnly run has no inventory folder and writes no resume state
+# (with -Resume or -ResumeFailedOnly it reads it, to name what a run would
+# collect).
 if (-not $PreflightOnly) { $ResumeStateFile = Join-Path $InventoryRoot (".resume-state-{0}.json" -f $ResumeKey) }
 
 
