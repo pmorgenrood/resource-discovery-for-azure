@@ -405,6 +405,12 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         @{ Case = 'its inventory is cut short'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":[{"Name":"vm"'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'its metrics file is not JSON'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = 'Metrics'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'its consumption file lacks a column downstream needs'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterName,MeterId' } }
+        @{ Case = 'its inventory is not JSON though it starts and ends with braces'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'its metrics file has no Metrics list'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'a metric value is text'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[{"MetricValue":"1.5","MetricError":false}]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'a quantity has a comma for the decimal mark'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,"1,5",2026-11-01T00:00:00Z,2026-11-02T00:00:00Z') } }
+        @{ Case = 'a usage date is not in a culture-free form'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5,31/12/2026,2026-11-02T00:00:00Z') } }
+        @{ Case = 'a row is cut short'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5') } }
     ) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $OddZip = Join-Path $script:Root ('odd7-{0}.zip' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
@@ -414,19 +420,35 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         Test-ReportZipReadable -Path $OddZip | Should -BeFalse
     }
 
-    It 'reads a report zip whose three files have the collector''s shape, a byte-order mark and white space included' {
+    It 'reads a report zip whose three files downstream can read, a byte-order mark, white space and a quoted JSON cell included' {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $GoodZip = Join-Path $script:Root 'good7.zip'
         $Z = [System.IO.Compression.ZipFile]::Open($GoodZip, 'Create')
         try
         {
-            foreach ($Pair in @(@('Inventory_R_7.json', ([char]0xFEFF + '  {"VirtualMachines":[]}' + "`r`n")), @('Metrics_R_7.json', '{"Metrics":[]}'), @('Consumption_R_7.csv', ('"InstanceData","MeterCategory","MeterId","MeterName","MeterRegion","MeterSubCategory","Quantity","Unit","UsageStartTime","UsageEndTime","ResourceId"' + "`r`n" + 'x,y,z'))))
+            foreach ($Pair in @(@('Inventory_R_7.json', ([char]0xFEFF + '  {"VirtualMachines":[]}' + "`r`n")), @('Metrics_R_7.json', '{"Metrics":[{"MetricCount":3,"MetricValue":1.5,"MetricPercentile":0,"MetricError":false}]}'), @('Consumption_R_7.csv', ('"InstanceData","MeterCategory","MeterId","MeterName","MeterRegion","MeterSubCategory","Quantity","Unit","UsageStartTime","UsageEndTime","ResourceId"' + "`r`n" + '"{""a"":1, ""b"":2}",Compute,m1,Hours,eastus,D,0.5,Hours,2026-11-01T00:00:00Z,2026-11-02T00:00:00.0000000Z,/subscriptions/s/x' + "`r`n"))))
             {
                 $W = [System.IO.StreamWriter]::new($Z.CreateEntry($Pair[0], 'Optimal').Open(), [System.Text.UTF8Encoding]::new($false)); try { $W.Write($Pair[1]) } finally { $W.Dispose() }
             }
         }
         finally { $Z.Dispose() }
         Test-ReportZipReadable -Path $GoodZip | Should -BeTrue
+    }
+
+    It 'checks a report zip with a 20 MB inventory and a 20 MB consumption file in under a minute' {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $BigZip = Join-Path $script:Root 'big7.zip'
+        $Z = [System.IO.Compression.ZipFile]::Open($BigZip, 'Create')
+        try
+        {
+            $W = [System.IO.StreamWriter]::new($Z.CreateEntry('Inventory_R_8.json', 'Optimal').Open()); try { $W.Write('{"VirtualMachines":['); foreach ($N in 1..200000) { if ($N -gt 1) { $W.Write(',') }; $W.Write('{"Name":"vm-0000000000000000000000000000000000000000000000000000000000000000000000000","N":1}') }; $W.Write(']}') } finally { $W.Dispose() }
+            $W = [System.IO.StreamWriter]::new($Z.CreateEntry('Metrics_R_8.json', 'Optimal').Open()); try { $W.Write('{"Metrics":[]}') } finally { $W.Dispose() }
+            $W = [System.IO.StreamWriter]::new($Z.CreateEntry('Consumption_R_8.csv', 'Optimal').Open())
+            try { $W.WriteLine('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime'); foreach ($N in 1..200000) { $W.WriteLine('/subscriptions/s/resourcegroups/g/providers/p/x,Compute,D,Hours,m1,1.5,2026-11-01T00:00:00Z,2026-11-02T00:00:00Z') } } finally { $W.Dispose() }
+        }
+        finally { $Z.Dispose() }
+        $Took = Measure-Command { Test-ReportZipReadable -Path $BigZip | Should -BeTrue }
+        $Took.TotalSeconds | Should -BeLessThan 60
     }
 
     It 'reads a report zip once per run when given the same cache' {
