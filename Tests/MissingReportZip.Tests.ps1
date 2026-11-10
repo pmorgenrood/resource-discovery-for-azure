@@ -286,6 +286,20 @@ Describe 'A missing report zip while a failed subscription left a zip' -Skip:$Is
         @($R1.State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id
         @($R1.Text | Where-Object { $_ -like 'Per-subscription output verification: OK*' }) | Should -BeNullOrEmpty
     }
+
+    It 'names a subscription that wrote no zip, though a failed subscription''s zip makes the counts match' {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        # A completes with no zip; B writes its zip and fails; C is whole.
+        script:Set-Scenario -NoZip @($A.Id) -FailAfterZip @($B.Id)
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 2
+        $R1.Text | Should -Contain 'ERROR: Per-subscription output verification failed.'
+        script:Get-Banner $R1 | Select-Object -Skip 1 -First 1 | Should -Be ('  - {0} ({1})' -f $A.Name, $A.Id)
+        $R1.Zip.RunSummary | Should -Contain ('  - {0} ({1})' -f $A.Name, $A.Id)
+        @($R1.State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id
+    }
 }
 
 Describe 'A report zip lost when the resume state cannot be written either' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {

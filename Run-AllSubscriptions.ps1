@@ -2338,9 +2338,13 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
             $ZipPath = Join-Path $InventoryRoot ([string]$ZipProp.Value)
             if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf) -or -not (Test-ReportZipReadable -Path $ZipPath -Cache $ReportZipChecks)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
         })
-    if ($ActualZipCount -lt $ExpectedZipCount -or $GoneRecords.Count -gt 0)
+    # A subscription that completed collection but wrote no zip is named on its
+    # own too, not only through the count: a zip a failed subscription left
+    # can make the counts match.
+    $NamedMissing = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
+    if ($ActualZipCount -lt $ExpectedZipCount -or $NamedMissing.Count -gt 0)
     {
-        $MissingCount = [math]::Max(($ExpectedZipCount - $ActualZipCount), $GoneRecords.Count)
+        $MissingCount = [math]::Max(($ExpectedZipCount - $ActualZipCount), $NamedMissing.Count)
         $CarriedNote = if ($CarriedReports.Count -gt 0) { ', plus {0} carried from an earlier run' -f $CarriedReports.Count } else { '' }
         Write-Host ""
         Write-Host "ERROR: Per-subscription output verification failed." -ForegroundColor Red
