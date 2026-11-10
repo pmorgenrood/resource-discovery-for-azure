@@ -485,7 +485,11 @@ function Test-RdaReportInventoryWritten
     try
     {
         $Stream = [System.IO.File]::OpenRead($InventoryFile)
-        $Document = [System.Text.Json.JsonDocument]::Parse($Stream)
+        # The file is written with ConvertTo-Json -Depth 100, deeper than the
+        # default limit of 64, so the limit is set above that.
+        $Options = [System.Text.Json.JsonDocumentOptions]::new()
+        $Options.MaxDepth = 128
+        $Document = [System.Text.Json.JsonDocument]::Parse($Stream, $Options)
         if ($Document.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) { return $true }
         $Reason = 'it is not a JSON object'
     }
