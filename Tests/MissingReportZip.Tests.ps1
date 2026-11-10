@@ -355,7 +355,8 @@ Describe 'RunSummary.log advice for a missing report' {
 
     It 'the wrapper passes the flag, raised by a failed save of the resume state too, and the console says the same' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:($MissingStateNotSaved -or $ResumeStateSaveFailed) `'))
-        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved -or $ResumeStateSaveFailed)'))
+        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))) `'))
+        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)))'))
+        $Src | Should -Match ([regex]::Escape("'may still list some of them as completed, so a -Resume could skip them'"))
     }
 }

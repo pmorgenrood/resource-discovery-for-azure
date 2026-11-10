@@ -2952,7 +2952,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -RetryLimited $RetryLimited `
             -NotInRun $RetryOwedNotInRun `
             -ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `
-            -MissingReportCount $MissingReportCount -MissingReports $MissingReports -MissingStateNotSaved:($MissingStateNotSaved -or $ResumeStateSaveFailed) `
+            -MissingReportCount $MissingReportCount -MissingReports $MissingReports -MissingStateNotSaved:($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))) `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
@@ -3194,9 +3194,11 @@ if ($MissingReportCount -gt 0)
         Write-Host ("  ({0} more could not be named; see 'Per-subscription output verification failed' above.)" -f ($MissingReportCount - @($MissingReports).Count)) -ForegroundColor Red
     }
     # A failed save of the resume state (named below) leaves the same risk.
-    if ($MissingStateNotSaved -or $ResumeStateSaveFailed)
+    if ($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)))
     {
-        Write-Host ("The resume state file {0} could not be updated and still lists some of them as completed, so a -Resume would skip them. Fix the cause (for example, free up disk space), then run again without -Resume: it collects every subscription." -f $ResumeStateFile) -ForegroundColor Red
+        # The read-back found them listed; after a failed save alone they may be.
+        $Lists = if ($MissingStateNotSaved) { 'still lists some of them as completed, so a -Resume would skip them' } else { 'may still list some of them as completed, so a -Resume could skip them' }
+        Write-Host ("The resume state file {0} could not be updated and {1}. Fix the cause (for example, free up disk space), then run again without -Resume: it collects every subscription." -f $ResumeStateFile, $Lists) -ForegroundColor Red
     }
     else
     {
