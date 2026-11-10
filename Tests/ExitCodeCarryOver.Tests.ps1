@@ -126,15 +126,26 @@ if ((Get-RdaStandInScenario).NarrationFail)
     }
 }
 # With ResumeRemoveFail, the wrapper cannot remove the resume state file at
-# the end of a clean run, with an error whose text holds braces.
-if ((Get-RdaStandInScenario).ResumeRemoveFail)
+# the end of a clean run, with an error whose text holds braces. With
+# ResumeRemoveSoftFail, the removal fails as Remove-Item itself fails on a
+# locked file: with a non-terminating error, which a catch sees only when the
+# call asks for -ErrorAction Stop.
+if ((Get-RdaStandInScenario).ResumeRemoveFail -or (Get-RdaStandInScenario).ResumeRemoveSoftFail)
 {
     function Remove-Item
     {
         [CmdletBinding()] param([Parameter(Position = 0)]$Path, $LiteralPath, [switch]$Force, [switch]$Recurse)
         # The wrapper names the file by -LiteralPath (or by -Path).
         $Target = if ($PSBoundParameters.ContainsKey('LiteralPath')) { [string]$LiteralPath } else { [string]$Path }
-        if ($Target -like '*.resume-state-*' -and $Target -notlike '*-stream-*' -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1') { throw 'stand-in: the file is in use by {another process}' }
+        if ($Target -like '*.resume-state-*' -and $Target -notlike '*-stream-*' -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1')
+        {
+            if ((Get-RdaStandInScenario).ResumeRemoveSoftFail)
+            {
+                $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new([System.IO.IOException]::new('stand-in: the file is locked by another process'), 'RemoveFileSystemItemIOError', [System.Management.Automation.ErrorCategory]::WriteError, $Target))
+                return
+            }
+            throw 'stand-in: the file is in use by {another process}'
+        }
         Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
     }
 }
@@ -401,7 +412,7 @@ function Get-UsageAggregates
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked)
+            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool)
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             # ReuseHome: the next run on the same machine, with the resume
             # state the run before left.
@@ -547,9 +558,18 @@ function Get-UsageAggregates
             # StandInInventory: the copy of the tool with the stand-in
             # ResourceInventory.ps1.
             $RunTool = if ($StandInInventory) { $script:ToolStandIn } else { $script:Tool }
+            # BracketTool: that copy of the tool under a folder whose name
+            # holds [ and ] ([client]), as a customer may unpack it.
+            if ($BracketTool)
+            {
+                $BracketParent = Join-Path $CaseDir '[client]'
+                $null = [System.IO.Directory]::CreateDirectory($BracketParent)
+                Copy-Item -LiteralPath $RunTool -Destination (Join-Path $BracketParent 'tool') -Recurse -Force
+                $RunTool = Join-Path $BracketParent 'tool'
+            }
             $RunWrapper = Join-Path $RunTool 'Run-AllSubscriptions.ps1'
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             # ConsumptionPageFail runs the consumption phase (see
             # Get-UsageAggregates in the stand-in), MetricsTokenFail the
@@ -1173,6 +1193,29 @@ function Get-UsageAggregates
         $Run.ExitCode | Should -Be 0 -Because $Run.Console
     }
 
+    It 'sequential: a resume state file whose removal fails with a non-terminating error (a locked file) is not called cleared, the warning says a later -Resume skips what it lists, and the next two runs clear it and then read none' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA) -ResumeRemoveSoftFail
+        $Run.Console | Should -Match ('WARNING: Could not remove resume state file .+: ' + [regex]::Escape('stand-in: the file is locked by another process')) -Because $Run.Console
+        $Run.Console | Should -Match 'still lists the subscriptions it holds as completed, so a later -Resume run skips them' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'Resume state cleared \(clean run\)' -Because 'the file is still there'
+        $Run.StateKept | Should -BeTrue -Because 'the removal failed'
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+
+        # The next run, a -Resume once the lock is gone, reads the kept state
+        # as kept (and says so), and its clean end clears it.
+        $Next = Invoke-CarryOverRun -Subs @($script:SubA) -Resume -ReuseHome $Run.Home
+        $Next.Console | Should -Match 'Resume mode: 1 previously completed subscription\(s\) will be skipped' -Because $Next.Console
+        $Next.Console | Should -Match 'Resume state cleared \(clean run\)' -Because $Next.Console
+        $Next.StateKept | Should -BeFalse -Because $Next.Console
+        $Next.ExitCode | Should -Be 0 -Because $Next.Console
+
+        # The run after that reads no state and runs the subscription.
+        $After = Invoke-CarryOverRun -Subs @($script:SubA) -Resume -ReuseHome $Run.Home
+        $After.Console | Should -Match 'Resume mode: no previous state found' -Because $After.Console
+        $After.Console | Should -Match 'Processing subscription: Sub A' -Because $After.Console
+        $After.ExitCode | Should -Be 0 -Because $After.Console
+    }
+
     It 'sequential: a non-zero $LASTEXITCODE left in the session before the run fails no subscription' {
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -PriorExitCode 1
         $Run.Console | Should -Not -Match 'ERROR processing subscription' -Because $Run.Console
@@ -1283,6 +1326,49 @@ function Get-UsageAggregates
         $After.Console | Should -Match 'Processing subscription: Sub A' -Because $After.Console
         $After.Console | Should -Match 'Processing subscription: Sub B' -Because $After.Console
         $After.ExitCode | Should -Be 0 -Because $After.Console
+    }
+
+    It 'two streams: a clean run whose resume state cannot be written and that then stops at the zip check names every kept stream resume state file and the summary-only file, which stay; the next run reads them back and clears them' {
+        # As above (Sub A's success is only in stream 0's summary, and the
+        # resume state cannot be written), but stream 1's summary names a
+        # zip for Sub B that is not on disk, so the run stops at the zip
+        # check, before the clean-run clean-up.
+        $RowB = [pscustomobject]@{ Name = $script:SubB.Name; Id = $script:SubB.Id; Count = 1; Zip = '{Reports}/SubB/ResourcesReport_gone.zip' }
+        $Forged = [pscustomobject]@{ RunId = '{RunId}'; StreamId = '1'; Status = 'ok'; ResourceCounts = @($RowB); Failed = @() } | ConvertTo-Json -Depth 5
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamStateBlocked -UnifiedStateBlocked -Stream1SummaryJson $Forged
+        $Run.Console | Should -Match 'WARNING: Failed to persist resume state to ' -Because $Run.Console
+        $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        $StreamFiles = @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) -File -Force | Where-Object { $_.Name -notlike '*-stream-summary-*' })
+        $Own = @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-summary-*.json' -f $script:Tenant) -File -Force)
+        $StreamFiles.Count | Should -Be 1 -Because 'stream 1 wrote its state file; stream 0 could not'
+        $Own.Count | Should -Be 1 -Because 'Sub A''s success is held only in the stream summaries'
+        @((Get-Content -LiteralPath $Own[0].FullName -Raw | ConvertFrom-Json).Completed) | Should -Be @($script:SubA.Id)
+        $Run.Console | Should -Match ([regex]::Escape(('WARNING: kept {0} stream resume state file(s) in {1}' -f $StreamFiles.Count, $Run.Root))) -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape(('were written to the stream resume state file {0}; the next run reads it at its start' -f $Own[0].FullName))) -Because $Run.Console
+
+        # The next run reads both back, runs every subscription and, clean,
+        # clears them.
+        $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -ReuseHome $Run.Home
+        $Next.Console | Should -Match 'Read per-stream resume state left by an earlier parallel run' -Because $Next.Console
+        $Next.ExitCode | Should -Be 0 -Because $Next.Console
+        @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) -File -Force).Count | Should -Be 0 -Because $Next.Console
+    }
+
+    It 'two streams: a clean run whose resume state cannot be written and that leaves a stream resume state file it could not read names only that file once the clean-up has removed the rest' {
+        # As above, with no zip gap, and with stream 7's file from an earlier
+        # run cut short: it opens but is not valid JSON, so this run does not
+        # read it and the clean-up leaves it. Stream 1's file and the
+        # summary-only file are read, so the clean-up removes them.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamStateBlocked -UnifiedStateBlocked -Stream7Unparseable
+        $Stream7 = Join-Path $Run.Root ('.resume-state-{0}-stream-7.json' -f $script:Tenant)
+        $Run.Console | Should -Match 'WARNING: Failed to persist resume state to ' -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+        @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) -File -Force).FullName | Should -Be @($Stream7) -Because 'only the file the run could not read is left'
+        $Run.Console | Should -Match ([regex]::Escape(('WARNING: kept 1 stream resume state file(s) in {0}' -f $Run.Root))) -Because $Run.Console
+        $Run.Console | Should -Not -Match 'WARNING: kept [02-9]\d* stream resume state file' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'as the resume state could not be written' -Because 'this file was kept because it could not be parsed, not because a save failed'
+        $Run.Console | Should -Not -Match 'were written to the stream resume state file' -Because 'the clean-up removed the summary-only file'
     }
 
     It 'two streams: when the resume state cannot be written, the old one is left as it was and every stream state file is kept; once it can be written, -ResumeFailedOnly retries the new failure only, and the run after has nothing to retry' {
@@ -1772,6 +1858,24 @@ function Get-UsageAggregates
         $After.ExitCode | Should -Be 0 -Because $After.Console
     }
 
+    It '<Case>: a copy of the tool in a folder whose name holds [ and ] starts, finds its Az.Accounts version file and makes its report' -ForEach @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'two streams'; Streams = 2 }
+    ) {
+        # The wrapper and the stream worker load Functions/AzModules.Functions.ps1
+        # from their own folder; a path read as a wildcard pattern finds no
+        # file under [client] and the run stops at its start. The stand-in
+        # ResourceInventory.ps1 is used: the real one still checks one file
+        # by -Path (another change owns that line).
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams $Streams -StandInInventory -BracketTool
+        $Run.Console | Should -Not -Match 'Required functions file not found' -Because $Run.Console
+        if ($Streams -gt 1) { $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console }
+        $Run.Console | Should -Match 'Per-subscription output verification: OK' -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+        $Run.ZipCount | Should -Be 1 -Because $Run.Console
+        @($Run.InnerZips).Count | Should -Be 2 -Because $Run.Console
+    }
+
     It 'two streams: a home whose path holds [ and ] gives a run with a failed subscription whose stream state files are merged into the resume state and removed' {
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -FailSub $script:SubA.Id -HomeName 'u[1]' -StandInInventory
         $Run.Console | Should -Match '\[stream-1\] done: Sub B' -Because $Run.Console
@@ -1916,5 +2020,33 @@ function Get-UsageAggregates
         $Run.Console | Should -Match '\[stream-1\] done: Sub B'
         $Run.FailedIds.Count | Should -Be 0
         $Run.ExitCode | Should -Be 0
+    }
+}
+
+# Remove-Item fails a locked or denied file with a non-terminating error,
+# which a catch never sees unless the call asks for -ErrorAction: the code
+# after it then runs as if the file was gone (as "Resume state cleared" did).
+# So each Remove-Item in the body of a try in the wrapper, its stream worker
+# and their functions names its -ErrorAction (Stop to reach the catch, or
+# SilentlyContinue where a failure is left on purpose).
+Describe 'Each Remove-Item inside a try names its -ErrorAction' {
+    It '<File>' -ForEach @(
+        @{ File = 'Run-AllSubscriptions.ps1' }
+        @{ File = 'Run-AllSubscriptions.Stream.ps1' }
+        @{ File = 'Functions/RunAllSubscriptions.Functions.ps1' }
+    ) {
+        $Path = Join-Path (Join-Path $PSScriptRoot '..') $File
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $Missing = @()
+        foreach ($Try in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true))
+        {
+            foreach ($Cmd in $Try.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Remove-Item' }, $true))
+            {
+                $Names = @($Cmd.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+                if (-not ($Names | Where-Object { $_ -in @('ErrorAction', 'EA') })) { $Missing += ('line {0}: {1}' -f $Cmd.Extent.StartLineNumber, $Cmd.Extent.Text) }
+            }
+        }
+        # A nested try finds the same call twice.
+        @($Missing | Select-Object -Unique) | Should -BeNullOrEmpty
     }
 }
