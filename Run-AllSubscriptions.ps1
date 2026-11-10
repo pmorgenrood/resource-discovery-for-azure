@@ -669,7 +669,9 @@ if ($StrandedStreamFiles.Count -gt 0)
         {
             $Obj = $StreamText | ConvertFrom-Json -ErrorAction Stop
             if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
-            if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
+            # A [null] (an older worker wrote one once its last failure was
+            # cleared) is no failure, so it is not counted as one.
+            if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts | Where-Object { $null -ne $_ }) }
             $ReadStreamStateFiles += $StreamFile.FullName
         }
         catch
@@ -1477,11 +1479,13 @@ else
                     }
                     # Read, but taken as this run's summary of the stream only
                     # when Resolve-StreamSummary accepts it: a JSON object that
-                    # names this run and this stream, has a row for every
-                    # subscription the stream ran this time, and holds in
+                    # names this run and this stream, has exactly one row
+                    # for every subscription the stream ran this time and
+                    # none for any other, and holds in
                     # every field the aggregation reads the shape the worker
                     # writes. Anything else ('{}', 'null', a list, another
-                    # run's or stream's, too few rows, a bad value) is
+                    # run's or stream's, too few, repeated or other rows,
+                    # a bad value) is
                     # treated as a summary that cannot
                     # be read: not confirmed. Only its checked values are used
                     # below.
@@ -1672,11 +1676,16 @@ else
                     # most-recent attempt's Reason/LastFailedAt winning when
                     # the same sub appears in multiple streams (which would
                     # only happen across re-runs with different slicing).
+                    # A [null] is no failure (see the start of the run).
                     if ($null -ne $Obj.FailedAttempts)
                     {
-                        $AllFailedFromStreams += @($Obj.FailedAttempts)
+                        $AllFailedFromStreams += @($Obj.FailedAttempts | Where-Object { $null -ne $_ })
                     }
                     $ReadStreamStateFiles += $PerStreamFile
+                    # A file the start could not parse, which this run's
+                    # stream has since written, is read now: it is no longer
+                    # one this run could not read (Write-StreamStateKept).
+                    $UnreadStreamStateFiles = @($UnreadStreamStateFiles | Where-Object { $_ -ne $PerStreamFile })
                 }
                 catch
                 {

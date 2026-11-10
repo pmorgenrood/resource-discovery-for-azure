@@ -328,6 +328,14 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         @{ Case = 'StreamId names another stream'; Json = '{"StreamId":"1","ResourceCounts":[{"Id":"sub-a","Count":1}]}'; Reason = 'names stream' }
         @{ Case = 'StreamId is missing'; Json = '{"ResourceCounts":[{"Id":"sub-a","Count":1}]}'; Reason = 'names stream' }
         @{ Case = 'rows miss a subscription the stream ran'; Json = '{"StreamId":"0","ResourceCounts":[],"Failed":[]}'; Reason = 'no row for 1 of the 1' }
+        # One outcome row per subscription the stream ran: a second row
+        # would count its resources and zip twice, and a row for another
+        # subscription would add counts and a zip the stream did not make.
+        @{ Case = 'success rows name one subscription twice'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/r/a.zip"},{"Id":"sub-a","Count":1,"Zip":"/r/a.zip"}]}'; Reason = 'more than one row for 1 of the 1' }
+        @{ Case = 'a success row and a failed row name one subscription'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"Failed":[{"Id":"sub-a","Name":"Sub A","Reason":"r"}]}'; Reason = 'more than one row for 1 of the 1' }
+        @{ Case = 'success rows name one subscription twice, in another case'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1},{"Id":"SUB-A","Count":1}]}'; Reason = 'more than one row for 1 of the 1' }
+        @{ Case = 'a success row names a subscription the stream did not run'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1},{"Id":"sub-x","Count":5,"Zip":"/r/x.zip"}]}'; Reason = '1 row(s) for a subscription the stream did not run' }
+        @{ Case = 'a failed row names a subscription the stream did not run'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"Failed":[{"Id":"sub-x","Name":"Sub X","Reason":"r"}]}'; Reason = '1 row(s) for a subscription the stream did not run' }
         @{ Case = 'text is a list'; Json = '[]'; Reason = 'not a JSON object' }
         @{ Case = 'RunId names another run'; Json = '{"RunId":"99999999-2222-3333-4444-555555555555","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}]}'; Reason = 'it is not from this run' }
         @{ Case = 'RunId is missing'; Json = '{"RunId":null,"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}]}'; Reason = 'it is not from this run' }
@@ -502,6 +510,45 @@ Describe 'A resume state warning that cannot be written' {
         @($script:StreamRead.Completed).Count | Should -Be 0
         @($script:StreamRead.Failed).Count | Should -Be 0
         Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { ([string]$Object) -like '`[stream-0`] WARNING: could not read stream state at *' }
+    }
+}
+
+Describe 'A stream resume state holds no [null] failure' {
+    # A worker's first success runs Remove-FailedAttempt on an empty list,
+    # and assigning the empty result sets $null. A [null] in the file then
+    # read back as one failure: the next run's start counted a failure for
+    # every stream file of a stream where every subscription worked.
+    BeforeAll {
+        $script:NullDir = Join-Path $script:TestRoot ('nullstream_' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $script:NullDir -Force | Out-Null
+    }
+
+    It 'Write-StreamState writes [] after the last failure was cleared, as a worker passes it' {
+        Set-Variable -Name Tag -Value '[stream-0]'
+        $Path = Join-Path $script:NullDir 'cleared.json'
+        $FailedAttempts = @()
+        $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id 'sub-a'
+        Write-StreamState -Path $Path -Completed @('sub-a') -FailedAttempts $FailedAttempts
+        $Obj = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        @($Obj.FailedAttempts | Where-Object { $null -eq $_ }).Count | Should -Be 0 -Because (Get-Content -LiteralPath $Path -Raw)
+        @((Read-StreamState -Path $Path).Failed).Count | Should -Be 0
+    }
+
+    It 'Read-StreamState reads [null] in a file an earlier worker wrote as no failure' {
+        $Path = Join-Path $script:NullDir 'older.json'
+        Set-Content -LiteralPath $Path -Value '{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[null]}' -Encoding utf8
+        $Read = Read-StreamState -Path $Path
+        @($Read.Failed).Count | Should -Be 0
+        @($Read.Completed) | Should -Be @('sub-a')
+    }
+
+    It 'Write-StreamState keeps a real failure and drops only the [null]' {
+        Set-Variable -Name Tag -Value '[stream-0]'
+        $Path = Join-Path $script:NullDir 'mixed.json'
+        $Failure = [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'r'; Attempts = 1 }
+        Write-StreamState -Path $Path -Completed @() -FailedAttempts @($null, $Failure)
+        @((Read-StreamState -Path $Path).Failed).Id | Should -Be @('sub-b')
+        @((Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json).FailedAttempts).Count | Should -Be 1
     }
 }
 
@@ -1056,5 +1103,60 @@ Describe 'Add-ItemsToZipArchive adds to a zip as Compress-Archive -Update does' 
         @($View | Where-Object { $_ -like 'ResourcesReport_1.zip=*' }).Count | Should -Be 1
         @($View | Where-Object { $_ -like '*=old' }).Count | Should -Be 0
         @($View | Where-Object { $_ -like 'Empty_1*' }).Count | Should -Be 0
+    }
+}
+
+Describe 'The stream worker does not say it is done when its summary cannot be written' {
+    # Set-Content into a folder that is gone fails with a non-terminating
+    # error, which a catch sees only with -ErrorAction Stop. Without it the
+    # worker said "complete" and ended with exit 0 though it wrote no
+    # summary. The REAL Run-AllSubscriptions.Stream.ps1 runs in its own pwsh,
+    # with stand-ins for the Az module import and the context import; no
+    # subscription is run (no name is passed for the one id, so the loop has
+    # no pair), so no Azure call is made.
+    BeforeAll {
+        $script:WorkerDir = Join-Path $script:TestRoot ('worker_' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $script:WorkerTree = Join-Path $script:WorkerDir 'tree'
+        New-Item -ItemType Directory -Path $script:WorkerTree -Force | Out-Null
+        $RepoRoot = Split-Path $PSScriptRoot -Parent
+        foreach ($Item in @('Run-AllSubscriptions.Stream.ps1', 'Functions'))
+        {
+            Copy-Item -LiteralPath (Join-Path $RepoRoot $Item) -Destination $script:WorkerTree -Recurse -Force
+        }
+        $script:WorkerHarness = Join-Path $script:WorkerDir 'worker.ps1'
+        @'
+param([string]$Tree, [string]$Case)
+$PSStyle.OutputRendering = 'PlainText'
+function global:Import-Module
+{
+    [CmdletBinding()] param([Parameter(Position = 0)][string[]]$Name, [switch]$DisableNameChecking, [switch]$Force, [version]$MinimumVersion)
+    if (@($Name).Count -eq 1 -and $Name[0] -like 'Az.*') { return }
+    Microsoft.PowerShell.Core\Import-Module @PSBoundParameters
+}
+function global:Disable-AzContextAutosave { param($Scope) }
+$Global:WorkerCase = $Case
+function global:Import-AzContext { param($Path) if ($Global:WorkerCase -eq 'import-fails') { throw 'stand-in: the context snapshot cannot be imported' } }
+$Root = Join-Path $Tree 'out'
+New-Item -ItemType Directory -Path $Root -Force | Out-Null
+# The summary goes in a folder that is not there.
+$SummaryPath = Join-Path $Root 'gone/summary.json'
+$Ids = if ($Case -eq 'empty-slice') { @() } else { @('12345678-1234-1234-1234-123456789012') }
+$global:LASTEXITCODE = 0
+& (Join-Path $Tree 'Run-AllSubscriptions.Stream.ps1') -TenantID '00000000-0000-0000-0000-000000000001' -RunId '11111111-2222-3333-4444-555555555555' -StreamId '0' -InventoryRoot $Root -ScriptRoot $Tree -AzContextPath (Join-Path $Root 'ctx.json') -StreamSummaryPath $SummaryPath -StreamFailuresPath (Join-Path $Root 'failures.log') -SubscriptionIds $Ids -SubscriptionNames @() -SkipMetrics -SkipConsumption
+exit $LASTEXITCODE
+'@ | Set-Content -LiteralPath $script:WorkerHarness -Encoding utf8
+    }
+
+    It 'a worker whose <Case> summary cannot be written says so and ends with exit 1' -ForEach @(
+        @{ Case = 'end-of-run' }
+        @{ Case = 'empty-slice' }
+        @{ Case = 'import-fails' }
+    ) {
+        $Output = '' | & (Join-Path $PSHOME 'pwsh') -NoProfile -NonInteractive -File $script:WorkerHarness -Tree $script:WorkerTree -Case $Case *>&1 | Out-String
+        $Code = $LASTEXITCODE
+        $Code | Should -Be 1 -Because $Output
+        $Output | Should -Match ([regex]::Escape('[stream-0] FATAL: could not write stream summary to ')) -Because $Output
+        $Output | Should -Not -Match '\[stream-0\] complete: ' -Because $Output
+        Test-Path -LiteralPath (Join-Path $script:WorkerTree 'out/gone/summary.json') | Should -BeFalse
     }
 }
