@@ -712,6 +712,13 @@ Describe 'Per-subscription count message' {
 
 Describe 'Callers use the message and the switch' {
 
+    It 'the stream worker checks every file it loads by its literal path (a checkout path may hold [ or ])' {
+        $Stream = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1'), [ref]$null, [ref]$null)
+        $Checks = @($Stream.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Test-Path' }, $true))
+        $Checks.Count | Should -BeGreaterThan 0
+        @($Checks | Where-Object { $_.Extent.Text -notmatch '-LiteralPath\b' } | ForEach-Object { $_.Extent.Text }) | Should -BeNullOrEmpty -Because '-Path reads [ and ] as a wildcard set, so a real file is reported missing'
+    }
+
     BeforeAll {
         $script:Wrapper = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $script:Stream = Get-Content -Path (Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1') -Raw
