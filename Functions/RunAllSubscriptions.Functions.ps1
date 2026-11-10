@@ -980,8 +980,8 @@ function Get-LatestCompletedReports
 # compared the other way; read the volume's own rule if one must be supported.
 function New-PathTable
 {
-    if ($IsLinux) { return [hashtable]::new([System.StringComparer]::Ordinal) }
-    return [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $Comparer = if ($IsLinux) { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
+    return [System.Collections.Generic.Dictionary[string, object]]::new($Comparer)
 }
 
 # Decide, for each subscription a -Resume run skipped because an earlier run
