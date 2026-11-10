@@ -356,6 +356,47 @@ Test-RdaAzAccountsVersion -SubModule @('Az.Accounts', 'Az.Compute', 'Az.Monitor'
         $Stop.Text | Should -Match ([regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3'))
     }
 
+    It 'before anything is loaded: with one module folder inside another, the copy checked is the one PowerShell loads from the first folder (<Case>)' -ForEach @(
+        @{ Case = 'the pinning copy in the outer folder stops'; OuterRequires = "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"; InnerRequires = "@{ ModuleName = 'Az.Accounts'; ModuleVersion = '5.5.4' }"; Status = 'SubModulePinned' }
+        @{ Case = 'a pinning copy only in the inner folder passes'; OuterRequires = "@{ ModuleName = 'Az.Accounts'; ModuleVersion = '5.5.4' }"; InnerRequires = "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"; Status = 'Ok' }
+    ) {
+        # PSModulePath <root>/mods:<root>/mods/x. PowerShell finds a module
+        # only right under a folder (<folder>/<Name>/<version>), so it loads
+        # Az.Compute 1.0.0 from mods, not 2.0.0 from mods/x, though that
+        # copy's path also starts with mods.
+        $Root = Join-Path $script:PinDir ('unloaded-nested-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Outer = Join-Path $Root 'mods'
+        $Inner = Join-Path $Outer 'x'
+        New-PinModule -Root $Outer -Name 'Az.Accounts' -Version '5.5.3'
+        New-PinModule -Root $Outer -Name 'Az.Accounts' -Version '5.5.4'
+        New-PinModule -Root $Outer -Name 'Az.Compute' -Version '1.0.0' -Requires $OuterRequires
+        New-PinModule -Root $Inner -Name 'Az.Compute' -Version '2.0.0' -Requires $InnerRequires
+
+        # What PowerShell itself loads there, in a new session.
+        $Old = $env:PSModulePath
+        $OldHome = $env:HOME
+        $OldData = $env:XDG_DATA_HOME
+        try
+        {
+            $env:PSModulePath = @($Outer, $Inner) -join [System.IO.Path]::PathSeparator
+            $env:HOME = Join-Path $script:PinDir 'home'
+            $env:XDG_DATA_HOME = Join-Path $env:HOME '.local/share'
+            $Loaded = (& (Join-Path $PSHOME 'pwsh') -NoProfile -NonInteractive -Command '(Import-Module Az.Compute -PassThru -ErrorAction Stop | Where-Object Name -eq ''Az.Compute'').Version.ToString()' | Out-String).Trim()
+        }
+        finally
+        {
+            $env:PSModulePath = $Old
+            $env:HOME = $OldHome
+            $env:XDG_DATA_HOME = $OldData
+        }
+        $Loaded | Should -Be '1.0.0' -Because 'PowerShell loads the copy right under the first folder'
+
+        $Check = Invoke-PinSession -ModulePath @($Outer, $Inner) -CheckOnly
+        $Check.Status | Should -Be $Status -Because $Check.Text
+        if ($Status -eq 'SubModulePinned') { $Check.Text | Should -Match ([regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3')) }
+        else { $Check.Text | Should -Not -Match 'Az\.Compute 2\.0\.0 asks for' -Because 'that copy is never loaded while the outer folder holds one' }
+    }
+
     It 'an older Az.Accounts loaded first: also names an unloaded submodule copy that would load and pins it, so one stop gives all the advice' {
         # Az.Accounts 5.5.3 is loaded (a profile or an older tool), 5.5.4 is
         # installed, and the Az.Compute that would load (not loaded yet) asks
@@ -1005,6 +1046,32 @@ Describe 'Every Az.Accounts import asks for the supported version' {
         }
         $Literal | Should -BeGreaterThan 0 -Because "$_ loads Az.Accounts by name"
         @($Bad) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The entry scripts find the Az.Accounts version file by its literal path' {
+
+    # Test-Path -Path reads [ and ] as wildcards, so a copy of the tool in a
+    # folder such as [client] would not find Functions/AzModules.Functions.ps1
+    # and stop as if it were missing. Each entry script checks that file
+    # with -LiteralPath.
+    It '<_> checks AzModules.Functions.ps1 with Test-Path -LiteralPath' -ForEach @('ResourceInventory.ps1', 'Run-AllSubscriptions.ps1', 'Run-AllSubscriptions.Stream.ps1') {
+        $Path = Join-Path $script:RepoRoot $_
+        $Tokens = $null
+        $Errors = $null
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$Tokens, [ref]$Errors)
+        $Checks = @($Ast.FindAll({
+                    param($Node)
+                    $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -eq 'Test-Path' -and
+                    @($Node.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.VariablePath.UserPath -eq 'AzModulesFunctionsFile' }).Count -gt 0
+                }, $true))
+        $Checks.Count | Should -BeGreaterThan 0 -Because "$_ checks that the file is there"
+        foreach ($Check in $Checks)
+        {
+            $Names = @($Check.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+            $Names | Should -Contain 'LiteralPath' -Because ("line {0}: {1}" -f $Check.Extent.StartLineNumber, $Check.Extent.Text)
+            $Names | Should -Not -Contain 'Path' -Because ("line {0}: {1}" -f $Check.Extent.StartLineNumber, $Check.Extent.Text)
+        }
     }
 }
 

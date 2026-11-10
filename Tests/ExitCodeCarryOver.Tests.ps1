@@ -1255,6 +1255,36 @@ function Get-UsageAggregates
         $After.ExitCode | Should -Be 0
     }
 
+    It 'two streams: a clean run whose stream cannot write its state and whose resume state cannot be written leaves no stream resume state file and says none is kept; the next two runs read none back and run every subscription' {
+        # Stream 0 runs Sub A, which works, but cannot write its state file,
+        # so Sub A's success is only in its summary; the resume state cannot
+        # be written at the end of the run. Nothing failed: the run is clean,
+        # so nothing is left to retry and nothing is kept.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -StreamStateBlocked -UnifiedStateBlocked
+        $Run.Console | Should -Match '\[stream-0\] WARNING: failed to persist stream state to ' -Because $Run.Console
+        $Run.Console | Should -Match 'WARNING: Failed to persist resume state to ' -Because $Run.Console
+        $Run.ExitCode | Should -Be 0 -Because $Run.Console
+        $Run.FailedIds.Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) -File -Force).Count | Should -Be 0 -Because 'a clean run leaves no stream resume state file, not one for the summary-only rows either'
+        $Run.Console | Should -Not -Match 'were written to the stream resume state file' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'WARNING: kept \d+ stream resume state file' -Because 'the clean-run clean-up removes the files this run read'
+
+        # The next run reads no state back and runs both subscriptions.
+        $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -ReuseHome $Run.Home
+        $Next.Console | Should -Not -Match 'Read per-stream resume state left by an earlier' -Because $Next.Console
+        $Next.Console | Should -Match '(Processing subscription|done): Sub A' -Because $Next.Console
+        $Next.Console | Should -Match '(Processing subscription|done): Sub B' -Because $Next.Console
+        $Next.ExitCode | Should -Be 0 -Because $Next.Console
+        @(Get-ChildItem -LiteralPath $Run.Root -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) -File -Force).Count | Should -Be 0
+
+        # And the run after that, a sequential -Resume, skips neither.
+        $After = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Resume -ReuseHome $Run.Home
+        $After.Console | Should -Not -Match 'Read per-stream resume state left by an earlier' -Because $After.Console
+        $After.Console | Should -Match 'Processing subscription: Sub A' -Because $After.Console
+        $After.Console | Should -Match 'Processing subscription: Sub B' -Because $After.Console
+        $After.ExitCode | Should -Be 0 -Because $After.Console
+    }
+
     It 'two streams: when the resume state cannot be written, the old one is left as it was and every stream state file is kept; once it can be written, -ResumeFailedOnly retries the new failure only, and the run after has nothing to retry' {
         # An earlier run left Sub B failed. This run: Sub A fails, Sub B
         # works, and the resume state cannot be written.
@@ -1522,8 +1552,11 @@ function Get-UsageAggregates
         @($Kept | Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -match [regex]::Escape($script:SubC.Id) }).Count | Should -Be 1 -Because 'stream 1''s summary holds Sub C''s failure'
         foreach ($K in $Kept)
         {
-            $Run.Console | Should -Match ([regex]::Escape(('The stream summary {0} that holds them is kept' -f $K.FullName))) -Because $Run.Console
+            # Each kept summary is named, also one that holds none of the
+            # unsaved rows (stream 0's), so none is said to hold them.
+            $Run.Console | Should -Match ([regex]::Escape(('The stream summary {0} is kept; no run reads it.' -f $K.FullName))) -Because $Run.Console
         }
+        $Run.Console | Should -Not -Match 'that holds them' -Because 'stream 0''s summary holds none of the unsaved rows'
 
         # While it still cannot be opened, the next plain run stops at its
         # start, before any subscription.
@@ -1634,8 +1667,11 @@ function Get-UsageAggregates
         $Kept.Count | Should -Be 2 -Because 'the stream summaries are the only record of Sub C''s failure, so both are kept'
         foreach ($K in $Kept)
         {
-            $Run.Console | Should -Match ([regex]::Escape(('The stream summary {0} that holds them is kept' -f $K.FullName))) -Because $Run.Console
+            # Each kept summary is named, also one that holds none of the
+            # unsaved rows (stream 0's), so none is said to hold them.
+            $Run.Console | Should -Match ([regex]::Escape(('The stream summary {0} is kept; no run reads it.' -f $K.FullName))) -Because $Run.Console
         }
+        $Run.Console | Should -Not -Match 'that holds them' -Because 'stream 0''s summary holds none of the unsaved rows'
 
         # The plain run the warning named runs every subscription, Sub C too.
         $Plain = Invoke-CarryOverRun -Subs @($script:SubB, $script:SubC) -Streams 2 -ReuseHome $Run.Home
