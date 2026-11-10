@@ -1735,8 +1735,11 @@ function Test-ReportFileShape
             $Reader = [System.IO.StreamReader]::new($Stream, [System.Text.Encoding]::UTF8, $true)
             try { $Header = $Reader.ReadLine() } finally { $Reader.Dispose() }
             if ([string]::IsNullOrEmpty($Header)) { return $false }
-            $Columns = @($Header -split ',' | ForEach-Object { $_.Trim().Trim('"') })
-            return (@('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $Columns -notcontains $_ }).Count -eq 0)
+            # Exact names (case and spaces included): downstream finds the
+            # columns by header name, so a header it would not find is refused.
+            # A quoted header name loses only its quotes, as Export-Csv writes it.
+            $Columns = @($Header -split ',' | ForEach-Object { if ($_ -match '^"(.*)"$') { $Matches[1] } else { $_ } })
+            return (@('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $Columns -cnotcontains $_ }).Count -eq 0)
         }
         # shortcut: the parse holds the whole file in memory (Test-ReportZipReadable
         # has read it once already); stream it with Utf8JsonReader if report files
