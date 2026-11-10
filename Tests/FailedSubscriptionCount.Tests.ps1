@@ -90,3 +90,19 @@ Describe 'MainSummary.html counts subscriptions, not entries' {
         $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptions @(Expand-FailedSubscriptionEntries -FailedSubscriptions $FailedSubscriptions -Slices $Slices -CompletedIds $AllCompletedFromStreams) `'))
     }
 }
+
+Describe 'RunSummary.log records retry entries left out of the run' {
+    It 'counts them, names them in a plain run, and only counts them in an obfuscated one' {
+        $Left = @([pscustomobject]@{ Id = 'sub-off'; Name = 'Sub Off'; Attempts = 1; Reason = 'stand-in' })
+        $Plain = @(Get-RunSummaryLogContent -Visible 2 -Eligible 1 -Processed 1 -NotInRun $Left)
+        $Plain | Should -Contain "  Not in this run     : 1 (on the retry list, but not in this run's subscription set; incomplete)"
+        $Plain | Should -Contain '  - Sub Off (sub-off): failed 1 run(s); last reason: stand-in'
+        $Masked = @(Get-RunSummaryLogContent -Visible 2 -Eligible 1 -Processed 1 -NotInRun $Left -Obfuscated)
+        $Masked | Should -Contain "  Not in this run     : 1 (on the retry list, but not in this run's subscription set; incomplete)"
+        @($Masked | Where-Object { $_ -like '*Sub Off*' -or $_ -like '*sub-off*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the wrapper passes the entries it names under Not In This Run' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-NotInRun $RetryOwedNotInRun `'))
+    }
+}

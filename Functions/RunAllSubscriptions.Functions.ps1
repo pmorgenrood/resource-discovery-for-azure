@@ -1457,6 +1457,9 @@ function Get-RunSummaryLogContent
         # Retry-list entries past the retry limit ({ Name; Id; Attempts; Reason }),
         # from Get-RetryLimitedAttempts.
         $RetryLimited = @(),
+        # Retry-list entries this run left out because their subscription was
+        # not in its set ({ Name; Id; Attempts; Reason }), below the retry limit.
+        $NotInRun = @(),
         # How many subscriptions failed, from Get-FailedSubscriptionCount; when
         # not given, one per entry of -FailedSubscriptions.
         [int]$FailedSubscriptionCount = -1,
@@ -1497,6 +1500,7 @@ function Get-RunSummaryLogContent
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -ne '(auth)' })
     $ConsumptionPhaseSkipped = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ -and [string]$_.Id -eq '(auth)' }).Count -gt 0
     $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
+    $LeftOut = @(@($NotInRun) | Where-Object { $null -ne $_ })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -1604,6 +1608,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $FailedCount))
     $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
+    $Lines.Add(('  Not in this run     : {0} (on the retry list, but not in this run''s subscription set; incomplete)' -f $LeftOut.Count))
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))
@@ -1642,6 +1647,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Retry limit reached (detail; to try them again, start a run without -Resume or -ResumeFailedOnly):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
+        }
+        if ($LeftOut.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Not in this run (detail; disabled without -IncludeDisabled, not listed, or not readable):')
+            foreach ($LeftOutSub in $LeftOut) { $Lines.Add(('  - {0} ({1}): failed {2} run(s); last reason: {3}' -f [string]$LeftOutSub.Name, [string]$LeftOutSub.Id, (Get-FailedAttemptCount -Entry $LeftOutSub), [string]$LeftOutSub.Reason)) }
         }
         if ($NoAccess.Count -gt 0)
         {
