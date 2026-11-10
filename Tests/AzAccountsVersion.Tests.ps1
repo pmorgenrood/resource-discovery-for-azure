@@ -202,13 +202,16 @@ Import-Module Az.Compute -ErrorAction Stop | Out-Null
 Test-RdaAzAccountsVersion -SubModule @('Az.Accounts', 'Az.Compute', 'Az.Monitor') | ConvertTo-Json -Depth 4
 '@ | Set-Content -LiteralPath $script:PinSession -Encoding utf8
         # The check alone, before any Az module is loaded, as the wrapper and
-        # ResourceInventory.ps1 run it first.
+        # ResourceInventory.ps1 run it first. A -PreloadCompute that is a full
+        # path loads the Az.Compute copy in that folder, as a profile that
+        # imports it by path does.
         $script:CheckSession = Join-Path $script:PinDir 'check.ps1'
         @'
 param([string]$Functions, [string]$Preload = '', [string]$PreloadCompute = '')
 . $Functions
 if ($Preload) { Import-Module Az.Accounts -RequiredVersion $Preload -ErrorAction Stop | Out-Null }
-if ($PreloadCompute) { Import-Module Az.Compute -RequiredVersion $PreloadCompute -ErrorAction Stop | Out-Null }
+if ($PreloadCompute -and [System.IO.Path]::IsPathRooted($PreloadCompute)) { Import-Module $PreloadCompute -ErrorAction Stop | Out-Null }
+elseif ($PreloadCompute) { Import-Module Az.Compute -RequiredVersion $PreloadCompute -ErrorAction Stop | Out-Null }
 Test-RdaAzAccountsVersion -SubModule @('Az.Accounts', 'Az.Compute', 'Az.Monitor') | ConvertTo-Json -Depth 4
 '@ | Set-Content -LiteralPath $script:CheckSession -Encoding utf8
         function script:Invoke-PinSession
@@ -412,6 +415,63 @@ Test-RdaAzAccountsVersion -SubModule @('Az.Accounts', 'Az.Compute', 'Az.Monitor'
         $Run.Status | Should -Be 'Ok' -Because $Run.Text
     }
 
+    It 'a supported Az.Accounts and a newer submodule loaded first: stops on the pinning submodule copy a new session (a stream worker) would load, as that new session does, and both pass once it is updated' {
+        # The wrapper's session has Az.Accounts 5.5.4 and Az.Compute 2.0.0 (a
+        # minimum only) loaded, as a profile does. A stream worker is its own
+        # process and loads neither: after it imports Az.Accounts 5.5.4, a
+        # plain Import-Module takes Az.Compute 1.0.0 from the first folder,
+        # which asks for exactly 5.5.3.
+        $Root = Join-Path $script:PinDir 'ok-loaded-hides-disk-pin'
+        $UserFolder = Join-Path $Root 'user'
+        $SystemFolder = Join-Path $Root 'system'
+        New-PinModule -Root $UserFolder -Name 'Az.Compute' -Version '1.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"
+        New-PinModule -Root $SystemFolder -Name 'Az.Accounts' -Version '5.5.3'
+        New-PinModule -Root $SystemFolder -Name 'Az.Accounts' -Version '5.5.4'
+        New-PinModule -Root $SystemFolder -Name 'Az.Compute' -Version '2.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; ModuleVersion = '5.5.3' }"
+
+        $Wrapper = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -Preload '5.5.4' -PreloadCompute '2.0.0' -CheckOnly
+        $Stream = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -Preload '5.5.4' -CheckOnly
+        $Stream.Status | Should -Be 'SubModulePinned' -Because $Stream.Text
+        $Wrapper.Status | Should -Be 'SubModulePinned' -Because 'the wrapper stops once, before any subscription, where every stream would stop'
+        $Wrapper.Text | Should -Be $Stream.Text
+        $Wrapper.Text | Should -Match ([regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3')) -Because $Wrapper.Text
+        $Wrapper.Text | Should -Not -Match 'Az\.Compute 2\.0\.0 asks for' -Because 'the loaded copy asks only for a minimum'
+        $Wrapper.Text | Should -Match ([regex]::Escape('Install-Module -Name Az.Compute -Repository PSGallery -Scope CurrentUser -Force'))
+
+        # The advice followed: the printed command installs a newer Az.Compute
+        # into the user's folder. The same wrapper session and a new stream
+        # both pass, and so does the run after.
+        New-PinModule -Root $UserFolder -Name 'Az.Compute' -Version '3.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; ModuleVersion = '5.5.4' }"
+        foreach ($Next in 1..2)
+        {
+            $Again = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -Preload '5.5.4' -PreloadCompute '2.0.0' -CheckOnly
+            $Again.Status | Should -Be 'Ok' -Because $Again.Text
+            $Again = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -Preload '5.5.4' -CheckOnly
+            $Again.Status | Should -Be 'Ok' -Because $Again.Text
+        }
+        (Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder)).Status | Should -Be 'Ok'
+    }
+
+    It 'the same pinning submodule version in two folders is named once in each line of the advice' {
+        # Az.Compute 1.0.0, which asks for exactly 5.5.3, is in the user's
+        # folder and in a later one. The session loaded Az.Accounts 5.5.3 and
+        # the later folder's Az.Compute by path; a new session takes the
+        # user's copy, so the check finds two copies of the same version.
+        $Root = Join-Path $script:PinDir 'same-pin-two-folders'
+        $UserFolder = Join-Path $Root 'user'
+        $SystemFolder = Join-Path $Root 'system'
+        New-PinModule -Root $UserFolder -Name 'Az.Compute' -Version '1.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"
+        New-PinModule -Root $SystemFolder -Name 'Az.Accounts' -Version '5.5.3'
+        New-PinModule -Root $SystemFolder -Name 'Az.Accounts' -Version '5.5.4'
+        New-PinModule -Root $SystemFolder -Name 'Az.Compute' -Version '1.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"
+
+        $Stop = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -Preload '5.5.3' -PreloadCompute (Join-Path $SystemFolder 'Az.Compute/1.0.0/Az.Compute.psd1') -CheckOnly
+        $Stop.Status | Should -Be 'LoadedTooOld' -Because $Stop.Text
+        @([regex]::Matches($Stop.Text, [regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3'))).Count | Should -Be 1 -Because $Stop.Text
+        @([regex]::Matches($Stop.Text, [regex]::Escape('If this stops again with the same Az.Compute 1.0.0'))).Count | Should -Be 1 -Because $Stop.Text
+        @([regex]::Matches($Stop.Text, [regex]::Escape('Install-Module -Name Az.Compute -Repository'))).Count | Should -Be 1 -Because $Stop.Text
+    }
+
     It 'names a submodule whose manifest caps Az.Accounts below the minimum (MaximumVersion)' {
         $Root = Join-Path $script:PinDir 'maximum'
         New-PinModule -Root $Root -Name 'Az.Accounts' -Version '5.5.3'
@@ -441,6 +501,40 @@ Test-RdaAzAccountsVersion -SubModule @('Az.Accounts', 'Az.Compute', 'Az.Monitor'
         # The old copy removed as the message says: the next session passes.
         Remove-Item -LiteralPath (Join-Path $OldFirst 'Az.Compute') -Recurse -Force
         (Invoke-PinSession -ModulePath @($OldFirst, $NewLater)).Status | Should -Be 'Ok'
+    }
+
+    It '<Status>: also names a submodule copy on disk that pins an older Az.Accounts, so one stop gives both fixes, and the next runs pass once both are done' -ForEach @(
+        @{ Status = 'Missing'; Accounts = @() }
+        @{ Status = 'TooOld'; Accounts = @('5.5.3') }
+    ) {
+        # Az.Accounts is not installed, or only 5.5.3 is, and the Az.Compute
+        # a new session would load asks for exactly 5.5.3. Installing a
+        # supported Az.Accounts alone would stop the next run on that pin.
+        $Root = Join-Path $script:PinDir ('accounts-' + $Status)
+        $UserFolder = Join-Path $Root 'user'
+        $SystemFolder = Join-Path $Root 'system'
+        foreach ($Version in $Accounts) { New-PinModule -Root $SystemFolder -Name 'Az.Accounts' -Version $Version }
+        New-PinModule -Root $SystemFolder -Name 'Az.Compute' -Version '1.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; RequiredVersion = '5.5.3' }"
+
+        $Stop = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -CheckOnly
+        $Stop.Status | Should -Be $Status -Because $Stop.Text
+        $Stop.Text | Should -Match ([regex]::Escape('Install-Module -Name Az.Accounts -MinimumVersion 5.5.4')) -Because $Stop.Text
+        $Stop.Text | Should -Match ([regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3')) -Because $Stop.Text
+        $Stop.Text | Should -Match ([regex]::Escape('Install-Module -Name Az.Compute -Repository PSGallery -Scope CurrentUser -Force')) -Because $Stop.Text
+        @([regex]::Matches($Stop.Text, [regex]::Escape('Az.Compute 1.0.0 asks for Az.Accounts 5.5.3'))).Count | Should -Be 1 -Because $Stop.Text
+
+        # Both printed commands run: a supported Az.Accounts and a newer
+        # Az.Compute in the user's folder, first on the module path. The
+        # next two runs pass, the check alone and the full load.
+        New-PinModule -Root $UserFolder -Name 'Az.Accounts' -Version '5.5.4'
+        New-PinModule -Root $UserFolder -Name 'Az.Compute' -Version '2.0.0' -Requires "@{ ModuleName = 'Az.Accounts'; ModuleVersion = '5.5.4' }"
+        foreach ($Next in 1..2)
+        {
+            $Again = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder) -CheckOnly
+            $Again.Status | Should -Be 'Ok' -Because $Again.Text
+            $Run = Invoke-PinSession -ModulePath @($UserFolder, $SystemFolder)
+            $Run.Status | Should -Be 'Ok' -Because $Run.Text
+        }
     }
 }
 
