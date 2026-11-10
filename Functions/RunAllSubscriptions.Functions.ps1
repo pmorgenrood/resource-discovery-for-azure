@@ -1387,6 +1387,36 @@ function Get-FailedSubscriptionCount
     return $Count
 }
 
+# The end-of-run failure list for MainSummary.html, one entry per subscription,
+# so its Failed count is the one Get-FailedSubscriptionCount gives: a
+# 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry becomes one
+# '<name> (<id>) (stream-N (no summary))' entry for each subscription of that
+# slice that is not completed (-CompletedIds), or stays as it is when the slice
+# is not known or all of it completed. Every other entry stays as it is.
+function Expand-FailedSubscriptionEntries
+{
+    param($FailedSubscriptions = @(), $Slices = @(), $CompletedIds = @())
+    $Done = @(@($CompletedIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $SliceList = @($Slices)
+    foreach ($Entry in @(@($FailedSubscriptions) | Where-Object { $null -ne $_ }))
+    {
+        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no|corrupt) summary\)$')
+        {
+            $Id = [int]$Matches[1]
+            if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
+            {
+                $Left = @(@($SliceList[$Id]) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
+                if ($Left.Count -gt 0)
+                {
+                    foreach ($Sub in $Left) { '{0} ({1}) ({2})' -f [string]$Sub.Name, [string]$Sub.Id, $Entry }
+                    continue
+                }
+            }
+        }
+        $Entry
+    }
+}
+
 # Build the run-level "RunSummary.log" content for the consolidated
 # AllSubscriptions zip. Pure and deterministic apart from the generation
 # timestamp (no file I/O, no Azure calls) so it is unit-testable offline: the

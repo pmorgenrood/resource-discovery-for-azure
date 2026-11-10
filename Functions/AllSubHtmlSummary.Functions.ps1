@@ -195,9 +195,6 @@ function New-RdaAllSubHtmlSummary
         # Optional run-health collections passed through from the wrapper. Each is an
         # array; when empty the corresponding banner is omitted.
         $FailedSubscriptions = @(),
-        # How many subscriptions failed (Get-FailedSubscriptionCount in the
-        # wrapper); when not given, one per entry of -FailedSubscriptions.
-        [int]$FailedSubscriptionCount = -1,
         $ConsumptionFailedSubs = @(),
         $MetricsFailedSubs = @(),
         $CollectorFailures = @(),
@@ -327,7 +324,6 @@ function New-RdaAllSubHtmlSummary
     # Health banners built from the passed-through wrapper collections. Each is
     # read-only; a null/empty collection renders nothing.
     $FailedList = @(@($FailedSubscriptions) | Where-Object { $_ })
-    $FailedCount = if ($FailedSubscriptionCount -ge 0) { $FailedSubscriptionCount } else { $FailedList.Count }
     $ConsumpList = @(@($ConsumptionFailedSubs) | Where-Object { $_ -and $_.Id -ne '(auth)' })
     $MetricsList = @(@($MetricsFailedSubs) | Where-Object { $_ })
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
@@ -337,11 +333,11 @@ function New-RdaAllSubHtmlSummary
     {
         if ($IsObfuscated)
         {
-            [void]$Banners.AppendFormat('<div class="banner err"><b>{0} subscription(s) failed to process.</b> These are missing from the totals below.</div>', $FailedCount)
+            [void]$Banners.AppendFormat('<div class="banner err"><b>{0} subscription(s) failed to process.</b> These are missing from the totals below.</div>', $FailedList.Count)
         }
         else
         {
-            [void]$Banners.AppendFormat('<div class="banner err"><b>{0} subscription(s) failed to process.</b> These are missing from the totals below: {1}</div>', $FailedCount, (ConvertTo-HtmlSafe (($FailedList | ForEach-Object { [string]$_ }) -join ', ')))
+            [void]$Banners.AppendFormat('<div class="banner err"><b>{0} subscription(s) failed to process.</b> These are missing from the totals below: {1}</div>', $FailedList.Count, (ConvertTo-HtmlSafe (($FailedList | ForEach-Object { [string]$_ }) -join ', ')))
         }
     }
     if ($EmptyCount -gt 0)
@@ -448,7 +444,7 @@ $($Banners.ToString())
   <div class="card"><div class="n">$('{0:N0}' -f $RunTotalResources)</div><div class="l">Total resources</div></div>
   <div class="card"><div class="n">$SubCount</div><div class="l">Subscriptions</div></div>
   <div class="card"><div class="n">$EmptyCount</div><div class="l">Empty (0 resources)</div></div>
-  <div class="card"><div class="n">$($FailedCount)</div><div class="l">Failed</div></div>
+  <div class="card"><div class="n">$($FailedList.Count)</div><div class="l">Failed</div></div>
 </div>
 $ChartsHtml
 <table><thead><tr><th>Subscription</th><th class="num">Resources</th><th>Health</th><th>Report</th></tr></thead>
@@ -459,7 +455,7 @@ $ChartsHtml
 
     $Html | Out-File -FilePath $HtmlFile -Encoding utf8
     Write-Host ("Main summary written: {0}" -f $HtmlFile) -ForegroundColor Green
-    Write-Host ("  {0} subscription(s), {1:N0} total resource(s), {2} empty, {3} failed. Privacy: {4}." -f $SubCount, $RunTotalResources, $EmptyCount, $FailedCount, $ObfuscationStatus) -ForegroundColor DarkGray
+    Write-Host ("  {0} subscription(s), {1:N0} total resource(s), {2} empty, {3} failed. Privacy: {4}." -f $SubCount, $RunTotalResources, $EmptyCount, $FailedList.Count, $ObfuscationStatus) -ForegroundColor DarkGray
 }
 
 # =============================================================================

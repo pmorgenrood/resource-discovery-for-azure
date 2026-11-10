@@ -2396,8 +2396,7 @@ if ($null -ne $OuterZipFile)
         }
         catch { Write-Verbose ("MainSummary: could not read Version.json: {0}" -f $_.Exception.Message) }
         New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime -IncludeFolders $CarriedFolderNames `
-            -FailedSubscriptions $FailedSubscriptions `
-            -FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams) `
+            -FailedSubscriptions @(Expand-FailedSubscriptionEntries -FailedSubscriptions $FailedSubscriptions -Slices $Slices -CompletedIds $AllCompletedFromStreams) `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -CollectorFailures $Global:CollectorFailures `

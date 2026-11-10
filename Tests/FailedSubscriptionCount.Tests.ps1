@@ -75,20 +75,18 @@ Describe 'RunSummary.log and the console line count subscriptions, not entries' 
 }
 
 Describe 'MainSummary.html counts subscriptions, not entries' {
-    It 'shows the count given in the Failed card, the banner and the console line, with the entries still named' {
-        $Run = Join-Path $TestDrive 'run'
-        New-Item -ItemType Directory -Path $Run -Force | Out-Null
-        $Out = Join-Path $Run 'main.html'
-        $Lines = @(New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -FailedSubscriptions @('stream-0 (no summary)') -FailedSubscriptionCount 3 6>&1 | ForEach-Object { [string]$_ })
-        $Html = Get-Content -LiteralPath $Out -Raw
-        $Html | Should -Match '<div class="n">3</div><div class="l">Failed</div>'
-        $Html | Should -Match '<b>3 subscription\(s\) failed to process\.</b>'
-        $Html | Should -Match 'stream-0 \(no summary\)'
-        @($Lines | Where-Object { $_ -like '*3 failed.*' }).Count | Should -Be 1
+    It 'gets one entry per unfinished subscription of a dead stream, as many as Get-FailedSubscriptionCount counts' {
+        $Slices = @(
+            [System.Collections.Generic.List[object]]@([pscustomobject]@{ Id = 'sub-a'; Name = 'A' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'B' }, [pscustomobject]@{ Id = 'sub-c'; Name = 'C' }),
+            [System.Collections.Generic.List[object]]@([pscustomobject]@{ Id = 'sub-d'; Name = 'D' }))
+        $Failed = @('stream-0 (no summary)', 'stream-1 (corrupt summary)', 'E (sub-e)')
+        $Out = @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Failed -Slices $Slices -CompletedIds @('sub-a', 'sub-d'))
+        $Out | Should -Be @('B (sub-b) (stream-0 (no summary))', 'C (sub-c) (stream-0 (no summary))', 'stream-1 (corrupt summary)', 'E (sub-e)')
+        $Out.Count | Should -Be (Get-FailedSubscriptionCount -FailedSubscriptions $Failed -Slices $Slices -CompletedIds @('sub-a', 'sub-d'))
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions @('stream-0 (no summary)') -Slices @()) | Should -Be @('stream-0 (no summary)')
     }
 
-    It 'the wrapper passes the same count to MainSummary.html' {
-        $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptionCount (Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions -StreamSummaries $StreamSummaries -Slices $Slices -CompletedIds $AllCompletedFromStreams) `'))
-        ([regex]::Matches($script:WrapperText, [regex]::Escape('Get-FailedSubscriptionCount -FailedSubscriptions $FailedSubscriptions'))).Count | Should -Be 3
+    It 'the wrapper gives MainSummary.html that list, on the same completions' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-FailedSubscriptions @(Expand-FailedSubscriptionEntries -FailedSubscriptions $FailedSubscriptions -Slices $Slices -CompletedIds $AllCompletedFromStreams) `'))
     }
 }
