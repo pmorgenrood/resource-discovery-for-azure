@@ -1748,11 +1748,14 @@ function Test-ReportZipReadable
             $Files = @($Archive.Entries | Where-Object { $_.Name -ne '' })
             if (@($Files | Where-Object { $_.Name -like 'Inventory_*.json' }).Count -gt 0)
             {
-                # Every file is read to its end; an inventory file that holds no
-                # byte cannot be parsed downstream (a bad inventory fails the
-                # whole upload), so it makes the zip unreadable too.
-                # shortcut: only an empty inventory is refused, not one that is
-                # not JSON; parse it here if a cut-short one is ever seen.
+                # Every file is read to its end. An inventory, metrics or
+                # consumption file that holds no byte cannot be read downstream
+                # (a bad inventory fails the whole upload; a bad metrics or
+                # consumption file is dropped in silence), and the collector
+                # always writes each with content (an empty metrics list, the
+                # consumption header), so it makes the zip unreadable too.
+                # shortcut: only an empty file is refused, not one that is not
+                # JSON or CSV; parse them here if a cut-short one is ever seen.
                 $Readable = $true
                 $Buffer = [byte[]]::new(81920)
                 foreach ($Entry in $Files)
@@ -1760,7 +1763,7 @@ function Test-ReportZipReadable
                     $Stream = $Entry.Open()
                     $Total = 0
                     try { while (($Got = $Stream.Read($Buffer, 0, $Buffer.Length)) -gt 0) { $Total += $Got } } finally { $Stream.Dispose() }
-                    if ($Total -eq 0 -and $Entry.Name -like 'Inventory_*.json') { $Readable = $false }
+                    if ($Total -eq 0 -and ($Entry.Name -like 'Inventory_*.json' -or $Entry.Name -like 'Metrics_*.json' -or $Entry.Name -like 'Consumption_*.csv')) { $Readable = $false }
                 }
             }
         }
