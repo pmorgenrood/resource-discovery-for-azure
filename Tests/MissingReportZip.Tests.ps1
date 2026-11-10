@@ -341,3 +341,19 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
         finally { & chmod 755 $script:Root }
     }
 }
+
+Describe 'RunSummary.log advice for a missing report' {
+    BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
+    It 'says to run again without -Resume when the resume state still lists one as completed, as the console does' {
+        $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
+        $Kept = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -MissingStateNotSaved)
+        @($Kept | Where-Object { $_ -like '  Report missing      : 1 (*run again without -Resume)' }).Count | Should -Be 1
+        @($Kept | Where-Object { $_ -like '*a -Resume collects them*' }) | Should -BeNullOrEmpty
+        $Saved = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing)
+        @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
+    }
+
+    It 'the wrapper passes the flag' {
+        (Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw) | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
+    }
+}
