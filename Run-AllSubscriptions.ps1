@@ -845,7 +845,8 @@ if ($Excluded.Count -gt 0)
 }
 Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -ForegroundColor Cyan
 
-# -PreflightOnly ends here, before any resume state is read or written: the
+# -PreflightOnly ends here, before any resume state is written (with -Resume
+# or -ResumeFailedOnly it is read, to name what a run would collect): the
 # read access check (the same probe the run's up-front access gate makes, on
 # the same scope, and a failure for any subscription that is not readable,
 # since the run would stop or skip it) and, unless -SkipConsumption, the
