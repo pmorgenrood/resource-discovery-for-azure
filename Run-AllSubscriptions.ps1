@@ -617,11 +617,11 @@ Write-Host ("Subscriptions to process: {0}" -f $Subscriptions.Count) -Foreground
 # controls whether we *use* that list to skip subscriptions; reading it
 # either way ensures the per-iteration writes below append to existing
 # state instead of overwriting it.
-$CompletedIds = Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID
+$CompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID)
 # Always seed $FailedAttempts the same way. Read on every run so the writes
 # below preserve any existing failure history; -ResumeFailedOnly is what
 # uses it to filter the subscription list.
-$FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
+$FailedAttempts = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID)
 
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
@@ -635,46 +635,47 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID
 # end-of-run merge still owns per-stream cleanup. Safe on non-interrupted runs: a
 # cleanly-finished parallel run deletes its per-stream files, so this finds none.
 # Runs at startup before any stream is launched, so it cannot race live streams.
+# Read on every run, as the unified file is: a plain run's successes then clear
+# the failures these files hold, and a plain parallel run, whose streams start
+# their state files empty, keeps a failure of a subscription it does not run.
+# Only -Resume uses the completed ids to skip a subscription.
 # The stream resume state files this run read in (here or in the parallel
 # merge). A clean run removes only these: a file it never read may hold a
 # failure this run knows nothing of.
 $ReadStreamStateFiles = @()
-if ($Resume -or $ResumeFailedOnly)
+$StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
+if ($StrandedStreamFiles.Count -gt 0)
 {
-    $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
-    if ($StrandedStreamFiles.Count -gt 0)
+    $StrandedCompleted = @()
+    $StrandedFailed = @()
+    foreach ($StreamFile in $StrandedStreamFiles)
     {
-        $StrandedCompleted = @()
-        $StrandedFailed = @()
-        foreach ($StreamFile in $StrandedStreamFiles)
+        try
         {
-            try
-            {
-                $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
-                if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
-                if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
-                $ReadStreamStateFiles += $StreamFile.FullName
-            }
-            catch
-            {
-                Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
-            }
+            $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
+            if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
+            if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
+            $ReadStreamStateFiles += $StreamFile.FullName
         }
-        if ($StrandedCompleted.Count -gt 0)
+        catch
         {
-            $CompletedIds = @($CompletedIds + $StrandedCompleted | Sort-Object -Unique)
+            Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
         }
-        # Same recency-wins / prune-on-completed reconciliation the end-of-run
-        # merge uses, so a sub that later succeeded in another stream is dropped.
-        $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $StrandedFailed -CompletedIds $CompletedIds
-        if ($StrandedCompleted.Count -gt 0 -or @($StrandedFailed).Count -gt 0)
-        {
-            Write-Host ("Recovered per-stream state from an interrupted parallel run: {0} completed, {1} failed subscription record(s)." -f $StrandedCompleted.Count, @($StrandedFailed).Count) -ForegroundColor Cyan
-            # Heal the unified file immediately so even a re-interrupted run keeps
-            # the recovered picture. Per-stream files are intentionally left for
-            # the end-of-run merge to reconcile and clean up.
-            Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
-        }
+    }
+    if ($StrandedCompleted.Count -gt 0)
+    {
+        $CompletedIds = @($CompletedIds + $StrandedCompleted | Sort-Object -Unique)
+    }
+    # Same recency-wins / prune-on-completed reconciliation the end-of-run
+    # merge uses, so a sub that later succeeded in another stream is dropped.
+    $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $StrandedFailed -CompletedIds $CompletedIds
+    if ($StrandedCompleted.Count -gt 0 -or @($StrandedFailed).Count -gt 0)
+    {
+        Write-Host ("Recovered per-stream state from an interrupted parallel run: {0} completed, {1} failed subscription record(s)." -f $StrandedCompleted.Count, @($StrandedFailed).Count) -ForegroundColor Cyan
+        # Heal the unified file immediately so even a re-interrupted run keeps
+        # the recovered picture. Per-stream files are intentionally left for
+        # the end-of-run merge to reconcile and clean up.
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts
     }
 }
 
@@ -1638,7 +1639,7 @@ else
             # -ParallelStreams value.
             # When the unified file could not be written, they are this run's
             # only record of its completions and failures: they are kept, and
-            # the next -Resume or -ResumeFailedOnly run reads them at its start.
+            # the next run reads them at its start.
             if ($UnifiedStateSaved)
             {
                 foreach ($StreamFile in $AllStreamFiles)
@@ -1649,7 +1650,7 @@ else
             }
             elseif ($AllStreamFiles.Count -gt 0)
             {
-                try { Write-Host ("WARNING: kept {0} stream resume state file(s) in {1}, as the resume state could not be written; the next -Resume or -ResumeFailedOnly run reads them." -f $AllStreamFiles.Count, $InventoryRoot) -ForegroundColor Yellow }
+                try { Write-Host ("WARNING: kept {0} stream resume state file(s) in {1}, as the resume state could not be written; the next run reads them at its start." -f $AllStreamFiles.Count, $InventoryRoot) -ForegroundColor Yellow }
                 catch { $null = $_ }
             }
         }
@@ -1921,9 +1922,9 @@ if ($FailedSubscriptions.Count -eq 0 -and $UnreadableStreamSummaries.Count -eq 0
     # could not be written, or left by a stopped run and read at this run's
     # start) are cleared too: the next run's start would read their old
     # failures back, and -ResumeFailedOnly would retry them for ever. A file
-    # this run did not read (a plain sequential run reads none) is left: its
-    # failures are not in this run's clean check, and the next -Resume or
-    # -ResumeFailedOnly run reads them.
+    # this run did not read (one it could not parse, or one another run
+    # wrote after this run's start) is left: its failures are not in this
+    # run's clean check, and the next run reads it.
     foreach ($StreamFile in @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID | Where-Object { $ReadStreamStateFiles -contains $_.FullName }))
     {
         try { Remove-Item -LiteralPath $StreamFile.FullName -Force -ErrorAction Stop }
