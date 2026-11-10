@@ -60,8 +60,8 @@ BeforeAll {
     }
 
     $script:AuthMessage = 'Metrics phase skipped: no usable Azure context/token after one reconnect attempt.'
-    $script:IncompleteTwo = 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
-    $script:IncompleteOne = 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+    $script:IncompleteTwo = 'Azure Monitor requests for 2 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
+    $script:IncompleteOne = 'Azure Monitor requests for 1 resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
     # One subscription skipped for the sign-in, two with incomplete metrics.
     $script:Mixed = @(
         [pscustomobject]@{ Name = 'sub-a'; Id = 'sub-a'; Message = $script:AuthMessage; ReportFolder = 'ResourcesReport_a' }
@@ -246,7 +246,7 @@ Describe 'Main summary: metrics incomplete apart from metrics auth-skipped' {
         $Html | Should -Match '<b>Metrics auth-skipped: 1 subscription\(s\)\.</b>[^<]*: sub-a</div>'
         $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b>[^<]*: sub-b, sub-c</div>'
         # A failure with no readable status is counted too, so the text names it.
-        $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b> Azure Monitor requests still failed after their retries \(throttling, a timeout, a server error or an error with no status\) for: sub-b, sub-c</div>'
+        $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b> Azure Monitor requests still failed after their retries \(throttling, a timeout, an expired sign-in, a server error or an error with no status\) for: sub-b, sub-c</div>'
     }
 
     It 'shows each with its own banner and count, without names, under -Obfuscated' {
@@ -259,7 +259,7 @@ Describe 'Main summary: metrics incomplete apart from metrics auth-skipped' {
 
         $Html | Should -Match '<b>Metrics auth-skipped: 1 subscription\(s\)\.</b>'
         $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b>'
-        $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b> Azure Monitor requests still failed after their retries \(throttling, a timeout, a server error or an error with no status\) for those subscriptions\.</div>'
+        $Html | Should -Match '<b>Metrics incomplete: 2 subscription\(s\)\.</b> Azure Monitor requests still failed after their retries \(throttling, a timeout, an expired sign-in, a server error or an error with no status\) for those subscriptions\.</div>'
         $Html | Should -Not -Match 'sub-[abc]'
     }
 }

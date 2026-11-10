@@ -527,9 +527,9 @@ if ($Task -eq 'Processing')
     $MetricRequestCounts = [long[]]::new(2)
 
     # The resource id of every request, grouped or for one metric, that still failed
-    # after its retries for a reason a re-run can fix (throttling, timeout, server
-    # error, or an error whose status cannot be read; not a 4xx client error such
-    # as BadRequest, 403 or 404). Their subscriptions are recorded as metrics
+    # after its retries for a reason a re-run can fix (throttling, timeout, an
+    # expired sign-in (401), server error, or an error whose status cannot be read;
+    # not another 4xx client error such as BadRequest, 403 or 404). Their subscriptions are recorded as metrics
     # incomplete at the end of the phase.
     $MetricFailedGroupIds = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
@@ -694,8 +694,9 @@ if ($Task -eq 'Processing')
 
                 # True when a request that still failed after its retries can work on a
                 # re-run, so its subscription's metrics are incomplete: a timeout,
-                # throttling, a server error (HTTP 5xx), or an error whose status cannot
-                # be read. A client error (HTTP 4xx such as 401, 403 or 404, or
+                # throttling, an expired sign-in (HTTP 401, which a fresh sign-in
+                # fixes), a server error (HTTP 5xx), or an error whose status cannot
+                # be read. Any other client error (HTTP 4xx such as 403 or 404, or
                 # BadRequest anywhere in the chain) fails the same way on every run.
                 # The throttled flag is not read, because the status or its absence
                 # already decides: a 429 counts, and a request with no readable
@@ -709,8 +710,9 @@ if ($Task -eq 'Processing')
                     if (Test-MetricBadRequest -Exception $Exception) { return $false }
                     $Status = Get-MetricErrorStatus -Exception $Exception
                     if ($null -eq $Status) { return $true }
-                    # 408 (request timeout) and 429 (too many requests) pass with time.
-                    if ($Status -in @(408, 429)) { return $true }
+                    # 408 (request timeout) and 429 (too many requests) pass with time,
+                    # and 401 (an expired sign-in) passes with a fresh sign-in.
+                    if ($Status -in @(401, 408, 429)) { return $true }
                     return -not ($Status -ge 400 -and $Status -lt 500)
                 }
 
@@ -1194,7 +1196,7 @@ if ($Task -eq 'Processing')
         $FailedResources = @($Resources | Where-Object { $null -ne $_ -and $FailedIdSet.Contains([string]$_.Id) })
         $FailedSubIds = @($FailedResources | ForEach-Object { [string]$_.subscriptionId } | Select-Object -Unique)
         $MetricsReportFolder = if ($Global:DefaultPath) { Split-Path -Path ($Global:DefaultPath.TrimEnd([IO.Path]::DirectorySeparatorChar, '/', '\')) -Leaf } else { $null }
-        $IncompleteFormat = 'Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, a timeout, a server error or an error with no status); their metrics are recorded as errors.'
+        $IncompleteFormat = 'Azure Monitor requests for {0} resource(s) still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status); their metrics are recorded as errors.'
         $IncompleteMsg = ($IncompleteFormat -f $FailedIdSet.Count)
         if ($null -eq $Global:MetricsFailedSubs) { $Global:MetricsFailedSubs = @() }
         foreach ($FailedSubId in $FailedSubIds)

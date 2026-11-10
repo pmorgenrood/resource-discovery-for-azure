@@ -285,7 +285,7 @@ function Write-MetricsIncompleteBanner
     if ($List.Count -eq 0) { return }
     Write-Host ''
     Write-Host '=================== FAILED (metrics) ===================' -ForegroundColor Red
-    Write-Host ('Metrics are incomplete for {0} subscription(s): Azure Monitor requests still failed after their retries (throttling, a timeout, a server error or an error with no status):' -f $List.Count) -ForegroundColor Red
+    Write-Host ('Metrics are incomplete for {0} subscription(s): Azure Monitor requests still failed after their retries (throttling, a timeout, an expired sign-in, a server error or an error with no status):' -f $List.Count) -ForegroundColor Red
     foreach ($Entry in $List)
     {
         Write-Host ('  - {0} ({1})' -f $Entry.Name, $Entry.Id) -ForegroundColor Red
