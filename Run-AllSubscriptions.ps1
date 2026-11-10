@@ -1002,6 +1002,25 @@ $FailedAttempts = Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey
 $FailedIdsAtStart = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
 $CompletedIds = @($CompletedIds | Where-Object { $FailedIdsAtStart -notcontains [string]$_ })
 
+# One retry-list entry as a single exact text: its id, count, time, reason and
+# name, as JSON (so no field can run into the next), with the time as UTC in
+# the round-trip form, as ConvertFrom-Json reads a saved time back as a date.
+# The read-backs before per-stream files are removed compare these exactly.
+function ConvertTo-RetryEntryKey
+{
+    param($Entry)
+    $Field = { param($Name) if ($Entry.PSObject.Properties[$Name]) { $Entry.$Name } else { $null } }
+    $When = & $Field 'LastFailedAt'
+    if ($When -is [datetime]) { $When = $When.ToUniversalTime().ToString('o') }
+    elseif ($null -ne $When)
+    {
+        $Parsed = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$When, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$Parsed)) { $When = $Parsed.ToUniversalTime().ToString('o') }
+        else { $When = [string]$When }
+    }
+    [ordered]@{ Id = [string](& $Field 'Id'); Attempts = [string](& $Field 'Attempts'); LastFailedAt = $When; Reason = [string](& $Field 'Reason'); Name = [string](& $Field 'Name') } | ConvertTo-Json -Compress
+}
+
 # Fold in any per-stream resume-state left behind by an INTERRUPTED parallel run.
 # A parallel run persists each stream's Completed/FailedAttempts to its own
 # .resume-state-<tenant>-stream-<N>.json and only merges them into the unified
@@ -1069,14 +1088,13 @@ if ($Resume -or $ResumeFailedOnly)
             # The files read are removed only when the unified file on disk holds
             # what they were folded into; otherwise they are kept, and the next
             # run folds them in again.
-            $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            # Each retry entry whole (its count, reason and name too; the time
-            # is read back as a date), so a save that did not reach the disk is
-            # seen when the file had the same ids.
-            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
-            $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
-            if ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+            $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+            # Each retry entry whole (see ConvertTo-RetryEntryKey), so a save
+            # that did not reach the disk is seen when the file had the same ids.
+            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-RetryEntryKey -Entry $_ } | Sort-Object -CaseSensitive -Unique)
+            $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-RetryEntryKey -Entry $_ } | Sort-Object -CaseSensitive -Unique)
+            if ((($SavedCompleted -join "`n") -ceq ($WantCompleted -join "`n")) -and (($SavedFailed -join "`n") -ceq ($WantFailed -join "`n")))
             {
                 foreach ($StreamFile in $FoldedStreamFiles)
                 {
@@ -1951,14 +1969,13 @@ else
             $StreamStateSaved = $true
             if ($MergedStreamFiles.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
             {
-                $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-                # Each retry entry whole (its count, reason and name too; the time
-                # is read back as a date), so a save that did not reach the disk
-                # is seen when the file had the same ids.
-                $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
-                $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-                $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
-                $StreamStateSaved = ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+                $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+                # Each retry entry whole (see ConvertTo-RetryEntryKey), so a save
+                # that did not reach the disk is seen when the file had the same ids.
+                $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-RetryEntryKey -Entry $_ } | Sort-Object -CaseSensitive -Unique)
+                $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+                $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-RetryEntryKey -Entry $_ } | Sort-Object -CaseSensitive -Unique)
+                $StreamStateSaved = ((($SavedCompleted -join "`n") -ceq ($WantCompleted -join "`n")) -and (($SavedFailed -join "`n") -ceq ($WantFailed -join "`n")))
             }
             if (-not $StreamStateSaved)
             {
