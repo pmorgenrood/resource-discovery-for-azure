@@ -1718,10 +1718,100 @@ function Get-RunSummaryLogContent
 
 # ---- Consolidated zip check -------------------------------------------------
 
+# Whether a report zip's inventory or metrics file is JSON downstream can read:
+# it parses (System.Text.Json, a UTF-8 BOM allowed) to an object; a metrics file
+# has a Metrics list of objects whose MetricCount, MetricValue and
+# MetricPercentile are numbers and MetricError is true or false where given.
+# shortcut: the whole file is parsed in memory (System.Text.Json keeps it in
+# pooled buffers), so a report of several GB takes that much memory here; read
+# it with Utf8JsonReader in a compiled helper if that is ever seen.
+function Test-ReportJsonEntry
+{
+    param([Parameter(Mandatory = $true)][System.IO.Compression.ZipArchiveEntry]$Entry, [switch]$Metrics)
+    $Stream = $Entry.Open()
+    try
+    {
+        $Doc = [System.Text.Json.JsonDocument]::Parse($Stream)
+        try
+        {
+            $Root = $Doc.RootElement
+            if ($Root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+            if (-not $Metrics) { return $true }
+            $List = [System.Text.Json.JsonElement]::new()
+            if (-not $Root.TryGetProperty('Metrics', [ref]$List) -or $List.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return $false }
+            foreach ($Item in $List.EnumerateArray())
+            {
+                if ($Item.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $false }
+                $Value = [System.Text.Json.JsonElement]::new()
+                foreach ($Name in 'MetricCount', 'MetricValue', 'MetricPercentile')
+                {
+                    if ($Item.TryGetProperty($Name, [ref]$Value) -and $Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { return $false }
+                }
+                if ($Item.TryGetProperty('MetricError', [ref]$Value) -and $Value.ValueKind -ne [System.Text.Json.JsonValueKind]::True -and $Value.ValueKind -ne [System.Text.Json.JsonValueKind]::False) { return $false }
+            }
+            return $true
+        }
+        finally { $Doc.Dispose() }
+    }
+    catch { return $false }
+    finally { $Stream.Dispose() }
+}
+
+# Whether a report zip's consumption file is CSV downstream can read: its header
+# names ResourceId, MeterCategory, MeterSubCategory, MeterName and MeterId, and in
+# every row Quantity, UsageStartTime and UsageEndTime (and Cost and UnitPrice
+# when there are such columns) parse with culture-free rules (a dot for the
+# decimal mark, no thousands mark; dates in a culture-free form). An empty
+# cell is not checked: downstream drops such a row, not the file.
+function Test-ReportConsumptionEntry
+{
+    param([Parameter(Mandatory = $true)][System.IO.Compression.ZipArchiveEntry]$Entry)
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    $Stream = $Entry.Open()
+    try
+    {
+        $Parser = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new($Stream, [System.Text.Encoding]::UTF8, $true)
+        try
+        {
+            $Parser.SetDelimiters(',')
+            $Parser.HasFieldsEnclosedInQuotes = $true
+            $Header = $Parser.ReadFields()
+            if ($null -eq $Header) { return $false }
+            $Columns = @($Header | ForEach-Object { ([string]$_).Trim().TrimStart([char]0xFEFF) })
+            if (@('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $Columns -notcontains $_ }).Count -gt 0) { return $false }
+            $Numbers = @(foreach ($Name in 'Quantity', 'Cost', 'UnitPrice') { $At = [array]::IndexOf($Columns, $Name); if ($At -ge 0) { $At } })
+            $Dates = @(foreach ($Name in 'UsageStartTime', 'UsageEndTime') { $At = [array]::IndexOf($Columns, $Name); if ($At -ge 0) { $At } })
+            $Culture = [System.Globalization.CultureInfo]::InvariantCulture
+            $Number = 0.0
+            $Date = [datetime]::MinValue
+            while (-not $Parser.EndOfData)
+            {
+                $Row = $Parser.ReadFields()
+                if ($null -eq $Row) { continue }
+                if ($Row.Count -ne $Columns.Count) { return $false }
+                foreach ($At in $Numbers)
+                {
+                    $Cell = $Row[$At]
+                    if ($Cell -ne '' -and -not [double]::TryParse($Cell, [System.Globalization.NumberStyles]::Float, $Culture, [ref]$Number)) { return $false }
+                }
+                foreach ($At in $Dates)
+                {
+                    $Cell = $Row[$At]
+                    if ($Cell -ne '' -and -not [datetime]::TryParse($Cell, $Culture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$Date)) { return $false }
+                }
+            }
+            return $true
+        }
+        finally { $Parser.Dispose() }
+    }
+    catch { return $false }
+    finally { $Stream.Dispose() }
+}
+
 # Whether the report zip at $Path is one a reader can use: it opens as a zip,
-# holds an Inventory_*.json, a Metrics_*.json and a Consumption_*.csv of the
-# collector's shape (see the body), and every file in it reads to its end, so
-# its packed data decodes. A
+# holds an Inventory_*.json, a Metrics_*.json and a Consumption_*.csv that
+# downstream can read (Test-ReportJsonEntry, Test-ReportConsumptionEntry), and
+# every file in it reads to its end, so its packed data decodes. A
 # file of a report zip's name that is cut short or damaged is counted as
 # missing, so it is named and collected again instead of being put into the
 # consolidated zip as a report. With -Cache (one hashtable per run), a zip of
@@ -1751,60 +1841,29 @@ function Test-ReportZipReadable
             # The collector always writes an inventory, a metrics and a
             # consumption file (an empty metrics list and the consumption header
             # when it has none), and downstream reads each: a bad inventory
-            # fails the whole upload, and a missing, empty or bad metrics or
+            # fails the whole upload, and a missing or bad metrics or
             # consumption file is dropped in silence, so the totals go wrong.
-            # A zip without one of the three, or with one that is empty or not
-            # the right shape, is not readable.
+            # A zip without one of the three, or with one downstream cannot
+            # read, is not readable.
             $Kinds = @('Inventory_*.json', 'Metrics_*.json', 'Consumption_*.csv')
             if (@($Kinds | Where-Object { $Kind = $_; @($Files | Where-Object { $_.Name -like $Kind }).Count -eq 0 }).Count -eq 0)
             {
-                # Every file is read to its end, so its packed data decodes. For
-                # the three report files the first and last bytes that are not
-                # white space (after a UTF-8 BOM) must be { and } for the JSON
-                # files, and the CSV's first line must name the columns
-                # downstream finds rows by.
-                # shortcut: the JSON is not parsed and the CSV cells are not
-                # read (a large inventory would be read twice); a file cut short
-                # inside its last value, or a bad cell, is not seen.
                 $Readable = $true
                 $Buffer = [byte[]]::new(81920)
                 foreach ($Entry in $Files)
                 {
-                    $IsJson = $Entry.Name -like 'Inventory_*.json' -or $Entry.Name -like 'Metrics_*.json'
-                    $IsCsv = $Entry.Name -like 'Consumption_*.csv'
+                    # Every file reads to its end, so its packed data decodes.
                     $Stream = $Entry.Open()
-                    $Total = 0
-                    $First = -1
-                    $Last = -1
-                    $Head = [System.Collections.Generic.List[byte]]::new()
-                    try
+                    try { while ($Stream.Read($Buffer, 0, $Buffer.Length) -gt 0) { } } finally { $Stream.Dispose() }
+                    if ($Entry.Name -like 'Inventory_*.json' -or $Entry.Name -like 'Metrics_*.json')
                     {
-                        while (($Got = $Stream.Read($Buffer, 0, $Buffer.Length)) -gt 0)
-                        {
-                            if ($IsJson -or $IsCsv)
-                            {
-                                for ($B = 0; $B -lt $Got; $B++)
-                                {
-                                    $Byte = $Buffer[$B]
-                                    if ($IsCsv -and $Head.Count -lt 4096) { $Head.Add($Byte) }
-                                    if ($Byte -in 0x20, 0x09, 0x0A, 0x0D) { continue }
-                                    if ($Total + $B -lt 3 -and $Byte -in 0xEF, 0xBB, 0xBF) { continue }
-                                    if ($First -lt 0) { $First = $Byte }
-                                    $Last = $Byte
-                                }
-                            }
-                            $Total += $Got
-                        }
+                        if (-not (Test-ReportJsonEntry -Entry $Entry -Metrics:($Entry.Name -like 'Metrics_*.json'))) { $Readable = $false }
                     }
-                    finally { $Stream.Dispose() }
-                    if (($IsJson -or $IsCsv) -and $Total -eq 0) { $Readable = $false }
-                    elseif ($IsJson -and ($First -ne 0x7B -or $Last -ne 0x7D)) { $Readable = $false }
-                    elseif ($IsCsv)
+                    elseif ($Entry.Name -like 'Consumption_*.csv')
                     {
-                        $Text = [System.Text.Encoding]::UTF8.GetString($Head.ToArray()).TrimStart([char]0xFEFF)
-                        $Columns = @((($Text -split "`r?`n", 2)[0] -split ',') | ForEach-Object { $_.Trim().Trim('"') })
-                        if (@('ResourceId', 'MeterCategory', 'MeterSubCategory', 'MeterName', 'MeterId' | Where-Object { $Columns -notcontains $_ }).Count -gt 0) { $Readable = $false }
+                        if (-not (Test-ReportConsumptionEntry -Entry $Entry)) { $Readable = $false }
                     }
+                    if (-not $Readable) { break }
                 }
             }
         }
