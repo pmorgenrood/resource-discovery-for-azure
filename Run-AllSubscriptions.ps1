@@ -2375,11 +2375,22 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
             $CompletedIds = @($CompletedIds | Where-Object { $_ -ne [string]$Gone.Id })
             $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne [string]$Gone.Id })
         }
-        if ($GoneRecords.Count -gt 0)
+        $MissingReports = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
+        # A report that is missing or cannot be read counts as one failed run of
+        # its subscription (unless this run already recorded one), so the retry
+        # limit ends the cycle when the collector keeps leaving no readable zip:
+        # -Resume collects it again until the limit, then names it under Retry
+        # Limit Reached (exit 2) and stops collecting it.
+        foreach ($M in $MissingReports)
+        {
+            $Entry = @($FailedAttempts | Where-Object { $null -ne $_ -and [string]$_.Id -eq [string]$M.Id }) | Select-Object -First 1
+            $FailedThisRun = $null -ne $Entry -and $Entry.PSObject.Properties['LastFailedAt'] -and $(try { ([datetime]$Entry.LastFailedAt).ToUniversalTime() -ge $RunStartTime.ToUniversalTime() } catch { $false })
+            if (-not $FailedThisRun) { $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$M.Id) -Name ([string]$M.Name) -Reason 'its report zip is missing or cannot be read' }
+        }
+        if ($MissingReports.Count -gt 0)
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         }
-        $MissingReports = @(@($NoReportSubs) + @($GoneRecords) | Where-Object { $null -ne $_ } | Sort-Object -Property Id -Unique)
         # Read back for every missing one, those that wrote no zip too: the same
         # disk problem that lost a zip can stop the save above, or the one the
         # run made when it took a no-zip subscription off the completed list.
