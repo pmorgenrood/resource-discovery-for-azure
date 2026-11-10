@@ -348,6 +348,17 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         [System.IO.File]::WriteAllBytes($Damaged, $Bytes)
         Test-ReportZipReadable -Path $Damaged | Should -BeFalse
         Test-ReportZipReadable -Path $script:Zip | Should -BeTrue
+
+        # An inventory file of 0 bytes cannot be parsed downstream: not readable,
+        # so the report is not carried and is named.
+        $EmptyInv = Join-Path $script:Root 'ResourcesReport5dddd/ResourcesReport_5dddd.zip'
+        New-Item -ItemType Directory -Path (Split-Path $EmptyInv -Parent) -Force | Out-Null
+        $Z = [System.IO.Compression.ZipFile]::Open($EmptyInv, 'Create')
+        try { $null = $Z.CreateEntry('Inventory_ResourcesReport_5dddd.json', 'Optimal') } finally { $Z.Dispose() }
+        Test-ReportZipReadable -Path $EmptyInv | Should -BeFalse
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport5dddd/ResourcesReport_5dddd.zip'; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false
+        @($R.Carried).Count | Should -Be 0
+        @($R.Missing).Count | Should -Be 1
     }
 
     It 'counts a report zip whose metrics or consumption file is damaged as unreadable, though its inventory reads' -ForEach @(@{ Member = 'Metrics_ResourcesReport_5dddd.json' }, @{ Member = 'Consumption_ResourcesReport_5dddd.csv' }) {
