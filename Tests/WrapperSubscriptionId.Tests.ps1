@@ -272,7 +272,8 @@ exit 0
 }
 
 AfterAll {
-    if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
+    # .NET, not Remove-Item: a case home's name can hold * or ? (paths as written).
+    if ($script:TestBase -and [System.IO.Directory]::Exists($script:TestBase)) { [System.IO.Directory]::Delete($script:TestBase, $true) }
 }
 
 Describe 'The -SubscriptionID helpers' {
@@ -777,25 +778,27 @@ Describe 'The preflight and the run check the same subscriptions' -Skip:($IsWind
     }
 }
 
-Describe 'A home folder with brackets in its name' -Skip:($IsWindows) {
+Describe 'A home folder with a wildcard character in its name' -Skip:($IsWindows) {
     AfterEach {
         if ($script:CaseRuns.Count -gt 0 -and $____Pester.CurrentTest.ErrorRecord.Count -gt 0) { script:Write-CaseRuns }
     }
 
     It 'stops <Label> with exit 1 before writing anything' -ForEach @(
-        @{ Label = 'a preflight'; Arguments = @('-PreflightOnly', '-Resume') }
-        @{ Label = 'a run'; Arguments = @('-Resume') }
+        @{ Label = 'a preflight'; Arguments = @('-PreflightOnly', '-Resume'); HomeName = 'home[{0}]' }
+        @{ Label = 'a run'; Arguments = @('-Resume'); HomeName = 'home[{0}]' }
+        @{ Label = 'a run under a home with ? in its name'; Arguments = @('-Resume'); HomeName = 'home?{0}' }
+        @{ Label = 'a run under a home with * in its name'; Arguments = @('-Resume'); HomeName = 'home*{0}' }
     ) {
         script:New-Case
         # The same case under a home whose name holds brackets.
-        $script:CaseHome = Join-Path $script:TestBase ('home[' + [guid]::NewGuid().ToString().Substring(0, 4) + ']')
+        $script:CaseHome = Join-Path $script:TestBase ($HomeName -f [guid]::NewGuid().ToString().Substring(0, 4))
         [void][System.IO.Directory]::CreateDirectory($script:CaseHome)
         $script:Root = Join-Path $script:CaseHome 'InventoryReports'
         $script:Scenario = Join-Path $script:CaseHome 'scenario.json'
         script:Set-Scenario -Subs 'A', 'B'
         $Run = script:Invoke-Wrapper -Arguments $Arguments
         $Run.ExitCode | Should -Be 1
-        @($Run.Text | Where-Object { $_ -eq ('ERROR: The inventory folder {0} has [ or ] in its path, which this script cannot use. Set HOME to a folder without them and run again.' -f $script:Root) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -eq ('ERROR: The inventory folder {0} has [ ] * or ? in its path, which this script cannot use. Set HOME to a folder without them and run again.' -f $script:Root) }).Count | Should -Be 1
         [System.IO.Directory]::Exists($script:Root) | Should -BeFalse
         script:Get-Calls | Should -BeNullOrEmpty
     }

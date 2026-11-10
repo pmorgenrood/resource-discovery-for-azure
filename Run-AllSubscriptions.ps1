@@ -567,14 +567,15 @@ $Global:CollectorFailures = @()
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
 $InventoryRoot = if ($PSVersionTable.Platform -eq 'Unix') { "$HOME/InventoryReports" } else { "C:\InventoryReports" }
-# A folder whose path holds [ or ] cannot be used: PowerShell reads them as a
-# wildcard, and the zip step (Compress-Archive) fails on such a path. Stopped
+# A folder whose path holds [ ] * or ? (the last two allowed in folder names
+# on Linux and macOS) cannot be used: PowerShell reads them as a wildcard,
+# and the zip step (Compress-Archive) fails on such a path. Stopped
 # here, before anything is written, so the preflight and the run never read
 # the resume state of such a folder differently.
-if ($InventoryRoot.IndexOfAny([char[]]'[]') -ge 0)
+if ($InventoryRoot.IndexOfAny([char[]]'[]*?') -ge 0)
 {
     $script:PreflightCheck = 'the inventory folder'
-    Write-Host ("ERROR: The inventory folder {0} has [ or ] in its path, which this script cannot use. Set HOME to a folder without them and run again." -f $InventoryRoot) -ForegroundColor Red
+    Write-Host ("ERROR: The inventory folder {0} has [ ] * or ? in its path, which this script cannot use. Set HOME to a folder without them and run again." -f $InventoryRoot) -ForegroundColor Red
     Exit-Wrapper -Code 1
 }
 
