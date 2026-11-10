@@ -1705,7 +1705,10 @@ finally
 # The summary reads the Inventory file, so it runs only when that file was
 # written and reads as an object. Otherwise the run makes no zip and exits 2
 # (under the wrapper, that subscription failed); see the zip step below,
-# which reuses this check's result.
+# which reuses this check's result. Both values are set first, so a value
+# left in the caller's session is never read.
+$InventoryNotWritten = $false
+$InventoryCheckedWritten = $false
 if ($script:InventoryWriteFailed -or -not ($InventoryCheckedWritten = Test-RdaReportInventoryWritten -JsonFiles @($Global:JsonFile)))
 {
     $InventoryNotWritten = $true

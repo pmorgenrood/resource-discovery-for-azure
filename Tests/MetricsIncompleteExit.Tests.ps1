@@ -1109,7 +1109,11 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         $Top = @($Ast.EndBlock.Statements)
         $Writer = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'ProcessResourceResult' }, $true))[0]
         $Finalizer = @($Top | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'FinalizeOutputs' })[0]
+        # The run sets its Inventory check values just before that statement, so
+        # those settings are taken too.
         $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_] -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and $Top[$_].Extent.Text -match '\bFinalizeOutputs\b' })[0]
+        while ($From -gt 0 -and $Top[$From - 1].Extent.Text -match '^\$Inventory(NotWritten|CheckedWritten) = \$false$') { $From-- }
+        $script:FlowFirst = @($Top[$From..($Top.Count - 1)] | Select-Object -First 2 | ForEach-Object { $_.Extent.Text })
         $script:FlowFolder = Join-Path $TestDrive 'inventory-flow'
         New-Item -ItemType Directory -Path (Join-Path $script:FlowFolder 'Extension') -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Extension/Summary.ps1') -Destination (Join-Path $script:FlowFolder 'Extension/Summary.ps1')
@@ -1218,6 +1222,27 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         $Result.ExitCode | Should -Be 0
         $Result.ZipLeft | Should -BeTrue
         Test-Path -LiteralPath $Global:HtmlFile | Should -BeTrue
+        @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 0
+    }
+
+    It 'sets both Inventory check values in the run''s own scope before the check reads them' {
+        $script:FlowFirst | Sort-Object | Should -Be @('$InventoryCheckedWritten = $false', '$InventoryNotWritten = $false')
+    }
+
+    It 'writes the zip when the caller holds stale Inventory check values' {
+        $Global:InventoryNotWritten = $true
+        $Global:InventoryCheckedWritten = $true
+        try
+        {
+            $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' }
+        }
+        finally
+        {
+            Remove-Variable -Name InventoryNotWritten, InventoryCheckedWritten -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        $Result.ExitCode | Should -Be 0
+        $Result.ZipLeft | Should -BeTrue
         @($Result.Lines | Where-Object { $_ -like '*No report was written*' }).Count | Should -Be 0
     }
 
