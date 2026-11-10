@@ -106,3 +106,16 @@ Describe 'RunSummary.log records retry entries left out of the run' {
         $script:WrapperText | Should -Match ([regex]::Escape('-NotInRun $RetryOwedNotInRun `'))
     }
 }
+
+Describe 'RunSummary.log records a resume state that was not saved' {
+    It 'says so in a plain and in an obfuscated run, and says nothing when the state was saved' {
+        $Line = '  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)'
+        @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -ResumeStateNotSaved) | Should -Contain $Line
+        @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -ResumeStateNotSaved -Obfuscated) | Should -Contain $Line
+        @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 | Where-Object { $_ -like '  Resume state *' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the wrapper passes the flag a failed save sets' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-ResumeStateNotSaved:$ResumeStateSaveFailed `'))
+    }
+}

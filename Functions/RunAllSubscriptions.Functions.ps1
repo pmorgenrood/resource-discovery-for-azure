@@ -1464,6 +1464,9 @@ function Get-RunSummaryLogContent
         # not given, one per entry of -FailedSubscriptions.
         [int]$FailedSubscriptionCount = -1,
         [int]$ConsumptionRecordCount = 0,
+        # A save of the resume state failed this run (and no later one reached
+        # the disk): the log says a -Resume could skip a failed subscription.
+        [switch]$ResumeStateNotSaved,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
         # the whole section is omitted (keeps standalone/offline callers clean).
@@ -1609,6 +1612,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Failed    : {0}' -f $FailedCount))
     $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  Not in this run     : {0} (on the retry list, but not in this run''s subscription set; incomplete)' -f $LeftOut.Count))
+    if ($ResumeStateNotSaved) { $Lines.Add('  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)') }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
     $Lines.Add(('  0 resources - undetermined: {0}' -f $Undetermined.Count))

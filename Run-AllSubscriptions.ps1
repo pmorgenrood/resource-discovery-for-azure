@@ -2779,6 +2779,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -RetryLimited $RetryLimited `
             -NotInRun $RetryOwedNotInRun `
+            -ResumeStateNotSaved:$ResumeStateSaveFailed `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
