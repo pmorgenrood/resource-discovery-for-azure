@@ -1944,14 +1944,28 @@ else
             # The files read are removed only when the unified file on disk holds
             # what they were merged into, as at the start of a run: a save that
             # failed (a full disk) only warns, and they hold the only copy.
-            $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
-            $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
-            $StreamStateSaved = ($MergedStreamFiles.Count -eq 0) -or ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+            # (Checked only when something was saved above.)
+            $StreamStateSaved = $true
+            if ($MergedStreamFiles.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
+            {
+                $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+                $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+                $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+                $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+                $StreamStateSaved = ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
+            }
             if (-not $StreamStateSaved)
             {
-                Write-Host ("WARNING: The resume state file {0} does not hold every record of this run's per-stream files, so they are kept: {1}. The next -Resume or -ResumeFailedOnly folds them in." -f $ResumeStateFile, (@($MergedStreamFiles | ForEach-Object { $_.FullName }) -join ', ')) -ForegroundColor Yellow
+                if ($MergedStreamFiles.Count -gt 0)
+                {
+                    Write-Host ("WARNING: The resume state file {0} does not hold every record of this run's per-stream files, so they are kept: {1}. The next -Resume or -ResumeFailedOnly folds them in." -f $ResumeStateFile, (@($MergedStreamFiles | ForEach-Object { $_.FullName }) -join ', ')) -ForegroundColor Yellow
+                }
+                # Failures only a stream summary holds have no stream file to keep
+                # them, so they are named here: no retry list holds them now.
+                if ($SummaryOnlyFailed.Count -gt 0)
+                {
+                    Write-Host ("ERROR: The resume state file {0} could not be written, so these failed subscriptions are on no retry list and -ResumeFailedOnly would not retry them: {1}. Once the folder can be written, run again with -Resume, or without it." -f $ResumeStateFile, (@($SummaryOnlyFailed | ForEach-Object { '{0} ({1})' -f [string]$_.Name, [string]$_.Id }) -join ', ')) -ForegroundColor Red
+                }
                 $MergedStreamFiles = @()
             }
             # Also delete per-stream resume files now that the unified file holds

@@ -1035,6 +1035,20 @@ Describe 'A resume state that lists a subscription as both completed and failed'
         $null = $R1
     }
 
+    It 'names the failures only the stream summaries hold when the resume state cannot be written, as no retry list holds them' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        # A folder at the state file's name: the save fails, as on a full disk.
+        New-Item -ItemType Directory -Path $script:State -Force | Out-Null
+        $env:RDA_STANDIN_IMPORT_FAIL = '1'
+        try { $Run = script:Invoke-Wrapper -Streams 2 }
+        finally { Remove-Item Env:\RDA_STANDIN_IMPORT_FAIL -ErrorAction SilentlyContinue }
+        $Line = @($Run.Text | Where-Object { $_ -like 'ERROR: The resume state file * could not be written, so these failed subscriptions are on no retry list*' })
+        $Line.Count | Should -Be 1
+        foreach ($L in 'A', 'B', 'C') { $Line[0] | Should -BeLike ('*{0} ({1})*' -f $script:Subs[$L].Name, $script:Subs[$L].Id) }
+    }
+
     It 'keeps a subscription a parallel run failed off the completed list, so -Resume -ResumeFailedOnly collects it' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
