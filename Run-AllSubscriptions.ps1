@@ -2626,7 +2626,11 @@ $RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $Retry
 # or when they are no longer visible. ResourceInventory.ps1 run on its own does
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
-if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and -not ($MissingReportCount -gt 0) -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+# A consolidated zip that could not be built keeps the state too (as in
+# all-fixes-optimized): the next -Resume then skips the completed
+# subscriptions and carries their reports into a new zip instead of
+# collecting them all again (exit 2 says why).
+if ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
 {
     try
     {
@@ -3098,6 +3102,14 @@ if ($null -ne $BundleBuildError)
     Write-Host ""
     Write-Host "================ FAILED (consolidated zip) ================" -ForegroundColor Red
     Write-Host $BundleBuildError -ForegroundColor Red
+    # A zip that failed after the clean-run clear above (when it took its name,
+    # or while the run summary was added): the state is saved again, so the
+    # next -Resume carries the completed reports into a new zip.
+    if (-not $InventoryFolderGone -and (Test-Path -LiteralPath $InventoryRoot -PathType Container) -and -not (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) -and @($CompletedIds).Count -gt 0)
+    {
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+        if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) { Write-Host 'The resume state is kept (written again): run again with -Resume to carry the completed reports into a new consolidated zip.' -ForegroundColor Yellow }
+    }
     # Read now: the folder can go while the zip is built, summarised or checked.
     if (Test-Path -LiteralPath $InventoryRoot -PathType Container)
     {
