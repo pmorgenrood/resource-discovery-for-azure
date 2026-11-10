@@ -646,6 +646,9 @@ $FailedAttempts = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $TenantID)
 # merge). A clean run removes only these: a file it never read may hold a
 # failure this run knows nothing of.
 $ReadStreamStateFiles = @()
+# The stream resume state files this run could not read and has warned
+# about, so a parallel run that tries again in its merge warns once.
+$UnreadStreamStateFiles = @()
 $StrandedStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $TenantID)
 if ($StrandedStreamFiles.Count -gt 0)
 {
@@ -655,7 +658,10 @@ if ($StrandedStreamFiles.Count -gt 0)
     {
         try
         {
-            $Obj = Get-Content -Path $StreamFile.FullName -Raw | ConvertFrom-Json
+            # -ErrorAction Stop: a file that cannot be opened (locked, no
+            # access) is a non-terminating error, which would leave it
+            # counted as read with nothing taken from it.
+            $Obj = Get-Content -LiteralPath $StreamFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($null -ne $Obj.Completed) { $StrandedCompleted += @($Obj.Completed) }
             if ($null -ne $Obj.FailedAttempts) { $StrandedFailed += @($Obj.FailedAttempts) }
             $ReadStreamStateFiles += $StreamFile.FullName
@@ -663,6 +669,12 @@ if ($StrandedStreamFiles.Count -gt 0)
         catch
         {
             Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
+            # A failure held only there is not retried this run: say so.
+            if ($UnreadStreamStateFiles -notcontains $StreamFile.FullName)
+            {
+                $UnreadStreamStateFiles += $StreamFile.FullName
+                Write-Host ('WARNING: Could not read the stream resume state file {0}, so its records were not read in this run.' -f $StreamFile.FullName) -ForegroundColor Yellow
+            }
         }
     }
     if ($StrandedCompleted.Count -gt 0)
@@ -1580,7 +1592,9 @@ else
                 $PerStreamFile = $StreamFile.FullName
                 try
                 {
-                    $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
+                    # -ErrorAction Stop, as at the start: a file that cannot
+                    # be opened is not counted as read.
+                    $Obj = Get-Content -LiteralPath $PerStreamFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
                     if ($null -ne $Obj.Completed)
                     {
                         $AllCompletedFromStreams += @($Obj.Completed)
@@ -1600,6 +1614,12 @@ else
                 catch
                 {
                     Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
+                    # Once per file: the start of the run may have warned.
+                    if ($UnreadStreamStateFiles -notcontains $PerStreamFile)
+                    {
+                        $UnreadStreamStateFiles += $PerStreamFile
+                        Write-Host ('WARNING: Could not read the stream resume state file {0}, so its records were not read in this run.' -f $PerStreamFile) -ForegroundColor Yellow
+                    }
                 }
             }
             if ($AllCompletedFromStreams.Count -gt 0)
@@ -1644,9 +1664,13 @@ else
             # When the unified file could not be written, they are this run's
             # only record of its completions and failures: they are kept, and
             # the next run reads them at its start.
+            # Only the files this run read are removed, as in the clean-run
+            # clean-up: a file it could not read (truncated, locked) may hold
+            # a failure the unified file does not, so it is left for the next
+            # run's start to read.
             if ($UnifiedStateSaved)
             {
-                foreach ($StreamFile in $AllStreamFiles)
+                foreach ($StreamFile in @($AllStreamFiles | Where-Object { $ReadStreamStateFiles -contains $_.FullName }))
                 {
                     $PerStreamFile = $StreamFile.FullName
                     try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }

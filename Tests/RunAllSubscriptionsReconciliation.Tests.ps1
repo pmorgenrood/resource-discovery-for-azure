@@ -369,6 +369,45 @@ Describe 'Resume state messages whose error text holds braces' {
     }
 }
 
+Describe 'A resume state file that is there but cannot be read' -Skip:$IsWindows {
+    # Mode 000, as when the file is locked or has no access. A read that fails
+    # is not a bad file: it may hold done subscriptions and failures still to
+    # retry, so the run stops with the real reason, before any write over it.
+    BeforeEach {
+        $script:LockDir = Join-Path $script:TestRoot ('lock_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:LockDir -Force | Out-Null
+        $script:LockPath = Join-Path $script:LockDir 'state.json'
+        Save-CompletedSubscriptionIds -Path $script:LockPath -Tenant 't' -Ids @('done-1') -FailedAttempts @([pscustomobject]@{ Id = 'failed-1'; Name = 'F'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'r'; Attempts = 1 })
+        $script:LockBefore = Get-Content -LiteralPath $script:LockPath -Raw
+        [System.IO.File]::SetUnixFileMode($script:LockPath, [System.IO.UnixFileMode]::None)
+        Mock Write-Host -MockWith { }
+        Mock Exit-Wrapper -MockWith { throw ('stand-in exit {0}' -f $Code) }
+    }
+
+    AfterEach {
+        [System.IO.File]::SetUnixFileMode($script:LockPath, [System.IO.UnixFileMode]'UserRead, UserWrite')
+    }
+
+    It '<Name> stops with exit 1 and names the read failure, not a different tenant' -ForEach @(
+        @{ Name = 'Get-CompletedSubscriptionIds' }
+        @{ Name = 'Get-FailedAttempts' }
+    ) {
+        { & $Name -Path $script:LockPath -Tenant 't' } | Should -Throw 'stand-in exit 1'
+        Should -Invoke Exit-Wrapper -Times 1 -Exactly -ParameterFilter { $Code -eq 1 }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { ([string]$Object) -like ('ERROR: The resume state file {0} exists but could not be read: *denied*' -f $script:LockPath) }
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { ([string]$Object) -like '*different tenant*' }
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter { ([string]$Object) -like '*starting fresh*' }
+    }
+
+    It 'once it can be read again, the saved completions and failures are all there' {
+        { Get-CompletedSubscriptionIds -Path $script:LockPath -Tenant 't' } | Should -Throw 'stand-in exit 1'
+        [System.IO.File]::SetUnixFileMode($script:LockPath, [System.IO.UnixFileMode]'UserRead, UserWrite')
+        Get-Content -LiteralPath $script:LockPath -Raw | Should -Be $script:LockBefore
+        @(Get-CompletedSubscriptionIds -Path $script:LockPath -Tenant 't') | Should -Be @('done-1')
+        @(Get-FailedAttempts -Path $script:LockPath -Tenant 't').Id | Should -Be @('failed-1')
+    }
+}
+
 Describe 'Save-CompletedSubscriptionIds keeps the old state when its write fails' {
     BeforeEach {
         $script:KeepDir = Join-Path $script:TestRoot ('keep_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -382,7 +421,7 @@ Describe 'Save-CompletedSubscriptionIds keeps the old state when its write fails
         # The write leaves a cut temp file and a non-terminating error, as
         # Set-Content does when the disk fills.
         Mock Set-Content -MockWith {
-            [System.IO.File]::WriteAllText([string]$PesterBoundParameters['Path'], '{"TenantID": "t", "Compl')
+            [System.IO.File]::WriteAllText([string]$(if ($PesterBoundParameters.ContainsKey('LiteralPath')) { $PesterBoundParameters['LiteralPath'] } else { $PesterBoundParameters['Path'] }), '{"TenantID": "t", "Compl')
             Write-Error 'stand-in: no space left on the disk'
         }
         Mock Write-Host -MockWith { }
@@ -889,5 +928,29 @@ Describe 'The wrapper keeps a resume state with one entry as a list' {
         @($CompletedIds) | Should -Be @('sub-a', 'sub-c')
         $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id 'sub-d' -Name 'D' -Reason 'r'
         @($FailedAttempts).Count | Should -Be 2
+    }
+}
+
+Describe 'The resume state in a folder whose path holds [ or ]' {
+    # -Path reads [ ] as a wildcard set, so the file was not found: the run
+    # started fresh and its first save wrote over the saved state.
+    BeforeAll {
+        $script:BracketDir = Join-Path $script:TestRoot ('inv[1]_' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $script:BracketDir -Force | Out-Null
+    }
+
+    It 'saves and reads back the main resume state' {
+        $Path = Join-Path $script:BracketDir 'state.json'
+        Save-CompletedSubscriptionIds -Path $Path -Tenant 't' -Ids @('sub-a', 'sub-b') -FailedAttempts @([pscustomobject]@{ Id = 'sub-c'; Name = 'C'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'r'; Attempts = 1 })
+        Test-Path -LiteralPath $Path -PathType Leaf | Should -BeTrue
+        @(Get-CompletedSubscriptionIds -Path $Path -Tenant 't') | Should -Be @('sub-a', 'sub-b')
+        @(Get-FailedAttempts -Path $Path -Tenant 't').Id | Should -Be @('sub-c')
+    }
+
+    It 'saves and reads back a stream resume state' {
+        $Path = Join-Path $script:BracketDir 'stream-0.json'
+        Write-StreamState -Path $Path -Completed @('sub-a') -FailedAttempts @()
+        Test-Path -LiteralPath $Path -PathType Leaf | Should -BeTrue
+        @((Read-StreamState -Path $Path).Completed) | Should -Be @('sub-a')
     }
 }
