@@ -276,6 +276,25 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
     }
 }
 
+Describe 'A subscription whose collector never leaves a readable zip' -Skip:$IsWindows {
+    It 'counts each such run as a failed run, so -Resume stops collecting it at the retry limit and names it' {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -NoZip @($B.Id)
+        $R1 = script:Invoke-Wrapper -Streams 1
+        $R1.ExitCode | Should -Be 2
+        [int](@($R1.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 1
+        $R2 = script:Invoke-Wrapper -Streams 1 -Arguments '-Resume'
+        [int](@($R2.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 2
+        $R3 = script:Invoke-Wrapper -Streams 1 -Arguments '-Resume'
+        [int](@($R3.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3
+        $R4 = script:Invoke-Wrapper -Streams 1 -Arguments '-Resume'
+        $R4.ExitCode | Should -Be 2
+        @($R4.Text | Where-Object { $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 1 -Because 'the cycle ends at the limit, named'
+        [int](@($R4.State.FailedAttempts | Where-Object { $_.Id -eq $B.Id })[0].Attempts) | Should -Be 3 -Because 'the fourth run did not collect it'
+    }
+}
+
 Describe 'A missing report zip while a failed subscription left a zip' -Skip:$IsWindows {
     It 'names the missing one: the failed subscription''s zip does not stand in for it, though the counts match' {
         script:New-Case

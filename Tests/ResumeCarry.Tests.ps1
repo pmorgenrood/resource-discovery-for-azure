@@ -407,10 +407,6 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         @{ Case = 'its consumption file lacks a column downstream needs'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterName,MeterId' } }
         @{ Case = 'its inventory is not JSON though it starts and ends with braces'; Files = @{ 'Inventory_R_7.json' = '{"VirtualMachines":}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
         @{ Case = 'its metrics file has no Metrics list'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
-        @{ Case = 'a metric value is text'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[{"MetricValue":"1.5","MetricError":false}]}'; 'Consumption_R_7.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
-        @{ Case = 'a quantity has a comma for the decimal mark'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,"1,5",2026-11-01T00:00:00Z,2026-11-02T00:00:00Z') } }
-        @{ Case = 'a usage date is not in a culture-free form'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5,31/12/2026,2026-11-02T00:00:00Z') } }
-        @{ Case = 'a row is cut short'; Files = @{ 'Inventory_R_7.json' = '{}'; 'Metrics_R_7.json' = '{"Metrics":[]}'; 'Consumption_R_7.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5') } }
     ) {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $OddZip = Join-Path $script:Root ('odd7-{0}.zip' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
@@ -420,7 +416,22 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         Test-ReportZipReadable -Path $OddZip | Should -BeFalse
     }
 
-    It 'reads a report zip whose three files downstream can read, a byte-order mark, white space and a quoted JSON cell included' {
+    # The check stops at the shape downstream needs to read a file at all (owner
+    # decision): a bad row or field is downstream's to drop, so it still passes.
+    It 'still reads a report zip when <Case>' -ForEach @(
+        @{ Case = 'a metric value is text'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[{"MetricValue":"1.5"}]}'; 'Consumption_R_9.csv' = 'ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId' } }
+        @{ Case = 'one consumption row has a comma for the decimal mark'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[]}'; 'Consumption_R_9.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,"1,5",2026-11-01T00:00:00Z,2026-11-02T00:00:00Z' + "`n" + '/subscriptions/s/y,Compute,D,Hours,m1,2.5,2026-11-01T00:00:00Z,2026-11-02T00:00:00Z') } }
+        @{ Case = 'one consumption row is cut short'; Files = @{ 'Inventory_R_9.json' = '{}'; 'Metrics_R_9.json' = '{"Metrics":[]}'; 'Consumption_R_9.csv' = ('ResourceId,MeterCategory,MeterSubCategory,MeterName,MeterId,Quantity,UsageStartTime,UsageEndTime' + "`n" + '/subscriptions/s/x,Compute,D,Hours,m1,1.5') } }
+    ) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $RowZip = Join-Path $script:Root ('row9-{0}.zip' -f [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $Z = [System.IO.Compression.ZipFile]::Open($RowZip, 'Create')
+        try { foreach ($Name in $Files.Keys) { $W = [System.IO.StreamWriter]::new($Z.CreateEntry($Name, 'Optimal').Open()); try { $W.Write($Files[$Name]) } finally { $W.Dispose() } } }
+        finally { $Z.Dispose() }
+        Test-ReportZipReadable -Path $RowZip | Should -BeTrue
+    }
+
+    It 'reads a report zip of the collector''s shape, a byte-order mark, white space and a quoted JSON cell included' {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $GoodZip = Join-Path $script:Root 'good7.zip'
         $Z = [System.IO.Compression.ZipFile]::Open($GoodZip, 'Create')
