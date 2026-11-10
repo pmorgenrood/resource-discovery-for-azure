@@ -996,6 +996,11 @@ function Get-ResumeCarriedReports
     $Carried = @()
     $Missing = @()
     $SeenIds = @{}
+    # Full path -> the id whose record carried it: one zip holds one
+    # subscription's report, so a second record naming the same file is not
+    # carried (Join-CarriedReportZips would add the file once, and the count of
+    # expected reports would never match).
+    $SeenZips = @{}
     foreach ($Sub in @($SkippedSubscriptions))
     {
         if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
@@ -1084,8 +1089,13 @@ function Get-ResumeCarriedReports
             }
         }
 
+        if ($null -eq $Reason -and $SeenZips.ContainsKey($FullPath))
+        {
+            $Reason = ('its report zip is the one recorded for {0}, and one zip holds one subscription''s report: {1}' -f $SeenZips[$FullPath], $Rel)
+        }
         if ($null -eq $Reason)
         {
+            $SeenZips[$FullPath] = $Id
             $Carried += [pscustomobject]@{
                 Id     = $Id
                 Name   = [string]$Sub.Name

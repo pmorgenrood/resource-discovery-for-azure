@@ -333,6 +333,19 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $R.Missing[0].Reason | Should -Match 'not true/false'
     }
 
+    It 'carries a zip once when two subscriptions'' records name the same file, and names the second as missing' {
+        $SubB = [pscustomobject]@{ Id = 'sub-b'; Name = 'B' }
+        $Recs = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = $script:Rel; Obfuscated = $false }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = $script:Rel; Obfuscated = $false }
+        )
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA, $SubB) -Reports $Recs -InventoryRoot $script:Root -Obfuscated $false
+        @($R.Carried | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
+        @($R.Missing).Count | Should -Be 1
+        $R.Missing[0].Id | Should -Be 'sub-b'
+        $R.Missing[0].Reason | Should -Be ('its report zip is the one recorded for sub-a, and one zip holds one subscription''s report: {0}' -f $script:Rel)
+    }
+
     It 'names a recorded zip that holds no Inventory_*.json, or one whose inventory cannot be read to its end' {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $HtmlOnly = Join-Path $script:Root 'ResourcesReport3bbbb/ResourcesReport_3bbbb.zip'
