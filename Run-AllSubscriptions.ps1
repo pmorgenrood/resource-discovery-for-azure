@@ -1070,9 +1070,12 @@ if ($Resume -or $ResumeFailedOnly)
             # what they were folded into; otherwise they are kept, and the next
             # run folds them in again.
             $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            # Each retry entry whole (its count, reason and name too; the time
+            # is read back as a date), so a save that did not reach the disk is
+            # seen when the file had the same ids.
+            $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
             $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+            $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
             if ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
             {
                 foreach ($StreamFile in $FoldedStreamFiles)
@@ -1949,9 +1952,12 @@ else
             if ($MergedStreamFiles.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
             {
                 $SavedCompleted = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-                $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+                # Each retry entry whole (its count, reason and name too; the time
+                # is read back as a date), so a save that did not reach the disk
+                # is seen when the file had the same ids.
+                $SavedFailed = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant $ResumeKey | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
                 $WantCompleted = @($CompletedIds | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-                $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+                $WantFailed = @($FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]$_.Id, $(if ($_.PSObject.Properties['Attempts']) { [string]$_.Attempts } else { '' }), $(if ($_.PSObject.Properties['Reason']) { [string]$_.Reason } else { '' }), $(if ($_.PSObject.Properties['Name']) { [string]$_.Name } else { '' }) } | Sort-Object -Unique)
                 $StreamStateSaved = ((($SavedCompleted -join ',') -eq ($WantCompleted -join ',')) -and (($SavedFailed -join ',') -eq ($WantFailed -join ',')))
             }
             if (-not $StreamStateSaved)

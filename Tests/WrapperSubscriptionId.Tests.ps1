@@ -1301,3 +1301,36 @@ Describe 'The start-of-run fold when a per-stream file it folded in cannot be re
         Test-Path -LiteralPath $Stream | Should -BeTrue
     }
 }
+
+Describe 'The resume state read back before per-stream files are removed' {
+    It 'compares each retry entry whole, so a newer count in a stream file is kept when the save does not reach the disk' {
+        $RepoRoot = Split-Path $PSScriptRoot -Parent
+        . (Join-Path $RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Found = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$Resume -or $ResumeFailedOnly' -and $_.Extent.Text.Contains('Get-StreamResumeStateFiles') })
+        $Found.Count | Should -Be 1
+        $InventoryRoot = Join-Path $TestDrive 'fold-whole'
+        New-Item -ItemType Directory -Path $InventoryRoot -Force | Out-Null
+        $ResumeKey = 't'
+        $ResumeStateFile = Join-Path $InventoryRoot '.resume-state-t.json'
+        # The unified file already lists Sub X as failed once; the stream file has its newer, second failure.
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-11-01T00:00:00Z'; Reason = 'older'; Attempts = 1 })
+        $Stream = Join-Path $InventoryRoot '.resume-state-t-stream-0.json'
+        @{ Tenant = 't'; StreamId = 0; Completed = @(); FailedAttempts = @(@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-11-09T00:00:00Z'; Reason = 'newer'; Attempts = 2 }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Stream -Encoding utf8
+        $Resume = $true
+        $ResumeFailedOnly = $false
+        $CompletedIds = @()
+        $FailedAttempts = @(Get-FailedAttempts -Path $ResumeStateFile -Tenant 't')
+        $null = $InventoryRoot, $ResumeKey, $ResumeStateFile, $Resume, $ResumeFailedOnly, $CompletedIds, $FailedAttempts
+        # The save does not reach the disk (it only warns).
+        Mock Save-CompletedSubscriptionIds { }
+        Mock Exit-Wrapper { throw ('Exit-Wrapper ' + $Code) }
+        $null = . ([scriptblock]::Create($Found[0].Extent.Text)) 6>$null
+        Test-Path -LiteralPath $Stream | Should -BeTrue -Because 'it holds the only copy of the second failure'
+    }
+
+    It 'the end-of-run merge compares the same whole entries' {
+        $Text = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        ([regex]::Matches($Text, [regex]::Escape("ForEach-Object { '{0}|{1}|{2}|{3}' -f [string]`$_.Id"))).Count | Should -Be 4
+    }
+}
