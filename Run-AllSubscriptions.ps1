@@ -916,7 +916,10 @@ if ($PreflightOnly)
             }
             catch
             {
-                Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $PfStreamFile.FullName, $_.Exception.Message)
+                # As the run does: it stops on such a file.
+                $script:PreflightCheck = 'the resume state'
+                Write-Host ("ERROR: Could not read the per-stream resume state file {0} of an interrupted run: {1}" -f $PfStreamFile.FullName, $_.Exception.Message) -ForegroundColor Red
+                Exit-Wrapper -Code 1
             }
         }
         # As the run does: a subscription a per-stream file lists as failed is
@@ -1032,7 +1035,11 @@ if ($Resume -or $ResumeFailedOnly)
             }
             catch
             {
-                Write-Verbose ("Could not read stranded stream resume file {0}: {1}" -f $StreamFile.FullName, $_.Exception.Message)
+                # Its records, a failure among them, cannot be used: a run that
+                # went on would skip that subscription as completed, or find
+                # nothing to retry, run after run. So the run stops here.
+                Write-Host ("ERROR: Could not read the per-stream resume state file {0} of an interrupted run: {1}. Fix it, or delete it to give up its records (a -Resume then collects every subscription it does not list as completed), then run again. Nothing was collected (exit 1)." -f $StreamFile.FullName, $_.Exception.Message) -ForegroundColor Red
+                Exit-Wrapper -Code 1
             }
         }
         # As the end-of-run merge: a subscription a per-stream file lists as
@@ -1073,7 +1080,7 @@ if ($Resume -or $ResumeFailedOnly)
                         # so its old failure would win over a newer completion and
                         # the same subscription would be collected run after run.
                         Write-Host ("ERROR: Could not remove the per-stream resume state file {0}: {1}. Its records are saved in {2}. Remove the file, then run again. Nothing was collected (exit 1)." -f $StreamFile.FullName, $_.Exception.Message, $ResumeStateFile) -ForegroundColor Red
-                        exit 1
+                        Exit-Wrapper -Code 1
                     }
                 }
             }
@@ -1746,6 +1753,8 @@ else
             # Aggregate per-stream summaries into the wrapper's existing
             # accumulators so the consolidated summary at end-of-run looks the
             # same shape as a sequential run.
+            # The failed subscriptions the summaries list ({ Id; Name; Reason }).
+            $SummaryFailedEntries = @()
             foreach ($S in $StreamSummaries)
             {
                 if (-not (Test-Path -Path $S.SummaryPath -PathType Leaf))
@@ -1794,6 +1803,7 @@ else
                     foreach ($f in $StreamSummary.Failed)
                     {
                         $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $f.Name, $S.StreamId, $f.Reason)
+                        $SummaryFailedEntries += $f
                     }
                 }
 
@@ -1867,12 +1877,15 @@ else
             $AllStreamFiles = @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeKey)
             $AllCompletedFromStreams = @()
             $AllFailedFromStreams = @()
+            # The files read: only these are removed below.
+            $MergedStreamFiles = @()
             foreach ($StreamFile in $AllStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
                 try
                 {
-                    $Obj = Get-Content -Path $PerStreamFile -Raw | ConvertFrom-Json
+                    $Obj = Get-Content -LiteralPath $PerStreamFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                    $MergedStreamFiles += $StreamFile
                     if ($null -ne $Obj.Completed)
                     {
                         $AllCompletedFromStreams += @($Obj.Completed)
@@ -1890,7 +1903,8 @@ else
                 }
                 catch
                 {
-                    Write-Verbose ("Could not read stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message)
+                    # Kept, and named: the next -Resume stops on it with what to do.
+                    Write-Host ("WARNING: Could not read the per-stream resume state file {0}: {1}. It is kept; fix it or delete it before the next -Resume or -ResumeFailedOnly." -f $PerStreamFile, $_.Exception.Message) -ForegroundColor Yellow
                 }
             }
             # A subscription a per-stream file lists as failed is not completed,
@@ -1907,20 +1921,30 @@ else
             # Reconcile failed attempts from all streams against the unified list.
             # See Merge-FailedAttempts for the recency/completion rules.
             $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
-            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0)
+            # A subscription a stream's summary lists as failed that no stream
+            # file records (its file could not be read) is not completed either,
+            # and goes on the retry list, so -ResumeFailedOnly retries it.
+            $SummaryOnlyFailed = @($SummaryFailedEntries | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and $StreamFailedIds -notcontains [string]$_.Id })
+            foreach ($FailedEntry in $SummaryOnlyFailed)
+            {
+                $CompletedIds = @($CompletedIds | Where-Object { [string]$_ -ne [string]$FailedEntry.Id })
+                $EntryName = if ($FailedEntry.PSObject.Properties['Name']) { [string]$FailedEntry.Name } else { '' }
+                $EntryReason = if ($FailedEntry.PSObject.Properties['Reason']) { [string]$FailedEntry.Reason } else { '' }
+                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$FailedEntry.Id) -Name $EntryName -Reason $EntryReason
+            }
+            if ($AllCompletedFromStreams.Count -gt 0 -or $AllFailedFromStreams.Count -gt 0 -or $SummaryOnlyFailed.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeKey -Ids $CompletedIds -FailedAttempts $FailedAttempts
             }
             # Also delete per-stream resume files now that the unified file holds
             # the truth - this prevents drift if a future run uses a different
-            # stream count. Reuses the same on-disk discovery ($AllStreamFiles)
-            # as the merge loop above, so every file that was just merged is also
-            # the one that gets cleaned up here - regardless of this run's
-            # -ParallelStreams value.
-            foreach ($StreamFile in $AllStreamFiles)
+            # stream count. Only the files the merge loop above read are removed
+            # (regardless of this run's -ParallelStreams value); one it could not
+            # read is kept and named, so its records are not lost unseen.
+            foreach ($StreamFile in $MergedStreamFiles)
             {
                 $PerStreamFile = $StreamFile.FullName
-                try { Remove-Item -Path $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
+                try { Remove-Item -LiteralPath $PerStreamFile -Force } catch { Write-Verbose ("Could not remove stream resume file {0}: {1}" -f $PerStreamFile, $_.Exception.Message) }
             }
         }
         finally

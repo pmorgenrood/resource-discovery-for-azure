@@ -941,6 +941,42 @@ Describe 'A resume state that lists a subscription as both completed and failed'
         $R2.ExitCode | Should -Be 0
     }
 
+    It 'stops a -Resume or -ResumeFailedOnly run, and its preflight, on a per-stream file it cannot read, until the file is fixed or deleted' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-1.json' -f $script:Tenant)
+        Set-Content -LiteralPath $Bad -Value '{ not json' -NoNewline
+        foreach ($Mode in @('-Resume', '-ResumeFailedOnly'))
+        {
+            $Run = script:Invoke-Wrapper -Streams 1 -Arguments @($Mode)
+            $Run.ExitCode | Should -Be 1
+            @($Run.Text | Where-Object { $_ -like ('ERROR: Could not read the per-stream resume state file {0} of an interrupted run:*Nothing was collected (exit 1).' -f $Bad) }).Count | Should -Be 1
+            @(script:Get-Calls).Count | Should -Be 0
+        }
+        $Pf = script:Invoke-Wrapper -Streams 1 -Arguments @('-PreflightOnly', '-Resume')
+        $Pf.ExitCode | Should -Be 1
+        @($Pf.Text | Where-Object { $_ -like 'Preflight failed: the resume state*' }).Count | Should -Be 1
+        Get-Content -LiteralPath $Bad -Raw | Should -Be '{ not json' -Because 'its records are left for the user'
+        Remove-Item -LiteralPath $Bad -Force
+        $Ok = script:Invoke-Wrapper -Streams 1 -Arguments @('-Resume')
+        $Ok.ExitCode | Should -Be 0
+        script:Get-Calls | Should -Be (script:Get-Ids 'A', 'B')
+    }
+
+    It 'keeps and names a per-stream file a parallel run cannot read at its end, instead of removing it' {
+        script:New-Case
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
+        $Bad = Join-Path $script:Root ('.resume-state-{0}-stream-5.json' -f $script:Tenant)
+        Set-Content -LiteralPath $Bad -Value '{ not json' -NoNewline
+        $Run = script:Invoke-Wrapper -Streams 2
+        $Run.ExitCode | Should -Be 0
+        Test-Path -LiteralPath $Bad | Should -BeTrue
+        @($Run.Text | Where-Object { $_ -like ('WARNING: Could not read the per-stream resume state file {0}:*It is kept*' -f $Bad) }).Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $script:Root -Force -Filter ('.resume-state-{0}-stream-*.json' -f $script:Tenant) | ForEach-Object { $_.FullName }) | Should -Be @($Bad)
+    }
+
     It 'keeps a subscription a parallel run failed off the completed list, so -Resume -ResumeFailedOnly collects it' {
         script:New-Case
         script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'C'
@@ -1163,5 +1199,33 @@ Describe 'ResourceInventory.ps1 reads free space as the wrapper does' {
         $Said = @(. ([scriptblock]::Create($Space[0].Extent.Text)) 6>&1 | ForEach-Object { [string]$_ })
         @($Said | Where-Object { $_ -like 'Free disk space: * MB at *' -or $_ -like 'WARNING: Free disk space at *' }).Count | Should -Be 1
         @($Said | Where-Object { $_ -like 'WARNING: Could not determine free disk space*' }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The start-of-run fold when a per-stream file it folded in cannot be removed' {
+    It 'stops with Exit-Wrapper -Code 1, which stops the transcript, after saving what the file held' {
+        $RepoRoot = Split-Path $PSScriptRoot -Parent
+        . (Join-Path $RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Found = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$Resume -or $ResumeFailedOnly' -and $_.Extent.Text.Contains('Get-StreamResumeStateFiles') })
+        $Found.Count | Should -Be 1
+        $InventoryRoot = Join-Path $TestDrive 'fold-remove'
+        New-Item -ItemType Directory -Path $InventoryRoot -Force | Out-Null
+        $ResumeKey = 't'
+        $ResumeStateFile = Join-Path $InventoryRoot '.resume-state-t.json'
+        $Stream = Join-Path $InventoryRoot '.resume-state-t-stream-0.json'
+        @{ Tenant = 't'; StreamId = 0; Completed = @(); FailedAttempts = @(@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-11-09T00:00:00Z'; Reason = 'stand-in'; Attempts = 1 }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Stream -Encoding utf8
+        $Resume = $true
+        $ResumeFailedOnly = $false
+        $CompletedIds = @()
+        $FailedAttempts = @()
+        $null = $InventoryRoot, $ResumeKey, $ResumeStateFile, $Resume, $ResumeFailedOnly, $CompletedIds, $FailedAttempts
+        Mock Remove-Item -ParameterFilter { $LiteralPath -like '*-stream-*.json' } -MockWith { throw 'stand-in: read-only' }
+        Mock Exit-Wrapper { throw ('Exit-Wrapper ' + $Code) }
+        $script:FoldOut = @()
+        { . ([scriptblock]::Create($Found[0].Extent.Text)) 6>&1 | ForEach-Object { $script:FoldOut += [string]$_ } } | Should -Throw 'Exit-Wrapper 1'
+        @($script:FoldOut | Where-Object { $_ -like ('ERROR: Could not remove the per-stream resume state file {0}:*Nothing was collected (exit 1).' -f $Stream) }).Count | Should -Be 1
+        @(Get-FailedAttempts -Path $ResumeStateFile -Tenant 't' | ForEach-Object Id) | Should -Be @('sub-x')
+        Test-Path -LiteralPath $Stream | Should -BeTrue
     }
 }
