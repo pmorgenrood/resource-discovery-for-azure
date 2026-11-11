@@ -523,7 +523,7 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 ### Run-AllSubscriptions Wrapper Parameters
 
 These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper forwards `-DeviceLogin`, 
-`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, and `-ConcurrencyLimit` to the inner `ResourceInventory.ps1`, so they behave the same in both contexts.
+`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, `-ConsumptionMaxPages`, `-ConcurrencyLimit`, `-Debug` when given, and the consumption window its up-front check used (`-ConsumptionWindowStart`, `-ConsumptionWindowEnd`, so every subscription collects that window) to the inner `ResourceInventory.ps1`, so they behave the same in both contexts.
 
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|---------|
