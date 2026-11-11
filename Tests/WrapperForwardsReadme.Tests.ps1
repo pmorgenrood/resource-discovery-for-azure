@@ -54,7 +54,8 @@ Describe 'The README names every parameter the wrapper forwards' {
         if ($script:Paragraph -match 'not to parallel streams')
         {
             $script:Stream | Should -Not -Match "InventoryPassthrough(?:\[['""]Debug['""]\]|\.Debug)\s*="
-            $script:Wrapper | Should -Not -Match 'WorkerArgs\.Debug\s*='
+            $script:Wrapper | Should -Not -Match "WorkerArgs(?:\[['""]Debug['""]\]|\.Debug)\s*=|WorkerArgs\s*=\s*@\{[^}]*\bDebug\s*="
+            $script:Wrapper | Should -Not -Match "WorkerArgs\.Add\(\s*['""]Debug['""]"
         }
     }
 }
