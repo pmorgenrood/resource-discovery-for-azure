@@ -1404,7 +1404,9 @@ function Get-FailedSubscriptionCount
             $Id = [int]$Matches[1]
             if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
             {
-                $Left = @(@($SliceList[$Id]) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
+                # Piped, not wrapped in @(): @() of a List[object] (a slice)
+                # throws 'Argument types do not match' (pwsh 7.4).
+                $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
                 $Count += [math]::Max(1, $Left.Count)
                 continue
             }
@@ -1434,7 +1436,9 @@ function Expand-FailedSubscriptionEntries
             $Id = [int]$Matches[1]
             if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
             {
-                $Left = @(@($SliceList[$Id]) | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
+                # Piped, not wrapped in @(): @() of a List[object] (a slice)
+                # throws 'Argument types do not match' (pwsh 7.4).
+                $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
                 if ($Left.Count -gt 0)
                 {
                     foreach ($Sub in $Left) { '{0} ({1}) ({2})' -f [string]$Sub.Name, [string]$Sub.Id, $Entry }

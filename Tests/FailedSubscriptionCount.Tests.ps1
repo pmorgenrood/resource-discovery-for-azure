@@ -37,6 +37,18 @@ Describe 'Get-FailedSubscriptionCount' {
         Get-FailedSubscriptionCount -FailedSubscriptions @('stream-1 (corrupt summary)') -StreamSummaries $script:Streams -Slices $Slices -CompletedIds @('sub-d') | Should -Be 1
     }
 
+    It 'reads slices built as the wrapper builds them (New-Object List, then Add), for the count and for MainSummary.html' {
+        # @() of such a List throws 'Argument types do not match' (pwsh 7.4),
+        # which stopped the end of a run with a stream whose summary was lost.
+        $Slices = @()
+        foreach ($S in 0..1) { $Slices += , (New-Object 'System.Collections.Generic.List[object]') }
+        $Slices[0].Add([pscustomobject]@{ Id = 'sub-a'; Name = 'A' })
+        $Slices[0].Add([pscustomobject]@{ Id = 'sub-c'; Name = 'C' })
+        $Slices[1].Add([pscustomobject]@{ Id = 'sub-b'; Name = 'B' })
+        Get-FailedSubscriptionCount -FailedSubscriptions @('stream-0 (corrupt summary)') -StreamSummaries $script:Streams -Slices $Slices -CompletedIds @('sub-b') | Should -Be 2
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions @('stream-0 (corrupt summary)') -Slices $Slices -CompletedIds @('sub-b')).Count | Should -Be 2
+    }
+
     It 'counts a stream marker as one when its stream is not known (a sequential run has none)' {
         Get-FailedSubscriptionCount -FailedSubscriptions @('stream-7 (no summary)') -StreamSummaries $null | Should -Be 1
         Get-FailedSubscriptionCount -FailedSubscriptions @() -StreamSummaries $script:Streams | Should -Be 0
