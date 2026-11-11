@@ -46,7 +46,7 @@ Describe 'Get-FailedSubscriptionCount' {
         $Slices[0].Add([pscustomobject]@{ Id = 'sub-c'; Name = 'C' })
         $Slices[1].Add([pscustomobject]@{ Id = 'sub-b'; Name = 'B' })
         Get-FailedSubscriptionCount -FailedSubscriptions @('stream-0 (corrupt summary)') -StreamSummaries $script:Streams -Slices $Slices -CompletedIds @('sub-b') | Should -Be 2
-        @(Expand-FailedSubscriptionEntries -FailedSubscriptions @('stream-0 (corrupt summary)') -Slices $Slices -CompletedIds @('sub-b')).Count | Should -Be 2
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions @('stream-0 (corrupt summary)') -Slices $Slices -CompletedIds @('sub-b')) | Should -Be @('A (sub-a) (stream-0 (corrupt summary))', 'C (sub-c) (stream-0 (corrupt summary))')
     }
 
     It 'counts a stream marker as one when its stream is not known (a sequential run has none)' {
