@@ -523,8 +523,8 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 
 ### Run-AllSubscriptions Wrapper Parameters
 
-These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper forwards `-DeviceLogin`, 
-`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, `-UseMetricsBatch` (with `-MetricsBatchPerCallSubscriptionIds`, the subscriptions its pre-flight found without `Microsoft.Insights` registered), `-ConcurrencyLimit`, and `-Debug` when given to the inner `ResourceInventory.ps1`, so they behave the same in both contexts.
+These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper forwards `-DeviceLogin`,
+`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, `-UseMetricsBatch` and `-ConcurrencyLimit` to the inner `ResourceInventory.ps1`, so they behave the same in both contexts. With `-UseMetricsBatch` it also passes `-MetricsBatchPerCallSubscriptionIds`: the subscriptions the wrapper's pre-flight found without `Microsoft.Insights` registered. `-Debug`, when given, is passed on only on the sequential path (one stream), not to parallel streams.
 
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|---------|
