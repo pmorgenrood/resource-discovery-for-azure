@@ -23,6 +23,15 @@ param ($TenantID,
     $ReportName = 'ResourcesReport',
     $OutputDirectory)
 
+# PowerShell 7 on every platform, checked first, before any module or sign-in
+# step can stop the run with other advice.
+if ($PSVersionTable.PSVersion.Major -lt 7)
+{
+    Write-Host "You must use PowerShell 7 to run the inventory script." -ForegroundColor Red
+    Write-Host "https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell" -ForegroundColor Yellow
+    exit 1
+}
+
 $FunctionsFile = Join-Path $PSScriptRoot 'Functions/ResourceInventory.Functions.ps1'
 if (-not (Test-Path -Path $FunctionsFile -PathType Leaf))
 {
@@ -351,17 +360,10 @@ Function RunInventorySetup()
             {
                 Write-Log -Message ('Identified Environment as PowerShell Desktop') -Severity 'Success'
                 $Global:PlatformOS = 'PowerShell Desktop'
-
-                $PsVersion = $PSVersionTable.PSVersion.Major
-                Write-Log -Message ("PowerShell Version {0}" -f $PsVersion) -Severity 'Info'
-
-                if ($PSVersionTable.PSVersion.Major -lt 7)
-                {
-                    Write-Log -Message ("You must use Powershell 7 to run the inventory script.") -Severity 'Error'
-                    Write-Log -Message ("https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows?view=powershell-7.3") -Severity 'Error'
-                    Exit
-                }
             }
+
+            # PowerShell 7 is checked at the top of the script.
+            Write-Log -Message ("PowerShell Version {0}" -f $PSVersionTable.PSVersion.Major) -Severity 'Info'
         }
 
         $ProcDiscriminator = ('{0:x4}' -f ($PID -band 0xffff))
@@ -385,12 +387,21 @@ Function RunInventorySetup()
             }
             catch
             {
-                Write-Log -Message ("Wrong OutputDirectory Path! OutputDirectory Parameter must contain the full path.") -Severity 'Error'
-                Exit
+                Write-Log -Message ("The output directory {0} could not be found or made. Pass -OutputDirectory as the full path of a folder you can write to." -f $OutputDirectory) -Severity 'Error'
+                exit 1
             }
         }
 
         $Global:DefaultPath = if ($OutputDirectory) { $OutputDirectory } else { $DefaultOutputDir }
+
+        # Refused before sign-in, so nobody is asked to sign in or pick a
+        # tenant for a run that cannot go on.
+        if (![string]::IsNullOrEmpty($ResourceGroup) -and [string]::IsNullOrEmpty($SubscriptionID))
+        {
+            Write-Log -Message ("-ResourceGroup was given without -SubscriptionID.") -Severity 'Error'
+            Write-Log -Message ("Pass -SubscriptionID when you use -ResourceGroup.") -Severity 'Error'
+            exit 1
+        }
 
         # Every environment signs in through LoginSession. In Cloud Shell the
         # sign-in Cloud Shell made is a cached sign-in like any other (rule 2),
@@ -433,7 +444,8 @@ Function RunInventorySetup()
         #     the same checks, so it cannot loop either.
         # Whatever the rule, the run goes on only when the context is on the
         # target tenant (Invoke-AzRestMethod and Get-AzSubscription use the
-        # context's tenant) and the tenant lists at least one subscription.
+        # context's tenant) and the tenant lists a subscription to collect:
+        # an Enabled one without -SubscriptionID, else the one it names.
         # With nothing usable and no -TenantID, the sign-in is made without a
         # tenant and the tenant is chosen afterwards. A usable sign-in is never
         # disconnected; a tenant switch applies to this process only, and so
@@ -525,15 +537,34 @@ Function RunInventorySetup()
             }
 
             # The run's subscriptions. A direct run with none stops instead of
-            # writing an empty report.
+            # writing an empty report. Without -SubscriptionID only Enabled
+            # subscriptions are kept, as `az account list` did by default. With
+            # -SubscriptionID every state is kept, so a named Disabled or Warned
+            # subscription is still found; a named one the sign-in does not
+            # list stops the run.
             function Set-RdaRunSubscriptions([string]$Tenant)
             {
                 $script:RdaRunTenant = $Tenant
-                $Global:Subscriptions = @(Get-RdaTenantSubscriptions -Tenant $Tenant)
-                if ($Global:Subscriptions.Count -eq 0)
+                $Listed = @(Get-RdaTenantSubscriptions -Tenant $Tenant)
+                $Access = 'Check that the signed-in identity has at least Reader on a subscription of the tenant, and that -TenantID names the right tenant, then re-run.'
+                $Empty = "Az PowerShell: tenant {0} lists {1} for this sign-in; stopping instead of writing an empty report."
+                if ($Listed.Count -eq 0)
                 {
-                    Stop-SignIn -Message ("Az PowerShell: tenant {0} lists no subscriptions for this sign-in; stopping instead of writing an empty report." -f $Tenant) -Advice 'Check that the signed-in identity has at least Reader on a subscription of the tenant, and that -TenantID names the right tenant, then re-run.'
+                    Stop-SignIn -Message ($Empty -f $Tenant, 'no subscriptions') -Advice $Access
                 }
+                if ([string]::IsNullOrEmpty($SubscriptionID))
+                {
+                    $Listed = @($Listed | Where-Object { [string]$_.state -eq 'Enabled' })
+                    if ($Listed.Count -eq 0)
+                    {
+                        Stop-SignIn -Message ($Empty -f $Tenant, 'no Enabled subscription') -Advice ('Without -SubscriptionID only Enabled subscriptions are collected. To collect a subscription that is not Enabled, pass -SubscriptionID.')
+                    }
+                }
+                elseif (@($Listed | Where-Object { [string]$_.id -eq $SubscriptionID }).Count -eq 0)
+                {
+                    Stop-SignIn -Message ("Az PowerShell: tenant {0} does not list subscription {1} for this sign-in; stopping instead of writing an empty report." -f $Tenant, $SubscriptionID) -Advice 'Check that -SubscriptionID is right, that -TenantID names its tenant, and that the signed-in identity has at least Reader on it, then re-run.'
+                }
+                $Global:Subscriptions = $Listed
             }
 
             if ($Appid)
@@ -794,16 +825,11 @@ Function RunInventorySetup()
     # page edge is lost or listed twice with it.
     function ResourceInventoryLoop()
     {
-        if (![string]::IsNullOrEmpty($ResourceGroup) -and [string]::IsNullOrEmpty($SubscriptionID))
-        {
-            Write-Log -Message ("Resource Group Name present, but missing Subscription ID.") -Severity 'Error'
-            Write-Log -Message ("If using ResourceGroup parameter you must also put SubscriptionId") -Severity 'Error'
-            Exit
-        }
-
         if (![string]::IsNullOrEmpty($ResourceGroup))
         {
-            $ResourceGroup = $ResourceGroup.ToLower()
+            # Invariant rules: on a tr-TR or az-Latn host ToLower() turns 'I'
+            # into a dotless i, and the query then matches no resource group.
+            $ResourceGroup = $ResourceGroup.ToLowerInvariant()
         }
 
         # The same type filter on the count and the page query, so the paging
