@@ -403,7 +403,7 @@ Describe 'A missing report zip while a failed subscription left a zip' -Skip:$Is
 }
 
 Describe 'A report zip lost when the resume state cannot be written either' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
-    It 'says to run again without -Resume, since the state still lists it as completed' {
+    It 'points to FAILED (resume state not saved), since the state still lists it as completed' {
         script:New-Case
         $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
         $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
