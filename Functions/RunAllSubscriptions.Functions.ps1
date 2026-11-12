@@ -1638,10 +1638,6 @@ function Get-RunSummaryLogContent
         # nameable) and the ones named ({ Name; Id }).
         [int]$MissingReportCount = 0,
         $MissingReports = @(),
-        # The resume state could not be updated and still lists some of them
-        # as completed, so a -Resume would skip them: the advice is a run
-        # without -Resume, as on the console.
-        [switch]$MissingStateNotSaved,
         [int]$ConsumptionRecordCount = 0,
         # A save of the resume state failed this run (and no later one reached
         # the disk): the log says a -Resume could skip a failed subscription.
@@ -1799,7 +1795,7 @@ function Get-RunSummaryLogContent
         # As on the console: when the resume state could not be saved, the
         # Resume state line above and FAILED (resume state not saved) say how
         # to run again.
-        $MissingAdvice = if ($MissingStateNotSaved -or $ResumeStateNotSaved) { 'the resume state could not be updated, see the Resume state line' } else { 'a -Resume collects them' }
+        $MissingAdvice = if ($ResumeStateNotSaved) { 'the resume state could not be updated, see the Resume state line' } else { 'a -Resume collects them' }
         $Lines.Add(('  Report missing      : {0} (completed, but their report zip is not in this zip; {1})' -f $MissingTotal, $MissingAdvice))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
@@ -1850,7 +1846,7 @@ function Get-RunSummaryLogContent
         if ($Missing.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add(('Report missing (detail; not in this zip, {0}):' -f $(if ($MissingStateNotSaved -or $ResumeStateNotSaved) { 'see the Resume state line' } else { 'a -Resume collects them' })))
+            $Lines.Add(('Report missing (detail; not in this zip, {0}):' -f $(if ($ResumeStateNotSaved) { 'see the Resume state line' } else { 'a -Resume collects them' })))
             foreach ($MissingSub in $Missing) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
