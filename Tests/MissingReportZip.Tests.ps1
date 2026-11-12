@@ -419,7 +419,7 @@ Describe 'A report zip lost when the resume state cannot be written either' -Ski
     }
 }
 
-Describe 'A subscription that wrote no zip while the resume state cannot be updated' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
+Describe 'A subscription that wrote no zip, then the next one''s write-ahead count cannot be saved' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
     It 'no longer lists it as completed (the write-ahead save took that out), and the run stops at the next sub, whose count cannot be saved first (exit 2)' {
         script:New-Case
         $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
@@ -437,6 +437,12 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
             @($R2.Text | Where-Object { $_ -like 'Processing subscription: Sub B*' }) | Should -BeNullOrEmpty -Because 'Sub B is not collected'
             $State = Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)) -Raw | ConvertFrom-Json
             @($State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id -Because 'its write-ahead save reached the disk before the lock'
+            $AEntry = @($State.FailedAttempts | Where-Object { [string]$_.Id -eq $A.Id })
+            $AEntry.Count | Should -Be 1 -Because 'its write-ahead count stays on the retry list'
+            [int]$AEntry[0].Attempts | Should -Be 1
+            # The file holds every count saved ahead, so it is kept for the next
+            # run, not put aside: what it lacks is only a reason or a result.
+            @($R2.Text | Where-Object { $_ -like '=*= FAILED (resume state not saved) =*=' }) | Should -BeNullOrEmpty
         }
         finally { & chmod 755 $script:Root }
     }
@@ -464,11 +470,8 @@ Describe 'The last subscription writes no zip and the resume state cannot be upd
 
 Describe 'RunSummary.log advice for a missing report' {
     BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
-    It 'points to the Resume state line when the resume state still lists one as completed, as the console does' {
+    It 'says a -Resume collects them when the resume state was saved' {
         $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
-        $Kept = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -MissingStateNotSaved)
-        @($Kept | Where-Object { $_ -like '  Report missing      : 1 (*see the Resume state line)' }).Count | Should -Be 1
-        @($Kept | Where-Object { $_ -like '*a -Resume collects them*' }) | Should -BeNullOrEmpty
         $Saved = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing)
         @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
     }
@@ -481,12 +484,23 @@ Describe 'RunSummary.log advice for a missing report' {
         @($Lines | Where-Object { $_ -like '*still lists some*' -or $_ -like '*may still list*' }) | Should -BeNullOrEmpty
     }
 
-    It 'the wrapper passes the read-back flag and the NOT SAVED switch apart, and the console uses both' {
+    It 'a read-back that still lists a missing one counts as a failed save, so a later save that reaches the disk clears it and no advice points to a banner that is not printed' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
-        # A failed save (the read-back may also find a missing one still listed)
-        # points to FAILED (resume state not saved), which says how to run again.
+        $Src | Should -Not -Match 'MissingStateNotSaved'
+        $Src | Should -Match ([regex]::Escape('if (@($MissingReports | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0) { $script:ResumeStateSaveFailed = $true }'))
+        # The log, the console advice and the banner all key on the same flag.
         $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and -not $RunClean) `'))
-        $Src | Should -Match ([regex]::Escape('if ($ResumeStateSaveFailed -or $MissingStateNotSaved)'))
+        $Src | Should -Match ([regex]::Escape('    if ($ResumeStateSaveFailed -and -not $RunClean)'))
+        $Src | Should -Match ([regex]::Escape('if ($ResumeStateSaveFailed -and -not $RunClean) { $null = Set-NotSavedResumeStateAside'))
+    }
+
+    It 'the bundle build checks for zips gone since the output check with the same path comparison as the recovery' {
+        $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Src | Should -Match ([regex]::Escape('$GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and $GoneNowPaths.ContainsKey([System.IO.Path]::GetFullPath($_.FullName)) })'))
+    }
+
+    It 'names a write-back of the resume state after a late bundle failure that does not reach the disk' {
+        $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Src | Should -Match ([regex]::Escape('could not be written again, so the next run, with or without -Resume, collects every subscription again.'))
     }
 }

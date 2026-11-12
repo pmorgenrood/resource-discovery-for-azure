@@ -2469,9 +2469,6 @@ $ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
 # and the run exits 2, so the next -Resume collects them and carries the others.
 $MissingReports = @()
 $MissingReportCount = 0
-# Set when the resume state on disk still lists a missing subscription as
-# completed (the save did not reach the disk): a -Resume would skip it.
-$MissingStateNotSaved = $false
 # Each report zip is read once in this run (see Test-ReportZipReadable).
 # Keyed by path, compared as the file system does (New-PathTable).
 $ReportZipChecks = New-PathTable
@@ -2559,10 +2556,13 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         # can stop the save above, and a -Resume would then skip it and carry
         # an earlier report of it. (A sub that wrote no zip was taken off the
         # completed list by its write-ahead save, which was read back.)
+        # A file that still lists one as completed counts as a save that
+        # failed (FAILED (resume state not saved), exit 2), until a later save
+        # of the whole state reaches the disk.
         if ($MissingReports.Count -gt 0 -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
         {
             $SavedCompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ } | ForEach-Object { [string]$_ })
-            $MissingStateNotSaved = @($MissingReports | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0
+            if (@($MissingReports | Where-Object { $SavedCompletedIds -contains [string]$_.Id }).Count -gt 0) { $script:ResumeStateSaveFailed = $true }
         }
         $MissingReportCount = [math]::Max($MissingCount, $MissingReports.Count)
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
@@ -2667,7 +2667,7 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             # A report zip the output check found that is gone now (an antivirus
             # quarantine, storage evicted in between) would be left out without
             # a word: the zip is not built, and the run ends with exit 2.
-            $GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and @($SubZips | ForEach-Object { $_.FullName }) -notcontains $_.FullName })
+            $GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and $GoneNowPaths.ContainsKey([System.IO.Path]::GetFullPath($_.FullName)) })
             if ($GoneSinceCheck.Count -gt 0) { throw ('{0} report zip(s) found by the output check are gone now: {1}. Each one the resume state records is taken off the completed list, so a -Resume collects it again' -f $GoneSinceCheck.Count, (@($GoneSinceCheck | ForEach-Object { $_.FullName }) -join ', ')) }
             # Built, checked, given the run summary and checked again under a
             # name of its own in the same folder; it takes the name a run
@@ -2827,9 +2827,8 @@ $RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $Retry
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
 # A consolidated zip that could not be built keeps the state too: the next
-# -Resume then skips the completed
-# subscriptions and carries their reports into a new zip instead of
-# collecting them all again (exit 2 says why).
+# -Resume then skips the completed subscriptions and carries their reports
+# into a new zip instead of collecting them all again (exit 2 says why).
 $RunClean = ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError)
 if ($RunClean -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
 {
@@ -3191,7 +3190,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -RetryLimited $RetryLimited `
             -NotInRun $RetryOwedNotInRun `
             -ResumeStateNotSaved:($ResumeStateSaveFailed -and -not $RunClean) `
-            -MissingReportCount $MissingReportCount -MissingReports $MissingReports -MissingStateNotSaved:$MissingStateNotSaved `
+            -MissingReportCount $MissingReportCount -MissingReports $MissingReports `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
@@ -3343,6 +3342,7 @@ if ($null -ne $BundleBuildError)
         }
         Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $WriteBackIds -FailedAttempts $FailedAttempts -Reports $WriteBackReports
         if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) { Write-Host 'The resume state is kept (written again): run again with -Resume to carry the completed reports into a new consolidated zip.' -ForegroundColor Yellow }
+        else { Write-Host ("WARNING: The resume state file {0} could not be written again, so the next run, with or without -Resume, collects every subscription again." -f $ResumeStateFile) -ForegroundColor Yellow }
     }
     # Read now: the folder can go while the zip is built, summarised or checked.
     if (Test-Path -LiteralPath $InventoryRoot -PathType Container)
@@ -3454,7 +3454,7 @@ if ($MissingReportCount -gt 0)
     # may have found a missing one still listed as completed) is handled by
     # FAILED (resume state not saved) below, which puts that state aside; the
     # advice is given there.
-    if ($ResumeStateSaveFailed -or $MissingStateNotSaved)
+    if ($ResumeStateSaveFailed -and -not $RunClean)
     {
         Write-Host ("The resume state file {0} could not be updated with this run's results: see FAILED (resume state not saved) below for how to run again." -f $ResumeStateFile) -ForegroundColor Red
     }
