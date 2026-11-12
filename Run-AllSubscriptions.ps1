@@ -2555,10 +2555,10 @@ if ($ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Conta
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         }
-        # Read back for every missing one, those that wrote no zip too: the same
-        # disk problem that lost a zip can stop the save above, or the one the
-        # run made when it took a no-zip subscription off the completed list.
-        # A -Resume would then skip it and carry an earlier report of it.
+        # Read back for every missing one: the same disk problem that lost a zip
+        # can stop the save above, and a -Resume would then skip it and carry
+        # an earlier report of it. (A sub that wrote no zip was taken off the
+        # completed list by its write-ahead save, which was read back.)
         if ($MissingReports.Count -gt 0 -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
         {
             $SavedCompletedIds = @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID | Where-Object { $_ } | ForEach-Object { [string]$_ })
@@ -2610,6 +2610,27 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
     # cannot be read is named as missing above.
     $SubZips = @($SubZips | Where-Object { Test-ReportZipReadable -Path $_.FullName -Cache $ReportZipChecks })
     $SubZips = @(Join-CarriedReportZips -Zips $SubZips -CarriedReports $CarriedReports)
+    # A report zip the output check found that is gone now (an antivirus
+    # quarantine, storage evicted in between): its subscription is not done
+    # (fail-safe rule), so it leaves the completed list and counts one more
+    # failed run, as for a zip gone before the check, and a later -Resume
+    # collects it again instead of failing to carry its report.
+    $SubZipPaths = @($SubZips | ForEach-Object { [System.IO.Path]::GetFullPath($_.FullName) })
+    $GoneNowPaths = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and $SubZipPaths -notcontains [System.IO.Path]::GetFullPath($_.FullName) } | ForEach-Object { [System.IO.Path]::GetFullPath($_.FullName) })
+    if ($GoneNowPaths.Count -gt 0)
+    {
+        $LatestNow = Get-LatestCompletedReports -Reports $CompletedReports
+        $GoneNow = @(foreach ($Id in @($LatestNow.Keys)) { $Rec = $LatestNow[$Id]; if ($Rec.PSObject.Properties['Zip'] -and $GoneNowPaths -contains [System.IO.Path]::GetFullPath((Join-Path $InventoryRoot ([string]$Rec.Zip)))) { [pscustomobject]@{ Id = [string]$Id; Name = [string]$Rec.Name } } })
+        foreach ($Gone in $GoneNow)
+        {
+            $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Gone.Id })
+            $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Gone.Id })
+            $Before = @($FailedAttemptsBeforeCollect | Where-Object { [string]$_.Id -eq $Gone.Id }) | Select-Object -First 1
+            if ($null -ne $Before -and -not @($FailedAttempts | Where-Object { $null -ne $_ -and [string]$_.Id -eq $Gone.Id })) { $FailedAttempts = @(@($FailedAttempts | Where-Object { $null -ne $_ }) + @($Before)) }
+            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Gone.Id -Name $Gone.Name -Reason 'its report zip was gone before the consolidated zip was built'
+        }
+        if ($GoneNow.Count -gt 0) { Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
+    }
     if ($SubZips.Count -gt 0)
     {
         # A run stopped (Ctrl+C, a killed process) while or after its
@@ -2637,7 +2658,7 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
             # quarantine, storage evicted in between) would be left out without
             # a word: the zip is not built, and the run ends with exit 2.
             $GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and @($SubZips | ForEach-Object { $_.FullName }) -notcontains $_.FullName })
-            if ($GoneSinceCheck.Count -gt 0) { throw ('{0} report zip(s) found by the output check are gone now: {1}. Run again without -Resume or -ResumeFailedOnly to collect them again (either one skips the subscriptions this run completed)' -f $GoneSinceCheck.Count, (@($GoneSinceCheck | ForEach-Object { $_.FullName }) -join ', ')) }
+            if ($GoneSinceCheck.Count -gt 0) { throw ('{0} report zip(s) found by the output check are gone now: {1}. They are no longer listed as completed, so a -Resume collects them again' -f $GoneSinceCheck.Count, (@($GoneSinceCheck | ForEach-Object { $_.FullName }) -join ', ')) }
             # Built, checked, given the run summary and checked again under a
             # name of its own in the same folder; it takes the name a run
             # ships only after the last check, so a run stopped part-way
@@ -2688,7 +2709,7 @@ if (Test-Path -Path $InventoryRoot -PathType Container)
     {
         Write-Host ("No per-subscription zip files found under {0} to consolidate." -f $InventoryRoot) -ForegroundColor Yellow
         # Every report zip the output check found is gone now: no consolidated zip.
-        if (@($ActualSubZips).Count -gt 0) { $BundleBuildError = 'The {0} report zip(s) found by the output check are all gone now, so no consolidated zip was built. Run again without -Resume or -ResumeFailedOnly to collect them again (either one skips the subscriptions this run completed).' -f @($ActualSubZips).Count }
+        if (@($ActualSubZips).Count -gt 0) { $BundleBuildError = 'The {0} report zip(s) found by the output check are all gone now, so no consolidated zip was built. They are no longer listed as completed, so a -Resume collects them again.' -f @($ActualSubZips).Count }
     }
 }
 else
@@ -2795,8 +2816,8 @@ $RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $Retry
 # or when they are no longer visible. ResourceInventory.ps1 run on its own does
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
-# A consolidated zip that could not be built keeps the state too (as in
-# all-fixes-optimized): the next -Resume then skips the completed
+# A consolidated zip that could not be built keeps the state too: the next
+# -Resume then skips the completed
 # subscriptions and carries their reports into a new zip instead of
 # collecting them all again (exit 2 says why).
 $RunClean = ($FailedSubscriptions.Count -eq 0 -and $RetryOwedCount -eq 0 -and $NotCollected.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and $LeftStreamFiles.Count -eq 0 -and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError)
@@ -3420,7 +3441,9 @@ if ($MissingReportCount -gt 0)
         Write-Host ("  ({0} more could not be named; see 'Per-subscription output verification failed' above.)" -f ($MissingReportCount - @($MissingReports).Count)) -ForegroundColor Red
     }
     # A failed save of the resume state (named below) leaves the same risk.
-    if ($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)))
+    # The read-back above decides: a failed save alone is named under FAILED
+    # (resume state not saved), which puts that state aside.
+    if ($MissingStateNotSaved)
     {
         # The read-back found them listed; after a failed save alone they may be.
         $Lists = if ($MissingStateNotSaved) { 'still lists some of them as completed, so a -Resume would skip them' } else { 'may still list some of them as completed, so a -Resume could skip them' }

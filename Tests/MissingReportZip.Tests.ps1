@@ -443,7 +443,7 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
 }
 
 Describe 'The last subscription writes no zip and the resume state cannot be updated after its write-ahead count' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
-    It 'names it under FAILED (report missing) and says to run again without -Resume' {
+    It 'names it under FAILED (report missing), says -Resume collects it, and names the unsaved state under FAILED (resume state not saved)' {
         script:New-Case
         $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
         script:Set-Scenario -NoZip @($C.Id) -LockBy $C.Id
@@ -452,7 +452,11 @@ Describe 'The last subscription writes no zip and the resume state cannot be upd
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 2
             @($R.Text | Where-Object { $_ -like ('  - {0} ({1})*' -f $C.Name, $C.Id) }).Count | Should -BeGreaterThan 0
-            @($R.Text | Where-Object { $_ -like 'The resume state file * could not be updated and *run again without -Resume*' }).Count | Should -Be 1
+            # Its write-ahead save took its completion out (read back), so a
+            # -Resume collects it; the save that failed after it is named under
+            # FAILED (resume state not saved).
+            @($R.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }).Count | Should -Be 1
+            @($R.Text | Where-Object { $_ -like '*FAILED (resume state not saved)*' }).Count | Should -Be 1
         }
         finally { & chmod 755 $script:Root }
     }
@@ -469,18 +473,21 @@ Describe 'RunSummary.log advice for a missing report' {
         @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
     }
 
-    It 'says the state may still list them after a failed save alone, as the console does' {
+    It 'after a failed save alone, says a -Resume collects them and names the state on its own line, as the console does' {
         $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
         $Lines = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -ResumeStateNotSaved)
-        @($Lines | Where-Object { $_ -like '  Report missing      : 1 (*the resume state may still list some as completed, so run again without -Resume)' }).Count | Should -Be 1
-        @($Lines | Where-Object { $_ -like '*a -Resume collects them*' -or $_ -like '*still lists some*' }) | Should -BeNullOrEmpty
+        @($Lines | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like '  Resume state        : NOT SAVED (*put aside as not saved*' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like '*still lists some*' -or $_ -like '*may still list*' }) | Should -BeNullOrEmpty
     }
 
     It 'the wrapper passes the read-back flag and the NOT SAVED switch apart, and the console uses both' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
         $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
-        $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `'))
-        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved -or ($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)))'))
+        # The read-back decides the 'without -Resume' advice; a failed save alone
+        # is named under FAILED (resume state not saved), which puts that state aside.
+        $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and -not $RunClean) `'))
+        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved)'))
         $Src | Should -Match ([regex]::Escape("'may still list some of them as completed, so a -Resume could skip them'"))
     }
 }
