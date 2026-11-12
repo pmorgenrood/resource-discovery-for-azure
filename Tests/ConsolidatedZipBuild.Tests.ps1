@@ -190,18 +190,31 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         $ActualSubZips = @(Get-ChildItem -LiteralPath $Root -Recurse -Filter '*.zip' -File)
         $ActualSubZips.Count | Should -Be 2
         $null = $ActualSubZips, $Kept
+        # The resume state this run saved: both completed with their zips.
+        $ResumeStateFile = Join-Path $Root '.resume-state-t.json'
+        $TenantID = 't'
+        $CompletedReports = @(
+            (New-CompletedReportRecord -InventoryRoot $Root -Id 'sub-g1' -Name 'Sub G1' -ZipPath $Kept -Obfuscated $false),
+            (New-CompletedReportRecord -InventoryRoot $Root -Id 'sub-g2' -Name 'Sub G2' -ZipPath $Gone -Obfuscated $false))
+        $CompletedIds = @('sub-g1', 'sub-g2')
+        $FailedAttempts = @()
+        $FailedAttemptsBeforeCollect = @()
+        $null = $ResumeStateFile, $TenantID, $CompletedReports, $CompletedIds, $FailedAttempts, $FailedAttemptsBeforeCollect
         Remove-Item -LiteralPath $Gone -Force
         $R = Invoke-BundleBlock -Root $Root
         $R.BundleBuildError | Should -BeLike ('*1 report zip(s) found by the output check are gone now: {0}*' -f $Gone)
-        # A -Resume run skips the subscriptions this run completed, so it would not collect them.
-        $R.BundleBuildError | Should -BeLike '*Run again without -Resume or -ResumeFailedOnly*'
+        # Its subscription is not done: off the completed list, one more failed
+        # run, so a -Resume collects it again (fail-safe rule).
+        $R.BundleBuildError | Should -BeLike '*no longer listed as completed, so a -Resume collects them again*'
+        @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant 't') | Should -Be @('sub-g1')
+        @(Get-FailedAttempts -Path $ResumeStateFile -Tenant 't' | ForEach-Object Id) | Should -Be @('sub-g2')
         $R.OuterZipFile | Should -BeNullOrEmpty
         @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -like 'AllSubscriptions_*' -or $_.Name -like 'rda-build-*' }) | Should -BeNullOrEmpty
         # Every zip gone: no consolidated zip, and the run says so with exit 2 too.
         Remove-Item -LiteralPath $Kept -Force
         $R2 = Invoke-BundleBlock -Root $Root
         $R2.BundleBuildError | Should -BeLike '*report zip(s) found by the output check are all gone now*'
-        $R2.BundleBuildError | Should -BeLike '*Run again without -Resume or -ResumeFailedOnly*'
+        $R2.BundleBuildError | Should -BeLike '*no longer listed as completed, so a -Resume collects them again*'
     }
 
     It 'the list of zips the output check found is set before that check, so the build can read it when the check does not run' {
