@@ -1466,8 +1466,19 @@ function Test-ConsumptionAccess
     }
 }
 
+# Whether the end-of-run failure list already names one subscription of
+# stream -StreamId on its own, as '<name> (<id>) (stream-N: <reason>)' (the
+# parallel merge names each sub it does not count done that way).
+function Test-OwnFailedEntry
+{
+    param($FailedSubscriptions = @(), [string]$Name, [string]$Id, [int]$StreamId)
+    $Prefix = '{0} ({1}) (stream-{2}: ' -f $Name, $Id, $StreamId
+    return [bool](@(@($FailedSubscriptions) | Where-Object { $_ -is [string] -and $_.StartsWith($Prefix, [System.StringComparison]::Ordinal) }).Count)
+}
+
 # How many subscriptions the end-of-run failure list stands for. A
-# 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry stands for the
+# 'stream-N (no summary)', 'stream-N (corrupt summary)' or 'stream-N (summary
+# not this run's)' entry stands for the
 # subscriptions of that stream's slice (-Slices, by stream number) that are not
 # completed (-CompletedIds: its own state file can record some it finished
 # before it stopped), at least one; without the slice, for SubCount in
@@ -1480,7 +1491,7 @@ function Get-FailedSubscriptionCount
     $Count = 0
     foreach ($Entry in @(@($FailedSubscriptions) | Where-Object { $null -ne $_ }))
     {
-        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no|corrupt) summary\)$')
+        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no summary|corrupt summary|summary not this run''s)\)$')
         {
             $Id = [int]$Matches[1]
             if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
@@ -1489,7 +1500,11 @@ function Get-FailedSubscriptionCount
                 # (as the wrapper makes its slices) throws 'Argument types do
                 # not match' (pwsh 7.4).
                 $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
-                $Count += [math]::Max(1, $Left.Count)
+                # A sub the run already names on its own ('<name> (stream-N: ...)')
+                # is counted by that entry, not again here.
+                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Name ([string]$_.Name) -Id ([string]$_.Id) -StreamId $Id })
+                $Left = @($Left | Where-Object { $Own -notcontains $_ })
+                if ($Own.Count -gt 0) { $Count += $Left.Count } else { $Count += [math]::Max(1, $Left.Count) }
                 continue
             }
             $Stream = @(@($StreamSummaries) | Where-Object { $null -ne $_ -and [string]$_.StreamId -eq [string]$Id }) | Select-Object -First 1
@@ -1513,7 +1528,7 @@ function Expand-FailedSubscriptionEntries
     $SliceList = @($Slices)
     foreach ($Entry in @(@($FailedSubscriptions) | Where-Object { $null -ne $_ }))
     {
-        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no|corrupt) summary\)$')
+        if ($Entry -is [string] -and $Entry -match '^stream-(\d+) \((?:no summary|corrupt summary|summary not this run''s)\)$')
         {
             $Id = [int]$Matches[1]
             if ($Id -lt $SliceList.Count -and $null -ne $SliceList[$Id])
@@ -1522,11 +1537,15 @@ function Expand-FailedSubscriptionEntries
                 # (as the wrapper makes its slices) throws 'Argument types do
                 # not match' (pwsh 7.4).
                 $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
+                # A sub the run already names on its own keeps that entry only.
+                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Name ([string]$_.Name) -Id ([string]$_.Id) -StreamId $Id })
+                $Left = @($Left | Where-Object { $Own -notcontains $_ })
                 if ($Left.Count -gt 0)
                 {
                     foreach ($Sub in $Left) { '{0} ({1}) ({2})' -f [string]$Sub.Name, [string]$Sub.Id, $Entry }
                     continue
                 }
+                if ($Own.Count -gt 0) { continue }
             }
         }
         $Entry
