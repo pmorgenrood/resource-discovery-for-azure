@@ -61,6 +61,9 @@ Describe 'Get-FailedSubscriptionCount' {
         $Half = @('stream-0 (no summary)', $Own[1])
         Get-FailedSubscriptionCount -FailedSubscriptions $Half -Slices $Slices | Should -Be 2
         @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Half -Slices $Slices) | Should -Be @('Sub B (sub-b) (stream-0 (no summary))', $Own[1])
+        # A sub named by its id alone (no display name known) is matched by its id.
+        $ById = @('stream-0 (no summary)', 'sub-a (sub-a) (stream-0: its stream ended without a usable summary, so it is collected again)', $Own[2])
+        Get-FailedSubscriptionCount -FailedSubscriptions $ById -Slices $Slices | Should -Be 2
         $Other = @("stream-0 (summary not this run's)")
         Get-FailedSubscriptionCount -FailedSubscriptions $Other -Slices $Slices | Should -Be 2
         @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Other -Slices $Slices).Count | Should -Be 2
