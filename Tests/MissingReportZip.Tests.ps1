@@ -281,7 +281,8 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
 Describe 'The resume state after a consolidated zip that could not be built' {
     It 'is kept, so the next -Resume carries the completed reports into a new zip' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Src | Should -Match ([regex]::Escape('-and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))'))
+        $Src | Should -Match ([regex]::Escape('-and -not ($MissingReportCount -gt 0) -and $null -eq $BundleBuildError)'))
+        $Src | Should -Match ([regex]::Escape('if ($RunClean -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))'))
     }
 
     It 'is written again when the zip fails after the clean-run clear (when it takes its name or gets the run summary)' {
@@ -419,7 +420,7 @@ Describe 'A report zip lost when the resume state cannot be written either' -Ski
 }
 
 Describe 'A subscription that wrote no zip while the resume state cannot be updated' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
-    It 'says to run again without -Resume, since the state still lists it as completed' {
+    It 'no longer lists it as completed (the write-ahead save took that out), and the run stops at the next sub, whose count cannot be saved first (exit 2)' {
         script:New-Case
         $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
         $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
@@ -432,8 +433,10 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
         {
             $R2 = script:Invoke-Wrapper -Streams 1
             $R2.ExitCode | Should -Be 2
-            @($R2.Text | Where-Object { $_ -like 'The resume state file * could not be updated and still lists some of them as completed*run again without -Resume*' }).Count | Should -Be 1
-            @($R2.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
+            @($R2.Text | Where-Object { $_ -like 'ERROR: The resume state file * could not be saved with one more failed run of Sub B before collecting it, so it is not collected and the run stops here (exit 2).*' }).Count | Should -Be 1
+            @($R2.Text | Where-Object { $_ -like 'Processing subscription: Sub B*' }) | Should -BeNullOrEmpty -Because 'Sub B is not collected'
+            $State = Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)) -Raw | ConvertFrom-Json
+            @($State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id -Because 'its write-ahead save reached the disk before the lock'
         }
         finally { & chmod 755 $script:Root }
     }
