@@ -195,8 +195,10 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         $TenantID = 't'
         $CompletedReports = @(
             (New-CompletedReportRecord -InventoryRoot $Root -Id 'sub-g1' -Name 'Sub G1' -ZipPath $Kept -Obfuscated $false),
-            (New-CompletedReportRecord -InventoryRoot $Root -Id 'sub-g2' -Name 'Sub G2' -ZipPath $Gone -Obfuscated $false))
-        $CompletedIds = @('sub-g1', 'sub-g2')
+            (New-CompletedReportRecord -InventoryRoot $Root -Id 'sub-g2' -Name 'Sub G2' -ZipPath $Gone -Obfuscated $false),
+            # A record whose path cannot be read as a path does not stop it.
+            [pscustomobject]@{ Id = 'sub-bad'; Name = 'Sub Bad'; Zip = ("bad" + [char]0 + ".zip"); Obfuscated = $false })
+        $CompletedIds = @('sub-g1', 'sub-g2', 'sub-bad')
         $FailedAttempts = @()
         $FailedAttemptsBeforeCollect = @()
         $null = $ResumeStateFile, $TenantID, $CompletedReports, $CompletedIds, $FailedAttempts, $FailedAttemptsBeforeCollect
@@ -205,8 +207,8 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         $R.BundleBuildError | Should -BeLike ('*1 report zip(s) found by the output check are gone now: {0}*' -f $Gone)
         # Its subscription is not done: off the completed list, one more failed
         # run, so a -Resume collects it again (fail-safe rule).
-        $R.BundleBuildError | Should -BeLike '*no longer listed as completed, so a -Resume collects them again*'
-        @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant 't') | Should -Be @('sub-g1')
+        $R.BundleBuildError | Should -BeLike '*taken off the completed list, so a -Resume collects it again*'
+        @(Get-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant 't' | Sort-Object) | Should -Be @('sub-bad', 'sub-g1')
         @(Get-FailedAttempts -Path $ResumeStateFile -Tenant 't' | ForEach-Object Id) | Should -Be @('sub-g2')
         $R.OuterZipFile | Should -BeNullOrEmpty
         @(Get-ChildItem -LiteralPath $Root -File -Force | Where-Object { $_.Name -like 'AllSubscriptions_*' -or $_.Name -like 'rda-build-*' }) | Should -BeNullOrEmpty
@@ -214,7 +216,7 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         Remove-Item -LiteralPath $Kept -Force
         $R2 = Invoke-BundleBlock -Root $Root
         $R2.BundleBuildError | Should -BeLike '*report zip(s) found by the output check are all gone now*'
-        $R2.BundleBuildError | Should -BeLike '*no longer listed as completed, so a -Resume collects them again*'
+        $R2.BundleBuildError | Should -BeLike '*taken off the completed list, so a -Resume collects it again*'
     }
 
     It 'the list of zips the output check found is set before that check, so the build can read it when the check does not run' {
