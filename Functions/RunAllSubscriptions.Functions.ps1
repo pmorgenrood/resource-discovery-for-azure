@@ -1500,9 +1500,10 @@ function Test-ConsumptionAccess
 # parallel merge names each sub it does not count done that way).
 function Test-OwnFailedEntry
 {
-    param($FailedSubscriptions = @(), [string]$Name, [string]$Id, [int]$StreamId)
-    $Prefix = '{0} ({1}) (stream-{2}: ' -f $Name, $Id, $StreamId
-    return [bool](@(@($FailedSubscriptions) | Where-Object { $_ -is [string] -and $_.StartsWith($Prefix, [System.StringComparison]::Ordinal) }).Count)
+    param($FailedSubscriptions = @(), [string]$Id, [int]$StreamId)
+    # By id alone, so a sub named by its id (no display name known) matches too.
+    $Tag = ' ({0}) (stream-{1}: ' -f $Id, $StreamId
+    return [bool](@(@($FailedSubscriptions) | Where-Object { $_ -is [string] -and $_.Contains($Tag) }).Count)
 }
 
 # How many subscriptions the end-of-run failure list stands for. A
@@ -1529,9 +1530,9 @@ function Get-FailedSubscriptionCount
                 # (as the wrapper makes its slices) throws 'Argument types do
                 # not match' (pwsh 7.4).
                 $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
-                # A sub the run already names on its own ('<name> (stream-N: ...)')
+                # A sub the run already names on its own ('<name> (<id>) (stream-N: ...)')
                 # is counted by that entry, not again here.
-                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Name ([string]$_.Name) -Id ([string]$_.Id) -StreamId $Id })
+                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Id ([string]$_.Id) -StreamId $Id })
                 $Left = @($Left | Where-Object { $Own -notcontains $_ })
                 if ($Own.Count -gt 0) { $Count += $Left.Count } else { $Count += [math]::Max(1, $Left.Count) }
                 continue
@@ -1546,10 +1547,13 @@ function Get-FailedSubscriptionCount
 
 # The end-of-run failure list for MainSummary.html, one entry per subscription,
 # so its Failed count is the one Get-FailedSubscriptionCount gives: a
-# 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry becomes one
-# '<name> (<id>) (stream-N (no summary))' entry for each subscription of that
-# slice that is not completed (-CompletedIds), or stays as it is when the slice
-# is not known or all of it completed. Every other entry stays as it is.
+# 'stream-N (no summary)', 'stream-N (corrupt summary)' or 'stream-N (summary
+# not this run's)' entry becomes one '<name> (<id>) (stream-N (no summary))'
+# entry for each subscription of that slice that is not completed
+# (-CompletedIds) and that the list does not already name on its own
+# (Test-OwnFailedEntry); it is dropped when the list names all of them, and
+# stays as it is when the slice is not known or all of it completed. Every
+# other entry stays as it is.
 function Expand-FailedSubscriptionEntries
 {
     param($FailedSubscriptions = @(), $Slices = @(), $CompletedIds = @())
@@ -1567,7 +1571,7 @@ function Expand-FailedSubscriptionEntries
                 # not match' (pwsh 7.4).
                 $Left = @($SliceList[$Id] | Where-Object { $null -ne $_ -and $Done -notcontains [string]$_.Id })
                 # A sub the run already names on its own keeps that entry only.
-                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Name ([string]$_.Name) -Id ([string]$_.Id) -StreamId $Id })
+                $Own = @($Left | Where-Object { Test-OwnFailedEntry -FailedSubscriptions $FailedSubscriptions -Id ([string]$_.Id) -StreamId $Id })
                 $Left = @($Left | Where-Object { $Own -notcontains $_ })
                 if ($Left.Count -gt 0)
                 {
