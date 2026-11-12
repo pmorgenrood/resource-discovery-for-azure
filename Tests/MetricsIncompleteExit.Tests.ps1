@@ -628,8 +628,10 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         Set-Content -LiteralPath $script:MetricsEnd -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
                 # The run sets these before the statements lifted here; set them as it
-                # does, so a value the session holds is not read.
+                # does (its error preference as without -Debug), so a value the
+                # session holds is not read.
                 '$InventoryNotWritten = $false; $InventoryCheckedWritten = $false'
+                '$ErrorActionPreference = ''SilentlyContinue'''
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
                 'function Out-File { [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject) begin { $Items = [System.Collections.Generic.List[object]]::new() } process { $Items.Add($InputObject) } end { if ($env:RDA_TEST_METRICS_WRITE_FAIL -and (Split-Path -Path $FilePath -Leaf) -like ''Metrics_*'') { Write-Error ''There is not enough space on the disk.'' } else { $Items | Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -Encoding utf8 -Append:$Append } } }'
@@ -697,6 +699,18 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
             if ($script:SessionValues[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:SessionValues[$Name].Value }
             else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
         }
+    }
+
+    It 'makes no zip and exits 2 when the Metrics file could not be written, also when the session stops on every error' {
+        # The run sets its own error preference before these statements, so a
+        # session that stops on every error (an earlier test can leave that)
+        # changes nothing.
+        $ErrorActionPreference = 'Stop'
+        $Result = Invoke-MetricsEnd -Arguments @{ TenantID = 'tenant-1' } -WriteFails
+
+        $Result.ExitCode | Should -Be 2
+        $Result.ZipLeft | Should -BeFalse
+        @($Result.Lines | Where-Object { $_ -like '*No report was written: the metrics output was not written*' }).Count | Should -Be 1
     }
 
     It 'makes no zip and exits 2 when the Metrics file could not be written and the other files are fine' {
