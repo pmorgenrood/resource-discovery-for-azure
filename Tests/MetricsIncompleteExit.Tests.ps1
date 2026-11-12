@@ -16,6 +16,27 @@ BeforeAll {
 
     $script:SignIn = [pscustomobject]@{ Name = 'sub-one'; Id = 'id-1'; Message = 'no usable Azure context' }
     $script:Incomplete = [pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Message = 'still failed'; ReportFolder = 'ResourcesReport_x'; Complete = $false }
+
+    # The globals the Describes below set and put back. They are given the
+    # values a run of the tool leaves (as an earlier test file can), so the
+    # last Describe can check each Describe put back what was there.
+    $script:SharedGlobals = @('MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'ZipOutputFile', 'DictionaryFile')
+    $script:GlobalsBeforeFile = @{}
+    foreach ($Name in $script:SharedGlobals) { $script:GlobalsBeforeFile[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } } }
+    $Global:MetricsFailedSubs = @(); $Global:ConsumptionFailedSubs = @(); $Global:RdaUnwrittenReportZips = @(); $Global:RdaMetricsWriteFailures = @(); $Global:ZipOutputFile = $null; $Global:DictionaryFile = $null
+    function script:Get-SharedGlobalsText
+    {
+        @($script:SharedGlobals | ForEach-Object { $V = Get-Variable -Name $_ -Scope Global -ErrorAction SilentlyContinue; '{0}={1}' -f $_, $(if ($V) { ConvertTo-Json -InputObject @($V.Value) -Compress -Depth 3 } else { '<unset>' }) })
+    }
+    $script:SharedGlobalsAtStart = @(script:Get-SharedGlobalsText)
+}
+
+AfterAll {
+    foreach ($Name in $script:SharedGlobals)
+    {
+        if ($script:GlobalsBeforeFile[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:GlobalsBeforeFile[$Name].Value }
+        else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'Get-MetricsIncompleteEntries' {
@@ -309,10 +330,10 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
             [pscustomobject]@{ ExitCode = $global:LASTEXITCODE; Lines = $Lines }
         }
 
-        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionDict = Get-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionConsumption = Get-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionDict = Get-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionConsumption = Get-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         $script:ConsumptionSignIn = [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' }
     }
     BeforeEach {
@@ -499,9 +520,9 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
             }
         }
 
-        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
@@ -644,7 +665,7 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         $script:SessionValues = @{}
         foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -909,7 +930,7 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $script:SessionValues = @{}
         foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsFailedSubs'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1064,7 +1085,7 @@ Describe 'The Inventory file of a ResourceInventory.ps1 run' {
         $script:SessionValues = @{}
         foreach ($Name in @('JsonFile', 'SmaResources', 'Version'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1174,7 +1195,7 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         $script:SessionValues = @{}
         foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'JsonFile', 'HtmlFile', 'ConsumptionFileCsv', 'ZipOutputFile', 'MetricsJsonFile', 'MetricsFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'SmaResources', 'Version', 'RdaTestInventoryChecks'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1300,7 +1321,7 @@ Describe 'The Diagnostics log of each ResourceInventory.ps1 run in one PowerShel
         $script:SessionValues = @{}
         foreach ($Name in @('DefaultPath', 'ReportName', 'CurrentDateTime', 'Version', 'CollectorFailures', 'MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaMetricsWriteFailures', 'RdaTestAddEntries'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1367,7 +1388,7 @@ Describe 'The Metrics files an earlier ResourceInventory.ps1 run could not write
                 $Ast.ParamBlock.Extent.Text
                 @($script:Clears | ForEach-Object { $_.Extent.Text })
             ) -join "`n")
-        $script:SessionWriteFailures = Get-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionWriteFailures = Get-Variable -Name RdaMetricsWriteFailures -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
     }
     AfterAll {
         if ($script:SessionWriteFailures) { $Global:RdaMetricsWriteFailures = $script:SessionWriteFailures.Value }
@@ -1424,8 +1445,8 @@ Describe 'Two direct ResourceInventory.ps1 runs in one PowerShell session' {
             }
         }
 
-        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
@@ -1476,7 +1497,7 @@ Describe 'The end of a Run-AllSubscriptions.ps1 run with incomplete metrics' {
         $script:SessionValues = @{}
         foreach ($Name in @('MetricsFailedSubs', 'CollectorFailures', 'ConsumptionFailedSubs'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1582,7 +1603,7 @@ Describe 'Two Run-AllSubscriptions.ps1 runs in one PowerShell session' {
         $script:SessionValues = @{}
         foreach ($Name in @('MetricsFailedSubs', 'CollectorFailures', 'ConsumptionFailedSubs', 'ConsumptionRecordCount', 'RdaUnwrittenReportZips'))
         {
-            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
+            $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
     AfterAll {
@@ -1640,8 +1661,8 @@ Describe 'The per-subscription output check of a Run-AllSubscriptions.ps1 run' {
             return @($Lines)
         }
 
-        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue
-        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionMetrics = Get-Variable -Name MetricsFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
     }
     AfterAll {
         if ($script:SessionMetrics) { $Global:MetricsFailedSubs = $script:SessionMetrics.Value }
@@ -1740,7 +1761,7 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
         $Top = @((Get-ScriptAst -File 'Run-AllSubscriptions.ps1').EndBlock.Statements)
         $From = @(0..($Top.Count - 1) | Where-Object { $Top[$_].Extent.Text -match '^\$OuterZipFile = \$null' })[0]
         $script:Consolidate = (@($Top[$From..($From + 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
-        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue
+        $script:SessionUnwritten = Get-Variable -Name RdaUnwrittenReportZips -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
     }
     AfterAll {
         if ($script:SessionUnwritten) { $Global:RdaUnwrittenReportZips = $script:SessionUnwritten.Value }
@@ -1803,5 +1824,14 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
         $Global:RdaUnwrittenReportZips = @()
         . ([scriptblock]::Create($Read[0].Extent.Text + "`n" + $Merge[0].Extent.Text))
         @($Global:RdaUnwrittenReportZips) | Should -Be @('/reports/ResourcesReport_y/ResourcesReport_y.zip')
+    }
+}
+
+# Last, so it sees what every Describe above left: a Describe that keeps a
+# global's PSVariable (the live variable) and sets its Value back puts back
+# its own last value, and the next test file then reads it.
+Describe 'The globals these tests set' {
+    It 'are as they were before the first Describe' {
+        @(script:Get-SharedGlobalsText) | Should -Be $script:SharedGlobalsAtStart
     }
 }
