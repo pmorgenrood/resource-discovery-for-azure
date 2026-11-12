@@ -92,7 +92,10 @@ Describe 'The startup fold of the per-stream resume state files' {
         $null = script:New-StreamFile -Dir $script:Dir -N 1 -Text '{ "Completed": [ "sub-a" ] }'
         $R = & { Set-StrictMode -Version Latest; & $script:FoldBlock $script:Dir 't' $script:State $true $false }
         @($R.CompletedIds) | Should -Be @('sub-a')
-        @($R.Folded | ForEach-Object Name) | Should -Be @('.resume-state-t-stream-1.json')
+        # Its record is saved (read back), so the fold removes it (#68): no file
+        # is left for the clean-run clean-up.
+        @($R.Folded) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $script:Dir '.resume-state-t-stream-1.json') | Should -BeFalse
     }
 
     It 'stops with exit 1 before it saves any record when a file it cannot read cannot be moved aside' {

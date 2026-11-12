@@ -14,7 +14,7 @@ param (
     # again. (Use -Resume instead to continue an interrupted run - that covers
     # both failures and subscriptions not yet reached.) If there are no recorded
     # failures, prints "Nothing to retry", names any subscription an interrupted
-    # run never reached, and exits 0. Works with
+    # run never reached, and exits 2 while one is named (0 when none). Works with
     # -ParallelStreams; the failed-only filter is applied before the
     # subscriptions are split across streams.
     [switch]$ResumeFailedOnly,
@@ -504,6 +504,10 @@ if (-not (Test-Path -LiteralPath $InventoryRoot -PathType Container))
     try { New-Item -Path $InventoryRoot -ItemType Directory -Force | Out-Null }
     catch { Write-Verbose ("InventoryRoot create failed at {0}: {1}" -f $InventoryRoot, $_.Exception.Message) }
 }
+# The report folders already there when this run starts: never this run's,
+# whatever the clock says (a clock moved back could date an old one after this
+# run's start), so MainSummary.html does not list an old folder.
+$PreRunReportDirs = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }), [System.StringComparer]::OrdinalIgnoreCase)
 
 # Wrapper-level transcript.
 #
@@ -601,7 +605,8 @@ catch
 # inventory. Capture warnings and treat zero-results-with-warnings as a
 # loud failure instead of a silent one.
 $SubWarnings = @()
-$AllSubscriptions = Get-AzSubscription -TenantId $TenantID -WarningVariable subWarnings -WarningAction SilentlyContinue
+$SubErrors = @()
+$AllSubscriptions = Get-AzSubscription -TenantId $TenantID -WarningVariable subWarnings -WarningAction SilentlyContinue -ErrorVariable subErrors
 if ($null -eq $AllSubscriptions) { $AllSubscriptions = @() }
 $AllSubscriptions = @($AllSubscriptions)
 
@@ -684,9 +689,10 @@ $IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -
 # sees no failures, and wrongly reports "Nothing to retry" - silently dropping
 # the retry set. Read the per-stream files here so BOTH -Resume (skip-completed)
 # and -ResumeFailedOnly (retry list) see the full picture, write what they hold
-# into the unified file; the files read here are removed when the run clears
-# the state (see the clean-run clean-up below), and the end-of-run merge of a
-# parallel run removes the ones it reads.
+# into the unified file; the files read here are removed once the unified file
+# on disk holds their records (else when the run clears the state, see the
+# clean-run clean-up below), and the end-of-run merge of a parallel run removes
+# the ones it reads.
 # A run without -Resume or -ResumeFailedOnly collects every subscription and
 # writes its own state, so the files of an earlier interrupted run are stale and
 # are removed too. Safe on non-interrupted runs: a cleanly-finished parallel run
@@ -758,19 +764,36 @@ if ($Resume -or $ResumeFailedOnly)
             # After the unified file's own records, so the interrupted run's newer report wins.
             $CompletedReports = @(@($CompletedReports) + @($StrandedReports))
         }
-        # Same recency-wins / prune-on-completed reconciliation the end-of-run
-        # merge uses, so a sub that later succeeded in another stream is dropped.
-        $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $StrandedFailed -CompletedIds $CompletedIds
+        # Per sub the entry with the most failed runs wins (a count only grows,
+        # so a clock moved back cannot undo one: Merge-RecoveredFailedAttempts),
+        # and a sub that later succeeded in another stream is dropped.
+        $FailedAttempts = Merge-RecoveredFailedAttempts -ExistingFailedAttempts $FailedAttempts -RecoveredFailedAttempts $StrandedFailed -CompletedIds $CompletedIds
         if ($StrandedCompleted.Count -gt 0 -or @($StrandedFailed).Count -gt 0)
         {
             Write-Host ("Recovered per-stream state from an interrupted parallel run: {0} completed, {1} failed subscription record(s)." -f $StrandedCompleted.Count, @($StrandedFailed).Count) -ForegroundColor Cyan
         }
         # Heal the unified file immediately so even a re-interrupted run keeps
         # the recovered picture. Saved whenever a file was read, also one with no
-        # record: the state in memory is reconciled above (Merge-FailedAttempts).
+        # record: the state in memory is reconciled above (Merge-RecoveredFailedAttempts).
         if ($FoldedStreamFiles.Count -gt 0)
         {
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+            # Once the file on disk holds their records (read back whole), the
+            # folded files go: left, every later -Resume or -ResumeFailedOnly
+            # would fold them in again, and their old failure would win over a
+            # newer completion, so a -ResumeFailedOnly that cannot clear the
+            # state would collect the same subscription on every run (#68). One
+            # that cannot be removed stays folded, and the clean-run clean-up
+            # tries it again.
+            if (Test-ResumeStateSaved -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports)
+            {
+                $FoldedStreamFiles = @(foreach ($StreamFile in $FoldedStreamFiles)
+                    {
+                        try { Remove-Item -LiteralPath $StreamFile.FullName -Force -ErrorAction Stop }
+                        catch { Write-Host ("WARNING: Could not remove the per-stream state file {0}: {1}. Its records are saved; a later run removes it." -f $StreamFile.Name, $_.Exception.Message) -ForegroundColor Yellow }
+                        if (Test-Path -LiteralPath $StreamFile.FullName) { $StreamFile }
+                    })
+            }
         }
     }
 }
@@ -817,7 +840,8 @@ else
         $StaleFailedIds = @($StaleFailed | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
         $CompletedIds = @($CompletedIds | Where-Object { $StaleFailedIds -notcontains [string]$_ })
         $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and $StaleFailedIds -notcontains [string]$_.Id })
-        $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $StaleFailed -CompletedIds $CompletedIds
+        # The most failed runs win, as in the -Resume fold.
+        $FailedAttempts = Merge-RecoveredFailedAttempts -ExistingFailedAttempts $FailedAttempts -RecoveredFailedAttempts $StaleFailed -CompletedIds $CompletedIds
         Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         if (-not (Test-ResumeStateSaved -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports))
         {
@@ -881,6 +905,54 @@ else
 # completed list is only checked to defend against a sub that succeeded on a
 # previous retry but whose FailedAttempts entry was not yet pruned (shouldn't
 # happen if the catch/success paths are correct, but cheap to defend).
+# A retry-list entry for a subscription the signed-in identity no longer sees
+# at all (deleted, moved to another tenant) can never be retried or counted, so
+# it would keep the resume state forever. Every run drops it, with or without
+# -Resume (a run without it reads and writes the same retry list), before the
+# entries past the retry limit are worked out, so a gone one is never owed.
+# A disabled subscription is still listed by Get-AzSubscription, so its entry
+# stays (-IncludeDisabled retries it). A listing that came back with warnings or
+# errors can leave out a subscription that is only hidden for now, so then no
+# entry is dropped, and the warnings and errors are printed.
+$DroppedGoneEntries = $false
+$KeptNotListedIds = @()
+# The ids dropped here, kept out of the per-stream records merged later too.
+$GoneIds = @()
+if (@($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
+{
+    $VisibleIds = @($AllSubscriptions | ForEach-Object { [string]$_.Id })
+    $GoneAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $VisibleIds -notcontains [string]$_.Id })
+    $ListingProblems = @(@($SubWarnings) + @($SubErrors) | Where-Object { $_ } | ForEach-Object {
+            $Text = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } elseif ($_ -is [System.Management.Automation.WarningRecord]) { $_.Message } else { [string]$_ }
+            # An Az notice of a coming breaking change says nothing about the
+            # list, so it does not hold back a drop.
+            if ($_ -isnot [System.Management.Automation.ErrorRecord] -and [string]$Text -match '(?i)breaking change') { return }
+            # The first line, at most 300 characters: what to fix, not the whole record.
+            $Line = @(([string]$Text) -split "`r?`n" | Where-Object { $_.Trim() })[0]
+            if ($null -eq $Line) { $Line = '' }
+            if ($Line.Length -gt 300) { $Line = $Line.Substring(0, 300) + '...' }
+            $Line.Trim()
+        } | Where-Object { $_ } | Select-Object -Unique)
+    if ($GoneAttempts.Count -gt 0 -and $ListingProblems.Count -gt 0)
+    {
+        Write-Host ("Kept on the retry list: {0} subscription(s) not in the subscription list ({1}), because Get-AzSubscription returned warnings or errors, so the list may be incomplete:" -f $GoneAttempts.Count, (@($GoneAttempts | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', ')) -ForegroundColor Yellow
+        foreach ($Problem in @($ListingProblems | Select-Object -First 5)) { Write-Host ("  - {0}" -f $Problem) -ForegroundColor Yellow }
+        if ($ListingProblems.Count -gt 5) { Write-Host ("  - ... and {0} more" -f ($ListingProblems.Count - 5)) -ForegroundColor Yellow }
+        $KeptNotListedIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
+    }
+    elseif ($GoneAttempts.Count -gt 0)
+    {
+        foreach ($Gone in $GoneAttempts)
+        {
+            Write-Host ("Dropped from the retry list: {0} ({1}) is no longer visible to the signed-in identity, so no run can retry it." -f $Gone.Name, $Gone.Id) -ForegroundColor Yellow
+        }
+        $GoneIds = @($GoneAttempts | ForEach-Object { [string]$_.Id })
+        $FailedAttempts = @($FailedAttempts | Where-Object { $null -ne $_ -and $GoneIds -notcontains [string]$_.Id })
+        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+        $DroppedGoneEntries = $true
+    }
+}
+
 if ($ResumeFailedOnly)
 {
     if ($FailedAttempts.Count -eq 0)
@@ -892,9 +964,39 @@ if ($ResumeFailedOnly)
         # deleted it) there is nothing to name.
         if (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)
         {
-            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds -NotReadableIds $NotReadableIds) -ResumeStateFile $ResumeStateFile
+            $NotReached = @(Get-NotCollectedSubscriptions -Eligible $Subscriptions -CompletedIds $CompletedIds -NotReadableIds $NotReadableIds)
+            $NotReachedIds = @($NotReached | Where-Object { $null -ne $_ })
+            Write-NotCollectedSummary -NotCollected $NotReached -ResumeStateFile $ResumeStateFile
         }
-        Exit-Wrapper -Code 0
+        # The drop above emptied the retry list and no subscription is left that
+        # no run has completed: nothing is owed, so the state is removed as at the
+        # end of a clean run. Otherwise it would stay behind on every repeat.
+        if ($DroppedGoneEntries -and $NotReachedIds.Count -eq 0 -and $UnreadableStreamFiles.Count -eq 0 -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf))
+        {
+            try
+            {
+                # (The per-stream files of an interrupted run were folded in and
+                # removed at the start.)
+                Remove-Item -LiteralPath $ResumeStateFile -Force -ErrorAction Stop
+                Write-Host "Resume state cleared (clean run)." -ForegroundColor Green
+            }
+            catch
+            {
+                Write-Host ("WARNING: Could not remove resume state file {0}: {1}" -f $ResumeStateFile, $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+        # A drop that reached neither a save nor the removal above leaves the
+        # dropped entries in the file, and every later -ResumeFailedOnly run
+        # would drop them again: exit 2, with the way out, so the repeat does
+        # not read as a success.
+        $DropNotSaved = $DroppedGoneEntries -and $ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)
+        if ($DropNotSaved)
+        {
+            Write-Host ("ERROR: The resume state file {0} could not be written or removed, so it still lists the retry entries dropped above, and every -ResumeFailedOnly run would drop them again. Fix the cause (for example, free up disk space), then run again, or delete the resume state files .resume-state-{1}.json and .resume-state-{1}-stream-*.json in the inventory folder to start over." -f $ResumeStateFile, $TenantID) -ForegroundColor Red
+        }
+        # A per-stream state file that could not be read may hold failures
+        # (named above): the run is not clean while it is there.
+        Exit-Wrapper -Code $(if ($NotReachedIds.Count -gt 0 -or $UnreadableStreamFiles.Count -gt 0 -or $DropNotSaved) { 2 } else { 0 })
     }
     $FailedIds = @($FailedAttempts | ForEach-Object { $_.Id })
     $BeforeCount = $Subscriptions.Count
@@ -910,11 +1012,43 @@ if ($ResumeFailedOnly)
         # IDs (sub was deleted, identity lost access, IncludeDisabled toggled
         # off relative to the prior run). Tell the user instead of silently
         # processing nothing.
+        # The retry list still holds them (the state is kept), so this is not a
+        # success: exit 2, as for any report the run could not produce.
         Write-Host "WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set. Verify access and -IncludeDisabled flag matches the prior run." -ForegroundColor Yellow
         # Nothing else takes such an entry off the list, so every later
         # -ResumeFailedOnly run would end the same way: name the way out.
         Write-Host ("  If they are gone for good, delete the resume state files .resume-state-{0}.json and .resume-state-{0}-stream-*.json in the inventory folder to start over with an empty retry list: the next run collects every subscription." -f $TenantID) -ForegroundColor Yellow
         Exit-Wrapper -Code 2
+    }
+}
+
+# A subscription past the retry limit (Get-RetryLimitedAttempts) is not
+# collected by -Resume or -ResumeFailedOnly; a run without either still
+# collects it. Its entry stays on the retry list, so the summary keeps listing
+# it as incomplete and the count goes on if a later run fails it again.
+$SkippedForRetryLimit = @()
+if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
+{
+    $EligibleIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
+    $SkippedForRetryLimit = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $EligibleIds -contains [string]$_.Id })
+    foreach ($Limited in $SkippedForRetryLimit)
+    {
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. To try it again, start a run without -Resume or -ResumeFailedOnly." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+    }
+    if ($SkippedForRetryLimit.Count -gt 0)
+    {
+        $SkippedLimitIds = @($SkippedForRetryLimit | ForEach-Object { [string]$_.Id })
+        $Subscriptions = @($Subscriptions | Where-Object { $SkippedLimitIds -notcontains [string]$_.Id })
+        if ($ResumeFailedOnly -and $Subscriptions.Count -eq 0)
+        {
+            Write-Host "ResumeFailedOnly: nothing left to retry; the subscriptions on the retry list are past the retry limit (named above)." -ForegroundColor Green
+            # As when the retry list is empty: name the subscriptions no run has
+            # reached. Those past the limit are on the retry list, so not among them.
+            Write-NotCollectedSummary -NotCollected (Get-NotCollectedSubscriptions -Eligible $EligibleBeforeRetryFilter -CompletedIds $CompletedIds -RetryIds @($FailedAttempts | Where-Object { $_ } | ForEach-Object { [string]$_.Id }) -NotReadableIds $NotReadableIds) -ResumeStateFile $ResumeStateFile
+            # Their reports are missing, so exit 2 (the advice above says how to
+            # try them again); the state is kept, so the limit is not forgotten.
+            Exit-Wrapper -Code 2
+        }
     }
 }
 
@@ -987,6 +1121,11 @@ $RetryNotListed = @($FailedAttempts | Where-Object { $null -ne $_ -and $ListedSu
 $RoleCheckSkippedIds = @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ } })
 $RetryNotInRunIds = @($FailedAttempts | Where-Object { $null -ne $_ -and $RunSubscriptionIds -notcontains [string]$_.Id -and $ListedSubscriptionIds -contains [string]$_.Id -and $RoleCheckSkippedIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
 
+# The retry-list entries past the retry limit that this run does not collect:
+# those the -Resume / -ResumeFailedOnly skip above left out, and those outside
+# this run's subscription set. While one is still on the retry list at the end,
+# its report is missing, so the run ends with exit 2 (Retry Limit Reached).
+$RetryLimitedNotInRunIds = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $RunSubscriptionIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id })
 # ---------------------------------------------------------------------------
 # Up-front consumption data check. Consumption was REQUESTED unless
 # -SkipConsumption was passed, and a run without usage values cannot price the
@@ -1139,6 +1278,20 @@ if ($ParallelStreams -le 1)
             continue
         }
 
+        # Write-ahead count (fail-safe rule): one more failed run is saved and
+        # read back before the sub is collected (Save-WriteAheadAttempt); only a
+        # good result takes it away (Remove-FailedAttempt below) and a failure
+        # only sets the reason. A count that cannot be saved stops the run here.
+        $WriteAhead = Save-WriteAheadAttempt -Path $ResumeStateFile -Tenant $TenantID -Id $Sub.Id -Name $Sub.Name -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+        if (-not $WriteAhead.Saved)
+        {
+            Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name) -ForegroundColor Red
+            Exit-Wrapper -Code 2
+        }
+        $CompletedIds = $WriteAhead.CompletedIds
+        $FailedAttempts = $WriteAhead.FailedAttempts
+        $CompletedReports = $WriteAhead.Reports
+
         Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
 
         try
@@ -1218,15 +1371,11 @@ if ($ParallelStreams -le 1)
             if ($null -eq $NewReport)
             {
                 # The run left no zip, so there is no report a later -Resume could
-                # carry: the sub is not completed. As after a failed attempt, an
-                # earlier run's completion of it ends here, so the next -Resume
-                # collects it again instead of carrying the older report.
-                if ($CompletedIds -contains $Sub.Id)
-                {
-                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                    $StateChanged = $true
-                }
+                # carry: the sub is not completed (the write-ahead step already
+                # took any earlier completion out and counted this failed run, so
+                # the retry limit ends a sub that keeps leaving no zip).
+                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'it left no report zip, so it is collected again'
+                $StateChanged = $true
             }
             elseif ($null -ne $IncompleteReason)
             {
@@ -1234,18 +1383,16 @@ if ($ParallelStreams -le 1)
                 # so the sub is not completed: it goes into the retry list, and an
                 # earlier run's completion of it ends here, so both -Resume and
                 # -ResumeFailedOnly collect it again. It is not a failed subscription.
+                # The write-ahead step counted this run; only the reason is set.
                 Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
                 $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
+                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
                 $StateChanged = $true
             }
             else
             {
-                if (-not ($CompletedIds -contains $Sub.Id))
-                {
-                    $CompletedIds += $Sub.Id
-                }
+                $CompletedIds += $Sub.Id
                 $CompletedReports = @(@($CompletedReports) + $NewReport)
                 $StateChanged = $true
                 $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
@@ -1334,21 +1481,15 @@ if ($ParallelStreams -le 1)
             catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
 
             $FailedSubscriptions += $Sub.Name
-            # A failed attempt ends an earlier run's completion of this sub: take
-            # it off the completed list and drop its report record, so a later
-            # -Resume collects it again instead of skipping it and carrying the
-            # older report.
-            if ($CompletedIds -contains $Sub.Id)
-            {
-                $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-            }
+            # The write-ahead step already took any earlier completion of this
+            # sub out, so a later -Resume collects it again.
             $FailedSubscriptionDetail += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id }
             # Persist the failure to the resume-state file so a future run with
             # -ResumeFailedOnly can target it. Use the exception message as the
             # Reason so the operator can see at a glance why each sub failed
             # without opening the diag log.
-            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
+            # The write-ahead step counted this failed run; only the reason is set.
+            $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts `
                 -Id $Sub.Id -Name $Sub.Name `
                 -Reason $ErrRecord.Exception.Message
             Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
@@ -1377,8 +1518,8 @@ else
     #   - Its own resume-state file at
     #     $InventoryRoot/.resume-state-<TenantID>-stream-<N>.json
     #     so concurrent state writes cannot race.
-    #   - Its own per-stream summary JSON (Stream_<N>_Summary.json) which the
-    #     parent aggregates at the end.
+    #   - Its own per-stream summary JSON (.rda-stream-<N>-summary-<run id>.json)
+    #     which the parent aggregates at the end.
     #   - Its own per-stream failures log (RunAllSubscriptions_failures_*_stream-<N>.log).
     #
     # All streams share:
@@ -1431,6 +1572,16 @@ else
         if ($PendingSubscriptions.Count -gt 0)
         {
             $Sub = $PendingSubscriptions[0]
+            # Write-ahead count, as in the sequential branch.
+            $WriteAhead = Save-WriteAheadAttempt -Path $ResumeStateFile -Tenant $TenantID -Id $Sub.Id -Name $Sub.Name -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+            if (-not $WriteAhead.Saved)
+            {
+                Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name) -ForegroundColor Red
+                Exit-Wrapper -Code 2
+            }
+            $CompletedIds = $WriteAhead.CompletedIds
+            $FailedAttempts = $WriteAhead.FailedAttempts
+            $CompletedReports = $WriteAhead.Reports
             Write-Host "Processing subscription: $($Sub.Name) ($($Sub.Id))" -ForegroundColor Cyan
             try
             {
@@ -1471,34 +1622,23 @@ else
                 if ($null -eq $NewReport)
                 {
                     # Same as the sequential branch: a run that left no zip does not
-                    # complete the sub, and ends an earlier run's completion of it.
-                    if ($CompletedIds -contains $Sub.Id)
-                    {
-                        $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                        $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                        Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
-                    }
+                    # complete the sub (counted by the write-ahead step).
+                    $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'it left no report zip, so it is collected again'
+                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
                 elseif ($null -ne $IncompleteReason)
                 {
                     # Same as the sequential branch: metrics or consumption left
-                    # incomplete puts the sub in the retry list, not the completed list.
+                    # incomplete puts the sub in the retry list, not the completed
+                    # list (the write-ahead step counted this run; only the reason is set).
                     Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
-                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                     $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                    $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
-                    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
-                }
-                elseif (-not ($CompletedIds -contains $Sub.Id))
-                {
-                    $CompletedIds += $Sub.Id
-                    $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
+                    $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
                 else
                 {
-                    # Already recorded as completed: still save, so this run's zip replaces the earlier one.
-                    # The failure entry goes too, or -ResumeFailedOnly would retry it for ever.
+                    $CompletedIds += $Sub.Id
                     $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id
                     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
                 }
@@ -1525,18 +1665,13 @@ else
                 try { $DiagLines | Out-File -LiteralPath $DiagFile -Append -Encoding utf8 }
                 catch { Write-Verbose ("DiagFile write failed at {0}: {1}" -f $DiagFile, $_.Exception.Message) }
                 $FailedSubscriptions += $Sub.Name
-                # Same as the sequential branch: a failed attempt takes the sub
-                # off the completed list and drops its report record.
-                if ($CompletedIds -contains $Sub.Id)
-                {
-                    $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
-                    $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
-                }
+                # Same as the sequential branch: the write-ahead step already took
+                # any earlier completion out.
                 $FailedSubscriptionDetail += [pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id }
                 # Mirror the sequential branch: persist failure to the
                 # resume-state file so -ResumeFailedOnly works even for the
                 # single-sub-collapses-to-inline corner case.
-                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
+                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts `
                     -Id $Sub.Id -Name $Sub.Name `
                     -Reason $ErrRecord.Exception.Message
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $TenantID -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
@@ -1791,6 +1926,9 @@ else
             # The subs of a stream that ended without a summary (it crashed, or
             # its summary cannot be read), for the retry list below.
             $StreamUnfinished = @()
+            # The subs a stream did not collect because it could not save their
+            # write-ahead count first: named, nothing counted for them.
+            $StreamNotAttemptedIds = @()
             foreach ($S in $StreamSummaries)
             {
                 # Each stream is read on its own: a throw while one is read
@@ -1869,6 +2007,15 @@ else
                         # is the stream's, not the subscription's, so its count
                         # of failed runs stays as it was.
                         $StreamNotStarted += @($Read.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and [string]$_.Id -ne '<unknown>' })
+                    }
+                    # The subs this stream did not collect: it could not save their
+                    # write-ahead count first. Named as failed; nothing is counted
+                    # for them (they keep the entry they had).
+                    foreach ($n in @($Read.NotAttempted))
+                    {
+                        $StreamNotAttemptedIds += [string]$n.Id
+                        $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $n.Name, $S.StreamId, $n.Reason)
+                        $FailedSubscriptionDetail += [pscustomobject]@{ Name = $n.Name; Id = $n.Id }
                     }
                     # The subs this stream collected this run without a zip being written.
                     $StreamNoReportIds += @($Read.NoReport | ForEach-Object { $_.Id })
@@ -2121,8 +2268,15 @@ else
                 $CompletedIds = @($CompletedIds | Where-Object { $ThisRunIds -notcontains [string]$_ })
             }
             # Reconcile failed attempts from all streams against the unified list.
-            # See Merge-FailedAttempts for the recency/completion rules.
-            $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
+            # The parent's count per sub before this run: a stream counts one more
+            # failed run before it collects a sub (write-ahead), so an entry with
+            # more failed runs than this is this run's (the clock is not read).
+            $PriorAttempts = @{}
+            foreach ($P in @($FailedAttempts | Where-Object { $null -ne $_ })) { $PriorAttempts[[string]$P.Id] = Get-FailedAttemptCount -Entry $P }
+            # Per sub the entry with the most failed runs wins (a stream's
+            # write-ahead count over the parent's entry, whatever the clocks
+            # say: Merge-RecoveredFailedAttempts), and a completion drops it.
+            $FailedAttempts = Merge-RecoveredFailedAttempts -ExistingFailedAttempts $FailedAttempts -RecoveredFailedAttempts $AllFailedFromStreams -CompletedIds $CompletedIds
             # A stream that did not start wrote no state, so its subs are added
             # here, after the merge, which drops entries of completed subs. The
             # stream's cause (its sign-in did not load) is not the subscription's,
@@ -2146,9 +2300,10 @@ else
             # list as one more failed run, unless its stream's own file already
             # recorded this run's failure of it (merged above). A stream starts
             # from the parent's entries for its slice and saves them as they are,
-            # so only an entry it failed this run (a time from this run) counts.
+            # so only an entry it counted on from them this run (more failed runs
+            # than the parent's entry: #68, whatever the clocks say) counts.
             $FailedThisRunIds = @($AllFailedFromStreams | Where-Object {
-                    $null -ne $_ -and $_.PSObject.Properties['LastFailedAt'] -and $(try { ([datetime]$_.LastFailedAt).ToUniversalTime() -ge ([datetime]$RunStartTime).ToUniversalTime() } catch { $false })
+                    $null -ne $_ -and (Get-FailedAttemptCount -Entry $_) -gt $(if ($PriorAttempts.ContainsKey([string]$_.Id)) { $PriorAttempts[[string]$_.Id] } else { 0 })
                 } | ForEach-Object { [string]$_.Id })
             foreach ($Lost in @($Unfinished | Where-Object { $FailedThisRunIds -notcontains [string]$_.Id }))
             {
@@ -2618,7 +2773,7 @@ if ($null -ne $OuterZipFile)
             $MainVer = ('{0}.{1}.{2}' -f $VerObj.MajorVersion, $VerObj.MinorVersion, $VerObj.BuildVersion)
         }
         catch { Write-Verbose ("MainSummary: could not read Version.json: {0}" -f $_.Exception.Message) }
-        New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime -IncludeFolders $CarriedFolderNames `
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime -IncludeFolders $CarriedFolderNames -ExcludeFolders @($PreRunReportDirs) `
             -FailedSubscriptions $FailedSubscriptions `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
@@ -2648,7 +2803,15 @@ if ($null -ne $OuterZipFile)
 # Retry-list entries this run did not collect because their subscription,
 # still listed, was not in its set (see $RetryNotInRunIds): their reports are
 # missing, so the run ends with exit 2 and says how to end that.
-$RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $RetryNotInRunIds -contains [string]$_.Id })
+# The retry-list entries past the retry limit, listed as incomplete in the
+# summary (Retry Limit Reached). They keep the state (every retry entry does),
+# so the next -Resume or -ResumeFailedOnly run skips them again; those this run
+# left out are owed, so the run ends with exit 2.
+$RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
+$RetryLimitedIds = @($RetryLimited | ForEach-Object { [string]$_.Id })
+$RetryLimitedOwed = @($RetryLimited | Where-Object { $RetryLimitedNotInRunIds -contains [string]$_.Id })
+# Those past the limit are named under Retry Limit Reached, not here.
+$RetryOwedNotInRun = @($FailedAttempts | Where-Object { $null -ne $_ -and $RetryNotInRunIds -contains [string]$_.Id -and $RetryLimitedIds -notcontains [string]$_.Id })
 
 # Clean up resume state on a fully successful run (all subs processed, no failures
 # this run AND no pending retries from a prior run). Otherwise leave it so a
@@ -2897,6 +3060,11 @@ if ($RetryNotListed.Count -gt 0)
 {
     Write-Host ("Not Listed:              {0} ({1}) - on the retry list, but not in this run's subscription listing, so this run could not collect them. If they are gone for good, delete the resume state files .resume-state-{2}.json and .resume-state-{2}-stream-*.json in the inventory folder to drop them; that also forgets every completion and other retry entry, so the next run collects every subscription." -f $RetryNotListed.Count, (@($RetryNotListed | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', '), $TenantID) -ForegroundColor Yellow
 }
+# The retry-list entries that -ResumeFailedOnly would still retry: none past
+# the retry limit, none outside this run's set, none the listing did not show.
+$OwedNotInRunIds = @($RetryOwedNotInRun | ForEach-Object { [string]$_.Id })
+$NotListedIdsForPending = @($RetryNotListed | ForEach-Object { [string]$_.Id })
+$PendingRetryCount = @($FailedAttempts | Where-Object { $null -ne $_ -and $RetryLimitedIds -notcontains [string]$_.Id -and $OwedNotInRunIds -notcontains [string]$_.Id -and $NotListedIdsForPending -notcontains [string]$_.Id }).Count
 if ($RetryOwedNotInRun.Count -gt 0)
 {
     Write-Host ("Not In This Run:         {0} ({1}) - on the retry list, but not in this run's subscription set (disabled without -IncludeDisabled, or not readable)" -f $RetryOwedNotInRun.Count, (@($RetryOwedNotInRun | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Id }) -join ', ')) -ForegroundColor Yellow
@@ -2917,15 +3085,16 @@ if ($FailedSubscriptions.Count -gt 0)
         Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Red
     }
 }
-elseif (($FailedAttempts.Count - $RetryOwedNotInRun.Count - $RetryNotListed.Count) -gt 0)
+elseif ($PendingRetryCount -gt 0)
 {
     # No new failures this run, but the retry list still holds subscriptions:
     # lingering FailedAttempts from a prior run that have not yet been retried,
     # or ones this run's role check skipped for a cause that can pass on a
     # later run. Surface them so the operator does not lose track of them
     # simply because the most recent run was clean. Those not in this run's
-    # subscription set are named under Not In This Run instead.
-    Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f ($FailedAttempts.Count - $RetryOwedNotInRun.Count - $RetryNotListed.Count)) -ForegroundColor Yellow
+    # subscription set are named under Not In This Run instead, and those past
+    # the retry limit under Retry Limit Reached ($PendingRetryCount).
+    Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $PendingRetryCount) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
     Write-Host "Re-run with -ResumeFailedOnly to retry them." -ForegroundColor Yellow
@@ -2949,6 +3118,11 @@ if ($NotCollected.Count -gt 0)
     # Set by the resume-state cleanup above on a -ResumeFailedOnly run.
     Write-NotCollectedSummary -NotCollected $NotCollected -ResumeStateFile $ResumeStateFile
 }
+if ($RetryLimited.Count -gt 0)
+{
+    # Set by the resume-state cleanup above.
+    Write-RetryLimitSummary -RetryLimited $RetryLimited -TenantID $TenantID -ExcludedIds @($Excluded | ForEach-Object { [string]$_.Id }) -NotListedIds $KeptNotListedIds -NotReadableIds @(if ($null -ne $AccessDecision) { @($AccessDecision.InaccessibleIds) | Where-Object { $_ } | ForEach-Object { [string]$_ } })
+}
 Write-Host ("Execution Time:          {0}" -f $Elapsed.ToString('hh\:mm\:ss')) -ForegroundColor Green
 if ($WrapperTranscriptStarted)
 {
@@ -2969,6 +3143,7 @@ if ((Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) -and $ResumeStateSa
 if (@($UncarriedSkipped).Count -gt 0) { $ExitTwoReasons += 'an earlier report could not be carried into the consolidated zip (see the FAILED banner above)' }
 if (@($LeftStreamFiles).Count -gt 0) { $ExitTwoReasons += 'a per-stream resume state file is kept (named above)' }
 if (@($RetryOwedNotInRun).Count -gt 0) { $ExitTwoReasons += 'a subscription on the retry list is not in this run (see Not In This Run)' }
+if (@($RetryLimitedOwed).Count -gt 0) { $ExitTwoReasons += 'a subscription past the retry limit was not collected (see Retry Limit Reached)' }
 if ($null -ne $BundleBuildError -or $InventoryFolderGone) { $ExitTwoReasons += 'no consolidated zip was made (see the FAILED banner above)' }
 $WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -SubscriptionsFailed ($SubscriptionsFailed -or $UnreadableStreamSummaries.Count -gt 0) -ReportsMissing ($ExitTwoReasons.Count -gt 0)
 $ExitCodeLines = @(Get-WrapperExitCodeSummary -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -SubscriptionsFailed $SubscriptionsFailed -UnreadableStreams $UnreadableStreamSummaries -ReportMade ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile)) -OtherReasons $ExitTwoReasons)
@@ -3016,6 +3191,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -CollectorFailures $Global:CollectorFailures `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
+            -RetryLimited $RetryLimited `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `

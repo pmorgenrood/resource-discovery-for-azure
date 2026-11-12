@@ -116,6 +116,7 @@ if ($SubscriptionIds.Count -eq 0)
             Skipped               = @()
             NoReport              = @()
             Incomplete            = @()
+            NotAttempted          = @()
             ResourceCounts        = @()
             ConsumptionRecords    = 0
             ConsumptionFailedSubs = @()
@@ -188,6 +189,7 @@ catch
             Skipped               = @()
             NoReport              = @()
             Incomplete            = @()
+            NotAttempted          = @()
             ResourceCounts        = @()
             ConsumptionRecords    = 0
             ConsumptionFailedSubs = @()
@@ -262,8 +264,11 @@ $ResourceCounts = @()
 # overload resolution against an empty PowerShell array argument.
 $Completed = @($CompletedIds)
 $FailedSubs = @()
-# Subs this stream skipped on -Resume as completed; reported in the summary so
-# the parent can carry their recorded reports into the consolidated zip.
+# Subs this stream skipped on -Resume as completed (its own file of this run
+# lists them). None today: the parent's pre-filter gives a stream only subs not
+# done, and this file is new each run. A sub skipped here would count as done
+# only through that same file of this run with its report record (the parent's
+# merge rule), and its report would be carried.
 $SkippedSubs = @()
 # Subs this stream collected without a zip being written; reported in the
 # summary so the parent takes them off the unified completed list.
@@ -272,6 +277,8 @@ $NoReportSubs = @()
 # are in the retry list, and the summary names them so the parent also takes
 # them off the unified completed list.
 $IncompleteSubs = @()
+# Subs this stream did not collect because it could not save its write-ahead count.
+$NotAttemptedSubs = @()
 
 # The inner script's $Global:ConsumptionRecordCount / $Global:ConsumptionFailedSubs
 # are *running totals*: ResourceInventory.ps1 only nil-initializes them once and
@@ -306,6 +313,31 @@ for ($i = 0; $i -lt $PairCount; $i++)
     {
         Write-Stream ("skipping (already completed): {0} ({1})" -f $SubName, $SubId) 'DarkGray'
         $SkippedSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
+        continue
+    }
+
+    # Write-ahead count (fail-safe rule, see the wrapper): one more failed run of
+    # the sub is written to this stream's state file, and read back, before it
+    # is collected; only a good result takes it away, and a failure only sets
+    # the reason. If the file does not hold it, the sub is not collected this
+    # run (NotAttempted: the parent counts nothing for it and names it).
+    $Undo = @{ Failed = $FailedAttempts; Completed = $Completed; Reports = $Reports }
+    $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason 'its collection started and no result was saved'
+    $WantCount = Get-FailedAttemptCount -Entry @($FailedAttempts | Where-Object { $_.Id -eq $SubId })[0]
+    $Completed = @($Completed | Where-Object { $_ -ne $SubId })
+    $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
+    Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
+    $Back = Read-StreamState -Path $StreamStateFile
+    $BackEntry = @($Back.Failed | Where-Object { $null -ne $_ -and [string]$_.Id -eq $SubId })
+    if ($BackEntry.Count -eq 0 -or (Get-FailedAttemptCount -Entry $BackEntry[0]) -ne $WantCount)
+    {
+        Write-Stream ("ERROR: could not save this stream's state before collecting {0}, so it is not collected this run" -f $SubName) 'Red'
+        $NotAttemptedSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName; Reason = "its stream could not save its state before collecting it, so it was not collected; free disk space or fix the folder, then run again" }
+        # Not collected, so nothing about it changes (a later save of this
+        # file must not carry its count or drop its completion).
+        $FailedAttempts = $Undo.Failed
+        $Completed = $Undo.Completed
+        $Reports = $Undo.Reports
         continue
     }
 
@@ -374,35 +406,31 @@ for ($i = 0; $i -lt $PairCount; $i++)
             # carry: the sub is not completed. Named in the summary so the parent
             # also ends an earlier run's completion of it in the unified state.
             $NoReportSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
-            if ($Completed -contains $SubId)
-            {
-                $Completed = @($Completed | Where-Object { $_ -ne $SubId })
-                $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
-                Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
-            }
+            # The write-ahead step counted this failed run and took any earlier
+            # completion out; only the reason is set.
+            $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason 'it left no report zip, so it is collected again'
+            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
         elseif ($null -ne $IncompleteReason)
         {
             # Same as the parent's sequential branch: the report was written
             # without some of its metrics or consumption, so the sub goes into
-            # the retry list instead of the completed list.
+            # the retry list instead of the completed list. The write-ahead step
+            # counted this run; only the reason is set.
             Write-Stream ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $SubName) 'Yellow'
             $IncompleteSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName; Reason = $IncompleteReason }
-            $Completed = @($Completed | Where-Object { $_ -ne $SubId })
             $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
-            $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason $IncompleteReason
-            Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
-        }
-        elseif (-not ($Completed -contains $SubId))
-        {
-            $Completed += $SubId
-            # If this is a retry that finally succeeded, drop the sub from
-            # FailedAttempts so the unified resume-state file reflects truth.
-            $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $SubId
+            $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id $SubId -Name $SubName -Reason $IncompleteReason
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
         else
         {
+            # The good result and its report are saved in this file, so the
+            # write-ahead count goes with it: a parent cut off before its merge
+            # leaves a completion the start-up fold takes (#38), and a sub this
+            # stream did not finish keeps its count (#68).
+            $Completed += $SubId
+            $FailedAttempts = Remove-FailedAttempt -Existing $FailedAttempts -Id $SubId
             Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
         }
     }
@@ -453,8 +481,11 @@ for ($i = 0; $i -lt $PairCount; $i++)
         # every failure (rather than only at end-of-stream) means a worker
         # that is killed mid-slice still surfaces its partial failure
         # history to the next -ResumeFailedOnly invocation.
-        $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts `
+        # The write-ahead step counted this failed run; only the reason is set.
+        $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts `
             -Id $SubId -Name $SubName -Reason $ErrRecord.Exception.Message
+        # The write-ahead step already took any earlier completion of it out,
+        # so the file and the summary do not list it as both.
         Write-StreamState -Path $StreamStateFile -Completed @($Completed) -FailedAttempts $FailedAttempts -Reports $Reports
     }
 }
@@ -489,6 +520,7 @@ $Summary = [pscustomobject]@{
     Skipped                = @($SkippedSubs)
     NoReport               = @($NoReportSubs)
     Incomplete             = @($IncompleteSubs)
+    NotAttempted           = @($NotAttemptedSubs)
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
     # Every entry (one per subscription). Not Select-Object -Unique: it treats any

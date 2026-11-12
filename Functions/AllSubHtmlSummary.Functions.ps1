@@ -456,6 +456,11 @@ function New-RdaAllSubHtmlSummary
         # from the earlier run that completed those subscriptions.
         $IncludeFolders = @(),
 
+        # Optional: full paths of report folders that were there before the run
+        # started, left out whatever their time says (a clock moved back), unless
+        # named in -IncludeFolders.
+        $ExcludeFolders = @(),
+
         # Optional run-health collections passed through from the wrapper. Each is an
         # array; when empty the corresponding banner is omitted. A consumption or
         # metrics entry whose ReportFolder names a report folder of this run also
@@ -518,7 +523,8 @@ function New-RdaAllSubHtmlSummary
     if ($null -ne $SinceTime)
     {
         $Included = @($IncludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
-        $Folders = @($Folders | Where-Object { $_.LastWriteTime -ge $SinceTime -or $Included -contains $_.Name })
+        $Excluded = @($ExcludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+        $Folders = @($Folders | Where-Object { ($_.LastWriteTime -ge $SinceTime -and $Excluded -notcontains $_.FullName) -or $Included -contains $_.Name })
     }
 
     $ObfPattern = '^(?:' + (Get-RdaObfuscationTokenPattern) + ')$'

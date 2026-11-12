@@ -80,23 +80,67 @@ Describe 'The per-stream resume state files at the start of a run' {
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
     }
 
-    It 'are folded into the unified file on <Mode>, and kept until the run clears the state' -ForEach @(@{ Mode = '-Resume'; Resume = $true; Rfo = $false }, @{ Mode = '-ResumeFailedOnly'; Resume = $false; Rfo = $true }) {
+    It 'are folded into the unified file and removed on <Mode>, so a later -Resume does not fold them again' -ForEach @(@{ Mode = '-Resume'; Resume = $true; Rfo = $false }, @{ Mode = '-ResumeFailedOnly'; Resume = $false; Rfo = $true }) {
         $null = script:New-StreamFile -Root $script:Root -N 0 -Completed @('sub-a')
         $null = script:New-StreamFile -Root $script:Root -N 1 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'stand-in'; Attempts = 3 })
         $R = script:Invoke-Fold -Root $script:Root -Resume $Resume -ResumeFailedOnly $Rfo
         @($R.Lines | Where-Object { $_ -like 'Recovered per-stream state*' }).Count | Should -Be 1
+        # #38 folds the completion in too; once the unified file holds the
+        # records (read back), the files go (#68), so a later run folds nothing.
         $R.Completed | Should -Be @('sub-a')
         $R.Failed | Should -Be @('sub-x')
-        @(Get-StreamResumeStateFiles -InventoryRoot $script:Root -Tenant 't').Count | Should -Be 2
+        @(Get-StreamResumeStateFiles -InventoryRoot $script:Root -Tenant 't') | Should -BeNullOrEmpty
+        $R2 = script:Invoke-Fold -Root $script:Root -Resume $true
+        @($R2.Lines | Where-Object { $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
     }
 
+    It 'keep the higher count of failed runs over an entry dated later (a clock moved back; <Mode>)' -ForEach @(@{ Mode = '-Resume'; Resume = $true }, @{ Mode = 'a run without -Resume'; Resume = $false }) {
+        Save-CompletedSubscriptionIds -Path (Join-Path $script:Root '.resume-state-t.json') -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = (Get-Date).AddDays(2).ToUniversalTime().ToString('o'); Reason = 'parent'; Attempts = 1 }) -Reports @()
+        $null = script:New-StreamFile -Root $script:Root -N 0 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = (Get-Date).AddDays(-1).ToUniversalTime().ToString('o'); Reason = 'stream'; Attempts = 2 })
+        $null = script:Invoke-Fold -Root $script:Root -Resume $Resume
+        $E = @(Get-FailedAttempts -Path (Join-Path $script:Root '.resume-state-t.json') -Tenant 't' | Where-Object Id -eq 'sub-x')
+        [int]$E[0].Attempts | Should -Be 2
+        [string]$E[0].Reason | Should -Be 'stream'
+    }
+
+    It 'Merge-RecoveredFailedAttempts picks the most failed runs, then the latest time, and drops completed ids' {
+        $Old = [pscustomobject]@{ Id = 'a'; Name = 'A'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'old'; Attempts = 3 }
+        $New = [pscustomobject]@{ Id = 'a'; Name = 'A'; LastFailedAt = '2030-01-01T00:00:00Z'; Reason = 'new'; Attempts = 1 }
+        $T1 = [pscustomobject]@{ Id = 'b'; Name = 'B'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'b1'; Attempts = 2 }
+        $T2 = [pscustomobject]@{ Id = 'b'; Name = 'B'; LastFailedAt = '2026-02-01T00:00:00Z'; Reason = 'b2'; Attempts = 2 }
+        $C = [pscustomobject]@{ Id = 'c'; Name = 'C'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'c'; Attempts = 1 }
+        $R = @(Merge-RecoveredFailedAttempts -ExistingFailedAttempts @($New, $T1, $C) -RecoveredFailedAttempts @($Old, $T2) -CompletedIds @('c'))
+        @($R | ForEach-Object Id | Sort-Object) | Should -Be @('a', 'b')
+        @($R | Where-Object Id -eq 'a')[0].Reason | Should -Be 'old'
+        @($R | Where-Object Id -eq 'b')[0].Reason | Should -Be 'b2'
+    }
+
+    It 'are kept when the saved state does not match what was folded (a retry entry with an older count)' {
+        $State = Join-Path $script:Root '.resume-state-t.json'
+        $Path = script:New-StreamFile -Root $script:Root -N 0 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-02-01T00:00:00Z'; Reason = 'newer'; Attempts = 3 })
+        Save-CompletedSubscriptionIds -Path $State -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'older'; Attempts = 1 }) -Reports @()
+        Mock Save-CompletedSubscriptionIds { }
+        # The read-back fails, so the file stays folded (#38: removed when the
+        # run clears the state), and the run goes on.
+        $null = script:Invoke-Fold -Root $script:Root -Resume $true
+        Test-Path -LiteralPath $Path | Should -BeTrue -Because 'the file on disk still holds the older entry'
+    }
+
+    It 'are kept when the saved retry entry differs only in its time' {
+        $State = Join-Path $script:Root '.resume-state-t.json'
+        $Path = script:New-StreamFile -Root $script:Root -N 0 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-02-01T00:00:00Z'; Reason = 'same'; Attempts = 2 })
+        Save-CompletedSubscriptionIds -Path $State -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'same'; Attempts = 2 }) -Reports @()
+        Mock Save-CompletedSubscriptionIds { }
+        $null = script:Invoke-Fold -Root $script:Root -Resume $true
+        Test-Path -LiteralPath $Path | Should -BeTrue -Because 'the file on disk holds the older time'
+    }
     It 'that cannot be read are moved aside, named and recorded as unread, and their records are not used' {
         $Bad = Join-Path $script:Root '.resume-state-t-stream-3.json'
         Set-Content -LiteralPath $Bad -Value '{ not json' -NoNewline
         $Good = script:New-StreamFile -Root $script:Root -N 0 -Completed @('sub-a')
         $R = script:Invoke-Fold -Root $script:Root -Resume $true
         Test-Path -LiteralPath $Bad | Should -BeFalse
-        Test-Path -LiteralPath $Good | Should -BeTrue
+        Test-Path -LiteralPath $Good | Should -BeFalse -Because 'the unified file holds its records, so the fold removes it (#68)'
         $Aside = @(Get-ChildItem -LiteralPath $script:Root -Force -Filter '.resume-state-t-stream-3.json.unreadable-*')
         $Aside.Count | Should -Be 1
         Get-Content -LiteralPath $Aside[0].FullName -Raw | Should -Be '{ not json'
@@ -111,7 +155,8 @@ Describe 'The per-stream resume state files at the start of a run' {
         $Path = script:New-StreamFile -Root $script:Root -N 0
         Mock Exit-Wrapper { throw ('Exit-Wrapper ' + $Code) }
         $null = script:Invoke-Fold -Root $script:Root -Resume $true
-        Test-Path -LiteralPath $Path | Should -BeTrue
+        # The unified file holds the reconciled state, so the fold removes the file (#68).
+        Test-Path -LiteralPath $Path | Should -BeFalse
     }
 
     It 'let a failure in a per-stream file win over an older completion in the unified file' {
@@ -448,11 +493,14 @@ Describe 'Retry-list entries this run leaves out' {
         @($RetryNotListed | ForEach-Object Id) | Should -Be @('sub-gone')
         $Out = @(. ([scriptblock]::Create($NotListedIf[0].Extent.Text)) 6>&1 | ForEach-Object { [string]$_ })
         @($Out | Where-Object { $_ -like 'Not Listed:*Sub Gone (sub-gone)*this run could not collect them*' }).Count | Should -Be 1
-        $script:WrapperSource | Should -Match ([regex]::Escape('$FailedAttempts.Count - $RetryOwedNotInRun.Count - $RetryNotListed.Count'))
+        # The pending count leaves them out (with those past the retry limit, #68).
+        $script:WrapperSource | Should -Match ([regex]::Escape('$NotListedIdsForPending = @($RetryNotListed | ForEach-Object { [string]$_.Id })'))
+        $script:WrapperSource | Should -Match ([regex]::Escape('$NotListedIdsForPending -notcontains [string]$_.Id }).Count'))
     }
 
     It 'are not counted on the Pending Retries line, which counts only the entries a -ResumeFailedOnly run can retry' {
-        $script:WrapperSource | Should -Match ([regex]::Escape('Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f ($FailedAttempts.Count - $RetryOwedNotInRun.Count - $RetryNotListed.Count))'))
+        $script:WrapperSource | Should -Match ([regex]::Escape('Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f $PendingRetryCount)'))
+        $script:WrapperSource | Should -Match ([regex]::Escape('$PendingRetryCount = @($FailedAttempts | Where-Object { $null -ne $_ -and $RetryLimitedIds -notcontains [string]$_.Id -and $OwedNotInRunIds -notcontains [string]$_.Id'))
     }
 
     It 'leave out a subscription the tenant no longer lists, which no run could collect (sync/pr-61)' -Skip:(-not (Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw).Contains('$ListedSubscriptionIds = ')) {
@@ -543,5 +591,20 @@ Describe 'The run''s exit code and stream summaries around a resume state that w
     It 'removes the stream summaries by literal path' {
         $script:Src | Should -Not -Match ([regex]::Escape('Test-Path -Path $S.SummaryPath'))
         $script:Src | Should -Not -Match ([regex]::Escape('Remove-Item -Path $S.SummaryPath'))
+    }
+}
+
+Describe '-ResumeFailedOnly with an empty retry list and a per-stream file it could not read' {
+    It 'ends with exit 2, not a clean exit 0' {
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Block = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$ResumeFailedOnly' -and $_.Extent.Text.Contains('Nothing to retry') })
+        $Block.Count | Should -Be 1
+        function Exit-Wrapper { param([int]$Code) throw ('Exit-Wrapper ' + $Code) }
+        $ResumeFailedOnly = $true
+        $FailedAttempts = @()
+        $UnreadableStreamFiles = @('/x/.resume-state-t-stream-0.json')
+        $ResumeStateFile = '/x/.resume-state-t.json'
+        $null = $ResumeFailedOnly, $FailedAttempts, $UnreadableStreamFiles, $ResumeStateFile
+        { . ([scriptblock]::Create($Block[0].Extent.Text)) 6>$null } | Should -Throw 'Exit-Wrapper 2'
     }
 }
