@@ -433,7 +433,7 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
         {
             $R2 = script:Invoke-Wrapper -Streams 1
             $R2.ExitCode | Should -Be 2
-            @($R2.Text | Where-Object { $_ -like 'ERROR: The resume state file * could not be saved with one more failed run of Sub B before collecting it, so it is not collected and the run stops here (exit 2).*' }).Count | Should -Be 1
+            @($R2.Text | Where-Object { $_ -like 'ERROR: The resume state file * could not be saved with one more failed run of Sub B (*) before collecting it, so it is not collected and the run stops here (exit 2).*' }).Count | Should -Be 1
             @($R2.Text | Where-Object { $_ -like 'Processing subscription: Sub B*' }) | Should -BeNullOrEmpty -Because 'Sub B is not collected'
             $State = Get-Content -LiteralPath (Join-Path $script:Root ('.resume-state-{0}.json' -f $script:Tenant)) -Raw | ConvertFrom-Json
             @($State.CompletedSubscriptionIds) | Should -Not -Contain $A.Id -Because 'its write-ahead save reached the disk before the lock'
