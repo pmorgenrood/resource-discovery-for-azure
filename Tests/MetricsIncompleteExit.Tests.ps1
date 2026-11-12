@@ -17,13 +17,24 @@ BeforeAll {
     $script:SignIn = [pscustomobject]@{ Name = 'sub-one'; Id = 'id-1'; Message = 'no usable Azure context' }
     $script:Incomplete = [pscustomobject]@{ Name = 'sub-two'; Id = 'id-2'; Message = 'still failed'; ReportFolder = 'ResourcesReport_x'; Complete = $false }
 
-    # The globals the Describes below set and put back. They are given the
-    # values a run of the tool leaves (as an earlier test file can), so the
-    # last Describe can check each Describe put back what was there.
-    $script:SharedGlobals = @('MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'ZipOutputFile', 'DictionaryFile')
+    # What the Describes below set and put back: every global each one keeps
+    # a copy of, and (put back here, at the end of the file) the exit code,
+    # two globals one test sets around a run, and the stand-ins' environment
+    # variables. The six globals a run of the tool leaves get the values it
+    # leaves, and two get stale values an earlier test file could leave, so
+    # each test sets what it reads; the last Describe checks each Describe
+    # put back what was there.
+    $script:SharedGlobals = @('MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'ZipOutputFile', 'DictionaryFile',
+        'DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'MetricsJsonFile', 'JsonFile', 'SmaResources', 'Version',
+        'CollectorFailures', 'ConsumptionRecordCount', 'RdaTestAddEntries', 'RdaTestInventoryChecks', 'InventoryNotWritten', 'InventoryCheckedWritten')
+    $script:FileGlobals = @($script:SharedGlobals) + @('LASTEXITCODE')
+    $script:TestEnvNames = @('RDA_TEST_ZIP_FAIL', 'RDA_TEST_REMOVE_FAIL', 'RDA_TEST_METRICS_WRITE_FAIL', 'RDA_TEST_INVENTORY_WRITE_FAIL', 'RDA_TEST_INVENTORY_PART', 'RDA_TEST_METRICS_GAP')
     $script:GlobalsBeforeFile = @{}
-    foreach ($Name in $script:SharedGlobals) { $script:GlobalsBeforeFile[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } } }
+    foreach ($Name in $script:FileGlobals) { $script:GlobalsBeforeFile[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } } }
+    $script:EnvBeforeFile = @{}
+    foreach ($Name in $script:TestEnvNames) { $script:EnvBeforeFile[$Name] = [Environment]::GetEnvironmentVariable($Name) }
     $Global:MetricsFailedSubs = @(); $Global:ConsumptionFailedSubs = @(); $Global:RdaUnwrittenReportZips = @(); $Global:RdaMetricsWriteFailures = @(); $Global:ZipOutputFile = $null; $Global:DictionaryFile = $null
+    $Global:InventoryNotWritten = $true; $Global:RdaTestInventoryChecks = 'left by an earlier test file'
     function script:Get-SharedGlobalsText
     {
         @($script:SharedGlobals | ForEach-Object { $V = Get-Variable -Name $_ -Scope Global -ErrorAction SilentlyContinue; '{0}={1}' -f $_, $(if ($V) { ConvertTo-Json -InputObject @($V.Value) -Compress -Depth 3 } else { '<unset>' }) })
@@ -32,11 +43,12 @@ BeforeAll {
 }
 
 AfterAll {
-    foreach ($Name in $script:SharedGlobals)
+    foreach ($Name in $script:FileGlobals)
     {
         if ($script:GlobalsBeforeFile[$Name]) { Set-Variable -Name $Name -Scope Global -Value $script:GlobalsBeforeFile[$Name].Value }
         else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
     }
+    foreach ($Name in $script:TestEnvNames) { [Environment]::SetEnvironmentVariable($Name, $script:EnvBeforeFile[$Name]) }
 }
 
 Describe 'Get-MetricsIncompleteEntries' {
@@ -334,6 +346,7 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         $script:SessionZip = Get-Variable -Name ZipOutputFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         $script:SessionDict = Get-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         $script:SessionConsumption = Get-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
+        $script:SessionAddEntries = Get-Variable -Name RdaTestAddEntries -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         $script:ConsumptionSignIn = [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' }
     }
     BeforeEach {
@@ -349,7 +362,8 @@ Describe 'A direct ResourceInventory.ps1 run with incomplete metrics' {
         else { Remove-Variable -Name DictionaryFile -Scope Global -ErrorAction SilentlyContinue }
         if ($script:SessionConsumption) { $Global:ConsumptionFailedSubs = $script:SessionConsumption.Value }
         else { Remove-Variable -Name ConsumptionFailedSubs -Scope Global -ErrorAction SilentlyContinue }
-        Remove-Variable -Name RdaTestAddEntries -Scope Global -ErrorAction SilentlyContinue
+        if ($script:SessionAddEntries) { $Global:RdaTestAddEntries = $script:SessionAddEntries.Value }
+        else { Remove-Variable -Name RdaTestAddEntries -Scope Global -ErrorAction SilentlyContinue }
     }
 
     It 'seeds the command of a masked run from the dictionary it saved' {
@@ -490,6 +504,9 @@ Describe 'The report zip at the end of a ResourceInventory.ps1 run' {
         $script:ZipEnd = Join-Path $TestDrive 'zip-end.ps1'
         Set-Content -LiteralPath $script:ZipEnd -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
+                # The run sets these before the statements lifted here; set them as it
+                # does, so a value the session holds is not read.
+                '$InventoryNotWritten = $false; $InventoryCheckedWritten = $false'
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
                 'function Compress-Archive { [CmdletBinding()] param($Path, $CompressionLevel, $DestinationPath) Set-Content -LiteralPath $DestinationPath -Value ''part''; if ($env:RDA_TEST_ZIP_FAIL) { throw ''The disk is full.'' } }'
@@ -607,6 +624,9 @@ Describe 'A ResourceInventory.ps1 run whose metrics output was not written' {
         $script:MetricsEnd = Join-Path $TestDrive 'metrics-end.ps1'
         Set-Content -LiteralPath $script:MetricsEnd -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
+                # The run sets these before the statements lifted here; set them as it
+                # does, so a value the session holds is not read.
+                '$InventoryNotWritten = $false; $InventoryCheckedWritten = $false'
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
                 'function Out-File { [CmdletBinding()] param([Parameter(Position = 0)][string]$FilePath, [string]$Encoding, [switch]$Append, [Parameter(ValueFromPipeline = $true)]$InputObject) begin { $Items = [System.Collections.Generic.List[object]]::new() } process { $Items.Add($InputObject) } end { if ($env:RDA_TEST_METRICS_WRITE_FAIL -and (Split-Path -Path $FilePath -Leaf) -like ''Metrics_*'') { Write-Error ''There is not enough space on the disk.'' } else { $Items | Microsoft.PowerShell.Utility\Out-File -FilePath $FilePath -Encoding utf8 -Append:$Append } } }'
@@ -862,6 +882,9 @@ Describe 'The files a ResourceInventory.ps1 run puts in its zip' {
         $script:ZipFiles = Join-Path $TestDrive 'zip-files.ps1'
         Set-Content -LiteralPath $script:ZipFiles -Encoding utf8 -Value (@(
                 $Ast.ParamBlock.Extent.Text
+                # The run sets these before the statements lifted here; set them as it
+                # does, so a value the session holds is not read.
+                '$InventoryNotWritten = $false; $InventoryCheckedWritten = $false'
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1') -replace "'", "''")
                 ". '{0}'" -f ((Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1') -replace "'", "''")
                 @($Top[$From..$To] | ForEach-Object { $_.Extent.Text })
@@ -1198,6 +1221,10 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
             $script:SessionValues[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } }
         }
     }
+    BeforeEach {
+        # The stand-in check counts its reads here, from 0 for each test.
+        $Global:RdaTestInventoryChecks = 0
+    }
     AfterAll {
         foreach ($Name in $script:SessionValues.Keys)
         {
@@ -1248,6 +1275,8 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
     }
 
     It 'writes the zip when the caller holds stale Inventory check values' {
+        $Before = @{}
+        foreach ($Name in @('InventoryNotWritten', 'InventoryCheckedWritten')) { $Before[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } } }
         $Global:InventoryNotWritten = $true
         $Global:InventoryCheckedWritten = $true
         try
@@ -1256,7 +1285,11 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
         }
         finally
         {
-            Remove-Variable -Name InventoryNotWritten, InventoryCheckedWritten -Scope Global -ErrorAction SilentlyContinue
+            foreach ($Name in $Before.Keys)
+            {
+                if ($Before[$Name]) { Set-Variable -Name $Name -Scope Global -Value $Before[$Name].Value }
+                else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
+            }
         }
 
         $Result.ExitCode | Should -Be 0
