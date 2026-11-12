@@ -1,7 +1,9 @@
 # Run-AllSubscriptions.ps1: how many subscriptions the end-of-run failure list
-# stands for. A 'stream-N (no summary)' or 'stream-N (corrupt summary)' entry
-# is a whole stream, so it counts the subscriptions of that stream's slice; the
-# console line "Subscriptions Failed" and RunSummary.log both use that count.
+# stands for. A 'stream-N (no summary)', 'stream-N (corrupt summary)' or
+# 'stream-N (summary not this run's)' entry is a whole stream, so it counts the
+# subscriptions of that stream's slice, less those the list already names on
+# their own as '<name> (<id>) (stream-N: ...)'; the console line
+# "Subscriptions Failed" and RunSummary.log both use that count.
 #
 # Offline; placeholder names only.
 #
