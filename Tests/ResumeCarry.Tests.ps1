@@ -1145,8 +1145,8 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         @($After2.Reports | ForEach-Object Id) | Should -Be @('sub-a') -Because 'no report of sub-b is recorded, so none can be carried twice'
         [int](@(Get-FailedAttempts -Path $script:State -Tenant 't' | Where-Object Id -eq 'sub-b')[0].Attempts) | Should -Be 2
         [int](@(Get-FailedAttempts -Path $script:State -Tenant 't' | Where-Object Id -eq 'sub-c')[0].Attempts) | Should -Be 1
-        @($Agg.FailedSubscriptions | Where-Object { $_ -like 'Sub B (stream-0: its stream could not save its result, so it is collected again)' }).Count | Should -Be 1
-        @($Agg.FailedSubscriptions | Where-Object { $_ -like 'Sub C (stream-0: its stream could not save its state before collecting it*' }).Count | Should -Be 1
+        @($Agg.FailedSubscriptions | Where-Object { $_ -like 'Sub B (sub-b) (stream-0: its stream could not save its result, so it is collected again)' }).Count | Should -Be 1
+        @($Agg.FailedSubscriptions | Where-Object { $_ -like 'Sub C (sub-c) (stream-0: its stream could not save its state before collecting it*' }).Count | Should -Be 1
         Remove-Variable -Name RdaStreamSaves -Scope Global -ErrorAction SilentlyContinue
 
         # Run 3, -Resume: sub-a is skipped and carried; sub-b and sub-c are

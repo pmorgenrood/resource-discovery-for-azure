@@ -49,6 +49,23 @@ Describe 'Get-FailedSubscriptionCount' {
         @(Expand-FailedSubscriptionEntries -FailedSubscriptions @('stream-0 (corrupt summary)') -Slices $Slices -CompletedIds @('sub-b')) | Should -Be @('A (sub-a) (stream-0 (corrupt summary))', 'C (sub-c) (stream-0 (corrupt summary))')
     }
 
+    It 'does not count again a sub of a dead stream the run names on its own, and reads a summary of another run as a dead stream' {
+        $Slice = New-Object System.Collections.Generic.List[object]
+        $Slice.Add([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
+        $Slice.Add([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' })
+        $Slices = @(, $Slice)
+        $Own = @('stream-0 (no summary)', 'Sub A (sub-a) (stream-0: its stream ended without a usable summary, so it is collected again)', 'Sub B (sub-b) (stream-0: its stream ended without a usable summary, so it is collected again)')
+        Get-FailedSubscriptionCount -FailedSubscriptions $Own -Slices $Slices | Should -Be 2
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Own -Slices $Slices) | Should -Be @($Own[1], $Own[2])
+        # One named on its own, one not: the stream entry stands for the other.
+        $Half = @('stream-0 (no summary)', $Own[1])
+        Get-FailedSubscriptionCount -FailedSubscriptions $Half -Slices $Slices | Should -Be 2
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Half -Slices $Slices) | Should -Be @('Sub B (sub-b) (stream-0 (no summary))', $Own[1])
+        $Other = @("stream-0 (summary not this run's)")
+        Get-FailedSubscriptionCount -FailedSubscriptions $Other -Slices $Slices | Should -Be 2
+        @(Expand-FailedSubscriptionEntries -FailedSubscriptions $Other -Slices $Slices).Count | Should -Be 2
+    }
+
     It 'counts a stream marker as one when its stream is not known (a sequential run has none)' {
         Get-FailedSubscriptionCount -FailedSubscriptions @('stream-7 (no summary)') -StreamSummaries $null | Should -Be 1
         Get-FailedSubscriptionCount -FailedSubscriptions @() -StreamSummaries $script:Streams | Should -Be 0
