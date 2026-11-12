@@ -1482,8 +1482,10 @@ function Test-OwnFailedEntry
 # not this run's)' entry stands for the
 # subscriptions of that stream's slice (-Slices, by stream number) that are not
 # completed (-CompletedIds: its own state file can record some it finished
-# before it stopped), at least one; without the slice, for SubCount in
-# -StreamSummaries. Every other entry is one subscription.
+# before it stopped) and that the list does not name on its own
+# (Test-OwnFailedEntry): at least one, or none when the list names every one
+# of them; without the slice, for SubCount in -StreamSummaries. Every other
+# entry is one subscription.
 function Get-FailedSubscriptionCount
 {
     param($FailedSubscriptions = @(), $StreamSummaries = @(), $Slices = @(), $CompletedIds = @())
@@ -1777,8 +1779,8 @@ function Get-RunSummaryLogContent
             $Lines.Add('Failed subscriptions (detail):')
             # Run-AllSubscriptions.ps1 collects each failure as a line of text
             # ('<name> (<id>)', '<name> (<id>) (stream-N: <reason>)', 'stream-N
-            # (no summary)' or 'stream-N (corrupt summary)'), which has no Name
-            # or Id; an object carries both.
+            # (no summary)', 'stream-N (corrupt summary)' or 'stream-N (summary
+            # not this run's)'), which has no Name or Id; an object carries both.
             foreach ($FailedSub in $Failed)
             {
                 if ($FailedSub -is [string]) { $Lines.Add(('  - {0}' -f $FailedSub)) }
