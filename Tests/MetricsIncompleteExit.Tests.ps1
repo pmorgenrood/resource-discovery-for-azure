@@ -6,6 +6,11 @@
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+    # The tool's function files define these as global functions; what the
+    # session had before this file is put back at its end.
+    $script:ToolGlobalFunctions = @('Write-Log', 'Protect-FreeTextValue', 'Protect-DiagnosticText')
+    $script:FunctionsBeforeFile = @{}
+    foreach ($Name in $script:ToolGlobalFunctions) { $script:FunctionsBeforeFile[$Name] = Get-Item -LiteralPath ('Function:\' + $Name) -ErrorAction SilentlyContinue | ForEach-Object { $_.ScriptBlock } }
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
     function Get-ScriptAst
@@ -28,8 +33,8 @@ BeforeAll {
         'DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'MetricsJsonFile', 'JsonFile', 'SmaResources', 'Version',
         'CollectorFailures', 'ConsumptionRecordCount', 'RdaTestAddEntries', 'RdaTestInventoryChecks', 'InventoryNotWritten', 'InventoryCheckedWritten')
     # shortcut: the exit code is put back only at the end of the file (the
-    # tests set it), so only a run of a later file in the same session checks
-    # that; check it in a cross-file test if one is added.
+    # tests set it), and Invoke-Pester sets it again when it ends, so no test
+    # here checks that put-back; the last Describe checks the others.
     $script:FileGlobals = @($script:SharedGlobals) + @('LASTEXITCODE')
     $script:TestEnvNames = @('RDA_TEST_ZIP_FAIL', 'RDA_TEST_REMOVE_FAIL', 'RDA_TEST_METRICS_WRITE_FAIL', 'RDA_TEST_INVENTORY_WRITE_FAIL', 'RDA_TEST_INVENTORY_PART', 'RDA_TEST_METRICS_GAP')
     $script:GlobalsBeforeFile = @{}
@@ -52,6 +57,11 @@ AfterAll {
         else { Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue }
     }
     foreach ($Name in $script:TestEnvNames) { [Environment]::SetEnvironmentVariable($Name, $script:EnvBeforeFile[$Name]) }
+    foreach ($Name in $script:ToolGlobalFunctions)
+    {
+        if ($script:FunctionsBeforeFile[$Name]) { Set-Item -LiteralPath ('Function:\global:' + $Name) -Value $script:FunctionsBeforeFile[$Name] }
+        else { Remove-Item -LiteralPath ('Function:\' + $Name) -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'Get-MetricsIncompleteEntries' {
@@ -1886,5 +1896,17 @@ Describe 'The globals these tests set' {
 
     It 'leave none of the stand-ins'' environment variables set (each helper clears its own)' {
         @($script:TestEnvNames | Where-Object { $null -ne [Environment]::GetEnvironmentVariable($_) }) | Should -BeNullOrEmpty
+    }
+}
+
+# The file's own end, which no test inside the file can see: run in a new
+# PowerShell session that already holds its own Write-Log, every other test
+# of this file, then look at what that session is left with.
+Describe 'The end of this test file' -Tag 'NestedRunCheck' {
+    It 'puts back the global functions the tool''s function files define, the globals and the test environment variables' {
+        $File = $PSCommandPath -replace "'", "''"
+        $Command = "function global:Write-Log { 'before this file' }; `$Global:ZipOutputFile = 'before this file'; `$env:RDA_TEST_ZIP_FAIL = 'before this file'; Import-Module Pester; `$c = New-PesterConfiguration; `$c.Run.Path = '$File'; `$c.Filter.ExcludeTag = 'NestedRunCheck'; `$c.Output.Verbosity = 'None'; `$null = Invoke-Pester -Configuration `$c; 'Write-Log=' + (Get-Item -LiteralPath 'Function:\Write-Log').ScriptBlock.ToString().Trim(); 'Protect-FreeTextValue=' + [bool](Get-Item -LiteralPath 'Function:\Protect-FreeTextValue' -ErrorAction SilentlyContinue); 'Protect-DiagnosticText=' + [bool](Get-Item -LiteralPath 'Function:\Protect-DiagnosticText' -ErrorAction SilentlyContinue); 'ZipOutputFile=' + `$Global:ZipOutputFile; 'RDA_TEST_ZIP_FAIL=' + `$env:RDA_TEST_ZIP_FAIL"
+        $Lines = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -Command $Command 2>$null | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^(Write-Log|Protect-FreeTextValue|Protect-DiagnosticText|ZipOutputFile|RDA_TEST_ZIP_FAIL)=' })
+        $Lines | Should -Be @("Write-Log='before this file'", 'Protect-FreeTextValue=False', 'Protect-DiagnosticText=False', 'ZipOutputFile=before this file', 'RDA_TEST_ZIP_FAIL=before this file')
     }
 }
