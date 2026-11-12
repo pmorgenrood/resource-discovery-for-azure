@@ -3325,6 +3325,10 @@ if ($null -ne $BundleBuildError)
     Write-Host ""
     Write-Host "================ FAILED (consolidated zip) ================" -ForegroundColor Red
     Write-Host $BundleBuildError -ForegroundColor Red
+    # A run without its consolidated zip is not clean: a write-back below that
+    # does not reach the disk then leaves the not-saved mark (see
+    # Set-NotSavedResumeStateAside), so -ResumeFailedOnly does not call it done.
+    $RunClean = $false
     # A zip that failed after the clean-run clear above (when it took its name,
     # or while the run summary was added): the state is saved again, so the
     # next -Resume carries the completed reports into a new zip.

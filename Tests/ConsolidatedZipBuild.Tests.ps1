@@ -568,6 +568,26 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
         $Printed | Should -Not -Contain 'Fix the cause (for example, free up disk space), then run again.'
     }
 
+    It 'a late failure after the clean-run clear makes the run not clean, so a write-back that fails leaves the not-saved mark' {
+        $Inv = Join-Path $TestDrive 'inv-late'
+        New-Item -ItemType Directory -Path $Inv -Force | Out-Null
+        # Set-Variable: these are read only by the lifted block.
+        Set-Variable -Name InventoryRoot -Value $Inv
+        Set-Variable -Name ResumeStateFile -Value (Join-Path $Inv '.resume-state-t.json')
+        Set-Variable -Name CompletedIds -Value @('sub-a')
+        Set-Variable -Name CompletedReports -Value @()
+        Set-Variable -Name FailedAttempts -Value @()
+        Set-Variable -Name KeptAsideRemoved -Value $false
+        Set-Variable -Name InventoryFolderGone -Value $false
+        Set-Variable -Name BundleBuildError -Value 'The consolidated zip was lost while the run summary was added to it: the zip is not on disk.'
+        $RunClean = $true
+        # The write-back does not reach the disk.
+        function Save-CompletedSubscriptionIds { $script:ResumeStateSaveFailed = $true }
+        $Printed = @(. $script:BannerBlock 6>&1 | ConvertTo-Lines)
+        @($Printed | Where-Object { $_ -like 'WARNING: The resume state file * could not be written again*' }).Count | Should -Be 1
+        $RunClean | Should -BeFalse -Because 'the put-aside step then makes the not-saved mark, so -ResumeFailedOnly does not call the run done'
+    }
+
     It 'no banner when the zip was built' {
         Set-Variable -Name InventoryRoot -Value (Join-Path $TestDrive 'inv')
         Set-Variable -Name BundleBuildError -Value $null
