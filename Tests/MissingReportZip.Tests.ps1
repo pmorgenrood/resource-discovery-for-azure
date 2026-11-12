@@ -412,7 +412,7 @@ Describe 'A report zip lost when the resume state cannot be written either' -Ski
         {
             $R1 = script:Invoke-Wrapper -Streams 1
             $R1.ExitCode | Should -Be 2
-            @($R1.Text | Where-Object { $_ -like 'The resume state file * could not be updated and still lists some of them as completed*run again without -Resume*' }).Count | Should -Be 1
+            @($R1.Text | Where-Object { $_ -like 'The resume state file * could not be updated with this run''s results: see FAILED (resume state not saved) below*' }).Count | Should -Be 1
             @($R1.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
         }
         finally { & chmod 755 $script:Root }
@@ -443,7 +443,7 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
 }
 
 Describe 'The last subscription writes no zip and the resume state cannot be updated after its write-ahead count' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
-    It 'names it under FAILED (report missing), says -Resume collects it, and names the unsaved state under FAILED (resume state not saved)' {
+    It 'names it under FAILED (report missing) and points to FAILED (resume state not saved) for how to run again' {
         script:New-Case
         $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
         script:Set-Scenario -NoZip @($C.Id) -LockBy $C.Id
@@ -452,11 +452,11 @@ Describe 'The last subscription writes no zip and the resume state cannot be upd
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 2
             @($R.Text | Where-Object { $_ -like ('  - {0} ({1})*' -f $C.Name, $C.Id) }).Count | Should -BeGreaterThan 0
-            # Its write-ahead save took its completion out (read back), so a
-            # -Resume collects it; the save that failed after it is named under
-            # FAILED (resume state not saved).
-            @($R.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }).Count | Should -Be 1
-            @($R.Text | Where-Object { $_ -like '*FAILED (resume state not saved)*' }).Count | Should -Be 1
+            # The save that failed after its write-ahead save is named under
+            # FAILED (resume state not saved), which says how to run again.
+            @($R.Text | Where-Object { $_ -like 'The resume state file * could not be updated with this run''s results: see FAILED (resume state not saved) below*' }).Count | Should -Be 1
+            @($R.Text | Where-Object { $_ -like 'The resume state is kept. Run again with -Resume*' }) | Should -BeNullOrEmpty
+            @($R.Text | Where-Object { $_ -like '=*= FAILED (resume state not saved) =*=' }).Count | Should -Be 1
         }
         finally { & chmod 755 $script:Root }
     }
@@ -464,19 +464,19 @@ Describe 'The last subscription writes no zip and the resume state cannot be upd
 
 Describe 'RunSummary.log advice for a missing report' {
     BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
-    It 'says to run again without -Resume when the resume state still lists one as completed, as the console does' {
+    It 'points to the Resume state line when the resume state still lists one as completed, as the console does' {
         $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
         $Kept = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -MissingStateNotSaved)
-        @($Kept | Where-Object { $_ -like '  Report missing      : 1 (*run again without -Resume)' }).Count | Should -Be 1
+        @($Kept | Where-Object { $_ -like '  Report missing      : 1 (*see the Resume state line)' }).Count | Should -Be 1
         @($Kept | Where-Object { $_ -like '*a -Resume collects them*' }) | Should -BeNullOrEmpty
         $Saved = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing)
         @($Saved | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
     }
 
-    It 'after a failed save alone, says a -Resume collects them and names the state on its own line, as the console does' {
+    It 'after a failed save alone, points to the Resume state line, which says the state is put aside, as the console does' {
         $Missing = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' })
         $Lines = @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -MissingReportCount 1 -MissingReports $Missing -ResumeStateNotSaved)
-        @($Lines | Where-Object { $_ -like '  Report missing      : 1 (*a -Resume collects them)' }).Count | Should -Be 1
+        @($Lines | Where-Object { $_ -like '  Report missing      : 1 (*see the Resume state line)' }).Count | Should -Be 1
         @($Lines | Where-Object { $_ -like '  Resume state        : NOT SAVED (*put aside as not saved*' }).Count | Should -Be 1
         @($Lines | Where-Object { $_ -like '*still lists some*' -or $_ -like '*may still list*' }) | Should -BeNullOrEmpty
     }
@@ -484,10 +484,9 @@ Describe 'RunSummary.log advice for a missing report' {
     It 'the wrapper passes the read-back flag and the NOT SAVED switch apart, and the console uses both' {
         $Src = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
         $Src | Should -Match ([regex]::Escape('-MissingStateNotSaved:$MissingStateNotSaved `'))
-        # The read-back decides the 'without -Resume' advice; a failed save alone
-        # is named under FAILED (resume state not saved), which puts that state aside.
+        # A failed save (the read-back may also find a missing one still listed)
+        # points to FAILED (resume state not saved), which says how to run again.
         $Src | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and -not $RunClean) `'))
-        $Src | Should -Match ([regex]::Escape('if ($MissingStateNotSaved)'))
-        $Src | Should -Match ([regex]::Escape("'may still list some of them as completed, so a -Resume could skip them'"))
+        $Src | Should -Match ([regex]::Escape('if ($ResumeStateSaveFailed -or $MissingStateNotSaved)'))
     }
 }
