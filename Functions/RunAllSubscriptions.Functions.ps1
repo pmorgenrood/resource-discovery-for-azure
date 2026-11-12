@@ -1791,7 +1791,7 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Failed    : {0}' -f $FailedCount))
     $Lines.Add(('  Retry limit reached : {0} (incomplete; -Resume and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
     $Lines.Add(('  Not in this run     : {0} (on the retry list, but not in this run''s subscription set; incomplete)' -f $LeftOut.Count))
-    if ($ResumeStateNotSaved) { $Lines.Add('  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)') }
+    if ($ResumeStateNotSaved) { $Lines.Add('  Resume state        : NOT SAVED (it does not hold this run''s results, so it is put aside as not saved; see FAILED (resume state not saved) on the console)') }
     if ($MissingTotal -gt 0)
     {
         # After a failed save alone the state may list them (the console says the same).
