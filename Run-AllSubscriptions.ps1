@@ -1434,7 +1434,7 @@ if ($ParallelStreams -le 1)
         $WriteAhead = Save-WriteAheadAttempt -Path $ResumeStateFile -Tenant $TenantID -Id $Sub.Id -Name $Sub.Name -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
         if (-not $WriteAhead.Saved)
         {
-            Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name) -ForegroundColor Red
+            Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} ({2}) before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name, $Sub.Id) -ForegroundColor Red
             Exit-Wrapper -Code 2
         }
         $CompletedIds = $WriteAhead.CompletedIds
@@ -1687,7 +1687,7 @@ else
             $WriteAhead = Save-WriteAheadAttempt -Path $ResumeStateFile -Tenant $TenantID -Id $Sub.Id -Name $Sub.Name -CompletedIds $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
             if (-not $WriteAhead.Saved)
             {
-                Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name) -ForegroundColor Red
+                Write-Host ("ERROR: The resume state file {0} could not be saved with one more failed run of {1} ({2}) before collecting it, so it is not collected and the run stops here (exit 2). Free disk space or fix the folder, then run again." -f $ResumeStateFile, $Sub.Name, $Sub.Id) -ForegroundColor Red
                 Exit-Wrapper -Code 2
             }
             $CompletedIds = $WriteAhead.CompletedIds
