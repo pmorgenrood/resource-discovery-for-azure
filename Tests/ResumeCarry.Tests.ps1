@@ -1064,6 +1064,7 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         @($Summary.Completed) | Should -Be @('sub-b') -Because 'the stream does not count sub-a as completed either'
         @($Summary.NoReport | ForEach-Object Id) | Should -Be @('sub-a')
         @($Agg.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b') -Because 'sub-a still counts as collected this run, so the verification still sees its zip missing'
+        @($Agg.FailedSubscriptions | Where-Object { $_ -like '*(sub-a)*left no report zip*' }) | Should -BeNullOrEmpty -Because 'it is named once, under FAILED (report missing), as on the sequential path'
         @($R.Run.SkippedSubscriptions | ForEach-Object Id) | Should -Be @('sub-b')
         @($R.Run.SubResourceCounts | ForEach-Object Id) | Should -Be @('sub-a') -Because 'the -Resume run must collect sub-a again'
         ($R.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 1 successful sub\(s\) this run \+ 1 carried'

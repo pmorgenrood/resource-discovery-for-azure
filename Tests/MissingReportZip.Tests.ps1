@@ -442,6 +442,22 @@ Describe 'A subscription that wrote no zip while the resume state cannot be upda
     }
 }
 
+Describe 'The last subscription writes no zip and the resume state cannot be updated after its write-ahead count' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
+    It 'names it under FAILED (report missing) and says to run again without -Resume' {
+        script:New-Case
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        script:Set-Scenario -NoZip @($C.Id) -LockBy $C.Id
+        try
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 2
+            @($R.Text | Where-Object { $_ -like ('  - {0} ({1})*' -f $C.Name, $C.Id) }).Count | Should -BeGreaterThan 0
+            @($R.Text | Where-Object { $_ -like 'The resume state file * could not be updated and *run again without -Resume*' }).Count | Should -Be 1
+        }
+        finally { & chmod 755 $script:Root }
+    }
+}
+
 Describe 'RunSummary.log advice for a missing report' {
     BeforeAll { . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1') }
     It 'says to run again without -Resume when the resume state still lists one as completed, as the console does' {

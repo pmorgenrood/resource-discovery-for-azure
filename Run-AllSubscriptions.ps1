@@ -2210,8 +2210,10 @@ else
                 $UName = [string](@(@($PendingSubscriptions) + @($FailedAttempts) | Where-Object { $null -ne $_ -and [string]$_.Id -eq $U.Id -and $_.Name } | Select-Object -First 1).Name)
                 $U | Add-Member -NotePropertyName Name -NotePropertyValue $(if ($UName) { $UName } else { $U.Id })
                 Write-Host ("[stream-{0}] WARNING: {1} is not counted done: {2}." -f $U.StreamId, $U.Name, $U.Reason) -ForegroundColor Yellow
-                # By name and id, as every per-sub failure line of this branch.
-                $FailedSubscriptions += ("{0} ({1}) (stream-{2}: {3})" -f $U.Name, $U.Id, $U.StreamId, $U.Reason)
+                # By name and id, as every per-sub failure line of this branch. A
+                # sub that left no zip is named under FAILED (report missing)
+                # instead ($NoReportSubs), as on the sequential path.
+                if ($StreamNoReportIds -notcontains [string]$U.Id) { $FailedSubscriptions += ("{0} ({1}) (stream-{2}: {3})" -f $U.Name, $U.Id, $U.StreamId, $U.Reason) }
             }
             if ($AllCompletedFromStreams.Count -gt 0)
             {
