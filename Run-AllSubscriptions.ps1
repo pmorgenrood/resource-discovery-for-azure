@@ -1998,7 +1998,7 @@ else
                     foreach ($n in @($StreamSummary.NotAttempted | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) }))
                     {
                         $StreamNotAttemptedIds += [string]$n.Id
-                        $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $n.Name, $S.StreamId, $n.Reason)
+                        $FailedSubscriptions += ("{0} ({1}) (stream-{2}: {3})" -f $n.Name, $n.Id, $S.StreamId, $n.Reason)
                     }
                 }
 
@@ -2177,7 +2177,8 @@ else
                 $UName = [string](@(@($PendingSubscriptions) + @($FailedAttempts) | Where-Object { $null -ne $_ -and [string]$_.Id -eq $U.Id -and $_.Name } | Select-Object -First 1).Name)
                 $U | Add-Member -NotePropertyName Name -NotePropertyValue $(if ($UName) { $UName } else { $U.Id })
                 Write-Host ("[stream-{0}] WARNING: {1} is not counted done: {2}." -f $U.StreamId, $U.Name, $U.Reason) -ForegroundColor Yellow
-                $FailedSubscriptions += ("{0} (stream-{1}: {2})" -f $U.Name, $U.StreamId, $U.Reason)
+                # By name and id, as every per-sub failure line of this branch.
+                $FailedSubscriptions += ("{0} ({1}) (stream-{2}: {3})" -f $U.Name, $U.Id, $U.StreamId, $U.Reason)
             }
             if ($AllCompletedFromStreams.Count -gt 0)
             {
