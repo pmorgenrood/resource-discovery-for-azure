@@ -27,12 +27,15 @@ BeforeAll {
     $script:SharedGlobals = @('MetricsFailedSubs', 'ConsumptionFailedSubs', 'RdaUnwrittenReportZips', 'RdaMetricsWriteFailures', 'ZipOutputFile', 'DictionaryFile',
         'DefaultPath', 'ReportName', 'CurrentDateTime', 'HtmlFile', 'ConsumptionFileCsv', 'MetricsJsonFile', 'JsonFile', 'SmaResources', 'Version',
         'CollectorFailures', 'ConsumptionRecordCount', 'RdaTestAddEntries', 'RdaTestInventoryChecks', 'InventoryNotWritten', 'InventoryCheckedWritten')
+    # shortcut: the exit code is put back only at the end of the file (the
+    # tests set it), so only a run of a later file in the same session checks
+    # that; check it in a cross-file test if one is added.
     $script:FileGlobals = @($script:SharedGlobals) + @('LASTEXITCODE')
     $script:TestEnvNames = @('RDA_TEST_ZIP_FAIL', 'RDA_TEST_REMOVE_FAIL', 'RDA_TEST_METRICS_WRITE_FAIL', 'RDA_TEST_INVENTORY_WRITE_FAIL', 'RDA_TEST_INVENTORY_PART', 'RDA_TEST_METRICS_GAP')
     $script:GlobalsBeforeFile = @{}
     foreach ($Name in $script:FileGlobals) { $script:GlobalsBeforeFile[$Name] = Get-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Value = $_.Value } } }
     $script:EnvBeforeFile = @{}
-    foreach ($Name in $script:TestEnvNames) { $script:EnvBeforeFile[$Name] = [Environment]::GetEnvironmentVariable($Name) }
+    foreach ($Name in $script:TestEnvNames) { $script:EnvBeforeFile[$Name] = [Environment]::GetEnvironmentVariable($Name); [Environment]::SetEnvironmentVariable($Name, $null) }
     $Global:MetricsFailedSubs = @(); $Global:ConsumptionFailedSubs = @(); $Global:RdaUnwrittenReportZips = @(); $Global:RdaMetricsWriteFailures = @(); $Global:ZipOutputFile = $null; $Global:DictionaryFile = $null
     $Global:InventoryNotWritten = $true; $Global:RdaTestInventoryChecks = 'left by an earlier test file'
     function script:Get-SharedGlobalsText
@@ -1298,7 +1301,6 @@ Describe 'A ResourceInventory.ps1 run whose Inventory file write failed' {
     }
 
     It 'reads the Inventory file once when the zip step checks the same file' {
-        $Global:RdaTestInventoryChecks = 0
         $Result = Invoke-InventoryFlow -Arguments @{ TenantID = 'tenant-1' }
 
         $Result.ExitCode | Should -Be 0
@@ -1866,5 +1868,9 @@ Describe 'The consolidation of a Run-AllSubscriptions.ps1 run' {
 Describe 'The globals these tests set' {
     It 'are as they were before the first Describe' {
         @(script:Get-SharedGlobalsText) | Should -Be $script:SharedGlobalsAtStart
+    }
+
+    It 'leave none of the stand-ins'' environment variables set (each helper clears its own)' {
+        @($script:TestEnvNames | Where-Object { $null -ne [Environment]::GetEnvironmentVariable($_) }) | Should -BeNullOrEmpty
     }
 }
