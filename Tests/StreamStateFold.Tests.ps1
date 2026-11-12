@@ -34,9 +34,13 @@ BeforeAll {
         if ($Body[$i] -is [System.Management.Automation.Language.ForEachStatementAst] -and $Body[$i].Condition.Extent.Text -eq '$StreamSummaries' -and $Body[$i].Body.Extent.Text -match 'ResourceCounts') { $AggStart = $i; break }
     }
     if ($AggStart -lt 0) { throw 'expected the stream-summary loop in the wrapper' }
+    # From the loop's list initializers on, so the lifted block starts them as the wrapper does.
+    for ($i = $AggStart - 1; $i -ge 0 -and $Body[$i].Extent.Text -match '^\$Stream\w+ = @\(\)$'; $i--) { $AggStart = $i }
+    if ($Body[$AggStart].Extent.Text -notmatch '^\$Stream\w+ = @\(\)$') { throw 'expected the list initializers before the stream-summary loop' }
+    # A run id, as the wrapper makes one for its streams; the fixtures carry it.
     $script:MergeBlock = [scriptblock]::Create(
         "param(`$StreamSummaries, `$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n" +
-        "`$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$GoneIds = @(); `$RunStartTime = (Get-Date).AddMinutes(-1)`n" +
+        "`$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$GoneIds = @(); `$RunStartTime = (Get-Date).AddMinutes(-1); `$StreamRunId = 'run-1'`n" +
         (@($Body[$AggStart..($Body.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n"))
     $TmpBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { '/tmp' }
     $script:TestBase = Join-Path $TmpBase ('StreamStateFold_' + [guid]::NewGuid().ToString().Substring(0, 8))
@@ -46,7 +50,15 @@ BeforeAll {
     {
         param([string]$Root, [int]$N, [string[]]$Completed = @(), [object[]]$Failed = @())
         $Path = Join-Path $Root ('.resume-state-t-stream-{0}.json' -f $N)
-        [pscustomobject]@{ Tenant = 't'; Completed = @($Completed); FailedAttempts = @($Failed); Reports = @() } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8
+        # Each completed sub with its report record, as a stream writes it (a
+        # completion without one is collected again).
+        $Reports = @(foreach ($Id in $Completed)
+            {
+                $Zip = Join-Path $Root ('report-{0}.zip' -f $Id)
+                Set-Content -LiteralPath $Zip -Value 'zip'
+                New-CompletedReportRecord -InventoryRoot $Root -Id $Id -Name $Id -ZipPath $Zip -Obfuscated $false
+            })
+        [pscustomobject]@{ RunId = 'run-1'; Tenant = 't'; StreamId = '0'; Completed = @($Completed); FailedAttempts = @($Failed); Reports = @($Reports) } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8
         $Path
     }
 
@@ -82,15 +94,38 @@ Describe 'The per-stream resume state files at the start of a run' {
         $null = script:New-StreamFile -Root $script:Root -N 1 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'stand-in'; Attempts = 3 })
         $R = script:Invoke-Fold -Root $script:Root -Resume $Resume -ResumeFailedOnly $Rfo
         @($R.Lines | Where-Object { $_ -like 'Recovered per-stream state*' }).Count | Should -Be 1
-        $R.Completed | Should -Be @('sub-a')
+        # Fail-safe rule: the cut-off run never proved its results saved, so its
+        # completion is not folded in (sub-a is collected again); its failure is.
+        $R.Completed | Should -BeNullOrEmpty
         $R.Failed | Should -Be @('sub-x')
         @(Get-StreamResumeStateFiles -InventoryRoot $script:Root -Tenant 't') | Should -BeNullOrEmpty
         $R2 = script:Invoke-Fold -Root $script:Root -Resume $true
         @($R2.Lines | Where-Object { $_ -like 'Recovered per-stream state*' }) | Should -BeNullOrEmpty
     }
 
+    It 'keep the higher count of failed runs over an entry dated later (a clock moved back; <Mode>)' -ForEach @(@{ Mode = '-Resume'; Resume = $true }, @{ Mode = 'a run without -Resume'; Resume = $false }) {
+        Save-CompletedSubscriptionIds -Path (Join-Path $script:Root '.resume-state-t.json') -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = (Get-Date).AddDays(2).ToUniversalTime().ToString('o'); Reason = 'parent'; Attempts = 1 }) -Reports @()
+        $null = script:New-StreamFile -Root $script:Root -N 0 -Failed @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = (Get-Date).AddDays(-1).ToUniversalTime().ToString('o'); Reason = 'stream'; Attempts = 2 })
+        $null = script:Invoke-Fold -Root $script:Root -Resume $Resume
+        $E = @(Get-FailedAttempts -Path (Join-Path $script:Root '.resume-state-t.json') -Tenant 't' | Where-Object Id -eq 'sub-x')
+        [int]$E[0].Attempts | Should -Be 2
+        [string]$E[0].Reason | Should -Be 'stream'
+    }
+
+    It 'Merge-RecoveredFailedAttempts picks the most failed runs, then the latest time, and drops completed ids' {
+        $Old = [pscustomobject]@{ Id = 'a'; Name = 'A'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'old'; Attempts = 3 }
+        $New = [pscustomobject]@{ Id = 'a'; Name = 'A'; LastFailedAt = '2030-01-01T00:00:00Z'; Reason = 'new'; Attempts = 1 }
+        $T1 = [pscustomobject]@{ Id = 'b'; Name = 'B'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'b1'; Attempts = 2 }
+        $T2 = [pscustomobject]@{ Id = 'b'; Name = 'B'; LastFailedAt = '2026-02-01T00:00:00Z'; Reason = 'b2'; Attempts = 2 }
+        $C = [pscustomobject]@{ Id = 'c'; Name = 'C'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'c'; Attempts = 1 }
+        $R = @(Merge-RecoveredFailedAttempts -ExistingFailedAttempts @($New, $T1, $C) -RecoveredFailedAttempts @($Old, $T2) -CompletedIds @('c'))
+        @($R | ForEach-Object Id | Sort-Object) | Should -Be @('a', 'b')
+        @($R | Where-Object Id -eq 'a')[0].Reason | Should -Be 'old'
+        @($R | Where-Object Id -eq 'b')[0].Reason | Should -Be 'b2'
+    }
+
     It 'are kept and named, and the run stops before any stream could write over them, when the unified file does not hold their records afterwards' {
-        $Path = script:New-StreamFile -Root $script:Root -N 0 -Completed @('sub-a')
+        $Path = script:New-StreamFile -Root $script:Root -N 0 -Failed @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'stand-in'; Attempts = 1 })
         Mock Save-CompletedSubscriptionIds { }
         Mock Exit-Wrapper { throw ('Exit-Wrapper ' + $Code) }
         $script:Out = @()
@@ -276,7 +311,7 @@ Describe 'The end-of-run merge of the per-stream resume state files' {
         New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
         $script:State = Join-Path $script:Root '.resume-state-t.json'
         $script:Summary = Join-Path $script:Root '.rda-stream-0-summary.json'
-        @{ StreamId = '0'; Tenant = 't'; Status = 'partial-failure'; Completed = @('sub-a'); ResourceCounts = @(); Failed = @(@{ Id = 'sub-b'; Name = 'Sub B'; Reason = 'stand-in failure' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:Summary -Encoding utf8
+        @{ RunId = 'run-1'; StreamId = '0'; Tenant = 't'; Status = 'partial-failure'; Completed = @('sub-a'); ResourceCounts = @(); Failed = @(@{ Id = 'sub-b'; Name = 'Sub B'; Reason = 'stand-in failure' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:Summary -Encoding utf8
         $script:Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $script:Summary; FailuresPath = (Join-Path $script:Root 'failures-stream-0.log'); SubCount = 2 })
         Set-Variable -Name Subscriptions -Value @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' })
     }
@@ -304,7 +339,7 @@ Describe 'The end-of-run merge of the per-stream resume state files' {
 
     It 'counts a failure the stream''s own file recorded once, not again from the summary' {
         # The stream recorded the failure this run (a time after the run's start).
-        [pscustomobject]@{ Tenant = 't'; Completed = @('sub-a'); FailedAttempts = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = (Get-Date).ToUniversalTime().ToString('o'); Reason = 'stand-in failure'; Attempts = 1 }); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t-stream-0.json') -Encoding utf8
+        [pscustomobject]@{ RunId = 'run-1'; Tenant = 't'; StreamId = '0'; Completed = @('sub-a'); FailedAttempts = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = (Get-Date).ToUniversalTime().ToString('o'); Reason = 'stand-in failure'; Attempts = 1 }); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:Root '.resume-state-t-stream-0.json') -Encoding utf8
         Set-Variable -Name UnreadableStreamFiles -Value @()
         Set-Variable -Name LeftStreamFiles -Value @()
         $null = & { . $script:MergeBlock $script:Streams $script:Root 't' $script:State @() @() @() } 6>$null
@@ -313,7 +348,7 @@ Describe 'The end-of-run merge of the per-stream resume state files' {
 
     It 'keeps the resume state for the per-stream files it keeps because the state does not hold their records' {
         $File = Join-Path $script:Root '.resume-state-t-stream-0.json'
-        [pscustomobject]@{ Tenant = 't'; Completed = @('sub-a'); FailedAttempts = @(); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $File -Encoding utf8
+        [pscustomobject]@{ RunId = 'run-1'; Tenant = 't'; StreamId = '0'; Completed = @('sub-a'); FailedAttempts = @(); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $File -Encoding utf8
         Mock Test-ResumeStateSaved { $false }
         Set-Variable -Name UnreadableStreamFiles -Value @()
         Set-Variable -Name LeftStreamFiles -Value @()
@@ -324,7 +359,7 @@ Describe 'The end-of-run merge of the per-stream resume state files' {
 
     It 'records a merged file it cannot remove, so the run keeps the state and ends with exit 2' {
         $File = Join-Path $script:Root '.resume-state-t-stream-0.json'
-        [pscustomobject]@{ Tenant = 't'; Completed = @('sub-a'); FailedAttempts = @(); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $File -Encoding utf8
+        [pscustomobject]@{ RunId = 'run-1'; Tenant = 't'; StreamId = '0'; Completed = @('sub-a'); FailedAttempts = @(); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $File -Encoding utf8
         Mock Remove-Item -ParameterFilter { $LiteralPath -like '*-stream-*.json' } -MockWith { throw 'stand-in: read-only' }
         Set-Variable -Name UnreadableStreamFiles -Value @()
         Set-Variable -Name LeftStreamFiles -Value @()
@@ -433,7 +468,7 @@ Describe 'The end-of-run merge reads stream summaries by literal path' {
         $Root = Join-Path $script:TestBase 'sum[1]'
         New-Item -ItemType Directory -Path $Root -Force | Out-Null
         $Summary = Join-Path $Root '.rda-stream-0-summary.json'
-        @{ StreamId = '0'; Tenant = 't'; Status = 'partial-failure'; Completed = @(); ResourceCounts = @(); Failed = @(@{ Id = 'sub-b'; Name = 'Sub B'; Reason = 'stand-in failure' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
+        @{ RunId = 'run-1'; StreamId = '0'; Tenant = 't'; Status = 'partial-failure'; Completed = @(); ResourceCounts = @(); Failed = @(@{ Id = 'sub-b'; Name = 'Sub B'; Reason = 'stand-in failure' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
         $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $Summary; FailuresPath = (Join-Path $Root 'failures-stream-0.log'); SubCount = 1 })
         Set-Variable -Name Subscriptions -Value @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B' })
         $State = Join-Path $Root '.resume-state-t.json'
@@ -582,7 +617,9 @@ Describe 'The stream worker and the Az context snapshot use literal paths' {
         $Worker = Get-Content -LiteralPath (Join-Path $RepoRoot 'Run-AllSubscriptions.Stream.ps1') -Raw
         $Wrapper = Get-Content -LiteralPath (Join-Path $RepoRoot 'Run-AllSubscriptions.ps1') -Raw
         $Worker | Should -Not -Match ([regex]::Escape('Set-Content -Path $StreamSummaryPath'))
-        ([regex]::Matches($Worker, [regex]::Escape('Set-Content -LiteralPath $StreamSummaryPath'))).Count | Should -Be 3
+        # The two short summaries in place, the full one through a temporary file.
+        ([regex]::Matches($Worker, [regex]::Escape('Set-Content -LiteralPath $StreamSummaryPath'))).Count | Should -Be 2
+        ([regex]::Matches($Worker, [regex]::Escape('Set-Content -LiteralPath "$StreamSummaryPath.tmp"'))).Count | Should -Be 1
         $Wrapper | Should -Not -Match ([regex]::Escape('Test-Path -Path $AzContextSnapshot'))
         $Wrapper | Should -Not -Match ([regex]::Escape('Remove-Item -Path $AzContextSnapshot'))
     }
@@ -594,7 +631,7 @@ Describe 'The end-of-run merge with a stream whose own file is unread (incomplet
         New-Item -ItemType Directory -Path $Root -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Root '.resume-state-t-stream-0.json') -Value '{ not json' -NoNewline
         $Summary = Join-Path $Root '.rda-stream-0-summary.json'
-        @{ StreamId = '0'; Tenant = 't'; Status = 'ok'; Completed = @(); ResourceCounts = @(); Failed = @(); Incomplete = @(@{ Id = 'sub-c'; Name = 'Sub C'; Reason = 'Metrics were left incomplete for Sub C.' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
+        @{ RunId = 'run-1'; StreamId = '0'; Tenant = 't'; Status = 'ok'; Completed = @(); ResourceCounts = @(); Failed = @(); Incomplete = @(@{ Id = 'sub-c'; Name = 'Sub C'; Reason = 'Metrics were left incomplete for Sub C.' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
         $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $Summary; FailuresPath = (Join-Path $Root 'failures-stream-0.log'); SubCount = 1 })
         Set-Variable -Name Subscriptions -Value @([pscustomobject]@{ Id = 'sub-c'; Name = 'Sub C' })
         $State = Join-Path $Root '.resume-state-t.json'
@@ -615,37 +652,53 @@ Describe 'The run''s exit code and stream summaries around a resume state that w
         $script:Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$Tokens, [ref]$ParseErrors)
     }
 
-    It 'ends with exit 2 while a resume state that could not be saved is still on disk' {
-        $script:Src | Should -Match ([regex]::Escape('-ReportsMissing (($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) -or ('))
+    It 'ends with exit 2 when a resume state could not be saved and the run is not clean' {
+        $script:Src | Should -Match ([regex]::Escape('-ReportsMissing (($ResumeStateSaveFailed -and -not $RunClean) -or ('))
     }
 
     It 'removes every stream summary an earlier run left before the sign-in snapshot and the first stream' {
-        $Pre = @($script:Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForStatementAst] -and $args[0].Body.Extent.Text.Contains('$StaleSummary = Join-Path $InventoryRoot') }, $true))
+        $Pre = @($script:Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] -and $args[0].Condition.Extent.Text.Contains("-Filter '.rda-stream-*-summary*.json*'") }, $true))
         $Pre.Count | Should -Be 1
         $Launch = @($script:Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForStatementAst] -and $args[0].Body.Extent.Text.Contains('Start-Job') }, $true))
         $Snapshot = @($script:Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] -and $args[0].GetCommandName() -eq 'Save-AzContext' }, $true))
         $Pre[0].Extent.StartOffset | Should -BeLessThan $Snapshot[0].Extent.StartOffset
         $Pre[0].Extent.StartOffset | Should -BeLessThan $Launch[0].Extent.StartOffset
         @($script:Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForStatementAst] -and $args[0].Body.Extent.Text.Contains('Start-Job') -and $args[0].Body.Extent.Text.Contains('Remove-Item -LiteralPath $SummaryPath') }, $true)) | Should -BeNullOrEmpty -Because 'no removal is left inside the launch loop'
+        # A top-level statement of the script, before the sequential or
+        # parallel split: every run that goes on to collect runs it, sequential ones included.
+        $script:Ast.EndBlock.Statements | Should -Contain $Pre[0]
+        $Split = @($script:Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$ParallelStreams -le 1' })
+        $Split.Count | Should -Be 1
+        $Pre[0].Extent.StartOffset | Should -BeLessThan $Split[0].Extent.StartOffset
         $script:PreBlock = [scriptblock]::Create("param(`$InventoryRoot, `$StreamCount)`n" + $Pre[0].Extent.Text)
     }
 
-    It 'leaves no stream summary of an earlier run, and stops with exit 1 before any stream when one cannot be removed' {
+    It 'leaves no stream summary of an earlier run, under the old shared name or a run''s name and of any stream number, and warns but goes on when one cannot be removed' {
         function Exit-Wrapper { param([int]$Code) throw ('EXIT ' + $Code) }
-        Mock Write-Host { }
+        $script:Warned = @()
+        Mock Write-Host { $script:Warned += [string]$Object }
         $Dir = Join-Path $script:TestBase ('stale-' + [guid]::NewGuid().ToString().Substring(0, 8))
         New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-        foreach ($N in 0, 1) { Set-Content -LiteralPath (Join-Path $Dir ('.rda-stream-{0}-summary.json' -f $N)) -Value '{}' }
+        # Stream 5 is above this run's stream count (2).
+        foreach ($N in 0, 1, 5)
+        {
+            Set-Content -LiteralPath (Join-Path $Dir ('.rda-stream-{0}-summary.json' -f $N)) -Value '{}'
+            Set-Content -LiteralPath (Join-Path $Dir ('.rda-stream-{0}-summary-oldrun.json' -f $N)) -Value '{}'
+            Set-Content -LiteralPath (Join-Path $Dir ('.rda-stream-{0}-summary-oldrun.json.tmp' -f $N)) -Value '{}'
+        }
         & $script:PreBlock $Dir 2
-        @(Get-ChildItem -LiteralPath $Dir -Force -Filter '.rda-stream-*-summary.json') | Should -BeNullOrEmpty
-        foreach ($N in 0, 1) { Set-Content -LiteralPath (Join-Path $Dir ('.rda-stream-{0}-summary.json' -f $N)) -Value '{}' }
-        Mock Remove-Item -ParameterFilter { [string]$LiteralPath -like '*.rda-stream-1-summary.json' } -MockWith { throw 'stand-in: denied' }
-        { & $script:PreBlock $Dir 2 } | Should -Throw 'EXIT 1'
+        @(Get-ChildItem -LiteralPath $Dir -Force -Filter '.rda-stream-*-summary*') | Should -BeNullOrEmpty
+        Set-Content -LiteralPath (Join-Path $Dir '.rda-stream-1-summary.json') -Value '{}'
+        Set-Content -LiteralPath (Join-Path $Dir '.rda-stream-1-summary-oldrun.json') -Value '{}'
+        Mock Remove-Item -ParameterFilter { [string]$LiteralPath -like '*.rda-stream-1-summary*' } -MockWith { throw 'stand-in: denied' }
+        { & $script:PreBlock $Dir 2 } | Should -Not -Throw
+        @($script:Warned | Where-Object { $_ -like 'WARNING: Could not remove the stream summary *stand-in: denied. It is not read; remove it when you can.' }).Count | Should -Be 2
     }
 
     It 'says the state was cleared at the end of a clean run only when its removal worked' {
         $script:Src | Should -Match ([regex]::Escape('Remove-Item -LiteralPath $ResumeStateFile -Force -ErrorAction Stop'))
-        $script:Src | Should -Match ([regex]::Escape('if (-not (Test-Path -LiteralPath $ResumeStateFile)) { Write-Host "Resume state cleared (clean run)." -ForegroundColor Green }'))
+        $script:Src | Should -Match ([regex]::Escape('if (-not (Test-Path -LiteralPath $ResumeStateFile))'))
+        $script:Src | Should -Match ([regex]::Escape('Write-Host "Resume state cleared (clean run)." -ForegroundColor Green'))
     }
 
     It 'removes the stream summaries by literal path' {
