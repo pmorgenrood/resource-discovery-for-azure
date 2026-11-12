@@ -122,10 +122,11 @@ $Global:ResourceCount = 1
         if ($Body[$i] -is [System.Management.Automation.Language.ForEachStatementAst] -and $Body[$i].Condition.Extent.Text -eq '$StreamSummaries' -and $Body[$i].Body.Extent.Text -match 'ResourceCounts') { $AggAt = $i; break }
     }
     if ($AggAt -lt 0) { throw 'Expected the stream-summary aggregation loop in the wrapper.' }
-    # The pending list as the parallel path builds it before it slices (lifted below).
+    # The pending list as the parallel path builds it before it slices (lifted below),
+    # and the run id the wrapper makes just before the orchestration's try.
     $PendingAt = @($SeqIf[0].ElseClause.Statements | Where-Object { $_ -is [System.Management.Automation.Language.ForEachStatementAst] -and $_.Body.Extent.Text.Contains('$PendingSubscriptions += $Sub') })
     if ($PendingAt.Count -ne 1) { throw 'Expected the pending-subscription list of the parallel path in the wrapper.' }
-    $ParLaunchPrelude = "`$PendingSubscriptions = @()`n" + $PendingAt[0].Extent.Text + "`n`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @()`n"
+    $ParLaunchPrelude = "`$PendingSubscriptions = @()`n" + $PendingAt[0].Extent.Text + "`n`$StreamCount = [Math]::Min(`$ParallelStreams, `$PendingSubscriptions.Count); `$AzContextSnapshot = Join-Path `$InventoryRoot 'ctx.json'; `$Jobs = @(); `$StreamSummaries = @(); `$StreamRunId = [guid]::NewGuid().ToString('N')`n"
     $ParLaunchText = script:Set-TestPaths -Text (@($Body[0..($AggAt - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
 
     # The resume-state cleanup: every statement after the main-summary build up to
@@ -533,10 +534,68 @@ Describe 'Retry limit on the parallel path' {
         @($R2.Calls | Sort-Object -Unique) | Should -Be @('sub-a', 'sub-b', 'sub-x')
     }
 
+    It 'a parallel run whose streams cannot save their state collects nothing and names each sub; the next -Resume collects each once, runs clean and clears the state' {
+        $Global:RdaRlFailIds = @()
+        $Global:RdaRlBreakStreamSave = $true
+        Mock Set-Content -ParameterFilter { $Global:RdaRlBreakStreamSave -and [string]$LiteralPath -like '*.resume-state-t-stream-*.json.tmp' } -MockWith { throw 'stand-in: disk full' }
+        $R1 = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2
+        $Global:RdaRlBreakStreamSave = $false
+        @($R1.Calls) | Should -BeNullOrEmpty -Because 'no stream could save the write-ahead count, so none collected'
+        @($R1.Result.FailedSubscriptions | Where-Object { $_ -like '*could not save its state before collecting it*' }).Count | Should -Be 2
+        $R1.Result.WrapperExitCode | Should -Not -Be 0
+        @(Get-FailedAttempts -Path $script:State -Tenant 't' | Where-Object { $null -ne $_ }) | Should -BeNullOrEmpty -Because 'nothing was attempted, so nothing is counted'
+        $R2 = script:Invoke-Run -Subs @($script:A, $script:B) -Streams 2 -Resume
+        @($R2.Calls | Sort-Object) | Should -Be @('sub-a', 'sub-b') -Because 'each is collected, once'
+        @($R2.Result.FailedSubscriptions) | Should -BeNullOrEmpty
+        Test-Path -LiteralPath $script:State | Should -BeFalse -Because 'the run is clean, so the clean-run rule clears the state and nothing is left to loop on'
+        Remove-Variable -Name RdaRlBreakStreamSave -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'stream saves that fail and a parent cut off before the merge never dodge the retry limit (<Case>)' -ForEach @(
+        @{ Case = 'every stream save fails: nothing is collected or counted'; AfterFirst = $false }
+        @{ Case = 'saves fail after the write-ahead count: the count stands'; AfterFirst = $true }
+    ) {
+        Save-CompletedSubscriptionIds -Path $script:State -Tenant 't' -Ids @() -FailedAttempts @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'earlier'; Attempts = 2 }) -Reports @()
+        $Global:RdaRlFailIds = @('sub-x')
+        $Global:RdaRlBreakStreamSave = $true
+        $Global:RdaRlAfterFirst = $AfterFirst
+        # With AfterFirst, a stream's first save (the write-ahead count of its first sub) reaches the disk.
+        Mock Set-Content -ParameterFilter { $Global:RdaRlBreakStreamSave -and [string]$LiteralPath -like '*.resume-state-t-stream-*.json.tmp' -and (-not $Global:RdaRlAfterFirst -or (Test-Path -LiteralPath ([string]$LiteralPath -replace '\.tmp$', ''))) } -MockWith { throw 'stand-in: disk full' }
+        $R1 = script:Invoke-Run -Subs @($script:A, $script:X) -Streams 2 -Resume -Interrupted
+        $Global:RdaRlBreakStreamSave = $false
+        $Global:RdaRlFailIds = @()
+        $R2 = script:Invoke-Run -Subs @($script:A, $script:X) -Streams 2 -Resume
+        if ($AfterFirst)
+        {
+            @($R1.Calls | Sort-Object) | Should -Be @('sub-a', 'sub-x')
+            # The next -Resume folds in the cut-off run's write-ahead counts:
+            # sub-x is at 3 and not retried; sub-a is not proven done, so it is
+            # collected again.
+            [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 3
+            @($R2.Calls) | Should -Be @('sub-a')
+            @(script:Get-Lines -Run $R2 -Like 'Not retried:*Sub X*').Count | Should -BeGreaterThan 0
+        }
+        else
+        {
+            @($R1.Calls) | Should -BeNullOrEmpty -Because 'no stream could save the write-ahead count, so nothing was collected and no failed run happened'
+            # The next -Resume collects both; sub-x succeeds now and leaves the list.
+            @($R2.Calls | Sort-Object) | Should -Be @('sub-a', 'sub-x')
+            script:Get-Entry -Id 'sub-x' | Should -BeNullOrEmpty
+        }
+        Remove-Variable -Name RdaRlBreakStreamSave, RdaRlAfterFirst -Scope Global -ErrorAction SilentlyContinue
+    }
+
     It 'a parallel -Resume with nothing left says so, and does not call it one eligible subscription' {
         $Subs = @($script:A, $script:B)
         $Global:RdaRlFailIds = @()
         $null = script:Invoke-Run -Subs $Subs -Streams 2 -Interrupted
+        # Fail-safe rule: the cut-off run never proved its results saved, so the
+        # first -Resume collects both again, once each (sub-x fails, so the
+        # state is kept for the next -Resume).
+        $Global:RdaRlFailIds = @('sub-x')
+        $R1 = script:Invoke-Run -Subs @($script:A, $script:B, $script:X) -Streams 2 -Resume
+        @($R1.Calls | Sort-Object) | Should -Be @('sub-a', 'sub-b', 'sub-x')
+        $Global:RdaRlFailIds = @()
         $R = script:Invoke-Run -Subs $Subs -Streams 2 -Resume
         @($R.Calls) | Should -BeNullOrEmpty
         @(script:Get-Lines -Run $R -Like 'No subscription left to process.').Count | Should -Be 1
