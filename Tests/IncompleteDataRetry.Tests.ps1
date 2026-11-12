@@ -54,7 +54,7 @@ if (@($Global:RdaIncompleteTestMetricsIds) -contains $SubscriptionID)
 if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
 if (@($Global:RdaIncompleteTestConsumptionIds) -contains $SubscriptionID)
 {
-    $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.' }
+    $Global:ConsumptionFailedSubs += [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = 'Consumption phase skipped: no usable Azure context/token after one reconnect attempt.'; SubscriptionId = [string]$SubscriptionID }
 }
 $Global:ZipOutputFile = $Zip
 $Global:Resources = @(1)
@@ -77,7 +77,7 @@ $Global:ResourceCount = 1
     $SeqText = $SeqIf[0].Clauses[0].Item2.Extent.Text -replace '\$PSScriptRoot', '$FakeScriptRoot' -replace '\$HOME\b', '$Global:RdaIncompleteTestHome'
     $script:SeqBlock = [scriptblock]::Create(
         "param(`$FakeScriptRoot, `$Subscriptions, `$Resume, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID)`n" +
-        "`$Obfuscate = `$false; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }`n" +
+        "`$Obfuscate = `$false; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$FailedSubscriptionDetail = @(); `$StreamSummaryFailed = @(); `$StreamSummaryCompletedIds = @(); `$UnreadableStreamSummaries = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }`n" +
         ". " + $SeqText + "`n" +
         "[pscustomobject]@{ SkippedSubscriptions = @(`$SkippedSubscriptions); SubResourceCounts = @(`$SubResourceCounts); FailedSubscriptions = @(`$FailedSubscriptions) }")
 
@@ -85,7 +85,7 @@ $Global:ResourceCount = 1
     if ($OneIf.Count -ne 1) { throw "Expected one 'if (`$StreamCount -le 1)' in the wrapper, found $($OneIf.Count)." }
     $script:FallbackBlock = [scriptblock]::Create(
         "param(`$FakeScriptRoot, `$Subscriptions, `$CompletedIds, `$FailedAttempts, `$CompletedReports, `$InventoryRoot, `$ResumeStateFile, `$TenantID)`n" +
-        "`$StreamCount = 1; `$Obfuscate = `$false; `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }`n" +
+        "`$StreamCount = 1; `$Obfuscate = `$false; `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$FailedSubscriptionDetail = @(); `$StreamSummaryFailed = @(); `$StreamSummaryCompletedIds = @(); `$UnreadableStreamSummaries = @(); `$DiagFile = `$null; `$InventoryPassthrough = @{ ConcurrencyLimit = 6 }`n" +
         # The parallel path builds the list it slices before this block; these runs are not -Resume runs, so it is every subscription.
         "`$PendingSubscriptions = @(`$Subscriptions)`n" +
         ($OneIf[0].Extent.Text -replace '\$PSScriptRoot', '$FakeScriptRoot') + "`n" +
@@ -102,7 +102,10 @@ $Global:ResourceCount = 1
     if ($AggStart -lt 0) { throw 'Expected the stream-summary aggregation loop in the wrapper.' }
     $script:AggregateBlock = [scriptblock]::Create(
         "param(`$StreamSummaries, `$InventoryRoot, `$TenantID, `$ResumeStateFile, `$CompletedIds, `$FailedAttempts, `$CompletedReports)`n" +
-        "`$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null`n" +
+        "`$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$FailedSubscriptionDetail = @(); `$StreamSummaryFailed = @(); `$StreamSummaryCompletedIds = @(); `$UnreadableStreamSummaries = @(); `$DiagFile = `$null`n" +
+        "# The run id the parent gives its streams, and the subscriptions each one runs
+        # (from its summary rows, as the parent knows them before it starts; #66).
+        `$RunId = 'test-run'; foreach (`$S in @(`$StreamSummaries | Where-Object { `$null -ne `$_ })) { if (-not `$S.PSObject.Properties['ExpectedIds']) { `$Rows = @(try { `$J = Get-Content -LiteralPath `$S.SummaryPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop; @(@(`$J.ResourceCounts) + @(`$J.Failed) | Where-Object { `$null -ne `$_ } | ForEach-Object { [string]`$_.Id }) } catch { }); `$S | Add-Member -NotePropertyName ExpectedIds -NotePropertyValue `$Rows } }`n" +
         (@($Body[$AggStart..($Body.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n") + "`n" +
         "[pscustomobject]@{ FailedSubscriptions = @(`$FailedSubscriptions) }")
 
@@ -119,6 +122,7 @@ $Global:ResourceCount = 1
         param($Root, [string[]]$Ids, [string[]]$Names)
         $WorkerArgs = @{
             TenantID           = 't'
+            RunId              = 'test-run'
             StreamId           = '0'
             InventoryRoot      = $Root
             ScriptRoot         = $script:FakeRoot

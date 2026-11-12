@@ -29,6 +29,7 @@
 # only; no live Azure.
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Join-Path -Path $PSScriptRoot -ChildPath '..' | Resolve-Path | Select-Object -ExpandProperty Path
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ObfuscationRoundTrip_" + [guid]::NewGuid().ToString('N'))
     $script:Tree = Join-Path $script:WorkDir 'tree'
@@ -92,7 +93,7 @@ $Global:StandInUsage = @(
         UsageStartTime   = [datetime]::SpecifyKind([datetime]'2026-10-01T00:00:00', 'Utc'); UsageEndTime = [datetime]::SpecifyKind([datetime]'2026-10-02T00:00:00', 'Utc')
     }
 }
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     $global:LASTEXITCODE = 0
@@ -110,12 +111,15 @@ function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ I
 function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $Context) $null }
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
-function global:Get-UsageAggregates
+function global:Get-AzUsageAggregate
 {
     [CmdletBinding()]
     param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
     [pscustomobject]@{ UsageAggregations = @($Global:StandInUsage | ForEach-Object { [pscustomobject]@{ Properties = $_.PSObject.Copy() } }); ContinuationToken = $null }
 }
+# Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is
+# loaded, and an alias wins over a function: the stand-in is the alias's target.
+function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)
@@ -129,6 +133,8 @@ function global:Invoke-AzRestMethod
     throw ('no stand-in for {0} {1}' -f $Method, $Target)
 }
 
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $Params = @{ SubscriptionID = $SubId; OutputDirectory = $Out; Service = @('SQLSERVER', 'SQLDB', 'SQLPOOL', 'VMDisk') }
 if ($Obfuscate) { $Params.Obfuscate = $true }
 Set-Location $Tree

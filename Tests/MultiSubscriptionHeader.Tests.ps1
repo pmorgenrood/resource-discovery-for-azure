@@ -89,49 +89,25 @@ BeforeAll {
     }
 
     # The shared harness lists only Enabled subscriptions of its own tenant.
-    # This small local stand-in adds more entries to the 'az account list'
-    # answer only (a global alias wins over the harness's az function), and
-    # can pass -TenantID through a one-line forwarder in a second tree copy.
-    # Resource Graph and the rest stay the harness's own.
-    $script:TenantTree = Join-Path $script:WorkDir 'tenant-tree'
-    Copy-Item -LiteralPath $script:Tree -Destination $script:TenantTree -Recurse -Force
-    Move-Item -LiteralPath (Join-Path $script:TenantTree 'ResourceInventory.ps1') -Destination (Join-Path $script:TenantTree 'ResourceInventory.Real.ps1')
-    '& (Join-Path $PSScriptRoot ''ResourceInventory.Real.ps1'') @args -TenantID $env:RDA_TEST_TENANT; exit $LASTEXITCODE' |
-        Set-Content -LiteralPath (Join-Path $script:TenantTree 'ResourceInventory.ps1') -Encoding utf8
-    $script:ExtraRunner = Join-Path $script:WorkDir 'extra-subs.ps1'
-    @'
-param([string]$Harness, [string]$SubIds, [string]$ExtraSubs)
-$Global:StandInExtraSubs = @($ExtraSubs | ConvertFrom-Json)
-function global:Invoke-StandInAzWithExtras
-{
-    if (($args -join ' ') -like 'account list*')
-    {
-        $global:LASTEXITCODE = 0
-        return (ConvertTo-Json -InputObject @(@($Global:StandInSubs) + @($Global:StandInExtraSubs)) -Compress)
-    }
-    & $function:global:az @args
-}
-Set-Alias -Name az -Value Invoke-StandInAzWithExtras -Scope Global
-& $Harness -SubIds $SubIds -AllSubs
-exit $LASTEXITCODE
-'@ | Set-Content -LiteralPath $script:ExtraRunner -Encoding utf8
-
+    # A test adds more entries to its Get-AzSubscription answer in
+    # $env:RDA_INNER_HARNESS_EXTRA_SUBS, and names the run's -TenantID in
+    # $env:RDA_INNER_HARNESS_TENANT_ID. Resource Graph and the rest stay the
+    # harness's own.
     function Invoke-ExtraSubsRun
     {
         param([string]$SubIds, [object[]]$ExtraSubs, [string]$TenantId)
         $Out = New-RunOut
-        $env:RDA_INNER_HARNESS_TREE = if ($TenantId) { $script:TenantTree } else { $script:Tree }
-        $env:RDA_INNER_HARNESS_OUT = $Out
-        $env:RDA_TEST_TENANT = $TenantId
+        $env:RDA_INNER_HARNESS_EXTRA_SUBS = ConvertTo-Json -InputObject @($ExtraSubs) -Compress
+        $env:RDA_INNER_HARNESS_TENANT_ID = $TenantId
         try
         {
-            $ArgList = @('-NoProfile', '-NonInteractive', '-File', $script:ExtraRunner, '-Harness', $script:Harness, '-SubIds', $SubIds, '-ExtraSubs', (ConvertTo-Json -InputObject @($ExtraSubs) -Compress))
+            $ArgList = @('-NoProfile', '-NonInteractive', '-File', $script:Harness, '-Tree', $script:Tree, '-Out', $Out, '-SubIds', $SubIds, '-AllSubs')
             $Console = @(& $script:Pwsh @ArgList 2>&1 | ForEach-Object { [string]$_ })
             return (Read-HeaderRun -Out $Out -Console $Console -Exit $LASTEXITCODE)
         }
         finally
         {
-            Remove-Item Env:RDA_INNER_HARNESS_TREE, Env:RDA_INNER_HARNESS_OUT, Env:RDA_TEST_TENANT -ErrorAction SilentlyContinue
+            Remove-Item Env:RDA_INNER_HARNESS_EXTRA_SUBS, Env:RDA_INNER_HARNESS_TENANT_ID -ErrorAction SilentlyContinue
         }
     }
 }
@@ -166,8 +142,8 @@ Describe 'Direct run under <Culture>: <Name>' -ForEach $script:Cases -Skip:$IsWi
     }
 }
 
-# The count is of the subscriptions the run inventories: az's list (by default
-# only 'Enabled' ones), narrowed to -TenantID when one is given. A Disabled or
+# The count is of the subscriptions the run inventories: Get-AzSubscription's list
+# (only 'Enabled' ones are kept), narrowed to -TenantID when one is given. A Disabled or
 # Warned entry, or another tenant's subscription under -TenantID, is not one.
 Describe 'Direct run without -SubscriptionID: <Name>' -Skip:$IsWindows -ForEach @(
     @{ Name = 'two Enabled subscriptions plus a Disabled and a Warned one'; SubIds = '12345678-1234-1234-1234-123456789012,12345678-1234-1234-1234-123456789013'; TenantId = ''; Header = '2 subscriptions (consolidated)'; Disks = 2

@@ -14,6 +14,7 @@
 # =============================================================================
 
 BeforeAll {
+    $env:RDA_AZPS_STANDINS = Join-Path $PSScriptRoot 'Helpers/AzPsStandIns.ps1'
     $script:RepoRoot = Split-Path $PSScriptRoot -Parent
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
 
@@ -1190,7 +1191,7 @@ $TestSub = '12345678-1234-1234-1234-123456789012'
 # Subscription N (from 1): ...1234567890<11+N>, so subscription 1 is $TestSub.
 $Global:TestSubs = @($(if ($SubCount -gt 0) { 1..$SubCount }) | ForEach-Object { [pscustomobject]@{ id = ('12345678-1234-1234-1234-1234567890{0:d2}' -f (11 + $_)); name = $(if ($SubCount -eq 1) { 'Placeholder subscription' } else { 'Placeholder subscription {0}' -f $_ }); tenantId = $TestSub } })
 $Global:UnreadableIds = @(($Unreadable -split ',') | Where-Object { $_ } | ForEach-Object { $Global:TestSubs[[int]$_ - 1].id })
-function global:az
+function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
     if ($Joined -like 'account show*') { return ('{{"user":{{"name":"tester"}},"tenantId":"{0}"}}' -f $TestSub) }
@@ -1268,6 +1269,8 @@ function global:Invoke-AzRestMethod
     Add-Content -Path $env:RDA_TEST_CALL_LOG -Value 'resource counts'
     & $Json @{ data = @(@(($Payload | ConvertFrom-Json).subscriptions) | ForEach-Object { @{ subscriptionId = $_; ResourceCount = 4 } }) }
 }
+# Az PowerShell sign-in, subscription list and Resource Graph paging on top of the stand-ins above.
+. $env:RDA_AZPS_STANDINS
 $env:RDA_TEST_ROLES = $Roles
 $env:RDA_TEST_PERM_SUB = $PermSub
 $env:RDA_TEST_PERM_RG = $PermRg
@@ -1384,7 +1387,7 @@ exit $LASTEXITCODE
         $Run = Invoke-DirectRun -Roles 'none' -PermSub 'none' -ResourceGroup 'rg-one' -SkipConsumption -NoSubscriptionId
         $Run.RoleCalls.Count | Should -Be 0
         $Run.InventoryReached | Should -BeFalse
-        $Run.Output | Should -Match 'If using ResourceGroup parameter you must also put SubscriptionId'
+        $Run.Output | Should -Match '-ResourceGroup was given without -SubscriptionID\.'
     }
 
     It 'on a consumption refusal prints the usage fix for a resource group grant' {
@@ -1489,7 +1492,8 @@ exit $LASTEXITCODE
         $Run.ExitCode | Should -Be 1
         $Run.InventoryReached | Should -BeFalse
         $Run.RoleCalls.Count | Should -Be 0
-        $Run.Output | Should -Match ([regex]::Escape('No subscription is visible to the signed-in identity. Stopping before any work.'))
+        # The Az PowerShell sign-in (#66) stops first, when the tenant lists no subscription.
+        $Run.Output | Should -Match ([regex]::Escape('lists no subscriptions for this sign-in; stopping instead of writing an empty report.'))
     }
 
     It 'stops with exit 1 for an unreadable -SubscriptionID even when other subscriptions are readable' {

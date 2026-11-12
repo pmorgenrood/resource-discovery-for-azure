@@ -35,7 +35,7 @@ BeforeAll {
     $MergeText = (@($Siblings[$From..($Siblings.Count - 1)] | ForEach-Object { $_.Extent.Text }) -join "`n")
     $script:MergeBlock = [scriptblock]::Create(
         "param(`$InventoryRoot, `$TenantID, `$ResumeStateFile, `$SeedCompleted = @(), `$Slices = @())`n" +
-        "`$CompletedIds = @(`$SeedCompleted); `$FailedAttempts = @(); `$UnreadableStreamFiles = @(); `$StreamStateNotMoved = @(); `$LeftStreamFiles = @(); `$CompletedReports = @(); `$StreamFailedIds = @(); `$StreamNoReportIds = @(); `$StreamNotStarted = @(); `$StreamFailedEntries = @(); `$StreamUnfinished = @(); `$StreamIncompleteIds = @()`n" +
+        "`$CompletedIds = @(`$SeedCompleted); `$FailedAttempts = @(); `$UnreadableStreamFiles = @(); `$StreamStateNotMoved = @(); `$LeftStreamFiles = @(); `$CompletedReports = @(); `$StreamFailedIds = @(); `$StreamNoReportIds = @(); `$StreamNotStarted = @(); `$StreamFailedEntries = @(); `$StreamUnfinished = @(); `$StreamIncompleteIds = @(); `$StreamSummaryCompletedIds = @(); `$StreamSummaryFailed = @(); `$StreamSummaries = @(); `$RunId = 'test-run'; `$Subscriptions = @()`n" +
         $MergeText + "`n" +
         "[pscustomobject]@{ CompletedIds = @(`$CompletedIds); FailedAttempts = @(`$FailedAttempts); Unreadable = @(`$UnreadableStreamFiles); NotMoved = @(`$StreamStateNotMoved); Left = @(`$LeftStreamFiles); RunEndUnreadable = `$RunEndUnreadable }")
 

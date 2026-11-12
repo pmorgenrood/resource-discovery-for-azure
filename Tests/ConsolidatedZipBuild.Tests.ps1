@@ -101,7 +101,7 @@ Describe 'Get-ConsolidatedZipProblem' {
 
 Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
     BeforeAll {
-        $script:BundleBlock = [scriptblock]::Create((Find-WrapperIf -Condition 'Test-Path -Path $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text)
+        $script:BundleBlock = [scriptblock]::Create((Find-WrapperIf -Condition 'Test-Path -LiteralPath $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text)
 
         # Runs the lifted bundling block over $Root with the variables it reads.
         $script:LastCheckBlock = [scriptblock]::Create((Find-WrapperIf -Condition '$null -ne $OuterZipFile' -Contains 'was lost while the run summary was added').Extent.Text)
@@ -111,6 +111,10 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
             # Set-Variable: these are read only by the lifted block.
             Set-Variable -Name InventoryRoot -Value $Root
             Set-Variable -Name RunStartTime -Value ((Get-Date).AddMinutes(-5))
+            # This run's success rows: one per report zip the test wrote, with its
+            # path, as the output check reads them (#66 builds only those).
+            Set-Variable -Name SubResourceCounts -Value @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter 'ResourcesReport_*.zip' -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Id = $_.BaseName; Name = $_.BaseName; Count = 1; Zip = $_.FullName } })
+            Set-Variable -Name UnreadableStreamSummaries -Value @()
             $OuterZipFile = $null
             $BundleBuildError = $null
             $Printed = @(. $script:BundleBlock 6>&1 | ConvertTo-Lines)
@@ -147,7 +151,7 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         Mock Compress-Archive -ParameterFilter { -not $Update } {
             $script:Builds += [pscustomobject]@{ Destination = $DestinationPath; ReservedThere = (Test-Path -LiteralPath $script:ReservedName -PathType Leaf) }
             $Zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, 'Create')
-            try { foreach ($Report in @($Path)) { $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Report, (Split-Path $Report -Leaf)) } } finally { $Zip.Dispose() }
+            try { foreach ($Report in @($Path) + @($LiteralPath) | Where-Object { $_ }) { $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Report, (Split-Path $Report -Leaf)) } } finally { $Zip.Dispose() }
         }
         $R = Invoke-BundleBlock -Root $Root
 
@@ -200,7 +204,7 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
     }
 
     It 'the list of zips the output check found is set before that check, so the build can read it when the check does not run' {
-        $CheckIf = Find-WrapperIf -Condition '$ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container)' -Contains '$ActualSubZips'
+        $CheckIf = Find-WrapperIf -Condition '$ExpectedZipCount -gt 0' -Contains '$ActualSubZips'
         $Init = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_.Extent.Text -eq '$ActualSubZips = @()' })
         $Init.Count | Should -Be 1
         $Init[0].Extent.StartOffset | Should -BeLessThan $CheckIf.Extent.StartOffset
@@ -265,7 +269,7 @@ Describe 'Run-AllSubscriptions.ps1: building the consolidated zip' {
         # Writes a real zip that holds only the first report.
         Mock Compress-Archive {
             $Zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, 'Create')
-            try { $null = $Zip.CreateEntry((Split-Path @($Path)[0] -Leaf)) } finally { $Zip.Dispose() }
+            try { $null = $Zip.CreateEntry((Split-Path @(@($Path) + @($LiteralPath) | Where-Object { $_ })[0] -Leaf)) } finally { $Zip.Dispose() }
         }
         $R = Invoke-BundleBlock -Root $Root
 
@@ -348,16 +352,16 @@ Describe 'Run-AllSubscriptions.ps1: adding the run summary to the consolidated z
     }
 
     It 'a fold that fails leaves no staging folder behind' {
-        Mock Compress-Archive -ParameterFilter { $Update } { throw [System.IO.IOException]::new('No space left on device') }
+        Mock Add-ItemsToZipArchive { throw [System.IO.IOException]::new('No space left on device') }
         $Root = Join-Path $TestDrive 'fold-stage'
         $null = Invoke-FoldBlock -Root $Root
         @(Get-ChildItem -LiteralPath $Root -Directory -Force -Filter '.rda-bundle-*') | Should -BeNullOrEmpty
     }
 
     It 'a fold that removes the zip (what a full disk does) makes the run report the zip as lost' {
-        # What the real cmdlet does when -Update hits a full disk: it removes the zip and fails.
-        Mock Compress-Archive -ParameterFilter { $Update } {
-            Remove-Item -LiteralPath $DestinationPath -Force
+        # What a write to the zip does when it hits a full disk: it removes the zip and fails.
+        Mock Add-ItemsToZipArchive {
+            Remove-Item -LiteralPath $ZipPath -Force
             throw [System.IO.IOException]::new('No space left on device')
         }
         $R = Invoke-FoldBlock -Root (Join-Path $TestDrive 'fold-lost')
@@ -379,10 +383,10 @@ Describe 'Run-AllSubscriptions.ps1: adding the run summary to the consolidated z
 
     It 'a fold that leaves a report out of the zip without an error: the zip is reported as lost and is not left under its name' {
         # Rewrites the zip with the staged extras only, and does not fail.
-        Mock Compress-Archive -ParameterFilter { $Update } {
-            Remove-Item -LiteralPath $DestinationPath -Force
-            $Zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, 'Create')
-            try { foreach ($Item in @($Path)) { if (Test-Path -LiteralPath $Item -PathType Leaf) { $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Item, (Split-Path $Item -Leaf)) } } } finally { $Zip.Dispose() }
+        Mock Add-ItemsToZipArchive {
+            Remove-Item -LiteralPath $ZipPath -Force
+            $Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, 'Create')
+            try { foreach ($Item in @($Items)) { if (Test-Path -LiteralPath $Item -PathType Leaf) { $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $Item, (Split-Path $Item -Leaf)) } } } finally { $Zip.Dispose() }
         }
         $Root = Join-Path $TestDrive 'fold-short'
         $R = Invoke-FoldBlock -Root $Root
@@ -394,9 +398,9 @@ Describe 'Run-AllSubscriptions.ps1: adding the run summary to the consolidated z
     }
 
     It 'a zip that fails the check after the fold and cannot be removed: the error says to delete it and not share it' {
-        Mock Compress-Archive -ParameterFilter { $Update } {
-            [System.IO.File]::Delete($DestinationPath)
-            $Zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, 'Create')
+        Mock Add-ItemsToZipArchive {
+            [System.IO.File]::Delete($ZipPath)
+            $Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, 'Create')
             try { $null = $Zip.CreateEntry('RunSummary.log') } finally { $Zip.Dispose() }
         }
         # The removal fails without an error, as on a locked file with SilentlyContinue.
@@ -431,7 +435,7 @@ Describe 'Run-AllSubscriptions.ps1: adding the run summary to the consolidated z
     }
 
     It 'a fold that fails but leaves every report in the zip is only a warning' {
-        Mock Compress-Archive -ParameterFilter { $Update } { throw [System.IO.IOException]::new('No space left on device') }
+        Mock Add-ItemsToZipArchive { throw [System.IO.IOException]::new('No space left on device') }
         $R = Invoke-FoldBlock -Root (Join-Path $TestDrive 'fold-kept')
 
         $R.BundleBuildError | Should -BeNullOrEmpty
@@ -473,8 +477,10 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
     BeforeAll {
         $script:BannerBlock = [scriptblock]::Create((Find-WrapperIf -Condition '$null -ne $BundleBuildError' -Contains 'FAILED (consolidated zip)').Extent.Text)
         $ExitIf = Find-WrapperIf -Condition '$null -ne $BundleBuildError -or $InventoryFolderGone' -Contains 'exit 2'
-        # From the exit-2 check to the end of the wrapper: the exit-code statements as they run.
-        $script:TailText = $script:WrapperAst.Extent.Text.Substring($ExitIf.Extent.StartOffset - $script:WrapperAst.Extent.StartOffset)
+        # The exit code is worked out before the bundle fold (#66): those
+        # statements, then from the exit-2 check to the end of the wrapper, as they run.
+        $ExitCodeStatements = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_.Extent.Text -match '^\$(AuthSkipped|CollectorsFailed|SubscriptionsFailed|ExitTwoReasons|WrapperExitCode) = ' -or ($_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match '\$ExitTwoReasons \+= ') } | ForEach-Object { $_.Extent.Text })
+        $script:TailText = ($ExitCodeStatements -join "`n") + "`n" + $script:WrapperAst.Extent.Text.Substring($ExitIf.Extent.StartOffset - $script:WrapperAst.Extent.StartOffset)
         $script:Pwsh = (Get-Process -Id $PID).Path
 
         # Any other variable the tail reads but does not assign is a list the wrapper
@@ -608,7 +614,7 @@ Describe 'New-RunOutputFile: a new file, never one that is there' {
 
 Describe 'Run-AllSubscriptions.ps1: the transcript and the main summary of the same second' {
     It 'the wrapper transcript takes its name from New-RunOutputFile, so it never writes over another run''s transcript' {
-        $Try = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains('Start-Transcript -Path $WrapperTranscriptFile') })
+        $Try = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains('Start-Transcript -LiteralPath $WrapperTranscriptFile') })
         $Try.Count | Should -Be 1
         $Root = Join-Path $TestDrive 'transcript'
         $null = New-Item -ItemType Directory -Path $Root
@@ -625,7 +631,7 @@ Describe 'Run-AllSubscriptions.ps1: the transcript and the main summary of the s
     }
 
     It 'a transcript that cannot start leaves no file under the name it took' {
-        $Try = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains('Start-Transcript -Path $WrapperTranscriptFile') })
+        $Try = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] -and $_.Body.Extent.Text.Contains('Start-Transcript -LiteralPath $WrapperTranscriptFile') })
         $Before = @($script:WrapperAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and @('$WrapperTranscriptStem', '$WrapperTranscriptFile', '$WrapperTranscriptReserved') -contains $_.Left.Extent.Text } | Where-Object { $_.Extent.EndOffset -lt $Try[0].Extent.StartOffset })
         $Root = Join-Path $TestDrive 'transcript-failed'
         $null = New-Item -ItemType Directory -Path $Root
@@ -684,11 +690,11 @@ Describe 'Run-AllSubscriptions.ps1: the inventory folder gone at the end of the 
         # bundling block, as the wrapper has them, then exit 0 if nothing exited.
         $script:EndOfRunText = @(
             $Expected[0].Extent.Text
-            (Find-WrapperIf -Condition '$ExpectedZipCount -gt 0 -and (Test-Path -Path $InventoryRoot -PathType Container)' -Contains 'Per-subscription output verification').Extent.Text
+            (Find-WrapperIf -Condition '$ExpectedZipCount -gt 0' -Contains 'Per-subscription output verification').Extent.Text
             '$OuterZipFile = $null'
             '$BundleBuildError = $null'
             '$InventoryFolderGone = $false'
-            (Find-WrapperIf -Condition 'Test-Path -Path $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text
+            (Find-WrapperIf -Condition 'Test-Path -LiteralPath $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text
             (Find-WrapperIf -Condition '$InventoryFolderGone' -Contains 'FAILED (report missing)').Extent.Text
             (Find-WrapperIf -Condition '$null -ne $BundleBuildError -or $InventoryFolderGone' -Contains 'exit 2').Extent.Text
             'exit 0'
@@ -721,8 +727,8 @@ Describe 'Run-AllSubscriptions.ps1: the inventory folder gone at the end of the 
         $Gone = Join-Path $TestDrive 'folder-gone'
         $R = Invoke-EndOfRun -Root $Gone -RunCount 2
         $R.Code | Should -Be 2
-        $R.Lines | Should -Contain ('Inventory root not found at {0}. Nothing to consolidate.' -f $Gone)
-        $R.Lines | Should -Contain ('FAILED (report missing): the inventory folder {0} is gone, with the report zips and the resume state that were in it, so no consolidated zip was built. The next run collects every subscription again.' -f $Gone)
+        # The report zip check finds every expected zip missing and stops there (#66).
+        $R.Lines | Should -Contain ('  The inventory folder {0} is gone, so every report under it is lost, with its resume state: the next run collects every subscription again.' -f $Gone)
     }
 
     It 'a run that expected no report zip keeps its exit code' {
