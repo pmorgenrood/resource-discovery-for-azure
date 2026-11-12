@@ -141,13 +141,13 @@ Describe 'RunSummary.log records retry entries left out of the run' {
 
 Describe 'RunSummary.log records a resume state that was not saved' {
     It 'says so in a plain and in an obfuscated run, and says nothing when the state was saved' {
-        $Line = '  Resume state        : NOT SAVED (a -Resume or -ResumeFailedOnly could skip a subscription this run failed and carry its old report; run again without them)'
+        $Line = '  Resume state        : NOT SAVED (it does not hold this run''s results, so it is put aside as not saved; see FAILED (resume state not saved) on the console)'
         @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -ResumeStateNotSaved) | Should -Contain $Line
         @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 -ResumeStateNotSaved -Obfuscated) | Should -Contain $Line
         @(Get-RunSummaryLogContent -Visible 1 -Eligible 1 -Processed 1 | Where-Object { $_ -like '  Resume state *' }) | Should -BeNullOrEmpty
     }
 
-    It 'the wrapper passes the flag a failed save sets, while the resume state file is there' {
-        $script:WrapperText | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and (Test-Path -LiteralPath $ResumeStateFile -PathType Leaf)) `'))
+    It 'the wrapper passes the flag a failed save sets, when the run is not clean (the state is then put aside)' {
+        $script:WrapperText | Should -Match ([regex]::Escape('-ResumeStateNotSaved:($ResumeStateSaveFailed -and -not $RunClean) `'))
     }
 }
