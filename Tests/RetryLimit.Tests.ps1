@@ -983,6 +983,25 @@ Describe 'A subscription past the retry limit that is no longer listed' {
         $R2.Result.WrapperExitCode | Should -Be 0
         Test-Path -LiteralPath $script:State | Should -BeFalse
     }
+
+    It '-ResumeFailedOnly while the listing warns retries nothing, exits 2 and names the run to go on with once the listing is fixed' {
+        Set-Variable -Name RdaRlFailIds -Scope Global -Value @('sub-x')
+        $Subs = @($script:A, $script:B, $script:X)
+        $null = script:Invoke-Run -Subs $Subs
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        $null = script:Invoke-Run -Subs $Subs -Resume
+        Set-Variable -Name RdaRlFailIds -Scope Global -Value @()
+        Set-Variable -Name RdaRlListWarnings -Scope Global -Value @('stand-in: unable to acquire a token for part of the tenant')
+        $R = script:Invoke-Run -Subs @($script:A, $script:B) -ResumeFailedOnly
+        $R.ExitCode | Should -Be 2
+        @($R.Calls) | Should -BeNullOrEmpty
+        @(script:Get-Lines -Run $R -Like 'WARNING: FailedAttempts list contained IDs but none are visible*') | Should -Be @("WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set, so nothing is retried. When the subscription list came back with warnings or errors (printed above), fix those until 'Get-AzSubscription -TenantId t' lists the tenant without them, then run: ./Run-AllSubscriptions.ps1 -TenantID t -Resume -RetryLimitReached")
+        # The listing is fixed; the named run collects it.
+        Set-Variable -Name RdaRlListWarnings -Scope Global -Value @()
+        $R2 = script:Invoke-Run -Subs $Subs -Resume -RetryLimitReached
+        @($R2.Calls) | Should -Be @('sub-x')
+        $R2.Result.WrapperExitCode | Should -Be 0
+    }
 }
 
 Describe 'A retry-list entry for a subscription whose stream did not load its Az context snapshot' {
@@ -1127,7 +1146,7 @@ Describe 'A subscription past the retry limit that the access check finds not re
         [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 4 -Because 'a subscription the check could not finish counts as a failed run'
         $R.Result.WrapperExitCode | Should -Be 2 -Because 'Sub X stays on the retry list and its report is missing'
         @(script:Get-Lines -Run $R -Like 'Retry Limit Reached:*') | Should -Be @('Retry Limit Reached:     1 (Sub X) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these without -RetryLimitReached')
-        @(script:Get-Lines -Run $R -Like '  Sub X was skipped by the access check*') | Should -Be @('  Sub X was skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for it, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions; or start a new run with -Fresh), for example:')
+        @(script:Get-Lines -Run $R -Like '  Sub X was skipped by the access check*') | Should -Be @('  Sub X was skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for it, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions; or start a new run with -Fresh), for example:')
         @(script:Get-Lines -Run $R -Like '    ./Run-AllSubscriptions.ps1 *') | Should -Be @('    ./Run-AllSubscriptions.ps1 -TenantID t -Resume -RetryLimitReached')
         @($R.Text | Where-Object { $_ -match 'IncludeDisabled' }) | Should -BeNullOrEmpty
         Test-Path -LiteralPath $script:State | Should -BeTrue
@@ -1245,5 +1264,23 @@ Describe 'A subscription whose grouped metric requests still fail after their re
         $Run5.Result.WrapperExitCode | Should -Be 0
         @(script:Get-Lines -Run $Run5 -Like 'Resume state cleared (clean run).') | Should -HaveCount 1
         Test-Path -LiteralPath $script:State | Should -BeFalse
+    }
+
+    # When the -RetryLimitReached run leaves it incomplete again, the line under
+    # the run does not say a plain -Resume collects it: that run would skip it.
+    It 'a -Resume -RetryLimitReached run that leaves it incomplete again names the switch for the next try (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        Set-Variable -Name RdaRlMetricsIds -Scope Global -Value @('sub-x')
+        $env:RDA_RL_METRICS_THROTTLE = '1'
+        $Subs = @($script:A, $script:B, $script:X)
+        foreach ($n in 1..3) { $null = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume:($n -gt 1) }
+        $Run4 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume -RetryLimitReached
+
+        @($Run4.Calls) | Should -Be @('sub-x')
+        [int](script:Get-Entry -Id 'sub-x').Attempts | Should -Be 4
+        $Stay = @(script:Get-Lines -Run $Run4 -Like '*It stays in the retry list*')
+        $Stay | Should -Not -BeNullOrEmpty
+        $Stay | ForEach-Object { $_ | Should -BeLike "*It stays in the retry list, so -Resume or -ResumeFailedOnly collects 'Sub X' again (after 3 failed runs in a row, only with -RetryLimitReached)." }
+        $Run5 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+        @($Run5.Calls) | Should -Not -Contain 'sub-x' -Because 'without the switch it is left out again'
     }
 }

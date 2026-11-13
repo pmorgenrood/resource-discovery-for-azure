@@ -2500,7 +2500,7 @@ function Invoke-FoldedStreamStateCleanup
 # retry list as a failed run (Add-FailedAttempt, so the run count goes up) and
 # taken off the completed list, so the resume state is kept and -Resume and
 # -ResumeFailedOnly check it again; the retry limit ends the retries of one
-# that keeps failing. A subscription skipped for a missing role is not added:
+# that keeps failing, unless a run has -RetryLimitReached. A subscription skipped for a missing role is not added:
 # it needs Reader first. Pure; the caller persists. Returns
 # { FailedAttempts; CompletedIds; Added }.
 # The retry-list entries ($FailedAttempts) of the subscriptions the up-front
@@ -2742,7 +2742,7 @@ function Write-RetryLimitSummary
     $NotReadable = @($List | Where-Object { @($NotReadableIds) -contains [string]$_.Id })
     if ($NotReadable.Count -gt 0)
     {
-        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions; or start a new run with -Fresh), for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
+        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions; or start a new run with -Fresh), for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
         Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
     }
     $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })

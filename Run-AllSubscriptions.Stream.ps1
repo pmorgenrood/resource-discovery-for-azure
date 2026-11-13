@@ -421,7 +421,7 @@ for ($i = 0; $i -lt $PairCount; $i++)
             # Same as the parent's sequential branch: the report was written
             # without some of its metrics or consumption, so the sub goes into
             # the retry list instead of the completed list.
-            Write-Stream ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $SubName) 'Yellow'
+            Write-Stream ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again (after 3 failed runs in a row, only with -RetryLimitReached)." -f $IncompleteReason, $SubName) 'Yellow'
             $IncompleteSubs += [pscustomobject]@{ Id = $SubId; Name = $SubName }
             $Completed = @($Completed | Where-Object { $_ -ne $SubId })
             $Reports = @($Reports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $SubId })
