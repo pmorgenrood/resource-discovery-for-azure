@@ -1045,6 +1045,30 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $D.ExitCode | Should -Be 1
     }
 
+    It 'names why a -ResumeFailedOnly run would retry nothing: past the limit without the switch, and not in the subscription set with it' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        foreach ($N in 1..3) { $null = script:Invoke-Wrapper }
+        $R = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain "  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: none of the subscriptions on its retry list is in this run's subscription set, or each is past the retry limit. To collect those past the retry limit again, add -RetryLimitReached; to start over with every subscription, start a new run with -Fresh."
+        $With = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $With.ExitCode | Should -Be 0 -Because 'with the switch the run would retry B'
+        # B is no longer listed: with the switch, the only cause left.
+        script:Set-Scenario -Subs 'A'
+        $Gone = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $Gone.ExitCode | Should -Be 1
+        $Gone.Text | Should -Contain "  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: none of the subscriptions on its retry list is in this run's subscription set. To start over with every subscription, start a new run with -Fresh."
+    }
+
+    It 'says a -ResumeFailedOnly run would retry nothing because its retry list is empty, and names the run that goes on' {
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain '  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: its retry list is empty. To go on with the unfinished run, run the same command without -ResumeFailedOnly.'
+    }
+
     It 'words the run-start lines of a -SubscriptionID run for that one subscription' {
         script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
         $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)

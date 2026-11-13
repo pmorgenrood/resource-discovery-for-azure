@@ -762,10 +762,10 @@ Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
         )
         # The retry-limit summary of the same run gives the same command.
         $R3.Text | Should -Contain ('  ' + $Again)
-        $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, continue this run with -RetryLimitReached)'
+        $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh)'
         $R3.Zip.RunSummary | Should -Contain ('    - Sub B ({0}): {1}' -f $B.Id, $Reason)
         $R3.Zip.MainSummary | Should -Match ([regex]::Escape(('<li>Sub B ({0}): {1}</li>' -f $B.Id, $Reason)))
-        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, continue this run with -RetryLimitReached)'
+        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh)'
         ($R3.Zip.RunSummary -join "`n") | Should -Not -Match 'the next run collects'
     }
 }

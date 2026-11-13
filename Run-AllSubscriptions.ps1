@@ -731,11 +731,14 @@ if ($PreflightOnly)
         }
         if ($PfScope.Count -eq 0 -and $ResumeFailedOnly)
         {
-            # The run would retry nothing and end with exit 2 (its retry list is
-            # empty, past the retry limit, or not in the subscription list).
-            # With -RetryLimitReached none is left out for the limit, so then none is listed.
-            $PfWhy = if ($RetryLimitReached) { 'none of them is in the subscription list' } else { 'none is listed, or each is past the retry limit; to collect those past the retry limit again, add -RetryLimitReached' }
-            Write-Host ('  A -ResumeFailedOnly run would retry nothing: no subscription on its retry list can be retried ({0}), so it would end with exit 2. To collect every subscription again, start a new run with -Fresh.' -f $PfWhy) -ForegroundColor Red
+            # The run would retry nothing and end with exit 2: its retry list is
+            # empty (then the run goes on without -ResumeFailedOnly), none of it is
+            # in this run's subscription set, or each is past the retry limit and
+            # the run has no -RetryLimitReached.
+            $PfWhy = if (@($PfFailed | Where-Object { $null -ne $_ }).Count -eq 0) { 'its retry list is empty. To go on with the unfinished run, run the same command without -ResumeFailedOnly' }
+            elseif ($RetryLimitReached) { 'none of the subscriptions on its retry list is in this run''s subscription set. To start over with every subscription, start a new run with -Fresh' }
+            else { 'none of the subscriptions on its retry list is in this run''s subscription set, or each is past the retry limit. To collect those past the retry limit again, add -RetryLimitReached; to start over with every subscription, start a new run with -Fresh' }
+            Write-Host ('  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: {0}.' -f $PfWhy) -ForegroundColor Red
             & $PreflightFailed 'the retry list'
         }
         if ($PfScope.Count -eq 0)
@@ -1470,13 +1473,13 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     {
         foreach ($Limited in $SkippedForRetryLimit)
         {
-            Write-Host ("Retrying past the retry limit (-RetryLimitReached): {0} ({1}) failed {2} runs in a row; last reason: {3}." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Cyan
+            Write-Host ("Past the retry limit, in this run's scope (-RetryLimitReached): {0} ({1}) failed {2} runs in a row; last reason: {3}." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Cyan
         }
         $SkippedForRetryLimit = @()
     }
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {
