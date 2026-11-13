@@ -37,6 +37,7 @@ function Write-Debug
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/ResourceInventory.Functions.ps1') -Value $Stub
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/Common.Functions.ps1') -Value '# stand-in'
     Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/AzModules.Functions.ps1') -Value '# stand-in'
+    Set-Content -LiteralPath (Join-Path $script:Tree 'Functions/InventoryJson.Functions.ps1') -Value '# stand-in'
 
     function script:Invoke-Inventory
     {
