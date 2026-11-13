@@ -1207,7 +1207,7 @@ Describe 'The next runs after each case, with the exit of every run' -Skip:$IsWi
             $R.ExitCode | Should -Be 2
             script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
             script:Get-Collected $R | Should -BeNullOrEmpty
-            $R.Text | Should -Contain 'Not retried: Sub B (sub-b) failed 3 runs in a row; last reason: stand-in failure for this subscription. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
+            $R.Text | Should -Contain 'Not retried: Sub B (sub-b) failed 3 runs in a row; last reason: stand-in failure for this subscription. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
             $R.Text | Should -Contain '  To try them again, keeping the completed subscriptions and their reports (any subscription not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:'
             $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached' -f $script:Tenant)
             Test-Path -LiteralPath $script:State | Should -BeTrue
@@ -1303,7 +1303,7 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
                 script:Get-Collected $R | Should -BeNullOrEmpty
             }
             @($R.Text | Where-Object { $_ -like 'Pending Retries:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -BeGreaterThan 0
-            if ($N -lt 3) { $R.Text | Should -Contain 'Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than 7 days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried. To start over instead, start a new run with -Fresh.' }
+            if ($N -lt 3) { $R.Text | Should -Contain 'Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than 7 days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried without -RetryLimitReached. To start over instead, start a new run with -Fresh.' }
             @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @($N)
         }
         foreach ($N in 4, 5)
@@ -1998,7 +1998,7 @@ Describe 'Collecting the subscriptions past the retry limit with -RetryLimitReac
         $R4 = script:Invoke-Wrapper -Arguments $Settings -Streams $Streams
         $R4.ExitCode | Should -Be 2
         script:Get-Collected $R4 | Should -BeNullOrEmpty
-        @($R4.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions)*' }).Count | Should -Be 1
+        @($R4.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions)*' }).Count | Should -Be 1
         $R4.Text | Should -Contain '  To try them again, keeping the completed subscriptions and their reports (any subscription not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:'
         $Printed = './Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached{1}' -f $script:Tenant, $Extra
         $R4.Text | Should -Contain ('    ' + $Printed)

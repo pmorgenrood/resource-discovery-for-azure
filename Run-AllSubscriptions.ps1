@@ -731,14 +731,17 @@ if ($PreflightOnly)
         }
         if ($PfScope.Count -eq 0 -and $ResumeFailedOnly)
         {
-            # The run would retry nothing and end with exit 2: its retry list is
-            # empty (then the run goes on without -ResumeFailedOnly), none of it is
-            # in this run's subscription set, or each is past the retry limit and
-            # the run has no -RetryLimitReached.
-            $PfWhy = if (@($PfFailed | Where-Object { $null -ne $_ }).Count -eq 0) { 'its retry list is empty. To go on with the unfinished run, run the same command without -ResumeFailedOnly' }
-            elseif ($RetryLimitReached) { 'none of the subscriptions on its retry list is in this run''s subscription set. To start over with every subscription, start a new run with -Fresh' }
-            else { 'none of the subscriptions on its retry list is in this run''s subscription set, or each is past the retry limit. To collect those past the retry limit again, add -RetryLimitReached; to start over with every subscription, start a new run with -Fresh' }
-            Write-Host ('  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: {0}.' -f $PfWhy) -ForegroundColor Red
+            # The run would retry nothing and end with exit 2. Fail-safe rule: the
+            # preflight names the cause only and leaves the next step to that run,
+            # which works it out from the whole state (entries it drops as gone or
+            # not enabled, a listing with warnings, an unfinished run past
+            # -ResumeMaxAgeDays, a consolidated zip owed) and prints it; the
+            # preflight reads too little to name it right in every case. Only
+            # the cause this switch removes is named with the switch.
+            $PfWhy = if (@($PfFailed | Where-Object { $null -ne $_ }).Count -eq 0) { 'its retry list is empty' }
+            elseif ($RetryLimitReached) { 'none of the subscriptions on its retry list is in this run''s subscription set' }
+            else { 'none of the subscriptions on its retry list is in this run''s subscription set, or each is past the retry limit (-RetryLimitReached collects those past the limit)' }
+            Write-Host ('  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: {0}. It collects nothing and names the run to go on with; run it without -PreflightOnly to see that.' -f $PfWhy) -ForegroundColor Red
             & $PreflightFailed 'the retry list'
         }
         if ($PfScope.Count -eq 0)
@@ -1479,7 +1482,7 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     }
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {
@@ -3368,7 +3371,7 @@ elseif ((@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimite
     # metrics or consumption this run left incomplete. Surface them so the
     # operator does not lose track of them simply because no subscription failed
     # outright. The entries past the retry limit are named below instead;
-    # -ResumeFailedOnly does not retry them.
+    # -ResumeFailedOnly does not retry them without -RetryLimitReached.
     Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f (@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimited.Count)) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
@@ -3381,7 +3384,7 @@ elseif ((@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimite
     $RoleCheckPending = @(if ($null -ne $AccessDecision) { @($AccessDecision.Inaccessible) | Where-Object { $null -ne $_ -and @('Unknown', 'Disagree') -contains [string]$_.State -and $PendingIds -contains [string]$_.Id } })
     if ($RoleCheckPending.Count -gt 0)
     {
-        Write-Host ("Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than {0} days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried. To start over instead, {1}." -f $ResumeMaxAgeDays, (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
+        Write-Host ("Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than {0} days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried without -RetryLimitReached. To start over instead, {1}." -f $ResumeMaxAgeDays, (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
     }
 }
 if ($NotCollected.Count -gt 0)

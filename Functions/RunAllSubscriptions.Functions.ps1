@@ -4950,7 +4950,7 @@ function Get-RunReportCoverage
     $Retry = @(@($FailedAttempts) | Where-Object { $null -ne $_ })
     $RetryIds = @(& $Ids $Retry)
     $EarlierIds = @(& $Ids $CompletedEarlierIds)
-    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry) }
+    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry) }
     $Without = @(foreach ($Sub in $VisibleSubs)
         {
             $Id = [string]$Sub.Id
@@ -5220,7 +5220,7 @@ function Get-RunSummaryLogContent
     }
     if ($MissingAtLimit.Count -gt 0)
     {
-        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
+        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
@@ -5264,7 +5264,7 @@ function Get-RunSummaryLogContent
         if ($Limited.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Retry limit reached (detail; to try them again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh):')
+            $Lines.Add('Retry limit reached (detail; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
         }
         if ($Missing.Count -gt 0)
@@ -5276,7 +5276,7 @@ function Get-RunSummaryLogContent
         if ($MissingAtLimit.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh):')
+            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh):')
             foreach ($MissingSub in $MissingAtLimit) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
