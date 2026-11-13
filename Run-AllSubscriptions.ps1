@@ -144,9 +144,10 @@ param (
     # otherwise leaves out. The completed subscriptions are kept, so only what
     # is not done yet is collected; a run without -ResumeFailedOnly also
     # carries their reports into its consolidated zip (a -ResumeFailedOnly
-    # run carries none, as always, and a later run that continues builds it). It lifts the limit for this run only: a subscription
-    # that fails again counts one more failed run and a later run without it
-    # leaves it out again. A run that starts a new run collects every
+    # run carries none, as always, and a later run that continues builds it).
+    # It lifts the limit for this run only: a subscription that fails again
+    # counts one more failed run and a later run without it leaves it out
+    # again. A run that starts a new run collects every
     # subscription anyway, so there it changes nothing. Last, so the positions
     # of the parameters above stay.
     [switch]$RetryLimitReached

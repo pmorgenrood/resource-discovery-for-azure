@@ -1240,7 +1240,8 @@ function Get-RetryCommandSettings
 }
 
 # A printed Run-AllSubscriptions.ps1 command: the tenant, $Mode ('-Fresh',
-# '-Resume', or '' for a run that continues by default) and the switches of
+# '-Resume', '-Resume -RetryLimitReached' (Get-RetryLimitReachedCommand), or ''
+# for a run that continues by default) and the switches of
 # $Settings that are on (Format-RunDataSwitches), so a continuing run does not
 # stop on a changed setting and a new run collects with the same ones. A
 # SubscriptionID in $Settings (Get-RetryCommandSettings) follows the tenant as
