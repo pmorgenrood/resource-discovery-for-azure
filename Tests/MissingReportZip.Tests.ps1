@@ -744,7 +744,7 @@ Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
         ($Banner -join "`n") | Should -Not -Match 'NOT in the consolidated zip'
     }
 
-    It 'on the run whose missing report takes a subscription to the retry limit, names it apart with the -Fresh command, in the banner, MainSummary.html and RunSummary.log' {
+    It 'on the run whose missing report takes a subscription to the retry limit, names it apart with the -Resume -RetryLimitReached command, in the banner, MainSummary.html and RunSummary.log' {
         script:New-Case
         $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
         script:Set-Scenario -NoZip @($B.Id)
@@ -753,19 +753,19 @@ Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
         $R3 = script:Invoke-Wrapper
         $R3.ExitCode | Should -Be 2 -Because ($R3.Text -join "`n")
         @($R3.State.FailedAttempts | ForEach-Object { [int]$_.Attempts }) | Should -Be @(3)
-        $Fresh = '  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -SkipMetrics -SkipConsumption' -f $script:Tenant
+        $Again = '  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -SkipMetrics -SkipConsumption' -f $script:Tenant
         script:Get-FullBanner $R3 | Should -Be @(
             '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
             ('  - {0} ({1})' -f $B.Name, $B.Id)
-            'Sub B failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect it again; to try again, start a new run with -Fresh:'
-            $Fresh
+            'Sub B failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect it again; to try again, keeping the completed subscriptions, run:'
+            $Again
         )
         # The retry-limit summary of the same run gives the same command.
-        $R3.Text | Should -Contain ('  ' + $Fresh)
-        $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, start a new run with -Fresh)'
+        $R3.Text | Should -Contain ('  ' + $Again)
+        $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, continue this run with -RetryLimitReached)'
         $R3.Zip.RunSummary | Should -Contain ('    - Sub B ({0}): {1}' -f $B.Id, $Reason)
         $R3.Zip.MainSummary | Should -Match ([regex]::Escape(('<li>Sub B ({0}): {1}</li>' -f $B.Id, $Reason)))
-        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)'
+        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, continue this run with -RetryLimitReached)'
         ($R3.Zip.RunSummary -join "`n") | Should -Not -Match 'the next run collects'
     }
 }

@@ -1207,9 +1207,9 @@ Describe 'The next runs after each case, with the exit of every run' -Skip:$IsWi
             $R.ExitCode | Should -Be 2
             script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
             script:Get-Collected $R | Should -BeNullOrEmpty
-            $R.Text | Should -Contain 'Not retried: Sub B (sub-b) failed 3 runs in a row; last reason: stand-in failure for this subscription. To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it.'
-            $R.Text | Should -Contain '  To try them again, start a new run with -Fresh (it collects every subscription again), for example:'
-            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh' -f $script:Tenant)
+            $R.Text | Should -Contain 'Not retried: Sub B (sub-b) failed 3 runs in a row; last reason: stand-in failure for this subscription. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -RetryLimitReached (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
+            $R.Text | Should -Contain '  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:'
+            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached' -f $script:Tenant)
             Test-Path -LiteralPath $script:State | Should -BeTrue
         }
         # Run 6: -Fresh with B fixed collects both and ends clean; run 7 starts a new run.
@@ -1311,8 +1311,8 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 2
             script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
-            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*To try it again, start a new run with -Fresh*' }).Count | Should -Be 1
-            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh' -f $script:Tenant)
+            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*run the same command with -RetryLimitReached*or start a new run with -Fresh*' }).Count | Should -Be 1
+            $R.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached' -f $script:Tenant)
         }
         # The role check can finish again: -Fresh collects both and ends clean; the next run is a new run.
         script:Set-Scenario -Subs 'A', 'B'
@@ -1334,14 +1334,14 @@ Describe 'The next runs after more cases, with the exit of every run' -Skip:$IsW
         script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B')
         $Started = script:Get-StateStartText
         @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) | Should -Be @(4) -Because '-Fresh keeps the retry list and its counts'
-        $R4.Text | Should -Contain '  To try them again, start a new run with -Fresh (it collects every subscription again), for example:'
+        $R4.Text | Should -Contain '  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:'
         foreach ($N in 5, 6)
         {
             $R = script:Invoke-Wrapper -Streams 1
             $R.ExitCode | Should -Be 2
             script:Get-StartLines $R | Should -Be @(('Continuing the run started {0} (1 of 2 subscriptions done, 1 past the retry limit). Settings: {1}. Pass -Fresh to start over.' -f $Started, $script:DefaultSettingsText))
             script:Get-Collected $R | Should -BeNullOrEmpty
-            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 4 runs in a row;*start a new run with -Fresh*' }).Count | Should -Be 1
+            @($R.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 4 runs in a row;*-RetryLimitReached*start a new run with -Fresh*' }).Count | Should -Be 1
         }
     }
 
@@ -2009,7 +2009,7 @@ Describe 'Collecting the subscriptions past the retry limit with -RetryLimitReac
         $R5 = script:Invoke-Wrapper -Arguments $Args5 -Streams $Streams
         $R5.ExitCode | Should -Be 0
         script:Get-Collected $R5 | Should -Be (script:Get-Ids 'B') -Because 'the completed A and C are kept, only the one past the limit is collected'
-        @($R5.Text | Where-Object { $_ -like 'Retried past the retry limit (-RetryLimitReached): Sub B (sub-b) failed 3 runs in a row;*' }).Count | Should -Be 1
+        @($R5.Text | Where-Object { $_ -like 'Retrying past the retry limit (-RetryLimitReached): Sub B (sub-b) failed 3 runs in a row;*' }).Count | Should -Be 1
         script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B', 'C') -Because 'the consolidated zip carries the completed reports and adds the new one'
         script:Read-State | Should -BeNullOrEmpty -Because 'a clean run clears the state'
         $R6 = script:Invoke-Wrapper -Arguments $Settings -Streams $Streams

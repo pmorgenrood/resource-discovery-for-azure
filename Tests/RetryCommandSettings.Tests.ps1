@@ -96,12 +96,12 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
         ($Lines -join "`n") | Should -Not -Match 'ResumeFailedOnly'
     }
 
-    It 'names one past the retry limit with the -Fresh command, with <Name>' -TestCases @(
+    It 'names one past the retry limit with the -Resume -RetryLimitReached command, with <Name>' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {
         $Lines = @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings (script:New-Settings -On $Name))
-        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
-        ($Lines -join "`n") | Should -Not -Match '-Resume'
+        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+        @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' }) | Should -HaveCount 1 -Because 'the one past the limit is not named with the plain -Resume command'
     }
 
     It 'gives the plain commands for a run with none of the settings' {
@@ -123,19 +123,19 @@ Describe 'The commands of the retry-limit summary' {
         $Lines = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -NotListedIds @('sub-a') -NotReadableIds @('sub-b') -Settings $S }
         $Commands = @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' } | ForEach-Object { $_.Trim() })
         $Commands | Should -Be @(
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -{1}' -f $script:Tenant, $Name)
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
         )
     }
 }
 
-Describe 'The -Fresh command under FAILED (report missing)' {
+Describe 'The -Resume -RetryLimitReached command under FAILED (report missing)' {
     It 'carries <Name> for a subscription whose missing report took it to the retry limit' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {
         $Lines = script:Get-HostLines { Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -RetryLimited @(& $script:Attempt 3) -TenantID $script:Tenant -Settings (script:New-Settings -On $Name) }
-        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
+        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
     }
 }
 

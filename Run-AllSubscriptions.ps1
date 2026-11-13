@@ -733,7 +733,9 @@ if ($PreflightOnly)
         {
             # The run would retry nothing and end with exit 2 (its retry list is
             # empty, past the retry limit, or not in the subscription list).
-            Write-Host '  A -ResumeFailedOnly run would retry nothing: no subscription on its retry list can be retried (none is listed, or each is past the retry limit), so it would end with exit 2. To collect those past the retry limit again, add -RetryLimitReached; to collect every subscription again, start a new run with -Fresh.' -ForegroundColor Red
+            # With -RetryLimitReached none is left out for the limit, so then none is listed.
+            $PfWhy = if ($RetryLimitReached) { 'none of them is in the subscription list' } else { 'none is listed, or each is past the retry limit; to collect those past the retry limit again, add -RetryLimitReached' }
+            Write-Host ('  A -ResumeFailedOnly run would retry nothing: no subscription on its retry list can be retried ({0}), so it would end with exit 2. To collect every subscription again, start a new run with -Fresh.' -f $PfWhy) -ForegroundColor Red
             & $PreflightFailed 'the retry list'
         }
         if ($PfScope.Count -eq 0)
@@ -1468,7 +1470,7 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     {
         foreach ($Limited in $SkippedForRetryLimit)
         {
-            Write-Host ("Retried past the retry limit (-RetryLimitReached): {0} ({1}) failed {2} runs in a row; last reason: {3}." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Cyan
+            Write-Host ("Retrying past the retry limit (-RetryLimitReached): {0} ({1}) failed {2} runs in a row; last reason: {3}." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Cyan
         }
         $SkippedForRetryLimit = @()
     }
@@ -3100,14 +3102,15 @@ if ($ResumeFailedOnly)
 }
 # The retry-list entries past the retry limit, listed as incomplete in the
 # summary. They keep the state (see $RetryOwedCount), so the next -Resume or
-# -ResumeFailedOnly run skips them again and ends with exit 2.
+# -ResumeFailedOnly run without -RetryLimitReached skips them again and ends
+# with exit 2.
 $RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
 $RetryLimitedOwed = @($RetryLimited | Where-Object { $RetryLimitedNotInRunIds -contains [string]$_.Id })
 # Every entry keeps the state, those past the limit included: clearing the
 # state would forget their count, so the next -Resume would collect them again
 # from the first attempt and the limit would never end the cycle. They leave
-# the state only when a run without -Resume or -ResumeFailedOnly collects them,
-# or when they are no longer visible. ResourceInventory.ps1 run on its own does
+# the state only when a run that collects them completes them (a new run, or
+# one with -RetryLimitReached), or when they are no longer visible. ResourceInventory.ps1 run on its own does
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
 

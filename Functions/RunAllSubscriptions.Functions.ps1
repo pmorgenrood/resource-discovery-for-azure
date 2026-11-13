@@ -2723,13 +2723,15 @@ function Write-RetryLimitSummary
     }
     # A subscription missing from a listing that came back with warnings or
     # errors is kept until a complete listing: no run can tell whether it is
-    # gone (then the run drops it) or only hidden (then a new run with -Fresh
-    # collects it), so the advice is to fix the listing first.
+    # gone (then the run drops it) or only hidden (then a run with
+    # -RetryLimitReached, or a new run, collects it), so the advice is to fix
+    # the listing first. The command is the -RetryLimitReached one: a run that
+    # continues this one leaves a listed one past the limit out without it.
     $NotListed = @($List | Where-Object { @($NotListedIds) -contains [string]$_.Id })
     if ($NotListed.Count -gt 0)
     {
         Write-Host ("  {0} not in the subscription list, which came back with warnings or errors (printed at the start of the run). Fix those until 'Get-AzSubscription -TenantId {1}' lists the tenant without them, then run again: the run drops a subscription that is gone from the retry list, and collects one that is listed again, for example:" -f ((@($NotListed | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotListed.Count -eq 1) { ' is' } else { ' are' })), $TenantID) -ForegroundColor Yellow
-        Write-Host ('    ' + (Get-WrapperRunCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
+        Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
     }
     $List = @($List | Where-Object { @($NotListedIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
