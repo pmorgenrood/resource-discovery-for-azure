@@ -1209,7 +1209,7 @@ Describe 'A subscription whose grouped metric requests still fail after their re
     # -RetryLimitReached collects only it, keeps the completed ones and ends
     # clean once its metrics are complete.
     It 'after three incomplete runs the printed -Resume -RetryLimitReached run collects only it and ends clean (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
-        $Global:RdaRlMetricsIds = @('sub-x')
+        Set-Variable -Name RdaRlMetricsIds -Scope Global -Value @('sub-x')
         $env:RDA_RL_METRICS_THROTTLE = '1'
         $Subs = @($script:A, $script:B, $script:X)
         foreach ($n in 1..3) { $null = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume:($n -gt 1) }

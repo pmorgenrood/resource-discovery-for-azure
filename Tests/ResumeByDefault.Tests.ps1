@@ -1999,7 +1999,7 @@ Describe 'Collecting the subscriptions past the retry limit with -RetryLimitReac
         $R4.ExitCode | Should -Be 2
         script:Get-Collected $R4 | Should -BeNullOrEmpty
         @($R4.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*run the same command with -RetryLimitReached (it keeps the completed subscriptions)*' }).Count | Should -Be 1
-        $R4.Text | Should -Contain '  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached:'
+        $R4.Text | Should -Contain '  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:'
         $Printed = './Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached{1}' -f $script:Tenant, $Extra
         $R4.Text | Should -Contain ('    ' + $Printed)
 

@@ -2745,10 +2745,8 @@ function Write-RetryLimitSummary
     }
     $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
-    Write-Host "  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached:" -ForegroundColor Yellow
+    Write-Host "  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:" -ForegroundColor Yellow
     Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
-    Write-Host "  Or start a new run with -Fresh (it collects every subscription again):" -ForegroundColor Yellow
-    Write-Host ('    ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings)) -ForegroundColor Yellow
 }
 
 # The subscriptions of the run's completed list ($CompletedIds) whose report
