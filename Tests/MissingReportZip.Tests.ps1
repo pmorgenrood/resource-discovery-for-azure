@@ -757,7 +757,7 @@ Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
         script:Get-FullBanner $R3 | Should -Be @(
             '1 subscription(s) completed collection this run, but their report zip is missing, so they are NOT in the consolidated zip:'
             ('  - {0} ({1})' -f $B.Name, $B.Id)
-            'Sub B failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect it again; to try again, keeping the completed subscriptions, run:'
+            'Sub B failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect it again without -RetryLimitReached; to try again, keeping the completed subscriptions, run:'
             $Again
         )
         # The retry-limit summary of the same run gives the same command.
@@ -765,7 +765,7 @@ Describe 'The FAILED (report missing) banner' -Skip:$IsWindows {
         $Reason = 'retry limit reached (failed 3 runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
         $R3.Zip.RunSummary | Should -Contain ('    - Sub B ({0}): {1}' -f $B.Id, $Reason)
         $R3.Zip.MainSummary | Should -Match ([regex]::Escape(('<li>Sub B ({0}): {1}</li>' -f $B.Id, $Reason)))
-        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
+        $R3.Zip.RunSummary | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
         ($R3.Zip.RunSummary -join "`n") | Should -Not -Match 'the next run collects'
     }
 }

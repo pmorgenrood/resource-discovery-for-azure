@@ -474,7 +474,7 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
         $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing -RetryLimited $Limited)
         $Clear | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
-        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
+        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
         $At = [array]::IndexOf($Clear, 'Report missing (detail; not in this zip, the next run collects them):')
         $Clear[$At + 1] | Should -Be '  - Sub A (sub-a)'
         $Clear[$At + 2] | Should -Be '' -Because 'Sub B is not among those the next run collects'

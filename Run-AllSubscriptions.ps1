@@ -1487,7 +1487,7 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     }
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {
@@ -1889,7 +1889,8 @@ if ($ParallelStreams -le 1)
                 # earlier run's completion of it ends here, so the next -Resume
                 # collects it again instead of carrying the older report. It goes
                 # on the retry list as a failed run, so -ResumeFailedOnly retries
-                # it and the retry limit ends a cause that does not go away.
+                # it and the retry limit ends a cause that does not go away
+                # (a run with -RetryLimitReached tries it again).
                 $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'the run wrote no report zip (see the errors above)'
@@ -3719,8 +3720,8 @@ if (@($UncarriedSkipped).Count -gt 0)
 # other than the sign-in (that one is in FAILED (auth) above) is missing some or
 # all of its cost data: exit 3 below (5 with a collector failure). It is on the
 # retry list, so the next run collects it again; once it has failed 3 runs in a
-# row the retry limit leaves it out (Retry Limit Reached), and that run is not
-# exited 3 for it.
+# row the retry limit leaves it out (Retry Limit Reached) unless the run has
+# -RetryLimitReached, and that run is not exited 3 for it.
 Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RetryCommandSettings)
 
 # A subscription whose Azure Monitor metric request (grouped or for one
@@ -3732,7 +3733,8 @@ Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-C
 # A subscription completed this run whose report zip is missing is not in the
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
-# the others, unless it has now failed 3 runs in a row; sets exit code 2 below.
+# the others, unless it has now failed 3 runs in a row (then only a run with
+# -RetryLimitReached collects it); sets exit code 2 below.
 # With the inventory folder gone, one line says so instead.
 Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RetryCommandSettings -GoneFolder $(if ($InventoryFolderGone) { $InventoryRoot } else { '' })
 

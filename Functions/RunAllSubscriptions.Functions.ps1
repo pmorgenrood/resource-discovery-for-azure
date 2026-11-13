@@ -2702,7 +2702,7 @@ function Get-ConsumptionFailedAdvice
     }
     if ($AtLimit.Count -gt 0)
     {
-        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, keeping the completed subscriptions, run:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
+        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping the completed subscriptions, run:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
         $Lines += ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings))
     }
     return $Lines
@@ -2807,7 +2807,7 @@ function Write-MissingReportBanner
     }
     if ($AtLimit.Count -gt 0)
     {
-        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, keeping the completed subscriptions, run:" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
+        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping the completed subscriptions, run:" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
         Write-Host ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Red
     }
     Write-Host "=============================================================" -ForegroundColor Red
@@ -4908,7 +4908,7 @@ function Get-AzContextAutosaveCheck
 # collection failed (on the retry list after this run), not collected. A
 # report missing on the run that takes it to the retry limit is named as
 # retry limit reached, since a run that continues this one does not collect
-# it. Kind is a fixed
+# it without -RetryLimitReached. Kind is a fixed
 # word for each reason; Reason is the text, which for a failed collection
 # ends with the reason the retry list records (raw error text, so a summary of
 # an obfuscated run shows Kind counts only).
@@ -5220,7 +5220,7 @@ function Get-RunSummaryLogContent
     }
     if ($MissingAtLimit.Count -gt 0)
     {
-        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
+        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))

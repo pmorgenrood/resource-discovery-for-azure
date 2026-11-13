@@ -271,7 +271,7 @@ Export-ModuleMember -Function Get-AzMetric
     $script:C = [pscustomobject]@{ Id = 'sub-c'; Name = 'Sub C' }
     $script:X = [pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X' }
     $script:Y = [pscustomobject]@{ Id = 'sub-y'; Name = 'Sub Y' }
-    $script:NotRetriedX = 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: stand-in failure for this subscription. A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
+    $script:NotRetriedX = 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: stand-in failure for this subscription. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
 
     # A fresh home, inventory root and resume-state path for each test. The root is
     # <home>/InventoryReports, the path the wrapper's sequential catch also uses.
@@ -502,7 +502,7 @@ Describe 'Following the retry-limit advice' {
         # The advice: the start-up line and the end-of-run command.
         $Advice = @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x)*')
         $Advice | Should -HaveCount 1
-        $Advice[0] | Should -BeLike '*A run that continues this one, with or without -Resume, does not collect it; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
+        $Advice[0] | Should -BeLike '*A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again).'
         $Command = @(script:Get-Lines -Run $Run4 -Like '    ./Run-AllSubscriptions.ps1 *')
         $Command | Should -HaveCount 1
         $Command[0] | Should -Be '    ./Run-AllSubscriptions.ps1 -TenantID t -Resume -RetryLimitReached'
