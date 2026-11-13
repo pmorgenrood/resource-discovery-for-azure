@@ -215,7 +215,7 @@ Export-ModuleMember -Function Get-AzMetric
     "`$SubWarnings = @(`$Global:RdaRlListWarnings | Where-Object { `$_ }); `$SubErrors = @(`$Global:RdaRlListErrors | Where-Object { `$_ })`n" +
     "`$NoAccessSubs = @(); `$GenuinelyEmptySubs = @(); `$UnknownSubs = @(); `$ConsumptionRecordTotal = 0; `$ConsumptionWindow = Get-ConsumptionWindow`n" +
     "`$AutoTune = [pscustomobject]@{ VCpu = 2; RamGB = 4 }; `$StreamsSrc = 'explicit'; `$ConcurrencySrc = 'auto'; `$AuthSkippedPhases = @(); `$UncarriedSkipped = @()`n"
-    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$ParallelStreams, `$ObfuscateRun)`n`$ResumeScope = `$TenantID`n"
+    $Params = "param(`$FakeScriptRoot, `$Subscriptions, `$InventoryRoot, `$ResumeStateFile, `$TenantID, `$Resume, `$ResumeFailedOnly, `$ParallelStreams, `$ObfuscateRun, `$RetryLimitReached)`n`$ResumeScope = `$TenantID`n"
     $Result = "`n[pscustomobject]@{ Kind = 'run-result'; SubResourceCounts = @(`$SubResourceCounts); FailedSubscriptions = @(`$FailedSubscriptions); RunSummary = @(`$RunSummaryLines); WrapperExitCode = `$WrapperExitCode }"
     $Tail = "`n" + $CleanupText + "`n" + $AdviceText + "`n" + $RunSummaryText + "`n" + $ConsumptionBannerText + "`n" + $ExitText + $Result
 
@@ -231,7 +231,7 @@ Export-ModuleMember -Function Get-AzMetric
     # and the ids the stand-in was called for.
     function script:Invoke-Run
     {
-        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [int]$Streams = 1, [switch]$Interrupted, [switch]$Obfuscate, [switch]$ZipFails)
+        param([object[]]$Subs, [switch]$Resume, [switch]$ResumeFailedOnly, [int]$Streams = 1, [switch]$Interrupted, [switch]$Obfuscate, [switch]$ZipFails, [switch]$RetryLimitReached)
         $Block = if ($Interrupted) { $script:InterruptedParallelBlock } elseif ($Streams -gt 1) { $script:ParallelBlock } elseif ($ZipFails) { $script:SequentialZipFailBlock } else { $script:SequentialBlock }
         $Global:RdaRlCalls = @()
         $global:LASTEXITCODE = 0
@@ -240,7 +240,7 @@ Export-ModuleMember -Function Get-AzMetric
         $Code = $null
         try
         {
-            & $Block $script:FakeRoot @($Subs) $script:Root $script:State 't' ([bool]$Resume) ([bool]$ResumeFailedOnly) $Streams ([bool]$Obfuscate) 6>&1 | ForEach-Object {
+            & $Block $script:FakeRoot @($Subs) $script:Root $script:State 't' ([bool]$Resume) ([bool]$ResumeFailedOnly) $Streams ([bool]$Obfuscate) ([bool]$RetryLimitReached) 6>&1 | ForEach-Object {
                 if ($_ -is [System.Management.Automation.InformationRecord]) { $Lines.Add([string]$_.MessageData) }
                 elseif ($_ -is [pscustomobject] -and $_.PSObject.Properties['Kind'] -and $_.Kind -eq 'run-result') { $Results.Add($_) }
             }
@@ -1203,5 +1203,27 @@ Describe 'A subscription whose grouped metric requests still fail after their re
         @(script:Get-Lines -Run $Run4 -Like '*FAILED (metrics)*').Count | Should -Be 0
         @(script:Get-Lines -Run $Run4 -Like 'Not retried: Sub X (sub-x) failed 3 runs in a row; last reason: Metrics incomplete*').Count | Should -Be 1
         $Run4.Result.WrapperExitCode | Should -Be 2
+    }
+
+    # The way out the summary prints: the same run with -Resume
+    # -RetryLimitReached collects only it, keeps the completed ones and ends
+    # clean once its metrics are complete.
+    It 'after three incomplete runs the printed -Resume -RetryLimitReached run collects only it and ends clean (<Streams> stream(s))' -ForEach @(@{ Streams = 1 }, @{ Streams = 2 }) {
+        $Global:RdaRlMetricsIds = @('sub-x')
+        $env:RDA_RL_METRICS_THROTTLE = '1'
+        $Subs = @($script:A, $script:B, $script:X)
+        foreach ($n in 1..3) { $null = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume:($n -gt 1) }
+        $Run4 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume
+        @(script:Get-Lines -Run $Run4 -Like '    ./Run-AllSubscriptions.ps1 -TenantID t -Resume -RetryLimitReached') | Should -HaveCount 1
+
+        $env:RDA_RL_METRICS_THROTTLE = ''
+        $Run5 = script:Invoke-Run -Subs $Subs -Streams $Streams -Resume -RetryLimitReached
+
+        @($Run5.Calls) | Should -Be @('sub-x') -Because 'the completed Sub A and Sub B are kept, not collected again'
+        @(script:Get-Lines -Run $Run5 -Like 'Retried past the retry limit (-RetryLimitReached): Sub X (sub-x) failed 3 runs in a row; last reason: Metrics incomplete*') | Should -HaveCount 1
+        @(script:Get-Lines -Run $Run5 -Like 'Not retried:*') | Should -BeNullOrEmpty
+        $Run5.Result.WrapperExitCode | Should -Be 0
+        @(script:Get-Lines -Run $Run5 -Like 'Resume state cleared (clean run).') | Should -HaveCount 1
+        Test-Path -LiteralPath $script:State | Should -BeFalse
     }
 }

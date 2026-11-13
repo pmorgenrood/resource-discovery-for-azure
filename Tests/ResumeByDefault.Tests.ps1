@@ -1979,3 +1979,86 @@ Describe 'A retry-list subscription that is not enabled' -Skip:$IsWindows {
         script:Read-State | Should -BeNullOrEmpty
     }
 }
+
+# A subscription past the retry limit is collected again, without collecting the
+# completed ones again, by the command the summary prints: the same command with
+# -Resume -RetryLimitReached. That run carries the completed reports, so its
+# consolidated zip holds every subscription. Traced over the next runs: the
+# state clears on success; on another failure the count goes on and a run
+# without the switch leaves it out again, so nothing loops by itself.
+Describe 'Collecting the subscriptions past the retry limit with -RetryLimitReached' -Skip:$IsWindows {
+    BeforeEach { script:New-Case }
+    AfterEach { script:Write-FailedCaseRuns }
+
+    It 'the printed command collects only them, its zip holds every subscription, it ends clean and the next run is a new run (-ParallelStreams <Streams><Extra>)' -ForEach @(@{ Streams = 1; Extra = '' }, @{ Streams = 2; Extra = ' -Obfuscate' }) {
+        $Settings = @(if ($Extra) { $Extra.Trim() })
+        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B'
+        $Exits = @(foreach ($N in 1, 2, 3) { (script:Invoke-Wrapper -Arguments $Settings -Streams $Streams).ExitCode })
+        $Exits | Should -Be @(2, 2, 2)
+        $R4 = script:Invoke-Wrapper -Arguments $Settings -Streams $Streams
+        $R4.ExitCode | Should -Be 2
+        script:Get-Collected $R4 | Should -BeNullOrEmpty
+        @($R4.Text | Where-Object { $_ -like 'Not retried: Sub B (sub-b) failed 3 runs in a row;*run the same command with -RetryLimitReached (it keeps the completed subscriptions)*' }).Count | Should -Be 1
+        $R4.Text | Should -Contain '  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached:'
+        $Printed = './Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached{1}' -f $script:Tenant, $Extra
+        $R4.Text | Should -Contain ('    ' + $Printed)
+
+        # The cause is gone. Run the printed command as written.
+        script:Set-Scenario -Subs 'A', 'B', 'C'
+        $Args5 = @(($Printed -split ' ') | Select-Object -Skip 3)
+        $R5 = script:Invoke-Wrapper -Arguments $Args5 -Streams $Streams
+        $R5.ExitCode | Should -Be 0
+        script:Get-Collected $R5 | Should -Be (script:Get-Ids 'B') -Because 'the completed A and C are kept, only the one past the limit is collected'
+        @($R5.Text | Where-Object { $_ -like 'Retried past the retry limit (-RetryLimitReached): Sub B (sub-b) failed 3 runs in a row;*' }).Count | Should -Be 1
+        script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B', 'C') -Because 'the consolidated zip carries the completed reports and adds the new one'
+        script:Read-State | Should -BeNullOrEmpty -Because 'a clean run clears the state'
+        $R6 = script:Invoke-Wrapper -Arguments $Settings -Streams $Streams
+        $R6.ExitCode | Should -Be 0
+        script:Get-StartLines $R6 | Should -Be @('Starting a new run.')
+    }
+
+    It 'when it fails again the count goes on, a run without the switch skips it again, and the switch tries it once more; nothing loops by itself' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = foreach ($N in 1, 2, 3) { script:Invoke-Wrapper -Streams 1 }
+        $Count = { @((script:Read-StateFile).FailedAttempts | Where-Object { $_.Id -eq 'sub-b' } | ForEach-Object { [int]$_.Attempts }) }
+        & $Count | Should -Be @(3)
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume', '-RetryLimitReached' -Streams 1
+        $R4.ExitCode | Should -Be 2
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'B')
+        & $Count | Should -Be @(4) -Because 'a failed run counts one more'
+        $R4.Text | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached' -f $script:Tenant)
+        foreach ($N in 5, 6)
+        {
+            $R = script:Invoke-Wrapper -Streams 1
+            $R.ExitCode | Should -Be 2
+            script:Get-Collected $R | Should -BeNullOrEmpty -Because 'the switch lifts the limit for its own run only'
+            & $Count | Should -Be @(4) -Because 'a skipped run neither counts nor forgets'
+        }
+        $R7 = script:Invoke-Wrapper -Arguments '-RetryLimitReached' -Streams 1
+        script:Get-Collected $R7 | Should -Be (script:Get-Ids 'B')
+        & $Count | Should -Be @(5)
+        $R7.ExitCode | Should -Be 2
+    }
+
+    It 'with -ResumeFailedOnly it retries the ones past the limit too, and the zip is still owed by a run that continues' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        $null = foreach ($N in 1, 2, 3) { script:Invoke-Wrapper -Streams 1 }
+        script:Set-Scenario -Subs 'A', 'B'
+        $R4 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly', '-RetryLimitReached' -Streams 1
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'B')
+        $R4.ExitCode | Should -Be 2 -Because 'its zip holds only B, so the consolidated zip with A is owed'
+        $R5 = script:Invoke-Wrapper -Streams 1
+        $R5.ExitCode | Should -Be 0
+        script:Get-Collected $R5 | Should -BeNullOrEmpty
+        script:Get-NewestBundleReportIds | Should -Be (script:Get-Ids 'A', 'B')
+        script:Read-State | Should -BeNullOrEmpty
+    }
+
+    It 'on a run that starts a new run it says it changes nothing and the run collects every subscription' {
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments '-RetryLimitReached' -Streams 1
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain '-RetryLimitReached: this run starts a new run, which collects every subscription, so the switch changes nothing.'
+        script:Get-Collected $R | Should -Be (script:Get-Ids 'A', 'B')
+    }
+}

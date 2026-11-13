@@ -494,11 +494,11 @@ Describe 'The -SubscriptionID helpers' {
         Get-WrapperRunCommand -TenantID $script:Tenant -Mode '-Fresh' -Settings $Whole | Should -BeExactly ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -Obfuscate' -f $script:Tenant)
     }
 
-    It 'keeps -SubscriptionID and then -PreflightOnly as the last parameters of the wrapper, after every earlier one' {
+    It 'keeps -SubscriptionID, -PreflightOnly and then -RetryLimitReached as the last parameters of the wrapper, after every earlier one' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
         $Names = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         $Names.IndexOf('SubscriptionID') | Should -Be ($Names.IndexOf('ResumeMaxAgeDays') + 1)
-        $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly')
+        $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly', 'RetryLimitReached')
         $Names[0..($Names.IndexOf('ResumeMaxAgeDays'))] | Should -Be @('TenantID', 'DeviceLogin', 'Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeNetworkResources', 'UseMetricsBatch', 'Resume', 'ResumeFailedOnly', 'Fresh', 'IncludeDisabled', 'AllowPartialAccess', 'MainSummary', 'Detailed', 'ConcurrencyLimit', 'ParallelStreams', 'ResumeMaxAgeDays')
     }
 }

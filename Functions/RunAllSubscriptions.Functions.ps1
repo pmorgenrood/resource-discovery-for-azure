@@ -2659,13 +2659,23 @@ function Get-FailedAttemptCount
 
 # The retry-list entries of the subscriptions that failed $RetryLimit runs in a
 # row. A run that continues the unfinished run (with or without -Resume) and
-# -ResumeFailedOnly do not collect these; a new run (-Fresh, or one past
-# -ResumeMaxAgeDays) still does, and only such a run takes them off the retry list.
+# -ResumeFailedOnly do not collect these unless the run has -RetryLimitReached;
+# a new run (-Fresh, or one past -ResumeMaxAgeDays) still does. A run that
+# completes one takes it off the retry list.
 function Get-RetryLimitedAttempts
 {
     param([object]$FailedAttempts)
     $RetryLimit = 3
     return @(@($FailedAttempts) | Where-Object { $null -ne $_ -and (Get-FailedAttemptCount -Entry $_) -ge $RetryLimit })
+}
+
+# The printed command that continues the unfinished run and also collects the
+# subscriptions past the retry limit (-RetryLimitReached): -Resume, so it
+# continues the run even past -ResumeMaxAgeDays, and the run's settings.
+function Get-RetryLimitReachedCommand
+{
+    param([string]$TenantID, [System.Collections.IDictionary]$Settings)
+    return (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume -RetryLimitReached' -Settings $Settings)
 }
 
 # The lines under the wrapper's FAILED (consumption) banner: the command that
@@ -2674,8 +2684,8 @@ function Get-RetryLimitedAttempts
 # new consolidated zip; -ResumeFailedOnly collects only the retry list and
 # carries no other report. One that has now failed $RetryLimit runs in a row
 # is not collected by a run that continues this one, so it is named apart with
-# the -Fresh command, as Write-RetryLimitSummary names it. Each command carries
-# the run's settings ($Settings, Get-RunDataSettings).
+# the -RetryLimitReached command, as Write-RetryLimitSummary names it. Each
+# command carries the run's settings ($Settings, Get-RunDataSettings).
 function Get-ConsumptionFailedAdvice
 {
     param([object[]]$Entries, [object]$FailedAttempts, [string]$TenantID, [System.Collections.IDictionary]$Settings)
@@ -2688,12 +2698,12 @@ function Get-ConsumptionFailedAdvice
     {
         $Lines += ('On the retry list, so a run that continues this one collects {0} again and carries the other reports into a new consolidated zip:' -f (@($Retried | ForEach-Object { $_.Name }) -join ', '))
         $Lines += ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $Settings))
-        $Lines += 'A subscription that fails 3 runs in a row is not collected again by a run that continues this one (Retry Limit Reached).'
+        $Lines += 'A subscription that fails 3 runs in a row is not collected again by a run that continues this one (Retry Limit Reached), unless the run has -RetryLimitReached.'
     }
     if ($AtLimit.Count -gt 0)
     {
-        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, start a new run with -Fresh:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
-        $Lines += ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings))
+        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, keeping the completed subscriptions, run:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
+        $Lines += ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings))
     }
     return $Lines
 }
@@ -2706,7 +2716,7 @@ function Write-RetryLimitSummary
     param([object]$RetryLimited, [string]$TenantID, [string[]]$NotListedIds = @(), [string[]]$NotReadableIds = @(), [System.Collections.IDictionary]$Settings)
     $List = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     if ($List.Count -eq 0) { return }
-    Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    Write-Host ("Retry Limit Reached:     {0} ({1}) - incomplete; a run that continues this one (with or without -Resume) and -ResumeFailedOnly do not collect these without -RetryLimitReached" -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
     foreach ($Entry in $List)
     {
         Write-Host ("  - {0} ({1}): failed {2} runs in a row; last reason: {3}" -f $Entry.Name, $Entry.Id, (Get-FailedAttemptCount -Entry $Entry), $Entry.Reason) -ForegroundColor Yellow
@@ -2730,12 +2740,14 @@ function Write-RetryLimitSummary
     $NotReadable = @($List | Where-Object { @($NotReadableIds) -contains [string]$_.Id })
     if ($NotReadable.Count -gt 0)
     {
-        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, start a new run with -Fresh, for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
-        Write-Host ('    ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings)) -ForegroundColor Yellow
+        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, run the same command with -RetryLimitReached (it keeps the completed subscriptions), for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
+        Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
     }
     $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
-    Write-Host "  To try them again, start a new run with -Fresh (it collects every subscription again), for example:" -ForegroundColor Yellow
+    Write-Host "  To try only them again, keeping the completed subscriptions and their reports, continue this run with -RetryLimitReached:" -ForegroundColor Yellow
+    Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
+    Write-Host "  Or start a new run with -Fresh (it collects every subscription again):" -ForegroundColor Yellow
     Write-Host ('    ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings)) -ForegroundColor Yellow
 }
 
@@ -2756,7 +2768,7 @@ function Get-ZipOwedSubscriptionIds
 # whose report zip is missing ($MissingReportCount of them, $MissingReports
 # those that can be named). One that has now failed 3 runs in a row
 # ($RetryLimited, Get-RetryLimitedAttempts) is not collected by a run that
-# continues this one, so it is named apart with the -Fresh command, as
+# continues this one, so it is named apart with the -RetryLimitReached command, as
 # Write-RetryLimitSummary names it. $ZipBuilt is $false when the run built no
 # consolidated zip (for example when every report of the run is missing).
 function Write-MissingReportBanner
@@ -2795,8 +2807,8 @@ function Write-MissingReportBanner
     }
     if ($AtLimit.Count -gt 0)
     {
-        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, start a new run with -Fresh:" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
-        Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings)) -ForegroundColor Red
+        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again; to try again, keeping the completed subscriptions, run:" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
+        Write-Host ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Red
     }
     Write-Host "=============================================================" -ForegroundColor Red
 }
@@ -4938,7 +4950,7 @@ function Get-RunReportCoverage
     $Retry = @(@($FailedAttempts) | Where-Object { $null -ne $_ })
     $RetryIds = @(& $Ids $Retry)
     $EarlierIds = @(& $Ids $CompletedEarlierIds)
-    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry) }
+    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, continue this run with -RetryLimitReached)' -f (Get-FailedAttemptCount -Entry $Entry) }
     $Without = @(foreach ($Sub in $VisibleSubs)
         {
             $Id = [string]$Sub.Id
@@ -5201,14 +5213,14 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Skipped   : {0} (already completed / resume)' -f $Skipped))
     $Lines.Add(('  Processed : {0}' -f $Processed))
     $Lines.Add(('  Failed    : {0}' -f $Failed.Count))
-    $Lines.Add(('  Retry limit reached : {0} (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these)' -f $Limited.Count))
+    $Lines.Add(('  Retry limit reached : {0} (incomplete; a run that continues this one and -ResumeFailedOnly do not collect these without -RetryLimitReached)' -f $Limited.Count))
     if ($MissingTotal -gt 0)
     {
         $Lines.Add(('  Report missing      : {0} (completed, but their report zip is not in this zip; the next run collects them)' -f $MissingTotal))
     }
     if ($MissingAtLimit.Count -gt 0)
     {
-        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these; to try them again, start a new run with -Fresh)' -f $MissingAtLimit.Count))
+        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these; to try them again, continue this run with -RetryLimitReached)' -f $MissingAtLimit.Count))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
@@ -5252,7 +5264,7 @@ function Get-RunSummaryLogContent
         if ($Limited.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Retry limit reached (detail; to try them again, start a new run with -Fresh):')
+            $Lines.Add('Retry limit reached (detail; to try them again, continue this run with -RetryLimitReached):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
         }
         if ($Missing.Count -gt 0)
@@ -5264,7 +5276,7 @@ function Get-RunSummaryLogContent
         if ($MissingAtLimit.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, start a new run with -Fresh):')
+            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, continue this run with -RetryLimitReached):')
             foreach ($MissingSub in $MissingAtLimit) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)
