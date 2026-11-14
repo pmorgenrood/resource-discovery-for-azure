@@ -1453,10 +1453,10 @@ if ($ResumeFailedOnly)
     Write-Host ("ResumeFailedOnly: filtered to {0} previously-failed subscription(s) (was {1})." -f $Subscriptions.Count, $BeforeCount) -ForegroundColor Cyan
     if ($Subscriptions.Count -eq 0)
     {
-        # Could happen if the visible-subs list no longer contains the failed
-        # IDs (sub was deleted, identity lost access, IncludeDisabled toggled
-        # off relative to the prior run). Tell the user instead of silently
-        # processing nothing.
+        # Entries of subscriptions that are gone or not enabled were taken off
+        # the retry list above, so the ones left here are those a subscription
+        # list with warnings or errors left out. Tell the user instead of
+        # silently processing nothing.
         # The retry list still holds them (the state is kept), so this is not a
         # success: exit 2, as for any report the run could not produce.
         # The entries left are those a subscription list with warnings or

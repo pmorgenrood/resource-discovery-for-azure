@@ -5282,7 +5282,7 @@ function Get-RunSummaryLogContent
             ('  Run stopped part way, or not everything done: {0} (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)' -f (& $Command '-Resume'))
             ('  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): {0} (its zip holds only the reports it collects; a later -Resume builds the full zip)' -f (& $Command '-ResumeFailedOnly'))
             ('  Past the retry limit (3 failed runs in a row): {0} (keeps what the unfinished run completed, with its reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings))
-            ('  Start over: {0} (collects everything this run covers again; slow on big tenants)' -f (& $Command '-Fresh'))
+            ('  Start over: {0} (collects everything this run covers again; slow when it covers many subscriptions)' -f (& $Command '-Fresh'))
             ('  Settings: a run that continues this one must use the settings of the unfinished run ({0}); the commands above carry them. To change them, start over with -Fresh.' -f (Format-RunDataSettings -Settings $GuideSettings))
         )
         # The wording is scope-neutral, so it reads right for a -SubscriptionID run too.

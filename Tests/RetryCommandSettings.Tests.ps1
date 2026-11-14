@@ -115,14 +115,17 @@ Describe 'The commands of the retry-limit summary' {
     # The retry-limit texts are scope-neutral: right for a -SubscriptionID run
     # and for a run of the tenant, so none names 'every subscription' or 'the
     # completed subscriptions'.
-    It 'reads right for a -SubscriptionID run: no tenant-wide words, and the command carries the subscription' {
+    It 'reads right for a -SubscriptionID run: the retry-limit summary (every branch), the FAILED banners, the coverage reason and RunSummary.log hold no tenant-wide words, and the command carries the subscription' {
         $Limited = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = 3; Reason = 'r' })
         $One = Get-RetryCommandSettings -Settings (script:New-Settings) -DeviceLogin $false -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001'
-        $Lines = @(script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings $One })
+        $Three = @('sub-a', 'sub-b', 'sub-c') | ForEach-Object { [pscustomobject]@{ Id = $_; Name = $_; Attempts = 3; Reason = 'r' } }
+        $Lines = @(script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Three -TenantID $script:Tenant -NotListedIds @('sub-a') -NotReadableIds @('sub-b') -Settings $One })
+        $Lines += @(Get-RunReportCoverageLines -Coverage (Get-RunReportCoverage -Visible @($Limited) -RunIds @('sub-a') -InZipIds @() -RetryLimited $Limited))
         $Lines += @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One)
         $Lines += @(script:Get-HostLines { Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -RetryLimited @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One })
         $Lines += @(Get-RunSummaryLogContent -RetryLimited $Limited -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -CommandSettings $One)
-        @($Lines | Where-Object { $_ -match 'every subscription|completed subscriptions|some subscriptions' }) | Should -BeNullOrEmpty
+        @($Lines | Where-Object { $_ -match 'retry limit reached \(failed' }) | Should -Not -BeNullOrEmpty -Because 'the coverage reason is among the texts checked'
+        @($Lines | Where-Object { $_ -match 'every subscription|completed subscriptions|some subscriptions|tenants' }) | Should -BeNullOrEmpty
         $Lines | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID aaaaaaaa-0000-4000-8000-000000000001 -Resume -RetryLimitReached' -f $script:Tenant)
     }
 

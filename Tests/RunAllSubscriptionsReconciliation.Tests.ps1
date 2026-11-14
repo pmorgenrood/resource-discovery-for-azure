@@ -414,7 +414,7 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
                 '  Run stopped part way, or not everything done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
                 '  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -ResumeFailedOnly -Obfuscate -SkipMetrics (its zip holds only the reports it collects; a later -Resume builds the full zip)'
                 '  Past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps what the unfinished run completed, with its reports)'
-                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects everything this run covers again; slow on big tenants)'
+                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects everything this run covers again; slow when it covers many subscriptions)'
                 '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate -SkipMetrics); the commands above carry them. To change them, start over with -Fresh.'
             )
         }
