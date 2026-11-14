@@ -5254,9 +5254,12 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
 
     # --- Which flag to use ---------------------------------------------------
-    # Fail-safe rule: the guide shows whenever the run is not complete, which is
-    # the wrapper's own test that keeps the resume state (-WorkLeft), or, for a
-    # caller without it, any count below that means work is left. It never
+    # Fail-safe rule: the guide shows whenever the run keeps its resume state,
+    # which is the wrapper's own test (-WorkLeft), or, for a caller without it,
+    # any count below of a subscription that goes on the retry list. A
+    # collector failure alone (exit 5) is not among them: that subscription
+    # completed, the run ends clean and clears the state, so there is no run to
+    # continue and the guide's ways on do not apply (Health shows the failure). It never
     # works out which way on applies; it lists every way on with what each one
     # does, so one rule covers every kind of incomplete run. One line per way
     # on, with the command the wrapper prints (Get-WrapperRunCommand, this run's

@@ -419,6 +419,14 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             )
         }
 
+        # A collector failure alone keeps no resume state (the run ends clean), so
+        # there is no run to continue: no guide, in either mode.
+        It 'is left out of a run whose only problem is a collector failure (<Mode>)' -ForEach @(@{ Mode = 'plain'; Obf = $false }, @{ Mode = 'obfuscated'; Obf = $true }) {
+            $Lines = @(Get-RunSummaryLogContent -Obfuscated:$Obf -CollectorFailures @([pscustomobject]@{ Id = 'sub-x'; Module = 'Foundry'; Message = 'm' }) -CommandSettings $script:Settings)
+            ($Lines -join "`n") | Should -Match 'Collector failures\s+:\s+1'
+            $Lines | Should -Not -Contain $script:GuideHead
+        }
+
         It 'is left out of a clean run' {
             $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -CommandSettings $script:Settings)
             $Lines | Should -Not -Contain $script:GuideHead
@@ -459,6 +467,15 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             $None = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
             (script:Get-Guide @(Get-RunSummaryLogContent -FailedSubscriptions @('Sub A') -CommandSettings $None))[4] | Should -BeLike '*(none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources)*'
         }
+    }
+
+    BeforeAll {
+        # Representative health collections carrying REAL-looking names/ids/messages,
+        # so the obfuscated-mode leak guard is exercised against concrete strings.
+        $script:Failed = @([pscustomobject]@{ Name = 'Contoso-Prod-Sub'; Id = '11111111-1111-1111-1111-111111111111' })
+        $script:NoAccess = @([pscustomobject]@{ Name = 'Fabrikam-Locked'; Id = '22222222-2222-2222-2222-222222222222' })
+        $script:CollectorFails = @([pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333'; Module = 'StreamAnalytics'; Message = 'threw on Contoso-Prod-Sub resource' })
+        $script:MetricsSkips = @([pscustomobject]@{ Name = 'Fabrikam-Locked'; Id = '22222222-2222-2222-2222-222222222222'; Message = 'no usable token' })
     }
 
     It 'obfuscated run emits counts only - no names, ids, or raw messages' {

@@ -3360,8 +3360,8 @@ if ($FailedSubscriptions.Count -gt 0)
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     # Not 'with -Resume' alone: after a -Fresh run, the same command plus -Resume
     # stops with exit 1 (the two switches are refused together).
-    Write-Host "Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
-    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
+    Write-Host "Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions (without -Resume only before -ResumeMaxAgeDays; those past the retry limit only with -RetryLimitReached)." -ForegroundColor Yellow
+    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached)." -ForegroundColor Yellow
     if ($DiagFile -and (Test-Path $DiagFile))
     {
         Write-Host ("Failure Diagnostics:     {0}" -f $DiagFile) -ForegroundColor Red
