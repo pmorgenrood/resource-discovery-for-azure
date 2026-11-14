@@ -1454,14 +1454,11 @@ if ($ResumeFailedOnly)
     if ($Subscriptions.Count -eq 0)
     {
         # Entries of subscriptions that are gone or not enabled were taken off
-        # the retry list above, so the ones left here are those a subscription
-        # list with warnings or errors left out. Tell the user instead of
-        # silently processing nothing.
+        # the retry list above, so the entries left are those a subscription
+        # list with warnings or errors left out (kept above, $KeptNotListedIds).
         # The retry list still holds them (the state is kept), so this is not a
-        # success: exit 2, as for any report the run could not produce.
-        # The entries left are those a subscription list with warnings or
-        # errors left out (kept above, $KeptNotListedIds): name the way on, as
-        # the not-listed advice of the retry-limit summary does.
+        # success: exit 2. Name the way on, as the not-listed advice of the
+        # retry-limit summary does, instead of silently processing nothing.
         $NextRun = if (@(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts).Count -gt 0) { Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $RetryCommandSettings } else { Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $RetryCommandSettings }
         Write-Host ("WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set, so nothing is retried. When the subscription list came back with warnings or errors (printed above), fix those until 'Get-AzSubscription -TenantId {0}' lists the tenant without them, then run: {1}" -f $TenantID, $NextRun) -ForegroundColor Yellow
         Exit-Wrapper -Code 2
