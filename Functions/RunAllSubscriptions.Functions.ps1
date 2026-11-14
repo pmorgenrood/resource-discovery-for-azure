@@ -5078,9 +5078,11 @@ function Get-RunSummaryLogContent
         # run settings, DeviceLogin and, for a -SubscriptionID run, the
         # subscription. Used by the 'Which flag to use' guide.
         [System.Collections.IDictionary]$CommandSettings,
-        # The wrapper's own test that work is left (the same one that keeps the
-        # resume state at the end of the run): any retry-list entry, a
-        # subscription no run has reached, an owed consolidated zip. The guide
+        # The wrapper's own test that work is left: the work-left terms of the
+        # test that keeps the resume state at the end of the run (a failure, any
+        # retry-list entry, a subscription no run has reached, an owed
+        # consolidated zip, a missing report). Its other terms (a zip lost, a
+        # state file that cannot be removed or read) leave no work to continue. The guide
         # shows whenever it is set or a count below says the run is not complete.
         [switch]$WorkLeft,
         # When set, emit counts only (no names / ids / raw messages).
@@ -5254,10 +5256,10 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
 
     # --- Which flag to use ---------------------------------------------------
-    # Fail-safe rule: the guide shows whenever the run keeps its resume state,
-    # which is the wrapper's own test (-WorkLeft), or, for a caller without it,
+    # Fail-safe rule: the guide shows whenever work is left, the work-left terms
+    # of the wrapper's keep-the-state test (-WorkLeft), or, for a caller without it,
     # any count below of a subscription that goes on the retry list. A
-    # collector failure alone (exit 5) is not among them: that subscription
+    # collector failure alone (exit 4) is not among them: that subscription
     # completed, the run ends clean and clears the state, so there is no run to
     # continue and the guide's ways on do not apply (Health shows the failure). It never
     # works out which way on applies; it lists every way on with what each one

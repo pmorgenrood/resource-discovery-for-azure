@@ -1035,7 +1035,7 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $Without.Text | Should -Contain '  Nothing is left for the run to collect, so no access check is needed.'
         $R = script:Invoke-Wrapper -Arguments @('-Resume', '-RetryLimitReached', '-PreflightOnly')
         $R.ExitCode | Should -Be 0
-        $R.Text | Should -Contain '  The run would collect 1 of these 2 subscription(s) (the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out); only those are checked.'
+        $R.Text | Should -Contain '  The run would collect 1 of these 2 subscription(s) (the unfinished run completed the others, or -ResumeFailedOnly leaves them out); only those are checked.' -Because 'with the switch none is left out for the retry limit'
         $R.Text | Should -Not -Contain '  Nothing is left for the run to collect, so no access check is needed.'
         $R.Text | Should -Contain 'Every check passed.'
         script:Get-RootSnapshot | Should -Be $Before -Because 'the preflight writes nothing'

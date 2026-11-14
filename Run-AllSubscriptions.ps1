@@ -729,7 +729,9 @@ if ($PreflightOnly)
                 $PfScope = @($PfScope | Where-Object { $PfLimitedIds -notcontains [string]$_.Id })
             }
             if ($PfResume) { $PfScope = @($PfScope | Where-Object { $PfCompleted -notcontains [string]$_.Id }) }
-            if ($PfScope.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out); only those are checked.' -f $PfScope.Count, $PfBefore) -ForegroundColor Cyan }
+            # With -RetryLimitReached none is left out for the retry limit.
+            $PfWhyFewer = if ($RetryLimitReached) { 'the unfinished run completed the others, or -ResumeFailedOnly leaves them out' } else { 'the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out' }
+            if ($PfScope.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) ({2}); only those are checked.' -f $PfScope.Count, $PfBefore, $PfWhyFewer) -ForegroundColor Cyan }
         }
         if ($PfScope.Count -eq 0 -and $ResumeFailedOnly)
         {
