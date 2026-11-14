@@ -403,6 +403,48 @@ Describe 'Resolve-AccessPreflight (up-front access gate decision)' {
 
 Describe 'Get-RunSummaryLogContent run-level shareable log' {
 
+    # The 'Which flag to use' guide: one line per way on, with the command the
+    # wrapper prints and this run's switches; only when the run is not complete.
+    Context 'Which flag to use' {
+        BeforeAll {
+            $script:GuideHead = 'Which flag to use (this run is not complete):'
+            $script:Settings = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $true -SkipMetrics $true -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
+            function script:Get-Guide { param([string[]]$Lines) $At = [array]::IndexOf($Lines, $script:GuideHead); if ($At -lt 0) { return @() } ; @($Lines[($At + 1)..($At + 5)]) }
+        }
+
+        It 'is left out of a clean run' {
+            $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -CommandSettings $script:Settings)
+            $Lines | Should -Not -Contain $script:GuideHead
+            ($Lines -join "`n") | Should -Not -Match 'Which flag to use'
+        }
+
+        It 'is shown when <Case>, with one line per way on and the run''s switches' -ForEach @(
+            @{ Case = 'a subscription failed'; Extra = @{ FailedSubscriptions = @('Sub A') } }
+            @{ Case = 'a subscription is past the retry limit'; Extra = @{ RetryLimited = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Attempts = 3; Reason = 'r' }) } }
+            @{ Case = 'metrics are incomplete'; Extra = @{ MetricsFailedSubs = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Message = 'm'; Complete = $false }) } }
+            @{ Case = 'a report is missing'; Extra = @{ MissingReportCount = 1 } }
+            @{ Case = 'consumption failed'; Extra = @{ ConsumptionFailedSubs = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Message = 'm' }) } }
+        ) {
+            $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -CommandSettings $script:Settings @Extra)
+            script:Get-Guide $Lines | Should -Be @(
+                '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (the same command without -Resume also continues; resume is the default)'
+                '  Retry only the failed subscriptions: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -ResumeFailedOnly -Obfuscate -SkipMetrics (its zip holds only those subscriptions)'
+                '  Subscriptions past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps the completed subscriptions and their reports)'
+                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects every subscription again; slow on big tenants)'
+                '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate -SkipMetrics); the commands above carry them. To change them, start over with -Fresh.'
+            )
+        }
+
+        It 'names the subscription of a -SubscriptionID run as a placeholder and no switch for a run with none, in an obfuscated log too' {
+            $One = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID '12345678-1234-1234-1234-123456789012'
+            $Lines = @(Get-RunSummaryLogContent -Obfuscated -FailedSubscriptions @('Sub A') -CommandSettings $One)
+            $Guide = script:Get-Guide $Lines
+            $Guide[0] | Should -BeLike '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume (*'
+            $Guide[4] | Should -BeLike '*(none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources)*'
+            ($Lines -join "`n") | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+        }
+    }
+
     BeforeAll {
         # Representative health collections carrying REAL-looking names/ids/messages,
         # so the obfuscated-mode leak guard is exercised against concrete strings.

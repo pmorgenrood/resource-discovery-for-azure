@@ -3468,6 +3468,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
             -Concurrency $ConcurrencyLimit -ConcurrencySource $ConcurrencySrc `
+            -CommandSettings $RetryCommandSettings `
             -Obfuscated:$Obfuscate
         $RunSummaryLines | Out-File -FilePath (Join-Path $BundleStage 'RunSummary.log') -Encoding utf8
 

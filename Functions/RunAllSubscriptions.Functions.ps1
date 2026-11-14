@@ -5074,6 +5074,10 @@ function Get-RunSummaryLogContent
         [string]$StreamsSource,
         [int]$Concurrency = 0,
         [string]$ConcurrencySource,
+        # The switches the printed commands carry (Get-RetryCommandSettings): the
+        # run settings, DeviceLogin and, for a -SubscriptionID run, the
+        # subscription. Used by the 'Which flag to use' guide.
+        [System.Collections.IDictionary]$CommandSettings,
         # When set, emit counts only (no names / ids / raw messages).
         [switch]$Obfuscated
     )
@@ -5243,6 +5247,29 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Metrics incomplete subs       : {0}' -f $MetricsIncomplete.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
+
+    # --- Which flag to use ---------------------------------------------------
+    # Only when the run is not complete: a subscription failed, is past the
+    # retry limit, has metrics or consumption skipped or incomplete, or has its
+    # report missing (each keeps the resume state). One line per way on, with
+    # the command the wrapper prints (Get-WrapperRunCommand, this run's
+    # switches). The tenant and the subscription stay placeholders: this log
+    # never records the target (see $ExcludedParamNames), in either mode.
+    $NotComplete = ($Failed.Count + $Limited.Count + $Metrics.Count + $MetricsIncomplete.Count + $Consumption.Count + $MissingTotal + $MissingAtLimit.Count) -gt 0
+    if ($NotComplete)
+    {
+        $GuideSettings = [ordered]@{}
+        if ($null -ne $CommandSettings) { foreach ($Key in @($CommandSettings.Keys)) { $GuideSettings[$Key] = $CommandSettings[$Key] } }
+        if ($GuideSettings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$GuideSettings['SubscriptionID'])) { $GuideSettings['SubscriptionID'] = '<subscription id>' }
+        $Command = { param([string]$Mode) Get-WrapperRunCommand -TenantID '<tenant id>' -Mode $Mode -Settings $GuideSettings }
+        $Lines.Add('')
+        $Lines.Add('Which flag to use (this run is not complete):')
+        $Lines.Add(('  Run stopped part way, or some subscriptions not done: {0} (the same command without -Resume also continues; resume is the default)' -f (& $Command '-Resume')))
+        $Lines.Add(('  Retry only the failed subscriptions: {0} (its zip holds only those subscriptions)' -f (& $Command '-ResumeFailedOnly')))
+        $Lines.Add(('  Subscriptions past the retry limit (3 failed runs in a row): {0} (keeps the completed subscriptions and their reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings)))
+        $Lines.Add(('  Start over: {0} (collects every subscription again; slow on big tenants)' -f (& $Command '-Fresh')))
+        $Lines.Add(('  Settings: a run that continues this one must use the settings of the unfinished run ({0}); the commands above carry them. To change them, start over with -Fresh.' -f (Format-RunDataSettings -Settings $GuideSettings)))
+    }
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where
     # real names already appear throughout the report. An obfuscated bundle stops

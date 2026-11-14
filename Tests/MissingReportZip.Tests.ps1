@@ -261,6 +261,10 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         )
         $R1.Zip.RunSummary | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
         $R1.Zip.RunSummary | Should -Contain ('  - {0} ({1})' -f $MissingSub.Name, $MissingSub.Id)
+        # The 'Which flag to use' guide of the wrapper's own RunSummary.log carries the run's switches.
+        $R1.Zip.RunSummary | Should -Contain 'Which flag to use (this run is not complete):'
+        $R1.Zip.RunSummary | Should -Contain '  Subscriptions past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -SkipMetrics -SkipConsumption (keeps the completed subscriptions and their reports)'
+        ($R1.Zip.RunSummary -join "`n") | Should -Not -Match ([regex]::Escape([string]$script:Tenant)) -Because 'the log never records the tenant'
         $R1.Text | Should -Not -Contain 'Resume state cleared (clean run).'
         $R1.State | Should -Not -BeNullOrEmpty
         @($R1.State.CompletedSubscriptionIds | Sort-Object) | Should -Be (script:Get-Ids $Kept)
@@ -276,6 +280,7 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
         $R2.Text | Should -Contain 'Resume state cleared (clean run).'
         $R2.State | Should -BeNullOrEmpty
+        $R2.Zip.RunSummary | Should -Not -Contain 'Which flag to use (this run is not complete):' -Because 'a clean run has no guide'
     }
 
     It 'a written zip gone before the consolidated zip, of a subscription whose metrics were left incomplete: it is named, its retry-list entry stays as it was, and the next run completes it' {
