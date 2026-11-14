@@ -111,6 +111,16 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
 }
 
 Describe 'The commands of the retry-limit summary' {
+    It 'speaks of the one subscription of a -SubscriptionID run, and of many for a run of the tenant' {
+        $Limited = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = 3; Reason = 'r' })
+        $One = Get-RetryCommandSettings -Settings (script:New-Settings) -DeviceLogin $false -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001'
+        $Lines = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings $One }
+        $Lines | Should -Contain '  To try it again, continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh), for example:'
+        $Lines | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID aaaaaaaa-0000-4000-8000-000000000001 -Resume -RetryLimitReached' -f $script:Tenant)
+        $Whole = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings (script:New-Settings) }
+        @($Whole | Where-Object { $_ -like '  To try them again, keeping the completed subscriptions and their reports*' }) | Should -HaveCount 1
+    }
+
     It 'every command carries <Name>' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {

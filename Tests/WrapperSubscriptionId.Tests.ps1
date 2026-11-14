@@ -1085,6 +1085,13 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         @($Run.Text | Where-Object { $_ -like 'Re-run with -Resume to collect them*' }).Count | Should -Be 1 -Because 'the run names the run to go on with'
     }
 
+    It 'says -RetryLimitReached changes nothing on a new -SubscriptionID run, for that one subscription' {
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-RetryLimitReached')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain '-RetryLimitReached: this run starts a new run, which collects the subscription, so the switch changes nothing.'
+    }
+
     It 'words the run-start lines of a -SubscriptionID run for that one subscription' {
         script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
         $null = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id)

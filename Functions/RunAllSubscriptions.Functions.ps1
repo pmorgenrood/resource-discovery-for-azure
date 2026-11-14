@@ -2748,7 +2748,10 @@ function Write-RetryLimitSummary
     }
     $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
-    Write-Host "  To try them again, keeping the completed subscriptions and their reports (any subscription not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:" -ForegroundColor Yellow
+    # A -SubscriptionID run (its SubscriptionID in $Settings) holds one subscription.
+    $OneSub = $null -ne $Settings -and $Settings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$Settings['SubscriptionID'])
+    $TryAgain = if ($OneSub) { '  To try it again, continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh), for example:' } else { '  To try them again, keeping the completed subscriptions and their reports (any subscription not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:' }
+    Write-Host $TryAgain -ForegroundColor Yellow
     Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
 }
 

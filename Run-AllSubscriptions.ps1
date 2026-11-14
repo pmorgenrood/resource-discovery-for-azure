@@ -942,7 +942,7 @@ if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
 $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnly))
 # -RetryLimitReached acts only on a run that continues the unfinished run; a new
 # run collects every subscription, so say it changes nothing there.
-if ($RetryLimitReached -and $RunStart.Mode -ne 'Continue') { Write-Host '-RetryLimitReached: this run starts a new run, which collects every subscription, so the switch changes nothing.' -ForegroundColor DarkGray }
+if ($RetryLimitReached -and $RunStart.Mode -ne 'Continue') { Write-Host ('-RetryLimitReached: this run starts a new run, which collects {0}, so the switch changes nothing.' -f $(if ($OneSubscription) { 'the subscription' } else { 'every subscription' })) -ForegroundColor DarkGray }
 # The cost window of this run: the one the unfinished run recorded when this
 # run continues a file that holds one it can use, so one consolidated zip has
 # one cost window even when the run is continued on a later day; otherwise the
