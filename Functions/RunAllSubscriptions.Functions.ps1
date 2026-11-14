@@ -2703,8 +2703,9 @@ function Get-ConsumptionFailedAdvice
     }
     if ($AtLimit.Count -gt 0)
     {
-        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping the completed subscriptions, run:' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
+        $Lines += ('{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping what the unfinished run completed, run (or start a new run with -Fresh, which collects everything this run covers again):' -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' }))
         $Lines += ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings))
+        $Lines += ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings))
     }
     return $Lines
 }
@@ -2743,15 +2744,14 @@ function Write-RetryLimitSummary
     $NotReadable = @($List | Where-Object { @($NotReadableIds) -contains [string]$_.Id })
     if ($NotReadable.Count -gt 0)
     {
-        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions; or start a new run with -Fresh), for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
+        Write-Host ("  {0} skipped by the access check at the start of this run (the reason and the fix are printed there). Once the check passes for {1}, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed; or start a new run with -Fresh), for example:" -f ((@($NotReadable | ForEach-Object { $_.Name }) -join ', ') + $(if ($NotReadable.Count -eq 1) { ' was' } else { ' were' })), $(if ($NotReadable.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Yellow
         Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
     }
     $List = @($List | Where-Object { @($NotReadableIds) -notcontains [string]$_.Id })
     if ($List.Count -eq 0) { return }
-    # A -SubscriptionID run (its SubscriptionID in $Settings) holds one subscription.
-    $OneSub = $null -ne $Settings -and $Settings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$Settings['SubscriptionID'])
-    $TryAgain = if ($OneSub) { '  To try it again, continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh), for example:' } else { '  To try them again, keeping the completed subscriptions and their reports (any subscription not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects every subscription again), for example:' }
-    Write-Host $TryAgain -ForegroundColor Yellow
+    # Scope-neutral wording (fail-safe rule): it reads right for a run of the
+    # tenant and for a -SubscriptionID run, so no text is chosen per kind of run.
+    Write-Host "  To try them again, keeping what the unfinished run completed and its reports (anything not done yet is collected too), continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh, which collects everything this run covers again), for example:" -ForegroundColor Yellow
     Write-Host ('    ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Yellow
 }
 
@@ -2811,8 +2811,9 @@ function Write-MissingReportBanner
     }
     if ($AtLimit.Count -gt 0)
     {
-        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping the completed subscriptions, run:" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
-        Write-Host ('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) -ForegroundColor Red
+        Write-Host ("{0} failed 3 runs in a row (Retry Limit Reached), so a run that continues this one does not collect {1} again without -RetryLimitReached; to try again, keeping what the unfinished run completed, run (or start a new run with -Fresh, which collects everything this run covers again):" -f (@($AtLimit | ForEach-Object { $_.Name }) -join ', '), $(if ($AtLimit.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
+        # Both commands in one call: the -RetryLimitReached one, then -Fresh.
+        Write-Host (('  ' + (Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $Settings)) + [Environment]::NewLine + ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $Settings))) -ForegroundColor Red
     }
     Write-Host "=============================================================" -ForegroundColor Red
 }
@@ -4954,7 +4955,7 @@ function Get-RunReportCoverage
     $Retry = @(@($FailedAttempts) | Where-Object { $null -ne $_ })
     $RetryIds = @(& $Ids $Retry)
     $EarlierIds = @(& $Ids $CompletedEarlierIds)
-    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry) }
+    $LimitReason = { param($Id) $Entry = @($Limited | Where-Object { [string]$_.Id -eq $Id })[0]; 'retry limit reached (failed {0} runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh)' -f (Get-FailedAttemptCount -Entry $Entry) }
     $Without = @(foreach ($Sub in $VisibleSubs)
         {
             $Id = [string]$Sub.Id
@@ -5235,7 +5236,7 @@ function Get-RunSummaryLogContent
     }
     if ($MissingAtLimit.Count -gt 0)
     {
-        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
+        $Lines.Add(('  Report missing, retry limit reached : {0} (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh)' -f $MissingAtLimit.Count))
     }
     $Lines.Add(('  0 resources - no access   : {0}' -f $NoAccess.Count))
     $Lines.Add(('  0 resources - empty       : {0}' -f $Empty.Count))
@@ -5275,18 +5276,16 @@ function Get-RunSummaryLogContent
     {
         $GuideSettings = [ordered]@{}
         if ($null -ne $CommandSettings) { foreach ($Key in @($CommandSettings.Keys)) { $GuideSettings[$Key] = $CommandSettings[$Key] } }
-        $OneSub = $GuideSettings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$GuideSettings['SubscriptionID'])
-        if ($OneSub) { $GuideSettings['SubscriptionID'] = '<subscription id>' }
+        if ($GuideSettings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$GuideSettings['SubscriptionID'])) { $GuideSettings['SubscriptionID'] = '<subscription id>' }
         $Command = { param([string]$Mode) Get-WrapperRunCommand -TenantID '<tenant id>' -Mode $Mode -Settings $GuideSettings }
         $Guide = @(
-            ('  Run stopped part way, or some subscriptions not done: {0} (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)' -f (& $Command '-Resume'))
+            ('  Run stopped part way, or not everything done: {0} (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)' -f (& $Command '-Resume'))
             ('  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): {0} (its zip holds only the reports it collects; a later -Resume builds the full zip)' -f (& $Command '-ResumeFailedOnly'))
-            ('  Subscriptions past the retry limit (3 failed runs in a row): {0} (keeps the completed subscriptions and their reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings))
-            ('  Start over: {0} (collects every subscription again; slow on big tenants)' -f (& $Command '-Fresh'))
+            ('  Past the retry limit (3 failed runs in a row): {0} (keeps what the unfinished run completed, with its reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings))
+            ('  Start over: {0} (collects everything this run covers again; slow on big tenants)' -f (& $Command '-Fresh'))
             ('  Settings: a run that continues this one must use the settings of the unfinished run ({0}); the commands above carry them. To change them, start over with -Fresh.' -f (Format-RunDataSettings -Settings $GuideSettings))
         )
-        # A -SubscriptionID run holds one subscription and keeps its own state.
-        if ($OneSub) { $Guide = @($Guide | ForEach-Object { $_.Replace('Run stopped part way, or some subscriptions not done', 'Run stopped part way, or the subscription not done').Replace('Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached)', 'Retry the subscription if it is on the retry list (failed or incomplete; past the retry limit only with -RetryLimitReached)').Replace('Subscriptions past the retry limit', 'The subscription past the retry limit').Replace(' (keeps the completed subscriptions and their reports)', ' (collects it again)').Replace('collects every subscription again; slow on big tenants', 'collects the subscription again') }) }
+        # The wording is scope-neutral, so it reads right for a -SubscriptionID run too.
         $Lines.Add('')
         $Lines.Add('Which flag to use (this run is not complete):')
         foreach ($GuideLine in $Guide) { $Lines.Add($GuideLine) }
@@ -5313,7 +5312,7 @@ function Get-RunSummaryLogContent
         if ($Limited.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Retry limit reached (detail; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh):')
+            $Lines.Add('Retry limit reached (detail; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh):')
             foreach ($LimitedSub in $Limited) { $Lines.Add(('  - {0} ({1}): failed {2} runs in a row; last reason: {3}' -f [string]$LimitedSub.Name, [string]$LimitedSub.Id, (Get-FailedAttemptCount -Entry $LimitedSub), [string]$LimitedSub.Reason)) }
         }
         if ($Missing.Count -gt 0)
@@ -5325,7 +5324,7 @@ function Get-RunSummaryLogContent
         if ($MissingAtLimit.Count -gt 0)
         {
             $Lines.Add('')
-            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh):')
+            $Lines.Add('Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh):')
             foreach ($MissingSub in $MissingAtLimit) { $Lines.Add(('  - {0} ({1})' -f [string]$MissingSub.Name, [string]$MissingSub.Id)) }
         }
         if ($NoAccess.Count -gt 0)

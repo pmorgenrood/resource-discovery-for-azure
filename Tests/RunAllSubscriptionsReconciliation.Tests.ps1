@@ -411,10 +411,10 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             $script:Settings = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $true -SkipMetrics $true -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
             function script:Get-Guide { param([string[]]$Lines) $At = [array]::IndexOf($Lines, $script:GuideHead); if ($At -lt 0) { return @() } ; @($Lines[($At + 1)..($At + 5)]) }
             $script:Expected = @(
-                '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
+                '  Run stopped part way, or not everything done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
                 '  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -ResumeFailedOnly -Obfuscate -SkipMetrics (its zip holds only the reports it collects; a later -Resume builds the full zip)'
-                '  Subscriptions past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps the completed subscriptions and their reports)'
-                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects every subscription again; slow on big tenants)'
+                '  Past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps what the unfinished run completed, with its reports)'
+                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects everything this run covers again; slow on big tenants)'
                 '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate -SkipMetrics); the commands above carry them. To change them, start over with -Fresh.'
             )
         }
@@ -453,16 +453,14 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             ($Lines -join "`n") | Should -Not -Match 'Contoso|11111111-1111-1111-1111-111111111111'
         }
 
-        It 'speaks of the one subscription of a -SubscriptionID run, as a placeholder, and names no switch for a run with none' {
+        It 'reads right for a -SubscriptionID run (scope-neutral lines, the subscription as a placeholder) and names no switch for a run with none' {
             $One = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $true -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID '12345678-1234-1234-1234-123456789012'
             $Lines = @(Get-RunSummaryLogContent -Obfuscated -FailedSubscriptions @('Sub A') -CommandSettings $One)
-            script:Get-Guide $Lines | Should -Be @(
-                '  Run stopped part way, or the subscription not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -Obfuscate (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
-                '  Retry the subscription if it is on the retry list (failed or incomplete; past the retry limit only with -RetryLimitReached): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -ResumeFailedOnly -Obfuscate (its zip holds only the reports it collects; a later -Resume builds the full zip)'
-                '  The subscription past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -RetryLimitReached -Obfuscate (collects it again)'
-                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Fresh -Obfuscate (collects the subscription again)'
-                '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate); the commands above carry them. To change them, start over with -Fresh.'
-            )
+            $Guide = @(script:Get-Guide $Lines)
+            $Guide | Should -HaveCount 5
+            $Guide | ForEach-Object { $_ | Should -Not -Match 'every subscription|completed subscriptions|some subscriptions' }
+            $Guide[0] | Should -BeLike '  Run stopped part way, or not everything done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -Obfuscate (*'
+            $Guide[2] | Should -BeLike '*./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -RetryLimitReached -Obfuscate (*'
             ($Lines -join "`n") | Should -Not -Match '12345678-1234-1234-1234-123456789012'
             $None = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
             (script:Get-Guide @(Get-RunSummaryLogContent -FailedSubscriptions @('Sub A') -CommandSettings $None))[4] | Should -BeLike '*(none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources)*'
@@ -540,11 +538,11 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })
         $Clear = @(Get-RunSummaryLogContent -MissingReportCount 2 -MissingReports $Missing -RetryLimited $Limited)
         $Clear | Should -Contain '  Report missing      : 1 (completed, but their report zip is not in this zip; the next run collects them)'
-        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
+        $Clear | Should -Contain '  Report missing, retry limit reached : 1 (not in this zip; a run that continues this one does not collect these without -RetryLimitReached; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh)'
         $At = [array]::IndexOf($Clear, 'Report missing (detail; not in this zip, the next run collects them):')
         $Clear[$At + 1] | Should -Be '  - Sub A (sub-a)'
         $Clear[$At + 2] | Should -Be '' -Because 'Sub B is not among those the next run collects'
-        $Limit = [array]::IndexOf($Clear, 'Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh):')
+        $Limit = [array]::IndexOf($Clear, 'Report missing, retry limit reached (detail; not in this zip; to try them again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh):')
         $Clear[$Limit + 1] | Should -Be '  - Sub B (sub-b)'
         $Only = @(Get-RunSummaryLogContent -MissingReportCount 1 -MissingReports @($Missing[1]) -RetryLimited $Limited)
         ($Only -join "`n") | Should -Not -Match 'the next run collects them'
@@ -557,7 +555,7 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         $C = Get-RunReportCoverage -Visible $Visible -RunIds @('sub-a', 'sub-b') -MissingReports $Missing -MissingReportCount 2 -RetryLimited $Limited -FailedAttempts $Limited
         @($C.WithoutReport | ForEach-Object { '{0}: {1}' -f $_.Id, $_.Reason }) | Should -Be @(
             'sub-a: report missing (collected, but its report zip was not written or is gone; the next run collects it)'
-            'sub-b: retry limit reached (failed 3 runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh)'
+            'sub-b: retry limit reached (failed 3 runs in a row; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh)'
         )
         $C.UnnamedMissing | Should -Be 0
     }

@@ -1490,7 +1490,7 @@ if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $nul
     }
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps the completed subscriptions), or start a new run with -Fresh (it collects every subscription again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh (it collects everything this run covers again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {

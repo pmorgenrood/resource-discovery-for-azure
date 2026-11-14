@@ -32,7 +32,8 @@ BeforeAll {
     function script:Get-HostLines
     {
         param([scriptblock]$Block)
-        @(& $Block 6>&1 | ForEach-Object { [string]$_.MessageData })
+        # One printed line per item, also when one Write-Host prints two lines.
+        @(& $Block 6>&1 | ForEach-Object { ([string]$_.MessageData) -split '\r?\n' })
     }
     $script:Entry = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Message = 'stand-in: the usage service returned an error'; Complete = $false }
     $script:Attempt = { param([int]$Count) [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = $Count; Reason = 'stand-in reason' } }
@@ -101,7 +102,7 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
     ) {
         $Lines = @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings (script:New-Settings -On $Name))
         $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
-        @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' }) | Should -HaveCount 1 -Because 'the one past the limit is not named with the plain -Resume command'
+        @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' }) | Should -Be @(('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name), ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)) -Because 'the one past the limit is named with both ways on, not with the plain -Resume command'
     }
 
     It 'gives the plain commands for a run with none of the settings' {
@@ -111,14 +112,18 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
 }
 
 Describe 'The commands of the retry-limit summary' {
-    It 'speaks of the one subscription of a -SubscriptionID run, and of many for a run of the tenant' {
+    # The retry-limit texts are scope-neutral: right for a -SubscriptionID run
+    # and for a run of the tenant, so none names 'every subscription' or 'the
+    # completed subscriptions'.
+    It 'reads right for a -SubscriptionID run: no tenant-wide words, and the command carries the subscription' {
         $Limited = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = 3; Reason = 'r' })
         $One = Get-RetryCommandSettings -Settings (script:New-Settings) -DeviceLogin $false -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001'
-        $Lines = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings $One }
-        $Lines | Should -Contain '  To try it again, continue this run with -Resume -RetryLimitReached (or start a new run with -Fresh), for example:'
+        $Lines = @(script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings $One })
+        $Lines += @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One)
+        $Lines += @(script:Get-HostLines { Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -RetryLimited @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One })
+        $Lines += @(Get-RunSummaryLogContent -RetryLimited $Limited -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -CommandSettings $One)
+        @($Lines | Where-Object { $_ -match 'every subscription|completed subscriptions|some subscriptions' }) | Should -BeNullOrEmpty
         $Lines | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID aaaaaaaa-0000-4000-8000-000000000001 -Resume -RetryLimitReached' -f $script:Tenant)
-        $Whole = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -Settings (script:New-Settings) }
-        @($Whole | Where-Object { $_ -like '  To try them again, keeping the completed subscriptions and their reports*' }) | Should -HaveCount 1
     }
 
     It 'every command carries <Name>' -TestCases @(
