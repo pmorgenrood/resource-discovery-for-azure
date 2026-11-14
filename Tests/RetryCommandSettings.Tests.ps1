@@ -32,7 +32,8 @@ BeforeAll {
     function script:Get-HostLines
     {
         param([scriptblock]$Block)
-        @(& $Block 6>&1 | ForEach-Object { [string]$_.MessageData })
+        # One printed line per item, also when one Write-Host prints two lines.
+        @(& $Block 6>&1 | ForEach-Object { ([string]$_.MessageData) -split '\r?\n' })
     }
     $script:Entry = [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Message = 'stand-in: the usage service returned an error'; Complete = $false }
     $script:Attempt = { param([int]$Count) [pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = $Count; Reason = 'stand-in reason' } }
@@ -96,12 +97,12 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
         ($Lines -join "`n") | Should -Not -Match 'ResumeFailedOnly'
     }
 
-    It 'names one past the retry limit with the -Fresh command, with <Name>' -TestCases @(
+    It 'names one past the retry limit with the -Resume -RetryLimitReached command, with <Name>' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {
         $Lines = @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings (script:New-Settings -On $Name))
-        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
-        ($Lines -join "`n") | Should -Not -Match '-Resume'
+        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+        @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' }) | Should -Be @(('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name), ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)) -Because 'the one past the limit is named with both ways on, not with the plain -Resume command'
     }
 
     It 'gives the plain commands for a run with none of the settings' {
@@ -111,6 +112,23 @@ Describe 'The advice under FAILED (consumption) and FAILED (metrics)' {
 }
 
 Describe 'The commands of the retry-limit summary' {
+    # The retry-limit texts are scope-neutral: right for a -SubscriptionID run
+    # and for a run of the tenant, so none names 'every subscription' or 'the
+    # completed subscriptions'.
+    It 'reads right for a -SubscriptionID run: the retry-limit summary (every branch), the FAILED banners, the coverage reason and RunSummary.log hold no tenant-wide words, and the command carries the subscription' {
+        $Limited = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; Attempts = 3; Reason = 'r' })
+        $One = Get-RetryCommandSettings -Settings (script:New-Settings) -DeviceLogin $false -SubscriptionID 'aaaaaaaa-0000-4000-8000-000000000001'
+        $Three = @('sub-a', 'sub-b', 'sub-c') | ForEach-Object { [pscustomobject]@{ Id = $_; Name = $_; Attempts = 3; Reason = 'r' } }
+        $Lines = @(script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Three -TenantID $script:Tenant -NotListedIds @('sub-a') -NotReadableIds @('sub-b') -Settings $One })
+        $Lines += @(Get-RunReportCoverageLines -Coverage (Get-RunReportCoverage -Visible @($Limited) -RunIds @('sub-a') -InZipIds @() -RetryLimited $Limited))
+        $Lines += @(Get-ConsumptionFailedAdvice -Entries @($script:Entry) -FailedAttempts @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One)
+        $Lines += @(script:Get-HostLines { Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -RetryLimited @(& $script:Attempt 3) -TenantID $script:Tenant -Settings $One })
+        $Lines += @(Get-RunSummaryLogContent -RetryLimited $Limited -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -CommandSettings $One)
+        @($Lines | Where-Object { $_ -match 'retry limit reached \(failed' }) | Should -Not -BeNullOrEmpty -Because 'the coverage reason is among the texts checked'
+        @($Lines | Where-Object { $_ -match 'every subscription|completed subscriptions|some subscriptions|tenants' }) | Should -BeNullOrEmpty
+        $Lines | Should -Contain ('    ./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID aaaaaaaa-0000-4000-8000-000000000001 -Resume -RetryLimitReached' -f $script:Tenant)
+    }
+
     It 'every command carries <Name>' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {
@@ -123,19 +141,19 @@ Describe 'The commands of the retry-limit summary' {
         $Lines = script:Get-HostLines { Write-RetryLimitSummary -RetryLimited $Limited -TenantID $script:Tenant -NotListedIds @('sub-a') -NotReadableIds @('sub-b') -Settings $S }
         $Commands = @($Lines | Where-Object { $_ -match '^\s+\./Run-AllSubscriptions\.ps1 ' } | ForEach-Object { $_.Trim() })
         $Commands | Should -Be @(
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -{1}' -f $script:Tenant, $Name)
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
-            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
+            ('./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
         )
     }
 }
 
-Describe 'The -Fresh command under FAILED (report missing)' {
+Describe 'The -Resume -RetryLimitReached command under FAILED (report missing)' {
     It 'carries <Name> for a subscription whose missing report took it to the retry limit' -TestCases @(
         @{ Name = 'Obfuscate' }, @{ Name = 'SkipMetrics' }, @{ Name = 'SkipConsumption' }, @{ Name = 'IncludeDisabled' }
     ) {
         $Lines = script:Get-HostLines { Write-MissingReportBanner -MissingReports @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A' }) -MissingReportCount 1 -RetryLimited @(& $script:Attempt 3) -TenantID $script:Tenant -Settings (script:New-Settings -On $Name) }
-        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -{1}' -f $script:Tenant, $Name)
+        $Lines | Should -Contain ('  ./Run-AllSubscriptions.ps1 -TenantID {0} -Resume -RetryLimitReached -{1}' -f $script:Tenant, $Name)
     }
 }
 

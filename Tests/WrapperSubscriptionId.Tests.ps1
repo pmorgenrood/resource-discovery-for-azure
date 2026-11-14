@@ -13,7 +13,7 @@
 #     (a) one-subscription run, then a whole run; (b) whole run interrupted,
 #     then one-subscription runs with -Resume, then the whole run; (c) the
 #     one-subscription run twice, and four times while it fails (retry limit,
-#     then -Fresh as the way out).
+#     then -Resume -RetryLimitReached or -Fresh as the way out).
 #   - Its printed commands carry -SubscriptionID; a run without it prints none.
 # The helpers are also tested on their own.
 #
@@ -494,11 +494,11 @@ Describe 'The -SubscriptionID helpers' {
         Get-WrapperRunCommand -TenantID $script:Tenant -Mode '-Fresh' -Settings $Whole | Should -BeExactly ('./Run-AllSubscriptions.ps1 -TenantID {0} -Fresh -Obfuscate' -f $script:Tenant)
     }
 
-    It 'keeps -SubscriptionID and then -PreflightOnly as the last parameters of the wrapper, after every earlier one' {
+    It 'keeps -SubscriptionID, -PreflightOnly and then -RetryLimitReached as the last parameters of the wrapper, after every earlier one' {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
         $Names = @($Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
         $Names.IndexOf('SubscriptionID') | Should -Be ($Names.IndexOf('ResumeMaxAgeDays') + 1)
-        $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly')
+        $Names[($Names.IndexOf('SubscriptionID') + 1)..($Names.Count - 1)] | Should -Be @('PreflightOnly', 'RetryLimitReached')
         $Names[0..($Names.IndexOf('ResumeMaxAgeDays'))] | Should -Be @('TenantID', 'DeviceLogin', 'Obfuscate', 'SkipMetrics', 'SkipConsumption', 'IncludeNetworkResources', 'UseMetricsBatch', 'Resume', 'ResumeFailedOnly', 'Fresh', 'IncludeDisabled', 'AllowPartialAccess', 'MainSummary', 'Detailed', 'ConcurrencyLimit', 'ParallelStreams', 'ResumeMaxAgeDays')
     }
 }
@@ -699,10 +699,11 @@ Describe 'The resume state of a -SubscriptionID run is its own' -Skip:$IsWindows
         }
         $CollectedAt | Should -Be @(1, 1, 1, 0) -Because 'three failed runs in a row reach the retry limit, and the fourth run does not collect B again'
         $Codes[3] | Should -Not -Be 0
-        # The fourth run prints the command that starts over: it carries -SubscriptionID.
+        # The fourth run prints the commands that try it again: each carries -SubscriptionID.
         $Commands = @($R.Text | Where-Object { $_ -like '*./Run-AllSubscriptions.ps1 -TenantID*' })
         $Commands.Count | Should -BeGreaterThan 0
-        $Commands | ForEach-Object { $_ | Should -BeLike ('*./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID {1} -Fresh*' -f $script:Tenant, $script:Subs['B'].Id) }
+        $Commands | ForEach-Object { $_ | Should -BeLike ('*./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID {1} -*' -f $script:Tenant, $script:Subs['B'].Id) }
+        @($Commands | Where-Object { $_ -like ('*./Run-AllSubscriptions.ps1 -TenantID {0} -SubscriptionID {1} -Resume -RetryLimitReached' -f $script:Tenant, $script:Subs['B'].Id) }).Count | Should -BeGreaterThan 0
         script:Read-StateAt $script:State | Should -BeNullOrEmpty
 
         script:Set-Scenario -Subs 'A', 'B'
@@ -1023,6 +1024,72 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $C = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-Resume', '-PreflightOnly')
         $C.ExitCode | Should -Be 0
         $C.Text | Should -Contain '  Nothing is left for the run to collect, so no access check is needed.'
+    }
+
+    It 'with -RetryLimitReached checks the subscription past the retry limit, as the run collects it, and leaves out the completed one' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        foreach ($N in 1..3) { $null = script:Invoke-Wrapper }
+        $Before = script:Get-RootSnapshot
+        $Without = script:Invoke-Wrapper -Arguments @('-Resume', '-PreflightOnly')
+        $Without.ExitCode | Should -Be 0
+        $Without.Text | Should -Contain '  Nothing is left for the run to collect, so no access check is needed.'
+        $R = script:Invoke-Wrapper -Arguments @('-Resume', '-RetryLimitReached', '-PreflightOnly')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain '  The run would collect 1 of these 2 subscription(s) (the unfinished run completed the others, or -ResumeFailedOnly leaves them out); only those are checked.' -Because 'with the switch none is left out for the retry limit'
+        $R.Text | Should -Not -Contain '  Nothing is left for the run to collect, so no access check is needed.'
+        $R.Text | Should -Contain 'Every check passed.'
+        script:Get-RootSnapshot | Should -Be $Before -Because 'the preflight writes nothing'
+        # The same preflight with B's read role gone fails on B: it is in scope.
+        script:Set-Scenario -Subs 'A', 'B' -Denied 'B'
+        $D = script:Invoke-Wrapper -Arguments @('-Resume', '-RetryLimitReached', '-PreflightOnly')
+        $D.ExitCode | Should -Be 1
+    }
+
+    # The preflight names the cause only; the run it stands for ends with exit 2
+    # without collecting and names the next run itself (the fail-safe rule in
+    # the wrapper), so each case also runs that run and checks the claim.
+    It 'names why a -ResumeFailedOnly run would retry nothing: past the limit without the switch, and not in the subscription set with it; the run does as said' {
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B'
+        foreach ($N in 1..3) { $null = script:Invoke-Wrapper }
+        $R = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain "  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: none of the subscriptions on its retry list is in this run's subscription set, or each is past the retry limit (-RetryLimitReached collects those past the limit). It collects nothing and names the run to go on with; run it without -PreflightOnly to see that."
+        script:Clear-Calls
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly')
+        $Run.ExitCode | Should -Be 2
+        script:Get-Calls | Should -BeNullOrEmpty
+        $With = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $With.ExitCode | Should -Be 0 -Because 'with the switch the run would retry B'
+        # B is no longer listed: with the switch, the only cause left.
+        script:Set-Scenario -Subs 'A'
+        $Gone = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $Gone.ExitCode | Should -Be 1
+        $Gone.Text | Should -Contain "  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: none of the subscriptions on its retry list is in this run's subscription set. It collects nothing and names the run to go on with; run it without -PreflightOnly to see that."
+        script:Clear-Calls
+        $GoneRun = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached')
+        $GoneRun.ExitCode | Should -Be 2
+        script:Get-Calls | Should -BeNullOrEmpty
+    }
+
+    It 'says a -ResumeFailedOnly run would retry nothing because its retry list is empty; the run does as said' {
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'C', 'D'
+        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $R = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
+        $R.ExitCode | Should -Be 1
+        $R.Text | Should -Contain '  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: its retry list is empty. It collects nothing and names the run to go on with; run it without -PreflightOnly to see that.'
+        script:Clear-Calls
+        $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached')
+        $Run.ExitCode | Should -Be 2
+        script:Get-Calls | Should -BeNullOrEmpty
+        @($Run.Text | Where-Object { $_ -like 'Re-run with -Resume to collect them*' }).Count | Should -Be 1 -Because 'the run names the run to go on with'
+    }
+
+    It 'says -RetryLimitReached changes nothing on a new -SubscriptionID run, for that one subscription' {
+        script:Set-Scenario -Subs 'A', 'B'
+        $R = script:Invoke-Wrapper -Arguments @('-SubscriptionID', $script:Subs['B'].Id, '-RetryLimitReached')
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain '-RetryLimitReached: this run starts a new run, which collects the subscription, so the switch changes nothing.'
     }
 
     It 'words the run-start lines of a -SubscriptionID run for that one subscription' {

@@ -134,8 +134,23 @@ param (
     # check that failed (a setup check, PowerShell 7 to the Az.Accounts load,
     # stops with its own message, as in a run). It writes no report, zip,
     # transcript, resume state or run lock, and creates nothing in the
-    # inventory folder. Last, so the positions of the parameters above stay.
-    [switch]$PreflightOnly
+    # inventory folder. After -SubscriptionID, so the positions of the
+    # parameters above stay.
+    [switch]$PreflightOnly,
+
+    # On a run that continues the unfinished run (with or without -Resume, or
+    # with -ResumeFailedOnly), also collect the subscriptions past the retry
+    # limit (Retry Limit Reached: failed 3 runs in a row), which such a run
+    # otherwise leaves out. The completed subscriptions are kept, so only what
+    # is not done yet is collected; a run without -ResumeFailedOnly also
+    # carries their reports into its consolidated zip (a -ResumeFailedOnly
+    # run carries none, as always, and a later run that continues builds it).
+    # It lifts the limit for this run only: a subscription that fails again
+    # counts one more failed run and a later run without it leaves it out
+    # again. A run that starts a new run collects every
+    # subscription anyway, so there it changes nothing. Last, so the positions
+    # of the parameters above stay.
+    [switch]$RetryLimitReached
 )
 
 # ---------------------------------------------------------------------------
@@ -683,7 +698,7 @@ if ($PreflightOnly)
         # The run checks access only for the subscriptions it would collect: a run
         # that continues the unfinished run leaves out those it completed,
         # -ResumeFailedOnly takes only the retry list, and both leave out those
-        # past the retry limit. The same lists are read here, the per-stream state
+        # past the retry limit unless -RetryLimitReached. The same lists are read here, the per-stream state
         # files of an interrupted parallel run folded in, without changing them.
         $PfContinues = $PfStart.Mode -eq 'Continue'
         $PfResume = $PfContinues -and ($Resume -or -not $ResumeFailedOnly)
@@ -708,19 +723,29 @@ if ($PreflightOnly)
                 $PfFailedIds = @($PfFailed | ForEach-Object { [string]$_.Id })
                 $PfScope = @($PfScope | Where-Object { $PfFailedIds -contains [string]$_.Id })
             }
-            if ($PfResume -or $ResumeFailedOnly)
+            if (($PfResume -or $ResumeFailedOnly) -and -not $RetryLimitReached)
             {
                 $PfLimitedIds = @(Get-RetryLimitedAttempts -FailedAttempts $PfFailed | ForEach-Object { [string]$_.Id })
                 $PfScope = @($PfScope | Where-Object { $PfLimitedIds -notcontains [string]$_.Id })
             }
             if ($PfResume) { $PfScope = @($PfScope | Where-Object { $PfCompleted -notcontains [string]$_.Id }) }
-            if ($PfScope.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) (the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out); only those are checked.' -f $PfScope.Count, $PfBefore) -ForegroundColor Cyan }
+            # With -RetryLimitReached none is left out for the retry limit.
+            $PfWhyFewer = if ($RetryLimitReached) { 'the unfinished run completed the others, or -ResumeFailedOnly leaves them out' } else { 'the unfinished run completed the others, they are past the retry limit, or -ResumeFailedOnly leaves them out' }
+            if ($PfScope.Count -ne $PfBefore) { Write-Host ('  The run would collect {0} of these {1} subscription(s) ({2}); only those are checked.' -f $PfScope.Count, $PfBefore, $PfWhyFewer) -ForegroundColor Cyan }
         }
         if ($PfScope.Count -eq 0 -and $ResumeFailedOnly)
         {
-            # The run would retry nothing and end with exit 2 (its retry list is
-            # empty, past the retry limit, or not in the subscription list).
-            Write-Host '  A -ResumeFailedOnly run would retry nothing: no subscription on its retry list can be retried (none is listed, or each is past the retry limit), so it would end with exit 2. To collect again, start a new run with -Fresh.' -ForegroundColor Red
+            # The run would retry nothing and end with exit 2. Fail-safe rule: the
+            # preflight names the cause only and leaves the next step to that run,
+            # which works it out from the whole state (entries it drops as gone or
+            # not enabled, a listing with warnings, an unfinished run past
+            # -ResumeMaxAgeDays, a consolidated zip owed) and prints it; the
+            # preflight reads too little to name it right in every case. Only
+            # the cause this switch removes is named with the switch.
+            $PfWhy = if (@($PfFailed | Where-Object { $null -ne $_ }).Count -eq 0) { 'its retry list is empty' }
+            elseif ($RetryLimitReached) { 'none of the subscriptions on its retry list is in this run''s subscription set' }
+            else { 'none of the subscriptions on its retry list is in this run''s subscription set, or each is past the retry limit (-RetryLimitReached collects those past the limit)' }
+            Write-Host ('  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: {0}. It collects nothing and names the run to go on with; run it without -PreflightOnly to see that.' -f $PfWhy) -ForegroundColor Red
             & $PreflightFailed 'the retry list'
         }
         if ($PfScope.Count -eq 0)
@@ -915,6 +940,9 @@ foreach ($Line in @($RunStart.Lines)) { Write-Host $Line.Text -ForegroundColor $
 if ($OneSubscription) { Write-Host ('-SubscriptionID: this run collects only subscription {0} and keeps its own resume state ({1}); the resume state of a run of the whole tenant is neither read nor changed.' -f $SubscriptionID, (Split-Path -Path $ResumeStateFile -Leaf)) -ForegroundColor DarkGray }
 if ($RunStart.Mode -eq 'Stop') { Exit-Wrapper -Code $RunStart.ExitCode }
 $Resume = ($RunStart.Mode -eq 'Continue' -and ($Resume -or -not $ResumeFailedOnly))
+# -RetryLimitReached acts only on a run that continues the unfinished run; a new
+# run collects every subscription, so say it changes nothing there.
+if ($RetryLimitReached -and $RunStart.Mode -ne 'Continue') { Write-Host ('-RetryLimitReached: this run starts a new run, which collects {0}, so the switch changes nothing.' -f $(if ($OneSubscription) { 'the subscription' } else { 'every subscription' })) -ForegroundColor DarkGray }
 # The cost window of this run: the one the unfinished run recorded when this
 # run continues a file that holds one it can use, so one consolidated zip has
 # one cost window even when the run is continued on a later day; otherwise the
@@ -1425,29 +1453,41 @@ if ($ResumeFailedOnly)
     Write-Host ("ResumeFailedOnly: filtered to {0} previously-failed subscription(s) (was {1})." -f $Subscriptions.Count, $BeforeCount) -ForegroundColor Cyan
     if ($Subscriptions.Count -eq 0)
     {
-        # Could happen if the visible-subs list no longer contains the failed
-        # IDs (sub was deleted, identity lost access, IncludeDisabled toggled
-        # off relative to the prior run). Tell the user instead of silently
-        # processing nothing.
+        # Entries of subscriptions that are gone or not enabled were taken off
+        # the retry list above, so the entries left are those a subscription
+        # list with warnings or errors left out (kept above, $KeptNotListedIds).
         # The retry list still holds them (the state is kept), so this is not a
-        # success: exit 2, as for any report the run could not produce.
-        Write-Host "WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set. Verify access and -IncludeDisabled flag matches the prior run." -ForegroundColor Yellow
+        # success: exit 2. Name the way on, as the not-listed advice of the
+        # retry-limit summary does, instead of silently processing nothing.
+        $NextRun = if (@(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts).Count -gt 0) { Get-RetryLimitReachedCommand -TenantID $TenantID -Settings $RetryCommandSettings } else { Get-WrapperRunCommand -TenantID $TenantID -Mode '-Resume' -Settings $RetryCommandSettings }
+        Write-Host ("WARNING: FailedAttempts list contained IDs but none are visible in the current subscription set, so nothing is retried. When the subscription list came back with warnings or errors (printed above), fix those until 'Get-AzSubscription -TenantId {0}' lists the tenant without them, then run: {1}" -f $TenantID, $NextRun) -ForegroundColor Yellow
         Exit-Wrapper -Code 2
     }
 }
 
 # A subscription past the retry limit (Get-RetryLimitedAttempts) is not
-# collected by -Resume or -ResumeFailedOnly; a run without either still
-# collects it. Its entry stays on the retry list, so the summary keeps listing
-# it as incomplete and the count goes on if a later run fails it again.
+# collected by a run that continues the unfinished run (with or without -Resume)
+# or by -ResumeFailedOnly, unless the run has -RetryLimitReached; a new run
+# still collects it. Its entry stays on the retry list, so the summary keeps
+# listing it as incomplete and the count goes on if a later run fails it again.
+# So -RetryLimitReached never loops by itself: each run that collects such a
+# subscription again is one the user started with it.
 $SkippedForRetryLimit = @()
 if (($Resume -or $ResumeFailedOnly) -and @($FailedAttempts | Where-Object { $null -ne $_ }).Count -gt 0)
 {
     $EligibleIds = @($Subscriptions | ForEach-Object { [string]$_.Id })
     $SkippedForRetryLimit = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts | Where-Object { $EligibleIds -contains [string]$_.Id })
+    if ($RetryLimitReached)
+    {
+        foreach ($Limited in $SkippedForRetryLimit)
+        {
+            Write-Host ("Past the retry limit, in this run's scope (-RetryLimitReached): {0} ({1}) failed {2} runs in a row; last reason: {3}." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Cyan
+        }
+        $SkippedForRetryLimit = @()
+    }
     foreach ($Limited in $SkippedForRetryLimit)
     {
-        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. To try it again, start a new run with -Fresh (it collects every subscription again); a run that continues this one, with or without -Resume, does not collect it." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
+        Write-Host ("Not retried: {0} ({1}) failed {2} runs in a row; last reason: {3}. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh (it collects everything this run covers again)." -f $Limited.Name, $Limited.Id, (Get-FailedAttemptCount -Entry $Limited), $Limited.Reason) -ForegroundColor Yellow
     }
     if ($SkippedForRetryLimit.Count -gt 0)
     {
@@ -1500,7 +1540,8 @@ if ($ScopeForProbe.Count -gt 0)
     # A subscription skipped because the check could not finish, or because the
     # two answers disagree while a role change takes effect, stays on the retry
     # list as a failed run, also when the run stops here, so the state is kept
-    # and the retry limit ends its retries (Add-RoleCheckRetryAttempts).
+    # and the retry limit ends its retries unless a run has -RetryLimitReached
+    # (Add-RoleCheckRetryAttempts).
     $RoleCheckRetry = Add-RoleCheckRetryAttempts -FailedAttempts $FailedAttempts -CompletedIds $CompletedIds -Decision $AccessDecision
     # A subscription on the retry list that this check finds with no read role
     # is taken off it, as one with no read role is never put on it: no run can
@@ -1848,7 +1889,8 @@ if ($ParallelStreams -le 1)
                 # earlier run's completion of it ends here, so the next -Resume
                 # collects it again instead of carrying the older report. It goes
                 # on the retry list as a failed run, so -ResumeFailedOnly retries
-                # it and the retry limit ends a cause that does not go away.
+                # it and the retry limit ends a cause that does not go away
+                # (a run with -RetryLimitReached tries it again).
                 $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason 'the run wrote no report zip (see the errors above)'
@@ -1861,7 +1903,7 @@ if ($ParallelStreams -le 1)
                 # so the sub is not completed: it goes into the retry list, and an
                 # earlier run's completion of it ends here, so both -Resume and
                 # -ResumeFailedOnly collect it again. It is not a failed subscription.
-                Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
+                Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again (after 3 failed runs in a row, only with -RetryLimitReached)." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
                 $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                 $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                 $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
@@ -2124,7 +2166,7 @@ else
                 {
                     # Same as the sequential branch: metrics or consumption left
                     # incomplete puts the sub in the retry list, not the completed list.
-                    Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
+                    Write-Host ("{0} It stays in the retry list, so -Resume or -ResumeFailedOnly collects '{1}' again (after 3 failed runs in a row, only with -RetryLimitReached)." -f $IncompleteReason, $Sub.Name) -ForegroundColor Yellow
                     $CompletedIds = @($CompletedIds | Where-Object { $_ -ne $Sub.Id })
                     $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne $Sub.Id })
                     $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id $Sub.Id -Name $Sub.Name -Reason $IncompleteReason
@@ -3073,14 +3115,15 @@ if ($ResumeFailedOnly)
 }
 # The retry-list entries past the retry limit, listed as incomplete in the
 # summary. They keep the state (see $RetryOwedCount), so the next -Resume or
-# -ResumeFailedOnly run skips them again and ends with exit 2.
+# -ResumeFailedOnly run without -RetryLimitReached skips them again and ends
+# with exit 2.
 $RetryLimited = @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts)
 $RetryLimitedOwed = @($RetryLimited | Where-Object { $RetryLimitedNotInRunIds -contains [string]$_.Id })
 # Every entry keeps the state, those past the limit included: clearing the
 # state would forget their count, so the next -Resume would collect them again
 # from the first attempt and the limit would never end the cycle. They leave
-# the state only when a run without -Resume or -ResumeFailedOnly collects them,
-# or when they are no longer visible. ResourceInventory.ps1 run on its own does
+# the state only when a run that collects them completes them (a new run, or
+# one with -RetryLimitReached), or when they are no longer visible. ResourceInventory.ps1 run on its own does
 # not read or write the state.
 $RetryOwedCount = @($FailedAttempts | Where-Object { $null -ne $_ }).Count
 
@@ -3316,8 +3359,8 @@ if ($FailedSubscriptions.Count -gt 0)
     Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
     # Not 'with -Resume' alone: after a -Fresh run, the same command plus -Resume
     # stops with exit 1 (the two switches are refused together).
-    Write-Host "Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions." -ForegroundColor Yellow
-    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the failed subscriptions." -ForegroundColor Yellow
+    Write-Host "Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions (without -Resume only before -ResumeMaxAgeDays; those past the retry limit only with -RetryLimitReached)." -ForegroundColor Yellow
+    Write-Host "Or re-run with -ResumeFailedOnly to retry ONLY the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached)." -ForegroundColor Yellow
     if ($DiagFile -and (Test-Path $DiagFile))
     {
         Write-Host ("Failure Diagnostics:     {0}" -f $DiagFile) -ForegroundColor Red
@@ -3335,7 +3378,7 @@ elseif ((@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimite
     # metrics or consumption this run left incomplete. Surface them so the
     # operator does not lose track of them simply because no subscription failed
     # outright. The entries past the retry limit are named below instead;
-    # -ResumeFailedOnly does not retry them.
+    # -ResumeFailedOnly does not retry them without -RetryLimitReached.
     Write-Host ("Pending Retries:         {0} subscription(s) on the retry list (FailedAttempts)" -f (@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimited.Count)) -ForegroundColor Yellow
     # Any of them the role check skipped as not readable, with the fix.
     Write-PendingRetrySkippedSummary -FailedAttempts $FailedAttempts -Decision $AccessDecision
@@ -3348,7 +3391,7 @@ elseif ((@($FailedAttempts | Where-Object { $null -ne $_ }).Count - $RetryLimite
     $RoleCheckPending = @(if ($null -ne $AccessDecision) { @($AccessDecision.Inaccessible) | Where-Object { $null -ne $_ -and @('Unknown', 'Disagree') -contains [string]$_.State -and $PendingIds -contains [string]$_.Id } })
     if ($RoleCheckPending.Count -gt 0)
     {
-        Write-Host ("Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than {0} days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried. To start over instead, {1}." -f $ResumeMaxAgeDays, (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
+        Write-Host ("Until their role check passes, every later run that continues this run checks them again. A run without -Resume continues it until it started more than {0} days ago (-ResumeMaxAgeDays), then starts a new run, which keeps them on the retry list; once one has failed 3 runs in a row it is no longer retried without -RetryLimitReached. To start over instead, {1}." -f $ResumeMaxAgeDays, (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly ([bool]$ResumeFailedOnly))) -ForegroundColor Yellow
     }
 }
 if ($NotCollected.Count -gt 0)
@@ -3424,6 +3467,8 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
             -Concurrency $ConcurrencyLimit -ConcurrencySource $ConcurrencySrc `
+            -CommandSettings $RetryCommandSettings `
+            -WorkLeft:(($FailedSubscriptions.Count -gt 0) -or ($RetryOwedCount -gt 0) -or ($NotCollected.Count -gt 0) -or ($ZipOwedIds.Count -gt 0) -or ($MissingReportCount -gt 0)) `
             -Obfuscated:$Obfuscate
         $RunSummaryLines | Out-File -FilePath (Join-Path $BundleStage 'RunSummary.log') -Encoding utf8
 
@@ -3677,8 +3722,8 @@ if (@($UncarriedSkipped).Count -gt 0)
 # other than the sign-in (that one is in FAILED (auth) above) is missing some or
 # all of its cost data: exit 3 below (5 with a collector failure). It is on the
 # retry list, so the next run collects it again; once it has failed 3 runs in a
-# row the retry limit leaves it out (Retry Limit Reached), and that run is not
-# exited 3 for it.
+# row the retry limit leaves it out (Retry Limit Reached) unless the run has
+# -RetryLimitReached, and that run is not exited 3 for it.
 Write-ConsumptionFailedBanner -Entries $Global:ConsumptionFailedSubs -Advice @(Get-ConsumptionFailedAdvice -Entries $Global:ConsumptionFailedSubs -FailedAttempts $FailedAttempts -TenantID $TenantID -Settings $RetryCommandSettings)
 
 # A subscription whose Azure Monitor metric request (grouped or for one
@@ -3690,7 +3735,8 @@ Write-MetricsIncompleteBanner -Entries $Global:MetricsFailedSubs -Advice @(Get-C
 # A subscription completed this run whose report zip is missing is not in the
 # consolidated zip, which holds the reports that exist. It is on the retry list
 # and the resume state is kept, so the next run collects it again and carries
-# the others, unless it has now failed 3 runs in a row; sets exit code 2 below.
+# the others, unless it has now failed 3 runs in a row (then only a run with
+# -RetryLimitReached collects it); sets exit code 2 below.
 # With the inventory folder gone, one line says so instead.
 Write-MissingReportBanner -MissingReports @($MissingReports) -MissingReportCount $MissingReportCount -RetryLimited $RetryLimited -ZipBuilt ($null -ne $OuterZipFile) -TenantID $TenantID -Settings $RetryCommandSettings -GoneFolder $(if ($InventoryFolderGone) { $InventoryRoot } else { '' })
 

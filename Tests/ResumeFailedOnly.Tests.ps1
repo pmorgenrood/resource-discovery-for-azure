@@ -216,7 +216,7 @@ Describe '-ResumeFailedOnly after an interrupted run' {
         $R = script:Invoke-Run -Subs @($script:A, $script:B)
 
         @($R.Text | Where-Object { $_ -like 'Subscriptions Failed:*Sub B*' }).Count | Should -Be 1
-        @($R.Text | Where-Object { $_ -eq 'Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions.' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -eq 'Run the same command again (without -Fresh), or with -Resume, to retry failed and any unprocessed subscriptions (without -Resume only before -ResumeMaxAgeDays; those past the retry limit only with -RetryLimitReached).' }).Count | Should -Be 1
         @($R.Text | Where-Object { $_ -like 'Re-run with -Resume to retry failed*' }).Count | Should -Be 0
     }
 
