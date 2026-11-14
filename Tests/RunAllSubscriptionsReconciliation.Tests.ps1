@@ -410,6 +410,13 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             $script:GuideHead = 'Which flag to use (this run is not complete):'
             $script:Settings = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $true -SkipMetrics $true -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
             function script:Get-Guide { param([string[]]$Lines) $At = [array]::IndexOf($Lines, $script:GuideHead); if ($At -lt 0) { return @() } ; @($Lines[($At + 1)..($At + 5)]) }
+            $script:Expected = @(
+                '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
+                '  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -ResumeFailedOnly -Obfuscate -SkipMetrics (its zip holds only the reports it collects; a later -Resume builds the full zip)'
+                '  Subscriptions past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps the completed subscriptions and their reports)'
+                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects every subscription again; slow on big tenants)'
+                '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate -SkipMetrics); the commands above carry them. To change them, start over with -Fresh.'
+            )
         }
 
         It 'is left out of a clean run' {
@@ -422,36 +429,36 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
             @{ Case = 'a subscription failed'; Extra = @{ FailedSubscriptions = @('Sub A') } }
             @{ Case = 'a subscription is past the retry limit'; Extra = @{ RetryLimited = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Attempts = 3; Reason = 'r' }) } }
             @{ Case = 'metrics are incomplete'; Extra = @{ MetricsFailedSubs = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Message = 'm'; Complete = $false }) } }
+            @{ Case = 'metrics were skipped for the sign-in'; Extra = @{ MetricsFailedSubs = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Message = 'm' }) } }
             @{ Case = 'a report is missing'; Extra = @{ MissingReportCount = 1 } }
+            @{ Case = 'a missing report took it to the retry limit'; Extra = @{ RetryLimited = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Attempts = 3; Reason = 'r' }); MissingReports = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X' }); MissingReportCount = 1 } }
             @{ Case = 'consumption failed'; Extra = @{ ConsumptionFailedSubs = @([pscustomobject]@{ Id = 'sub-x'; Name = 'Sub X'; Message = 'm' }) } }
+            @{ Case = 'the wrapper says work is left (retry list, not reached, or zip owed)'; Extra = @{ WorkLeft = $true } }
         ) {
             $Lines = @(Get-RunSummaryLogContent -Visible 3 -Eligible 3 -Processed 3 -CommandSettings $script:Settings @Extra)
-            script:Get-Guide $Lines | Should -Be @(
-                '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -Obfuscate -SkipMetrics (the same command without -Resume also continues; resume is the default)'
-                '  Retry only the failed subscriptions: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -ResumeFailedOnly -Obfuscate -SkipMetrics (its zip holds only those subscriptions)'
-                '  Subscriptions past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume -RetryLimitReached -Obfuscate -SkipMetrics (keeps the completed subscriptions and their reports)'
-                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Fresh -Obfuscate -SkipMetrics (collects every subscription again; slow on big tenants)'
-                '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate -SkipMetrics); the commands above carry them. To change them, start over with -Fresh.'
-            )
+            script:Get-Guide $Lines | Should -Be $script:Expected
         }
 
-        It 'names the subscription of a -SubscriptionID run as a placeholder and no switch for a run with none, in an obfuscated log too' {
-            $One = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID '12345678-1234-1234-1234-123456789012'
+        It 'carries -Obfuscate in an obfuscated log and leaks no name or id' {
+            $Lines = @(Get-RunSummaryLogContent -Obfuscated -FailedSubscriptions @([pscustomobject]@{ Name = 'Contoso-Prod-Sub'; Id = '11111111-1111-1111-1111-111111111111' }) -CommandSettings $script:Settings)
+            script:Get-Guide $Lines | Should -Be $script:Expected
+            ($Lines -join "`n") | Should -Not -Match 'Contoso|11111111-1111-1111-1111-111111111111'
+        }
+
+        It 'speaks of the one subscription of a -SubscriptionID run, as a placeholder, and names no switch for a run with none' {
+            $One = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $true -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID '12345678-1234-1234-1234-123456789012'
             $Lines = @(Get-RunSummaryLogContent -Obfuscated -FailedSubscriptions @('Sub A') -CommandSettings $One)
-            $Guide = script:Get-Guide $Lines
-            $Guide[0] | Should -BeLike '  Run stopped part way, or some subscriptions not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume (*'
-            $Guide[4] | Should -BeLike '*(none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources)*'
+            script:Get-Guide $Lines | Should -Be @(
+                '  Run stopped part way, or the subscription not done: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -Obfuscate (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)'
+                '  Retry the subscription if it is on the retry list (failed or incomplete; past the retry limit only with -RetryLimitReached): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -ResumeFailedOnly -Obfuscate (its zip holds only the reports it collects; a later -Resume builds the full zip)'
+                '  The subscription past the retry limit (3 failed runs in a row): ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Resume -RetryLimitReached -Obfuscate (collects it again)'
+                '  Start over: ./Run-AllSubscriptions.ps1 -TenantID <tenant id> -SubscriptionID <subscription id> -Fresh -Obfuscate (collects the subscription again)'
+                '  Settings: a run that continues this one must use the settings of the unfinished run (-Obfuscate); the commands above carry them. To change them, start over with -Fresh.'
+            )
             ($Lines -join "`n") | Should -Not -Match '12345678-1234-1234-1234-123456789012'
+            $None = Get-RetryCommandSettings -Settings (Get-RunDataSettings -Obfuscate $false -SkipMetrics $false -SkipConsumption $false -IncludeDisabled $false -IncludeNetworkResources $false) -DeviceLogin $false -SubscriptionID ''
+            (script:Get-Guide @(Get-RunSummaryLogContent -FailedSubscriptions @('Sub A') -CommandSettings $None))[4] | Should -BeLike '*(none of -Obfuscate, -SkipMetrics, -SkipConsumption, -IncludeDisabled, -IncludeNetworkResources)*'
         }
-    }
-
-    BeforeAll {
-        # Representative health collections carrying REAL-looking names/ids/messages,
-        # so the obfuscated-mode leak guard is exercised against concrete strings.
-        $script:Failed = @([pscustomobject]@{ Name = 'Contoso-Prod-Sub'; Id = '11111111-1111-1111-1111-111111111111' })
-        $script:NoAccess = @([pscustomobject]@{ Name = 'Fabrikam-Locked'; Id = '22222222-2222-2222-2222-222222222222' })
-        $script:CollectorFails = @([pscustomobject]@{ Id = '33333333-3333-3333-3333-333333333333'; Module = 'StreamAnalytics'; Message = 'threw on Contoso-Prod-Sub resource' })
-        $script:MetricsSkips = @([pscustomobject]@{ Name = 'Fabrikam-Locked'; Id = '22222222-2222-2222-2222-222222222222'; Message = 'no usable token' })
     }
 
     It 'obfuscated run emits counts only - no names, ids, or raw messages' {

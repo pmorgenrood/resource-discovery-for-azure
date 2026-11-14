@@ -5078,6 +5078,11 @@ function Get-RunSummaryLogContent
         # run settings, DeviceLogin and, for a -SubscriptionID run, the
         # subscription. Used by the 'Which flag to use' guide.
         [System.Collections.IDictionary]$CommandSettings,
+        # The wrapper's own test that work is left (the same one that keeps the
+        # resume state at the end of the run): any retry-list entry, a
+        # subscription no run has reached, an owed consolidated zip. The guide
+        # shows whenever it is set or a count below says the run is not complete.
+        [switch]$WorkLeft,
         # When set, emit counts only (no names / ids / raw messages).
         [switch]$Obfuscated
     )
@@ -5249,26 +5254,34 @@ function Get-RunSummaryLogContent
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
 
     # --- Which flag to use ---------------------------------------------------
-    # Only when the run is not complete: a subscription failed, is past the
-    # retry limit, has metrics or consumption skipped or incomplete, or has its
-    # report missing (each keeps the resume state). One line per way on, with
-    # the command the wrapper prints (Get-WrapperRunCommand, this run's
+    # Fail-safe rule: the guide shows whenever the run is not complete, which is
+    # the wrapper's own test that keeps the resume state (-WorkLeft), or, for a
+    # caller without it, any count below that means work is left. It never
+    # works out which way on applies; it lists every way on with what each one
+    # does, so one rule covers every kind of incomplete run. One line per way
+    # on, with the command the wrapper prints (Get-WrapperRunCommand, this run's
     # switches). The tenant and the subscription stay placeholders: this log
     # never records the target (see $ExcludedParamNames), in either mode.
-    $NotComplete = ($Failed.Count + $Limited.Count + $Metrics.Count + $MetricsIncomplete.Count + $Consumption.Count + $MissingTotal + $MissingAtLimit.Count) -gt 0
+    $NotComplete = $WorkLeft -or ($Failed.Count + $Limited.Count + $Metrics.Count + $MetricsIncomplete.Count + $Consumption.Count + $MissingTotal + $MissingAtLimit.Count) -gt 0
     if ($NotComplete)
     {
         $GuideSettings = [ordered]@{}
         if ($null -ne $CommandSettings) { foreach ($Key in @($CommandSettings.Keys)) { $GuideSettings[$Key] = $CommandSettings[$Key] } }
-        if ($GuideSettings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$GuideSettings['SubscriptionID'])) { $GuideSettings['SubscriptionID'] = '<subscription id>' }
+        $OneSub = $GuideSettings.Contains('SubscriptionID') -and -not [string]::IsNullOrWhiteSpace([string]$GuideSettings['SubscriptionID'])
+        if ($OneSub) { $GuideSettings['SubscriptionID'] = '<subscription id>' }
         $Command = { param([string]$Mode) Get-WrapperRunCommand -TenantID '<tenant id>' -Mode $Mode -Settings $GuideSettings }
+        $Guide = @(
+            ('  Run stopped part way, or some subscriptions not done: {0} (it continues the unfinished run at any age; the same command without -Resume continues it only while it is newer than -ResumeMaxAgeDays)' -f (& $Command '-Resume'))
+            ('  Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached): {0} (its zip holds only the reports it collects; a later -Resume builds the full zip)' -f (& $Command '-ResumeFailedOnly'))
+            ('  Subscriptions past the retry limit (3 failed runs in a row): {0} (keeps the completed subscriptions and their reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings))
+            ('  Start over: {0} (collects every subscription again; slow on big tenants)' -f (& $Command '-Fresh'))
+            ('  Settings: a run that continues this one must use the settings of the unfinished run ({0}); the commands above carry them. To change them, start over with -Fresh.' -f (Format-RunDataSettings -Settings $GuideSettings))
+        )
+        # A -SubscriptionID run holds one subscription and keeps its own state.
+        if ($OneSub) { $Guide = @($Guide | ForEach-Object { $_.Replace('Run stopped part way, or some subscriptions not done', 'Run stopped part way, or the subscription not done').Replace('Retry only the subscriptions on the retry list (failed or incomplete; those past the retry limit only with -RetryLimitReached)', 'Retry the subscription if it is on the retry list (failed or incomplete; past the retry limit only with -RetryLimitReached)').Replace('Subscriptions past the retry limit', 'The subscription past the retry limit').Replace(' (keeps the completed subscriptions and their reports)', ' (collects it again)').Replace('collects every subscription again; slow on big tenants', 'collects the subscription again') }) }
         $Lines.Add('')
         $Lines.Add('Which flag to use (this run is not complete):')
-        $Lines.Add(('  Run stopped part way, or some subscriptions not done: {0} (the same command without -Resume also continues; resume is the default)' -f (& $Command '-Resume')))
-        $Lines.Add(('  Retry only the failed subscriptions: {0} (its zip holds only those subscriptions)' -f (& $Command '-ResumeFailedOnly')))
-        $Lines.Add(('  Subscriptions past the retry limit (3 failed runs in a row): {0} (keeps the completed subscriptions and their reports)' -f (Get-RetryLimitReachedCommand -TenantID '<tenant id>' -Settings $GuideSettings)))
-        $Lines.Add(('  Start over: {0} (collects every subscription again; slow on big tenants)' -f (& $Command '-Fresh')))
-        $Lines.Add(('  Settings: a run that continues this one must use the settings of the unfinished run ({0}); the commands above carry them. To change them, start over with -Fresh.' -f (Format-RunDataSettings -Settings $GuideSettings)))
+        foreach ($GuideLine in $Guide) { $Lines.Add($GuideLine) }
     }
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where

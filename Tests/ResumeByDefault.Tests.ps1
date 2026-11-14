@@ -2047,6 +2047,11 @@ Describe 'Collecting the subscriptions past the retry limit with -RetryLimitReac
         $R4 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly', '-RetryLimitReached' -Streams 1
         script:Get-Collected $R4 | Should -Be (script:Get-Ids 'B')
         $R4.ExitCode | Should -Be 2 -Because 'its zip holds only B, so the consolidated zip with A is owed'
+        # Nothing failed, but the zip is owed: its RunSummary.log has the guide.
+        $Bundle = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter 'AllSubscriptions_*.zip' | Sort-Object LastWriteTimeUtc | Select-Object -Last 1)[0].Name
+        $Log = @(script:Get-ZipEntries | Where-Object { $_.Zip -eq $Bundle -and $_.Name -eq 'RunSummary.log' })[0].Text
+        $Log | Should -Match ([regex]::Escape('Which flag to use (this run is not complete):'))
+        $Log | Should -Match ([regex]::Escape('./Run-AllSubscriptions.ps1 -TenantID <tenant id> -Resume (it continues the unfinished run at any age'))
         $R5 = script:Invoke-Wrapper -Streams 1
         $R5.ExitCode | Should -Be 0
         script:Get-Collected $R5 | Should -BeNullOrEmpty

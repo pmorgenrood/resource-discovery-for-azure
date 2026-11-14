@@ -3469,6 +3469,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
             -Concurrency $ConcurrencyLimit -ConcurrencySource $ConcurrencySrc `
             -CommandSettings $RetryCommandSettings `
+            -WorkLeft:(($FailedSubscriptions.Count -gt 0) -or ($RetryOwedCount -gt 0) -or ($NotCollected.Count -gt 0) -or ($ZipOwedIds.Count -gt 0) -or ($MissingReportCount -gt 0)) `
             -Obfuscated:$Obfuscate
         $RunSummaryLines | Out-File -FilePath (Join-Path $BundleStage 'RunSummary.log') -Encoding utf8
 
