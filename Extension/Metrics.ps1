@@ -37,6 +37,49 @@ if (-not (Get-Command -Name 'Write-RdaProgress' -ErrorAction SilentlyContinue))
 }
 
 
+# The masking of a -Obfuscate run's metric records: each record's ID, Name,
+# Subscription and ResourceGroup become the tokens of its real id; a record whose
+# id has none gets a masked id built from the run's tokens, added to the
+# dictionaries. $FallbackCache (Sub, Rg and Name hashtables) holds the tokens of
+# those built ids for the whole run. Records are changed in place. Run by this
+# script on each batch of records, and by Protect-RdaReport.ps1 on the records of a
+# finished plain report, so both mask a record the same way.
+function Protect-RdaMetricRecord
+{
+    param($Metrics, $ResourceIdDictionary, $ResourceNameDictionary, $ResourceSubDictionary, $ResourceGroupDictionary, [hashtable]$FallbackCache)
+
+    foreach ($metric in $Metrics)
+    {
+        $OriginalId = $metric.ID
+        if (![string]::IsNullOrEmpty($OriginalId) -and $null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0 -and $ResourceIdDictionary.ContainsKey($OriginalId))
+        {
+            $metric.ID = $ResourceIdDictionary[$OriginalId]
+            $metric.Name = $ResourceNameDictionary[$OriginalId]
+            $metric.Subscription = $ResourceSubDictionary[$OriginalId]
+            $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
+        }
+        else
+        {
+            if (![string]::IsNullOrEmpty($OriginalId))
+            {
+                $FbPrefix = if ($OriginalId -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b') { 'nonprod_' } else { 'prod_' }
+
+                $ObfuscatedId = Build-ObfuscatedResourceUri -RawUri $OriginalId -Prefix $FbPrefix -SubscriptionDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary -NameDictionary $ResourceNameDictionary -SubCache $FallbackCache.Sub -RgCache $FallbackCache.Rg -NameCache $FallbackCache.Name
+
+                $ResourceIdDictionary[$OriginalId] = $ObfuscatedId
+                if (-not $ResourceNameDictionary.ContainsKey($OriginalId)) { $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
+                if (-not $ResourceSubDictionary.ContainsKey($OriginalId)) { $ResourceSubDictionary[$OriginalId] = $FbPrefix + 'sub_' + [guid]::NewGuid().ToString() }
+                if (-not $ResourceGroupDictionary.ContainsKey($OriginalId)) { $ResourceGroupDictionary[$OriginalId] = $FbPrefix + 'rg_' + [guid]::NewGuid().ToString() }
+
+                $metric.ID = $ObfuscatedId
+                $metric.Name = $ResourceNameDictionary[$OriginalId]
+                $metric.Subscription = $ResourceSubDictionary[$OriginalId]
+                $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
+            }
+        }
+    }
+}
+
 if (-not (Get-Command -Name 'Resolve-ObfuscationToken' -ErrorAction SilentlyContinue))
 {
     function Resolve-ObfuscationToken
@@ -1876,40 +1919,8 @@ function Add-MetricRecord
 
             if ($Obfuscate)
             {
-                foreach ($metric in $Tmp.Metrics)
-                {
-                    $OriginalId = $metric.ID
-                    if (![string]::IsNullOrEmpty($OriginalId) -and $null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0 -and $ResourceIdDictionary.ContainsKey($OriginalId))
-                    {
-                        $metric.ID = $ResourceIdDictionary[$OriginalId]
-                        $metric.Name = $ResourceNameDictionary[$OriginalId]
-                        $metric.Subscription = $ResourceSubDictionary[$OriginalId]
-                        $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
-                    }
-                    else
-                    {
-                        if (![string]::IsNullOrEmpty($OriginalId))
-                        {
-                            $FbPrefix = if ($OriginalId -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b') { 'nonprod_' } else { 'prod_' }
-
-                            if (-not $script:MetricsFallbackSubCache) { $script:MetricsFallbackSubCache = @{} }
-                            if (-not $script:MetricsFallbackRgCache) { $script:MetricsFallbackRgCache = @{} }
-                            if (-not $script:MetricsFallbackNameCache) { $script:MetricsFallbackNameCache = @{} }
-
-                            $ObfuscatedId = Build-ObfuscatedResourceUri -RawUri $OriginalId -Prefix $FbPrefix -SubscriptionDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary -NameDictionary $ResourceNameDictionary -SubCache $script:MetricsFallbackSubCache -RgCache $script:MetricsFallbackRgCache -NameCache $script:MetricsFallbackNameCache
-
-                            $ResourceIdDictionary[$OriginalId] = $ObfuscatedId
-                            if (-not $ResourceNameDictionary.ContainsKey($OriginalId)) { $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
-                            if (-not $ResourceSubDictionary.ContainsKey($OriginalId)) { $ResourceSubDictionary[$OriginalId] = $FbPrefix + 'sub_' + [guid]::NewGuid().ToString() }
-                            if (-not $ResourceGroupDictionary.ContainsKey($OriginalId)) { $ResourceGroupDictionary[$OriginalId] = $FbPrefix + 'rg_' + [guid]::NewGuid().ToString() }
-
-                            $metric.ID = $ObfuscatedId
-                            $metric.Name = $ResourceNameDictionary[$OriginalId]
-                            $metric.Subscription = $ResourceSubDictionary[$OriginalId]
-                            $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
-                        }
-                    }
-                }
+                if ($null -eq $script:MetricsFallbackCache) { $script:MetricsFallbackCache = @{ Sub = @{}; Rg = @{}; Name = @{} } }
+                Protect-RdaMetricRecord -Metrics $Tmp.Metrics -ResourceIdDictionary $ResourceIdDictionary -ResourceNameDictionary $ResourceNameDictionary -ResourceSubDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary -FallbackCache $script:MetricsFallbackCache
             }
 
             $OutputPath = $FilePath + "_" + $RangeIdx + ".json"

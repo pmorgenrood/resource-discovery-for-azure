@@ -320,6 +320,290 @@ function Get-ObfuscatedResourceId
     return ($Masked -join '/')
 }
 
+# The token loop of a -Obfuscate run: gives every resource row its name,
+# subscription and resource group tokens, then its masked id. Ids are built once
+# every resource has its name token, so a child's id can use its parent's token
+# (Get-ObfuscatedResourceId). Each row needs ID, name, subscriptionId and
+# resourceGroup, as Resource Graph rows have them. Run by RunInventorySetup on the
+# pull's rows, and by Protect-RdaReport.ps1 on the rows of a finished plain report,
+# so both write the same tokens the same way.
+function Add-RdaObfuscationToken
+{
+    param($Rows, [hashtable]$SubscriptionIndex)
+
+    $SubIndex = if ($null -ne $SubscriptionIndex) { $SubscriptionIndex } else { Get-ObfuscationSubscriptionIndex }
+    $SubLookup = $Global:ObfuscationSubscriptionTokens
+    $RgLookup = $Global:ObfuscationResourceGroupTokens
+    $IdsToMask = [System.Collections.Generic.HashSet[string]]::new()
+
+    foreach ($resourceItem in $Rows)
+    {
+        if ($IdsToMask.Contains($resourceItem.ID)) { continue }
+
+        # The token New-ObfuscatedNameToken writes, built inline because this loop
+        # runs once per resource.
+        $TokenId = [string]$resourceItem.id
+        $TokenName = [string]$resourceItem.name
+        $Hint = if ($TokenId -match 'databricks') { 'databricks_' } elseif ($TokenId -match '/resourcegroups/mc_') { 'aks_' } elseif ($TokenId -match 'virtualmachinescalesets') { 'vmss_' } else { '' }
+        $Prefix = if ($TokenName -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $TokenName -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+        $ObfuscatedName = $Prefix + $Hint + [guid]::NewGuid().ToString()
+
+        $SubEntries = if ($null -eq $resourceItem.subscriptionId) { $SubIndex.NoId } else { $SubIndex.ById[[string]$resourceItem.subscriptionId] }
+        $RealSub = $SubEntries.Name
+        if ([string]::IsNullOrEmpty($RealSub)) { $RealSub = $resourceItem.subscriptionId }
+        if (-not $SubLookup.ContainsKey($RealSub))
+        {
+            $SubPrefix = if ($RealSub -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealSub -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
+            $SubLookup[$RealSub] = $SubPrefix + [guid]::NewGuid().ToString()
+        }
+        $ObfuscatedSubscription = $SubLookup[$RealSub]
+
+        $RealRG = $resourceItem.resourceGroup
+        if ([string]::IsNullOrEmpty($RealRG)) { $RealRG = '__none__' }
+        if (-not $RgLookup.ContainsKey($RealRG))
+        {
+            $RgPrefix = if ($RealRG -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealRG -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
+            $RgLookup[$RealRG] = $RgPrefix + [guid]::NewGuid().ToString()
+        }
+        $ObfuscatedResourceGroup = $RgLookup[$RealRG]
+
+        if ($ResourceIdDictionary.ContainsKey($resourceItem.ID))
+        {
+            $ObfuscatedID = $ResourceIdDictionary[$resourceItem.ID]
+            $ObfuscatedName = $ResourceNameDictionary[$resourceItem.ID]
+            $ObfuscatedSubscription = $ResourceSubscriptionDictionary[$resourceItem.ID]
+            $ObfuscatedResourceGroup = $ResourceResourceGroupDictionary[$resourceItem.ID]
+        }
+        else
+        {
+            $ObfuscatedID = $null
+            [void]$IdsToMask.Add($resourceItem.ID)
+        }
+
+        if ($null -ne $ObfuscatedID) { $ResourceIdDictionary[$resourceItem.ID] = $ObfuscatedID }
+        $ResourceNameDictionary[$resourceItem.ID] = $ObfuscatedName
+        $ResourceSubscriptionDictionary[$resourceItem.ID] = $ObfuscatedSubscription
+        $ResourceResourceGroupDictionary[$resourceItem.ID] = $ObfuscatedResourceGroup
+
+    }
+
+    foreach ($MaskId in $IdsToMask)
+    {
+        $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId -SubscriptionIndex $SubIndex
+    }
+}
+
+# The masking of a -Obfuscate run's collector rows: each row's ID, Name,
+# Subscription and ResourceGroup become the tokens of its real id (a row whose id
+# has none gets new ones), and each tag value its tag token. Rows are hashtables,
+# as the collectors write them; they are changed in place. Run by
+# ExecuteInventoryProcessing on each collector's rows, and by Protect-RdaReport.ps1
+# on the rows of a finished plain report, so both mask a row the same way.
+function Protect-RdaCollectorRow
+{
+    param($Rows)
+
+    foreach ($resourceItem in $Rows)
+    {
+        $OrigID = $resourceItem.ID
+
+        if ([string]::IsNullOrEmpty($OrigID))
+        {
+            $Fallback = 'obfuscated_' + [guid]::NewGuid().ToString()
+            $resourceItem.ID = $Fallback
+            $resourceItem.Name = $Fallback
+            $resourceItem.Subscription = $Fallback
+            $resourceItem.ResourceGroup = $Fallback
+            if ($resourceItem.ContainsKey('tags')) { $resourceItem.tags = $null }
+            if ($resourceItem.ContainsKey('Tags')) { $resourceItem.Tags = $null }
+            continue
+        }
+
+        if ($ResourceIdDictionary.ContainsKey($OrigID))
+        {
+            $ObfuscatedID = $ResourceIdDictionary[$OrigID]
+            if ([string]::IsNullOrEmpty($ObfuscatedID)) { $ObfuscatedID = 'obfuscated_' + [guid]::NewGuid().ToString() }
+            $resourceItem.ID = $ObfuscatedID
+        }
+        else
+        {
+            $Prefix = if ($OrigID -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $OrigID -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
+            $Fallback = $Prefix + [guid]::NewGuid().ToString()
+            $ResourceIdDictionary[$OrigID] = $Fallback
+            $resourceItem.ID = $Fallback
+        }
+
+        $Prefix = $resourceItem.ID.Split('_')[0] + '_'
+
+        if ($ResourceNameDictionary.ContainsKey($OrigID))
+        {
+            $ObfuscatedName = $ResourceNameDictionary[$OrigID]
+            if ([string]::IsNullOrEmpty($ObfuscatedName)) { $ObfuscatedName = 'obfuscated_' + [guid]::NewGuid().ToString() }
+            $resourceItem.Name = $ObfuscatedName
+        }
+        else
+        {
+            $FbName = $Prefix + [guid]::NewGuid().ToString()
+            $ResourceNameDictionary[$OrigID] = $FbName
+            $resourceItem.Name = $FbName
+        }
+
+        if ($ResourceSubscriptionDictionary.ContainsKey($OrigID))
+        {
+            $ObfuscatedSub = $ResourceSubscriptionDictionary[$OrigID]
+            if ([string]::IsNullOrEmpty($ObfuscatedSub)) { $ObfuscatedSub = 'obfuscated_' + [guid]::NewGuid().ToString() }
+            $resourceItem.Subscription = $ObfuscatedSub
+        }
+        else
+        {
+            $FbSub = $Prefix + [guid]::NewGuid().ToString()
+            $ResourceSubscriptionDictionary[$OrigID] = $FbSub
+            $resourceItem.Subscription = $FbSub
+        }
+
+        if ($ResourceResourceGroupDictionary.ContainsKey($OrigID))
+        {
+            $ObfuscatedRG = $ResourceResourceGroupDictionary[$OrigID]
+            if ([string]::IsNullOrEmpty($ObfuscatedRG)) { $ObfuscatedRG = 'obfuscated_' + [guid]::NewGuid().ToString() }
+            $resourceItem.ResourceGroup = $ObfuscatedRG
+        }
+        else
+        {
+            $FbRG = $Prefix + [guid]::NewGuid().ToString()
+            $ResourceResourceGroupDictionary[$OrigID] = $FbRG
+            $resourceItem.ResourceGroup = $FbRG
+        }
+
+        if ($resourceItem.ContainsKey('Tags') -and $null -ne $resourceItem.Tags)
+        {
+            foreach ($Tag in $resourceItem.Tags)
+            {
+                if ($null -ne $Tag -and -not [string]::IsNullOrEmpty([string]$Tag.Value))
+                {
+                    $RealTagValue = [string]$Tag.Value
+                    if (-not $Global:TagValueDictionary.ContainsKey($RealTagValue))
+                    {
+                        $TagPrefix = if ($RealTagValue -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealTagValue -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+                        $Global:TagValueDictionary[$RealTagValue] = $TagPrefix + [guid]::NewGuid().ToString()
+                    }
+                    $Tag.Value = $Global:TagValueDictionary[$RealTagValue]
+                }
+            }
+        }
+    }
+}
+
+# The masking of one consumption row of a -Obfuscate run: the row's ResourceId and
+# the ResourceUri in its InstanceData object become the masked id (the inventory's
+# when it has the id, else built from the run's tokens and added to the
+# dictionary), and a reservation id or order id is written as 'obfuscated'. Only
+# those cells change; the additionalInfo fields are left as they are. Run by the
+# consumption loop on each row, and by Protect-RdaReport.ps1 on the rows of a
+# finished plain report, so both mask a row the same way.
+function Protect-RdaUsageRow
+{
+    param($Row, $InstanceObject)
+
+    $RawUri = $InstanceObject.'Microsoft.Resources'.resourceUri
+
+    if (![string]::IsNullOrEmpty($RawUri) -and $ResourceIdDictionary.ContainsKey($RawUri))
+    {
+        $ObfuscatedUri = $ResourceIdDictionary[$RawUri]
+    }
+    else
+    {
+        # A resource that is not in the inventory: its segments reuse the
+        # inventory's tokens where they exist (subscription, resource
+        # group, parent resource), and new ones go into the dictionary.
+        $ObfuscatedUri = Get-ObfuscatedResourceId -ResourceId $RawUri
+
+        if (![string]::IsNullOrEmpty($RawUri))
+        {
+            $ResourceIdDictionary[$RawUri] = $ObfuscatedUri
+        }
+    }
+
+    $Row.ResourceId = $ObfuscatedUri
+    $InstanceObject.'Microsoft.Resources'.resourceUri = $ObfuscatedUri
+
+    if (![string]::IsNullOrEmpty($Row.ReservationId))
+    {
+        $Row.ReservationId = 'obfuscated'
+    }
+    if (![string]::IsNullOrEmpty($Row.ReservationOrderId))
+    {
+        $Row.ReservationOrderId = 'obfuscated'
+    }
+}
+
+# The obfuscation dictionary of a -Obfuscate run (token -> real value, per map),
+# from the run's dictionaries and $Global:Subscriptions. Its JSON is the
+# ObfuscationDictionary_*.json file Reveal.ps1 reads. Used by the end of a run and
+# by Protect-RdaReport.ps1, so both write the same maps.
+function Get-RdaObfuscationDictionary
+{
+    $Dictionary = @{
+        GeneratedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        ResourceIdMap = @{}
+        ResourceNameMap = @{}
+        SubscriptionMap = @{}
+        ResourceGroupMap = @{}
+        SubscriptionNameMap = @{}
+        TagMap = @{}
+        FreeTextMap = @{}
+    }
+
+    foreach ($key in $ResourceIdDictionary.Keys)
+    {
+        $Dictionary.ResourceIdMap[$ResourceIdDictionary[$key]] = $key
+    }
+    foreach ($key in $ResourceNameDictionary.Keys)
+    {
+        $Dictionary.ResourceNameMap[$ResourceNameDictionary[$key]] = $key
+    }
+    foreach ($key in $ResourceSubscriptionDictionary.Keys)
+    {
+        $Dictionary.SubscriptionMap[$ResourceSubscriptionDictionary[$key]] = $key
+    }
+    foreach ($key in $ResourceResourceGroupDictionary.Keys)
+    {
+        $Dictionary.ResourceGroupMap[$ResourceResourceGroupDictionary[$key]] = $key
+    }
+
+    foreach ($key in $ResourceSubscriptionDictionary.Keys)
+    {
+        $SubToken = $ResourceSubscriptionDictionary[$key]
+        if ($Dictionary.SubscriptionNameMap.ContainsKey($SubToken)) { continue }
+        $SubGuid = if ($key -match '(?i)/subscriptions/([^/]+)') { $Matches[1] } else { $null }
+        if (-not [string]::IsNullOrEmpty($SubGuid))
+        {
+            $SubName = ($Global:Subscriptions | Where-Object { $_.id -eq $SubGuid } | Select-Object -First 1).name
+            if (-not [string]::IsNullOrEmpty($SubName))
+            {
+                $Dictionary.SubscriptionNameMap[$SubToken] = $SubName
+            }
+        }
+    }
+
+    if ($null -ne $Global:TagValueDictionary)
+    {
+        foreach ($realValue in $Global:TagValueDictionary.Keys)
+        {
+            $Dictionary.TagMap[$Global:TagValueDictionary[$realValue]] = $realValue
+        }
+    }
+
+    if ($null -ne $Global:FreeTextDictionary)
+    {
+        foreach ($realValue in $Global:FreeTextDictionary.Keys)
+        {
+            $Dictionary.FreeTextMap[$Global:FreeTextDictionary[$realValue]] = $realValue
+        }
+    }
+
+    return $Dictionary
+}
+
 Function RunInventorySetup()
 {
     function CheckVersion()
@@ -1247,9 +1531,6 @@ Function RunInventorySetup()
     {
         $SubLookup = $Global:ObfuscationSubscriptionTokens
         $RgLookup = $Global:ObfuscationResourceGroupTokens
-        # Ids are built once every resource has its name token, so a child's id
-        # can use its parent's token (Get-ObfuscatedResourceId).
-        $IdsToMask = [System.Collections.Generic.HashSet[string]]::new()
 
         if (-not [string]::IsNullOrEmpty($ObfuscationDictionary))
         {
@@ -1300,61 +1581,7 @@ Function RunInventorySetup()
             $TokenLoopRows = @(@($Global:Resources) + $script:NetworkTokenRows)
         }
 
-        foreach ($resourceItem in $TokenLoopRows)
-        {
-            if ($IdsToMask.Contains($resourceItem.ID)) { continue }
-
-            # The token New-ObfuscatedNameToken writes, built inline because this loop
-            # runs once per resource.
-            $TokenId = [string]$resourceItem.id
-            $TokenName = [string]$resourceItem.name
-            $Hint = if ($TokenId -match 'databricks') { 'databricks_' } elseif ($TokenId -match '/resourcegroups/mc_') { 'aks_' } elseif ($TokenId -match 'virtualmachinescalesets') { 'vmss_' } else { '' }
-            $Prefix = if ($TokenName -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $TokenName -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-            $ObfuscatedName = $Prefix + $Hint + [guid]::NewGuid().ToString()
-
-            $SubEntries = if ($null -eq $resourceItem.subscriptionId) { $SubIndex.NoId } else { $SubIndex.ById[[string]$resourceItem.subscriptionId] }
-            $RealSub = $SubEntries.Name
-            if ([string]::IsNullOrEmpty($RealSub)) { $RealSub = $resourceItem.subscriptionId }
-            if (-not $SubLookup.ContainsKey($RealSub))
-            {
-                $SubPrefix = if ($RealSub -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealSub -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
-                $SubLookup[$RealSub] = $SubPrefix + [guid]::NewGuid().ToString()
-            }
-            $ObfuscatedSubscription = $SubLookup[$RealSub]
-
-            $RealRG = $resourceItem.resourceGroup
-            if ([string]::IsNullOrEmpty($RealRG)) { $RealRG = '__none__' }
-            if (-not $RgLookup.ContainsKey($RealRG))
-            {
-                $RgPrefix = if ($RealRG -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealRG -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
-                $RgLookup[$RealRG] = $RgPrefix + [guid]::NewGuid().ToString()
-            }
-            $ObfuscatedResourceGroup = $RgLookup[$RealRG]
-
-            if ($ResourceIdDictionary.ContainsKey($resourceItem.ID))
-            {
-                $ObfuscatedID = $ResourceIdDictionary[$resourceItem.ID]
-                $ObfuscatedName = $ResourceNameDictionary[$resourceItem.ID]
-                $ObfuscatedSubscription = $ResourceSubscriptionDictionary[$resourceItem.ID]
-                $ObfuscatedResourceGroup = $ResourceResourceGroupDictionary[$resourceItem.ID]
-            }
-            else
-            {
-                $ObfuscatedID = $null
-                [void]$IdsToMask.Add($resourceItem.ID)
-            }
-
-            if ($null -ne $ObfuscatedID) { $ResourceIdDictionary[$resourceItem.ID] = $ObfuscatedID }
-            $ResourceNameDictionary[$resourceItem.ID] = $ObfuscatedName
-            $ResourceSubscriptionDictionary[$resourceItem.ID] = $ObfuscatedSubscription
-            $ResourceResourceGroupDictionary[$resourceItem.ID] = $ObfuscatedResourceGroup
-
-        }
-
-        foreach ($MaskId in $IdsToMask)
-        {
-            $ResourceIdDictionary[$MaskId] = Get-ObfuscatedResourceId -ResourceId $MaskId -SubscriptionIndex $SubIndex
-        }
+        Add-RdaObfuscationToken -Rows $TokenLoopRows -SubscriptionIndex $SubIndex
         $TokenLoopRows = $null
     }
     # The id query's rows are not needed past the token loop.
@@ -1684,6 +1911,7 @@ function ExecuteInventoryProcessing()
                     Id      = $SubscriptionID
                     Module  = $ModName
                     Message = $_.Exception.Message
+                    Facts   = (Get-RdaErrorFacts $_)
                 }
                 $Global:CollectorFailures += $CollectorFailure
                 # $Global:CollectorFailures is a running total across every subscription a wrapper run
@@ -1703,94 +1931,7 @@ function ExecuteInventoryProcessing()
 
             if ($Obfuscate.IsPresent)
             {
-                foreach ($resourceItem in $Result)
-                {
-                    $OrigID = $resourceItem.ID
-
-                    if ([string]::IsNullOrEmpty($OrigID))
-                    {
-                        $Fallback = 'obfuscated_' + [guid]::NewGuid().ToString()
-                        $resourceItem.ID = $Fallback
-                        $resourceItem.Name = $Fallback
-                        $resourceItem.Subscription = $Fallback
-                        $resourceItem.ResourceGroup = $Fallback
-                        if ($resourceItem.ContainsKey('tags')) { $resourceItem.tags = $null }
-                        if ($resourceItem.ContainsKey('Tags')) { $resourceItem.Tags = $null }
-                        continue
-                    }
-
-                    if ($ResourceIdDictionary.ContainsKey($OrigID))
-                    {
-                        $ObfuscatedID = $ResourceIdDictionary[$OrigID]
-                        if ([string]::IsNullOrEmpty($ObfuscatedID)) { $ObfuscatedID = 'obfuscated_' + [guid]::NewGuid().ToString() }
-                        $resourceItem.ID = $ObfuscatedID
-                    }
-                    else
-                    {
-                        $Prefix = if ($OrigID -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $OrigID -match '(^|-)([dts])-') { "nonprod_" } else { "prod_" }
-                        $Fallback = $Prefix + [guid]::NewGuid().ToString()
-                        $ResourceIdDictionary[$OrigID] = $Fallback
-                        $resourceItem.ID = $Fallback
-                    }
-
-                    $Prefix = $resourceItem.ID.Split('_')[0] + '_'
-
-                    if ($ResourceNameDictionary.ContainsKey($OrigID))
-                    {
-                        $ObfuscatedName = $ResourceNameDictionary[$OrigID]
-                        if ([string]::IsNullOrEmpty($ObfuscatedName)) { $ObfuscatedName = 'obfuscated_' + [guid]::NewGuid().ToString() }
-                        $resourceItem.Name = $ObfuscatedName
-                    }
-                    else
-                    {
-                        $FbName = $Prefix + [guid]::NewGuid().ToString()
-                        $ResourceNameDictionary[$OrigID] = $FbName
-                        $resourceItem.Name = $FbName
-                    }
-
-                    if ($ResourceSubscriptionDictionary.ContainsKey($OrigID))
-                    {
-                        $ObfuscatedSub = $ResourceSubscriptionDictionary[$OrigID]
-                        if ([string]::IsNullOrEmpty($ObfuscatedSub)) { $ObfuscatedSub = 'obfuscated_' + [guid]::NewGuid().ToString() }
-                        $resourceItem.Subscription = $ObfuscatedSub
-                    }
-                    else
-                    {
-                        $FbSub = $Prefix + [guid]::NewGuid().ToString()
-                        $ResourceSubscriptionDictionary[$OrigID] = $FbSub
-                        $resourceItem.Subscription = $FbSub
-                    }
-
-                    if ($ResourceResourceGroupDictionary.ContainsKey($OrigID))
-                    {
-                        $ObfuscatedRG = $ResourceResourceGroupDictionary[$OrigID]
-                        if ([string]::IsNullOrEmpty($ObfuscatedRG)) { $ObfuscatedRG = 'obfuscated_' + [guid]::NewGuid().ToString() }
-                        $resourceItem.ResourceGroup = $ObfuscatedRG
-                    }
-                    else
-                    {
-                        $FbRG = $Prefix + [guid]::NewGuid().ToString()
-                        $ResourceResourceGroupDictionary[$OrigID] = $FbRG
-                        $resourceItem.ResourceGroup = $FbRG
-                    }
-
-                    if ($resourceItem.ContainsKey('Tags') -and $null -ne $resourceItem.Tags)
-                    {
-                        foreach ($Tag in $resourceItem.Tags)
-                        {
-                            if ($null -ne $Tag -and -not [string]::IsNullOrEmpty([string]$Tag.Value))
-                            {
-                                $RealTagValue = [string]$Tag.Value
-                                if (-not $Global:TagValueDictionary.ContainsKey($RealTagValue))
-                                {
-                                    $TagPrefix = if ($RealTagValue -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RealTagValue -match '(^|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-                                    $Global:TagValueDictionary[$RealTagValue] = $TagPrefix + [guid]::NewGuid().ToString()
-                                }
-                                $Tag.Value = $Global:TagValueDictionary[$RealTagValue]
-                            }
-                        }
-                    }
-                }
+                Protect-RdaCollectorRow -Rows $Result
             }
 
             $Global:SmaResources | Add-Member -MemberType NoteProperty -Name $ModName -Value NotSet
@@ -1944,6 +2085,7 @@ function ExecuteInventoryProcessing()
             $ConsumptionRecordsThisSub = 0
             $ConsumptionFailedThisSub = $false
             $ConsumptionFailureMessage = $null
+            $ConsumptionFailureFacts = ''
             $ConsumptionPageIndex = 0
 
             # $UsageData is the last page read, and the next page's token comes
@@ -2083,36 +2225,7 @@ function ExecuteInventoryProcessing()
 
                         if ($Obfuscate.IsPresent)
                         {
-                            $RawUri = $InstanceObject.'Microsoft.Resources'.resourceUri
-
-                            if (![string]::IsNullOrEmpty($RawUri) -and $ResourceIdDictionary.ContainsKey($RawUri))
-                            {
-                                $ObfuscatedUri = $ResourceIdDictionary[$RawUri]
-                            }
-                            else
-                            {
-                                # A resource that is not in the inventory: its segments reuse the
-                                # inventory's tokens where they exist (subscription, resource
-                                # group, parent resource), and new ones go into the dictionary.
-                                $ObfuscatedUri = Get-ObfuscatedResourceId -ResourceId $RawUri
-
-                                if (![string]::IsNullOrEmpty($RawUri))
-                                {
-                                    $ResourceIdDictionary[$RawUri] = $ObfuscatedUri
-                                }
-                            }
-
-                            $UsageDataExport[$Item].ResourceId = $ObfuscatedUri
-                            $InstanceObject.'Microsoft.Resources'.resourceUri = $ObfuscatedUri
-
-                            if (![string]::IsNullOrEmpty($UsageDataExport[$Item].ReservationId))
-                            {
-                                $UsageDataExport[$Item].ReservationId = 'obfuscated'
-                            }
-                            if (![string]::IsNullOrEmpty($UsageDataExport[$Item].ReservationOrderId))
-                            {
-                                $UsageDataExport[$Item].ReservationOrderId = 'obfuscated'
-                            }
+                            Protect-RdaUsageRow -Row $UsageDataExport[$Item] -InstanceObject $InstanceObject
                         }
 
                         $UsageDataExport[$Item].InstanceData = $InstanceObject | ConvertTo-Json -Compress
@@ -2137,6 +2250,7 @@ function ExecuteInventoryProcessing()
             {
                 $ConsumptionFailedThisSub = $true
                 $ConsumptionFailureMessage = ("{0} (stopped at consumption page {1}, after {2} record(s); this subscription's consumption is INCOMPLETE)" -f $_.Exception.Message, $ConsumptionPageIndex, $ConsumptionRecordsThisSub)
+                $ConsumptionFailureFacts = (Get-RdaErrorFacts $_)
                 Write-Log -Message ("Consumption query failed for {0}: {1}" -f $sub.Name, $ConsumptionFailureMessage) -Severity 'Warning'
             }
 
@@ -2149,6 +2263,7 @@ function ExecuteInventoryProcessing()
                     Name             = $sub.Name
                     Id               = $sub.Id
                     Message          = $ConsumptionFailureMessage
+                    Facts            = $ConsumptionFailureFacts
                     Complete         = $false
                     PageAtFailure    = $ConsumptionPageIndex
                     RecordsCollected = $ConsumptionRecordsThisSub
@@ -2461,64 +2576,7 @@ if ($Obfuscate.IsPresent)
 {
     $Global:DictionaryFile = ($DefaultPath + "ObfuscationDictionary_" + $Global:ReportName + "_" + $CurrentDateTime + ".json")
 
-    $Dictionary = @{
-        GeneratedAt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        ResourceIdMap = @{}
-        ResourceNameMap = @{}
-        SubscriptionMap = @{}
-        ResourceGroupMap = @{}
-        SubscriptionNameMap = @{}
-        TagMap = @{}
-        FreeTextMap = @{}
-    }
-
-    foreach ($key in $ResourceIdDictionary.Keys)
-    {
-        $Dictionary.ResourceIdMap[$ResourceIdDictionary[$key]] = $key
-    }
-    foreach ($key in $ResourceNameDictionary.Keys)
-    {
-        $Dictionary.ResourceNameMap[$ResourceNameDictionary[$key]] = $key
-    }
-    foreach ($key in $ResourceSubscriptionDictionary.Keys)
-    {
-        $Dictionary.SubscriptionMap[$ResourceSubscriptionDictionary[$key]] = $key
-    }
-    foreach ($key in $ResourceResourceGroupDictionary.Keys)
-    {
-        $Dictionary.ResourceGroupMap[$ResourceResourceGroupDictionary[$key]] = $key
-    }
-
-    foreach ($key in $ResourceSubscriptionDictionary.Keys)
-    {
-        $SubToken = $ResourceSubscriptionDictionary[$key]
-        if ($Dictionary.SubscriptionNameMap.ContainsKey($SubToken)) { continue }
-        $SubGuid = if ($key -match '(?i)/subscriptions/([^/]+)') { $Matches[1] } else { $null }
-        if (-not [string]::IsNullOrEmpty($SubGuid))
-        {
-            $SubName = ($Global:Subscriptions | Where-Object { $_.id -eq $SubGuid } | Select-Object -First 1).name
-            if (-not [string]::IsNullOrEmpty($SubName))
-            {
-                $Dictionary.SubscriptionNameMap[$SubToken] = $SubName
-            }
-        }
-    }
-
-    if ($null -ne $Global:TagValueDictionary)
-    {
-        foreach ($realValue in $Global:TagValueDictionary.Keys)
-        {
-            $Dictionary.TagMap[$Global:TagValueDictionary[$realValue]] = $realValue
-        }
-    }
-
-    if ($null -ne $Global:FreeTextDictionary)
-    {
-        foreach ($realValue in $Global:FreeTextDictionary.Keys)
-        {
-            $Dictionary.FreeTextMap[$Global:FreeTextDictionary[$realValue]] = $realValue
-        }
-    }
+    $Dictionary = Get-RdaObfuscationDictionary
 
     $Dictionary | ConvertTo-Json -depth 5 | Out-File -LiteralPath $Global:DictionaryFile -Encoding utf8
     Write-Log -Message ("Obfuscation dictionary saved locally: {0}" -f $Global:DictionaryFile) -Severity 'Success'

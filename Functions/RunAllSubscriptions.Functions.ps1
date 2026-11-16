@@ -1889,6 +1889,10 @@ function Resolve-RunStart
             & $Say ('  -{0}: {1} in the unfinished run, {2} in this run.' -f $Difference.Name, (& $OnOff $Difference.Stored), (& $OnOff $Difference.Given)) 'Red'
         }
         & $Say ('  Next: run the same command with the unfinished run''s settings ({0}) to continue it, or {1} to start a new run that collects every subscription again.' -f (Format-RunDataSettings -Settings $Info.Settings), $FreshHow) 'Yellow'
+        if (@($Differences | Where-Object { $_.Name -eq 'Obfuscate' -and -not $_.Stored -and $_.Given }).Count -gt 0)
+        {
+            & $Say '  To share a plain report masked without collecting again, mask it offline: ./Protect-RdaReport.ps1 -Path <AllSubscriptions_ResourcesReport_*.zip of the plain run, once it has finished> (docs/offline-obfuscate.md).' 'Yellow'
+        }
         return (& $Decide 'Stop' 'settings-differ' 1)
     }
     if ($null -ne $AgeProblem) { & $Say $AgeWarning 'Yellow' }

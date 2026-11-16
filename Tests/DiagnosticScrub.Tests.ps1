@@ -1,167 +1,198 @@
-# Protect-DiagnosticText scrub tests
 # =============================================================================
-# Offline, self-contained tests for the scrub that makes the SHAREABLE (in-zip,
-# obfuscated) diagnostics log safe. Protect-DiagnosticText is what stands
-# between a raw collector/phase exception message and the Diagnostics_*.log
-# that ships in the obfuscated bundle, so these assert - directly, without a
-# live run - that every identifier class is masked or tokenized and NONE leaks:
-#   - a dictionary-known subscription GUID / resource name / resource group /
-#     full ARM id  -> its deterministic prod_/nonprod_ token (via the caller's
-#     real-value -> token $ValueMap, applied longest-first)
-#   - an UNKNOWN GUID not in the map (e.g. a tenant GUID)  -> '<guid>'
-#   - email / UPN            -> '<email>'
-#   - IPv4                   -> '<ip>'
-#   - Azure data-plane FQDN  -> '<host>'
-#   - *nix / Windows home dir-> '<user>'
-#   - SAS signature / Bearer -> '<redacted>'
-# and that a prod_/nonprod_ token already in the text is left intact.
-#
-# No customer data: the only literal GUID is the Azure docs placeholder; the
-# "unknown tenant" GUID is generated at runtime; every other value is synthetic.
+# Shareable diagnostics log: no failure message text
+# =============================================================================
+# The shareable Diagnostics_*.log holds, per failure: the collector, the
+# subscription's token and only closed-list facts read from the error OBJECT
+# (exception type name, HTTP status number, an Azure error code on a fixed
+# list). No message text is ever written, so no credential, home folder, host,
+# email or resource name in an error can reach it. These tests assert that
+# directly, without a live run. Synthetic values only; the GUID is the Azure
+# docs placeholder.
 # =============================================================================
 
 BeforeAll {
     $FunctionsFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/ResourceInventory.Functions.ps1'
     if (-not (Test-Path $FunctionsFile)) { throw "ResourceInventory.Functions.ps1 not found at $FunctionsFile" }
     . $FunctionsFile
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/Common.Functions.ps1')
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/OfflineObfuscation.Functions.ps1')
+    . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1')
+    . $FunctionsFile
 
-    # Known (dictionary-backed) real values and their deterministic tokens,
-    # mirroring the real-value -> token $diagScrubMap the packaging block builds.
-    # All token GUIDs and the secret-shaped fixtures (SAS sig, Bearer JWT) are
-    # GENERATED AT RUNTIME so no literal GUID / auth token lives in this source
-    # file (only the Azure docs placeholder is a literal GUID) - keeps the file
-    # clean for the pre-commit leak scan while still exercising every scrub path.
-    $script:SubGuid = '12345678-1234-1234-1234-123456789012'   # Azure docs placeholder
-    $script:RgName = 'rg-sensitive-demo'
-    $script:ResName = 'vm-app-demo'
-    $script:ArmId = "/subscriptions/$script:SubGuid/resourceGroups/$script:RgName/providers/Microsoft.Compute/virtualMachines/$script:ResName"
+    $script:SubGuid = '12345678-1234-1234-1234-123456789012'
+    $script:Secrets = @(
+        'Password="hunter2x"', 'AccountKey=abc/def+ghi==', 'sig%3DSECRETVALUE', 'OAuthToken=zzz999',
+        'C:\Users\Jane Doe\x', '/Users/alice/x', 'ops.admin@contoso-corp.com', 'appdatastore.blob.core.windows.net',
+        'secretacct.privatelink.blob.core.windows.net', '10.20.30.40', '001A.2B3C.4D5E', 'rg-sensitive-demo', 'vm-app-demo'
+    )
 
-    $script:SubToken = 'prod_' + [guid]::NewGuid().ToString()
-    $script:RgToken = 'nonprod_' + [guid]::NewGuid().ToString()
-    $script:NameToken = 'prod_' + [guid]::NewGuid().ToString()
-    $script:IdToken = 'prod_' + [guid]::NewGuid().ToString()
-
-    $script:Map = @{
-        $script:ArmId   = $script:IdToken
-        $script:ResName = $script:NameToken
-        $script:RgName  = $script:RgToken
-        $script:SubGuid = $script:SubToken
-    }
-
-    # A GUID the map has never seen (models a tenant GUID in an ARM error).
-    $script:UnknownGuid = [guid]::NewGuid().ToString()
-
-    # Random alphanumeric helper so the secret-shaped fixtures are built at
-    # runtime (never a literal secret in source).
-    $NewRand = { param($n) -join (1..$n | ForEach-Object { '{0:x}' -f (Get-Random -Minimum 0 -Maximum 16) }) }
-
-    # Synthetic identifiers of every class, embedded in one message.
-    $script:Email = 'ops.admin@contoso-corp.com'
-    $script:Fqdn = 'appdatastore.blob.core.windows.net'
-    $script:Ip = '10.42.13.99'
-    $script:HomeNix = '/home/testuser/inventory/run.log'
-    $script:HomeWin = 'C:\Users\testuser\inventory\run.log'
-    # SAS signature + Bearer JWT assembled from runtime-random parts, so the
-    # secret-shaped literal never appears in this file but the scrub's sig=/Bearer
-    # rules still fire. Keep the sig/jwt values to assert they are gone afterward.
-    $script:SigValue = (& $NewRand 32)
-    $script:SasUrl = 'https://example-host/container/blob?sv=2021-08-06&ss=b&' + 'sig=' + $script:SigValue
-    $script:JwtValue = 'eyJ' + (& $NewRand 12) + '.' + (& $NewRand 16) + '.' + (& $NewRand 16)
-    $script:Bearer = 'Bearer ' + $script:JwtValue
-
-    $script:RawMessage = @(
-        "Collector 'Streamanalytics' failed for $script:ArmId",
-        "(subscription $script:SubGuid, resourceGroup $script:RgName, resource $script:ResName);",
-        "tenant $script:UnknownGuid;",
-        "contact $script:Email;",
-        "host $script:Fqdn ($script:Ip);",
-        "log $script:HomeNix / $script:HomeWin;",
-        "download $script:SasUrl;",
-        "auth: $script:Bearer"
-    ) -join ' '
-
-    $script:Scrubbed = Protect-DiagnosticText $script:RawMessage $script:Map
-}
-
-Describe "Protect-DiagnosticText masks dictionary-known identifiers" {
-
-    It "tokenizes the full ARM resource id" {
-        $script:Scrubbed | Should -Match ([regex]::Escape($script:IdToken))
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:ArmId))
-    }
-
-    It "tokenizes the bare resource group name" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:RgName))
-        $script:Scrubbed | Should -Match ([regex]::Escape($script:RgToken))
-    }
-
-    It "tokenizes the bare resource name" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:ResName))
-        $script:Scrubbed | Should -Match ([regex]::Escape($script:NameToken))
-    }
-
-    It "removes the real subscription GUID entirely (tokenized or masked)" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:SubGuid))
+    function script:New-DiagnosticsText
+    {
+        param([object[]]$Collector = @(), [object[]]$Metrics = @(), [object[]]$Consumption = @(), [switch]$Obfuscated)
+        $Dir = Join-Path ([IO.Path]::GetTempPath()) ('RdaDiagText_' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Dir | Out-Null
+        $Saved = @{ C = $Global:CollectorFailures; M = $Global:MetricsFailedSubs; U = $Global:ConsumptionFailedSubs; S = $Global:ResourceSubscriptionDictionary; I = $Global:ResourceIdDictionary }
+        try
+        {
+            $Global:CollectorFailures = $Collector; $Global:MetricsFailedSubs = $Metrics; $Global:ConsumptionFailedSubs = $Consumption
+            $Global:ResourceIdDictionary = $null; $Global:ResourceSubscriptionDictionary = $null
+            $File = Write-RdaShareableDiagnosticsLog -DefaultPath ($Dir + [IO.Path]::DirectorySeparatorChar) -ReportName 'P' -RunDateTime '1' -Version '3.2.3' -PhaseTimings ([ordered]@{}) -Obfuscated:$Obfuscated 6>$null
+            return (Get-Content -Raw -LiteralPath $File)
+        }
+        finally
+        {
+            $Global:CollectorFailures = $Saved.C; $Global:MetricsFailedSubs = $Saved.M; $Global:ConsumptionFailedSubs = $Saved.U
+            $Global:ResourceSubscriptionDictionary = $Saved.S; $Global:ResourceIdDictionary = $Saved.I
+            Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
-Describe "Protect-DiagnosticText masks structured identifier classes" {
-
-    It "masks an UNKNOWN GUID (not in the map) as <guid>" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:UnknownGuid))
-        $script:Scrubbed | Should -Match '<guid>'
+Describe 'Get-RdaErrorFacts reads only closed-list facts from the error object' {
+    It 'reads the exception type, the HTTP status and a listed Azure error code' {
+        $Ex = [System.Net.WebException]::new('Password="hunter2x" at /Users/alice/x')
+        $Obj = [pscustomobject]@{ Response = [pscustomobject]@{ StatusCode = [System.Net.HttpStatusCode]::Forbidden }; Body = [pscustomobject]@{ Code = 'AuthorizationFailed' } }
+        Get-RdaErrorFacts $Ex | Should -Be 'exception=System.Net.WebException'
+        Get-RdaErrorFacts $Obj | Should -Be 'status=403 code=AuthorizationFailed'
     }
 
-    It "masks email addresses and cannot trip the Obfuscation email scan" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:Email))
-        # Same pattern Tests/Obfuscation.Tests.ps1 uses.
-        $script:Scrubbed | Should -Not -Match '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    It 'drops an Azure error code that is not on the list, and a type from outside the closed prefixes' {
+        $Obj = [pscustomobject]@{ StatusCode = 429; Code = 'Contoso-Secret-Code' }
+        Get-RdaErrorFacts $Obj | Should -Be 'status=429'
+        # A custom type name is not kept.
+        Add-Type -TypeDefinition 'public class AcmeCustomerError : System.Exception { public AcmeCustomerError(string m) : base(m) {} }' -ErrorAction SilentlyContinue
+        Get-RdaErrorFacts ([AcmeCustomerError]::new('x')) | Should -Be ''
     }
 
-    It "masks IPv4 addresses" {
-        $script:Scrubbed | Should -Not -Match '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
+    It 'never reads the message text' {
+        $Facts = Get-RdaErrorFacts ([System.InvalidOperationException]::new('status=403 code=AuthorizationFailed ops.admin@contoso-corp.com'))
+        $Facts | Should -Be 'exception=System.InvalidOperationException'
     }
 
-    It "masks Azure data-plane FQDNs" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:Fqdn))
+    It 'reads Status, Error.Code and ErrorCode shapes, and ignores a status outside 100-599 (so a non-HTTP enum such as WebExceptionStatus)' {
+        Get-RdaErrorFacts ([pscustomobject]@{ Status = 404; ErrorCode = 'ResourceNotFound' }) | Should -Match 'status=404 code=ResourceNotFound$'
+        Get-RdaErrorFacts ([pscustomobject]@{ Error = [pscustomobject]@{ Code = 'TooManyRequests' } }) | Should -Match 'code=TooManyRequests$'
+        Get-RdaErrorFacts ([pscustomobject]@{ Status = [System.Net.WebExceptionStatus]::Timeout }) | Should -Not -Match 'status='
+        Get-RdaErrorFacts ([pscustomobject]@{ StatusCode = 99; Code = 'Nope' }) | Should -Not -Match 'status=|code='
     }
 
-    It "masks Unix home paths and cannot trip the Obfuscation home-path scan" {
-        $script:Scrubbed | Should -Not -Match '/home/[a-zA-Z]'
+    It 'never throws while a failure is being handled: a wide enum, a throwing getter, an odd object' {
+        Add-Type -TypeDefinition 'public enum RdaWideStatus : ulong { Huge = 18446744073709551615 } public class RdaThrowingError : System.Exception { public override string StackTrace { get { throw new System.InvalidOperationException(); } } public int Status { get { throw new System.InvalidOperationException(); } } public RdaWideStatus Code2 { get { return RdaWideStatus.Huge; } } }' -ErrorAction SilentlyContinue
+        { Get-RdaErrorFacts ([pscustomobject]@{ Status = [RdaWideStatus]::Huge }) } | Should -Not -Throw
+        Get-RdaErrorFacts ([pscustomobject]@{ Status = [RdaWideStatus]::Huge }) | Should -Not -Match 'status='
+        { Get-RdaErrorFacts ([RdaThrowingError]::new()) } | Should -Not -Throw
+        { Get-RdaErrorFacts $null } | Should -Not -Throw
     }
 
-    It "masks Windows user paths and cannot trip the Obfuscation home-path scan" {
-        $script:Scrubbed | Should -Not -Match 'C:\\Users\\[a-zA-Z]'
+    It 'rejects facts the writer never writes: spacing, order, repeats, leading zeros, a lone page or records' {
+        foreach ($Bad in ' status=403', 'status=403 ', 'status=403  code=BadRequest', 'status=403code=BadRequest', 'code=BadRequest status=403', 'status=403 status=404', 'page=01 records=1', 'page=1', 'records=1', 'page=1 code=BadRequest records=2', 'status=99', 'status=600')
+        {
+            Test-RdaDiagnosticFacts $Bad | Should -BeFalse -Because "'$Bad'"
+        }
+        Test-RdaDiagnosticFacts 'exception=System.Net.WebException status=403 code=AuthorizationFailed page=0 records=0' | Should -BeTrue
     }
 
-    It "redacts a SAS signature value" {
-        $script:Scrubbed | Should -Not -Match ('sig=' + [regex]::Escape($script:SigValue))
-        $script:Scrubbed | Should -Match 'sig=<redacted>'
+    It 'keeps an exception type only from the exact list, not any name under an allowed namespace' {
+        Add-Type -TypeDefinition 'namespace Microsoft.ContosoSecret123 { public class Error : System.Exception { public Error(string m) : base(m) {} } }' -ErrorAction SilentlyContinue
+        Get-RdaErrorFacts ([Microsoft.ContosoSecret123.Error]::new('x')) | Should -Be ''
+        Get-RdaErrorFacts ([System.Net.WebException]::new('x')) | Should -Be 'exception=System.Net.WebException'
     }
 
-    It "redacts a Bearer token" {
-        $script:Scrubbed | Should -Not -Match ([regex]::Escape($script:JwtValue))
-        $script:Scrubbed | Should -Match 'Bearer <redacted>'
+    It 'writes each listed type to the log and reads it back' {
+        $Sub = '11111111-2222-3333-4444-555555555555'
+        $Entries = @($Global:RdaDiagnosticExceptionTypes | ForEach-Object { [pscustomobject]@{ Id = $Sub; Module = 'M'; Message = 'm'; Facts = ('exception=' + $_) } })
+        $Text = New-DiagnosticsText -Collector $Entries
+        $Back = ConvertFrom-RdaDiagnosticsText -Lines ($Text.TrimEnd() -split "`r?`n") -ReportFolder 'f'
+        @($Back.CollectorFailures | ForEach-Object { $_.Facts }) | Should -Be @($Global:RdaDiagnosticExceptionTypes | ForEach-Object { 'exception=' + $_ })
+    }
+
+    It 'keeps a type on the list when it is the error object, and lists no type twice' {
+        $Global:RdaDiagnosticExceptionTypes.Count | Should -Be @($Global:RdaDiagnosticExceptionTypes | Select-Object -Unique).Count
+        Get-RdaErrorFacts ([System.Management.Automation.ActionPreferenceStopException]::new('x')) | Should -Be 'exception=System.Management.Automation.ActionPreferenceStopException'
+        # A type that is a module's own and never loaded here is not listed (Az.ResourceGraph is not used).
+        $Global:RdaDiagnosticExceptionTypes | Should -Not -Contain 'Microsoft.Azure.Management.ResourceGraph.Models.ErrorResponseException'
+    }
+
+    It 'returns no facts when reading the list itself throws (the outer guard)' {
+        $Saved = $Global:RdaDiagnosticErrorCodes
+        try
+        {
+            $Global:RdaDiagnosticErrorCodes = [pscustomobject]@{} | Add-Member -MemberType ScriptMethod -Name GetEnumerator -Value { throw 'boom' } -PassThru
+            { Get-RdaErrorFacts ([pscustomobject]@{ Code = 'BadRequest' }) } | Should -Not -Throw
+        }
+        finally { $Global:RdaDiagnosticErrorCodes = $Saved }
+    }
+
+    It 'accepts only the closed grammar when a log line is read back' {
+        Test-RdaDiagnosticFacts '' | Should -BeTrue
+        Test-RdaDiagnosticFacts 'exception=System.Net.WebException status=403 code=AuthorizationFailed' | Should -BeTrue
+        Test-RdaDiagnosticFacts 'code=Contoso-Secret-Code' | Should -BeFalse
+        Test-RdaDiagnosticFacts 'status=403 ops.admin@contoso-corp.com' | Should -BeFalse
+        Test-RdaDiagnosticFacts 'exception=Contoso.Secret.Error' | Should -BeFalse
+        Test-RdaDiagnosticFacts 'exception=Microsoft.ContosoSecret123.Error' | Should -BeFalse
+        Test-RdaDiagnosticFacts 'exception=System.Net.WebException+Inner' | Should -BeFalse
     }
 }
 
-Describe "Protect-DiagnosticText preserves already-obfuscated tokens and edge cases" {
+Describe 'The shareable diagnostics log writes no message text' {
+    It 'writes a failure line with its collector, its subscription label and its facts only' {
+        $Text = New-DiagnosticsText -Obfuscated -Collector @([pscustomobject]@{ Id = $script:SubGuid; Module = 'VMSS'; Message = ($script:Secrets -join ' '); Facts = 'status=403 code=AuthorizationFailed' })
+        $Text | Should -Match '(?m)^  \[sub <guid>\] VMSS: \(message not kept: status=403 code=AuthorizationFailed\)\r?$'
+        foreach ($Secret in $script:Secrets) { $Text.Contains($Secret) | Should -BeFalse -Because $Secret }
+        $Text.Contains($script:SubGuid) | Should -BeFalse
+    }
 
-    It "leaves an existing prod_/nonprod_ token intact (GUID safety net does not corrupt it)" {
-        # Token built at runtime so no literal GUID lives in this source file.
+    It 'drops an unknown error code, and facts that are not in the closed grammar' {
+        $Text = New-DiagnosticsText -Obfuscated -Collector @(
+            [pscustomobject]@{ Id = $script:SubGuid; Module = 'A'; Message = 'm'; Facts = 'code=Contoso-Secret-Code' },
+            [pscustomobject]@{ Id = $script:SubGuid; Module = 'B'; Message = 'm'; Facts = 'ops.admin@contoso-corp.com' })
+        $Text | Should -Match '(?m)^  \[sub <guid>\] A: \(message not kept\)\r?$'
+        $Text | Should -Match '(?m)^  \[sub <guid>\] B: \(message not kept\)\r?$'
+        $Text | Should -Not -Match 'Contoso|contoso'
+    }
+
+    It 'writes the same for the metrics and consumption sections, and a default run' {
+        $Metrics = @([pscustomobject]@{ Id = '(unknown)'; Name = 'n'; Message = 'AccountKey=abc/def+ghi== rg-sensitive-demo' })
+        $Consumption = @([pscustomobject]@{ Id = '(auth)'; Name = 'n'; Message = 'C:\Users\Jane Doe\x'; Facts = 'status=401' })
+        foreach ($Obf in $true, $false)
+        {
+            $Text = New-DiagnosticsText -Obfuscated:$Obf -Metrics $Metrics -Consumption $Consumption
+            $Text | Should -Match '(?m)^  \[sub \(unknown\)\] \(message not kept\)\r?$'
+            $Text | Should -Match '(?m)^  \[sub \(auth\)\] \(message not kept: status=401\)\r?$'
+            $Text | Should -Not -Match 'AccountKey|Jane|rg-sensitive'
+        }
+    }
+
+    It 'writes a subscription as its token when the run has one, else <guid>' {
         $Token = 'prod_' + [guid]::NewGuid().ToString()
-        $Out = Protect-DiagnosticText "already masked: $Token" $null
-        $Out | Should -Match ([regex]::Escape($Token))
+        $Saved = @{ S = $Global:ResourceSubscriptionDictionary; I = $Global:ResourceIdDictionary }
+        try
+        {
+            $Global:ResourceIdDictionary = @{ "/subscriptions/$($script:SubGuid)/resourceGroups/g/providers/Microsoft.Compute/virtualMachines/v" = 'x' }
+            $Global:ResourceSubscriptionDictionary = @{ "/subscriptions/$($script:SubGuid)/resourceGroups/g/providers/Microsoft.Compute/virtualMachines/v" = $Token }
+            $Dir = Join-Path ([IO.Path]::GetTempPath()) ('RdaDiagTok_' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $Dir | Out-Null
+            $Global:CollectorFailures = @([pscustomobject]@{ Id = $script:SubGuid.ToUpperInvariant(); Module = 'M'; Message = 'm' }, [pscustomobject]@{ Id = [guid]::NewGuid().ToString(); Module = 'N'; Message = 'm' })
+            $Global:MetricsFailedSubs = @(); $Global:ConsumptionFailedSubs = @()
+            $File = Write-RdaShareableDiagnosticsLog -DefaultPath ($Dir + [IO.Path]::DirectorySeparatorChar) -ReportName 'P' -RunDateTime '1' -Version '3.2.3' -PhaseTimings ([ordered]@{}) -Obfuscated 6>$null
+            $Text = Get-Content -Raw -LiteralPath $File
+            $Text | Should -Match ('(?m)^  \[sub ' + [regex]::Escape($Token) + '\] M: ')
+            $Text | Should -Match '(?m)^  \[sub <guid>\] N: '
+            $Text.Contains($script:SubGuid) | Should -BeFalse
+        }
+        finally
+        {
+            $Global:ResourceSubscriptionDictionary = $Saved.S; $Global:ResourceIdDictionary = $Saved.I
+            $Global:CollectorFailures = @(); $Global:MetricsFailedSubs = @(); $Global:ConsumptionFailedSubs = @()
+            Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    It "returns null/empty input unchanged" {
-        (Protect-DiagnosticText '' $script:Map) | Should -BeNullOrEmpty
-        (Protect-DiagnosticText $null $script:Map) | Should -BeNullOrEmpty
+    It 'runs under Set-StrictMode -Version Latest' {
+        { Set-StrictMode -Version Latest; Get-RdaErrorFacts ([System.Exception]::new('x')); Get-RdaDiagnosticMessage ([pscustomobject]@{ Message = 'x' }) } | Should -Not -Throw
     }
 
-    It "works with no map (structured masking still applies)" {
-        $Out = Protect-DiagnosticText "tenant $script:UnknownGuid mail $script:Email" $null
-        $Out | Should -Not -Match ([regex]::Escape($script:UnknownGuid))
-        $Out | Should -Not -Match ([regex]::Escape($script:Email))
+    It 'has no free-text scrub left' {
+        Get-Command Protect-DiagnosticText -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
 }
