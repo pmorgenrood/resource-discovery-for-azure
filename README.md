@@ -71,6 +71,18 @@ Consumption (usage) data needs the permission `Microsoft.Commerce/UsageAggregate
 
 Before any other work, the run checks the signed-in identity's roles on every subscription, then (when consumption is requested) that usage values come back, and stops with exit code 1 if either fails (see [Subscription access check](#subscription-access-check-up-front) and [Consumption data check](#consumption-data-check-up-front)).
 
+#### Microsoft Fabric capacities (optional)
+
+When the scope holds a Microsoft Fabric capacity (`microsoft.fabric/capacities`), the inventory gets a `FabricCapacities` section: the capacity's SKU, the hours it ran in the consumption window (read from the Azure activity log with the Reader role), and the pool settings of each Apache Airflow job on it (node size, shutdown policy, minimum and maximum node count).
+
+- The Airflow settings come from the Fabric REST API, which uses Fabric roles, not Azure roles. The signed-in identity needs:
+  - **Capacity admin or contributor** on each Fabric capacity (the Fabric capacity list, which links the Azure capacity to its Fabric capacity by name, region and SKU, shows only those capacities); without it the row says `CapacityNotLinked`;
+  - **Viewer** on each Fabric workspace that holds Airflow jobs; a capacity with no workspace the identity can see says `NoFabricAccess`. Fabric lists only the workspaces the identity has a role on, so the Airflow jobs of a workspace it cannot see are not counted, even when the row says `Collected`; the run prints a note saying so.
+- For a service principal, the Fabric tenant setting "Service principals can call Fabric public APIs" must be on.
+- The Airflow compute call is a Fabric **beta** API, which Microsoft says may change.
+- Without that access the run still finishes with the same exit code: the capacity row says why in `AirflowStatus` (`NoFabricAccess`, `CapacityNotLinked`, `ApiUnavailable`, `Throttled` or `Partial`).
+- Workspace and job ids are used only to make the next Fabric call; names in Fabric's answers are ignored. No workspace, job or template name or id, admin e-mail or environment variable is written or logged, and the call that returns Airflow environment variables is never made.
+
 ### Environment Options
 
 The script runs in either Azure Cloud Shell or a local PowerShell 7 install. Pick based on the size of the tenant you're inventorying:
