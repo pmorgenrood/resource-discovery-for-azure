@@ -1041,6 +1041,8 @@ function Get-UsageAggregates
         # Sub C. Stream-0's context import fails, so it runs nothing.
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -ImportFailStream '0'
         $Run.Console | Should -Match '\[stream-0\] FATAL: could not import Az context' -Because $Run.Console
+        # The advice is the one of a stream whose autosave could not be turned off.
+        $Run.Console | Should -Match ([regex]::Escape('Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot.')) -Because $Run.Console
         $Run.Console | Should -Match '\[stream-1\] done: Sub C' -Because $Run.Console
         # Sub A has no report to carry (the earlier run is not there): under
         # ruling 1 that is a missing report, so the run stops with exit 2
