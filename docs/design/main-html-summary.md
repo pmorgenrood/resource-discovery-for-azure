@@ -251,8 +251,9 @@ Banners: subs without a report in this zip, with the reason (red), failed subs
 Totals:  [ total resources ] [ subscriptions processed ] [ empty ] [ failed ]
 Charts:  (Detailed only) run-wide donut (by service) + top-N bar (by service)
 Table:   one row per subscription:
-         | Subscription | Resources | Health | Report |
-         |  <name>      |   1,234   |  ok    | open ↗ |   (link = per-sub HTML)
+         | Subscription | Resources | Health | Report | Folder   |
+         |  <name>      |   1,234   |  ok    | open ↗ | folder ↗ |
+         (Report = per-sub HTML; Folder = the sub's report folder)
 Footer:  RDA version, generator note
 ```
 
@@ -260,6 +261,11 @@ The per-sub links use relative paths so the main page travels with the report
 folder (matching the self-contained/portable contract). The wrapper passes the
 report folders whose zip went into the consolidated zip, so the table, the
 totals and the HTML copies in the zip hold only those reports.
+
+The Folder link is the URL-encoded folder name plus `/`, never an absolute
+path. In the consolidated zip it points at the `HTML<stamp>/` folder. In the
+zip, a link whose folder or html is not there shows muted "no folder" or
+"no report" text instead.
 
 Health is `ok`, `0 resources`, or `consumption incomplete` when the
 subscription's consumption collection failed or its consumption phase was
