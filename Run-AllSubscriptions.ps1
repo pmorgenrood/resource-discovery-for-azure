@@ -1938,12 +1938,27 @@ Write-Host ("Host: {0} vCPU / {1}." -f $AutoTune.VCpu, $RamLabel) -ForegroundCol
 # clears the resume state, it also deletes the per-stream state files an
 # interrupted parallel run left (see the clean-up below).
 $NothingLeftToCollect = $Resume -and $null -ne $AccessDecision -and $AccessDecision.ReadableCount -eq 0 -and $AccessDecision.CompletedCount -gt 0
+# The retry entries of this run's subscriptions whose last run did not start
+# their stream because it could not load its Az context snapshot (marked
+# NotCounted, see Add-FailedAttempt): that run is not counted toward the retry
+# limit, so streams that fail the same way on every run would never end. One
+# stream needs no snapshot (the run collects in this process), so this run uses
+# one: each of them then completes, or fails a counted run.
+$RunSubIds = @($Subscriptions | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+$SnapshotNotLoaded = @($FailedAttempts | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['NotCounted'] -and $_.NotCounted -eq $true -and $RunSubIds -contains [string]$_.Id })
 if ($NothingLeftToCollect -and $ParallelStreams -gt 1)
 {
     $StreamsAsked = if ($StreamsAuto) { 'the {0} chosen automatically' -f $ParallelStreams } else { 'the {0} passed' -f $ParallelStreams }
     Write-Host ("Parallelism: -ParallelStreams 1 (nothing is left to collect, so one stream instead of {0}), -ConcurrencyLimit {1} ({2})." -f $StreamsAsked, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
     $ParallelStreams = 1
     $StreamsSrc = 'nothing left to collect'
+}
+elseif ($SnapshotNotLoaded.Count -gt 0 -and $ParallelStreams -gt 1)
+{
+    $StreamsAsked = if ($StreamsAuto) { 'the {0} chosen automatically' -f $ParallelStreams } else { 'the {0} passed' -f $ParallelStreams }
+    Write-Host ("Parallelism: -ParallelStreams 1 (the last run's stream could not load its Az context snapshot for {0} subscription(s) on the retry list, so one stream instead of {1}), -ConcurrencyLimit {2} ({3})." -f $SnapshotNotLoaded.Count, $StreamsAsked, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+    $ParallelStreams = 1
+    $StreamsSrc = 'snapshot not loaded on the last run'
 }
 else
 {

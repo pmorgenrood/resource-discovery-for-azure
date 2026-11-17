@@ -1001,6 +1001,27 @@ function Get-UsageAggregates
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
+    It 'two streams: after a run whose stream could not load its Az context snapshot, the next run uses one stream, so the loop ends' {
+        # Run 1: stream-0 (Sub A, Sub C) cannot import its snapshot, so it runs
+        # nothing; their retry entries are not counted (they stay at 0), so the
+        # retry limit can never end them.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -ImportFailStream '0'
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        @($Run.FailedIds | Sort-Object) | Should -Be @(@($script:SubA.Id, $script:SubC.Id) | Sort-Object) -Because $Run.Console
+        # Run 2, -Resume, two streams asked for, and the snapshot still cannot be
+        # imported: a run with one stream uses no snapshot, so it collects them.
+        $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -ImportFailStream '0' -ReuseHome $Run.Home
+        $Next.Console | Should -Match ([regex]::Escape('Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed)')) -Because $Next.Console
+        $Next.Console | Should -Not -Match 'FATAL: could not import Az context' -Because $Next.Console
+        @($Next.FailedIds) | Should -BeNullOrEmpty -Because $Next.Console
+        $Next.StateKept | Should -BeFalse -Because $Next.Console
+        $Next.ExitCode | Should -Be 0 -Because $Next.Console
+        # Run 3, -Resume: no retry entry is left, so two streams again.
+        $Last = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -ReuseHome $Run.Home
+        $Last.Console | Should -Match ([regex]::Escape('Parallelism: -ParallelStreams 2 (explicit)')) -Because $Last.Console
+        $Last.ExitCode | Should -Be 0 -Because $Last.Console
+    }
+
     It 'two streams: the zips of a stream whose summary could not be read do not hide the missing zip of a subscription that reported success' {
         # Stream-0 (Sub A, Sub C) writes two zips but its summary cannot be
         # read; stream 1 runs Sub B and Sub X (two zips) but its summary
