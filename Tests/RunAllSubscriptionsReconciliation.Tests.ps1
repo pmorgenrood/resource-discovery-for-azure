@@ -385,6 +385,45 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Read.Reason | Should -Match ([regex]::Escape($Reason))
     }
 
+    It 'refuses a summary in which two subscriptions name one zip (<Case>)' -ForEach @(
+        @{ Case = 'the same path'; ZipB = 'a/a.zip'; FullB = '/inv/a/a.zip' }
+        @{ Case = 'the same path spelled another way'; ZipB = 'a/./a.zip'; FullB = '/inv/a/../a/a.zip' }
+    ) {
+        # One zip holds one subscription's report: accepted, one zip would stand in for both.
+        $Json = '{"RunId":"' + $script:SummaryRunId + '","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/inv/a/a.zip"},{"Id":"sub-b","Count":1,"Zip":"' + $FullB + '"}],"RunReports":[{"Id":"sub-a","Zip":"a/a.zip"},{"Id":"sub-b","Zip":"' + $ZipB + '"}]}'
+        $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId $script:SummaryRunId -StreamId '0' -ExpectedIds @('sub-a', 'sub-b') -InventoryRoot '/inv'
+        $Read.Accepted | Should -BeFalse -Because $Case
+        $Read.Reason | Should -Match 'name a zip another subscription'
+        # The same two success rows with no RunReports are refused too.
+        $Json = '{"RunId":"' + $script:SummaryRunId + '","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/inv/a/a.zip"},{"Id":"sub-b","Count":1,"Zip":"' + $FullB + '"}]}'
+        $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId $script:SummaryRunId -StreamId '0' -ExpectedIds @('sub-a', 'sub-b') -InventoryRoot '/inv'
+        $Read.Accepted | Should -BeFalse -Because $Case
+    }
+
+    It 'Get-RepeatReportZipClaims names each later row of another subscription on a zip an earlier row names' {
+        # Success rows of two streams, a record row, a carried report: every second claim is a gap.
+        $Rows = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = '/inv/a/a.zip' }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = '/inv/a/./a.zip' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'C'; Zip = '/inv/c/c.zip'; FromRecord = $true }
+            [pscustomobject]@{ Id = 'sub-d'; Name = 'D'; Zip = '/inv/c/c.zip' }
+            [pscustomobject]@{ Id = 'sub-e'; Name = 'E'; Zip = '' }
+            [pscustomobject]@{ Id = 'sub-f'; Name = 'F'; Zip = $null }
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = '/inv/a/a.zip' }
+        )
+        $Repeat = @(Get-RepeatReportZipClaims -Rows $Rows -InventoryRoot '/inv')
+        @($Repeat | ForEach-Object { $_.Id }) | Should -Be @('sub-b', 'sub-d')
+        @($Repeat | Where-Object { $_.RepeatClaim -and [string]::IsNullOrEmpty($_.Zip) }).Count | Should -Be 2
+        # A relative path is taken under the inventory folder.
+        @(Get-RepeatReportZipClaims -Rows @([pscustomobject]@{ Id = 'sub-a'; Zip = '/inv/a/a.zip' }, [pscustomobject]@{ Id = 'sub-b'; Zip = 'a/a.zip' }) -InventoryRoot '/inv').Count | Should -Be 1
+    }
+
+    It 'has the output check count a second claim on one zip as a gap, across streams, record rows and carried reports' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match ([regex]::Escape('Get-RepeatReportZipClaims -Rows (@($VerifyRows) + @($CarriedReports))'))
+        $Wrapper | Should -Match 'Get-ResumeCarriedReports [^\r\n]*-ClaimedZips \$ClaimedByThisRun'
+    }
+
     It 'accepts a RunReports row whose zip is the success row''s zip under the inventory folder' {
         $Json = '{"RunId":"' + $script:SummaryRunId + '","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/inv/a/a.zip"}],"RunReports":[{"Id":"sub-a","Zip":"a/a.zip"}]}'
         $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId $script:SummaryRunId -StreamId '0' -ExpectedIds @('sub-a') -InventoryRoot '/inv'

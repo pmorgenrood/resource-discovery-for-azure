@@ -1274,6 +1274,72 @@ function Get-UsageAggregates
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
+    It 'two streams: two subscriptions of two streams whose rows name one zip are a gap, not one report for both<Note>' -ForEach @(
+        @{ Note = ''; Stuck = $false }
+    ) {
+        # Each stream's summary names, for its one subscription, the same report
+        # zip, which is on disk: one zip would stand in for both.
+        $CaseHome = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Shared = New-Item -ItemType Directory -Path (Join-Path $CaseHome 'InventoryReports/Shared') -Force
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $Archive = [System.IO.Compression.ZipFile]::Open((Join-Path $Shared.FullName 'ResourcesReport_shared.zip'), [System.IO.Compression.ZipArchiveMode]::Create)
+        try { $W = [System.IO.StreamWriter]::new($Archive.CreateEntry('Inventory_shared.json').Open()); $W.Write('{}'); $W.Dispose() } finally { $Archive.Dispose() }
+        $Forge = {
+            param($Sub, [string]$Stream)
+            [pscustomobject]@{ RunId = '{RunId}'; StreamId = $Stream; Status = 'ok'; Failed = @()
+                ResourceCounts = @([pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = 1; Zip = '{Reports}/Shared/ResourcesReport_shared.zip' })
+                RunReports = @([pscustomobject]@{ Id = $Sub.Id; Name = $Sub.Name; Zip = 'Shared/ResourcesReport_shared.zip'; Obfuscated = $false }) } | ConvertTo-Json -Depth 5
+        }
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -ReuseHome $CaseHome -StreamSummaryJson (& $Forge $script:SubA '0') -Stream1SummaryJson (& $Forge $script:SubB '1') -StreamFileStuck:$Stuck
+        $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
+        $Run.Console | Should -Match ('(?m)^\s*- Sub B \({0}\) \[its zip is one another subscription''s report also names\]' -f [regex]::Escape($script:SubB.Id)) -Because $Run.Console
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        # The second claim is collected again by the next run; the first is kept.
+        $Run.FailedIds | Should -Contain $script:SubB.Id -Because $Run.Console
+        $Run.FailedIds | Should -Not -Contain $script:SubA.Id -Because $Run.Console
+        if ($Stuck)
+        {
+            $Left = @(Get-ChildItem -LiteralPath $Run.Root -Filter '.resume-state-*-stream-*.json' -File -Force | Where-Object { $_.Name -notlike '*-stream-summary-*' -and (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Completed -contains $script:SubB.Id })
+            $Left.Count | Should -Be 0 -Because ('a per-stream file still lists Sub B as completed: ' + (@($Left | ForEach-Object { $_.Name }) -join ', '))
+        }
+    }
+
+    It 'sequential with -Resume: two completed subscriptions whose records name one zip are not both carried; the second is collected again and the run after ends clean' {
+        # Run 1 fails Sub A and completes Sub B and Sub C, so the state is kept.
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -FailSub $script:SubA.Id
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        # The state then names Sub B's zip for Sub C too.
+        $StatePath = Join-Path $Run.Root ('.resume-state-{0}.json' -f $script:TenantKey)
+        $Text = Get-Content -LiteralPath $StatePath -Raw
+        $State = $Text | ConvertFrom-Json
+        $ZipB = @($State.CompletedReports | Where-Object { $_.Id -eq $script:SubB.Id })[0].Zip
+        $ZipC = @($State.CompletedReports | Where-Object { $_.Id -eq $script:SubC.Id })[0].Zip
+        $ZipB | Should -Not -BeNullOrEmpty
+        $ZipC | Should -Not -BeNullOrEmpty
+        $Json = { param($V) (ConvertTo-Json -InputObject ([string]$V)) }
+        $Text.Contains((& $Json $ZipC)) | Should -BeTrue
+        Set-Content -LiteralPath $StatePath -Value $Text.Replace((& $Json $ZipC), (& $Json $ZipB)) -Encoding utf8 -NoNewline
+        # Run 2: Sub B is carried, Sub C is not (its zip is Sub B's), so it stops.
+        $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Resume -ReuseHome $Run.Home
+        $Next.Console | Should -Match '= FAILED \(earlier report not carried\) =' -Because $Next.Console
+        $Next.Console | Should -Match ('(?m)^  - Sub C \({0}\): its report zip is one another subscription already names' -f [regex]::Escape($script:SubC.Id)) -Because $Next.Console
+        # No consolidated zip is made (run 1's, with Sub B and Sub C, is the one there).
+        $Next.Console | Should -Match 'No consolidated zip was made' -Because $Next.Console
+        $Next.ZipCount | Should -Be $Run.ZipCount -Because $Next.Console
+        $Next.ExitCode | Should -Be 2 -Because $Next.Console
+        # Run 3 collects Sub C and ends with one report for each subscription.
+        $Done = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Resume -ReuseHome $Run.Home
+        $Done.Console | Should -Match 'Processing subscription: Sub C' -Because $Done.Console
+        $Done.ExitCode | Should -Be 0 -Because $Done.Console
+        $Newest = @(Get-ChildItem -LiteralPath $Done.Root -Filter 'AllSubscriptions_ResourcesReport_*.zip' -File | Sort-Object LastWriteTimeUtc)[-1]
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Outer = [System.IO.Compression.ZipFile]::OpenRead($Newest.FullName)
+        try { $Inner = @($Outer.Entries | Where-Object { $_.FullName -like '*.zip' } | ForEach-Object { $_.FullName }) } finally { $Outer.Dispose() }
+        $Inner.Count | Should -Be 3 -Because ($Inner -join ', ')
+        @($Inner | Sort-Object -Unique).Count | Should -Be 3 -Because ($Inner -join ', ')
+    }
+
     It 'two streams: a stream summary left by an earlier run is not read as this run''s' {
         # An earlier run left stream 0's summary on disk ("ok", no rows, as
         # an interrupted -Resume run that skipped everything writes it). This

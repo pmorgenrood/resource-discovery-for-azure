@@ -164,7 +164,11 @@ $Global:ResourceCount = 1
         "function Exit-Wrapper { param([int]`$Code) throw ('Exit-Wrapper ' + `$Code) }`n" +
         "`$WrapperTranscriptStarted = `$false; `$FailedSubscriptions = @(); `$FailedSubscriptionDetail = @(); `$StreamSummaryFailed = @(); `$StreamSummaryCompletedIds = @(); `$UnreadableStreamSummaries = @(); `$Detailed = `$false`n" +
         "# This run's own report records: the report zips the test wrote for this run.`n" +
-        "`$RunReports = @(Get-ChildItem -LiteralPath `$InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -LiteralPath `$_.FullName -Filter '*.zip' -File | Where-Object { `$_.LastWriteTime -ge `$RunStartTime } } | ForEach-Object { [pscustomobject]@{ Id = `$_.BaseName; Name = `$_.BaseName; Zip = [System.IO.Path]::GetRelativePath(`$InventoryRoot, `$_.FullName); Obfuscated = [bool]`$Obfuscate } })`n" +
+        "# A run writes no zip and no record for a subscription it skips, so a zip a skipped`n" +
+        "# subscription's record names is not one of them, whatever its time (clock skew).`n" +
+        "`$SkippedIdsForRecords = @(@(`$SkippedSubscriptions) | Where-Object { `$null -ne `$_ } | ForEach-Object { [string]`$_.Id })`n" +
+        "`$SkippedZipsForRecords = @(foreach (`$R in @(`$CompletedReports)) { if (`$null -ne `$R -and `$R -isnot [string] -and `$R.PSObject.Properties['Zip'] -and `$SkippedIdsForRecords -contains [string]`$R.Id) { [System.IO.Path]::GetFullPath((Join-Path `$InventoryRoot ([string]`$R.Zip))) } })`n" +
+        "`$RunReports = @(Get-ChildItem -LiteralPath `$InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -LiteralPath `$_.FullName -Filter '*.zip' -File | Where-Object { `$_.LastWriteTime -ge `$RunStartTime -and `$SkippedZipsForRecords -notcontains `$_.FullName } } | ForEach-Object { [pscustomobject]@{ Id = `$_.BaseName; Name = `$_.BaseName; Zip = [System.IO.Path]::GetRelativePath(`$InventoryRoot, `$_.FullName); Obfuscated = [bool]`$Obfuscate } })`n" +
         $PostText + "`n" +
         "[pscustomobject]@{ OuterZipFile = `$OuterZipFile; MainSummaryFile = `$MainSummaryFile; Uncarried = @(`$UncarriedSkipped) }")
 
@@ -380,6 +384,25 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA, $script:SubA) -Reports $Reports -InventoryRoot $script:Root -Obfuscated $false
         @($R.Carried).Count | Should -Be 1
         @($R.Missing).Count | Should -Be 0
+    }
+
+    It 'carries one zip for one subscription only: a second skipped subscription whose record names the same zip, however spelled, is not carried' {
+        # Two completed subscriptions whose records name one zip would pass with
+        # one report on the next -Resume; the second is collected again instead.
+        $Subs = @($script:SubA, [pscustomobject]@{ Id = 'sub-b'; Name = 'B' })
+        $Reports = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = $script:Rel; Obfuscated = $false },
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = (Join-Path 'ResourcesReport2aaaa' (Join-Path '.' 'ResourcesReport_2aaaa.zip')); Obfuscated = $false })
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions $Subs -Reports $Reports -InventoryRoot $script:Root -Obfuscated $false
+        @($R.Carried | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
+        @($R.Missing | ForEach-Object { $_.Id }) | Should -Be @('sub-b')
+        $R.Missing[0].Reason | Should -Match 'another subscription already names'
+    }
+
+    It 'does not carry a record whose zip a subscription of this run already names' {
+        $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = $script:Rel; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false -ClaimedZips @($script:Zip)
+        @($R.Carried).Count | Should -Be 0
+        $R.Missing[0].Reason | Should -Match 'another subscription already names'
     }
 
     It 'Join-CarriedReportZips adds each carried zip once, after this run''s' {

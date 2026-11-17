@@ -3384,7 +3384,10 @@ $CarriedReports = @()
 $UncarriedSkipped = @()
 if ($Resume -and @($SkippedSubscriptions).Count -gt 0)
 {
-    $ResumeCarry = Get-ResumeCarriedReports -SkippedSubscriptions $SkippedSubscriptions -Reports $CompletedReports -InventoryRoot $InventoryRoot -Obfuscated ([bool]$Obfuscate)
+    # The zips this run's own rows name: an earlier record that names one of
+    # them is not carried, as one zip holds one subscription's report.
+    $ClaimedByThisRun = @(@($SubResourceCounts | ForEach-Object { [string]$_.Zip }) + @(@($RunReports) + @($UnconfirmedStreamReports) | Where-Object { $null -ne $_ -and $_ -isnot [string] -and $_ -isnot [ValueType] -and $_.PSObject.Properties['Zip'] } | ForEach-Object { [string]$_.Zip }) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $ResumeCarry = Get-ResumeCarriedReports -SkippedSubscriptions $SkippedSubscriptions -Reports $CompletedReports -InventoryRoot $InventoryRoot -Obfuscated ([bool]$Obfuscate) -ClaimedZips $ClaimedByThisRun
     $CarriedReports = @($ResumeCarry.Carried)
     $UncarriedSkipped = @($ResumeCarry.Missing)
     if ($CarriedReports.Count -gt 0)
@@ -3539,6 +3542,12 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
     $FoundZipPaths = [System.Collections.Generic.HashSet[string]]::new($PathComparer)
     foreach ($Z in $ActualSubZips) { [void]$FoundZipPaths.Add([System.IO.Path]::GetFullPath($Z.FullName)) }
     $MissingZipSubs = @($VerifyRows | Where-Object { [string]::IsNullOrEmpty($_.Zip) -or -not $FoundZipPaths.Contains([System.IO.Path]::GetFullPath([string]$_.Zip)) })
+    # One zip holds one subscription's report: a row (success, record or
+    # carried, across every stream) that names a zip an earlier row of another
+    # subscription names is a gap, even though that zip is found.
+    $RepeatClaimRows = @(Get-RepeatReportZipClaims -Rows (@($VerifyRows) + @($CarriedReports)) -InventoryRoot $InventoryRoot)
+    $MissingIdsSoFar = @($MissingZipSubs | ForEach-Object { [string]$_.Id })
+    $MissingZipSubs = @($MissingZipSubs) + @($RepeatClaimRows | Where-Object { $MissingIdsSoFar -notcontains [string]$_.Id })
     if ($MissingZipSubs.Count -gt 0)
     {
         $MissingCount = $MissingZipSubs.Count
@@ -3558,7 +3567,11 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
         {
             # A record row has no resource count: its stream's summary is
             # missing or unreadable, so only its report record is known.
-            if ($null -ne $S.PSObject.Properties['FromRecord'])
+            if ($null -ne $S.PSObject.Properties['RepeatClaim'])
+            {
+                Write-Host ("  - {0} ({1}) [its zip is one another subscription's report also names]" -f $S.Name, $S.Id) -ForegroundColor Yellow
+            }
+            elseif ($null -ne $S.PSObject.Properties['FromRecord'])
             {
                 Write-Host ("  - {0} ({1}) [report recorded by a stream whose summary could not be read]" -f $S.Name, $S.Id) -ForegroundColor Yellow
             }
@@ -3583,13 +3596,21 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
         if (-not $InventoryRootGone)
         {
             $LatestReports = Get-LatestCompletedReports -Reports (@($RunReports) + @($UnconfirmedStreamReports))
-            $GoneCompleted = @(foreach ($S in @($VerifyRows))
+            # A row whose zip another subscription's row also names is collected
+            # again too, though the zip is on disk: kept as completed, the next
+            # -Resume would carry one zip for both.
+            # A record row with no zip is one Get-UnconfirmedReportRows made for a
+            # second record on one zip.
+            $RepeatClaimIds = @(@($RepeatClaimRows) + @($GoneRecordRows | Where-Object { [string]::IsNullOrEmpty($_.Zip) }) | ForEach-Object { [string]$_.Id })
+            $GoneCompleted = @(foreach ($S in @(@($VerifyRows) + @($RepeatClaimRows | Where-Object { @($VerifyRows | ForEach-Object { [string]$_.Id }) -notcontains [string]$_.Id })))
                 {
                     $Id = [string]$S.Id
-                    if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
+                    if (-not ($CompletedIds -contains $Id)) { continue }
+                    if ($RepeatClaimIds -contains $Id) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name; Reason = 'its report zip is one another subscription''s report also names' }; continue }
+                    if (-not $LatestReports.ContainsKey($Id)) { continue }
                     $ZipProp = $LatestReports[$Id].PSObject.Properties['Zip']
                     if ($null -eq $ZipProp -or [string]::IsNullOrWhiteSpace([string]$ZipProp.Value)) { continue }
-                    if (-not (Test-Path -LiteralPath (Join-Path $InventoryRoot ([string]$ZipProp.Value)) -PathType Leaf)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name } }
+                    if (-not (Test-Path -LiteralPath (Join-Path $InventoryRoot ([string]$ZipProp.Value)) -PathType Leaf)) { [pscustomobject]@{ Id = $Id; Name = [string]$S.Name; Reason = 'its report zip was written and was gone before the consolidated zip was built' } }
                 })
             foreach ($Gone in $GoneCompleted)
             {
@@ -3599,7 +3620,7 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
                 # took the entry away: the entry comes back with that count
                 # (one more than at the start of collecting), not with 1.
                 $StartCount = if ($null -ne $CollectStartAttemptCounts -and $CollectStartAttemptCounts.ContainsKey([string]$Gone.Id)) { [int]$CollectStartAttemptCounts[[string]$Gone.Id] } else { 0 }
-                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id ([string]$Gone.Id) -Name ([string]$Gone.Name) -Reason 'its report zip was written and was gone before the consolidated zip was built' -AtLeast ($StartCount + 1)
+                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id ([string]$Gone.Id) -Name ([string]$Gone.Name) -Reason ([string]$Gone.Reason) -AtLeast ($StartCount + 1)
             }
             if ($GoneCompleted.Count -gt 0)
             {

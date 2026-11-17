@@ -3383,7 +3383,8 @@ function Get-LatestCompletedReports
 # completed it, whether that earlier run's report zip can go into this run's
 # consolidated zip. A record is carried only when its path is a relative path
 # inside the inventory root, names a .zip that is not a de-obfuscated
-# (*_revealed*) copy, exists, opens as a zip with at least one entry, and was
+# (*_revealed*) copy, that no other subscription names (-ClaimedZips, or one
+# carried before it), exists, opens as a zip with at least one entry, and was
 # written with the same -Obfuscate setting as this run, so one bundle never mixes
 # obfuscated and real identifiers. Everything else is returned under Missing with
 # the reason. Cost: one file-exists check and one zip-directory read per skipped
@@ -3395,12 +3396,18 @@ function Get-ResumeCarriedReports
         [object]$SkippedSubscriptions = @(),
         [object]$Reports = @(),
         [string]$InventoryRoot,
-        [bool]$Obfuscated = $false
+        [bool]$Obfuscated = $false,
+        # The zips this run's own rows already name (full, or relative to the
+        # inventory root): a skipped subscription's record that names one of
+        # them, or one an earlier skipped subscription carries, is not carried.
+        [object]$ClaimedZips = @()
     )
     $ById = Get-LatestCompletedReports -Reports $Reports
     $Carried = @()
     $Missing = @()
     $SeenIds = @{}
+    $Claimed = @{}
+    foreach ($C in @($ClaimedZips)) { $Key = Get-ReportZipPathKey -Path ([string]$C) -InventoryRoot $InventoryRoot; if ($null -ne $Key) { $Claimed[$Key] = $true } }
     foreach ($Sub in @($SkippedSubscriptions))
     {
         if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
@@ -3447,6 +3454,10 @@ function Get-ResumeCarriedReports
                 {
                     $Reason = ('its report path in the resume state is not a report zip: {0}' -f $Rel)
                 }
+                elseif ($Claimed.ContainsKey((Get-ReportZipPathKey -Path $FullPath)))
+                {
+                    $Reason = ('its report zip is one another subscription already names, and one zip holds one report: {0}' -f $Rel)
+                }
                 elseif (-not (Test-Path -LiteralPath $FullPath -PathType Leaf))
                 {
                     $Reason = ('its report zip is no longer on disk: {0}' -f $Rel)
@@ -3485,6 +3496,7 @@ function Get-ResumeCarriedReports
 
         if ($null -eq $Reason)
         {
+            $Claimed[(Get-ReportZipPathKey -Path $FullPath)] = $true
             $Carried += [pscustomobject]@{
                 Id     = $Id
                 Name   = [string]$Sub.Name
@@ -3650,6 +3662,45 @@ function Test-ReportZipRecordPath
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $Parts = @($Path.Split($Separators) | Where-Object { $_ -ne '' -and $_ -ne '.' })
     return ($Parts.Count -ge 2 -and $Parts[-1] -like '*.zip')
+}
+
+# The key a report zip path is compared by: its full path (a relative path is
+# taken under $InventoryRoot), lower-cased where the file system ignores case
+# (Windows), so two spellings of one file give one key. $null when the path is
+# empty or not a path.
+function Get-ReportZipPathKey
+{
+    param([string]$Path, [string]$InventoryRoot = '')
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try
+    {
+        $Full = if ([System.IO.Path]::IsPathRooted($Path) -or [string]::IsNullOrWhiteSpace($InventoryRoot)) { [System.IO.Path]::GetFullPath($Path) } else { [System.IO.Path]::GetFullPath((Join-Path $InventoryRoot $Path)) }
+    }
+    catch { return $null }
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') { $Full = $Full.ToLowerInvariant() }
+    return $Full
+}
+
+# The rows of the output check ($Rows: Id, Name and Zip, in order) that name a
+# zip an earlier row of another subscription already names (Get-ReportZipPathKey).
+# One zip holds one subscription's report, so a second claim on it is a gap:
+# each such row comes back with no zip and RepeatClaim set, to be counted as
+# missing. A row with no zip claims nothing.
+function Get-RepeatReportZipClaims
+{
+    param([object]$Rows = @(), [string]$InventoryRoot = '')
+    $Owner = @{}
+    foreach ($Row in @($Rows))
+    {
+        if ($null -eq $Row -or $Row -is [string] -or $Row -is [ValueType]) { continue }
+        $ZipProp = $Row.PSObject.Properties['Zip']
+        $Key = if ($null -eq $ZipProp) { $null } else { Get-ReportZipPathKey -Path ([string]$ZipProp.Value) -InventoryRoot $InventoryRoot }
+        if ($null -eq $Key) { continue }
+        $Id = [string]$Row.Id
+        if (-not $Owner.ContainsKey($Key)) { $Owner[$Key] = $Id; continue }
+        if ($Owner[$Key] -eq $Id) { continue }
+        [pscustomobject]@{ Name = [string]$Row.Name; Id = $Id; Count = 0; Skipped = 0; Zip = $null; RepeatClaim = $true }
+    }
 }
 
 # The expected rows of the output check for the report records of a stream whose
@@ -5649,6 +5700,12 @@ function Resolve-StreamSummary
     if ($ReportRepeated.Count -gt 0) { return (& $NotConfirmed ('it has more than one RunReports row for {0} subscription(s)' -f $ReportRepeated.Count)) }
     $ReportNoSuccess = @($ReportIds | Where-Object { $Id = $_; @($ResourceCounts | Where-Object { $_.Id -eq $Id }).Count -eq 0 })
     if ($ReportNoSuccess.Count -gt 0) { return (& $NotConfirmed ('it has {0} RunReports row(s) for a subscription with no success row' -f $ReportNoSuccess.Count)) }
+    # One zip holds one subscription's report: two subscriptions' rows that name
+    # one zip (the same path, however it is spelled) would let one report stand
+    # in for both.
+    $ReportRepeatZip = @(Get-RepeatReportZipClaims -Rows $RunReports -InventoryRoot $InventoryRoot).Count
+    $SuccessRepeatZip = @(Get-RepeatReportZipClaims -Rows @($ResourceCounts | Where-Object { -not [string]::IsNullOrEmpty($_.Zip) }) -InventoryRoot $InventoryRoot).Count
+    if (($ReportRepeatZip + $SuccessRepeatZip) -gt 0) { return (& $NotConfirmed ('{0} of its row(s) name a zip another subscription''s row already names' -f ($ReportRepeatZip + $SuccessRepeatZip))) }
     if (-not [string]::IsNullOrWhiteSpace($InventoryRoot))
     {
         $Compare = if ([System.IO.Path]::DirectorySeparatorChar -eq '\') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
