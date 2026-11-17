@@ -3527,7 +3527,7 @@ $MissingReportCount = 0
 # Set when the inventory folder is gone at the end of a run that expected
 # report zips (below the consolidation step).
 $InventoryFolderGone = $false
-if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
+if ($ExpectedZipCount -gt 0)
 {
     $InventoryRootGone = -not (Test-Path -LiteralPath $InventoryRoot -PathType Container)
     # This run's own report zips, by its records (Get-RunReportZipItems), never

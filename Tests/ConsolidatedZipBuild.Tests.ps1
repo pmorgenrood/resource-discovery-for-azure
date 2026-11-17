@@ -27,13 +27,32 @@ BeforeAll {
     $ParseErrors = $null
     $script:WrapperAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'Run-AllSubscriptions.ps1'), [ref]$Tokens, [ref]$ParseErrors)
 
+    # The operands of a condition joined by -or, read from its syntax tree, each as its
+    # text: 'a -or b -or c' gives a, b, c; a condition with no -or gives itself.
+    function script:Get-OrOperandText
+    {
+        param($Ast)
+        if ($Ast -is [System.Management.Automation.Language.PipelineAst] -and $Ast.PipelineElements.Count -eq 1 -and $Ast.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst])
+        {
+            $Ast = $Ast.PipelineElements[0].Expression
+        }
+        if ($Ast -is [System.Management.Automation.Language.BinaryExpressionAst] -and $Ast.Operator -eq [System.Management.Automation.Language.TokenKind]::Or)
+        {
+            @(script:Get-OrOperandText $Ast.Left) + @(script:Get-OrOperandText $Ast.Right)
+        }
+        else { $Ast.Extent.Text }
+    }
+
     # The one top-level 'if (<Condition>)' statement of the wrapper whose text contains $Contains.
+    # The condition is compared by its syntax tree: its -or operands, in order, are those of
+    # $Condition, so a condition with more or fewer operands is a different statement.
     function script:Find-WrapperIf
     {
         param([string]$Condition, [string]$Contains)
+        $Want = @(script:Get-OrOperandText ([System.Management.Automation.Language.Parser]::ParseInput($Condition, [ref]$null, [ref]$null).EndBlock.Statements[0])) -join "`n"
         $Found = @($script:WrapperAst.EndBlock.Statements | Where-Object {
                 $_ -is [System.Management.Automation.Language.IfStatementAst] -and
-                $_.Clauses[0].Item1.Extent.Text -eq $Condition -and
+                (@(script:Get-OrOperandText $_.Clauses[0].Item1) -join "`n") -eq $Want -and
                 $_.Extent.Text.Contains($Contains)
             })
         if ($Found.Count -ne 1)
@@ -546,6 +565,9 @@ Describe 'Run-AllSubscriptions.ps1: the end of a run without a consolidated zip'
             (Find-WrapperIf -Condition 'Test-Path -LiteralPath $InventoryRoot -PathType Container' -Contains 'AllSubscriptions_ResourcesReport_').Extent.Text
         ) -join "`n"
         $script:EndOfRunText = @(
+            # The wrapper sets the rows of a stream with no readable summary before the
+            # expected count; this end of a run has none.
+            '$GoneRecordRows = @()'
             $ExpectedAssignment[0].Extent.Text
             '$MissingReports = @()'
             '$MissingReportCount = 0'
