@@ -11,6 +11,9 @@ back into an ingestible one with only the dimensions you choose un-masked.
 > - The run also writes a **local** `ObfuscationDictionary_*.json` that maps
 >   each token back to the real value. **The ZIP is safe to share; the
 >   dictionary and the transcript are not.**
+> - A report already run without `-Obfuscate` can be masked offline, with the
+>   same code and no new collection: `Protect-RdaReport.ps1`
+>   ([offline-obfuscate.md](offline-obfuscate.md)).
 > - When you want analytics on real names, run `Reveal.ps1`
 >   **locally** to produce a new ingestible ZIP with only the dimensions you
 >   select (Resource Group + Subscription by default) un-masked.
@@ -60,6 +63,27 @@ deterministically into `$Global:FreeTextDictionary` (same real value → same
 `prod_`/`nonprod_` token within a run) and recorded in the dictionary's
 `FreeTextMap`, so `Reveal.ps1` can restore them locally
 (`-Fields FreeText` or `-All`). They remain masked in the shared report.
+
+An App Service's `SiteProperties` (Azure's own object: its runtime or container
+image settings) is masked part by part, with the same tokens. Its own keys (and
+`name`/`value` in its `properties` and `metadata` lists), null values, numbers,
+booleans and times stay. Azure's words stay only in the value of
+a setting Azure names (`{name: LinuxFxVersion, WindowsFxVersion or CURRENT_STACK,
+value: ...}`) in the object's `properties` or `metadata` list; any other value (an
+app setting's value, another key) keeps only a time, the keys of such an object (an
+app setting's name) are masked too, and a value with a `|` whose head is no stack word is masked whole. In such a
+setting's value, Azure's words stay only in their place: a setting name (`LinuxFxVersion`), a stack word before the
+`|` (`DOCKER`, `DOTNETCORE`), a registry host word (`azurecr.io`), a runtime
+version word (`lts`, `java17`), and a tag of digits or `latest`. Short numbers
+(up to 6 digits) stay only where Azure writes one: in a runtime version after the
+`|`, an image tag and a registry port. Anywhere else (an app setting's value, an
+image path, a registry host) a number is masked like any other part. An IP address (IPv4, bracketed or bare IPv6), with any letters
+or digits it runs into, is one real part anywhere; so is a 4-part version such as
+`1.0.0.123`, which reads as an IPv4 address, and words joined by `::` (`std::string`). Every other part, in any script, and every GUID becomes
+one token, so `DOCKER|myreg.azurecr.io/team-app/web:1.2.3` is shared as
+`DOCKER|<token>.azurecr.io/<token>-<token>/<token>:1.2.3`. The tokens have the
+`prod_`/`nonprod_<guid>` form, so a masked value holds more `-` and `_` than the
+plain one. Nothing downstream reads this field.
 
 ---
 

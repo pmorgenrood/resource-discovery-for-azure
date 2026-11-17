@@ -41,6 +41,9 @@ BeforeAll {
     # (an older source file may not have it).
     $Helper = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Get-ReportFolderName' }, $true))
     if ($Helper.Count -eq 1) { . ([scriptblock]::Create($Helper[0].Extent.Text)) }
+    # The row masking the loop calls (a build from before it was its own function has none).
+    $RowFn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaUsageRow' }, $true))
+    if ($RowFn.Count -eq 1) { . ([scriptblock]::Create($RowFn[0].Extent.Text)) }
 
     function Get-UsageAggregates { param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) }
     function Set-AzContext { param($Subscription, $Context, $Scope) }

@@ -26,14 +26,19 @@ BeforeAll {
         . ([scriptblock]::Create($Fn[0].Extent.Text))
     }
     $MetAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Extension/Metrics.ps1'), [ref]$null, [ref]$null)
+    # The masking the step calls (a build from before it was its own function has none).
+    $MetFn = @($MetAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaMetricRecord' }, $false))
+    if ($MetFn.Count -eq 1) { . ([scriptblock]::Create($MetFn[0].Extent.Text)) }
     $Step = @($MetAst.FindAll({
                 param($N)
                 $N -is [System.Management.Automation.Language.IfStatementAst] -and
                 $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate' -and
-                $N.Clauses[0].Item2.Extent.Text -match '^\{\s*foreach \(\$metric in \$Tmp\.Metrics\)'
+                $N.Clauses[0].Item2.Extent.Text -match '^\{\s*(foreach \(\$metric in \$Tmp\.Metrics\)|Protect-RdaMetricRecord -Metrics \$Tmp\.Metrics )'
             }, $true))
     if ($Step.Count -ne 1) { throw 'The -Obfuscate step over the metric rows was not found in Extension/Metrics.ps1.' }
     $script:Step = $Step
+    # The step's code: the step and the masking function it calls, when it calls one.
+    $script:StepText = $Step[0].Extent.Text + $(if ($MetFn.Count -eq 1) { "`n" + $MetFn[0].Extent.Text })
     . ([scriptblock]::Create("function Invoke-MetricMasking { param(`$Tmp) `$Obfuscate = `$true; `$ResourceIdDictionary = `$Global:ResourceIdDictionary; `$ResourceNameDictionary = `$Global:ResourceNameDictionary; `$ResourceSubDictionary = `$Global:ResourceSubscriptionDictionary; `$ResourceGroupDictionary = `$Global:ResourceResourceGroupDictionary; $($Step[0].Extent.Text); return `$Tmp }"))
 
     $script:Sub = '12345678-1234-1234-1234-123456789012'   # Azure docs placeholder
@@ -117,8 +122,8 @@ Describe 'Masking a metric row whose resource the inventory does not hold' {
     }
 
     It 'has one way to mask a fallback row: the run''s Get-ObfuscatedResourceId, never private token caches' {
-        $script:Step[0].Extent.Text | Should -Match 'Get-ObfuscatedResourceId -ResourceId \$OriginalId'
-        $script:Step[0].Extent.Text | Should -Not -Match 'MetricsFallback(Sub|Rg|Name)Cache|Build-ObfuscatedResourceUri'
+        $script:StepText | Should -Match 'Get-ObfuscatedResourceId -ResourceId \$OriginalId'
+        $script:StepText | Should -Not -Match 'MetricsFallback(Sub|Rg|Name)Cache|Build-ObfuscatedResourceUri'
     }
 
     It 'stops before any Azure call when run on its own with -Obfuscate' {

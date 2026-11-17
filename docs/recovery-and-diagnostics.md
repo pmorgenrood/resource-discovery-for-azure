@@ -147,13 +147,17 @@ Two logs help diagnose partial failures (also summarised in the README):
   that previously scrolled past on the terminal. **Local-only**, never added to
   the ZIP (it can contain real names and raw exception text).
 - **`Diagnostics_<ReportName>_<timestamp>.log`** — **shareable**, human-readable,
-  scrubbed diagnostics. Built on `-Obfuscate` runs and **included in the ZIP**.
-  Subscriptions appear as obfuscated tokens; identifiers are masked. It lists
+  diagnostics with **no failure message text**. Built on `-Obfuscate` runs and **included in the ZIP**.
+  Subscriptions appear as obfuscated tokens. It lists
   phase timings and one-line health entries for collector failures, metrics
   auth-skips, and **consumption failures — including exactly where a consumption
   pull stopped** (`PageAtFailure` / `RecordsCollected`), so a truncated billing
   sheet is obvious rather than inferred. It is a plain `.log` (not `.json`) on
   purpose so the ingestion pipeline treats it as an attachment, not report data.
+  A failure line never holds the error's message (it can name anything). It holds the
+  collector, the subscription token and facts read from the error object: the .NET
+  exception type, an HTTP status number and an Azure error code on a fixed list. The
+  full text stays in the local `DebugLog_*.log`.
 
 If a subscription is **not** listed under a failure heading, that dimension
 completed cleanly.

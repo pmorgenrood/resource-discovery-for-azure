@@ -202,7 +202,9 @@ $Global:StandInRows = @(
     @{ id = "$Base/Microsoft.Web/serverFarms/plan-demo"; name = 'plan-demo'; type = 'microsoft.web/serverfarms'; kind = 'app'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; sku = @{ name = 'P1v3'; tier = 'PremiumV3'; capacity = 1 }
         properties = @{ status = 'Ready'; numberOfSites = 1 } }
     @{ id = "$Base/Microsoft.Web/sites/app-demo"; name = 'app-demo'; type = 'microsoft.web/sites'; kind = 'app'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
-        properties = @{ enabled = $true; state = 'Running'; sku = 'PremiumV3'; availabilityState = 'Normal'; containerSize = 0; serverFarmId = "$Base/Microsoft.Web/serverFarms/plan-demo" } }
+        properties = @{ enabled = $true; state = 'Running'; sku = 'PremiumV3'; availabilityState = 'Normal'; containerSize = 0; serverFarmId = "$Base/Microsoft.Web/serverFarms/plan-demo"
+            # As Resource Graph gives it: a container image from the customer's own registry.
+            siteProperties = [ordered]@{ metadata = $null; properties = @([ordered]@{ name = 'LinuxFxVersion'; value = 'DOCKER|contosoregdemo.azurecr.io/teamdemo-api/webdemo:1.2.3' }, [ordered]@{ name = 'WindowsFxVersion'; value = $null }); appSettings = $null } } }
     @{ id = "$Base/Microsoft.Purview/accounts/pview-demo"; name = 'pview-demo'; type = 'microsoft.purview/accounts'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
         properties = @{ sku = @{ name = 'Standard'; capacity = 1 }; createdBy = 'creator-demo'; friendlyName = 'Purview Demo'; createdAt = '2024-03-15T09:41:27Z' } }
     @{ id = "$Base/Microsoft.KeyVault/vaults/kv-demo"; name = 'kv-demo'; type = 'microsoft.keyvault/vaults'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'

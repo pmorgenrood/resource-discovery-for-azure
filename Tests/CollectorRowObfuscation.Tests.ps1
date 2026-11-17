@@ -19,7 +19,7 @@ BeforeAll {
     . (Join-Path $PSScriptRoot 'Helpers/ContractIdPattern.ps1')
     $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
     $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
-    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Test-ObfuscatedIdShape', 'New-ObfuscatedRowIdWithoutId'))
+    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Test-ObfuscatedIdShape', 'New-ObfuscatedRowIdWithoutId', 'Protect-RdaCollectorRow'))
     {
         $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq $Name }, $false))
         # A missing helper fails the tests that need it, not the whole file.
@@ -29,7 +29,7 @@ BeforeAll {
                 param($N)
                 $N -is [System.Management.Automation.Language.IfStatementAst] -and
                 $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and
-                $N.Clauses[0].Item2.Extent.Text -match '^\{\s*foreach \(\$resourceItem in \$Result\)'
+                $N.Clauses[0].Item2.Extent.Text -match '^\{\s*(foreach \(\$resourceItem in \$Result\)|Protect-RdaCollectorRow -Rows \$Result -Collector \$ModName\s*\})'
             }, $true))
     if ($Step.Count -ne 1) { throw 'The -Obfuscate step over the collector rows was not found in ResourceInventory.ps1.' }
     . ([scriptblock]::Create("function Invoke-RowMasking { param(`$Result, `$ModName) `$Obfuscate = [switch]`$true; $($Step[0].Extent.Text); return `$Result }"))

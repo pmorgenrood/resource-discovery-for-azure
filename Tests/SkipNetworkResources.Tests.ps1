@@ -544,7 +544,7 @@ Describe 'Under -Obfuscate the skipped rows keep their masked ids (id-only query
         # The functions the token loop calls, and the statements of
         # RunInventorySetup after discovery (access filter, count, token loop),
         # lifted from ResourceInventory.ps1 so the real code is what runs.
-        foreach ($Name in @('Variables', 'Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId'))
+        foreach ($Name in @('Variables', 'Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Add-RdaObfuscationToken'))
         {
             $Fn = $script:InventoryAst.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq $Name }, $true) | Select-Object -First 1
             if ($null -eq $Fn) { throw "$Name was not found in ResourceInventory.ps1." }

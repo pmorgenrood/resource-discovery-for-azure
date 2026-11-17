@@ -686,6 +686,7 @@ Describe 'A run whose settings differ from the unfinished run''s stops before it
             $R = script:Invoke-Wrapper -Streams $Streams
             $R.ExitCode | Should -Be 1
             @($R.Text | Where-Object { $_ -like 'ERROR: This run stops here*' -or $_ -like '  -Obfuscate: *' -or $_ -like '  Next: run the same command with*' }) | Should -Be $Expected
+            @($R.Text | Where-Object { $_ -like '  To share a plain report masked*' }) | Should -BeNullOrEmpty -Because 'the unfinished run was masked already'
             script:Get-Calls | Should -BeNullOrEmpty
             script:Get-UsagePaths | Should -BeNullOrEmpty -Because 'the stop comes before the up-front checks'
             Get-Content -LiteralPath $script:State -Raw | Should -Be $Before
@@ -714,6 +715,20 @@ Describe 'A run whose settings differ from the unfinished run''s stops before it
         $R4 = script:Invoke-Wrapper -Streams $Streams
         $R4.ExitCode | Should -Be 0
         script:Get-StartLines $R4 | Should -Be @('Starting a new run.')
+    }
+
+    It 'after an unfinished plain run, a run with -Obfuscate stops and names the offline mask of the plain report' {
+        script:Invoke-InterruptedRun -Streams 1
+        $Started = script:Get-StateStartText
+        script:Clear-Calls
+        $R = script:Invoke-Wrapper -Arguments '-Obfuscate' -Streams 1
+        $R.ExitCode | Should -Be 1
+        @($R.Text | Where-Object { $_ -like 'ERROR: This run stops here*' -or $_ -like '  -Obfuscate: *' -or $_ -like '  To share a plain report masked*' }) | Should -Be @(
+            ('ERROR: This run stops here (exit 1), before it signs in, collects anything or writes the resume state: the unfinished run started {0} used other settings than this run, and one consolidated zip must not mix them.' -f $Started)
+            '  -Obfuscate: off in the unfinished run, on in this run.'
+            '  To share a plain report masked without collecting again, mask it offline: ./Protect-RdaReport.ps1 -Path <AllSubscriptions_ResourcesReport_*.zip of the plain run, once it has finished> (docs/offline-obfuscate.md).'
+        )
+        script:Get-Calls | Should -BeNullOrEmpty
     }
 
     It 'with -Fresh starts a new unmasked run whose zip holds only its own reports, and the next run starts a new run' {

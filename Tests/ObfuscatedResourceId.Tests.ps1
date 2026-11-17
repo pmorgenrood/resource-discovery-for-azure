@@ -13,7 +13,7 @@
 BeforeAll {
     $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
     $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
-    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId'))
+    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Add-RdaObfuscationToken', 'Get-RdaObfuscationDictionary'))
     {
         $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq $Name }, $false))
         if ($Fn.Count -ne 1) { throw "$Name was not found in ResourceInventory.ps1." }
@@ -169,7 +169,7 @@ Describe 'The dictionary build writes the name token New-ObfuscatedNameToken wri
         # per-resource loop builds the name token inline.
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
         if ($Build.Count -ne 1) { throw 'The -Obfuscate dictionary build was not found in RunInventorySetup.' }
         . ([scriptblock]::Create("function Invoke-DictionaryBuild { `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$null; $($Build[0].Extent.Text) }"))
 
@@ -208,7 +208,7 @@ Describe 'The run''s resource dictionaries ignore the case of an id' {
         $Vars = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Variables' }, $false)
         . ([scriptblock]::Create("function Invoke-RunVariables { `$Obfuscate = [switch]`$true; $($Vars.Body.Extent.Text.Substring(1, $Vars.Body.Extent.Text.Length - 2)) }"))
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
         . ([scriptblock]::Create("function Invoke-DictionaryBuild2 { `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$null; $($Build[0].Extent.Text) }"))
         function GetLocalVersion { '0.0.0-test' }
     }
@@ -265,7 +265,7 @@ Describe 'A run seeded with an obfuscation dictionary' {
         $Vars = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Variables' }, $false)
         . ([scriptblock]::Create("function Invoke-RunVariables3 { `$Obfuscate = [switch]`$true; $($Vars.Body.Extent.Text.Substring(1, $Vars.Body.Extent.Text.Length - 2)) }"))
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
         . ([scriptblock]::Create("function Invoke-SeededBuild { param(`$Seed) `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$Seed; function Write-Log { }; $($Build[0].Extent.Text) }"))
         function GetLocalVersion { '0.0.0-test' }
         $script:SeedDir = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-seed-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -376,7 +376,7 @@ Describe 'The seed is checked when it is read' {
         $Vars = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Variables' }, $false)
         . ([scriptblock]::Create("function Invoke-RunVariables4 { `$Obfuscate = [switch]`$true; $($Vars.Body.Extent.Text.Substring(1, $Vars.Body.Extent.Text.Length - 2)) }"))
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
         . ([scriptblock]::Create("function Invoke-SeededBuild4 { param(`$Seed) `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$Seed; function Write-Log { param(`$Message, `$Severity) if (`$Severity -eq 'Warning') { `$script:SeedWarnings.Add([string]`$Message) } }; $($Build[0].Extent.Text) }"))
         $script:SeedWarnings = [System.Collections.Generic.List[string]]::new()
         function GetLocalVersion { '0.0.0-test' }
@@ -555,7 +555,7 @@ Describe 'The seed''s parent tokens' {
         $Vars = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Variables' }, $false)
         . ([scriptblock]::Create("function Invoke-RunVariables5 { `$Obfuscate = [switch]`$true; $($Vars.Body.Extent.Text.Substring(1, $Vars.Body.Extent.Text.Length - 2)) }"))
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+        $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
         . ([scriptblock]::Create("function Invoke-SeededBuild5 { param(`$Seed) `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$Seed; function Write-Log { }; $($Build[0].Extent.Text) }"))
         function GetLocalVersion { '0.0.0-test' }
         $script:SeedDir5 = Join-Path ([System.IO.Path]::GetTempPath()) ('rda-seed5-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -700,7 +700,9 @@ Describe 'The seed check frees what it built' {
     It 'sets <_> to null in the seeded branch, after it is last read and before the token loop' -ForEach @('SeedSlotsOf', 'SeedSlotTokens', 'SeedDictionary') {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-        $Loop = $Setup.Find({ param($N) $N -is [System.Management.Automation.Language.ForEachStatementAst] -and $N.Condition.Extent.Text -match '^\$(TokenLoopRows|Global:Resources)$' -and $N.Body.Extent.Text -match 'IdsToMask\.Contains\(\$resourceItem\.ID\)' }, $true)
+        # The token loop: inline, or the call of Add-RdaObfuscationToken that runs it.
+        $Loop = $Setup.Find({ param($N) ($N -is [System.Management.Automation.Language.ForEachStatementAst] -and $N.Condition.Extent.Text -match '^\$(TokenLoopRows|Global:Resources)$' -and $N.Body.Extent.Text -match 'IdsToMask\.Contains\(\$resourceItem\.ID\)') -or ($N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq 'Add-RdaObfuscationToken') }, $true)
+        $Loop | Should -Not -BeNullOrEmpty
         $Name = $_
         $Nulls = @($Setup.FindAll({ param($N) $N -is [System.Management.Automation.Language.AssignmentStatementAst] -and $N.Left.Extent.Text -eq ('$' + $Name) -and $N.Right.Extent.Text -eq '$null' }, $true))
         $Nulls.Count | Should -Be 1

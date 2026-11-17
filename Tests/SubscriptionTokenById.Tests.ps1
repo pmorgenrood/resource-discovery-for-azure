@@ -17,7 +17,7 @@
 BeforeAll {
     $Root = Split-Path $PSScriptRoot -Parent
     $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
-    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Test-ObfuscatedIdShape'))
+    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Test-ObfuscatedIdShape', 'Add-RdaObfuscationToken', 'Get-RdaObfuscationDictionary'))
     {
         $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq $Name }, $false))
         if ($Fn.Count -eq 1) { . ([scriptblock]::Create($Fn[0].Extent.Text)) }
@@ -25,12 +25,15 @@ BeforeAll {
     $Vars = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Variables' }, $false)
     . ([scriptblock]::Create("function Invoke-RunVariables { `$Obfuscate = [switch]`$true; $($Vars.Body.Extent.Text.Substring(1, $Vars.Body.Extent.Text.Length - 2)) }"))
     $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
-    $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)' }, $true))
+    $Build = @($Setup.Body.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate.IsPresent' -and $N.Extent.Text -match 'foreach \(\$resourceItem in \$(Global:Resources|TokenLoopRows)\)|Add-RdaObfuscationToken -Rows \$TokenLoopRows' }, $true))
     . ([scriptblock]::Create("function Invoke-DictionaryBuild { param(`$Seed) `$Obfuscate = [switch]`$true; `$ObfuscationDictionary = `$Seed; function Write-Log { param(`$Message, `$Severity) `$script:BuildLog.Add([string]`$Message); if (`$Severity -eq 'Warning') { `$script:BuildWarnings.Add([string]`$Message) } }; $($Build[0].Extent.Text) }"))
     $script:BuildWarnings = [System.Collections.Generic.List[string]]::new()
     $script:BuildLog = [System.Collections.Generic.List[string]]::new()
     $MetAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Extension/Metrics.ps1'), [ref]$null, [ref]$null)
-    $Step = @($MetAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate' -and $N.Clauses[0].Item2.Extent.Text -match '^\{\s*foreach \(\$metric in \$Tmp\.Metrics\)' }, $true))
+    # The masking the step calls (a build from before it was its own function has none).
+    $MetFn = @($MetAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaMetricRecord' }, $false))
+    if ($MetFn.Count -eq 1) { . ([scriptblock]::Create($MetFn[0].Extent.Text)) }
+    $Step = @($MetAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.IfStatementAst] -and $N.Clauses[0].Item1.Extent.Text -eq '$Obfuscate' -and $N.Clauses[0].Item2.Extent.Text -match '^\{\s*(foreach \(\$metric in \$Tmp\.Metrics\)|Protect-RdaMetricRecord -Metrics \$Tmp\.Metrics )' }, $true))
     . ([scriptblock]::Create("function Invoke-MetricMasking { param(`$Tmp) `$Obfuscate = `$true; `$ResourceIdDictionary = `$Global:ResourceIdDictionary; `$ResourceNameDictionary = `$Global:ResourceNameDictionary; `$ResourceSubDictionary = `$Global:ResourceSubscriptionDictionary; `$ResourceGroupDictionary = `$Global:ResourceResourceGroupDictionary; $($Step[0].Extent.Text); return `$Tmp }"))
     function GetLocalVersion { '0.0.0-test' }
 

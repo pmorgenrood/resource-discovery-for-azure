@@ -176,11 +176,10 @@ function Write-RdaProgress
 #
 # Deliberately NOT baked in (kept separate on purpose):
 #   - Progress UI: that is Write-RdaProgress above (a bar, not a log line).
-#   - Obfuscation scrubbing (Protect-DiagnosticText): only the SHAREABLE
-#     Diagnostics_*.log needs scrubbing, and it is built once at packaging time
-#     from aggregated health globals - NOT line-by-line here. Scrubbing every
-#     log line would be slow and would destroy the local logs' raw
-#     troubleshooting value, so it stays out of the hot path.
+#   - The shareable Diagnostics_*.log: it is built once at packaging time from the aggregated
+#     health globals - NOT line-by-line here - and holds no failure message text at all
+#     (see Get-RdaDiagnosticMessage). The raw text stays in the local logs, so their
+#     troubleshooting value is kept and nothing needs scrubbing in the hot path.
 #   - Per-call logging from inside ForEach-Object -Parallel workers: concurrent
 #     appends to one file are not safe. Those paths record into a thread-safe
 #     bag and are logged as an aggregated summary on the main thread instead.
