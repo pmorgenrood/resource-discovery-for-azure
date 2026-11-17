@@ -28,6 +28,8 @@ Describe 'The checks for the scripts'' own files read a path with brackets as wr
         @{ Script = 'Run-AllSubscriptions.ps1'; Variable = 'WorkerScript' }
         @{ Script = 'Run-AllSubscriptions.ps1'; Variable = 'AllSubSummaryFunctions' }
         @{ Script = 'Run-AllSubscriptions.Stream.ps1'; Variable = 'FunctionsFile' }
+        @{ Script = 'Run-AllSubscriptions.Stream.ps1'; Variable = 'CommonFunctionsFile' }
+        @{ Script = 'Run-AllSubscriptions.Stream.ps1'; Variable = 'AzModulesFunctionsFile' }
     ) {
         param($Script, $Variable)
         $Checks = @(script:Get-FileCheck -Script $Script -Variable $Variable)
