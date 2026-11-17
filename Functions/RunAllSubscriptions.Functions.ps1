@@ -3382,9 +3382,10 @@ function Get-LatestCompletedReports
 # Decide, for each subscription a -Resume run skipped because an earlier run
 # completed it, whether that earlier run's report zip can go into this run's
 # consolidated zip. A record is carried only when its path is a relative path
-# inside the inventory root, names a .zip that is not a de-obfuscated
-# (*_revealed*) copy, that no other subscription names (-ClaimedZips, or one
-# carried before it), exists, opens as a zip with at least one entry, and was
+# inside the inventory root, names a .zip one folder or more down (a report
+# folder, Test-ReportZipRecordPath) that is not a de-obfuscated (*_revealed*)
+# copy and that no other subscription names (-ClaimedZips, or one carried
+# before it), exists, opens as a zip with at least one entry, and was
 # written with the same -Obfuscate setting as this run, so one bundle never mixes
 # obfuscated and real identifiers. Everything else is returned under Missing with
 # the reason. Cost: one file-exists check and one zip-directory read per skipped
@@ -3450,8 +3451,11 @@ function Get-ResumeCarriedReports
                 {
                     $Reason = 'its report path in the resume state is not a path inside the inventory root'
                 }
-                elseif ([System.IO.Path]::GetExtension($FullPath) -ne '.zip' -or [System.IO.Path]::GetFileName($FullPath) -like '*_revealed*')
+                elseif ([System.IO.Path]::GetExtension($FullPath) -ne '.zip' -or [System.IO.Path]::GetFileName($FullPath) -like '*_revealed*' -or -not (Test-ReportZipRecordPath -Path $Rel))
                 {
+                    # A report zip is a .zip in a report folder (Test-ReportZipRecordPath),
+                    # never a file in the inventory folder itself, such as an earlier
+                    # consolidated zip, whose reports would sit two zips deep.
                     $Reason = ('its report path in the resume state is not a report zip: {0}' -f $Rel)
                 }
                 elseif ($Claimed.ContainsKey((Get-ReportZipPathKey -Path $FullPath)))
