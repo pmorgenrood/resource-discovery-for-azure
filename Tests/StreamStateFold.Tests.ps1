@@ -60,6 +60,7 @@ BeforeAll {
     # Runs the startup block over $Root and returns what it printed and the state.
     function script:Invoke-Fold
     {
+        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ResumeScope', Justification = 'The dot-sourced state reads use it through dynamic scope.')]
         param([string]$Root, [bool]$Resume, [bool]$ResumeFailedOnly = $false)
         $InventoryRoot = $Root
         $TenantID = 't'

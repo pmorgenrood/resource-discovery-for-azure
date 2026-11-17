@@ -222,7 +222,7 @@ function Invoke-AzRestMethod
         param($Run)
         $At = [array]::IndexOf($Run.Text, 'Subscriptions whose inner script reported success this run but whose zip was not found:')
         if ($At -lt 0) { return @() }
-        @($Run.Text[($At + 1)..($Run.Text.Count - 1)] | ForEach-Object -Begin { $Go = $true } -Process { if ($Go -and $_ -like '  - *') { $_ } else { $Go = $false } })
+        @(foreach ($Line in $Run.Text[($At + 1)..($Run.Text.Count - 1)]) { if ($Line -like '  - *') { $Line } else { break } })
     }
     function script:Get-Ids { param([string[]]$Letters) @($Letters | ForEach-Object { $L = $_; ($script:Subs | Where-Object { $_.Name -eq ('Sub ' + $L) }).Id } | Sort-Object) }
 }

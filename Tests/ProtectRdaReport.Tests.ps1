@@ -1942,7 +1942,9 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
                 $Lines = $T -split "`n"
                 $Lines[1] = ([regex]'","24","1 Hour","').Replace($Lines[1], '","-24","1 Hour","', 1)
                 $Lines[2] = ([regex]',"meter-demo","Hours",').Replace($Lines[2], ',"","Hours",', 1)
-                $Lines -join "`n" } }
+                $Lines -join "`n"
+            }
+        }
         $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
         $R = script:Invoke-Protect -Path $Zip -Out $Out
         $R.ExitCode | Should -Be 0 -Because ($R.Text -join ' | ')

@@ -31,6 +31,10 @@
 # The same file is dot-sourced at runtime by both Run-AllSubscriptions.ps1 and
 # its stream worker, so this test exercises the exact code that ships.
 
+# The resume-state reads lifted from the wrapper read $ResumeScope through dynamic scope.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'ResumeScope', Justification = 'The dot-sourced state reads use it through dynamic scope.')]
+param()
+
 BeforeAll {
     $script:FunctionsPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RunAllSubscriptions.Functions.ps1'
     if (-not (Test-Path $script:FunctionsPath))

@@ -1289,7 +1289,8 @@ function Get-UsageAggregates
             param($Sub, [string]$Stream)
             [pscustomobject]@{ RunId = '{RunId}'; StreamId = $Stream; Status = 'ok'; Failed = @()
                 ResourceCounts = @([pscustomobject]@{ Name = $Sub.Name; Id = $Sub.Id; Count = 1; Zip = '{Reports}/Shared/ResourcesReport_shared.zip' })
-                RunReports = @([pscustomobject]@{ Id = $Sub.Id; Name = $Sub.Name; Zip = 'Shared/ResourcesReport_shared.zip'; Obfuscated = $false }) } | ConvertTo-Json -Depth 5
+                RunReports = @([pscustomobject]@{ Id = $Sub.Id; Name = $Sub.Name; Zip = 'Shared/ResourcesReport_shared.zip'; Obfuscated = $false })
+            } | ConvertTo-Json -Depth 5
         }
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -ReuseHome $CaseHome -StreamSummaryJson (& $Forge $script:SubA '0') -Stream1SummaryJson (& $Forge $script:SubB '1') -StreamFileStuck:$Stuck
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
