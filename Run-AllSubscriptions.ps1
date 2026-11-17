@@ -3688,7 +3688,10 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
     }
     elseif ($CarriedReports.Count -gt 0)
     {
-        Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {1} successful sub(s) this run + {2} carried from an earlier run)" -f $ActualZipCount, @($SubResourceCounts).Count, $CarriedReports.Count) -ForegroundColor Green
+        # Record rows (a stream whose summary could not be read) are expected
+        # zips too, so they are named here and the counts add up.
+        $RecordNote = if ($GoneRecordRows.Count -gt 0) { ' + {0} recorded by a stream whose summary could not be read' -f $GoneRecordRows.Count } else { '' }
+        Write-Host ("Per-subscription output verification: OK ({0} zip(s) match {1} successful sub(s) this run{3} + {2} carried from an earlier run)" -f $ActualZipCount, @($SubResourceCounts).Count, $CarriedReports.Count, $RecordNote) -ForegroundColor Green
     }
     else
     {

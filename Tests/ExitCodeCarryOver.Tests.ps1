@@ -1341,6 +1341,24 @@ function Get-UsageAggregates
         @($Inner | Sort-Object -Unique).Count | Should -Be 3 -Because ($Inner -join ', ')
     }
 
+    It 'two streams with -Resume: the OK line with carried reports counts the reports of a stream with no summary file, so its numbers add up' {
+        # Run 1: stream 0 runs Sub A then Sub C, stream 1 Sub B then Sub D; Sub A and Sub B fail.
+        $SubD = [pscustomobject]@{ Id = [guid]::new(('0' * 31) + 'd').ToString(); Name = 'Sub D' }
+        $Subs = @($script:SubA, $script:SubB, $script:SubC, $SubD)
+        $Run = Invoke-CarryOverRun -Subs $Subs -Streams 2 -FailSub @($script:SubA.Id, $script:SubB.Id)
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        $Run.FailedIds | Should -Contain $script:SubA.Id -Because $Run.Console
+        $Run.FailedIds | Should -Contain $script:SubB.Id -Because $Run.Console
+        # Run 2 carries Sub C and Sub D; stream 0 collects Sub A and writes no summary file.
+        $Next = Invoke-CarryOverRun -Subs $Subs -Streams 2 -Resume -ReuseHome $Run.Home -MissingStreamSummary
+        $Next.Console | Should -Match '\[stream-0\] WARNING: no summary file' -Because $Next.Console
+        $Line = [regex]::Match($Next.Console, 'Per-subscription output verification: OK \((\d+) zip\(s\) match (\d+) successful sub\(s\) this run(?: \+ (\d+) recorded by a stream whose summary could not be read)? \+ (\d+) carried from an earlier run\)')
+        $Line.Success | Should -BeTrue -Because $Next.Console
+        $Parts = @(2, 3, 4 | ForEach-Object { if ($Line.Groups[$_].Success) { [int]$Line.Groups[$_].Value } else { 0 } })
+        [int]$Line.Groups[1].Value | Should -Be ($Parts | Measure-Object -Sum).Sum -Because $Line.Value
+        [int]$Line.Groups[4].Value | Should -Be 2 -Because $Line.Value
+    }
+
     It 'two streams: a stream summary left by an earlier run is not read as this run''s' {
         # An earlier run left stream 0's summary on disk ("ok", no rows, as
         # an interrupted -Resume run that skipped everything writes it). This
