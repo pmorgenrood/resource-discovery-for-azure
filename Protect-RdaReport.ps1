@@ -444,6 +444,9 @@ try
         # Any full id in any field of the plain report, a field no rule masks too (an id no
         # row holds): its subscription, group and name parts are real values the masked
         # report must not hold (Get-RdaRealValueSet splits it), so the leak scan finds it.
+        # A Databricks workspace's managed group, masked by the row masking with no
+        # field rule: its plain name must not be in the masked report either.
+        if ($Rows.ContainsKey('Databricks')) { foreach ($Row in $Rows['Databricks']) { $V = [string]$Row['ManagedResourceGroup']; if ($V -notin @('', 'obfuscated')) { $ExtraReal.Add($V) } } }
         foreach ($Section in $Rows.Keys) { $ExtraReal.AddRange([string[]]@(Get-RdaFullIdInValue -Value $Rows[$Section])) }
         foreach ($MObj in $Metrics.Values) { $ExtraReal.AddRange([string[]]@(Get-RdaFullIdInValue -Value @($MObj['Metrics']))) }
         # A collector of the plain run that failed left out rows its pull held: the ids

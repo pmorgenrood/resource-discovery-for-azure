@@ -548,6 +548,17 @@ function Protect-RdaCollectorRow
     {
         $OrigID = $resourceItem.ID
 
+        # A Databricks workspace names its managed group as a value: it
+        # takes the group's token from the ids (recorded for Reveal),
+        # so it equals the group of the workspace's worker VMs and disks
+        # in the inventory and in the consumption file. A row whose id
+        # is no workspace id gets 'obfuscated', never the real name.
+        if ($resourceItem.ContainsKey('ManagedResourceGroup') -and -not [string]::IsNullOrEmpty([string]$resourceItem.ManagedResourceGroup))
+        {
+            if ([string]$OrigID -match '(?i)^/subscriptions/([^/]+)/resourcegroups/[^/]+/providers/microsoft\.databricks/workspaces/[^/]+$') { $resourceItem.ManagedResourceGroup = (Get-ObfuscatedResourceId -ResourceId ('/subscriptions/{0}/resourceGroups/{1}' -f $Matches[1], $resourceItem.ManagedResourceGroup)).Split('/')[4] }
+            else { $resourceItem.ManagedResourceGroup = 'obfuscated' }
+        }
+
         if ([string]::IsNullOrEmpty($OrigID))
         {
             # No id to mask: a masked ARM path from the row's own

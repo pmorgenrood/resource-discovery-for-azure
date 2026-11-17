@@ -28,8 +28,10 @@ if ($Task -eq 'Processing')
                 'Sku'               = $Sku.name;
                 # ManagedResourceGroupId is theoretically always set on a workspace, but
                 # split('/')[4] still fails if the property is missing or malformed.
-                # Guard cheaply rather than crash the whole subscription.
-                'ManagedResourceGroup'      = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { 'obfuscated' } elseif ([string]::IsNullOrEmpty($Data.managedResourceGroupId)) { $null } else { $Data.managedResourceGroupId.split('/')[4] };
+                # Guard cheaply rather than crash the whole subscription. Under
+                # -Obfuscate ResourceInventory.ps1 masks the real name with the
+                # group's own token, the one the worker VMs and disks have.
+                'ManagedResourceGroup'      = if ([string]::IsNullOrEmpty([string]$Data.managedResourceGroupId)) { $null } else { ([string]$Data.managedResourceGroupId).split('/')[4] };
                 'StorageAccount'            = if ($null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0) { 'obfuscated' } else { $Data.parameters.storageAccountName.value };
                 'StorageAccountSKU'         = $Data.parameters.storageAccountSkuName.value;
                 'CreatedTime'               = $Timecreated;

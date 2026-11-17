@@ -751,7 +751,7 @@ Describe "Cross-Reference Field Obfuscation" {
         if ($Checked -eq 0) { Set-ItResult -Skipped -Because "no MachineLearning had a non-null KeyVault in this fixture" }
     }
 
-    It "Databricks: ManagedResourceGroup should be obfuscated or null" {
+    It "Databricks: ManagedResourceGroup should be a group token or null" {
         $Resources = @($script:Inventory.Databricks) | Where-Object { $null -ne $_ }
         if ($Resources.Count -eq 0) { Set-ItResult -Skipped -Because "no Databricks resources in this fixture"; return }
         $Checked = 0
@@ -759,7 +759,8 @@ Describe "Cross-Reference Field Obfuscation" {
         {
             if ($null -ne $r -and ![string]::IsNullOrEmpty($r.ManagedResourceGroup))
             {
-                $r.ManagedResourceGroup | Should -BeIn @('obfuscated') -Because "Databricks ManagedResourceGroup should be obfuscated"
+                $r.ManagedResourceGroup | Should -Match $script:ObfuscationPattern -Because "Databricks ManagedResourceGroup should be the managed group's token, as in its workers' ids"
+                $r.ManagedResourceGroup | Should -Not -Match '^(prod|nonprod)_(databricks|aks|vmss)_' -Because 'a group token carries no name-token hint'
                 $Checked++
             }
         }

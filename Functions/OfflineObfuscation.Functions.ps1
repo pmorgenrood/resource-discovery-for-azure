@@ -193,7 +193,6 @@ function Get-RdaOfflineFieldRule
         @{ Section = 'SQLDB'; Field = 'ElasticPoolID'; Kind = 'PoolRef'; Target = 'SQLPOOL' }
         @{ Section = 'IOTHubs'; Field = 'EventsPath'; Kind = 'FreeText' }
         @{ Section = 'IOTHubs'; Field = 'HostName'; Kind = 'FreeText' }
-        @{ Section = 'Databricks'; Field = 'ManagedResourceGroup'; Kind = 'Value'; Value = 'obfuscated' }
         @{ Section = 'Databricks'; Field = 'StorageAccount'; Kind = 'Value'; Value = 'obfuscated' }
         @{ Section = 'MachineLearning'; Field = 'StorageAccount'; Kind = 'NameRef'; Sections = @('StorageAcc'); EmptyIs = 'obfuscated' }
         @{ Section = 'MachineLearning'; Field = 'KeyVault'; Kind = 'NameRef'; Sections = @('Vault'); EmptyIs = 'obfuscated' }
@@ -1862,7 +1861,8 @@ function Test-RdaAzureWordCandidate([string]$Text)
 
 # Adds to $Exempt (Test-RdaMaskedOutputLeak) the values a plain report holds in fields
 # neither a run nor this script masks: every inventory field but the masked ones (ID,
-# Name, ResourceGroup, Subscription, Tags, each rule's field and a list a rule masks
+# Name, ResourceGroup, Subscription, Tags, a Databricks workspace's ManagedResourceGroup
+# (the row masking gives it its group token), each rule's field and a list a rule masks
 # inside), and the metric fields that name Azure's own things.
 function Add-RdaExemptValue
 {
@@ -1878,6 +1878,7 @@ function Add-RdaExemptValue
     foreach ($Section in @($Rows.Keys))
     {
         $RuleFields = @($Rules | Where-Object { $_.Section -eq $Section } | ForEach-Object { $_.Field; if ($_.Within) { $_.Within } })
+        if ($Section -eq 'Databricks') { $RuleFields += 'ManagedResourceGroup' }
         foreach ($Row in @($Rows[$Section])) { foreach ($K in @($Row.Keys)) { if ($Masked -notcontains $K -and $RuleFields -notcontains $K) { & $Add $Row[$K] } } }
     }
     foreach ($MObj in @($Metrics)) { foreach ($Rec in @($MObj['Metrics'])) { foreach ($K in 'Location', 'Service', 'Metric', 'MetricAggregate', 'MetricMeasure', 'MetricTimeGrain') { & $Add $Rec[$K] } } }
