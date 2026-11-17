@@ -768,6 +768,10 @@ Describe 'A tenant-scope id keeps its shape (it has no subscription)' {
         $Parts[4] | Should -Match ('^' + $script:Token + '$')
         $Parts[5] | Should -BeExactly 'reservations'
         $Parts[6] | Should -Match ('^' + $script:Token + '$')
+        # Reservation rows are found by their path segments: the order part of the
+        # reservation's masked id is the masked id of the order itself.
+        $Order = Get-ObfuscatedResourceId -ResourceId '/providers/Microsoft.Capacity/reservationOrders/ro-a'
+        (($Parts[0..4]) -join '/') | Should -BeExactly $Order
     }
 
     It 'gives the same masked id to the same tenant-scope id on a second call' {
