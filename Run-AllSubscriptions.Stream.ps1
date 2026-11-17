@@ -219,7 +219,7 @@ catch
     }
     else
     {
-        Write-Stream ("FATAL: could not import Az context from {0}: {1}" -f $AzContextPath, $Reason) 'Red'
+        Write-Stream ("FATAL: could not import Az context from {0}: {1}. Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot." -f $AzContextPath, $Reason.TrimEnd().TrimEnd('.')) 'Red'
         $SubReason = 'stream did not start: Az context import failed'
     }
     # Under -Resume the stream would have skipped the subscriptions its own

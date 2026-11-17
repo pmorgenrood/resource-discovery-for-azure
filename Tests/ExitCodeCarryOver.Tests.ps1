@@ -1041,6 +1041,8 @@ function Get-UsageAggregates
         # Sub C. Stream-0's context import fails, so it runs nothing.
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -ImportFailStream '0'
         $Run.Console | Should -Match '\[stream-0\] FATAL: could not import Az context' -Because $Run.Console
+        # The advice is the one of a stream whose autosave could not be turned off.
+        $Run.Console | Should -Match ([regex]::Escape('Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot.')) -Because $Run.Console
         $Run.Console | Should -Match '\[stream-1\] done: Sub C' -Because $Run.Console
         # Sub A has no report to carry (the earlier run is not there): under
         # ruling 1 that is a missing report, so the run stops with exit 2
@@ -1250,7 +1252,18 @@ function Get-UsageAggregates
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
         $Run.Console | Should -Match ([regex]::Escape($script:SubA.Id)) -Because $Run.Console
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        # The subscription is taken off the completed list and put on the retry list.
+        $Run.FailedIds | Should -Contain $script:SubA.Id -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        # The lines name the gone report as a recorded report, with no resource count.
+        # Expected counts the gone record row too: the found count is one lower.
+        $Expected = [int]([regex]::Match($Run.Console, '  Expected zips: (\d+) ').Groups[1].Value)
+        $Found = [int]([regex]::Match($Run.Console, '  Found zips:\s+(\d+) ').Groups[1].Value)
+        $Gap = [int]([regex]::Match($Run.Console, '  Gap:\s+(\d+) missing').Groups[1].Value)
+        $Gap | Should -Be 1 -Because $Run.Console
+        ($Expected - $Found) | Should -Be $Gap -Because $Run.Console
+        $Run.Console | Should -Not -Match '\[0 resources\]' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('[report recorded by a stream whose summary could not be read]')) -Because $Run.Console
     }
 
     It 'two streams: a report zip of a stream with no summary file that is there at the first look and gone before the zips are picked is a gap, not a smaller bundle' {
