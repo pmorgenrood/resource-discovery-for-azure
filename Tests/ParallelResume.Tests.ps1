@@ -2225,15 +2225,39 @@ Describe 'The per-stream and resume state helpers' {
         $Result.Left | Should -Be @($Without)
         $Result.Moved[0].MovedTo | Should -Be '.resume-state-e3b98a4da31a-stream-0.json.unused-20260102-030405'
         Test-Path -LiteralPath ($With + '.unused-20260102-030405') | Should -BeTrue
-        # A rename that fails leaves the file and says so.
+        # A rename that fails leaves the file and says so: here every name it
+        # tries is taken (the first by a folder with content).
         Set-Content -LiteralPath $With -Value '{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[],"Notes":[{"Id":"sub-a"}]}' -Encoding utf8
         Remove-Item -LiteralPath ($With + '.unused-20260102-030405') -Force
         New-Item -ItemType Directory -Path ($With + '.unused-20260102-030405') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path ($With + '.unused-20260102-030405') 'keep') -Value 'x'
+        foreach ($N in 2..100) { Set-Content -LiteralPath ('{0}.unused-20260102-030405-{1}' -f $With, $N) -Value 'taken' -Encoding utf8 }
         $Out = @(Move-UntrackedStreamStateFiles -Files @($With) -Now $Now 6>&1)
         @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })[0] | Should -BeLike 'WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It could not be moved aside (*), so a later -Resume reads it again.'
         @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0].NotMoved | Should -Be @($With)
         Test-Path -LiteralPath $With | Should -BeTrue
+    }
+
+    It 'Move-UntrackedStreamStateFiles adds -2 to the name when it is taken, and -3 when that is taken too, as Move-UnreadableStreamStateFile does' {
+        $Dir = Join-Path $script:UnitDir ('unused-' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        $With = Join-Path $Dir '.resume-state-e3b98a4da31a-stream-0.json'
+        $Base = '.resume-state-e3b98a4da31a-stream-0.json.unused-20260102-030405'
+        Set-Content -LiteralPath (Join-Path $Dir $Base) -Value 'an earlier one' -Encoding utf8
+        Set-Content -LiteralPath $With -Value '{"Tenant":"t","StreamId":"0","Completed":["sub-a"],"FailedAttempts":[],"Notes":[{"Id":"sub-a"}]}' -Encoding utf8
+        $Now = [datetime]::new(2026, 1, 2, 3, 4, 5, [DateTimeKind]::Utc)
+        $Out = @(Move-UntrackedStreamStateFiles -Files @($With) -Now $Now 6>&1)
+        $Result = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
+        @($Result.NotMoved) | Should -BeNullOrEmpty
+        $Result.Moved[0].MovedTo | Should -Be ($Base + '-2')
+        @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ }) | Should -Be @(('WARNING: The per-stream state file .resume-state-e3b98a4da31a-stream-0.json holds records this version does not keep (Notes); its completed and failed subscriptions were used. It was moved aside to {0}-2.' -f $Base))
+        # A second such file of the same stream in the same second.
+        Set-Content -LiteralPath $With -Value '{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[],"Notes":[{"Id":"sub-b"}]}' -Encoding utf8
+        (Move-UntrackedStreamStateFiles -Files @($With) -Now $Now 6>$null).Moved[0].MovedTo | Should -Be ($Base + '-3')
+        Get-Content -LiteralPath (Join-Path $Dir $Base) -Raw | Should -Be ('an earlier one' + [Environment]::NewLine)
+        Test-Path -LiteralPath (Join-Path $Dir ($Base + '-2')) -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Dir ($Base + '-3')) -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath $With | Should -BeFalse
     }
 
     It 'Get-StreamStateRecordIds lists every id a per-stream state file holds a record for' {

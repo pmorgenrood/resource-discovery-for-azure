@@ -2796,7 +2796,8 @@ function Get-ResumeStateRecordMismatch
 # A per-stream state file holding a list this version does not keep
 # (Get-StreamStateUntrackedLists) is not deleted where the others are: its
 # completed and failed subscriptions were used, and the file is renamed in place
-# to <name>.unused-<UTC time> with a warning naming the list, kept for
+# to <name>.unused-<UTC time> (with -2, -3 and so on added when that name is
+# taken) with a warning naming the list, kept for
 # inspection. That name ends neither in '.json' nor matches
 # Get-StreamResumeStateFiles, so no run reads it, and it stays a dot-file in the
 # inventory root, which no zip step takes. $Files are file objects or paths.
@@ -2814,10 +2815,22 @@ function Move-UntrackedStreamStateFiles
         $Lists = @(Get-StreamStateUntrackedLists -State (Read-StreamResumeStateFile -Path $Path))
         if ($Lists.Count -eq 0) { $Left += $Path; continue }
         $Name = Split-Path -Path $Path -Leaf
-        $MovedTo = '{0}.unused-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+        $Base = '{0}.unused-{1}' -f $Name, $Now.ToString('yyyyMMdd-HHmmss')
+        # A second move in the same second, or a name an earlier run left, must
+        # not make the rename fail: up to 100 names are tried, as
+        # Move-UnreadableStreamStateFile does.
+        $Dir = Split-Path -Path $Path -Parent
+        $MovedTo = $Base
+        $N = 1
+        while ($null -ne $MovedTo -and (Test-Path -LiteralPath (Join-Path $Dir $MovedTo)))
+        {
+            $N++
+            $MovedTo = if ($N -le 100) { '{0}-{1}' -f $Base, $N } else { $null }
+        }
         $Lead = 'WARNING: The per-stream state file {0} holds records this version does not keep ({1}); its completed and failed subscriptions were used.' -f $Name, ($Lists -join ', ')
         try
         {
+            if ($null -eq $MovedTo) { throw ('every name from {0} to {0}-100 is taken' -f $Base) }
             Rename-Item -LiteralPath $Path -NewName $MovedTo -ErrorAction Stop
             Write-Host ('{0} It was moved aside to {1}.' -f $Lead, $MovedTo) -ForegroundColor Yellow
             $Moved += [pscustomobject]@{ Name = $Name; MovedTo = $MovedTo; Lists = $Lists }
