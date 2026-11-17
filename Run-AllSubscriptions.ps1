@@ -1197,7 +1197,7 @@ $NotReadableIds = @(Get-NotReadableSubscriptionIds -Path $ResumeStateFile -Tenan
 $IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -Tenant $ResumeScope) { @($CompletedIds) } else { @() }
 
 # The run id ties the per-stream state files to the run that wrote them. A run
-# without -Resume or -ResumeFailedOnly starts a new one ($NewRunId) and writes
+# without -Resume or -ResumeFailedOnly starts a new one ($RunRecord.RunId) and writes
 # it into the resume state file right before it starts collecting, after every
 # setup stop (Write-StartOfRunId, at the start of the sequential loop, of the
 # one-subscription path and of the parallel streams); until then $RunId is the
@@ -1217,7 +1217,6 @@ $IdsWithoutReports = if (Test-ResumeStateWithoutReports -Path $ResumeStateFile -
 # its id with it, so a later -Resume finds none, and until this run writes its
 # new id its early exits compare with that.
 if (-not ($Resume -or $ResumeFailedOnly)) { $RunId = [string](Get-ResumeStateRunId -Path $ResumeStateFile -Tenant $ResumeScope) }
-$NewRunId = if ($RunRecord.NewRun) { [string]$RunRecord.RunId } else { '' }
 # A new run starts with nothing completed (see $RunRecord above); the retry
 # list and its counts are kept.
 if ($RunRecord.NewRun) { $CompletedIds = @(); $CompletedReports = @() }
@@ -2053,8 +2052,8 @@ if ($ParallelStreams -le 1)
 {
     # === SEQUENTIAL PATH (default) ============================================
     # Original behavior, unchanged. Selected when -ParallelStreams 1 or unset.
-    # The new run id, right before collecting (see $NewRunId above).
-    if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
+    # The new run id, right before collecting (see the run id note above).
+    if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
     $SubTotal = @($Subscriptions).Count
     $SubIndex = 0
     foreach ($Sub in $Subscriptions)
@@ -2387,7 +2386,7 @@ else
         # process. Process it inline using the same per-sub logic the
         # sequential branch uses, instead of bailing and asking the user to
         # re-run. The new run id first, as in the sequential path.
-        if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
+        if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
         if ($PendingSubscriptions.Count -eq 0)
         {
             Write-Host "Nothing left to process: every eligible subscription was completed by an earlier run." -ForegroundColor Green
@@ -2614,8 +2613,8 @@ else
             $StreamsStarted = $true
 
             # The new run id, after the Az context snapshot and the worker
-            # check, right before the streams start (see $NewRunId above).
-            if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; $NewRunId = ''; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
+            # check, right before the streams start (see the run id note above).
+            if ($RunRecordPending) { $RunRecordPending = $false; $RunId = [string]$RunRecord.RunId; Write-StartOfRunId -Path $ResumeStateFile -Tenant $ResumeScope -Record $RunRecord -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports }
 
             # Round-robin split: sub 0 -> stream 0, sub 1 -> stream 1, ..., sub N -> stream (N % StreamCount).
             # This balances the slices regardless of how subscription sizes vary,
