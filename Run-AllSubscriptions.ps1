@@ -1990,6 +1990,12 @@ $SubResourceCounts = @()
 # (complete or not): the consolidated zip and the summaries are built from
 # these and the carried reports only (Get-RunReportZipItems).
 $RunReports = @()
+# The report records of the subscriptions of a stream whose summary is missing
+# or could not be read, from that stream's own state file (the end-of-run
+# merge): their zips are selected by these records, as no success row names
+# them. The output check and the consolidated zip select by records only, never
+# by time, so a zip another run writes in the same folder is never taken.
+$UnconfirmedStreamReports = @()
 
 # A run without -Resume or -ResumeFailedOnly: first the shape of the per-stream
 # state file of each stream it will use (more than one stream: set by
@@ -3095,6 +3101,11 @@ else
             }
             # Last, so a report a stream recorded this run replaces an earlier one.
             $CompletedReports = @(@($CompletedReports) + @($AllReportsFromStreams))
+            # A stream whose summary is missing or could not be read names no
+            # zip in a success row, so its subscriptions' zips are selected by
+            # the records its own state file holds (this tenant's file).
+            $UnconfirmedIds = @($StreamUnfinished | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id })
+            $UnconfirmedStreamReports = @($AllReportsFromStreams | Where-Object { $null -ne $_ -and $_ -isnot [string] -and $_ -isnot [ValueType] -and $_.PSObject.Properties['Id'] -and $UnconfirmedIds -contains [string]$_.Id })
             # A sub a stream failed this run is not completed, even when an earlier
             # run completed it: take it off the list and drop its report record,
             # as the sequential branch does, so Merge-FailedAttempts keeps the
@@ -3386,8 +3397,8 @@ $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
 # subscription that ran to completion this invocation has no zip among the
 # per-subscription zips the consolidation step below will pick up.
 #
-# Why this matters. The consolidation step below globs `*.zip` under
-# $InventoryRoot. If a per-sub zip is missing for any reason - antivirus
+# Why this matters. The consolidation step below takes this run's report
+# zips by its own records. If a per-sub zip is missing for any reason - antivirus
 # quarantine, Cloud Shell ephemeral-storage eviction between worker exit and
 # wrapper consolidation, a worker that crashed after the inner script logged
 # completion but before its zip flushed, an out-of-disk-space write that the
@@ -3423,7 +3434,11 @@ $InventoryFolderGone = $false
 if ($ExpectedZipCount -gt 0)
 {
     $InventoryRootGone = -not (Test-Path -LiteralPath $InventoryRoot -PathType Container)
-    $ActualSubZips = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter "*.zip" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
+    # This run's own report zips, by its records (Get-RunReportZipItems), never
+    # every zip written since the run started: a run for another tenant in the
+    # same folder writes zips in that time too, and a share whose clock runs
+    # behind gives this run's zips an earlier time.
+    $ActualSubZips = @(Get-RunReportZipItems -InventoryRoot $InventoryRoot -Reports (@($RunReports) + @($UnconfirmedStreamReports)))
     $ActualSubZips = @(Join-CarriedReportZips -Zips $ActualSubZips -CarriedReports $CarriedReports)
     $ActualZipCount = $ActualSubZips.Count
     $PathComparer = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
@@ -3547,24 +3562,12 @@ $ZipKeptAs = $null
 
 if (Test-Path -LiteralPath $InventoryRoot -PathType Container)
 {
-    # Filter ZIPs by current run timestamp only
-    $OtherRunZips = @()
-    $SubZips = @(Get-ChildItem -LiteralPath $InventoryRoot -Directory | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter "*.zip" -File | Where-Object { $_.LastWriteTime -ge $RunStartTime } })
-    # Then only the zips this run's subscriptions named (the Zip of each
-    # success row, which the output verification above found), so a zip
-    # another run writes under the same inventory root in the same time is
-    # left out. When a stream's summary is missing or could not be read, its
-    # subscriptions' zips cannot be named, so the time filter alone is kept
-    # and the Exit code lines say to check the consolidated zip for them.
-    if ($UnreadableStreamSummaries.Count -eq 0)
-    {
-        $ZipPathComparer = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
-        $RunZipPaths = [System.Collections.Generic.HashSet[string]]::new($ZipPathComparer)
-        foreach ($Row in @($SubResourceCounts | Where-Object { -not [string]::IsNullOrEmpty($_.Zip) })) { [void]$RunZipPaths.Add([System.IO.Path]::GetFullPath([string]$Row.Zip)) }
-        # The zips left out here are another run's, not gone (the check below).
-        $OtherRunZips = @($SubZips | Where-Object { -not $RunZipPaths.Contains([System.IO.Path]::GetFullPath($_.FullName)) } | ForEach-Object { $_.FullName })
-        $SubZips = @($SubZips | Where-Object { $RunZipPaths.Contains([System.IO.Path]::GetFullPath($_.FullName)) })
-    }
+    # This run's own report zips, by its records (Get-RunReportZipItems): the
+    # zip of each subscription this run collected that wrote one, and of a
+    # stream whose summary is missing or could not be read, the records its
+    # own state file holds. Never another run's zips written in the same time,
+    # and the same set the output check above found.
+    $SubZips = @(Get-RunReportZipItems -InventoryRoot $InventoryRoot -Reports (@($RunReports) + @($UnconfirmedStreamReports)))
     # Plus the zips carried from an earlier run on -Resume.
     $SubZips = @(Join-CarriedReportZips -Zips $SubZips -CarriedReports $CarriedReports)
     if ($SubZips.Count -gt 0)
@@ -3595,7 +3598,7 @@ if (Test-Path -LiteralPath $InventoryRoot -PathType Container)
             # A report zip the output check found that is gone now (an antivirus
             # quarantine, storage evicted in between) would be left out without
             # a word: the zip is not built, and the run ends with exit 2.
-            $GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and @($SubZips | ForEach-Object { $_.FullName }) -notcontains $_.FullName -and @($OtherRunZips) -notcontains $_.FullName })
+            $GoneSinceCheck = @(@($ActualSubZips) | Where-Object { $null -ne $_ -and @($SubZips | ForEach-Object { $_.FullName }) -notcontains $_.FullName })
             if ($GoneSinceCheck.Count -gt 0) { throw ('{0} report zip(s) found by the output check are gone now: {1}. Run again without -Resume or -ResumeFailedOnly to collect them again (either one skips the subscriptions this run completed)' -f $GoneSinceCheck.Count, (@($GoneSinceCheck | ForEach-Object { $_.FullName }) -join ', ')) }
             # Built, checked, given the run summary and checked again under a
             # name of its own in the same folder; it takes the name a run

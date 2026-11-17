@@ -64,6 +64,8 @@ if ([string]$Scenario.GoneBy -eq $SubscriptionID)
 if (@($Scenario.NoZip) -contains $SubscriptionID) { $Global:ZipOutputFile = $null; return }
 $Zip = Join-Path $Folder ('ResourcesReport_{0}.zip' -f $Stamp)
 Compress-Archive -Path (Join-Path $Folder '*.json') -DestinationPath $Zip -Force
+# A zip whose time is a day before the run's start, as on a share whose clock runs behind.
+if (@($Scenario.OldTime) -contains $SubscriptionID) { (Get-Item -LiteralPath $Zip).LastWriteTime = (Get-Date).AddDays(-1) }
 $Global:ZipOutputFile = $Zip
 '@ | Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Encoding utf8
 
@@ -146,8 +148,8 @@ function Invoke-AzRestMethod
     }
     function script:Set-Scenario
     {
-        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [string[]]$NoRole = @(), [string[]]$Incomplete = @())
-        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; NoRole = @($NoRole); Incomplete = @($Incomplete) } |
+        param([string[]]$NoZip = @(), [string]$GoneSub = '', [string]$GoneBy = '', [string[]]$NoRole = @(), [string[]]$Incomplete = @(), [string[]]$OldTime = @())
+        [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = $script:Subs; NoZip = @($NoZip); GoneSub = $GoneSub; GoneBy = $GoneBy; NoRole = @($NoRole); Incomplete = @($Incomplete); OldTime = @($OldTime) } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -303,6 +305,21 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2 = script:Invoke-Wrapper
         $R2.ExitCode | Should -Be 2 -Because ($R2.Text -join "`n")
         $R2.Text | Should -Contain "  Found zips:    2 (this run's report records, plus 2 carried from an earlier run)"
+    }
+
+    It '<Case>: a report zip whose time is before the run''s start (a share whose clock runs behind) is found by its record, and the run ends clean with every report' -ForEach @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'two streams'; Streams = 2 }
+    ) {
+        script:New-Case
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        script:Set-Scenario -OldTime @($B.Id)
+
+        $R1 = script:Invoke-Wrapper -Streams $Streams
+        $R1.Text | Should -Not -Contain 'ERROR: Per-subscription output verification failed.' -Because ($R1.Text -join "`n")
+        $R1.ExitCode | Should -Be 0 -Because ($R1.Text -join "`n")
+        $R1.NewZips | Should -Be 1
+        $R1.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
     }
 }
 
