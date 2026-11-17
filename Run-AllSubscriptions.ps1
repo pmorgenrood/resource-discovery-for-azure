@@ -3481,7 +3481,29 @@ if (@($UncarriedSkipped).Count -gt 0)
 # zip, so it is checked too: every expected zip is then missing.
 # On -Resume, the zips carried from an earlier run count on both sides: they
 # were checked when carried and are added to the found set below.
-$ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
+#
+# A stream whose summary is missing or unreadable has no success row, but its
+# own state file holds a report record for each subscription it completed.
+# Such a record names a zip this run's stream wrote, so a record whose zip is
+# gone is a gap too, checked like a success row. Only a gone one is added, so
+# the counts of the lines below stay those of the success rows.
+$GoneRecordRows = @()
+$SeenUnconfirmed = @{}
+foreach ($Record in @($UnconfirmedStreamReports))
+{
+    if ($null -eq $Record -or $Record -is [string] -or $Record -is [ValueType] -or $null -eq $Record.PSObject.Properties['Id']) { continue }
+    $RecZip = $Record.PSObject.Properties['Zip']
+    if ($null -eq $RecZip -or $RecZip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($RecZip.Value)) { continue }
+    if ([System.IO.Path]::IsPathRooted($RecZip.Value) -or (@($RecZip.Value -split '[\\/]') -contains '..')) { continue }
+    $RecId = [string]$Record.Id
+    if ($SeenUnconfirmed.ContainsKey($RecId) -or @($SubResourceCounts | Where-Object { [string]$_.Id -eq $RecId }).Count -gt 0) { continue }
+    if (Test-Path -LiteralPath (Join-Path $InventoryRoot $RecZip.Value) -PathType Leaf) { continue }
+    $SeenUnconfirmed[$RecId] = $true
+    $RecName = $Record.PSObject.Properties['Name']
+    $GoneRecordRows += [pscustomobject]@{ Name = $(if ($null -eq $RecName) { $RecId } else { [string]$RecName.Value }); Id = $RecId; Count = 0; Skipped = 0; Zip = (Join-Path $InventoryRoot $RecZip.Value); FromRecord = $true }
+}
+$VerifyRows = @(@($SubResourceCounts) + @($GoneRecordRows))
+$ExpectedZipCount = @($SubResourceCounts).Count + $GoneRecordRows.Count + $CarriedReports.Count
 # A gap stops the run with exit 2 before the consolidated zip is built. The
 # missing reports are counted below only when the inventory folder is gone
 # after this check (the consolidation step).
@@ -3503,7 +3525,7 @@ if ($ExpectedZipCount -gt 0)
     $PathComparer = if ($PSVersionTable.Platform -eq 'Unix') { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
     $FoundZipPaths = [System.Collections.Generic.HashSet[string]]::new($PathComparer)
     foreach ($Z in $ActualSubZips) { [void]$FoundZipPaths.Add([System.IO.Path]::GetFullPath($Z.FullName)) }
-    $MissingZipSubs = @($SubResourceCounts | Where-Object { [string]::IsNullOrEmpty($_.Zip) -or -not $FoundZipPaths.Contains([System.IO.Path]::GetFullPath([string]$_.Zip)) })
+    $MissingZipSubs = @($VerifyRows | Where-Object { [string]::IsNullOrEmpty($_.Zip) -or -not $FoundZipPaths.Contains([System.IO.Path]::GetFullPath([string]$_.Zip)) })
     if ($MissingZipSubs.Count -gt 0)
     {
         $MissingCount = $MissingZipSubs.Count
@@ -3538,8 +3560,8 @@ if ($ExpectedZipCount -gt 0)
         # When the inventory folder is gone, its resume state went with it.
         if (-not $InventoryRootGone)
         {
-            $LatestReports = Get-LatestCompletedReports -Reports $RunReports
-            $GoneCompleted = @(foreach ($S in @($SubResourceCounts))
+            $LatestReports = Get-LatestCompletedReports -Reports (@($RunReports) + @($UnconfirmedStreamReports))
+            $GoneCompleted = @(foreach ($S in @($VerifyRows))
                 {
                     $Id = [string]$S.Id
                     if (-not ($CompletedIds -contains $Id) -or -not $LatestReports.ContainsKey($Id)) { continue }
