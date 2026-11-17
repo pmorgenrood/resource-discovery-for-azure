@@ -373,6 +373,42 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
     It 'never throws on a bad value' {
         { Read-Case -Json '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":{"a":1},"Zip":{"b":2}}],"ConsumptionRecords":[1,2]}' } | Should -Not -Throw
     }
+
+    It 'gives back the checked RunReports and FailedStep, the only copies the wrapper reads' {
+        $Json = '{"StreamId":"0","Status":"ok","ResourceCounts":[' + $script:GoodRow + '],"RunReports":[{"Id":"sub-a","Name":"Sub A","Zip":"ResourcesReport_a/ResourcesReport_a.zip","Obfuscated":true}]}'
+        $Read = Read-Case -Json $Json
+        $Read.Accepted | Should -BeTrue -Because $Read.Reason
+        @($Read.RunReports).Count | Should -Be 1
+        $Read.RunReports[0].Id | Should -Be 'sub-a'
+        $Read.RunReports[0].Zip | Should -Be 'ResourcesReport_a/ResourcesReport_a.zip'
+        $Read.RunReports[0].Obfuscated | Should -BeTrue
+        $Read.FailedStep | Should -Be ''
+        $Started = Read-Case -Json '{"StreamId":"0","Status":"failed-to-start","FailedStep":"autosave","Failed":[{"Id":"sub-a","Name":"Sub A","Reason":"r"}]}'
+        $Started.Accepted | Should -BeTrue -Because $Started.Reason
+        $Started.FailedStep | Should -Be 'autosave'
+        # The wrapper reads the two fields from the checked values only.
+        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Not -Match ([regex]::Escape('$StreamSummary.FailedStep'))
+        $Wrapper | Should -Not -Match ([regex]::Escape('$StreamSummary.RunReports'))
+        $Wrapper | Should -Match ([regex]::Escape('$Read.FailedStep'))
+        $Wrapper | Should -Match ([regex]::Escape('$Read.RunReports'))
+    }
+
+    It 'does not confirm a summary whose <Case>' -ForEach @(
+        @{ Case = 'RunReports is one object, not a list'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":{"Id":"sub-a","Zip":"a/a.zip"}}'; Reason = 'RunReports is not a list' }
+        @{ Case = 'RunReports row has no Id'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Zip":"a/a.zip"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Zip is rooted'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"/other/tenant/b.zip"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Zip goes up a folder'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"../b/b.zip"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Zip is a number'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":5}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Obfuscated is text'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"a/a.zip","Obfuscated":"yes"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row is text'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":["a/a.zip"]}'; Reason = 'RunReports row' }
+        @{ Case = 'FailedStep is another step'; Json = '{"StreamId":"0","Failed":[{"Id":"sub-a","Name":"Sub A","Reason":"r"}],"FailedStep":"login"}'; Reason = 'FailedStep' }
+        @{ Case = 'FailedStep is a number'; Json = '{"StreamId":"0","Failed":[{"Id":"sub-a","Name":"Sub A","Reason":"r"}],"FailedStep":1}'; Reason = 'FailedStep' }
+    ) {
+        $Read = Read-Case -Json $Json
+        $Read.Accepted | Should -BeFalse
+        $Read.Reason | Should -Match ([regex]::Escape($Reason))
+    }
 }
 
 Describe 'Resume state messages whose error text holds braces' {

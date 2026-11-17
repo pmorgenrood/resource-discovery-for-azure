@@ -2878,7 +2878,7 @@ else
                         # load its Az context snapshot ('autosave' or 'import')
                         # marks its subscriptions as not counted, so a new entry
                         # starts at 0 and the run says so.
-                        $NotCounted = @('autosave', 'import') -contains [string]$StreamSummary.FailedStep
+                        $NotCounted = @('autosave', 'import') -contains $Read.FailedStep
                         $StreamNotStarted += @($Read.Failed | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) -and [string]$_.Id -ne '<unknown>' } |
                                 ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; Name = [string]$_.Name; Reason = [string]$_.Reason; NotCounted = $NotCounted } })
                     }
@@ -2896,7 +2896,7 @@ else
                     $NoReportSubs += @($Read.NoReport | ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; Name = [string]$_.Name } })
                     # The report zip of each subscription this stream collected
                     # that wrote one, complete or not.
-                    if ($StreamSummary.PSObject.Properties['RunReports'] -and $null -ne $StreamSummary.RunReports) { $RunReports = @(@($RunReports) + @($StreamSummary.RunReports | Where-Object { $null -ne $_ })) }
+                    $RunReports = @(@($RunReports) + @($Read.RunReports))
                     # The subs this stream collected this run with metrics or
                     # consumption left incomplete, with their reason, for the
                     # retry list when the stream's own state file cannot be read.

@@ -5286,6 +5286,14 @@ function Write-StreamState
 #                          the subscriptions the stream did not collect
 #                          because it could not save their write-ahead
 #                          count first (an outcome row: nothing is counted)
+#   RunReports             absent, or a list of report records
+#                          (New-CompletedReportRecord): Id text, Name text or
+#                          empty, Zip a path relative to the inventory folder
+#                          (not rooted, no '..'), Obfuscated true or false
+#                          when present; the zips the output check and the
+#                          consolidated zip take for this stream
+#   FailedStep             absent, or 'module', 'autosave' or 'import' (the
+#                          step that stopped a stream that did not start)
 # and it holds exactly one row (ResourceCounts, Failed or NotAttempted) for every
 # subscription the stream ran this time (-ExpectedIds), and no row for any
 # other subscription. Returns Accepted $true with the checked
@@ -5327,11 +5335,47 @@ function Resolve-StreamSummary
         $Value = & $Field $Summary $Name
         if ($null -ne $Value -and -not (& $IsTextOrEmpty $Value.Value)) { return (& $NotConfirmed ('its {0} is not text' -f $Name)) }
     }
-    foreach ($Name in @('ResourceCounts', 'Failed', 'ConsumptionFailedSubs', 'MetricsFailedSubs', 'CollectorFailures', 'Skipped', 'NoReport', 'Incomplete', 'NotAttempted'))
+    foreach ($Name in @('ResourceCounts', 'Failed', 'ConsumptionFailedSubs', 'MetricsFailedSubs', 'CollectorFailures', 'Skipped', 'NoReport', 'Incomplete', 'NotAttempted', 'RunReports'))
     {
         $Value = & $Field $Summary $Name
         if ($null -ne $Value -and -not (& $IsList $Value.Value)) { return (& $NotConfirmed ('its {0} is not a list' -f $Name)) }
     }
+    $FailedStep = ''
+    $StepField = & $Field $Summary 'FailedStep'
+    if ($null -ne $StepField -and $null -ne $StepField.Value)
+    {
+        if (-not (& $IsText $StepField.Value) -or @('module', 'autosave', 'import') -cnotcontains $StepField.Value) { return (& $NotConfirmed 'its FailedStep is not module, autosave or import') }
+        $FailedStep = [string]$StepField.Value
+    }
+
+    # The report records: the output check and the consolidated zip take the
+    # zip each names under the inventory folder (Get-RunReportZipItems).
+    $RunReports = @()
+    $BadRows = 0
+    foreach ($Row in (& $ListRows $Summary 'RunReports'))
+    {
+        $Ok = (& $IsObject $Row)
+        if ($Ok)
+        {
+            $Id = & $Field $Row 'Id'
+            $RowName = & $Field $Row 'Name'
+            $Zip = & $Field $Row 'Zip'
+            $Obf = & $Field $Row 'Obfuscated'
+            $IdOk = $null -ne $Id -and (& $IsText $Id.Value) -and $Id.Value -ne ''
+            $NameOk = $null -eq $RowName -or (& $IsTextOrEmpty $RowName.Value)
+            $ZipOk = $null -ne $Zip -and (& $IsText $Zip.Value) -and $Zip.Value -ne '' -and $(try { -not [System.IO.Path]::IsPathRooted($Zip.Value) } catch { $false }) -and (@($Zip.Value -split '[\\/]') -notcontains '..')
+            $ObfOk = $null -eq $Obf -or $Obf.Value -is [bool]
+            $Ok = $IdOk -and $NameOk -and $ZipOk -and $ObfOk
+        }
+        if (-not $Ok) { $BadRows++; continue }
+        $RunReports += [pscustomobject]@{
+            Id         = [string]$Id.Value
+            Name       = if ($null -eq $RowName) { '' } else { [string]$RowName.Value }
+            Zip        = [string]$Zip.Value
+            Obfuscated = if ($null -eq $Obf) { $false } else { [bool]$Obf.Value }
+        }
+    }
+    if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its RunReports row(s) have no Id, or a Zip that is not a path under the inventory folder' -f $BadRows)) }
 
     # Success rows: Count must be there (on a row with no Count, $Row.Count is
     # PowerShell's own count of 1) and a whole number of 0 or more; Zip empty
@@ -5482,6 +5526,8 @@ function Resolve-StreamSummary
         NoReport              = @($Lists['NoReport'])
         Incomplete            = @($Lists['Incomplete'])
         NotAttempted          = @($Lists['NotAttempted'])
+        RunReports            = @($RunReports)
+        FailedStep            = $FailedStep
     }
 }
 
