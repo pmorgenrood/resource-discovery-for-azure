@@ -3443,8 +3443,18 @@ if (@($UncarriedSkipped).Count -gt 0)
     # still lists these subscriptions as completed makes the next run of the
     # same command skip them again and stop the same way.
     $UncarriedStateSaved = Test-ResumeStateSaved -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+    # A per-stream state file (one folded in at startup, or one a stream of this
+    # run wrote) that is still on disk lists
+    # these subscriptions as completed: the next -Resume folds that in again
+    # and skips them. Its completed records are taken out (the file is removed
+    # when it cannot be rewritten); one that stays is named below.
+    $StuckStreamFiles = @(Clear-StreamStateCompletions -Files @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeScope) -Ids @($UncarriedSkipped | ForEach-Object { [string]$_.Id }))
     # Each command carries the run's settings.
-    if ($UncarriedStateSaved)
+    if ($UncarriedStateSaved -and $StuckStreamFiles.Count -gt 0)
+    {
+        Write-Host ("No consolidated zip was made. The per-stream state file(s) {0} still list them as completed and could not be changed (see the WARNING above), so they are not on the retry list: a run of the same command folds that in again, skips them and stops the same way. Remove the file(s) once the folder can be written, or start a new run with -Fresh to collect every subscription again:" -f (@($StuckStreamFiles | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', ')) -ForegroundColor Red
+    }
+    elseif ($UncarriedStateSaved)
     {
         Write-Host "No consolidated zip was made. They are back on the retry list, so the next run of the same command collects them again. Or start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
     }

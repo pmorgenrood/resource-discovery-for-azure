@@ -2844,6 +2844,61 @@ function Move-UntrackedStreamStateFiles
     return [pscustomobject]@{ Left = $Left; Moved = $Moved; NotMoved = $NotMoved }
 }
 
+# Take the completed records of $Ids (their ids in Completed and their report
+# records in Reports) out of the per-stream state files $Files, in place. Used
+# when a run puts completed subscriptions back on the retry list while a
+# per-stream file it folded in at startup still lists them as completed and
+# could not be removed: a later -Resume folds that completion in again, skips
+# the subscription again and stops the same way. Each file is rewritten with a
+# temp file and one rename; when that fails the file is removed instead. Each
+# file is read back after, and every one that still lists an id comes back as a
+# path in the result, with a warning that names it (the caller says what to do
+# by hand). Files that are gone, or that hold none of the ids, are left alone.
+function Clear-StreamStateCompletions
+{
+    param([object]$Files, [object]$Ids)
+    $Wanted = @($Ids | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $Stuck = [System.Collections.Generic.List[string]]::new()
+    if ($Wanted.Count -eq 0) { return @() }
+    $Holds = {
+        param($Obj)
+        $InCompleted = @(@($Obj.Completed) | Where-Object { $Wanted -contains [string]$_ }).Count
+        $InReports = if ($Obj.PSObject.Properties['Reports']) { @(@($Obj.Reports) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Id'] -and $Wanted -contains [string]$_.Id }).Count } else { 0 }
+        ($InCompleted + $InReports) -gt 0
+    }
+    foreach ($File in @($Files | Where-Object { $null -ne $_ }))
+    {
+        $Path = if ($File -is [System.IO.FileSystemInfo]) { $File.FullName } else { [string]$File }
+        if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { continue }
+        $Obj = Read-StreamResumeStateFile -Path $Path
+        if ($null -ne $Obj -and -not (& $Holds $Obj)) { continue }
+        $Reason = $null
+        try
+        {
+            if ($null -eq $Obj) { throw 'it can no longer be read' }
+            $Obj.Completed = @(@($Obj.Completed) | Where-Object { $Wanted -notcontains [string]$_ })
+            if ($Obj.PSObject.Properties['Reports']) { $Obj.Reports = @(@($Obj.Reports) | Where-Object { $null -ne $_ -and -not ($_.PSObject.Properties['Id'] -and $Wanted -contains [string]$_.Id) }) }
+            $Obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$Path.tmp" -Encoding utf8 -ErrorAction Stop
+            [System.IO.File]::Move("$Path.tmp", $Path, $true)
+        }
+        catch
+        {
+            $Reason = $_.Exception.Message
+            try { Remove-ResumeStateTempPath -Path "$Path.tmp" } catch { $null = $_ }
+        }
+        $After = if (Test-Path -LiteralPath $Path -PathType Leaf) { Read-StreamResumeStateFile -Path $Path } else { $false }
+        if ($After -is [bool]) { continue }
+        if ($null -ne $After -and -not (& $Holds $After)) { continue }
+        # The rewrite failed: removing the file takes its records away too.
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { if ([string]::IsNullOrEmpty($Reason)) { $Reason = $_.Exception.Message } }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { continue }
+        if ([string]::IsNullOrEmpty($Reason)) { $Reason = 'it still lists them after the rewrite' }
+        Write-Host ('WARNING: Could not take the completed records out of the per-stream state file {0}: {1}' -f (Split-Path -Path $Path -Leaf), $Reason) -ForegroundColor Yellow
+        $Stuck.Add($Path)
+    }
+    return $Stuck.ToArray()
+}
+
 # Delete per-stream state files ($Files, the ids they hold records for in $Ids)
 # once the resume state file on disk holds those records as this run holds
 # them (Get-ResumeStateRecordMismatch); each removal is checked
