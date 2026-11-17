@@ -744,4 +744,3 @@ Describe 'Test-ObfuscatedIdShape' {
         Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.sql/servers/srv-a/databases/db-a" -MaskedId ($Masked -f $script:T) | Should -BeFalse
     }
 }
-

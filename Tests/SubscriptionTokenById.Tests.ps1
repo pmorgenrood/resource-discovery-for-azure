@@ -286,4 +286,3 @@ Describe 'An older seed whose shared-name subscriptions have one good and one ol
         }
     }
 }
-
