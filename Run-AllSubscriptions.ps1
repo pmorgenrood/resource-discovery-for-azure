@@ -845,7 +845,7 @@ if (-not (Test-Path -LiteralPath $InventoryRoot -PathType Container))
 # The report folders already there when this run starts: never this run's,
 # whatever the clock says (a clock moved back could date an old one after this
 # run's start), so MainSummary.html does not list an old folder.
-$PreRunReportDirs = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-ChildItem -Path $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }), [System.StringComparer]::OrdinalIgnoreCase)
+$PreRunReportDirs = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-ChildItem -LiteralPath $InventoryRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }), [System.StringComparer]::OrdinalIgnoreCase)
 
 # Wrapper-level transcript.
 #
