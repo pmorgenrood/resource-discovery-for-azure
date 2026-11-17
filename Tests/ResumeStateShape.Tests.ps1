@@ -994,11 +994,24 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         # B, listed as completed only in the moved file, is collected.
         script:Get-Collected $R1 | Should -Be (script:Get-Ids 'B', 'C')
         @($R1.Text | Where-Object { $_ -like '*were written by another run*' }) | Should -BeNullOrEmpty
-        script:Get-LiveStateFiles | Should -BeNullOrEmpty
+        # The per-stream file records no report for A, so A's report cannot be
+        # carried: a missing report stops the run before its consolidated zip
+        # (ruling 1), and A goes back on the retry list. Only the resume state
+        # file is left; the per-stream file was folded in and removed.
+        $R1.ExitCode | Should -Be 2
+        @($R1.Text | Where-Object { $_ -like '  - Sub A (sub-a): *' }).Count | Should -Be 1
+        script:Get-LiveStateFiles | Should -Be @($script:StateName)
+        $Kept = Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json
+        @($Kept.CompletedSubscriptionIds | Where-Object { $_ } | Sort-Object) | Should -Be (script:Get-Ids 'B', 'C')
+        @($Kept.FailedAttempts | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Id }) | Should -Be (script:Get-Ids 'A')
+        # The next -Resume collects A, carries B and C, and ends clean.
         $R2 = script:Invoke-Wrapper -Arguments '-Resume'
-        $R2.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
-        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A')
         script:Test-CleanLine $R2 | Should -BeTrue
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume'
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R3 | Should -BeTrue
     }
 
     It 'beside a right-shaped per-stream file of the same run (<Label>), -ResumeFailedOnly stops and the -Resume it names skips what that file lists, with <Streams> stream(s); the -Resume after that finds no state' -ForEach @(
@@ -1022,10 +1035,18 @@ Describe 'Wrapper end to end: a wrong-shaped resume state file' -Skip:$IsWindows
         $R2.Error | Should -BeNullOrEmpty
         $R2.Text | Should -Contain 'Skipping (already completed): Sub A (sub-a)'
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B', 'C')
+        # The per-stream file records no report for A, so A's report cannot be
+        # carried: the run stops before its consolidated zip (ruling 1) with A
+        # back on the retry list, and the next -Resume collects A and ends clean.
+        $R2.ExitCode | Should -Be 2
+        @($R2.Text | Where-Object { $_ -like '  - Sub A (sub-a): *' }).Count | Should -Be 1
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
-        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
-        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Get-Collected $R3 | Should -Be (script:Get-Ids 'A')
         script:Test-CleanLine $R3 | Should -BeTrue
+        $R4 = script:Invoke-Wrapper -Arguments '-Resume' -Streams $Streams
+        $R4.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Get-Collected $R4 | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        script:Test-CleanLine $R4 | Should -BeTrue
     }
 
     It 'a <Label> resume state file is not called the wrong shape: -ResumeFailedOnly has no unfinished run to retry, so it stops with exit 1; nothing is moved' -TestCases @(

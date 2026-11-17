@@ -960,12 +960,14 @@ function Get-UsageAggregates
         # stream-0 runs Sub B and stream-1 runs Sub C.
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -CorruptStreamSummary -Resume -Stream0Completed @($script:SubA.Id)
         $Run.Console | Should -Match 'Skipping \(already completed\): Sub A' -Because $Run.Console
-        $Run.Console | Should -Match 'Stream Summary Unreadable:\s+stream-0 \(1 subscription\(s\) not confirmed; check the consolidated zip\)' -Because $Run.Console
-        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.'))
-        $Run.Console | Should -Match '(?m)^Subscriptions Skipped:\s+1 \(already completed\)' -Because $Run.Console
-        $Run.Console | Should -Match '(?m)^Subscriptions Processed: 2\s*$' -Because $Run.Console
-        $Run.RunSummary | Should -Match ([regex]::Escape('  Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.')) -Because $Run.RunSummary
-        $Run.MainSummary | Should -Match ([regex]::Escape('The summary of stream 0 could not be read.</b> Its 1 subscription(s) are not confirmed')) -Because $Run.Console
+        # Stream-0's resume file records no report for Sub A, so it cannot be
+        # carried: under ruling 1 a missing report stops the run with exit 2
+        # before the consolidated zip (no zip, RunSummary.log or MainSummary),
+        # and the Exit code lines still name only the subscription stream-0
+        # ran this time as not confirmed.
+        $Run.Console | Should -Match ('(?m)^  - {0} \({1}\): ' -f [regex]::Escape($script:SubA.Name), [regex]::Escape($script:SubA.Id)) -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; no consolidated zip was made.'))
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
         $Run.StateKept | Should -BeTrue -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
@@ -977,15 +979,19 @@ function Get-UsageAggregates
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -ImportFailStream '0'
         $Run.Console | Should -Match '\[stream-0\] FATAL: could not import Az context' -Because $Run.Console
         $Run.Console | Should -Match '\[stream-1\] done: Sub C' -Because $Run.Console
-        $Run.Console | Should -Match '(?m)^Subscriptions Failed:\s+1 \(Sub B \(stream-0: stream did not start: Az context import failed\)\)\s*$' -Because $Run.Console
-        $Run.Console | Should -Match '(?m)^Subscriptions Skipped:\s+1 \(already completed\)' -Because $Run.Console
-        $Run.Console | Should -Match '(?m)^Subscriptions Processed: 2\s*$' -Because $Run.Console
-        $Run.ZipCount | Should -Be 1 -Because $Run.Console
-        $Run.RunSummary | Should -Match ('(?m)^  - {0} \({1}\)\s*$' -f [regex]::Escape($script:SubB.Name), [regex]::Escape($script:SubB.Id)) -Because $Run.RunSummary
-        # Sub A has no report to carry (the earlier run is not there), so the log names it for that, not as a failed subscription.
-        $Run.RunSummary | Should -Not -Match ('(?m)^  - {0} \({1}\)\s*$' -f [regex]::Escape($script:SubA.Name), [regex]::Escape($script:SubA.Id)) -Because 'Sub A was done in an earlier run and was not run or failed this time'
-        # The summary names Sub A for its earlier report that is not carried, not as a failure.
-        $Run.MainSummary | Should -Match ('<li>{0} \({1}\): earlier report not carried' -f [regex]::Escape($script:SubA.Name), [regex]::Escape($script:SubA.Id)) -Because 'Sub A did not fail this run'
+        # Sub A has no report to carry (the earlier run is not there): under
+        # ruling 1 that is a missing report, so the run stops with exit 2
+        # before the consolidated zip (no zip, RunSummary.log or MainSummary).
+        # Sub A is named for its earlier report that is not carried, not as a
+        # failed subscription; only Sub B is counted as failed.
+        $Run.Console | Should -Match '(?m)^Subscriptions Failed:\s+1 \(see the ERROR and FATAL lines above\)\s*$' -Because $Run.Console
+        $Run.Console | Should -Match ('(?m)^  - {0} \({1}\): ' -f [regex]::Escape($script:SubA.Name), [regex]::Escape($script:SubA.Id)) -Because $Run.Console
+        $Run.Console | Should -Match '= FAILED \(earlier report not carried\) =' -Because $Run.Console
+        $Run.Console | Should -Not -Match ('{0} \(stream-0' -f [regex]::Escape($script:SubA.Name)) -Because 'Sub A was done in an earlier run and was not run or failed this time'
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: one or more subscriptions failed (see Subscriptions Failed); no consolidated zip was made.')) -Because $Run.Console
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        # Both go on the retry list: Sub B for its stream, Sub A to be collected again.
+        @($Run.FailedIds | Sort-Object) | Should -Be @(@($script:SubA.Id, $script:SubB.Id) | Sort-Object) -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
@@ -1240,7 +1246,10 @@ function Get-UsageAggregates
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -StreamSummaryJson $Wrong
         $Run.Console | Should -Match 'Skipping \(already completed\): Sub A' -Because $Run.Console
         $Run.Console | Should -Match '\[stream-0\] ERROR: summary file .+ is not this run''s summary of stream 0' -Because $Run.Console
-        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; check the consolidated zip for their reports.')) -Because $Run.Console
+        # Sub A's report cannot be carried (the resume file records none), so
+        # the run stops before the consolidated zip (ruling 1).
+        $Run.Console | Should -Match ([regex]::Escape('Exit code 2: the summary of stream 0 could not be read; its 1 subscription(s) are not confirmed; no consolidated zip was made.')) -Because $Run.Console
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
         $Run.StateKept | Should -BeTrue -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }

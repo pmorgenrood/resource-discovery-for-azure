@@ -399,16 +399,19 @@ Describe 'Exit code when an earlier report is missing from the consolidated zip'
         Get-WrapperExitCode -AuthSkipped $true -CollectorsFailed $false | Should -Be 3
     }
 
-    It 'the wrapper passes the uncarried list to the exit code and prints the FAILED banner before its transcript stops' {
-        $Src = Get-Content -LiteralPath $script:WrapperPath -Raw
-        # Each cause of 2 is one entry of $ExitTwoReasons, which the exit code reads (#66 works it out before the bundle fold).
-        $Src | Should -Match ([regex]::Escape('if (@($UncarriedSkipped).Count -gt 0) { $ExitTwoReasons += '))
-        $Src | Should -Match ([regex]::Escape('$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -SubscriptionsFailed ($SubscriptionsFailed -or $UnreadableStreamSummaries.Count -gt 0) -ReportsMissing ($ExitTwoReasons.Count -gt 0)'))
+    It 'the wrapper prints the FAILED banner for an uncarried report and stops with exit 2 before the consolidated zip is built (ruling 1: a missing report stops the run)' {
         $Lines = Get-Content -LiteralPath $script:WrapperPath
         $Banner = ($Lines | Select-String -SimpleMatch 'FAILED (earlier report not carried) =' | Select-Object -First 1).LineNumber
-        $Stop = ($Lines | Select-String -SimpleMatch 'Stop-Transcript on normal completion failed' | Select-Object -First 1).LineNumber
+        $Build = ($Lines | Select-String -SimpleMatch '# Consolidate per-subscription ZIPs into a single outer ZIP' | Select-Object -First 1).LineNumber
         $Banner | Should -Not -BeNullOrEmpty
-        $Banner | Should -BeLessThan $Stop
+        $Build | Should -Not -BeNullOrEmpty
+        $Banner | Should -BeLessThan $Build
+        # The stop for it, right before the build, ends the run with exit 2.
+        $Src = Get-Content -LiteralPath $script:WrapperPath -Raw
+        $Src | Should -Match ([regex]::Escape('$WrapperExitCode = Get-WrapperExitCode -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -SubscriptionsFailed ($SubscriptionsFailed -or $UnreadableStreamSummaries.Count -gt 0) -ReportsMissing ($ExitTwoReasons.Count -gt 0)'))
+        $Stop = $Src.LastIndexOf('if (@($UncarriedSkipped).Count -gt 0)', $Src.IndexOf('# Consolidate per-subscription ZIPs into a single outer ZIP'))
+        $Stop | Should -BeGreaterThan 0
+        $Src.Substring($Stop, $Src.IndexOf('# Consolidate per-subscription ZIPs into a single outer ZIP') - $Stop) | Should -Match ([regex]::Escape('Exit-Wrapper -Code 2'))
     }
 }
 
@@ -446,6 +449,27 @@ Describe 'The bundle never takes a report that was there before the run started'
 }
 
 Describe 'Sequential path, end to end: interrupted run, then -Resume' {
+    BeforeAll {
+        # The post-processing up to the stop it makes (Exit-Wrapper), for a run
+        # whose carried report is missing: its lines, the exit code it stopped
+        # with, and any consolidated zip it made under the root.
+        function script:Invoke-PostToStop
+        {
+            param($Run, [bool]$Obfuscate = $false)
+            $Lines = [System.Collections.Generic.List[string]]::new()
+            $Code = $null
+            try
+            {
+                & $script:PostBlock $script:RepoRoot $script:Root $script:Since @($Run.SubResourceCounts) @($Run.SkippedSubscriptions) @($Run.CompletedReports) $true $Obfuscate $script:State 't' 6>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.InformationRecord]) { $Lines.Add([string]$_.MessageData) } }
+            }
+            catch
+            {
+                if ($_.Exception.Message -match '^Exit-Wrapper (\d+)$') { $Code = [int]$Matches[1] } else { throw }
+            }
+            return [pscustomobject]@{ Text = @($Lines); ExitCode = $Code; Bundles = @(Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File) }
+        }
+    }
+
     BeforeEach {
         $script:Root = script:New-CaseRoot
         $Global:RdaCarryTestRoot = $script:Root
@@ -482,21 +506,28 @@ Describe 'Sequential path, end to end: interrupted run, then -Resume' {
         (Get-Content -LiteralPath $Post.Result.MainSummaryFile -Raw) | Should -Match 'sub-a'
     }
 
-    It 'a skipped subscription whose recorded zip is gone is named, and the gate does not say OK' {
+    # Ruling 1: a report the run cannot carry is a missing report, so the run
+    # stops with exit 2 before the consolidated zip, names it, and puts it
+    # back on the retry list for the next run.
+    It 'a skipped subscription whose recorded zip is gone is named, the gate does not say OK, and the run stops with exit 2 before the consolidated zip' {
         Get-ChildItem -LiteralPath $script:Root -Recurse -Filter 'ResourcesReport_*.zip' | Remove-Item -Force
         $Run2 = & $script:SequentialBlock $script:FakeRoot @($script:A, $script:B) $true @(Get-CompletedSubscriptionIds -Path $script:State -Tenant 't') @() @(script:Read-StateReports -Path $script:State) $script:Root $script:State 't' $false 6>$null
-        $Post = script:Invoke-Post -Root $script:Root -Since $script:Since -ThisRun $Run2.SubResourceCounts -Skipped $Run2.SkippedSubscriptions -Reports $Run2.CompletedReports
-        @($Post.Result.Uncarried | ForEach-Object Id) | Should -Be @('sub-a')
+        $Post = script:Invoke-PostToStop -Run $Run2
+        $Post.ExitCode | Should -Be 2
+        @($Post.Text | Where-Object { $_ -like '  - Sub A (sub-a): *' }).Count | Should -Be 1 -Because ($Post.Text -join "`n")
         ($Post.Text -join "`n") | Should -Match 'verification: INCOMPLETE'
         ($Post.Text -join "`n") | Should -Not -Match 'verification: OK'
-        @(script:Get-InnerZipNames -OuterZip $Post.Result.OuterZipFile).Count | Should -Be 1
+        $Post.Bundles.Count | Should -Be 0
+        @(Get-CompletedSubscriptionIds -Path $script:State -Tenant 't') | Should -Not -Contain 'sub-a'
+        @(Get-FailedAttempts -Path $script:State -Tenant 't' | ForEach-Object { $_.Id }) | Should -Contain 'sub-a'
     }
 
-    It 'a -Resume run with -Obfuscate does not carry the earlier non-obfuscated report' {
+    It 'a -Resume run with -Obfuscate does not carry the earlier non-obfuscated report, and stops with exit 2 before the consolidated zip' {
         $Run2 = & $script:SequentialBlock $script:FakeRoot @($script:A, $script:B) $true @(Get-CompletedSubscriptionIds -Path $script:State -Tenant 't') @() @(script:Read-StateReports -Path $script:State) $script:Root $script:State 't' $true 6>$null
-        $Post = script:Invoke-Post -Root $script:Root -Since $script:Since -ThisRun $Run2.SubResourceCounts -Skipped $Run2.SkippedSubscriptions -Reports $Run2.CompletedReports -Obfuscate $true
-        @($Post.Result.Uncarried | ForEach-Object Id) | Should -Be @('sub-a')
-        $Post.Result.Uncarried[0].Reason | Should -Match 'never mixes'
+        $Post = script:Invoke-PostToStop -Run $Run2 -Obfuscate $true
+        $Post.ExitCode | Should -Be 2
+        @($Post.Text | Where-Object { $_ -like '  - Sub A (sub-a): *never mixes*' }).Count | Should -Be 1 -Because ($Post.Text -join "`n")
+        $Post.Bundles.Count | Should -Be 0
     }
 }
 

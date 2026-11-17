@@ -335,6 +335,38 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R4.Zip.Ids | Should -Be (script:Get-Ids 'B')
     }
 
+    It '<Case>: a subscription the run skips as completed whose earlier report zip is gone stops the run with exit 2 before the consolidated zip; it goes back on the retry list, and the next run collects it and ends clean' -ForEach @(
+        @{ Case = 'sequential'; Streams = 1 }
+        @{ Case = 'two streams'; Streams = 2 }
+    ) {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $B = $script:Subs | Where-Object { $_.Name -eq 'Sub B' }
+        # Run 1: Sub B writes no zip, so the run stops with Sub A and Sub C completed.
+        script:Set-Scenario -NoZip @($B.Id)
+        $R1 = script:Invoke-Wrapper -Streams $Streams
+        $R1.ExitCode | Should -Be 2 -Because ($R1.Text -join "`n")
+        # Then Sub A's report zip is gone (an antivirus quarantine, a clean-up).
+        $AZips = @(Get-ChildItem -LiteralPath $script:Root -Directory -Filter ('ResourcesReport*-' + $A.Id) | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -Filter '*.zip' -File })
+        $AZips.Count | Should -Be 1
+        $AZips | Remove-Item -Force
+
+        script:Set-Scenario
+        $R2 = script:Invoke-Wrapper -Streams $Streams -Resume
+        $R2.ExitCode | Should -Be 2 -Because ($R2.Text -join "`n")
+        $R2.NewZips | Should -Be 0 -Because ($R2.Text -join "`n")
+        @($R2.Text | Where-Object { $_ -like '*= FAILED (earlier report not carried) =*' }).Count | Should -Be 1 -Because ($R2.Text -join "`n")
+        @($R2.Text | Where-Object { $_ -like ('  - Sub A ({0}): *' -f $A.Id) }).Count | Should -Be 1 -Because ($R2.Text -join "`n")
+        $R2.Text | Should -Contain 'Exit code 2: a report is missing (verification gap, see Per-subscription output verification failed); no consolidated zip was made.'
+        @($R2.State.CompletedSubscriptionIds | Sort-Object) | Should -Be (script:Get-Ids 'B', 'C')
+        @($R2.State.FailedAttempts | ForEach-Object { [string]$_.Id }) | Should -Be @($A.Id)
+
+        $R3 = script:Invoke-Wrapper -Streams $Streams -Resume
+        $R3.ExitCode | Should -Be 0 -Because ($R3.Text -join "`n")
+        $R3.Zip.Ids | Should -Be (script:Get-Ids 'A', 'B', 'C')
+        $R3.Text | Should -Contain 'Resume state cleared (clean run).'
+    }
+
     It '<Case>: a report zip whose time is before the run''s start (a share whose clock runs behind) is found by its record, and the run ends clean with every report' -ForEach @(
         @{ Case = 'sequential'; Streams = 1 }
         @{ Case = 'two streams'; Streams = 2 }

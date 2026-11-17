@@ -3403,6 +3403,36 @@ if ($ConsumptionAuthSkipped.Count -gt 0) { $AuthSkippedPhases += 'Consumption' }
 $AuthSkipped = $AuthSkippedPhases.Count -gt 0
 $CollectorsFailed = @($Global:CollectorFailures).Count -gt 0
 
+# A subscription -Resume skipped as completed whose earlier report zip could not
+# be carried would be missing from the consolidated zip: a verification gap, so
+# the run stops with exit 2 before the consolidated zip is built (as for a
+# report of this run that is missing, below). Each one is taken off the
+# completed list and put on the retry list first, so the next run of the same
+# command collects it again instead of stopping the same way.
+if (@($UncarriedSkipped).Count -gt 0)
+{
+    Write-Host ""
+    Write-Host "============== FAILED (earlier report not carried) ==============" -ForegroundColor Red
+    Write-Host ("{0} subscription(s) were skipped by -Resume as completed by an earlier run, but that run's report could not be carried into the consolidated zip:" -f @($UncarriedSkipped).Count) -ForegroundColor Red
+    foreach ($U in @($UncarriedSkipped))
+    {
+        Write-Host ("  - {0} ({1}): {2}" -f $U.Name, $U.Id, $U.Reason) -ForegroundColor Red
+        $CompletedIds = @($CompletedIds | Where-Object { [string]$_ -ne [string]$U.Id })
+        $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne [string]$U.Id })
+        $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$U.Id) -Name ([string]$U.Name) -Reason ('its earlier report could not be carried: {0}' -f $U.Reason)
+    }
+    Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+    # Each command carries the run's settings.
+    Write-Host "No consolidated zip was made. They are back on the retry list, so the next run of the same command collects them again. Or start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
+    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
+    Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
+    foreach ($U in @($UncarriedSkipped))
+    {
+        Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID $TenantID -SubscriptionID $U.Id -Settings $RetryCommandSettings)) -ForegroundColor Red
+    }
+    Write-Host "=================================================================" -ForegroundColor Red
+}
+
 # === Per-subscription output verification (hard-stop) ========================
 #
 # Hard-fail with exit code 2 (distinct from auth/runtime exit code 1) if a
@@ -3552,7 +3582,7 @@ if ($ExpectedZipCount -gt 0)
     }
     elseif ($UncarriedSkipped.Count -gt 0)
     {
-        Write-Host ("Per-subscription output verification: INCOMPLETE ({0} zip(s) found, but {1} subscription(s) skipped by -Resume have no earlier report to carry - see FAILED (earlier report not carried) below)" -f $ActualZipCount, $UncarriedSkipped.Count) -ForegroundColor Red
+        Write-Host ("Per-subscription output verification: INCOMPLETE ({0} zip(s) found, but {1} subscription(s) skipped by -Resume have no earlier report to carry - see FAILED (earlier report not carried) above)" -f $ActualZipCount, $UncarriedSkipped.Count) -ForegroundColor Red
     }
     elseif ($CarriedReports.Count -gt 0)
     {
@@ -3562,6 +3592,34 @@ if ($ExpectedZipCount -gt 0)
     {
         Write-Host ("Per-subscription output verification: OK (each of the {0} successful sub(s) has its zip; {1} zip(s) found)" -f $ExpectedZipCount, $ActualZipCount) -ForegroundColor Green
     }
+}
+
+# A report that -Resume could not carry (FAILED (earlier report not carried)
+# above) and no gap of this run's own: the same stop, with the Exit code lines.
+if (@($UncarriedSkipped).Count -gt 0)
+{
+    $GapSubscriptionsFailed = @($FailedSubscriptions | Where-Object { $null -ne $_ }).Count -gt 0
+    if ($GapSubscriptionsFailed)
+    {
+        Write-Host ("Subscriptions Failed:    {0} (see the ERROR and FATAL lines above)" -f $FailedSubscriptions.Count) -ForegroundColor Red
+    }
+    Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
+    if ($WrapperTranscriptStarted)
+    {
+        Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
+    }
+    Write-Host ""
+    $GapConsumptionIncomplete = @(Get-ConsumptionIncompleteEntries -Entries $Global:ConsumptionFailedSubs).Count -gt 0
+    $GapMetricsIncomplete = @(Get-MetricsIncompleteEntries -Entries $Global:MetricsFailedSubs).Count -gt 0
+    foreach ($ExitLine in @(Get-WrapperExitCodeSummary -AuthSkipped $AuthSkipped -CollectorsFailed $CollectorsFailed -SubscriptionsFailed $GapSubscriptionsFailed -UnreadableStreams $UnreadableStreamSummaries -VerificationGap $true -ReportMade $false -ConsumptionFailed $GapConsumptionIncomplete -MetricsIncomplete $GapMetricsIncomplete))
+    {
+        Write-Host $ExitLine -ForegroundColor Yellow
+    }
+    if ($StreamStateNotMoved.Count -gt 0)
+    {
+        Stop-WrongShapeStateNotMoved -Files $StreamStateNotMoved -AfterCollection -NoExit -ResumeFailedOnly:$ResumeFailedOnly
+    }
+    Exit-Wrapper -Code 2
 }
 
 # Consolidate per-subscription ZIPs into a single outer ZIP
@@ -3705,7 +3763,7 @@ if ($null -ne $OuterZipFile)
     $RoleSkippedIds = @(@($NotReadableIds) + @(if ($null -ne $AccessDecision) { $AccessDecision.InaccessibleIds }) | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $ReportCoverage = Get-RunReportCoverage -Visible $AllSubscriptions -RunIds @($AllSubscriptions | Where-Object { $ExcludedIds -notcontains [string]$_.Id } | ForEach-Object { [string]$_.Id }) `
         -InZipIds $InZipIds -ReportsInZip $SubZips.Count -MissingReports $MissingReports -MissingReportCount $MissingReportCount `
-        -NotReadableIds $RoleSkippedIds -RetryLimited @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts) -Uncarried $UncarriedSkipped -FailedAttempts $FailedAttempts `
+        -NotReadableIds $RoleSkippedIds -RetryLimited @(Get-RetryLimitedAttempts -FailedAttempts $FailedAttempts) -FailedAttempts $FailedAttempts `
         -CompletedEarlierIds @(if ($ResumeFailedOnly) { Get-ZipOwedSubscriptionIds -CompletedIds $CompletedIds -InZipIds $InZipIds })
     $CoverageLines = @(Get-RunReportCoverageLines -Coverage $ReportCoverage -Obfuscated:$Obfuscate)
 }
@@ -4149,7 +4207,6 @@ $SubscriptionsFailed = @($FailedSubscriptions | Where-Object { $null -ne $_ }).C
 $ExitTwoReasons = @()
 # (The same test as the banner below, so a cleared state gives no 2.)
 if ((Test-Path -LiteralPath $ResumeStateFile -PathType Leaf) -and $ResumeStateSaveFailed) { $ExitTwoReasons += 'the resume state could not be saved (see the FAILED banner above)' }
-if (@($UncarriedSkipped).Count -gt 0) { $ExitTwoReasons += 'an earlier report could not be carried into the consolidated zip (see the FAILED banner above)' }
 if (@($LeftStreamFiles).Count -gt 0) { $ExitTwoReasons += 'a per-stream resume state file is kept (named above)' }
 if (@($RetryOwedNotInRun).Count -gt 0) { $ExitTwoReasons += 'a subscription on the retry list is not in this run (see Not In This Run)' }
 if (@($RetryLimitedOwed).Count -gt 0) { $ExitTwoReasons += 'a subscription past the retry limit was not collected (see Retry Limit Reached)' }
@@ -4494,29 +4551,6 @@ if (@($Global:CollectorFailures).Count -gt 0)
     Write-Host "Re-run to retry, or investigate the error(s) above if they repeat." -ForegroundColor Red
     Write-Host "The rest of the inventory completed and the report was still produced." -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Red
-}
-
-# A subscription -Resume skipped as completed whose earlier report zip could not
-# be carried is missing from the consolidated zip. Named here with the reason and
-# the way to collect it; sets exit code 2 below.
-if (@($UncarriedSkipped).Count -gt 0)
-{
-    Write-Host ""
-    Write-Host "============== FAILED (earlier report not carried) ==============" -ForegroundColor Red
-    Write-Host ("{0} subscription(s) were skipped by -Resume as completed by an earlier run, but that run's report could not be carried into the consolidated zip:" -f @($UncarriedSkipped).Count) -ForegroundColor Red
-    foreach ($U in @($UncarriedSkipped))
-    {
-        Write-Host ("  - {0} ({1}): {2}" -f $U.Name, $U.Id, $U.Reason) -ForegroundColor Red
-    }
-    # Each command carries the run's settings.
-    Write-Host "Their reports are NOT in the consolidated zip. Start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
-    Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
-    Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
-    foreach ($U in @($UncarriedSkipped))
-    {
-        Write-Host ('  ' + (Get-DirectRunRetryCommand -TenantID $TenantID -SubscriptionID $U.Id -Settings $RetryCommandSettings)) -ForegroundColor Red
-    }
-    Write-Host "=================================================================" -ForegroundColor Red
 }
 
 # A subscription whose billing download failed or stopped part-way for a reason

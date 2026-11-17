@@ -2282,7 +2282,17 @@ Describe 'The recovery line after an interrupted parallel run' -Skip:$IsWindows 
         $R = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         script:Get-RecoveryLines $R | Should -Be @('Recovered per-stream state from an interrupted parallel run: 2 completed, 0 failed subscription record(s).')
         script:Get-Collected $R | Should -Be (script:Get-Ids 'C')
-        script:Test-CleanLine $R | Should -BeTrue
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        # Those older files record no report for A and B, so -Resume cannot
+        # carry them: a missing report stops the run before its consolidated
+        # zip (ruling 1) and puts A and B back on the retry list. The next
+        # -Resume collects them and ends clean.
+        $R.ExitCode | Should -Be 2
+        @($R.Text | Where-Object { $_ -like '*= FAILED (earlier report not carried) =*' }).Count | Should -Be 1
+        script:Test-CleanLine $R | Should -BeFalse
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Test-CleanLine $R2 | Should -BeTrue
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
     }
 }
