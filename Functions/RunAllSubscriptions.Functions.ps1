@@ -3638,9 +3638,13 @@ function Get-RunLockRunKey
 # New-CompletedReportRecord writes it.
 function Test-ReportZipRecordPath
 {
-    param([string]$Path)
+    # $Separators: the characters the file system splits a path on, the
+    # platform's own ('/' on Unix, '\' and '/' on Windows). A backslash on Unix
+    # is part of one file name, so 'folder\report.zip' is one name there, a file
+    # at the top of the inventory folder, and is refused.
+    param([string]$Path, [char[]]$Separators = @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar))
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $Parts = @($Path -split '[\\/]' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+    $Parts = @($Path.Split($Separators) | Where-Object { $_ -ne '' -and $_ -ne '.' })
     return ($Parts.Count -ge 2 -and $Parts[-1] -like '*.zip')
 }
 

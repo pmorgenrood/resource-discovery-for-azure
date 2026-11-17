@@ -409,6 +409,32 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Items[0].Name | Should -Be 'ResourcesReport_a.zip'
     }
 
+    It 'Test-ReportZipRecordPath splits on the platform''s own separators: a backslash on Unix is part of one file name, both slashes split on Windows' {
+        # The Windows cases pass that platform's separators, so they run anywhere.
+        $Windows = [char[]]@('\', '/')
+        Test-ReportZipRecordPath -Path 'folder\report.zip' -Separators $Windows | Should -BeTrue
+        Test-ReportZipRecordPath -Path 'folder/report.zip' -Separators $Windows | Should -BeTrue
+        Test-ReportZipRecordPath -Path 'report.zip' -Separators $Windows | Should -BeFalse
+        $Unix = [char[]]@('/')
+        Test-ReportZipRecordPath -Path 'folder/report.zip' -Separators $Unix | Should -BeTrue
+        Test-ReportZipRecordPath -Path 'folder\report.zip' -Separators $Unix | Should -BeFalse
+        # The default is the platform this runs on.
+        Test-ReportZipRecordPath -Path 'folder\report.zip' | Should -Be ([System.IO.Path]::DirectorySeparatorChar -eq '\')
+        Test-ReportZipRecordPath -Path 'folder/report.zip' | Should -BeTrue
+    }
+
+    It 'Get-RunReportZipItems refuses a record whose backslash is no separator here: on Unix a file named folder\report.zip at the top of the inventory folder is not a report zip' -Skip:([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        $Root = Join-Path $script:TestRoot ('zipitems_bs_' + [guid]::NewGuid().ToString().Substring(0, 6))
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+        [System.IO.File]::WriteAllText(($Root + '/folder\report.zip'), 'zip')
+        # Join-Path turns that backslash into a slash, so a record that names a
+        # file the file system calls one name must not be read as folder/report.zip.
+        New-Item -ItemType Directory -Path (Join-Path $Root 'folder') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Root 'folder/report.zip') -Value 'zip'
+        $Items = @(Get-RunReportZipItems -InventoryRoot $Root -Reports @([pscustomobject]@{ Id = 'sub-a'; Zip = 'folder\report.zip' }))
+        $Items.Count | Should -Be 0
+    }
+
     It 'gives back the checked RunReports and FailedStep, the only copies the wrapper reads' {
         $Json = '{"StreamId":"0","Status":"ok","ResourceCounts":[' + $script:GoodRow + '],"RunReports":[{"Id":"sub-a","Name":"Sub A","Zip":"ResourcesReport_a/ResourcesReport_a.zip","Obfuscated":true}]}'
         $Read = Read-Case -Json $Json
