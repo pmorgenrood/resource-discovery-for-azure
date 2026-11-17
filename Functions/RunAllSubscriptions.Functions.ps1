@@ -1316,7 +1316,7 @@ function Write-NotCountedRetrySummary
     param([object]$FailedAttempts)
     $List = @(@($FailedAttempts) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['NotCounted'] -and $_.NotCounted -eq $true })
     if ($List.Count -eq 0) { return }
-    Write-Host ("Not counted toward the retry limit: {0} ({1}) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. Run with -ParallelStreams 1 to collect them without stream workers." -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    Write-Host ("Not counted toward the retry limit: {0} ({1}) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. The next run that continues this one collects them with one stream, which needs no Az context snapshot." -f $List.Count, (@($List | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
 }
 
 # Remove a sub's FailedAttempts entry once it has succeeded on a retry, so

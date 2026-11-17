@@ -209,7 +209,7 @@ catch
     $Reason = $_.Exception.Message
     if ($ImportStep -eq 'autosave')
     {
-        Write-Stream ("FATAL: {0} Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers." -f $Reason) 'Red'
+        Write-Stream ("FATAL: {0} Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot." -f $Reason) 'Red'
         $SubReason = 'stream did not start: Az context autosave could not be turned off'
     }
     elseif ($ImportStep -eq 'module')

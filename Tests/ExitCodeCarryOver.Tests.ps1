@@ -1046,7 +1046,7 @@ function Get-UsageAggregates
         # Run 2, -Resume, two streams asked for, and the snapshot still cannot be
         # imported: a run with one stream uses no snapshot, so it collects them.
         $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -ImportFailStream '0' -ReuseHome $Run.Home
-        $Next.Console | Should -Match ([regex]::Escape('Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed)')) -Because $Next.Console
+        $Next.Console | Should -Match ([regex]::Escape('Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed; this covers all of this run''s subscriptions, also when -ParallelStreams was passed, because one stream needs no snapshot)')) -Because $Next.Console
         $Next.Console | Should -Not -Match 'FATAL: could not import Az context' -Because $Next.Console
         @($Next.FailedIds) | Should -BeNullOrEmpty -Because $Next.Console
         $Next.StateKept | Should -BeFalse -Because $Next.Console

@@ -1956,7 +1956,7 @@ if ($NothingLeftToCollect -and $ParallelStreams -gt 1)
 elseif ($SnapshotNotLoaded.Count -gt 0 -and $ParallelStreams -gt 1)
 {
     $StreamsAsked = if ($StreamsAuto) { 'the {0} chosen automatically' -f $ParallelStreams } else { 'the {0} passed' -f $ParallelStreams }
-    Write-Host ("Parallelism: -ParallelStreams 1 (the last run's stream could not load its Az context snapshot for {0} subscription(s) on the retry list, so one stream instead of {1}), -ConcurrencyLimit {2} ({3})." -f $SnapshotNotLoaded.Count, $StreamsAsked, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
+    Write-Host ("Parallelism: -ParallelStreams 1 (the last run's stream could not load its Az context snapshot for {0} subscription(s) on the retry list, so one stream instead of {1}; this covers all of this run's subscriptions, also when -ParallelStreams was passed, because one stream needs no snapshot), -ConcurrencyLimit {2} ({3})." -f $SnapshotNotLoaded.Count, $StreamsAsked, $ConcurrencyLimit, $ConcurrencySrc) -ForegroundColor DarkGray
     $ParallelStreams = 1
     $StreamsSrc = 'snapshot not loaded on the last run'
 }

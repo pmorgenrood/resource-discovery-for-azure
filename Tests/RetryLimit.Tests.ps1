@@ -1287,7 +1287,7 @@ Describe 'A stream that did not start on the parallel path' {
             [int]$Entry.Attempts | Should -Be 0
             $Entry.Reason | Should -Be 'stream did not start: Az context autosave could not be turned off'
         }
-        @(script:Get-Lines -Run $Run -Like 'Not counted toward the retry limit:*') | Should -Be @("Not counted toward the retry limit: 2 (Sub A, Sub B) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. Run with -ParallelStreams 1 to collect them without stream workers.")
+        @(script:Get-Lines -Run $Run -Like 'Not counted toward the retry limit:*') | Should -Be @("Not counted toward the retry limit: 2 (Sub A, Sub B) - the last run for these did not start their stream (it did not load its Az context snapshot), so that run is not counted as a failed run; each keeps its count. The next run that continues this one collects them with one stream, which needs no Az context snapshot.")
         $Run.Result.WrapperExitCode | Should -Be 2
 
         # A run whose stream starts and fails a subscription counts it, and the

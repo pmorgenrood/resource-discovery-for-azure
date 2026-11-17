@@ -948,7 +948,7 @@ Start-Sleep -Seconds 600
         $Fatal.Count | Should -Be 2 -Because ($Result.Text -join ' | ')
         foreach ($Line in $Fatal)
         {
-            $Line | Should -BeLike ('*({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user''s Az profile files. Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers.' -f $Detail)
+            $Line | Should -BeLike ('*({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user''s Az profile files. Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot.' -f $Detail)
         }
         @($Result.Text | Where-Object { $_ -like '`[stream-?`] stream status: failed-to-start - Az context autosave could not be turned off*' }).Count | Should -Be 2
 
@@ -978,7 +978,7 @@ Start-Sleep -Seconds 600
         # own process with no snapshot: it collects both and clears the entries.
         $Next = script:Invoke-Wrapper -Streams 2 -Autosave 'stuck' -Resume
         $Next.ExitCode | Should -Be 0 -Because ($Next.Text -join ' | ')
-        @($Next.Text | Where-Object { $_ -like 'Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed)*' }).Count | Should -Be 1 -Because ($Next.Text -join ' | ')
+        @($Next.Text | Where-Object { $_ -like 'Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed; this covers all of this run''s subscriptions, also when -ParallelStreams was passed, because one stream needs no snapshot)*' }).Count | Should -Be 1 -Because ($Next.Text -join ' | ')
         @($Next.Text | Where-Object { $_ -like '*FATAL*' }).Count | Should -Be 0
         @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 2
         Test-Path -LiteralPath $State | Should -BeFalse -Because 'every subscription is collected, so the resume state is cleared'
