@@ -3505,7 +3505,7 @@ foreach ($Record in @($UnconfirmedStreamReports))
     if ($null -eq $Record -or $Record -is [string] -or $Record -is [ValueType] -or $null -eq $Record.PSObject.Properties['Id']) { continue }
     $RecZip = $Record.PSObject.Properties['Zip']
     if ($null -eq $RecZip -or $RecZip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($RecZip.Value)) { continue }
-    if ([System.IO.Path]::IsPathRooted($RecZip.Value) -or (@($RecZip.Value -split '[\\/]') -contains '..')) { continue }
+    if ([System.IO.Path]::IsPathRooted($RecZip.Value) -or (@($RecZip.Value -split '[\\/]') -contains '..') -or -not (Test-ReportZipRecordPath -Path $RecZip.Value)) { continue }
     $RecId = [string]$Record.Id
     if ($SeenUnconfirmed.ContainsKey($RecId) -or @($SubResourceCounts | Where-Object { [string]$_.Id -eq $RecId }).Count -gt 0) { continue }
     if (Test-Path -LiteralPath (Join-Path $InventoryRoot $RecZip.Value) -PathType Leaf) { continue }

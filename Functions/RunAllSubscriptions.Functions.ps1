@@ -3578,6 +3578,17 @@ function Get-RunLockRunKey
     return $Hex.Substring(0, 8).ToLowerInvariant()
 }
 
+# Whether a report record's Zip (a path relative to the inventory folder) has the
+# shape of a report zip: a .zip file one or more folders down, as
+# New-CompletedReportRecord writes it.
+function Test-ReportZipRecordPath
+{
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $Parts = @($Path -split '[\\/]' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+    return ($Parts.Count -ge 2 -and $Parts[-1] -like '*.zip')
+}
+
 # The report zips this run wrote, from its own records (New-CompletedReportRecord,
 # one per subscription that wrote a zip this run, complete or not), each once and
 # only when it is still on disk under the inventory root. Not every zip written
@@ -3593,6 +3604,10 @@ function Get-RunReportZipItems
         $Zip = $Report.PSObject.Properties['Zip']
         if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
         if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..')) { continue }
+        # A report zip is a .zip in a report folder, never a file in the inventory
+        # folder itself (its state files, its context snapshots, an earlier run's
+        # consolidated zip) or one that is not a zip.
+        if (-not (Test-ReportZipRecordPath -Path $Zip.Value)) { continue }
         $Item = Get-Item -LiteralPath (Join-Path $InventoryRoot $Zip.Value) -ErrorAction SilentlyContinue
         if ($null -eq $Item -or $Item.PSIsContainer -or $Seen.ContainsKey($Item.FullName)) { continue }
         $Seen[$Item.FullName] = $true
@@ -5380,7 +5395,7 @@ function Resolve-StreamSummary
             $Obf = & $Field $Row 'Obfuscated'
             $IdOk = $null -ne $Id -and (& $IsText $Id.Value) -and $Id.Value -ne ''
             $NameOk = $null -eq $RowName -or (& $IsTextOrEmpty $RowName.Value)
-            $ZipOk = $null -ne $Zip -and (& $IsText $Zip.Value) -and $Zip.Value -ne '' -and $(try { -not [System.IO.Path]::IsPathRooted($Zip.Value) } catch { $false }) -and (@($Zip.Value -split '[\\/]') -notcontains '..')
+            $ZipOk = $null -ne $Zip -and (& $IsText $Zip.Value) -and $Zip.Value -ne '' -and $(try { -not [System.IO.Path]::IsPathRooted($Zip.Value) } catch { $false }) -and (@($Zip.Value -split '[\\/]') -notcontains '..') -and (Test-ReportZipRecordPath -Path $Zip.Value)
             $ObfOk = $null -eq $Obf -or $Obf.Value -is [bool]
             $Ok = $IdOk -and $NameOk -and $ZipOk -and $ObfOk
         }
@@ -5392,7 +5407,7 @@ function Resolve-StreamSummary
             Obfuscated = if ($null -eq $Obf) { $false } else { [bool]$Obf.Value }
         }
     }
-    if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its RunReports row(s) have no Id, or a Zip that is not a path under the inventory folder' -f $BadRows)) }
+    if ($BadRows -gt 0) { return (& $NotConfirmed ('{0} of its RunReports row(s) have no Id, or a Zip that is not a .zip file in a report folder under the inventory folder' -f $BadRows)) }
 
     # Success rows: Count must be there (on a row with no Count, $Row.Count is
     # PowerShell's own count of 1) and a whole number of 0 or more; Zip empty

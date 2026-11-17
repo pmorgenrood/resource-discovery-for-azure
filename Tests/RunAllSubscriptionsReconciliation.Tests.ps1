@@ -396,6 +396,19 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Wrapper | Should -Match 'Resolve-StreamSummary[^\r\n]*-InventoryRoot \$InventoryRoot'
     }
 
+    It 'Get-RunReportZipItems takes only a .zip in a report folder: not a state file, a consolidated zip at the top of the inventory folder, or a file that is not a zip' {
+        $Root = Join-Path $script:TestRoot ('zipitems_' + [guid]::NewGuid().ToString().Substring(0, 6))
+        New-Item -ItemType Directory -Path (Join-Path $Root 'ResourcesReport_a') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Root 'ResourcesReport_a/ResourcesReport_a.zip') -Value 'zip'
+        Set-Content -LiteralPath (Join-Path $Root 'ResourcesReport_a/notes.txt') -Value 'x'
+        Set-Content -LiteralPath (Join-Path $Root 'AllSubscriptions_ResourcesReport_old.zip') -Value 'zip'
+        Set-Content -LiteralPath (Join-Path $Root '.resume-state-x.json') -Value '{}'
+        $Records = @('ResourcesReport_a/ResourcesReport_a.zip', 'AllSubscriptions_ResourcesReport_old.zip', '.resume-state-x.json', 'ResourcesReport_a/notes.txt' | ForEach-Object { [pscustomobject]@{ Id = 'sub-a'; Zip = $_ } })
+        $Items = @(Get-RunReportZipItems -InventoryRoot $Root -Reports $Records)
+        $Items.Count | Should -Be 1
+        $Items[0].Name | Should -Be 'ResourcesReport_a.zip'
+    }
+
     It 'gives back the checked RunReports and FailedStep, the only copies the wrapper reads' {
         $Json = '{"StreamId":"0","Status":"ok","ResourceCounts":[' + $script:GoodRow + '],"RunReports":[{"Id":"sub-a","Name":"Sub A","Zip":"ResourcesReport_a/ResourcesReport_a.zip","Obfuscated":true}]}'
         $Read = Read-Case -Json $Json
@@ -421,6 +434,8 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         @{ Case = 'RunReports row has no Id'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Zip":"a/a.zip"}]}'; Reason = 'RunReports row' }
         @{ Case = 'RunReports row Zip is rooted'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"/other/tenant/b.zip"}]}'; Reason = 'RunReports row' }
         @{ Case = 'RunReports row Zip goes up a folder'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"../b/b.zip"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Zip is a file in the inventory folder itself'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"AllSubscriptions_ResourcesReport_old.zip"}]}'; Reason = 'RunReports row' }
+        @{ Case = 'RunReports row Zip is not a .zip file'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"a/.resume-state-x.json"}]}'; Reason = 'RunReports row' }
         @{ Case = 'RunReports row Zip is a number'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":5}]}'; Reason = 'RunReports row' }
         @{ Case = 'RunReports row Obfuscated is text'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":[{"Id":"sub-a","Zip":"a/a.zip","Obfuscated":"yes"}]}'; Reason = 'RunReports row' }
         @{ Case = 'RunReports row is text'; Json = '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1}],"RunReports":["a/a.zip"]}'; Reason = 'RunReports row' }
