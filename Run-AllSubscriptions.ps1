@@ -2022,6 +2022,18 @@ if (-not ($Resume -or $ResumeFailedOnly))
     }
 }
 
+# The failed-run count of each retry-list entry as this run starts collecting.
+# The write-ahead step counts one more run before a subscription is collected,
+# and a good result takes the entry away; a zip that is then gone before the
+# consolidated zip is built puts the subscription back with that count (the
+# output check below), so a zip that goes missing on every run reaches the
+# retry limit instead of starting again at 1.
+$CollectStartAttemptCounts = @{}
+foreach ($StartEntry in @($FailedAttempts | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) }))
+{
+    $CollectStartAttemptCounts[[string]$StartEntry.Id] = Get-FailedAttemptCount -Entry $StartEntry
+}
+
 if ($ParallelStreams -le 1)
 {
     # === SEQUENTIAL PATH (default) ============================================
@@ -3492,7 +3504,11 @@ if ($ExpectedZipCount -gt 0)
             {
                 $CompletedIds = @($CompletedIds | Where-Object { $_ -ne [string]$Gone.Id })
                 $CompletedReports = @($CompletedReports | Where-Object { $null -ne $_ -and [string]$_.Id -ne [string]$Gone.Id })
-                $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$Gone.Id) -Name ([string]$Gone.Name) -Reason 'its report zip was written and was gone before the consolidated zip was built'
+                # The write-ahead step counted this run before the good result
+                # took the entry away: the entry comes back with that count
+                # (one more than at the start of collecting), not with 1.
+                $StartCount = if ($null -ne $CollectStartAttemptCounts -and $CollectStartAttemptCounts.ContainsKey([string]$Gone.Id)) { [int]$CollectStartAttemptCounts[[string]$Gone.Id] } else { 0 }
+                $FailedAttempts = Set-FailedAttemptReason -Existing $FailedAttempts -Id ([string]$Gone.Id) -Name ([string]$Gone.Name) -Reason 'its report zip was written and was gone before the consolidated zip was built' -AtLeast ($StartCount + 1)
             }
             if ($GoneCompleted.Count -gt 0)
             {

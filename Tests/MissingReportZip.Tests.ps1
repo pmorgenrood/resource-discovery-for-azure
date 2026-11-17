@@ -307,6 +307,34 @@ Describe 'A subscription whose report zip is missing' -Skip:$IsWindows {
         $R2.Text | Should -Contain "  Found zips:    2 (this run's report records, plus 2 carried from an earlier run)"
     }
 
+    It 'a report zip removed after it is written on every run counts one more failed run each time, so the fourth run stops collecting it (Retry Limit Reached) and builds the consolidated zip of the others' {
+        script:New-Case
+        $A = $script:Subs | Where-Object { $_.Name -eq 'Sub A' }
+        $C = $script:Subs | Where-Object { $_.Name -eq 'Sub C' }
+        # Sub C's collection removes Sub A's zip after Sub A wrote it, on every
+        # run (as an antivirus would). Sub C's metrics are left incomplete, so
+        # Sub C stays on the retry list and is collected after Sub A each run.
+        # Sequential, so the order is fixed.
+        script:Set-Scenario -GoneSub $A.Id -GoneBy $C.Id -Incomplete @($C.Id)
+        foreach ($N in 1..3)
+        {
+            $R = script:Invoke-Wrapper
+            $R.ExitCode | Should -Be 2 -Because ($R.Text -join "`n")
+            $R.NewZips | Should -Be 0 -Because ($R.Text -join "`n")
+            script:Get-GapNames $R | Should -Be @(('  - {0} ({1}) [1 resources]' -f $A.Name, $A.Id)) -Because ('run {0}: {1}' -f $N, ($R.Text -join "`n"))
+            $Entries = @($R.State.FailedAttempts | Where-Object { [string]$_.Id -eq $A.Id })
+            $Entries.Count | Should -Be 1 -Because ('run {0}' -f $N)
+            $Entries[0].Attempts | Should -Be $N -Because ('run {0}: one more failed run each time the zip is gone' -f $N)
+        }
+        $R4 = script:Invoke-Wrapper
+        $R4.Text | Should -Contain ('Not retried: {0} ({1}) failed 3 runs in a row; last reason: its report zip was written and was gone before the consolidated zip was built. A run that continues this one, with or without -Resume, does not collect it without -RetryLimitReached; to try it again, run the same command with -Resume -RetryLimitReached in place of -Fresh or -ResumeFailedOnly (it keeps what the unfinished run completed), or start a new run with -Fresh (it collects everything this run covers again).' -f $A.Name, $A.Id) -Because ($R4.Text -join "`n")
+        @($R4.Text | Where-Object { $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 1 -Because ($R4.Text -join "`n")
+        $R4.Text | Should -Not -Contain 'ERROR: Per-subscription output verification failed.' -Because ($R4.Text -join "`n")
+        $R4.ExitCode | Should -Be 2 -Because ($R4.Text -join "`n")
+        $R4.NewZips | Should -Be 1 -Because ($R4.Text -join "`n")
+        $R4.Zip.Ids | Should -Be (script:Get-Ids 'B')
+    }
+
     It '<Case>: a report zip whose time is before the run''s start (a share whose clock runs behind) is found by its record, and the run ends clean with every report' -ForEach @(
         @{ Case = 'sequential'; Streams = 1 }
         @{ Case = 'two streams'; Streams = 2 }
