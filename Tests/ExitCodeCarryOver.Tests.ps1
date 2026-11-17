@@ -1250,6 +1250,8 @@ function Get-UsageAggregates
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
         $Run.Console | Should -Match ([regex]::Escape($script:SubA.Id)) -Because $Run.Console
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        # The subscription is taken off the completed list and put on the retry list.
+        $Run.FailedIds | Should -Contain $script:SubA.Id -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 
