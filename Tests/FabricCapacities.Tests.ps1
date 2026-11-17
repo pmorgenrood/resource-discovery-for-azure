@@ -118,6 +118,14 @@ BeforeAll {
             if ($Row.AirflowStatus -notin @('Collected', 'NoAirflowJobs', 'NoFabricAccess', 'CapacityNotLinked', 'ApiUnavailable', 'Throttled', 'Partial')) { $Problems.Add('AirflowStatus word') }
             if ($Row.ActiveHoursSource -notin @('ActivityLog', 'Unavailable')) { $Problems.Add('ActiveHoursSource word') }
             if (-not (& $IsCount $Row.WindowHours)) { $Problems.Add('WindowHours not a whole number') }
+            # ConvertFrom-Json turns ISO date text into [datetime]; the file holds the text either way.
+            foreach ($W in @('WindowStart', 'WindowEnd'))
+            {
+                if ($null -eq $Row.PSObject.Properties[$W]) { continue }
+                $V = $Row.$W
+                $Ok = if ($V -is [datetime]) { $V.TimeOfDay -eq [timespan]::Zero } else { [string]$V -match '^\d{4}-\d{2}-\d{2}T00:00:00Z$' }
+                if (-not $Ok) { $Problems.Add("$W not a UTC ISO 8601 midnight") }
+            }
             if (-not (& $IsCount $Row.ActiveHours -Nullable)) { $Problems.Add('ActiveHours not null or a whole number') }
             foreach ($Job in @($Row.AirflowJobs))
             {
@@ -582,6 +590,22 @@ Describe 'FabricCapacities collector' {
         $Row.WindowHours | Should -BeOfType [int]
         $Row.WindowHours | Should -Be 720 -Because 'the window is 30 UTC days, whatever the host time zone'
         $Row.ActiveHours | Should -Be 720 -Because 'an Active capacity with no pause or resume ran every hour of the window'
+    }
+
+    It 'writes the window start and end on every row as UTC ISO 8601 text, 720 hours apart, whatever the host culture' {
+        $Old = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        try
+        {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::new('th-TH')
+            $Row = @(Invoke-Collector @((Get-TestCapacityRow)))[0]
+        }
+        finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $Old }
+        $Inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $Row.WindowStart | Should -BeOfType [string]
+        $Row.WindowStart | Should -Be ((Get-Date).Date.AddDays(-31).ToString('yyyy-MM-dd', $Inv) + 'T00:00:00Z')
+        $Row.WindowEnd | Should -Be ((Get-Date).Date.AddDays(-1).ToString('yyyy-MM-dd', $Inv) + 'T00:00:00Z')
+        $Span = [datetimeoffset]::Parse($Row.WindowEnd, $Inv) - [datetimeoffset]::Parse($Row.WindowStart, $Inv)
+        $Span.TotalHours | Should -Be $Row.WindowHours
     }
 
     It 'takes the window from the same local dates the consumption read sends, read as UTC days' {

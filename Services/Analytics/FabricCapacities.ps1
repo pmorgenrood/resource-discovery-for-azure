@@ -160,6 +160,9 @@ if ($Task -eq 'Processing')
         $WindowStart = [datetime]::SpecifyKind($LocalToday.AddDays(-31), [System.DateTimeKind]::Utc)
         $WindowEnd = [datetime]::SpecifyKind($LocalToday.AddDays(-1), [System.DateTimeKind]::Utc)
         $WindowHours = [int][math]::Round(($WindowEnd - $WindowStart).TotalHours)
+        # The window as written on every row: UTC, ISO 8601, invariant culture (for example 2026-10-17T00:00:00Z).
+        $WindowStartText = $WindowStart.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $WindowEndText = $WindowEnd.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
 
         # Fabric side, read once per run: the caller's Fabric capacities and workspaces.
         # Fail-safe: any error in these reads is a status word on every row, never a collector failure.
@@ -319,6 +322,8 @@ if ($Task -eq 'Processing')
                 'Location'          = $1.LOCATION;
                 'SKU'               = if ([string]::IsNullOrEmpty([string]$1.SKU.name)) { $null } else { [string]$1.SKU.name };
                 'State'             = if ([string]::IsNullOrEmpty([string]$Data.state)) { $null } else { [string]$Data.state };
+                'WindowStart'       = $WindowStartText;
+                'WindowEnd'         = $WindowEndText;
                 'WindowHours'       = $WindowHours;
                 'ActiveHours'       = $ActiveHours;
                 'ActiveHoursSource' = $ActiveHoursSource;

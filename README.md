@@ -73,7 +73,7 @@ Before any other work, the run checks the signed-in identity's roles on every su
 
 #### Microsoft Fabric capacities (optional)
 
-When the scope holds a Microsoft Fabric capacity (`microsoft.fabric/capacities`), the inventory gets a `FabricCapacities` section: the capacity's SKU, the hours it ran in the consumption window (read from the Azure activity log with the Reader role), and the pool settings of each Apache Airflow job on it (node size, shutdown policy, minimum and maximum node count).
+When the scope holds a Microsoft Fabric capacity (`microsoft.fabric/capacities`), the inventory gets a `FabricCapacities` section: the capacity's SKU, the consumption window (`WindowStart`, `WindowEnd`, UTC), the hours it ran in that window (read from the Azure activity log with the Reader role), and the pool settings of each Apache Airflow job on it (node size, shutdown policy, minimum and maximum node count).
 
 - The Airflow settings come from the Fabric REST API, which uses Fabric roles, not Azure roles. The signed-in identity needs:
   - **Capacity admin or contributor** on each Fabric capacity (the Fabric capacity list, which links the Azure capacity to its Fabric capacity by name, region and SKU, shows only those capacities); without it the row says `CapacityNotLinked`;
