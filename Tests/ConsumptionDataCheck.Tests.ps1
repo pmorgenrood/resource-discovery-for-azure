@@ -218,6 +218,8 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         $Helper = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Get-ReportFolderName' }, $true))
         if ($Helper.Count -ne 1) { throw 'Get-ReportFolderName was not found in ResourceInventory.ps1.' }
         . ([scriptblock]::Create($Helper[0].Extent.Text))
+        # Get-RdaErrorFacts and the other helpers ResourceInventory.ps1 dot-sources at its start.
+        . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
         function Test-DataPlaneAuthReady { param($Phase) $true }
 
         function New-UsageRow
