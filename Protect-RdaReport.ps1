@@ -125,7 +125,7 @@ $WorkOut = Join-Path $Work 'out'
 $ExitCode = 1
 # The run's masking reads and fills these globals; they hold real values while the
 # mask runs, so the caller's own values are put back at the end, in any case.
-$GlobalNames = 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'TagValueDictionary', 'FreeTextDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'ObfuscationSubscriptionIndex', 'RdaNoIdRealNames', 'Subscriptions', 'CollectorFailures', 'MetricsFailedSubs', 'ConsumptionFailedSubs'
+$GlobalNames = 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'TagValueDictionary', 'FreeTextDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'ObfuscationSubscriptionIndex', 'Subscriptions', 'CollectorFailures', 'MetricsFailedSubs', 'ConsumptionFailedSubs'
 $SavedGlobals = @{}
 foreach ($G in $GlobalNames) { $SavedGlobals[$G] = Get-Variable -Name $G -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
 try
@@ -278,7 +278,6 @@ try
         # New-ObfuscatedRowIdWithoutId's per-run state, reset as a run's Variables resets it.
         $script:RdaNoIdRowsSeen = $null
         $script:RdaNoIdNameIndex = $null
-        $Global:RdaNoIdRealNames = $null
         $Global:CollectorFailures = @()
         $Global:MetricsFailedSubs = @()
         $Global:ConsumptionFailedSubs = @()

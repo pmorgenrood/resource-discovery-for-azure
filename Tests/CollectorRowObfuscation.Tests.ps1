@@ -166,6 +166,14 @@ Describe 'Masking the collector rows under -Obfuscate' {
         @($Global:ResourceIdDictionary.Keys | Where-Object { $_ -match '~[0-9a-f]{8}-2$' }).Count | Should -Be 1 -Because 'the second row with the same four values adds -2'
     }
 
+    It 'keeps no list of the real names of rows with no id, since nothing reads one' {
+        $Global:RdaNoIdRealNames = $null
+        $null = Invoke-RowMasking -Result @(New-Row -Id '' -Name 'plan-secret-a') -ModName 'AppServicePlan'
+        $Global:RdaNoIdRealNames | Should -BeNullOrEmpty -Because 'a real name kept where no code reads it only adds a copy to protect'
+        $Products = @(Get-ChildItem -LiteralPath (Split-Path $PSScriptRoot -Parent) -Recurse -Filter '*.ps1' | Where-Object { $_.FullName -notmatch '[\\/]Tests[\\/]' })
+        @($Products | Select-String -SimpleMatch 'RdaNoIdRealNames').Count | Should -Be 0 -Because 'the variable was the old diagnostics scrub''s input, and that scrub is gone'
+    }
+
     It 'hashes with SHA256.Create and ComputeHash, not SHA256.HashData or Convert.ToHexString, which need .NET 5 (PowerShell 7.1), while the scripts accept PowerShell 7.0' {
         $Ast = (Get-Command -Name New-ObfuscatedRowIdWithoutId -CommandType Function).ScriptBlock.Ast
         $Members = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.MemberExpressionAst] }, $true) | ForEach-Object { [string]$_.Member })

@@ -123,9 +123,6 @@ function Variables
     # New-ObfuscatedRowIdWithoutId's count of no-id rows and name index, per run.
     $script:RdaNoIdRowsSeen = $null
     $script:RdaNoIdNameIndex = $null
-    # Stand-in path -> the row's real name (the path writes a '/' as '_'),
-    # for the shareable diagnostics log's scrub.
-    $Global:RdaNoIdRealNames = $null
 
     if ($Obfuscate.IsPresent)
     {
@@ -197,6 +194,11 @@ function Get-ObfuscationSubscriptionIndex
 # segment is empty or '$system'); any other '/providers/...' value gets one
 # flat token. The seed check asks the same, so it treats a seeded value the
 # way this run would write it.
+# Why the shape is kept: a tenant-scope id has no subscription, so masking
+# must not invent one; masking keeps the real id's shape (mask-keep-shape.md).
+# Open for the owner (Peter) to confirm: the output contract's line "every
+# masked id is /subscriptions/..." does not cover these ids. Changing this
+# shape is an output change.
 function Test-RdaTenantScopeIdMaskable
 {
     param([string]$ResourceId)
@@ -232,6 +234,11 @@ function Get-ObfuscatedResourceId
     # name segment can be a token: each type has a name, and no segment is
     # empty or the fixed name '$system'. Any other '/providers/...' value
     # gets one flat token, as before (not changed here).
+    # Why the shape is kept: the real id has no subscription, so masking must
+    # not invent one. Masking keeps the shape of the real id (mask-keep-shape.md).
+    # Open for the owner (Peter) to confirm: rdfa-output-contract.md says every
+    # masked id is /subscriptions/..., which does not cover these tenant-scope
+    # ids, since they have no subscription. Changing this shape is an output change.
     $IsTenantScope = Test-RdaTenantScopeIdMaskable -ResourceId $ResourceId
     if ($IsTenantScope)
     {
@@ -399,11 +406,6 @@ function New-ObfuscatedRowIdWithoutId
     $script:RdaNoIdRowsSeen[$Key] = 1 + [int]$script:RdaNoIdRowsSeen[$Key]
     $Suffix = if ($script:RdaNoIdRowsSeen[$Key] -gt 1) { '{0}-{1}' -f $Hash, $script:RdaNoIdRowsSeen[$Key] } else { $Hash }
     $StandIn = '/subscriptions/{0}/resourcegroups/{1}/providers/rda.noid/{2}/{3}~{4}' -f $SubSegment, $RgSegment, $Type, $NameBase, $Suffix
-    if (-not [string]::IsNullOrEmpty($Name))
-    {
-        if ($null -eq $Global:RdaNoIdRealNames) { $Global:RdaNoIdRealNames = @{} }
-        $Global:RdaNoIdRealNames[$StandIn] = $Name
-    }
 
     # A seeded run already holds this stand-in's masked id: keep it.
     $Masked = $null
