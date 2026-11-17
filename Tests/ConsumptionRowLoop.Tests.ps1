@@ -37,6 +37,10 @@ BeforeAll {
     $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'GetResorceConsumption' }, $true))
     if ($Fn.Count -ne 1) { throw 'GetResorceConsumption was not found.' }
     . ([scriptblock]::Create($Fn[0].Extent.Text))
+    # Get-ReportFolderName, which the lifted function calls for the folder name
+    # (an older source file may not have it).
+    $Helper = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Get-ReportFolderName' }, $true))
+    if ($Helper.Count -eq 1) { . ([scriptblock]::Create($Helper[0].Extent.Text)) }
 
     function Get-UsageAggregates { param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) }
     function Set-AzContext { param($Subscription, $Context, $Scope) }

@@ -115,7 +115,9 @@ function global:Start-Sleep { param($Seconds, $Milliseconds) }
 # The stream worker imports Az.Accounts before it imports the saved context.
 function global:Import-Module
 {
-    if ($args -contains 'Az.Accounts') { return }
+    # No Az module is loaded for real: the stand-ins above take their place
+    # (with #66 the run loads each module it does not find in the session).
+    if (@($args | Where-Object { [string]$_ -like 'Az.*' }).Count -gt 0) { return }
     Microsoft.PowerShell.Core\Import-Module @args
 }
 
@@ -142,6 +144,7 @@ else
 {
     $WorkerArgs = @{
         TenantID           = $Tenant
+        RunId              = 'test-run'
         StreamId           = '0'
         InventoryRoot      = $Root
         ScriptRoot         = $Tree

@@ -20,6 +20,8 @@ BeforeAll {
     # The helpers the lifted blocks call (Test-MetricsIncompleteEntry), loaded as
     # the wrapper loads them.
     . (Join-Path $script:RepoRoot 'Functions/Common.Functions.ps1')
+    # Get-ConsumptionFailureView, which the lifted failure block calls.
+    . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
 
     function script:Get-TopText
     {

@@ -131,10 +131,9 @@ foreach ($prop in $Inventory.PSObject.Properties)
         Count   = $Count
     }
 }
-$ServiceSummary = $ServiceSummary | Sort-Object -Property Count -Descending
-$TotalResources = ($ServiceSummary | Measure-Object -Property Count -Sum).Sum
-# Measure-Object gives no sum for no input: an inventory with no records has 0.
-if ($null -eq $TotalResources) { $TotalResources = 0 }
+$ServiceSummary = @($ServiceSummary | Sort-Object -Property Count -Descending)
+# A plain sum: 0 for a report with no resources, also under strict mode.
+$TotalResources = 0; foreach ($SvcRow in $ServiceSummary) { $TotalResources += [int]$SvcRow.Count }
 
 # Detect obfuscation so the header can carry a privacy-posture banner. Sample
 # resource Names and Subscription values across the first few populated
@@ -156,7 +155,7 @@ foreach ($svc in $ServiceSummary | Select-Object -First 5)
 }
 if ($Samples.Count -gt 0)
 {
-    $ObfHits = ($Samples | Where-Object { $_ -match $ObfPattern }).Count
+    $ObfHits = @($Samples | Where-Object { $_ -match $ObfPattern }).Count
     if ($ObfHits -gt ($Samples.Count * 0.7))
     {
         $ObfuscationStatus = 'obfuscated'
@@ -167,18 +166,23 @@ if ($Samples.Count -gt 0)
 # that EXISTS; the consumption CSV lists VMs that produced a compute-usage
 # record in the billing window. A running VM with no compute-usage record is an
 # anomaly - it usually means consumption data was incomplete for that VM's
-# subscription (auth / billing-scope gap), not that the VM is idle. We compare
-# COUNTS only (not identities): the inventory and consumption files obfuscate
-# resource ids through different dictionaries, so a per-VM join is impossible in
-# an obfuscated report. Counts of distinct tokens are preserved either way.
+# subscription (auth / billing-scope gap), not that the VM is idle.
+# shortcut: COUNTS only, so a running VM with no billing can be missed when
+# another billed VM makes the counts match. Both files carry the same id (the
+# output contract gives a masked resource one token in every file), so join
+# each running VM to the billed ids by ID, with Set (its scale set) as the
+# fallback, when that must be caught.
 $VmBilling = $null
 if (-not [string]::IsNullOrWhiteSpace($ConsumptionFile) -and (Test-Path -LiteralPath $ConsumptionFile -PathType Leaf))
 {
     $RunningVmCount = 0
-    $VmRecords = $Inventory.VirtualMachines
+    # A report with no VirtualMachines section has no VM (also under Set-StrictMode).
+    $VmRecords = if ($Inventory.PSObject.Properties.Name -contains 'VirtualMachines') { $Inventory.VirtualMachines } else { $null }
     if ($VmRecords)
     {
-        $RunningVmCount = @($VmRecords | Where-Object { $_.PowerState -match 'running' }).Count
+        # As pricing reads PowerState: 'running' or 'transient' is on, and so is
+        # an empty state.
+        $RunningVmCount = @($VmRecords | Where-Object { $State = if ($_.PSObject.Properties.Name -contains 'PowerState') { [string]$_.PowerState } else { '' }; [string]::IsNullOrWhiteSpace($State) -or $State -match 'running|transient' }).Count
     }
 
     # Count distinct VM-meter resources in the consumption CSV. A header-only or
@@ -250,7 +254,7 @@ if ([string]::IsNullOrWhiteSpace($SubscriptionName))
 }
 
 # Resolve version: explicit -Version wins, else the JSON's Version key.
-if ([string]::IsNullOrWhiteSpace([string]$Version) -and $null -ne $Inventory.Version)
+if ([string]::IsNullOrWhiteSpace([string]$Version) -and $Inventory.PSObject.Properties.Name -contains 'Version' -and $null -ne $Inventory.Version)
 {
     $Version = [string]$Inventory.Version
 }
@@ -828,7 +832,7 @@ $PlatBlock = if ([string]::IsNullOrWhiteSpace($PlatSafe)) { '' } else { "<div><b
 # content carries real subscription / resource names.
 if ($ObfuscationStatus -eq 'obfuscated')
 {
-    $PrivacyBanner = '<div class="privacy-banner obfuscated"><span class="privacy-icon">&#128274;</span><div><b>Obfuscated report.</b> Resource and subscription names have been replaced with deterministic pseudonyms (prod_/nonprod_ prefixes). Real identifiers are not present. Suitable for sharing.</div></div>'
+    $PrivacyBanner = '<div class="privacy-banner obfuscated"><span class="privacy-icon">&#128274;</span><div><b>Obfuscated report.</b> Resource and subscription names in a sample of this report are deterministic pseudonyms (prod_/nonprod_ prefixes). Only a sample was checked: review the report before sharing it.</div></div>'
 }
 else
 {
@@ -941,7 +945,7 @@ $FileSize = (Get-Item -LiteralPath $HtmlFile).Length
 Write-Host ("  File size: {0:N0} bytes ({1:N1} KB)" -f $FileSize, ($FileSize / 1KB)) -ForegroundColor Green
 if ($ObfuscationStatus -eq 'obfuscated')
 {
-    Write-Host "  Privacy posture: obfuscated (safe to share)" -ForegroundColor Green
+    Write-Host "  Privacy posture: obfuscated (names in a sample look masked; review before sharing)" -ForegroundColor Green
 }
 else
 {

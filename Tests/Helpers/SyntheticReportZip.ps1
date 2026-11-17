@@ -298,12 +298,15 @@ function global:Get-AzComputeResourceSku
     param($Location)
     [pscustomobject]@{ Name = 'Standard_D2s_v3'; ResourceType = 'virtualMachines'; Capabilities = @([pscustomobject]@{ Name = 'vCPUs'; Value = '2' }, [pscustomobject]@{ Name = 'MemoryGB'; Value = '8' }) }
 }
-function global:Get-UsageAggregates
+function global:Get-AzUsageAggregate
 {
     [CmdletBinding()]
     param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
     [pscustomobject]@{ UsageAggregations = @($Global:StandInUsage | ForEach-Object { [pscustomobject]@{ Properties = $_.PSObject.Copy() } }); ContinuationToken = $null }
 }
+# Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is
+# loaded, and an alias wins over a function: the stand-in is the alias's target.
+function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)

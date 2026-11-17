@@ -656,14 +656,12 @@ Describe 'Az context snapshot names, owners and files' {
         Set-Content -LiteralPath (Join-Path $Out '.rda-stream-azcontext-live.json') -Value '{}'
         # As on Windows: a wildcard over the folder lists dot-files, in the
         # bundle's own listing and in Compress-Archive -Path alike.
+        # The bundle is written entry by entry from the files this call wrote
+        # (no Compress-Archive over a folder), so whatever a wildcard lists
+        # cannot reach it; the entries below are what is checked.
         Mock Get-ChildItem -ParameterFilter { $Path -eq (Join-Path $Out '*') } -MockWith { Get-ChildItem -LiteralPath $Out -Force }
-        $RealCompress = Get-Command -Name Compress-Archive -Module Microsoft.PowerShell.Archive -CommandType Function, Cmdlet
-        Mock Compress-Archive -ParameterFilter { $DestinationPath -eq ($Out + '.zip') } -MockWith {
-            $Items = if ($LiteralPath) { @($LiteralPath) } else { @(Get-ChildItem -LiteralPath (Split-Path -Path @($Path)[0] -Parent) -Force | ForEach-Object { $_.FullName }) }
-            & $RealCompress -LiteralPath $Items -DestinationPath $DestinationPath -Force
-        }
         $null = New-RdaAllSubHtmlSummaryFromZip -InputZip $Outer -OutputDirectory $Out -KeepOriginalReports -PackageZip
-        Should -Invoke Compress-Archive -ParameterFilter { $DestinationPath -eq ($Out + '.zip') } -Times 1 -Exactly
+        Test-Path -LiteralPath ($Out + '.zip') -PathType Leaf | Should -BeTrue
         $Entries = @(script:Get-ZipEntry -Zip ($Out + '.zip'))
         $Entries | Should -Contain 'MainSummary.html'
         @($Entries | Where-Object { $_ -like 'ResourcesReport_20261030/*' }).Count | Should -BeGreaterThan 0

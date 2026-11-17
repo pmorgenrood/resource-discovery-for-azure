@@ -326,6 +326,10 @@ Export-ModuleMember -Function Get-AzMetric
             $Arguments['ResourceNameDictionary'] = $Dictionaries.Name
             $Arguments['ResourceSubDictionary'] = $Dictionaries.Sub
             $Arguments['ResourceGroupDictionary'] = $Dictionaries.Rg
+            # Metrics.ps1 -Obfuscate stops unless ResourceInventory.ps1's
+            # Get-ObfuscatedResourceId is defined. Every resource here is in the
+            # dictionaries, so this stand-in must never be called.
+            function Get-ObfuscatedResourceId { param($ResourceId) throw "stand-in: Get-ObfuscatedResourceId was called for $ResourceId" }
         }
         $Global:MetricsFailedSubs = @()
         $Clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1182,6 +1186,16 @@ Describe 'Microsoft.Insights is never registered without -UseMetricsBatch and a 
             }
             $Old = & $Positional ((git -C $script:RepoRoot show ('{0}:{1}' -f $Base, $File)) -join "`n")
             $New = & $Positional (Get-Content -LiteralPath (Join-Path $script:RepoRoot $File) -Raw)
+            # A later change moved a parameter on purpose: the stream worker's
+            # RunId ("Give each wrapper run an id in its stream summaries") is
+            # now second, and is passed by name only. The check is that this
+            # change's own parameters shift no other earlier one.
+            $MovedOnPurpose = @{ 'Run-AllSubscriptions.Stream.ps1' = @('RunId') }
+            if ($MovedOnPurpose.ContainsKey($File))
+            {
+                $Old = @($Old | Where-Object { $_ -notin $MovedOnPurpose[$File] })
+                $New = @($New | Where-Object { $_ -notin $MovedOnPurpose[$File] })
+            }
             @($New | Select-Object -First $Old.Count) | Should -Be $Old -Because $File
         }
     }

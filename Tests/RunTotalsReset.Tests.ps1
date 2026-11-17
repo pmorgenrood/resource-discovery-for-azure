@@ -85,9 +85,12 @@ BeforeAll {
         return (@($script:Top[$F..$T] | ForEach-Object { $_.Extent.Text }) -join "`n")
     }
 
-    # End-of-run consumption summary, then the auth banner and the exit code.
-    $script:SummaryText = Get-TopText '^\$ConsumptionRecords = ' '^if \(\$ConsumptionFailures\.Count -gt 0\)'
-    $script:FinalText = Get-TopText '^\$AuthSkippedPhases = @\(\)' '^\$WrapperExitCode = Get-WrapperExitCode'
+    # The sign-in skips (worked out once every run has ended), then the
+    # end-of-run consumption summary; then the exit code and the auth banner.
+    # The statements between them (zip checks, the summary block) need a whole
+    # run's state and are not lifted.
+    $script:SummaryText = (Get-TopText '^\$AuthSkippedPhases = @\(\)' '^\$CollectorsFailed = ') + "`n" + (Get-TopText '^\$ConsumptionRecords = ' '^if \(\$ConsumptionFailures\.Count -gt 0\)')
+    $script:FinalText = (Get-TopText '^\$SubscriptionsFailed = ' '^\$WrapperExitCode = Get-WrapperExitCode') + "`n" + (Get-TopText '^if \(\$AuthSkippedPhases\.Count -gt 0\)' '^if \(\$AuthSkippedPhases\.Count -gt 0\)')
 
     # The parallel path's per-stream summary aggregation.
     $Aggregation = @($WrapperAst.FindAll({
@@ -145,6 +148,17 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
             Set-Variable -Name WrapperTranscriptStarted -Value $false
             Set-Variable -Name UncarriedSkipped -Value @()
             Set-Variable -Name RetryLimitedOwed -Value @()
+            # The other exit code 2 causes: none in these runs.
+            Set-Variable -Name FailedSubscriptions -Value @()
+            Set-Variable -Name UnreadableStreamSummaries -Value @()
+            Set-Variable -Name ResumeStateFile -Value (Join-Path $script:TestRoot 'no-resume-state.json')
+            Set-Variable -Name ResumeStateSaveFailed -Value $false
+            Set-Variable -Name LeftStreamFiles -Value @()
+            Set-Variable -Name RetryOwedNotInRun -Value @()
+            Set-Variable -Name BundleBuildError -Value $null
+            Set-Variable -Name InventoryFolderGone -Value $false
+            Set-Variable -Name MissingReportCount -Value 0
+            Set-Variable -Name ZipOwedIds -Value @()
         }
 
         It 'sequential run: reports only its own consumption records and exits 0' {
@@ -164,7 +178,10 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
 
         It 'parallel run: the totals added from the stream summaries are only this run''s' {
             $SummaryPath = Join-Path $script:TestRoot '.rda-stream-0-summary.json'
+            # The wrapper takes only its own run's summary of the stream, with
+            # one row for each subscription the stream ran (Resolve-StreamSummary).
             [pscustomobject]@{
+                RunId                 = 'run-test'
                 StreamId              = 0
                 Status                = 'ok'
                 ResourceCounts        = @([pscustomobject]@{ Name = 'Sub A'; Id = '12345678-1234-1234-1234-123456789012'; Count = 1 })
@@ -175,7 +192,8 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
                 CollectorFailures     = @()
             } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SummaryPath -Encoding utf8
             Set-Variable -Name InventoryRoot -Value $script:TestRoot
-            Set-Variable -Name StreamSummaries -Value @([pscustomobject]@{ StreamId = 0; SummaryPath = $SummaryPath; FailuresPath = (Join-Path $script:TestRoot 'failures-stream-0.log') })
+            Set-Variable -Name RunId -Value 'run-test'
+            Set-Variable -Name StreamSummaries -Value @([pscustomobject]@{ StreamId = 0; SummaryPath = $SummaryPath; FailuresPath = (Join-Path $script:TestRoot 'failures-stream-0.log'); ExpectedIds = @('12345678-1234-1234-1234-123456789012') })
             Set-Variable -Name FailedSubscriptions -Value @()
             Set-Variable -Name SubResourceCounts -Value @()
             Set-Variable -Name DiagFile -Value $null
@@ -197,7 +215,8 @@ Describe 'Run-AllSubscriptions.ps1 starts each run with zero run-wide totals' {
 
             $Lines = ConvertTo-Lines (. ([scriptblock]::Create($script:SummaryText + "`n" + $script:FinalText)) 6>&1)
 
-            ($Lines -join "`n") | Should -Match 'Consumption Failures:\s+1 subscription\(s\)'
+            # A sign-in skip names no subscription, so it has its own count line.
+            ($Lines -join "`n") | Should -Match 'Consumption skipped for sign-in on 1 subscription\(s\)'
             ($Lines -join "`n") | Should -Match 'Could not collect: Consumption'
             $WrapperExitCode | Should -Be 3
         }

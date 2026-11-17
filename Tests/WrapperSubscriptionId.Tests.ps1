@@ -618,7 +618,8 @@ Describe 'The resume state of a -SubscriptionID run is its own' -Skip:$IsWindows
         $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'C') -and ((script:Read-StateAt $script:State).Completed -join ',') -eq $script:Subs['A'].Id }
         $Whole = script:Read-StateAt $script:State
         $Whole.Completed | Should -Be (script:Get-Ids 'A')
-        $Whole.Failed | Should -Be (script:Get-Ids 'B')
+        # C holds the failed run counted before its collection (write-ahead, #68).
+        $Whole.Failed | Should -Be (script:Get-Ids 'B', 'C')
         $WholeHash = script:Get-FileHashOrNone $script:State
 
         # D, which the whole run never reached, and then A, which it completed.
@@ -937,19 +938,21 @@ Describe 'A -SubscriptionID run whose subscription is gone' -Skip:$IsWindows {
 
     It 'checks access only for what the run would collect: <Case>' -ForEach @(
         @{ Case = 'a continued run leaves out a completed subscription that is now unreadable'; Extra = @(); Denied = 'A'; Code = 0 }
-        @{ Case = '-ResumeFailedOnly leaves out a subscription not on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'C'; Code = 0 }
+        @{ Case = '-ResumeFailedOnly leaves out a subscription not on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'D'; Code = 0 }
         @{ Case = '-ResumeFailedOnly still checks the subscription on the retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1 }
     ) {
-        # An unfinished run of the whole tenant: A completed, B failed, C never reached.
-        script:Set-Scenario -Subs 'A', 'B', 'C' -Fail 'B' -Hang 'C'
-        $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'C') -and ((script:Read-StateAt $script:State).Failed -join ',') -eq $script:Subs['B'].Id }
+        # An unfinished run of the whole tenant: A completed, B failed, the run
+        # was cut off in C (on the retry list by its write-ahead count, #68), D
+        # never reached.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C'
+        $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'C') -and ((script:Read-StateAt $script:State).Failed -join ',') -eq ((script:Get-Ids 'B', 'C') -join ',') }
         $State = script:Read-StateAt $script:State
         $State.Completed | Should -Be (script:Get-Ids 'A')
         $Before = script:Get-RootSnapshot
-        script:Set-Scenario -Subs 'A', 'B', 'C' -Denied $Denied
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Denied $Denied
         $R = script:Invoke-Wrapper -Arguments (@('-PreflightOnly') + $Extra)
         $R.ExitCode | Should -Be $Code
-        @($R.Text | Where-Object { $_ -like '  The run would collect * of these 3 subscription(s)*' }).Count | Should -Be 1
+        @($R.Text | Where-Object { $_ -like '  The run would collect * of these 4 subscription(s)*' }).Count | Should -Be 1
         script:Get-RootSnapshot | Should -Be $Before
         # The run itself gets past its access check the same way.
         $Run = script:Invoke-Wrapper -Arguments $Extra
@@ -992,7 +995,8 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
     AfterEach { script:Write-FailedCaseRuns }
 
     It 'after an interrupted parallel run, checks what the run would collect from the per-stream state: <Case>' -ForEach @(
-        @{ Case = '-ResumeFailedOnly checks the subscription only a per-stream file has on its retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1; Collect = 1 }
+        # B failed; C and D hang, each on its stream's retry list by its write-ahead count (#68).
+        @{ Case = '-ResumeFailedOnly checks the subscription only a per-stream file has on its retry list'; Extra = @('-ResumeFailedOnly'); Denied = 'B'; Code = 1; Collect = 3 }
         @{ Case = 'a continued run leaves out the subscription only a per-stream file has completed'; Extra = @(); Denied = 'A'; Code = 0; Collect = 3 }
     ) {
         # Two streams: A then C, and B then D. A completes, B fails, C and D hang.
@@ -1072,9 +1076,16 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
     }
 
     It 'says a -ResumeFailedOnly run would retry nothing because its retry list is empty; the run does as said' {
-        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'C', 'D'
-        $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
+        # An unfinished run with an empty retry list: the run cut off in B (on
+        # the retry list by its write-ahead count, #68), then a -ResumeFailedOnly
+        # that collects B; C and D were never collected, so the state is kept.
+        script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Hang 'B'
+        $null = script:Invoke-Wrapper -EndWhen { (script:Test-Hanging 'B') -and ((script:Read-StateAt $script:State).Completed -join ',') -eq $script:Subs['A'].Id }
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
+        $null = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly')
+        $State = script:Read-StateAt $script:State
+        $State.Completed | Should -Be (script:Get-Ids 'A', 'B')
+        @($State.Failed) | Should -BeNullOrEmpty
         $R = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly', '-RetryLimitReached', '-PreflightOnly')
         $R.ExitCode | Should -Be 1
         $R.Text | Should -Contain '  A -ResumeFailedOnly run would retry nothing, so it would end with exit 2: its retry list is empty. It collects nothing and names the run to go on with; run it without -PreflightOnly to see that.'
@@ -1102,7 +1113,9 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         @($R.Text | Where-Object { $_ -like '*every subscription*' }) | Should -BeNullOrEmpty
     }
 
-    It 'fails -ResumeFailedOnly where the run stops: a per-stream state file that is not the right shape, and leaves it in place' {
+    # #38's design (conductor ruling): a per-stream file that is not the right
+    # shape is moved aside and its records are not used; the run goes on.
+    It '-ResumeFailedOnly with a per-stream state file that is not the right shape: the preflight names the move a run would make and leaves the file in place; the run moves it aside' {
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D' -Fail 'B' -Hang 'C', 'D'
         $null = script:Invoke-Wrapper -Streams 2 -EndWhen { script:Test-Hanging 'C', 'D' }
         $Stream = @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ('.resume-state-{0}-stream-*.json' -f (script:Get-Key $script:Tenant)) | Sort-Object Name)[0]
@@ -1112,12 +1125,16 @@ Describe 'Run-AllSubscriptions.ps1 -PreflightOnly reads the state a run would re
         $Before = script:Get-RootSnapshot
         script:Set-Scenario -Subs 'A', 'B', 'C', 'D'
         $R = script:Invoke-Wrapper -Arguments @('-PreflightOnly', '-ResumeFailedOnly') -Streams 2
-        $R.ExitCode | Should -Be 1
-        $R.Text | Should -Contain ('  A run would move the resume state file {0} aside (it is not the right shape) and leave out what it lists.' -f $Stream.Name)
-        $R.Text | Should -Contain 'Preflight failed: how the run would start. Nothing was collected or written to the inventory folder (exit 1).'
+        $R.ExitCode | Should -Be 0
+        $R.Text | Should -Contain ('  A run would move the per-stream state file {0} aside (it cannot be read) and leave out what it lists.' -f $Stream.Name)
+        $R.Text | Should -Contain 'Every check passed.'
         script:Get-RootSnapshot | Should -Be $Before
         $Run = script:Invoke-Wrapper -Arguments @('-ResumeFailedOnly') -Streams 2
-        $Run.ExitCode | Should -Be 1 -Because 'the run stops there too'
+        $Run.ExitCode | Should -Be 0 -Because 'the file is moved aside, so the run goes on (#38); exit 1 only when it cannot be moved'
+        @($Run.Text | Where-Object { $_ -like ('Resume state kept, but not a clean run: the per-stream state file {0} could not be read and was moved aside to *; its records were not used.' -f $Stream.Name) }).Count | Should -Be 1
+        @($Run.Text | Where-Object { $_ -like 'Not Collected:*2 (Sub A, Sub C)*' }).Count | Should -Be 1 -Because 'what the moved-aside file listed is not used'
+        Test-Path -LiteralPath $Stream.FullName | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $script:Root -Force -File -Filter ($Stream.Name + '.unreadable-*')).Count | Should -Be 1
     }
 
     It 'reads a resume state file that an earlier version named with the tenant id, as a run would after renaming it, and leaves it in place' {

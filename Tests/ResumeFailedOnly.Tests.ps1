@@ -73,7 +73,7 @@ $Global:ResourceCount = 1
     # lifted on its own: the statements up to the retry-owed count, then the
     # clear from the statement that starts it.
     $OwedAt = script:Find-TopIndex -After $MainSummaryAt -What 'the retry-owed count' -Match { param($s) $s.Extent.Text.StartsWith('$RetryOwedCount = ') }
-    $ClearStartAt = script:Find-TopIndex -After $OwedAt -What 'the start of the resume-state clear' -Match { param($s) $s.Extent.Text -eq '$ResumeStateClearTried = $false' }
+    $ClearStartAt = script:Find-TopIndex -After $OwedAt -What 'the start of the resume-state clear' -Match { param($s) $s.Extent.Text -eq '$CleanRun = $false' }
     $ClearAt = script:Find-TopIndex -After $ClearStartAt -What 'the clean-run resume-state clear' -Match { param($s) $s -is [System.Management.Automation.Language.IfStatementAst] -and $s.Extent.Text.Contains('Resume state cleared (clean run).') }
     $CleanupText = (script:Join-Top -From ($MainSummaryAt + 1) -To $OwedAt) + "`n" + (script:Join-Top -From $ClearStartAt -To $ClearAt)
 
@@ -98,7 +98,7 @@ $Global:ResourceCount = 1
     # array: a one-id list comes back from Get-CompletedSubscriptionIds as a bare
     # string, and `+=` would then join the next id onto it.
     $Prologue = "function Exit-Wrapper { param([int]`$Code) throw ('Exit-Wrapper ' + `$Code) }`n" +
-    "`$Obfuscate = `$false; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$DiagFile = `$null`n" +
+    "`$Obfuscate = `$false; `$SkippedCount = 0; `$SkippedSubscriptions = @(); `$SubResourceCounts = @(); `$FailedSubscriptions = @(); `$FailedSubscriptionDetail = @(); `$StreamSummaryFailed = @(); `$StreamSummaryCompletedIds = @(); `$UnreadableStreamSummaries = @(); `$DiagFile = `$null`n" +
     "`$InventoryPassthrough = @{ ConcurrencyLimit = 6 }; `$WrapperTranscriptStarted = `$false; `$Elapsed = [timespan]::Zero`n" +
     "`$CompletedIds = @(Get-CompletedSubscriptionIds -Path `$ResumeStateFile -Tenant `$TenantID | Where-Object { `$_ })`n" +
     "`$FailedAttempts = Get-FailedAttempts -Path `$ResumeStateFile -Tenant `$TenantID`n" +

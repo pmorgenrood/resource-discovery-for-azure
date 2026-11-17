@@ -555,23 +555,32 @@ function Invoke-AzGraphQuerySafe
 
 # The total of a count probe (`... | summarize count()`) across every row of an
 # Invoke-AzGraphQuerySafe result: one row per subscription batch. 0 for none.
-# A count_ that is present but not a whole number of 0 or more ends the function
-# with an error, as a failure in Invoke-AzGraphQuerySafe does, instead of being
-# read as 0, rounded or added as a negative number. 'Stop' here for the same
-# reason as there: the inventory's SilentlyContinue would otherwise let the
-# function go on past the throw.
+# A row that is null, or whose count_ is missing, null or not a whole number of
+# 0 or more, ends the function with an error, as a failure in
+# Invoke-AzGraphQuerySafe does, instead of being read as 0 (or skipped, which
+# counts too few), rounded or added as a negative number. An answer with no
+# rows at all is still 0. 'Stop' here for the same reason as there: the
+# inventory's SilentlyContinue would otherwise let the function go on past the
+# throw.
 function Get-AzGraphCount
 {
     param([Parameter(Mandatory = $true)]$Result)
     $ErrorActionPreference = 'Stop'
     $Total = [long]0
-    foreach ($Row in @($Result.data))
+    # Not `$Rows = if ...`: a statement's output is unrolled, so a lone null
+    # row would come out as no rows at all.
+    $Rows = @()
+    if ($null -ne $Result.data) { $Rows = @($Result.data) }
+    foreach ($Row in $Rows)
     {
-        if ($null -eq $Row -or $null -eq $Row.count_) { continue }
+        if ($null -eq $Row) { throw 'Resource Graph returned a count row that is null.' }
+        $HasCount = if ($Row -is [System.Collections.IDictionary]) { $Row.Contains('count_') } else { $null -ne $Row.PSObject.Properties['count_'] }
         $Value = [long]0
-        if (-not [long]::TryParse([string]$Row.count_, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Value) -or $Value -lt 0)
+        if (-not $HasCount -or $null -eq $Row.count_ -or -not [long]::TryParse([string]$Row.count_, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Value) -or $Value -lt 0)
         {
-            throw ("Resource Graph returned a count (count_, a {0}) that is not a whole number of 0 or more." -f $Row.count_.GetType().Name)
+            # Only the kind of value goes in the message, never the value.
+            $Kind = if (-not $HasCount) { 'missing' } elseif ($null -eq $Row.count_) { 'null' } else { 'a {0}' -f $Row.count_.GetType().Name }
+            throw ("Resource Graph returned a count (count_, {0}) that is not a whole number of 0 or more." -f $Kind)
         }
         $Total += $Value
     }
@@ -786,6 +795,15 @@ function Write-RdaShareableDiagnosticsLog
                 if (-not $DiagScrubMap.ContainsKey($realId)) { $DiagScrubMap[$realId] = $Global:ResourceIdDictionary[$realId] }
 
                 $ShortName = ($realId -split '/')[-1]
+                # A collector row with no id is filed under a stand-in path whose
+                # last segment is <name>~<hash>, with a '/' in the name written
+                # '_': take the real name the run recorded for it, else the part
+                # before '~'.
+                if ($realId -match '(?i)/providers/rda\.noid/')
+                {
+                    if ($null -ne $Global:RdaNoIdRealNames -and $Global:RdaNoIdRealNames.ContainsKey($realId)) { $ShortName = [string]$Global:RdaNoIdRealNames[$realId] }
+                    elseif ($ShortName -match '^(.+)~[0-9a-f]{8}(-\d+)?$' -and $Matches[1] -ne '~noname') { $ShortName = $Matches[1] }
+                }
                 if (-not [string]::IsNullOrEmpty($ShortName) -and $null -ne $Global:ResourceNameDictionary -and $Global:ResourceNameDictionary.ContainsKey($realId) -and -not $DiagScrubMap.ContainsKey($ShortName))
                 {
                     $DiagScrubMap[$ShortName] = $Global:ResourceNameDictionary[$realId]
@@ -980,7 +998,9 @@ function Compress-RdaReportArchive
     {
         $ParentPath = ([System.IO.DirectoryInfo]::new($SourceDir)).Parent.FullName
         $Prefix = if ($ParentPath.Length -eq 3) { $ParentPath } else { $ParentPath + [System.IO.Path]::DirectorySeparatorChar }
-        foreach ($Child in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -ErrorAction Continue))
+        # -ErrorAction Stop: a folder it cannot list stops the zip, as in Compress-Archive,
+        # so a zip is never made without that folder's files.
+        foreach ($Child in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -ErrorAction Stop))
         {
             $IsDirectory = $Child -is [System.IO.DirectoryInfo]
             if ($IsDirectory -and $Child.GetFiles().Count -ne 0) { continue }
@@ -1007,6 +1027,7 @@ function Compress-RdaReportArchive
     $TempPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($DestinationPath), $TempName)
     $ArchiveStream = $null
     $Archive = $null
+    $Moved = $false
     try
     {
         $ArchiveStream = [System.IO.File]::Open($TempPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -1032,6 +1053,8 @@ function Compress-RdaReportArchive
         if ($Entries.Count -gt 0)
         {
             [System.IO.File]::Move($TempPath, $DestinationPath)
+            # The last step that may fail: from here on nothing may fail the call.
+            $Moved = $true
         }
     }
     finally
@@ -1044,6 +1067,22 @@ function Compress-RdaReportArchive
             if ($null -eq $Disposable) { continue }
             try { $Disposable.Dispose() } catch { Write-Verbose ('Closing the partial archive failed: {0}' -f $_.Exception.Message) }
         }
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue }
+        # After the move there is no temporary file to remove. Before it, a failed clean-up
+        # only warns, so it never replaces the original error.
+        if (-not $Moved)
+        {
+            try
+            {
+                if (Test-Path -LiteralPath $TempPath)
+                {
+                    Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $TempPath) { Write-Warning ("Compress-RdaReportArchive: could not remove the temporary file '{0}'; delete it by hand." -f $TempPath) }
+                }
+            }
+            catch
+            {
+                Write-Warning ("Compress-RdaReportArchive: could not check or remove the temporary file '{0}': {1}; delete it by hand if it is there." -f $TempPath, $_.Exception.Message)
+            }
+        }
     }
 }

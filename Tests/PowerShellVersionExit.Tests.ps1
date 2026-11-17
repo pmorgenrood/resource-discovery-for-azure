@@ -10,7 +10,7 @@
 # stops do.
 #
 # PowerShell 5.1 is not available to the test, and $PSVersionTable cannot be
-# replaced, so the test lifts the REAL CheckPowerShell function from
+# replaced, so the test lifts the REAL version check at the top of
 # ResourceInventory.ps1's parsed source, reads the version from a stand-in
 # table in its place, and runs it in a child pwsh: as Windows PowerShell 5.1
 # (Desktop, 5.1), as PowerShell 7.4 on Windows, and as PowerShell 7 on Unix,
@@ -32,10 +32,11 @@ BeforeAll {
     $Tokens = $null
     $ParseErrors = $null
     $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$Tokens, [ref]$ParseErrors)
-    $Found = @($Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'CheckPowerShell' }, $true))
-    if ($Found.Count -ne 1) { throw ("expected one CheckPowerShell in ResourceInventory.ps1, found {0}" -f $Found.Count) }
+    # The check is the version test at the top of ResourceInventory.ps1, before any module or sign-in step.
+    $Found = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'PSVersionTable\.PSVersion\.Major' })
+    if ($Found.Count -ne 1) { throw ("expected one top-level PowerShell version check in ResourceInventory.ps1, found {0}" -f $Found.Count) }
     $script:FunctionText = $Found[0].Extent.Text -replace '\$PSVersionTable\b', '$StandInVersionTable'
-    if ($script:FunctionText -notmatch 'StandInVersionTable') { throw 'CheckPowerShell no longer reads $PSVersionTable' }
+    if ($script:FunctionText -notmatch 'StandInVersionTable') { throw 'the version check no longer reads $PSVersionTable' }
     $script:WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('PowerShellVersionExit_' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $script:WorkDir -Force
 
@@ -46,13 +47,7 @@ BeforeAll {
         $Lines = @(
             ('[System.Globalization.CultureInfo]::CurrentCulture = ''{0}''' -f $Culture),
             ('$StandInVersionTable = @{{ Platform = ''{0}''; PSVersion = [version]''{1}'' }}' -f $Platform, $Version),
-            '$Global:RdaSessionInitialized = $false',
-            '$Global:ReportName = ''ResourcesReport''',
-            'function Write-Log { param($Message, $Severity) Write-Host ("{0}: {1}" -f $Severity, $Message) }',
-            'function Get-CloudDrive { throw ''not Cloud Shell'' }',
-            'function LoginSession { }',
             $script:FunctionText,
-            'CheckPowerShell',
             'Write-Host ''check passed''',
             'exit 0'
         )
@@ -79,7 +74,7 @@ Describe 'CheckPowerShell as PowerShell <Version> on <Platform> under <Culture>'
     }
 
     It 'says PowerShell 7 is needed only when it stops' {
-        @($script:Run.Console | Where-Object { $_ -like '*You must use Powershell 7 to run the inventory script.*' }).Count | Should -Be $(if ($Stops) { 1 } else { 0 })
+        @($script:Run.Console | Where-Object { $_ -like '*You must use PowerShell 7 to run the inventory script.*' }).Count | Should -Be $(if ($Stops) { 1 } else { 0 })
         @($script:Run.Console | Where-Object { $_ -eq 'check passed' }).Count | Should -Be $(if ($Stops) { 0 } else { 1 })
     }
 }

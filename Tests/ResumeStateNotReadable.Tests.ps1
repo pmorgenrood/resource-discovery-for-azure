@@ -300,6 +300,27 @@ Describe 'A subscription on the not-readable record that a later check can read'
 
 Describe 'Two -Resume runs in a row after a not-readable subscription was skipped' -Skip:$IsWindows {
     BeforeAll {
+        # The sub the interrupted run was collecting counts that run as a failed
+        # run (write-ahead count, #68). When the first -Resume finds it taken off
+        # the retry list (disabled: out of scope; or no read role, faa02a18), it
+        # prints $TakenOff, ends with exit 0 and clears the state; the second
+        # -Resume has nothing left to take off and ends with exit 0 too.
+        function script:Assert-TakenOffThenClean
+        {
+            param($Sub, [string]$TakenOff)
+            [int](@((Get-Content -LiteralPath $script:State -Raw | ConvertFrom-Json).FailedAttempts) | Where-Object Id -eq $Sub.Id)[0].Attempts | Should -Be 1 -Because 'the interrupted run counted one failed run before it collected the sub'
+            foreach ($Run in 1..2)
+            {
+                $R = script:Invoke-Wrapper -Arguments '-Resume', '-AllowPartialAccess'
+                script:Get-AccessStopLines $R | Should -BeNullOrEmpty -Because ('-Resume run {0} does not stop at the access check' -f $Run)
+                $Lines = @($R.Text | Where-Object { $_ -like $TakenOff })
+                $Lines.Count | Should -Be $(if ($Run -eq 1) { 1 } else { 0 }) -Because ($R.Text -join "`n")
+                @($R.Text | Where-Object { $_ -like 'Not In This Run:*' -or $_ -like 'Pending Retries:*' }) | Should -BeNullOrEmpty -Because ('-Resume run {0} owes nothing' -f $Run)
+                $R.ExitCode | Should -Be 0 -Because ($R.Text -join "`n")
+                Test-Path -LiteralPath $script:State | Should -BeFalse -Because ('{0} left the retry list, so -Resume run {1} clears the state' -f $Sub.Name, $Run)
+            }
+        }
+
         # Two -Resume runs; each must exit 0 without an access stop, name
         # nothing under "Not Collected" and leave no resume state.
         function script:Assert-TwoCleanResumes
@@ -361,6 +382,21 @@ Describe 'Two -Resume runs in a row after a not-readable subscription was skippe
         script:Assert-TwoCleanResumes
     }
 
+    It 'when the interrupted run''s sub is disabled afterwards, the first -Resume takes it off the retry list with the command that collects it (exit 0), the rest being not readable' {
+        # Run 1: Sub X is skipped, Sub A completes, the session ends in Sub C,
+        # which is disabled afterwards. A disabled subscription is out of scope
+        # without -IncludeDisabled, so no run with these settings can retry it:
+        # its entry is taken off, and it never reads as owed.
+        script:Set-Scenario -Subs $script:A, $script:X, $script:C -Unreadable $script:X.Id -EndSession $script:C.Id
+        $null = script:Invoke-Wrapper -Arguments '-AllowPartialAccess'
+        $State1 = script:Read-State
+        $State1.Completed | Should -Be @($script:A.Id)
+        $State1.NotReadable | Should -Be @($script:X.Id)
+
+        script:Set-Scenario -Subs $script:A, $script:X, $script:C -Unreadable $script:X.Id -Disabled $script:C.Id
+        script:Assert-TakenOffThenClean -Sub $script:C -TakenOff ('Taken off the retry list: {0} ({1}) is Disabled, *-IncludeDisabled*' -f $script:C.Name, $script:C.Id)
+    }
+
     It 'when the subscription left to collect cannot be read after the interruption, the second -Resume ends cleanly' {
         # Run 1: every subscription is readable; Sub A completes, the session ends
         # in Sub X. Sub X cannot be read afterwards.
@@ -370,6 +406,20 @@ Describe 'Two -Resume runs in a row after a not-readable subscription was skippe
 
         script:Set-Scenario -Subs $script:A, $script:X -Unreadable $script:X.Id
         script:Assert-TwoCleanResumes
+    }
+
+    It 'when the interrupted run''s sub cannot be read afterwards, the first -Resume takes it off the retry list as having no read role (exit 0)' {
+        # Run 1: every subscription is readable; Sub A completes, the session ends
+        # in Sub X, whose failed-run count was saved before its collection (#68).
+        # Sub X cannot be read afterwards: a retry entry the role check finds with
+        # no read role is taken off the retry list with a line naming it, as one
+        # with no read role is never put on it (faa02a18).
+        script:Set-Scenario -Subs $script:A, $script:X -EndSession $script:X.Id
+        $null = script:Invoke-Wrapper -Arguments '-AllowPartialAccess'
+        (script:Read-State).Completed | Should -Be @($script:A.Id)
+
+        script:Set-Scenario -Subs $script:A, $script:X -Unreadable $script:X.Id
+        script:Assert-TakenOffThenClean -Sub $script:X -TakenOff ('Taken off the retry list: {0} ({1}): the signed-in identity has no read role on it*' -f $script:X.Name, $script:X.Id)
     }
 }
 

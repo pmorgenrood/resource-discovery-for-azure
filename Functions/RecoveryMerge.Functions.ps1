@@ -121,9 +121,8 @@ function Merge-RecoveryData
     }
 
     # -- Verify an ObfuscationDictionary actually BELONGS to a given inventory.
-    #    An obfuscated inventory stores per-resource tokens (prod_/nonprod_<guid>)
-    #    in its ID/Name/cross-ref fields; those exact tokens are the KEYS of the
-    #    dictionary's maps (ResourceIdMap/ResourceNameMap/... are token -> real).
+    #    An obfuscated inventory holds per-resource tokens (prod_/nonprod_<guid>);
+    #    each one is a KEY of one of the dictionary's maps (token -> real).
     #    So the dictionary that goes with an inventory must contain (almost) all of
     #    that inventory's tokens as keys. If someone points at the WRONG dictionary
     #    (a different run/subscription), the inventory's tokens are absent and
@@ -147,15 +146,9 @@ function Merge-RecoveryData
         }
 
         # Collect the DISTINCT obfuscation tokens present in the inventory text.
-        # The pattern matches single prod_/nonprod_<guid> tokens. Inventory IDs are not
-        # flat tokens: they are ARM-shaped paths
-        # (/subscriptions/<token>/resourcegroups/<token>/providers/<type>/<token>),
-        # so the pattern finds the subscription, resource-group and name tokens inside
-        # each path, and the Name/Subscription/ResourceGroup fields carry the same
-        # tokens. Those single tokens are keys of the name, subscription and
-        # resource-group maps, so they are what this check counts. Consumption-style
-        # tokens (prod_sub_/prod_rg_...) live in the CSV, not the inventory JSON, so
-        # they never enter this scan.
+        # The pattern counts every prod_/nonprod_<guid> token in the inventory text that
+        # is not joined to a letter, digit or '_' on either side (\b); each must be a key
+        # of one of the dictionary's maps.
         $InventoryText = Get-Content -Path $InventoryPath -Raw
         $InventoryTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($TokenMatch in [regex]::Matches($InventoryText, '(?i)\b(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'))
@@ -480,12 +473,12 @@ function Merge-RecoveryData
     #    error). Consumption ResourceUris keep the ARM path structure for
     #    categorisation. A ResourceUri that matches an inventory id exactly
     #    takes that resource's whole masked path from the run's ResourceIdMap;
-    #    any other ResourceUri gets subscription, resource group and name
-    #    tokens minted for that run's consumption file. So a replaced
-    #    consumption file categorises correctly, but its tokens can differ
-    #    from the gap run's, and a resource that is not in the inventory can
-    #    carry subscription and resource group tokens different from the
-    #    inventory's for the same real values. If the chosen
+    #    any other ResourceUri gets the tokens the run's own consumption
+    #    masking gives it (how they relate to the inventory's tokens is that
+    #    code's rule, in ResourceInventory.ps1, not this merge's). So a
+    #    replaced consumption file categorises correctly, and its tokens match
+    #    the gap run's only when the recovery run was seeded with the gap
+    #    bundle's dictionary. If the chosen
     #    source has none, write a canonical empty file so the bundle is
     #    structurally complete. --------------------------------------------------
     $ConsumptionSource = 'gap'
