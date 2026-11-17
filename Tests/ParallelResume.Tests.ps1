@@ -133,6 +133,14 @@ if ($Scenario.CutStreamFile -and $Scenario.CutStreamFile.AfterId -eq $Subscripti
     if ($Cut.Kind -eq 'empty') { [System.IO.File]::WriteAllBytes($Target, [byte[]]@()) }
     else { $Raw = Get-Content -LiteralPath $Target -Raw; Set-Content -LiteralPath $Target -Value $Raw.Substring(0, [int]($Raw.Length / 2)) -NoNewline -Encoding utf8 }
 }
+# After the report of this subscription is written, another run writes a
+# right-shaped per-stream state file of its own (stream 5, run id run-other)
+# into the inventory folder, after this run's start read the stream files.
+if ($Scenario.OtherRunFileAfterId -and $Scenario.OtherRunFileAfterId -eq $SubscriptionID)
+{
+    $Target = Join-Path $Root ('.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$TenantID).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
+    Set-Content -LiteralPath $Target -Encoding utf8 -Value (@{ Tenant = $TenantID; StreamId = '5'; RunId = 'run-other'; Completed = @(); FailedAttempts = @() } | ConvertTo-Json -Depth 4)
+}
 '@
     Set-Content -LiteralPath (Join-Path $script:ToolRoot 'ResourceInventory.ps1') -Value $StandInInner -Encoding utf8
 
@@ -309,7 +317,7 @@ function global:Add-Type
     # The scenario: subscriptions by letter, and which of them fail, hang or are disabled.
     function script:Set-Scenario
     {
-        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold, [string]$CutAfter, [int]$CutStream = 1, [string]$CutKind = 'cut short')
+        param([string[]]$Subs, [string[]]$Fail = @(), [string[]]$Hang = @(), [string[]]$Disabled = @(), [string[]]$NoZip = @(), [string[]]$ReadOnlyAfter = @(), [string]$FailReason, [switch]$BlockStateWrite, [string[]]$Denied = @(), [switch]$ConsumptionDenied, [switch]$LoseZipOnFold, [string]$CutAfter, [int]$CutStream = 1, [string]$CutKind = 'cut short', [string]$OtherRunFileAfter)
         $Id = { param($L) $script:Subs[$L].Id }
         [pscustomobject]@{
             Tenant        = $script:Tenant
@@ -324,6 +332,7 @@ function global:Add-Type
             ConsumptionDenied = [bool]$ConsumptionDenied
             LoseZipOnFold = [bool]$LoseZipOnFold
             CutStreamFile = $(if ($CutAfter) { [pscustomobject]@{ AfterId = (& $Id $CutAfter); Stream = $CutStream; Kind = $CutKind } } else { $null })
+            OtherRunFileAfterId = $(if ($OtherRunFileAfter) { & $Id $OtherRunFileAfter } else { $null })
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:Scenario -Encoding utf8
     }
 
@@ -1693,6 +1702,33 @@ Describe 'The run id ties per-stream state files to the run that wrote them' -Sk
         @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -BeNullOrEmpty
         @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
 
+        $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
+        script:Test-CleanLine $R3 | Should -BeTrue
+    }
+
+    It 'a run that does not end clean names the per-stream file another run wrote while it ran, and a clean run removes such a file' {
+        # A run's start folds in or removes the per-stream files already on
+        # disk (#38). A file another run writes while this run is going is left:
+        # a run that does not end clean names it, a clean run removes it.
+        $Name = '.resume-state-{0}-stream-5.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant())
+        # Run 1: A completes, another run then writes its file, B fails.
+        script:Set-Scenario -Subs 'A', 'B' -Fail 'B' -OtherRunFileAfter 'A'
+        $R1 = script:Invoke-Wrapper -Streams 1
+        script:Get-Collected $R1 | Should -Be (script:Get-Ids 'A', 'B')
+        script:Test-CleanLine $R1 | Should -BeFalse
+        @($R1.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -Be @(('The per-stream state files {0} were written by another run, so this run does not use them; they are left in place.' -f $Name))
+        Test-Path -LiteralPath (Join-Path $script:Root $Name) -PathType Leaf | Should -BeTrue
+        # Run 2, -Resume: its start takes the file in; B completes, another run
+        # writes its file again, and the run ends clean and removes it.
+        script:Set-Scenario -Subs 'A', 'B' -OtherRunFileAfter 'B'
+        $R2 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
+        script:Get-Collected $R2 | Should -Be (script:Get-Ids 'B')
+        script:Test-CleanLine $R2 | Should -BeTrue
+        @($R2.Text | Where-Object { $_ -like 'Removed the per-stream state files*' }) | Should -Be @(('Removed the per-stream state files {0}, which another run wrote and no run can resume.' -f $Name))
+        @($R2.Text | Where-Object { $_ -like 'The per-stream state files * were written by another run*' }) | Should -BeNullOrEmpty
+        @(script:Get-StreamLikeFiles) | Should -BeNullOrEmpty
+        # Run 3 finds no state.
         $R3 = script:Invoke-Wrapper -Arguments '-Resume' -Streams 1
         $R3.Text | Should -Contain 'Resume mode: no previous state found; processing all subscriptions.'
         script:Test-CleanLine $R3 | Should -BeTrue
