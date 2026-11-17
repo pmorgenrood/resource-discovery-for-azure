@@ -1276,6 +1276,7 @@ function Get-UsageAggregates
 
     It 'two streams: two subscriptions of two streams whose rows name one zip are a gap, not one report for both<Note>' -ForEach @(
         @{ Note = ''; Stuck = $false }
+        @{ Note = ', and a per-stream file that cannot be removed no longer lists the second as completed'; Stuck = $true }
     ) {
         # Each stream's summary names, for its one subscription, the same report
         # zip, which is on disk: one zip would stand in for both.

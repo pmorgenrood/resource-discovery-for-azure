@@ -3593,6 +3593,8 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
         # of failing to carry its report. One whose run wrote no zip, or left
         # incomplete (metrics or consumption), is on the retry list already.
         # When the inventory folder is gone, its resume state went with it.
+        $GapStateSaved = $true
+        $GapStuckStreamFiles = @()
         if (-not $InventoryRootGone)
         {
             $LatestReports = Get-LatestCompletedReports -Reports (@($RunReports) + @($UnconfirmedStreamReports))
@@ -3625,12 +3627,30 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
             if ($GoneCompleted.Count -gt 0)
             {
                 Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+                # Read back, as at the earlier-report stop: the save only warns when
+                # its write fails, and a per-stream state file that still lists these
+                # subscriptions as completed is folded in again by the next -Resume.
+                $GapStateSaved = Test-ResumeStateSaved -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+                $GapStuckStreamFiles = @(Clear-StreamStateCompletions -Files @(Get-StreamResumeStateFiles -InventoryRoot $InventoryRoot -Tenant $ResumeScope) -Ids @($GoneCompleted | ForEach-Object { [string]$_.Id }))
             }
         }
         Write-Host ("Resume State:            {0}" -f $ResumeStateFile) -ForegroundColor Yellow
-        Write-Host "Recover by either:" -ForegroundColor Yellow
-        Write-Host "  - Locating the missing per-sub directory under the inventory root and inspecting why its zip is absent, OR" -ForegroundColor Yellow
-        Write-Host "  - Re-running with -Resume to re-collect any unprocessed/missing subscription." -ForegroundColor Yellow
+        if (-not $InventoryRootGone -and -not $GapStateSaved)
+        {
+            Write-Host ("The resume state file {0} could not be written (see the WARNING above), so the subscriptions above are not on the retry list: a run with -Resume skips them as completed again. Fix the cause (for example, free up disk space), then start a new run with -Fresh:" -f $ResumeStateFile) -ForegroundColor Red
+            Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
+        }
+        elseif (-not $InventoryRootGone -and $GapStuckStreamFiles.Count -gt 0)
+        {
+            Write-Host ("The per-stream state file(s) {0} still list the subscriptions above as completed and could not be changed (see the WARNING above), so a run with -Resume folds that in again and skips them. Remove the file(s) once the folder can be written, or start a new run with -Fresh:" -f (@($GapStuckStreamFiles | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', ')) -ForegroundColor Red
+            Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
+        }
+        else
+        {
+            Write-Host "Recover by either:" -ForegroundColor Yellow
+            Write-Host "  - Locating the missing per-sub directory under the inventory root and inspecting why its zip is absent, OR" -ForegroundColor Yellow
+            Write-Host "  - Re-running with -Resume to re-collect any unprocessed/missing subscription." -ForegroundColor Yellow
+        }
         if ($WrapperTranscriptStarted)
         {
             Write-Host ("Wrapper Transcript:      {0}" -f $WrapperTranscriptFile) -ForegroundColor Yellow
