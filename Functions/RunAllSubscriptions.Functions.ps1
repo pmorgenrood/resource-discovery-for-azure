@@ -5321,7 +5321,10 @@ function Resolve-StreamSummary
         # Empty for a run that continues a resume state written before run ids existed.
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RunId,
         [string]$StreamId,
-        [string[]]$ExpectedIds = @()
+        [string[]]$ExpectedIds = @(),
+        # The inventory folder: when given, each report record's Zip must be the
+        # zip its subscription's success row names.
+        [string]$InventoryRoot = ''
     )
 
     $NotConfirmed = { param([string]$Reason) [pscustomobject]@{ Accepted = $false; Reason = $Reason } }
@@ -5524,6 +5527,34 @@ function Resolve-StreamSummary
     if ($Unexpected.Count -gt 0) { return (& $NotConfirmed ('it has {0} row(s) for a subscription the stream did not run' -f $Unexpected.Count)) }
     $Repeated = @($RowIds | Group-Object | Where-Object { $_.Count -gt 1 })
     if ($Repeated.Count -gt 0) { return (& $NotConfirmed ('it has more than one row for {0} of the {1} subscription(s) the stream ran' -f $Repeated.Count, @($ExpectedIds).Count)) }
+
+    # A report record belongs to one subscription the stream ran, once, and
+    # names the zip that subscription's success row names: otherwise a summary
+    # could add another tenant's or another run's zip to this run's bundle.
+    $ReportIds = @($RunReports | ForEach-Object { $_.Id })
+    $ReportOutside = @($ReportIds | Where-Object { @($ExpectedIds) -notcontains $_ })
+    if ($ReportOutside.Count -gt 0) { return (& $NotConfirmed ('it has {0} RunReports row(s) for a subscription the stream did not run' -f $ReportOutside.Count)) }
+    $ReportRepeated = @($ReportIds | Group-Object | Where-Object { $_.Count -gt 1 })
+    if ($ReportRepeated.Count -gt 0) { return (& $NotConfirmed ('it has more than one RunReports row for {0} subscription(s)' -f $ReportRepeated.Count)) }
+    $ReportNoSuccess = @($ReportIds | Where-Object { $Id = $_; @($ResourceCounts | Where-Object { $_.Id -eq $Id }).Count -eq 0 })
+    if ($ReportNoSuccess.Count -gt 0) { return (& $NotConfirmed ('it has {0} RunReports row(s) for a subscription with no success row' -f $ReportNoSuccess.Count)) }
+    if (-not [string]::IsNullOrWhiteSpace($InventoryRoot))
+    {
+        $Compare = if ([System.IO.Path]::DirectorySeparatorChar -eq '\') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+        $Disagree = 0
+        foreach ($Report in $RunReports)
+        {
+            $Success = @($ResourceCounts | Where-Object { $_.Id -eq $Report.Id })[0]
+            $Same = $false
+            if (-not [string]::IsNullOrEmpty($Success.Zip))
+            {
+                try { $Same = [string]::Equals([System.IO.Path]::GetFullPath((Join-Path $InventoryRoot $Report.Zip)), [System.IO.Path]::GetFullPath($Success.Zip), $Compare) }
+                catch { $Same = $false }
+            }
+            if (-not $Same) { $Disagree++ }
+        }
+        if ($Disagree -gt 0) { return (& $NotConfirmed ('{0} RunReports row(s) name a zip that is not the one the success row names' -f $Disagree)) }
+    }
 
     return [pscustomobject]@{
         Accepted              = $true

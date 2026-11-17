@@ -374,6 +374,28 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         { Read-Case -Json '{"StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":{"a":1},"Zip":{"b":2}}],"ConsumptionRecords":[1,2]}' } | Should -Not -Throw
     }
 
+    It 'refuses a RunReports row that is not that subscription''s own success report' -ForEach @(
+        @{ Case = 'an id the stream did not run'; Rows = '{"Id":"sub-x","Zip":"a/a.zip"}'; Reason = 'for a subscription the stream did not run' }
+        @{ Case = 'the same id twice'; Rows = '{"Id":"sub-a","Zip":"a/a.zip"},{"Id":"sub-a","Zip":"other/b.zip"}'; Reason = 'more than one RunReports row' }
+        @{ Case = 'a zip the success row does not name'; Rows = '{"Id":"sub-a","Zip":"other/b.zip"}'; Reason = 'not the one the success row names' }
+    ) {
+        $Json = '{"RunId":"' + $script:SummaryRunId + '","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/inv/a/a.zip"}],"RunReports":[' + $Rows + ']}'
+        $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId $script:SummaryRunId -StreamId '0' -ExpectedIds @('sub-a') -InventoryRoot '/inv'
+        $Read.Accepted | Should -BeFalse -Because $Case
+        $Read.Reason | Should -Match ([regex]::Escape($Reason))
+    }
+
+    It 'accepts a RunReports row whose zip is the success row''s zip under the inventory folder' {
+        $Json = '{"RunId":"' + $script:SummaryRunId + '","StreamId":"0","ResourceCounts":[{"Id":"sub-a","Count":1,"Zip":"/inv/a/a.zip"}],"RunReports":[{"Id":"sub-a","Zip":"a/a.zip"}]}'
+        $Read = Resolve-StreamSummary -Summary ($Json | ConvertFrom-Json) -RunId $script:SummaryRunId -StreamId '0' -ExpectedIds @('sub-a') -InventoryRoot '/inv'
+        $Read.Accepted | Should -BeTrue -Because $Read.Reason
+    }
+
+    It 'has the wrapper pass the inventory folder to the summary check' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Match 'Resolve-StreamSummary[^\r\n]*-InventoryRoot \$InventoryRoot'
+    }
+
     It 'gives back the checked RunReports and FailedStep, the only copies the wrapper reads' {
         $Json = '{"StreamId":"0","Status":"ok","ResourceCounts":[' + $script:GoodRow + '],"RunReports":[{"Id":"sub-a","Name":"Sub A","Zip":"ResourcesReport_a/ResourcesReport_a.zip","Obfuscated":true}]}'
         $Read = Read-Case -Json $Json

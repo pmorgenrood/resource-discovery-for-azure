@@ -2856,7 +2856,7 @@ else
                     # treated as a summary that cannot
                     # be read: not confirmed. Only its checked values are used
                     # below.
-                    $Read = Resolve-StreamSummary -Summary $StreamSummary -RunId $RunId -StreamId $S.StreamId -ExpectedIds $S.ExpectedIds
+                    $Read = Resolve-StreamSummary -Summary $StreamSummary -RunId $RunId -StreamId $S.StreamId -ExpectedIds $S.ExpectedIds -InventoryRoot $InventoryRoot
                     if (-not $Read.Accepted)
                     {
                         $UnreadableStreamSummaries += [pscustomobject]@{ StreamId = $S.StreamId; SubCount = $S.SubCount; Reason = 'Unreadable' }
