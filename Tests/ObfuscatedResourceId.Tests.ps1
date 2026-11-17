@@ -744,3 +744,41 @@ Describe 'Test-ObfuscatedIdShape' {
         Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.sql/servers/srv-a/databases/db-a" -MaskedId ($Masked -f $script:T) | Should -BeFalse
     }
 }
+
+Describe 'A tenant-scope id keeps its shape (it has no subscription)' {
+    BeforeEach { Reset-ObfuscationState }
+
+    It 'masks a <Label> id to its own path with a token as the name' -ForEach @(
+        @{ Label = 'reservation order'; Id = '/providers/Microsoft.Capacity/reservationOrders/ro-a'; Prefix = '/providers/Microsoft.Capacity/reservationOrders/' }
+        @{ Label = 'management group'; Id = '/providers/Microsoft.Management/managementGroups/mg-a'; Prefix = '/providers/Microsoft.Management/managementGroups/' }
+    ) {
+        $Masked = Get-ObfuscatedResourceId -ResourceId $Id
+        $Masked | Should -Match ('^' + [regex]::Escape($Prefix) + $script:Token + '$')
+        $Masked | Should -Not -Match '/subscriptions/'
+        $Masked | Should -Not -Match 'ro-a|mg-a'
+    }
+
+    It 'gives every name of a tenant-scope reservation id a token and keeps its types' {
+        $Masked = Get-ObfuscatedResourceId -ResourceId '/providers/Microsoft.Capacity/reservationOrders/ro-a/reservations/res-a'
+        $Parts = $Masked -split '/'
+        $Parts.Count | Should -Be 7
+        $Parts[1] | Should -BeExactly 'providers'
+        $Parts[2] | Should -BeExactly 'Microsoft.Capacity'
+        $Parts[3] | Should -BeExactly 'reservationOrders'
+        $Parts[4] | Should -Match ('^' + $script:Token + '$')
+        $Parts[5] | Should -BeExactly 'reservations'
+        $Parts[6] | Should -Match ('^' + $script:Token + '$')
+    }
+
+    It 'gives the same masked id to the same tenant-scope id on a second call' {
+        $Id = '/providers/Microsoft.Capacity/reservationOrders/ro-a'
+        $First = Get-ObfuscatedResourceId -ResourceId $Id
+        $Second = Get-ObfuscatedResourceId -ResourceId $Id
+        $Second | Should -BeExactly $First
+    }
+
+    It 'keeps the /subscriptions/ start on an id that has a subscription' {
+        $Masked = Get-ObfuscatedResourceId -ResourceId "$script:Base/microsoft.compute/virtualmachines/vm-a"
+        $Masked | Should -Match '^/subscriptions/'
+    }
+}
