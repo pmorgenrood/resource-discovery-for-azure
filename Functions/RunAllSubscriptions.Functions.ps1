@@ -3384,8 +3384,9 @@ function Get-LatestCompletedReports
 # consolidated zip. A record is carried only when its path is a relative path
 # inside the inventory root, names a .zip one folder or more down (a report
 # folder, Test-ReportZipRecordPath) that is not a de-obfuscated (*_revealed*)
-# copy and that no other subscription names (-ClaimedZips, or one carried
-# before it), exists, opens as a zip with at least one entry, and was
+# copy and that no other subscription names (-ClaimedZips, or the record of
+# another skipped subscription: then none of them is carried, whatever their
+# order, as nothing tells whose report the zip holds), exists, opens as a zip with at least one entry, and was
 # written with the same -Obfuscate setting as this run, so one bundle never mixes
 # obfuscated and real identifiers. Everything else is returned under Missing with
 # the reason. Cost: one file-exists check and one zip-directory read per skipped
@@ -3409,6 +3410,26 @@ function Get-ResumeCarriedReports
     $SeenIds = @{}
     $Claimed = @{}
     foreach ($C in @($ClaimedZips)) { $Key = Get-ReportZipPathKey -Path ([string]$C) -InventoryRoot $InventoryRoot; if ($null -ne $Key) { $Claimed[$Key] = $true } }
+    # How many skipped subscriptions' records name each zip. A zip two of them
+    # name is carried for neither: keeping the first in list order would let a
+    # bad record stand in for the right one, and the next run would hold one
+    # report twice and lose the other. Both are collected again instead.
+    $SkippedPerZip = @{}
+    $CountedIds = @{}
+    foreach ($Sub in @($SkippedSubscriptions))
+    {
+        if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
+        $Id = [string]$Sub.Id
+        if ($CountedIds.ContainsKey($Id) -or -not $ById.ContainsKey($Id)) { continue }
+        $CountedIds[$Id] = $true
+        $Zip = $ById[$Id].PSObject.Properties['Zip']
+        if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
+        if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..')) { continue }
+        $Key = Get-ReportZipPathKey -Path $Zip.Value -InventoryRoot $InventoryRoot
+        if ($null -eq $Key) { continue }
+        if (-not $SkippedPerZip.ContainsKey($Key)) { $SkippedPerZip[$Key] = 0 }
+        $SkippedPerZip[$Key]++
+    }
     foreach ($Sub in @($SkippedSubscriptions))
     {
         if ($null -eq $Sub -or [string]::IsNullOrWhiteSpace([string]$Sub.Id)) { continue }
@@ -3458,7 +3479,7 @@ function Get-ResumeCarriedReports
                     # consolidated zip, whose reports would sit two zips deep.
                     $Reason = ('its report path in the resume state is not a report zip: {0}' -f $Rel)
                 }
-                elseif ($Claimed.ContainsKey((Get-ReportZipPathKey -Path $FullPath)))
+                elseif ($Claimed.ContainsKey((Get-ReportZipPathKey -Path $FullPath)) -or [int]$SkippedPerZip[(Get-ReportZipPathKey -Path $FullPath)] -gt 1)
                 {
                     $Reason = ('its report zip is one another subscription already names, and one zip holds one report: {0}' -f $Rel)
                 }
@@ -3500,7 +3521,6 @@ function Get-ResumeCarriedReports
 
         if ($null -eq $Reason)
         {
-            $Claimed[(Get-ReportZipPathKey -Path $FullPath)] = $true
             $Carried += [pscustomobject]@{
                 Id     = $Id
                 Name   = [string]$Sub.Name
@@ -3685,25 +3705,35 @@ function Get-ReportZipPathKey
     return $Full
 }
 
-# The rows of the output check ($Rows: Id, Name and Zip, in order) that name a
-# zip an earlier row of another subscription already names (Get-ReportZipPathKey).
-# One zip holds one subscription's report, so a second claim on it is a gap:
-# each such row comes back with no zip and RepeatClaim set, to be counted as
-# missing. A row with no zip claims nothing.
+# The rows of the output check ($Rows: Id, Name and Zip) whose zip another
+# subscription's row also names (Get-ReportZipPathKey). One zip holds one
+# subscription's report, and nothing tells whose report a shared zip holds, so
+# no claim wins by row order: every subscription that names a shared zip comes
+# back once, in first-seen order, with no zip and RepeatClaim set, to be counted
+# as missing and collected again. A row with no zip claims nothing; one
+# subscription's rows that name one zip twice are one claim.
 function Get-RepeatReportZipClaims
 {
     param([object]$Rows = @(), [string]$InventoryRoot = '')
-    $Owner = @{}
+    $IdsByKey = @{}
+    $Order = [System.Collections.Generic.List[object]]::new()
     foreach ($Row in @($Rows))
     {
         if ($null -eq $Row -or $Row -is [string] -or $Row -is [ValueType]) { continue }
         $ZipProp = $Row.PSObject.Properties['Zip']
         $Key = if ($null -eq $ZipProp) { $null } else { Get-ReportZipPathKey -Path ([string]$ZipProp.Value) -InventoryRoot $InventoryRoot }
         if ($null -eq $Key) { continue }
+        if (-not $IdsByKey.ContainsKey($Key)) { $IdsByKey[$Key] = [System.Collections.Generic.List[string]]::new() }
         $Id = [string]$Row.Id
-        if (-not $Owner.ContainsKey($Key)) { $Owner[$Key] = $Id; continue }
-        if ($Owner[$Key] -eq $Id) { continue }
-        [pscustomobject]@{ Name = [string]$Row.Name; Id = $Id; Count = 0; Skipped = 0; Zip = $null; RepeatClaim = $true }
+        if (-not $IdsByKey[$Key].Contains($Id)) { $IdsByKey[$Key].Add($Id) }
+        $Order.Add([pscustomobject]@{ Key = $Key; Id = $Id; Name = [string]$Row.Name })
+    }
+    $Seen = @{}
+    foreach ($Entry in $Order)
+    {
+        if ($IdsByKey[$Entry.Key].Count -lt 2 -or $Seen.ContainsKey($Entry.Id)) { continue }
+        $Seen[$Entry.Id] = $true
+        [pscustomobject]@{ Name = $Entry.Name; Id = $Entry.Id; Count = 0; Skipped = 0; Zip = $null; RepeatClaim = $true }
     }
 }
 
@@ -3712,31 +3742,40 @@ function Get-RepeatReportZipClaims
 # one row for each record that has the shape of a report zip record
 # (Test-ReportZipRecordPath, not rooted, no '..'), whose id the stream completed
 # ($CompletedIds) and that no success row ($SuccessIds) already covers. Each id
-# and each zip path counts once: a later record for a zip an earlier row has
-# already named gets a row with no zip, so it is a gap (one zip cannot stand in
-# for two subscriptions). A row is made whether or not its zip is on disk now,
-# so a zip that is gone by the time the zips are picked is a gap too.
+# counts once (its first record). Each zip path belongs to one subscription:
+# when the records of two or more subscriptions name one zip, nothing tells
+# whose report it holds, so every one of them gets a row with no zip and is a
+# gap (one zip cannot stand in for two subscriptions, and no record wins by its
+# order). A row is made whether or not its zip is on disk now, so a zip that is
+# gone by the time the zips are picked is a gap too.
 function Get-UnconfirmedReportRows
 {
     param([object]$Records = @(), [object]$CompletedIds = @(), [object]$SuccessIds = @(), [Parameter(Mandatory = $true)][string]$InventoryRoot)
     $SeenIds = @{}
-    $SeenZips = @{}
+    $ZipIds = @{}
     $PathCase = if ([System.IO.Path]::DirectorySeparatorChar -eq '/') { { param($P) $P } } else { { param($P) $P.ToLowerInvariant() } }
-    foreach ($Record in @($Records))
+    $Kept = @(foreach ($Record in @($Records))
+        {
+            if ($null -eq $Record -or $Record -is [string] -or $Record -is [ValueType] -or $null -eq $Record.PSObject.Properties['Id']) { continue }
+            $Zip = $Record.PSObject.Properties['Zip']
+            if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
+            if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..') -or -not (Test-ReportZipRecordPath -Path $Zip.Value)) { continue }
+            $Id = [string]$Record.Id
+            if ($SeenIds.ContainsKey($Id) -or @($SuccessIds) -contains $Id -or @($CompletedIds) -notcontains $Id) { continue }
+            $SeenIds[$Id] = $true
+            $FullZip = [System.IO.Path]::GetFullPath((Join-Path $InventoryRoot $Zip.Value))
+            $Key = & $PathCase $FullZip
+            if (-not $ZipIds.ContainsKey($Key)) { $ZipIds[$Key] = 0 }
+            $ZipIds[$Key]++
+            $Name = $Record.PSObject.Properties['Name']
+            [pscustomobject]@{ Name = $(if ($null -eq $Name) { $Id } else { [string]$Name.Value }); Id = $Id; FullZip = $FullZip; Key = $Key }
+        })
+    foreach ($Row in $Kept)
     {
-        if ($null -eq $Record -or $Record -is [string] -or $Record -is [ValueType] -or $null -eq $Record.PSObject.Properties['Id']) { continue }
-        $Zip = $Record.PSObject.Properties['Zip']
-        if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
-        if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..') -or -not (Test-ReportZipRecordPath -Path $Zip.Value)) { continue }
-        $Id = [string]$Record.Id
-        if ($SeenIds.ContainsKey($Id) -or @($SuccessIds) -contains $Id -or @($CompletedIds) -notcontains $Id) { continue }
-        $SeenIds[$Id] = $true
-        $FullZip = [System.IO.Path]::GetFullPath((Join-Path $InventoryRoot $Zip.Value))
-        $Key = & $PathCase $FullZip
-        $Repeat = $SeenZips.ContainsKey($Key)
-        $SeenZips[$Key] = $true
-        $Name = $Record.PSObject.Properties['Name']
-        [pscustomobject]@{ Name = $(if ($null -eq $Name) { $Id } else { [string]$Name.Value }); Id = $Id; Count = 0; Skipped = 0; Zip = $(if ($Repeat) { $null } else { $FullZip }); FromRecord = $true }
+        # A row with no zip because its zip is shared says so (RepeatClaim), so the
+        # output check names that cause, not the unread summary.
+        if ($ZipIds[$Row.Key] -gt 1) { [pscustomobject]@{ Name = $Row.Name; Id = $Row.Id; Count = 0; Skipped = 0; Zip = $null; FromRecord = $true; RepeatClaim = $true } }
+        else { [pscustomobject]@{ Name = $Row.Name; Id = $Row.Id; Count = 0; Skipped = 0; Zip = $Row.FullZip; FromRecord = $true } }
     }
 }
 

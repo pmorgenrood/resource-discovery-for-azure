@@ -400,8 +400,9 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Read.Accepted | Should -BeFalse -Because $Case
     }
 
-    It 'Get-RepeatReportZipClaims names each later row of another subscription on a zip an earlier row names' {
-        # Success rows of two streams, a record row, a carried report: every second claim is a gap.
+    It 'Get-RepeatReportZipClaims names every subscription whose zip another subscription''s row also names, whatever the row order' {
+        # Success rows of two streams, a record row, a carried report: every claim on a shared zip is a gap,
+        # the first one too, since nothing tells whose report the zip holds.
         $Rows = @(
             [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = '/inv/a/a.zip' }
             [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = '/inv/a/./a.zip' }
@@ -412,16 +413,39 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
             [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = '/inv/a/a.zip' }
         )
         $Repeat = @(Get-RepeatReportZipClaims -Rows $Rows -InventoryRoot '/inv')
-        @($Repeat | ForEach-Object { $_.Id }) | Should -Be @('sub-b', 'sub-d')
-        @($Repeat | Where-Object { $_.RepeatClaim -and [string]::IsNullOrEmpty($_.Zip) }).Count | Should -Be 2
+        @($Repeat | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b', 'sub-c', 'sub-d')
+        @($Repeat | Where-Object { $_.RepeatClaim -and [string]::IsNullOrEmpty($_.Zip) }).Count | Should -Be 4
+        # The same rows in the reverse order name the same subscriptions.
+        [array]::Reverse($Rows)
+        @(Get-RepeatReportZipClaims -Rows $Rows -InventoryRoot '/inv' | ForEach-Object { $_.Id } | Sort-Object) | Should -Be @('sub-a', 'sub-b', 'sub-c', 'sub-d')
         # A relative path is taken under the inventory folder.
-        @(Get-RepeatReportZipClaims -Rows @([pscustomobject]@{ Id = 'sub-a'; Zip = '/inv/a/a.zip' }, [pscustomobject]@{ Id = 'sub-b'; Zip = 'a/a.zip' }) -InventoryRoot '/inv').Count | Should -Be 1
+        @(Get-RepeatReportZipClaims -Rows @([pscustomobject]@{ Id = 'sub-a'; Zip = '/inv/a/a.zip' }, [pscustomobject]@{ Id = 'sub-b'; Zip = 'a/a.zip' }) -InventoryRoot '/inv').Count | Should -Be 2
+        # One subscription's rows on one zip are no shared zip.
+        @(Get-RepeatReportZipClaims -Rows @([pscustomobject]@{ Id = 'sub-a'; Zip = '/inv/a/a.zip' }, [pscustomobject]@{ Id = 'sub-a'; Zip = 'a/a.zip' }) -InventoryRoot '/inv').Count | Should -Be 0
     }
 
     It 'has the output check count a second claim on one zip as a gap, across streams, record rows and carried reports' {
-        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
-        $Wrapper | Should -Match ([regex]::Escape('Get-RepeatReportZipClaims -Rows (@($VerifyRows) + @($CarriedReports))'))
-        $Wrapper | Should -Match 'Get-ResumeCarriedReports [^\r\n]*-ClaimedZips \$ClaimedByThisRun'
+        # Read from the wrapper's syntax tree, not its spelling: which variables each call is given.
+        # The behaviour is in the ExitCodeCarryOver cases; this pins the wiring they run through.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Calls = { param([string]$Name) @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.CommandAst] -and $N.GetCommandName() -eq $Name }, $true)) }
+        $ArgVars = {
+            param($Call, [string]$Param)
+            $E = $Call.CommandElements
+            for ($I = 0; $I -lt $E.Count - 1; $I++)
+            {
+                if ($E[$I] -is [System.Management.Automation.Language.CommandParameterAst] -and $E[$I].ParameterName -eq $Param)
+                {
+                    return @($E[$I + 1].FindAll({ param($N) $N -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath })
+                }
+            }
+            @()
+        }
+        $Repeat = @(& $Calls 'Get-RepeatReportZipClaims')
+        @($Repeat | Where-Object { $V = & $ArgVars $_ 'Rows'; $V -contains 'VerifyRows' -and $V -contains 'CarriedReports' }).Count | Should -Be 1
+        $Carry = @(& $Calls 'Get-ResumeCarriedReports')
+        $Carry.Count | Should -Be 1
+        & $ArgVars $Carry[0] 'ClaimedZips' | Should -Be @('ClaimedByThisRun')
     }
 
     It 'accepts a RunReports row whose zip is the success row''s zip under the inventory folder' {
@@ -448,7 +472,7 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Items[0].Name | Should -Be 'ResourcesReport_a.zip'
     }
 
-    It 'Get-UnconfirmedReportRows makes a row for each completed id with a report zip record, there or not, and a second record for the same zip or id is no second zip' {
+    It 'Get-UnconfirmedReportRows makes a row for each completed id with a report zip record, there or not; a second record for the same id is no second row, and no subscription whose zip another names keeps it' {
         $Root = Join-Path $script:TestRoot ('unconf_' + [guid]::NewGuid().ToString().Substring(0, 6))
         New-Item -ItemType Directory -Path (Join-Path $Root 'ResourcesReport_a') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $Root 'ResourcesReport_a/ResourcesReport_a.zip') -Value 'zip'
@@ -462,9 +486,43 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         )
         $Rows = @(Get-UnconfirmedReportRows -Records $Records -CompletedIds @('sub-a', 'sub-b', 'sub-c', 'sub-s') -SuccessIds @('sub-s') -InventoryRoot $Root)
         @($Rows | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b', 'sub-c')
-        $Rows[0].Zip | Should -Be ([System.IO.Path]::GetFullPath((Join-Path $Root 'ResourcesReport_a/ResourcesReport_a.zip')))
+        # Sub A and Sub B name one zip: neither keeps it, whichever comes first.
+        $Rows[0].Zip | Should -BeNullOrEmpty
         $Rows[1].Zip | Should -BeNullOrEmpty
         $Rows[2].Zip | Should -Be ([System.IO.Path]::GetFullPath((Join-Path $Root 'ResourcesReport_c/ResourcesReport_c.zip')))
+        $Reversed = @(Get-UnconfirmedReportRows -Records @($Records[1], $Records[0]) -CompletedIds @('sub-a', 'sub-b') -InventoryRoot $Root)
+        @($Reversed | Where-Object { -not [string]::IsNullOrEmpty($_.Zip) }).Count | Should -Be 0
+    }
+
+    It 'Get-UnconfirmedReportRows marks a record row that has no zip because its zip is shared, so the output check names that cause' {
+        # The output check prints a RepeatClaim row as "its zip is one another subscription's report
+        # also names", ahead of the "summary could not be read" line of a plain record row.
+        $Root = Join-Path $script:TestRoot ('unconfmark_' + [guid]::NewGuid().ToString().Substring(0, 6))
+        $Records = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport_a/ResourcesReport_a.zip' }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = 'ResourcesReport_a/ResourcesReport_a.zip' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'C'; Zip = 'ResourcesReport_c/ResourcesReport_c.zip' }
+        )
+        $Rows = @(Get-UnconfirmedReportRows -Records $Records -CompletedIds @('sub-a', 'sub-b', 'sub-c') -InventoryRoot $Root)
+        @($Rows | Where-Object { $null -ne $_.PSObject.Properties['RepeatClaim'] -and $_.RepeatClaim } | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b')
+        $Rows[2].PSObject.Properties['RepeatClaim'] | Should -BeNullOrEmpty
+        # The output check's loop over the missing-zip rows, read from the wrapper's syntax tree:
+        # its if/elseif clauses test RepeatClaim first, then FromRecord, each with its own line.
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1'), [ref]$null, [ref]$null)
+        $Loops = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.ForEachStatementAst] -and $N.Variable.VariablePath.UserPath -eq 'S' -and $N.Condition.Extent.Text -eq '$MissingZipSubs' }, $true))
+        $Loops.Count | Should -Be 1 -Because 'the output check has one loop over the missing-zip rows'
+        $Ifs = @($Loops[0].Body.Statements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] })
+        $Ifs.Count | Should -Be 1 -Because 'the loop body picks each row''s line with one if/elseif'
+        # The property each clause tests: $S.PSObject.Properties['<name>'].
+        $Keys = @(foreach ($Clause in $Ifs[0].Clauses)
+            {
+                $Index = @($Clause.Item1.FindAll({ param($N) $N -is [System.Management.Automation.Language.IndexExpressionAst] -and $N.Target -is [System.Management.Automation.Language.MemberExpressionAst] -and $N.Target.Member.Extent.Text -eq 'Properties' }, $true))
+                $Index.Count | Should -Be 1 -Because $Clause.Item1.Extent.Text
+                $Index[0].Index.Value
+            })
+        $Keys | Should -Be @('RepeatClaim', 'FromRecord') -Because 'the RepeatClaim clause is tested first'
+        $Ifs[0].Clauses[0].Item2.Extent.Text | Should -Match ([regex]::Escape("its zip is one another subscription's report also names"))
+        $Ifs[0].Clauses[1].Item2.Extent.Text | Should -Match ([regex]::Escape('report recorded by a stream whose summary could not be read'))
     }
 
     It 'Test-ReportZipRecordPath splits on the platform''s own separators: a backslash on Unix is part of one file name, both slashes split on Windows' {

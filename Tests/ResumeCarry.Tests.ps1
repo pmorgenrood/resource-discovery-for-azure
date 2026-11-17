@@ -386,17 +386,23 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
         @($R.Missing).Count | Should -Be 0
     }
 
-    It 'carries one zip for one subscription only: a second skipped subscription whose record names the same zip, however spelled, is not carried' {
+    It 'carries a zip that two skipped subscriptions'' records name, however spelled, for neither of them, in either order<Note>' -ForEach @(
+        @{ Note = ''; Reverse = $false }
+        @{ Note = ' (the bad record first)'; Reverse = $true }
+    ) {
         # Two completed subscriptions whose records name one zip would pass with
-        # one report on the next -Resume; the second is collected again instead.
+        # one report on the next -Resume. Nothing tells whose report the zip
+        # holds, so keeping the first in list order could carry the wrong one:
+        # both are collected again instead.
         $Subs = @($script:SubA, [pscustomobject]@{ Id = 'sub-b'; Name = 'B' })
+        if ($Reverse) { [array]::Reverse($Subs) }
         $Reports = @(
             [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = $script:Rel; Obfuscated = $false },
             [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = (Join-Path 'ResourcesReport2aaaa' (Join-Path '.' 'ResourcesReport_2aaaa.zip')); Obfuscated = $false })
         $R = Get-ResumeCarriedReports -SkippedSubscriptions $Subs -Reports $Reports -InventoryRoot $script:Root -Obfuscated $false
-        @($R.Carried | ForEach-Object { $_.Id }) | Should -Be @('sub-a')
-        @($R.Missing | ForEach-Object { $_.Id }) | Should -Be @('sub-b')
-        $R.Missing[0].Reason | Should -Match 'another subscription already names'
+        @($R.Carried).Count | Should -Be 0
+        @($R.Missing | ForEach-Object { $_.Id } | Sort-Object) | Should -Be @('sub-a', 'sub-b')
+        @($R.Missing | Where-Object { $_.Reason -match 'another subscription already names' }).Count | Should -Be 2
     }
 
     It 'does not carry a record whose zip a subscription of this run already names' {

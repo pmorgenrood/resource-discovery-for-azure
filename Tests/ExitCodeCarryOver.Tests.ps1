@@ -1293,20 +1293,27 @@ function Get-UsageAggregates
         }
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB) -Streams 2 -ReuseHome $CaseHome -StreamSummaryJson (& $Forge $script:SubA '0') -Stream1SummaryJson (& $Forge $script:SubB '1') -StreamFileStuck:$Stuck
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
-        $Run.Console | Should -Match ('(?m)^\s*- Sub B \({0}\) \[its zip is one another subscription''s report also names\]' -f [regex]::Escape($script:SubB.Id)) -Because $Run.Console
+        # Nothing tells whose report the zip holds, so neither claim wins by its order.
+        foreach ($Sub in @($script:SubA, $script:SubB))
+        {
+            $Run.Console | Should -Match ('(?m)^\s*- {0} \({1}\) \[its zip is one another subscription''s report also names\]' -f [regex]::Escape($Sub.Name), [regex]::Escape($Sub.Id)) -Because $Run.Console
+        }
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
-        # The second claim is collected again by the next run; the first is kept.
+        # Both claims are collected again by the next run.
+        $Run.FailedIds | Should -Contain $script:SubA.Id -Because $Run.Console
         $Run.FailedIds | Should -Contain $script:SubB.Id -Because $Run.Console
-        $Run.FailedIds | Should -Not -Contain $script:SubA.Id -Because $Run.Console
         if ($Stuck)
         {
-            $Left = @(Get-ChildItem -LiteralPath $Run.Root -Filter '.resume-state-*-stream-*.json' -File -Force | Where-Object { $_.Name -notlike '*-stream-summary-*' -and (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Completed -contains $script:SubB.Id })
-            $Left.Count | Should -Be 0 -Because ('a per-stream file still lists Sub B as completed: ' + (@($Left | ForEach-Object { $_.Name }) -join ', '))
+            $Left = @(Get-ChildItem -LiteralPath $Run.Root -Filter '.resume-state-*-stream-*.json' -File -Force | Where-Object { $_.Name -notlike '*-stream-summary-*' -and @((Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).Completed | Where-Object { $_ -in @($script:SubA.Id, $script:SubB.Id) }).Count -gt 0 })
+            $Left.Count | Should -Be 0 -Because ('a per-stream file still lists Sub A or Sub B as completed: ' + (@($Left | ForEach-Object { $_.Name }) -join ', '))
         }
     }
 
-    It 'sequential with -Resume: two completed subscriptions whose records name one zip are not both carried; the second is collected again and the run after ends clean' {
+    It 'sequential with -Resume: two completed subscriptions whose records name one zip are carried for neither, both are collected again and the run after ends clean<Note>' -ForEach @(
+        @{ Note = ' (the bad record is the later one)'; From = 'C'; To = 'B' }
+        @{ Note = ' (the bad record is the first one)'; From = 'B'; To = 'C' }
+    ) {
         # Run 1 fails Sub A and completes Sub B and Sub C, so the state is kept.
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -FailSub $script:SubA.Id
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
@@ -1319,18 +1326,23 @@ function Get-UsageAggregates
         $ZipB | Should -Not -BeNullOrEmpty
         $ZipC | Should -Not -BeNullOrEmpty
         $Json = { param($V) (ConvertTo-Json -InputObject ([string]$V)) }
-        $Text.Contains((& $Json $ZipC)) | Should -BeTrue
-        Set-Content -LiteralPath $StatePath -Value $Text.Replace((& $Json $ZipC), (& $Json $ZipB)) -Encoding utf8 -NoNewline
-        # Run 2: Sub B is carried, Sub C is not (its zip is Sub B's), so it stops.
+        $Zips = @{ B = $ZipB; C = $ZipC }
+        $Text.Contains((& $Json $Zips[$From])) | Should -BeTrue
+        Set-Content -LiteralPath $StatePath -Value $Text.Replace((& $Json $Zips[$From]), (& $Json $Zips[$To])) -Encoding utf8 -NoNewline
+        # Run 2: neither Sub B nor Sub C is carried (one zip, two records), so it stops.
         $Next = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Resume -ReuseHome $Run.Home
         $Next.Console | Should -Match '= FAILED \(earlier report not carried\) =' -Because $Next.Console
-        $Next.Console | Should -Match ('(?m)^  - Sub C \({0}\): its report zip is one another subscription already names' -f [regex]::Escape($script:SubC.Id)) -Because $Next.Console
+        foreach ($Sub in @($script:SubB, $script:SubC))
+        {
+            $Next.Console | Should -Match ('(?m)^  - {0} \({1}\): its report zip is one another subscription already names' -f [regex]::Escape($Sub.Name), [regex]::Escape($Sub.Id)) -Because $Next.Console
+        }
         # No consolidated zip is made (run 1's, with Sub B and Sub C, is the one there).
         $Next.Console | Should -Match 'No consolidated zip was made' -Because $Next.Console
         $Next.ZipCount | Should -Be $Run.ZipCount -Because $Next.Console
         $Next.ExitCode | Should -Be 2 -Because $Next.Console
-        # Run 3 collects Sub C and ends with one report for each subscription.
+        # Run 3 collects Sub B and Sub C and ends with one report for each subscription.
         $Done = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Resume -ReuseHome $Run.Home
+        $Done.Console | Should -Match 'Processing subscription: Sub B' -Because $Done.Console
         $Done.Console | Should -Match 'Processing subscription: Sub C' -Because $Done.Console
         $Done.ExitCode | Should -Be 0 -Because $Done.Console
         $Newest = @(Get-ChildItem -LiteralPath $Done.Root -Filter 'AllSubscriptions_ResourcesReport_*.zip' -File | Sort-Object LastWriteTimeUtc)[-1]
