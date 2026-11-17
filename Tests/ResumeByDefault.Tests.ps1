@@ -1751,7 +1751,7 @@ Describe 'One run record in every write, and advice that runs as stated' -Skip:$
         script:Set-Scenario -Subs 'A', 'B'
         $R1 = script:Invoke-Wrapper -Arguments '-ResumeFailedOnly' -Streams 1
         $R1.ExitCode | Should -Be 2
-        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Fresh. The resume state records no report for 2 completed subscription(s), so a run that continues this one cannot put them into a consolidated zip and ends with exit 2; a new run collects every subscription again.'
+        $R1.Text | Should -Contain '  Next: run the same command without -ResumeFailedOnly, with -Fresh. The resume state records no report for 2 completed subscription(s), so a run that continues this one stops with exit 2 before the consolidated zip and puts them back on the retry list, and the run after it collects only them; a new run collects every subscription again.'
         $R2 = script:Invoke-Wrapper -Arguments '-Fresh' -Streams 1
         $R2.ExitCode | Should -Be 0
         script:Get-Collected $R2 | Should -Be (script:Get-Ids 'A', 'B')

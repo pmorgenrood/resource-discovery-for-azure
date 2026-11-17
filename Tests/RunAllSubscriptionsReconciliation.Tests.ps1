@@ -997,6 +997,11 @@ Describe 'Get-RunSummaryLogContent run-level shareable log' {
         ($Only -join "`n") | Should -Not -Match 'the next run collects them'
     }
 
+    It 'the zip coverage has no earlier-report-not-carried reason: a run with a report it could not carry stops before the coverage is made' {
+        (Get-Command Get-RunReportCoverage).Parameters.ContainsKey('Uncarried') | Should -BeFalse
+        (Get-Content -LiteralPath $script:FunctionsPath -Raw) | Should -Not -Match 'earlier report not carried'
+    }
+
     It 'gives a missing report that took its subscription to the retry limit the retry-limit reason in the zip coverage' {
         $Visible = @([pscustomobject]@{ Id = 'sub-a'; Name = 'Sub A'; State = 'Enabled' }, [pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; State = 'Enabled' })
         $Limited = @([pscustomobject]@{ Name = 'Sub B'; Id = 'sub-b'; Attempts = 3; Reason = 'its report zip was not written' })

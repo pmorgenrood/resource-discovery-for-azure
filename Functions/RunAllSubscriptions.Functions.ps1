@@ -5896,7 +5896,7 @@ function Get-AzContextAutosaveCheck
 # visible and not left out as not enabled), those visible to the tenant, and
 # the reports in the zip. The first reason that applies is used, in this
 # order: report missing, skipped by the up-front role check, retry limit
-# reached, earlier report not carried, completed earlier in the run (a
+# reached, completed earlier in the run (a
 # -ResumeFailedOnly run carries no earlier report), not enabled or excluded,
 # collection failed (on the retry list after this run), not collected. A
 # report missing on the run that takes it to the retry limit is named as
@@ -5922,9 +5922,6 @@ function Get-RunReportCoverage
         $NotReadableIds = @(),
         # Retry-list entries past the retry limit (Get-RetryLimitedAttempts).
         $RetryLimited = @(),
-        # { Id; Name; Reason } of the subscriptions a run that continued the
-        # unfinished run skipped as completed but could not carry.
-        $Uncarried = @(),
         # The retry list after this run ({ Id; Name; Attempts; Reason }).
         $FailedAttempts = @(),
         # Ids of the subscriptions completed earlier in the run whose report a
@@ -5939,7 +5936,6 @@ function Get-RunReportCoverage
     $NotReadable = @(& $Ids $NotReadableIds)
     $Limited = @(@($RetryLimited) | Where-Object { $null -ne $_ })
     $LimitedIds = @(& $Ids $Limited)
-    $UncarriedIds = @(& $Ids $Uncarried)
     $Retry = @(@($FailedAttempts) | Where-Object { $null -ne $_ })
     $RetryIds = @(& $Ids $Retry)
     $EarlierIds = @(& $Ids $CompletedEarlierIds)
@@ -5953,7 +5949,6 @@ function Get-RunReportCoverage
             elseif ($Missing -contains $Id) { 'report missing', 'report missing (collected, but its report zip was not written or is gone; the next run collects it)' }
             elseif ($NotReadable -contains $Id) { 'skipped by the role check', 'skipped by the up-front role check (not readable)' }
             elseif ($AtLimit) { 'retry limit reached', (& $LimitReason $Id) }
-            elseif ($UncarriedIds -contains $Id) { 'earlier report not carried', 'earlier report not carried (completed by an earlier run, but its report could not be carried into this zip)' }
             elseif ($EarlierIds -contains $Id) { 'completed earlier in the run', 'completed earlier in the run; -ResumeFailedOnly does not carry its report, so a run that continues this one puts it into a new consolidated zip' }
             elseif ($Run -notcontains $Id) { 'not enabled or excluded', ('not enabled or excluded (state: {0})' -f [string]$Sub.State) }
             elseif ($RetryIds -contains $Id)

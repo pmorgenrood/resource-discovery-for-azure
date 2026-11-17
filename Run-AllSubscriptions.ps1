@@ -1627,7 +1627,7 @@ if ($ResumeFailedOnly)
                 $Aged = $null -ne $StoredRun -and $RunStart.Reason -notin 'legacy', 'stream-only' -and $null -ne (Get-ResumeRunAgeProblem -Info $StoredRun -MaxAgeDays $ResumeMaxAgeDays)
                 if ($Uncarried.Count -gt 0)
                 {
-                    Write-Host ("  Next: {0}. The resume state records no report for {1} completed subscription(s), so a run that continues this one cannot put them into a consolidated zip and ends with exit 2; a new run collects every subscription again." -f (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly $true), $Uncarried.Count) -ForegroundColor Yellow
+                    Write-Host ("  Next: {0}. The resume state records no report for {1} completed subscription(s), so a run that continues this one stops with exit 2 before the consolidated zip and puts them back on the retry list, and the run after it collects only them; a new run collects every subscription again." -f (Get-RunGoOnCommand -StateKept $true -ResumeFailedOnly $true), $Uncarried.Count) -ForegroundColor Yellow
                 }
                 else
                 {
