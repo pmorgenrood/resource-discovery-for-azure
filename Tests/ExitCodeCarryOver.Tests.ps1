@@ -245,6 +245,21 @@ if ((Get-RdaStandInScenario).UnifiedStateOnce -and -not $Global:RdaStandInStateB
         if (-not (Test-Path -LiteralPath $Tmp)) { New-Item -ItemType Directory -Path $Tmp -Force | Out-Null }
     }
 }
+# With CarryStopStateBlocked, a folder with a file in it sits at the resume
+# state's temp path from the moment the wrapper works out which skipped
+# subscriptions it can carry, so the write that puts them on the retry list
+# fails (as on a full disk) and the temp path cannot be cleared.
+if ((Get-RdaStandInScenario).CarryStopStateBlocked -and -not $Global:RdaStandInCarryBreakpoint)
+{
+    $Global:RdaStandInCarryBreakpoint = $true
+    $null = Set-PSBreakpoint -Variable ResumeCarry -Mode Write -Action {
+        foreach ($StateFile in @(Get-ChildItem -LiteralPath (Join-Path $HOME 'InventoryReports') -Filter '.resume-state-*.json' -File -Force | Where-Object { $_.Name -notlike '*-stream-*' }))
+        {
+            $Blocked = New-Item -ItemType Directory -Path ($StateFile.FullName + '.tmp') -Force
+            Set-Content -LiteralPath (Join-Path $Blocked.FullName 'keep') -Value 'x'
+        }
+    }
+}
 function Start-Transcript
 {
     if ((Get-RdaStandInScenario).RemoveRoot -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1') { throw 'stand-in: the transcript cannot start' }
@@ -483,7 +498,7 @@ function Get-UsageAggregates
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool, [switch]$SnapshotPartialFail, [switch]$Stream0Unparseable, [string]$Stream1StateJson = '', [switch]$Fresh, [string]$GoneBy = '', [string]$GoneSub = '')
+            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool, [switch]$SnapshotPartialFail, [switch]$Stream0Unparseable, [string]$Stream1StateJson = '', [switch]$Fresh, [string]$GoneBy = '', [string]$GoneSub = '', [switch]$CarryStopStateBlocked)
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             # ReuseHome: the next run on the same machine, with the resume
             # state the run before left.
@@ -655,7 +670,7 @@ function Get-UsageAggregates
             }
             $RunWrapper = Join-Path $RunTool 'Run-AllSubscriptions.ps1'
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked; SnapshotPartialFail = [bool]$SnapshotPartialFail; GoneBy = $GoneBy; GoneSub = $GoneSub } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked; SnapshotPartialFail = [bool]$SnapshotPartialFail; GoneBy = $GoneBy; GoneSub = $GoneSub; CarryStopStateBlocked = [bool]$CarryStopStateBlocked } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             # ConsumptionPageFail runs the consumption phase (see
             # Get-UsageAggregates in the stand-in), MetricsTokenFail the
@@ -1002,6 +1017,16 @@ function Get-UsageAggregates
         $Run.ZipCount | Should -Be 0 -Because $Run.Console
         # Both go on the retry list: Sub B for its stream, Sub A to be collected again.
         @($Run.FailedIds | Sort-Object) | Should -Be @(@($script:SubA.Id, $script:SubB.Id) | Sort-Object) -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams with -Resume: when the state write at the earlier-report stop fails, the stop says the subscriptions are not on the retry list, not that they are' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -Resume -Stream0Completed @($script:SubA.Id) -ImportFailStream '0' -CarryStopStateBlocked
+        $Run.Console | Should -Match '= FAILED \(earlier report not carried\) =' -Because $Run.Console
+        $Run.Console | Should -Match 'could not be written \(see the WARNING above\), so they are not on the retry list' -Because $Run.Console
+        $Run.Console | Should -Not -Match 'They are back on the retry list' -Because $Run.Console
+        $Run.Console | Should -Match '(?m)^  .*-Fresh' -Because $Run.Console
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
     }
 

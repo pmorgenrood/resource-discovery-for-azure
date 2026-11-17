@@ -3439,8 +3439,19 @@ if (@($UncarriedSkipped).Count -gt 0)
         $FailedAttempts = Add-FailedAttempt -Existing $FailedAttempts -Id ([string]$U.Id) -Name ([string]$U.Name) -Reason ('its earlier report could not be carried: {0}' -f $U.Reason)
     }
     Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
+    # Read back: the save only warns when its write fails, and a state that
+    # still lists these subscriptions as completed makes the next run of the
+    # same command skip them again and stop the same way.
+    $UncarriedStateSaved = Test-ResumeStateSaved -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports
     # Each command carries the run's settings.
-    Write-Host "No consolidated zip was made. They are back on the retry list, so the next run of the same command collects them again. Or start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
+    if ($UncarriedStateSaved)
+    {
+        Write-Host "No consolidated zip was made. They are back on the retry list, so the next run of the same command collects them again. Or start a new run with -Fresh to collect every subscription again:" -ForegroundColor Red
+    }
+    else
+    {
+        Write-Host ("No consolidated zip was made. The resume state file {0} could not be written (see the WARNING above), so they are not on the retry list: a run of the same command skips them as completed again and stops the same way. Fix the cause (for example, free up disk space), then start a new run with -Fresh to collect every subscription again:" -f $ResumeStateFile) -ForegroundColor Red
+    }
     Write-Host ('  ' + (Get-WrapperRunCommand -TenantID $TenantID -Mode '-Fresh' -Settings $RetryCommandSettings)) -ForegroundColor Red
     Write-Host "or collect each one listed above on its own with:" -ForegroundColor Red
     foreach ($U in @($UncarriedSkipped))
