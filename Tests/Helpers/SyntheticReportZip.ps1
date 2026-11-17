@@ -126,8 +126,9 @@ function Remove-RdaTestReportZip
 
 function New-RdaSyntheticReportZip
 {
-    # -DroppedRows: the first usage row has a negative quantity and the second an empty
-    # MeterId, rows downstream drops with no error.
+    # -DroppedRows: the first usage row has a negative quantity, the second an empty
+    # MeterId, and a last one no InstanceData (so an empty ResourceId): rows downstream
+    # drops with no error.
     param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain, [switch]$DroppedRows)
 
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('RdaSyntheticReport_' + $PID + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -279,7 +280,15 @@ $Global:StandInUsage = @(
         UsageStartTime   = [datetime]::SpecifyKind([datetime]'2026-10-01T00:00:00', 'Utc'); UsageEndTime = [datetime]::SpecifyKind([datetime]'2026-10-02T00:00:00', 'Utc')
     }
 }
-if ($DroppedRows) { $Global:StandInUsage[0].Quantity = [decimal]-24; $Global:StandInUsage[1].MeterId = '' }
+if ($DroppedRows)
+{
+    $Global:StandInUsage[0].Quantity = [decimal]-24
+    $Global:StandInUsage[1].MeterId = ''
+    # A last row with no InstanceData: it is written with an empty ResourceId.
+    $NoId = $Global:StandInUsage[2].PSObject.Copy()
+    $NoId.InstanceData = $null
+    $Global:StandInUsage += $NoId
+}
 function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '

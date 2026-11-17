@@ -556,6 +556,7 @@ try
             # Rows downstream drops in silence, by kind: { Row, Id } with the row's masked id.
             $NegativeRows = [System.Collections.Generic.List[object]]::new()
             $NoMeterRows = [System.Collections.Generic.List[object]]::new()
+            $NoIdRows = [System.Collections.Generic.List[object]]::new()
             $TokenRegex = Get-RdaTokenRegex
             Import-Csv -LiteralPath $CsvIn | ForEach-Object {
                 $RowIndex++
@@ -590,16 +591,18 @@ try
                 {
                     Stop-RdaOfflineMask ("{0}: consumption row {1} has a quantity or time downstream cannot read. Nothing was written." -f $ReportZip.Name, $RowIndex)
                 }
-                # Rule: offline = live. A row with a negative Quantity or an empty MeterId is
-                # written byte for byte as a live -Obfuscate run writes it: unchanged, never
-                # dropped, fixed or refused.
+                # Rule: offline = live. A row with a negative Quantity, an empty MeterId or an
+                # empty ResourceId is written byte for byte as a live -Obfuscate run writes it:
+                # unchanged, never dropped, fixed or refused.
                 # Reason: the client must not change data rows (the output contract), and a
                 # masked report must read downstream as the plain one does, so the offline mask
                 # may not differ from a run. Downstream drops such a row with no error, so the
-                # mask counts each kind and names the rows (row number and masked id) at the end:
-                # the loss is then not silent.
+                # mask counts each kind and names the rows (row number and masked id, or "no id")
+                # at the end: the loss is then not silent.
                 $IsNegative = $Qty -lt 0
                 $IsNoMeter = [string]::IsNullOrEmpty([string]$UsageRow.MeterId)
+                # Read from the plain id: the mask writes a stand-in for an empty one.
+                $IsNoId = [string]::IsNullOrEmpty([string]$UsageRow.ResourceId)
                 if ([string]$UsageRow.ResourceId -match $TokenRegex) { Stop-RdaOfflineMask ("{0} is already masked (its consumption holds masked ids). Nothing was written." -f $ReportZip.Name) }
                 # A row with fewer cells than the header is cut off (a run writes every cell, "" when empty).
                 $Short = $false
@@ -632,11 +635,14 @@ try
                         $Cell++
                     }
                 }
-                if ($IsNegative) { $NegativeRows.Add([pscustomobject]@{ Row = $RowIndex; Id = [string]$UsageRow.ResourceId }) }
-                if ($IsNoMeter) { $NoMeterRows.Add([pscustomobject]@{ Row = $RowIndex; Id = [string]$UsageRow.ResourceId }) }
+                # Named by its masked id, or "no id" for a row that has none.
+                $NamedId = if ($IsNoId) { 'no id' } else { [string]$UsageRow.ResourceId }
+                if ($IsNegative) { $NegativeRows.Add([pscustomobject]@{ Row = $RowIndex; Id = $NamedId }) }
+                if ($IsNoMeter) { $NoMeterRows.Add([pscustomobject]@{ Row = $RowIndex; Id = $NamedId }) }
+                if ($IsNoId) { $NoIdRows.Add([pscustomobject]@{ Row = $RowIndex; Id = $NamedId }) }
                 $UsageRow
             } | Export-Csv -LiteralPath $CsvOut -Encoding utf8 -NoTypeInformation
-            if (($NegativeRows.Count + $NoMeterRows.Count) -gt 0) { $DroppedReport.Add([pscustomobject]@{ Zip = $ReportZip.Name; Negative = $NegativeRows.ToArray(); NoMeter = $NoMeterRows.ToArray() }) }
+            if (($NegativeRows.Count + $NoMeterRows.Count + $NoIdRows.Count) -gt 0) { $DroppedReport.Add([pscustomobject]@{ Zip = $ReportZip.Name; Negative = $NegativeRows.ToArray(); NoMeter = $NoMeterRows.ToArray(); NoId = $NoIdRows.ToArray() }) }
         }
 
         # --- The dictionary, then the logs and the report page -------------------
@@ -811,7 +817,7 @@ try
     foreach ($D in $DroppedReport)
     {
         Write-Host ("In {0}, downstream drops these consumption rows with no error, so their usage is not counted. They are written unchanged, as a live run writes them:" -f $D.Zip) -ForegroundColor Yellow
-        foreach ($Kind in @(@{ Rows = $D.Negative; Text = 'a negative Quantity' }, @{ Rows = $D.NoMeter; Text = 'an empty MeterId' }))
+        foreach ($Kind in @(@{ Rows = $D.Negative; Text = 'a negative Quantity' }, @{ Rows = $D.NoMeter; Text = 'an empty MeterId' }, @{ Rows = $D.NoId; Text = 'an empty ResourceId' }))
         {
             $KindRows = @($Kind.Rows)
             if ($KindRows.Count -eq 0) { continue }

@@ -2510,6 +2510,10 @@ function ExecuteInventoryProcessing()
             Write-Log -Message ("Gathering Consumption for: {0}" -f $sub.Name) -Severity 'Info'
 
             $ConsumptionRecordsThisSub = 0
+            # Written rows downstream drops with no error (see the warning below the loop).
+            $NegativeQuantityThisSub = 0
+            $EmptyMeterIdThisSub = 0
+            $EmptyResourceIdThisSub = 0
             $ConsumptionFailedThisSub = $false
             $ConsumptionFailureMessage = $null
             $ConsumptionFailureFacts = ''
@@ -2562,6 +2566,9 @@ function ExecuteInventoryProcessing()
                     Write-Log -Message ("Records found: $($UsageDataExport.Count)...") -Severity 'Info'
 
                     $NewUsageDataExport = [System.Collections.ArrayList]::new()
+                    $NegativeQuantityThisPage = 0
+                    $EmptyMeterIdThisPage = 0
+                    $EmptyResourceIdThisPage = 0
 
                     for ($Item = 0; $Item -lt $UsageDataExport.Count; $Item++)
                     {
@@ -2597,6 +2604,14 @@ function ExecuteInventoryProcessing()
 
                         # The clock value as Get-UsageAggregates returned it, no time-zone conversion.
                         $UsageRecord = $UsageDataExport[$Item]
+                        # A row is written as Azure gave it, but downstream drops one with a
+                        # negative quantity, an empty MeterId or an empty ResourceId: it is
+                        # counted, to be named. The ResourceId is read before masking, which
+                        # writes a stand-in for an empty one.
+                        $UsageQuantity = $UsageRecord.Quantity
+                        if (($UsageQuantity -is [ValueType] -and $UsageQuantity -lt 0) -or ($UsageQuantity -is [string] -and $UsageQuantity.StartsWith('-'))) { $NegativeQuantityThisPage++ }
+                        if ([string]::IsNullOrEmpty([string]$UsageRecord.MeterId)) { $EmptyMeterIdThisPage++ }
+                        if ([string]::IsNullOrEmpty([string]$UsageResource.resourceUri)) { $EmptyResourceIdThisPage++ }
                         $StartText = $UsageRecord.UsageStartTime
                         if ($StartText -is [datetime]) { $StartText = $StartText.ToString($UsageDateFormat, $InvariantCulture) }
                         $EndText = $UsageRecord.UsageEndTime
@@ -2664,6 +2679,9 @@ function ExecuteInventoryProcessing()
                     # Rows written to the consumption file: a -ResourceGroup run leaves out the
                     # other resource groups' rows, and a page that fails part-way writes none.
                     $ConsumptionRecordsThisSub += $NewUsageDataExport.Count
+                    $NegativeQuantityThisSub += $NegativeQuantityThisPage
+                    $EmptyMeterIdThisSub += $EmptyMeterIdThisPage
+                    $EmptyResourceIdThisSub += $EmptyResourceIdThisPage
 
                     $MorePages = ('ContinuationToken' -in $UsageData.psobject.properties.name -and $UsageData.ContinuationToken)
                     if ($MorePages -and $ConsumptionPageIndex -ge $MaxPages)
@@ -2679,6 +2697,12 @@ function ExecuteInventoryProcessing()
                 $ConsumptionFailureMessage = ("{0} (stopped at consumption page {1}, after {2} record(s); this subscription's consumption is INCOMPLETE)" -f $_.Exception.Message, $ConsumptionPageIndex, $ConsumptionRecordsThisSub)
                 $ConsumptionFailureFacts = (Get-RdaErrorFacts $_)
                 Write-Log -Message ("Consumption query failed for {0}: {1}" -f $sub.Name, $ConsumptionFailureMessage) -Severity 'Warning'
+            }
+            # Named, not changed: the rows stay as Azure gave them (the offline mask writes them
+            # the same way and names them too).
+            if (($NegativeQuantityThisSub + $EmptyMeterIdThisSub + $EmptyResourceIdThisSub) -gt 0)
+            {
+                Write-Log -Message ("Consumption for {0}: {1} written row(s) have a negative Quantity, {2} an empty MeterId and {3} an empty ResourceId. They are written as Azure gave them, but downstream drops such rows with no error, so their usage is not counted." -f $sub.Name, $NegativeQuantityThisSub, $EmptyMeterIdThisSub, $EmptyResourceIdThisSub) -Severity 'Warning'
             }
 
             if ($null -eq $Global:ConsumptionRecordCount) { $Global:ConsumptionRecordCount = 0 }

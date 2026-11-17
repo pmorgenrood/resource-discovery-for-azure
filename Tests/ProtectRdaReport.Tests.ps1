@@ -1959,7 +1959,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         # A report with no such row prints no such line.
         $Clean = script:Invoke-Protect -Path $script:PlainRun.ZipPath -Out (Join-Path $script:Work ([guid]::NewGuid().ToString('N')))
         $Clean.ExitCode | Should -Be 0
-        @($Clean.Text | Where-Object { $_ -match 'downstream drops these consumption rows|negative Quantity|empty MeterId' }).Count | Should -Be 0
+        @($Clean.Text | Where-Object { $_ -match 'downstream drops these consumption rows|negative Quantity|empty MeterId|empty ResourceId' }).Count | Should -Be 0
     }
 
     It 'counts the cells of each consumption record as Export-Csv writes them' {
@@ -2290,7 +2290,8 @@ Describe 'Get-RdaFullIdInValue' {
 Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfuscate run writes them' {
     BeforeAll {
         . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
-        # The same estate with one usage row of a negative quantity and one with an empty MeterId.
+        # The same estate with one usage row of a negative quantity, one with an empty MeterId
+        # and one with no InstanceData (an empty ResourceId).
         $script:PlainOdd = New-RdaSyntheticReportZip -RepoRoot $script:RepoRoot -TestsRoot $PSScriptRoot -Plain -DroppedRows
         $script:LiveOdd = New-RdaSyntheticReportZip -RepoRoot $script:RepoRoot -TestsRoot $PSScriptRoot -DroppedRows
         $script:Work = Join-Path ([IO.Path]::GetTempPath()) ('RdaProtectOdd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -2316,6 +2317,7 @@ Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfu
     It 'gives the same bytes for a row with <Label>, tokens aside, and the same values through each side''s dictionary' -ForEach @(
         @{ Label = 'a negative Quantity'; Pick = { param($R) $R.Quantity -eq '-24' } }
         @{ Label = 'an empty MeterId'; Pick = { param($R) $R.MeterId -eq '' } }
+        @{ Label = 'an empty ResourceId'; Pick = { param($R) $R.ResourceLocation -eq '' } }
     ) {
         $script:PlainOdd.Exit | Should -Be 0 -Because $script:PlainOdd.Console
         $script:LiveOdd.Exit | Should -Be 0 -Because $script:LiveOdd.Console
@@ -2352,13 +2354,24 @@ Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfu
     It 'names each kind with its count, by row number and masked id only' {
         $Text = @($script:OddRun.Text)
         $Rows = @((& $script:CsvText $script:OddZip) | ConvertFrom-Csv)
-        foreach ($Kind in @(@{ Text = 'a negative Quantity'; Row = 1 }, @{ Text = 'an empty MeterId'; Row = 2 }))
+        # The row with no InstanceData has no id: it is named "no id", never by the id the
+        # mask writes for it.
+        foreach ($Kind in @(@{ Text = 'a negative Quantity'; Row = 1 }, @{ Text = 'an empty MeterId'; Row = 2 }, @{ Text = 'an empty ResourceId'; Row = $Rows.Count; Id = 'no id' }))
         {
             $Line = @($Text | Where-Object { $_ -like ('  1 row has {0}: *' -f $Kind.Text) })
             $Line.Count | Should -Be 1 -Because ($Text -join ' | ')
-            $Line[0] | Should -BeExactly ('  1 row has {0}: row {1} ({2})' -f $Kind.Text, $Kind.Row, $Rows[$Kind.Row - 1].ResourceId)
+            $Id = if ($Kind.Id) { $Kind.Id } else { $Rows[$Kind.Row - 1].ResourceId }
+            $Line[0] | Should -BeExactly ('  1 row has {0}: row {1} ({2})' -f $Kind.Text, $Kind.Row, $Id)
         }
+        $Rows[$Rows.Count - 1].ResourceLocation | Should -Be '' -Because 'the last row is the one with no InstanceData'
         $Named = ($Text | Where-Object { $_ -match 'row has|downstream drops' }) -join "`n"
         foreach ($Real in 'rg-demo', '12345678-1234-1234-1234-123456789012', 'vm-demo', 'osdisk-vm-demo', 'Consumption_') { $Named.Contains($Real) | Should -BeFalse -Because "'$Real' is a real value or a file name" }
+    }
+
+    It 'has a live run, plain and masked, count and name those rows too, as it writes them unchanged' {
+        foreach ($Run in $script:PlainOdd, $script:LiveOdd)
+        {
+            $Run.Console | Should -Match 'Consumption for [^\r\n]+: 1 written row\(s\) have a negative Quantity, 1 an empty MeterId and 1 an empty ResourceId\. They are written as Azure gave them, but downstream drops such rows with no error' -Because $Run.Console
+        }
     }
 }
