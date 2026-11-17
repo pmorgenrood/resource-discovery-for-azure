@@ -1982,7 +1982,8 @@ function Get-PreflightRunLists
             if ($null -ne $Obj.PSObject.Properties['FailedAttempts']) { $StreamFailed += @($Obj.FailedAttempts | Where-Object { $_ }) }
         }
         if ($StreamCompleted.Count -gt 0) { $Completed = @($Completed + $StreamCompleted | Sort-Object -Unique) }
-        $Failed = @(Merge-FailedAttempts -ExistingFailedAttempts $Failed -StreamFailedAttempts $StreamFailed -CompletedIds $Completed | Where-Object { $null -ne $_ })
+        # Folded as the run's start-up fold does: the higher count wins.
+        $Failed = @(Merge-RecoveredFailedAttempts -ExistingFailedAttempts $Failed -RecoveredFailedAttempts $StreamFailed -CompletedIds $Completed | Where-Object { $null -ne $_ })
     }
     return [pscustomobject]@{ Completed = @($Completed); Failed = @($Failed); Skipped = @($Skipped); WrongShape = @($WrongShape) }
 }

@@ -313,12 +313,14 @@ if ($Resume -or $ResumeFailedOnly)
     }
 }
 # Start from the parent's retry-list entries, so a failure here counts one more
-# run on top of the earlier ones instead of starting again at one. The newer
-# entry wins where this stream's own state file has the same subscription.
+# run on top of the earlier ones instead of starting again at one. Where this
+# stream's own state file has the same subscription, the entry with more failed
+# runs wins and the time only breaks a tie, so a clock moved back cannot undo a
+# counted run (Merge-RecoveredFailedAttempts).
 $Prior = @(@($PriorFailedAttempts) | Where-Object { $null -ne $_ })
 if ($Prior.Count -gt 0)
 {
-    $FailedAttempts = @(Merge-FailedAttempts -ExistingFailedAttempts $Prior -StreamFailedAttempts $FailedAttempts -CompletedIds @())
+    $FailedAttempts = @(Merge-RecoveredFailedAttempts -ExistingFailedAttempts $Prior -RecoveredFailedAttempts $FailedAttempts -CompletedIds @())
 }
 
 # ---- Build the inner-script passthrough --------------------------------------

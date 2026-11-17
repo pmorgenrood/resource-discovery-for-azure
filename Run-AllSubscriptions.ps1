@@ -3032,7 +3032,9 @@ else
                     {
                         $SummaryFailedAttempts += @(Add-FailedAttempt -Existing @($FailedAttempts | Where-Object { $_ -and $_.Id -eq $f.Id }) -Id $f.Id -Name $f.Name -Reason $f.Reason)
                     }
-                    $FailedAttempts = Merge-FailedAttempts -ExistingFailedAttempts $FailedAttempts -StreamFailedAttempts $SummaryFailedAttempts -CompletedIds $CompletedIds
+                    # Each entry counts one more run on top of its own: the
+                    # higher count wins, so a clock moved back cannot undo it.
+                    $FailedAttempts = Merge-RecoveredFailedAttempts -ExistingFailedAttempts $FailedAttempts -RecoveredFailedAttempts $SummaryFailedAttempts -CompletedIds $CompletedIds
                     $SummarySaved = Save-CompletedSubscriptionIds -Path $ResumeStateFile -Tenant $ResumeScope -Ids $CompletedIds -FailedAttempts $FailedAttempts -Reports $CompletedReports -PassThru
                 }
                 $SummaryStateFile = $null
@@ -3120,7 +3122,7 @@ else
             $UnconfirmedStreamReports = @($AllReportsFromStreams | Where-Object { $null -ne $_ -and $_ -isnot [string] -and $_ -isnot [ValueType] -and $_.PSObject.Properties['Id'] -and $UnconfirmedIds -contains [string]$_.Id })
             # A sub a stream failed this run is not completed, even when an earlier
             # run completed it: take it off the list and drop its report record,
-            # as the sequential branch does, so Merge-FailedAttempts keeps the
+            # as the sequential branch does, so the merge below keeps the
             # failure and a later -Resume collects the sub again. The same goes for
             # a sub a stream collected this run without a zip being written, and
             # for one whose metrics or consumption were left incomplete.

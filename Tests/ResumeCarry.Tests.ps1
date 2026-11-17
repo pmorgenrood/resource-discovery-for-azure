@@ -1174,6 +1174,56 @@ Describe 'A failed attempt, or a run that leaves no zip, clears the completed re
         [int](@($After | Where-Object Id -eq 'sub-b')[0].Attempts) | Should -Be 2
     }
 
+    It 'a stream''s start-up merge keeps the parent''s higher count when its own file of this run holds a lower one with a later time' {
+        # The parent counted sub-b's third failed run after the stream file was
+        # written, and the clock then moved back: the parent's entry has the
+        # higher count but the older time.
+        $Prior = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = '2026-01-01T00:00:00Z'; Reason = 'parent'; Attempts = 3 })
+        $Own = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = '2026-01-05T00:00:00Z'; Reason = 'stream'; Attempts = 2 })
+        $StreamFile = Join-Path $script:Root '.resume-state-e3b98a4da31a-stream-0.json'
+        @{ RunId = 'test-run'; Tenant = 't'; StreamId = '0'; Completed = @(); FailedAttempts = @($Own); Reports = @() } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StreamFile -Encoding utf8
+        $Global:RdaCarryTestFailIds = @('sub-b')
+        $WorkerArgs = @{
+            RunId = 'test-run'
+            TenantID = 't'; StreamId = '0'; InventoryRoot = $script:Root; ScriptRoot = $script:FailRoot
+            AzContextPath = (Join-Path $script:Root 'ctx.json'); StreamSummaryPath = (Join-Path $script:Root '.rda-stream-0-summary.json'); StreamFailuresPath = (Join-Path $script:Root 'failures-stream-0.log')
+            SubscriptionIds = @('sub-b'); SubscriptionNames = @('Sub B'); PriorFailedAttempts = $Prior; ResumeFailedOnly = $true; ConcurrencyLimit = 6
+        }
+        & (Join-Path $script:RepoRoot 'Run-AllSubscriptions.Stream.ps1') @WorkerArgs 6>$null
+        $File = Get-Content -LiteralPath $StreamFile -Raw | ConvertFrom-Json
+        # 3 counted runs, and this run's failure: 4. A clock moved back cannot undo a counted run.
+        [int](@($File.FailedAttempts | Where-Object Id -eq 'sub-b')[0].Attempts) | Should -Be 4
+    }
+
+    It 'parallel: the summary-only merge at the end keeps this run''s count when the parent''s entry is dated ahead (a clock moved), with a stream file that cannot be opened' -Skip:$IsWindows {
+        $S = script:Read-State -Path $script:State
+        # The parent's entry is dated in the future; this run failed sub-b once more.
+        $Prior = @([pscustomobject]@{ Id = 'sub-b'; Name = 'Sub B'; LastFailedAt = (Get-Date).AddDays(2).ToUniversalTime().ToString('o'); Reason = 'earlier'; Attempts = 2 })
+        # No stream state file holds sub-b's failure (the stream's write failed),
+        # so the summary is its only record; and one stream file cannot be opened.
+        $Locked = Join-Path $script:Root '.resume-state-e3b98a4da31a-stream-7.json'
+        [pscustomobject]@{ RunId = 'test-run'; Tenant = 't'; StreamId = '7'; Completed = @(); FailedAttempts = @(); Reports = @() } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Locked -Encoding utf8
+        [System.IO.File]::SetUnixFileMode($Locked, [System.IO.UnixFileMode]::None)
+        $Summary = Join-Path $script:Root '.rda-stream-0-summary-run-1.json'
+        @{ RunId = 'test-run'; StreamId = '0'; Tenant = 't'; Status = 'partial-failure'; Completed = @(); ResourceCounts = @(); Failed = @(@{ Id = 'sub-b'; Name = 'Sub B'; Reason = 'this run' }) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Summary -Encoding utf8
+        $Streams = @([pscustomobject]@{ StreamId = 0; SummaryPath = $Summary; FailuresPath = (Join-Path $script:Root 'failures-stream-0.log'); SubCount = 1 })
+        # The run's stop is a throw here, so the test host does not end.
+        function Exit-Wrapper { param([int]$Code) throw ('Exit-Wrapper ' + $Code) }
+        try
+        {
+            $Code = $null
+            try { $null = & $script:AggregateBlock $Streams $script:Root 't' $script:State $S.Completed $Prior $S.Reports 6>$null }
+            catch { if ($_.Exception.Message -match '^Exit-Wrapper (\d+)$') { $Code = [int]$Matches[1] } else { throw } }
+            $Code | Should -Not -BeNullOrEmpty -Because 'a stream file that cannot be opened stops the run'
+            $After = @(Get-FailedAttempts -Path $script:State -Tenant 't' | Where-Object { $null -ne $_ })
+            [int](@($After | Where-Object Id -eq 'sub-b')[0].Attempts) | Should -Be 3 -Because 'this run failed it once more, and a clock moved back cannot undo that'
+        }
+        finally
+        {
+            [System.IO.File]::SetUnixFileMode($Locked, [System.IO.UnixFileMode]'UserRead, UserWrite')
+        }
+    }
+
     It 'a failed save of the resume state after a subscription fails is named at the end, with a run without -Resume as the way on' {
         # Run 1 (BeforeEach) completed sub-a. This run saves the write-ahead count
         # of sub-a (#68), which takes its completion out, then fails it, and the
@@ -1324,5 +1374,23 @@ Describe 'A -Resume run on a state file written before CompletedReports existed'
         @($R3.Run.SkippedSubscriptions | ForEach-Object Id) | Should -Be @('sub-a', 'sub-b')
         @($R3.Post.Result.Uncarried).Count | Should -Be 0
         ($R3.Post.Text -join "`n") | Should -Match 'verification: OK \(2 zip\(s\) match 0 successful sub\(s\) this run \+ 2 carried'
+    }
+}
+
+Describe 'The preflight view of the retry list after an interrupted parallel run' {
+    It 'keeps the higher count when a per-stream file holds a lower one with a later time, as the run''s start-up fold does' {
+        $Root = script:New-CaseRoot
+        $Main = Join-Path $Root '.resume-state-e3b98a4da31a.json'
+        # The resume state counts 3 failed runs; the per-stream file, written
+        # before the third was counted and dated later (a clock moved back), 2.
+        Set-Content -LiteralPath $Main -Value '{"TenantID":"t","CompletedSubscriptionIds":[],"FailedAttempts":[{"Id":"sub-b","Name":"Sub B","LastFailedAt":"2026-01-01T00:00:00Z","Reason":"main","Attempts":3}]}' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $Root '.resume-state-e3b98a4da31a-stream-0.json') -Value '{"Tenant":"t","StreamId":"0","Completed":[],"FailedAttempts":[{"Id":"sub-b","Name":"Sub B","LastFailedAt":"2026-01-05T00:00:00Z","Reason":"stream","Attempts":2}]}' -Encoding utf8
+        $View = [pscustomobject]@{ StoredRun = [pscustomobject]@{}; RunStart = [pscustomobject]@{ Mode = 'Continue' } }
+        $Lists = Get-PreflightRunLists -InventoryRoot $Root -ResumeStateFile $Main -Key 't' -View $View -Resume $true -ResumeFailedOnly $false
+        @($Lists.Failed).Count | Should -Be 1
+        [int]$Lists.Failed[0].Attempts | Should -Be 3
+        # The start-up fold of the run itself.
+        $Fold = @(Merge-RecoveredFailedAttempts -ExistingFailedAttempts @(Get-FailedAttempts -Path $Main -Tenant 't') -RecoveredFailedAttempts @((Get-Content -LiteralPath (Join-Path $Root '.resume-state-e3b98a4da31a-stream-0.json') -Raw | ConvertFrom-Json).FailedAttempts) -CompletedIds @())
+        [int]$Lists.Failed[0].Attempts | Should -Be ([int]$Fold[0].Attempts)
     }
 }
