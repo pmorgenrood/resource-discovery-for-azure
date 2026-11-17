@@ -3514,9 +3514,9 @@ if (@($UncarriedSkipped).Count -gt 0)
 # The counts of the lines below then include these rows.
 $GoneRecordRows = @(Get-UnconfirmedReportRows -Records $UnconfirmedStreamReports -CompletedIds (Get-Variable -Name AllCompletedFromStreams -ValueOnly -ErrorAction SilentlyContinue) -SuccessIds @($SubResourceCounts | ForEach-Object { [string]$_.Id }) -InventoryRoot $InventoryRoot)
 $VerifyRows = @(@($SubResourceCounts) + @($GoneRecordRows))
-# The record rows are counted only when their zip is missing (below), so the
-# counts of the lines below stay those of the success rows when nothing is.
-$ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count
+# Each record row is an expected zip, like a success row, so the expected and
+# found counts of the lines below count the same rows.
+$ExpectedZipCount = @($SubResourceCounts).Count + $CarriedReports.Count + $GoneRecordRows.Count
 # A gap stops the run with exit 2 before the consolidated zip is built. The
 # missing reports are counted below only when the inventory folder is gone
 # after this check (the consolidation step).
@@ -3539,7 +3539,6 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
     $FoundZipPaths = [System.Collections.Generic.HashSet[string]]::new($PathComparer)
     foreach ($Z in $ActualSubZips) { [void]$FoundZipPaths.Add([System.IO.Path]::GetFullPath($Z.FullName)) }
     $MissingZipSubs = @($VerifyRows | Where-Object { [string]::IsNullOrEmpty($_.Zip) -or -not $FoundZipPaths.Contains([System.IO.Path]::GetFullPath([string]$_.Zip)) })
-    $ExpectedZipCount += @($MissingZipSubs | Where-Object { $null -ne $_.PSObject.Properties['FromRecord'] }).Count
     if ($MissingZipSubs.Count -gt 0)
     {
         $MissingCount = $MissingZipSubs.Count
@@ -3557,7 +3556,16 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
         Write-Host "Subscriptions whose inner script reported success this run but whose zip was not found:" -ForegroundColor Yellow
         foreach ($S in $MissingZipSubs)
         {
-            Write-Host ("  - {0} ({1}) [{2:N0} resources]" -f $S.Name, $S.Id, $S.Count) -ForegroundColor Yellow
+            # A record row has no resource count: its stream's summary is
+            # missing or unreadable, so only its report record is known.
+            if ($null -ne $S.PSObject.Properties['FromRecord'])
+            {
+                Write-Host ("  - {0} ({1}) [report recorded by a stream whose summary could not be read]" -f $S.Name, $S.Id) -ForegroundColor Yellow
+            }
+            else
+            {
+                Write-Host ("  - {0} ({1}) [{2:N0} resources]" -f $S.Name, $S.Id, $S.Count) -ForegroundColor Yellow
+            }
         }
         Write-Host ""
         Write-Host "Likely causes:" -ForegroundColor Yellow
@@ -3643,7 +3651,7 @@ if ($ExpectedZipCount -gt 0 -or $GoneRecordRows.Count -gt 0)
     }
     else
     {
-        Write-Host ("Per-subscription output verification: OK (each of the {0} successful sub(s) has its zip; {1} zip(s) found)" -f $ExpectedZipCount, $ActualZipCount) -ForegroundColor Green
+        Write-Host ("Per-subscription output verification: OK (each of the {0} successful sub(s) has its zip; {1} zip(s) found)" -f ($ExpectedZipCount - $GoneRecordRows.Count), $ActualZipCount) -ForegroundColor Green
     }
 }
 
@@ -3788,10 +3796,9 @@ else
     Write-Host ("Inventory root not found at {0}. Nothing to consolidate." -f $InventoryRoot) -ForegroundColor Yellow
     # Every report zip the run expected went with the folder, so none of them is
     # in a consolidated zip (exit code 2 below).
-    # The record rows of a stream with no readable summary count too: their
-    # zips were found by the output check (it stops the run otherwise).
-    $LostRecordRows = @($GoneRecordRows | Where-Object { -not [string]::IsNullOrEmpty([string]$_.Zip) }).Count
-    if (($ExpectedZipCount + $LostRecordRows) -gt 0) { $MissingReportCount = $ExpectedZipCount + $LostRecordRows; $InventoryFolderGone = $true }
+    # The record rows of a stream with no readable summary are in the count:
+    # their zips were found by the output check (it stops the run otherwise).
+    if ($ExpectedZipCount -gt 0) { $MissingReportCount = $ExpectedZipCount; $InventoryFolderGone = $true }
 }
 
 # Aggregate "main" HTML summary across all per-subscription reports from

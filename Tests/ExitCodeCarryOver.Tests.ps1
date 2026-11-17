@@ -1253,6 +1253,15 @@ function Get-UsageAggregates
         # The subscription is taken off the completed list and put on the retry list.
         $Run.FailedIds | Should -Contain $script:SubA.Id -Because $Run.Console
         $Run.ExitCode | Should -Be 2 -Because $Run.Console
+        # The lines name the gone report as a recorded report, with no resource count.
+        # Expected counts the gone record row too: the found count is one lower.
+        $Expected = [int]([regex]::Match($Run.Console, '  Expected zips: (\d+) ').Groups[1].Value)
+        $Found = [int]([regex]::Match($Run.Console, '  Found zips:\s+(\d+) ').Groups[1].Value)
+        $Gap = [int]([regex]::Match($Run.Console, '  Gap:\s+(\d+) missing').Groups[1].Value)
+        $Gap | Should -Be 1 -Because $Run.Console
+        ($Expected - $Found) | Should -Be $Gap -Because $Run.Console
+        $Run.Console | Should -Not -Match '\[0 resources\]' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape('[report recorded by a stream whose summary could not be read]')) -Because $Run.Console
     }
 
     It 'two streams: a report zip of a stream with no summary file that is there at the first look and gone before the zips are picked is a gap, not a smaller bundle' {
