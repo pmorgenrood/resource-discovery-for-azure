@@ -260,6 +260,21 @@ if ((Get-RdaStandInScenario).CarryStopStateBlocked -and -not $Global:RdaStandInC
         }
     }
 }
+# With GoneAfterProbe, the zip GoneSub wrote is removed (as an antivirus product
+# does) just after the output check has made its list of expected zips and before
+# the zips are picked: the moment between the check's two looks at the folder.
+if ((Get-RdaStandInScenario).GoneAfterProbe -and -not $Global:RdaStandInGoneBreakpoint)
+{
+    $Global:RdaStandInGoneBreakpoint = $true
+    $null = Set-PSBreakpoint -Variable VerifyRows -Mode Write -Action {
+        $Scenario = Get-RdaStandInScenario
+        foreach ($Earlier in @(Get-ChildItem -LiteralPath (Join-Path $HOME 'InventoryReports') -Recurse -Filter '*.zip' -File -ErrorAction SilentlyContinue))
+        {
+            $EarlierJson = @(Get-ChildItem -LiteralPath $Earlier.DirectoryName -Filter 'Inventory_*.json' -File)
+            if ($EarlierJson.Count -gt 0 -and (Get-Content -LiteralPath $EarlierJson[0].FullName -Raw) -like ('*' + [string]$Scenario.GoneSub + '*')) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath $Earlier.FullName -Force }
+        }
+    }
+}
 function Start-Transcript
 {
     if ((Get-RdaStandInScenario).RemoveRoot -and @(Get-PSCallStack)[1].ScriptName -like '*Run-AllSubscriptions.ps1') { throw 'stand-in: the transcript cannot start' }
@@ -516,7 +531,7 @@ function Get-UsageAggregates
         # value, as when a native command failed at the prompt before the run.
         function script:Invoke-CarryOverRun
         {
-            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool, [switch]$SnapshotPartialFail, [switch]$Stream0Unparseable, [string]$Stream1StateJson = '', [switch]$Fresh, [string]$GoneBy = '', [string]$GoneSub = '', [switch]$CarryStopStateBlocked, [switch]$StreamFileStuck, [switch]$StreamFileRewriteBlocked)
+            param([object[]]$Subs, [string[]]$FailSub = @(), [int]$Streams = 1, [int]$PriorExitCode = -1, [string]$CollectorFailSub = '', [switch]$CorruptStreamSummary, [string]$StreamSummaryJson = '', [switch]$MissingStreamSummary, [string]$Stream1SummaryJson = '', [switch]$Resume, [string[]]$Stream0Completed = @(), [switch]$RemoveRoot, [string]$StaleStreamSummaryJson = '', [switch]$StreamSummaryFolderBeforeRun, [string]$ImportFailStream = '', [switch]$NarrationFail, [switch]$VerboseFail, [switch]$FailuresLogFail, [switch]$OtherRun, [switch]$PinnedCompute, [switch]$StreamNarrationFail, [switch]$ResumeRemoveFail, [switch]$ConsumptionPageFail, [switch]$MetricsTokenFail, [switch]$ResumeFailedOnly, [object]$SeedState = $null, [string]$ReuseHome = '', [switch]$ConsumptionTokenFail, [switch]$StreamStateBlocked, [switch]$UnifiedStateBlocked, [string[]]$Stream1Failed = @(), [string[]]$Stream7FailedUnreadable = @(), [switch]$UnifiedStateUnreadable, [string]$HomeName = 'home', [switch]$StandInInventory, [switch]$Stream7Unparseable, [string[]]$Stream7LockedDuringRun = @(), [switch]$SummaryStateBlocked, [switch]$ResumeRemoveSoftFail, [switch]$BracketTool, [switch]$SnapshotPartialFail, [switch]$Stream0Unparseable, [string]$Stream1StateJson = '', [switch]$Fresh, [string]$GoneBy = '', [string]$GoneSub = '', [switch]$CarryStopStateBlocked, [switch]$StreamFileStuck, [switch]$StreamFileRewriteBlocked, [switch]$GoneAfterProbe)
             $CaseDir = Join-Path $script:WorkDir ([guid]::NewGuid().ToString('N').Substring(0, 8))
             # ReuseHome: the next run on the same machine, with the resume
             # state the run before left.
@@ -693,7 +708,7 @@ function Get-UsageAggregates
             }
             $RunWrapper = Join-Path $RunTool 'Run-AllSubscriptions.ps1'
             $Scenario = Join-Path $CaseDir 'scenario.json'
-            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked; SnapshotPartialFail = [bool]$SnapshotPartialFail; GoneBy = $GoneBy; GoneSub = $GoneSub; CarryStopStateBlocked = [bool]$CarryStopStateBlocked; StreamFileStuck = [bool]$StreamFileStuck } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
+            [pscustomobject]@{ Tenant = $script:Tenant; Subscriptions = @($Subs); FailSub = @($FailSub); CollectorFailSub = $CollectorFailSub; RemoveRoot = [bool]$RemoveRoot; Plant = @($Plant); ImportFailStream = $ImportFailStream; NarrationFail = [bool]$NarrationFail; VerboseFail = [bool]$VerboseFail; FailuresLogFail = [bool]$FailuresLogFail; StreamNarrationFail = [bool]$StreamNarrationFail; ResumeRemoveFail = [bool]$ResumeRemoveFail; ResumeRemoveSoftFail = [bool]$ResumeRemoveSoftFail; SummaryFolderAtStart = [bool]$StreamSummaryFolderBeforeRun; ConsumptionPageFail = [bool]$ConsumptionPageFail; MetricsTokenFail = [bool]$MetricsTokenFail; ConsumptionTokenFail = [bool]$ConsumptionTokenFail; UnifiedStateOnce = [bool]$UnifiedStateBlocked; SummaryStateFail = [bool]$SummaryStateBlocked; SnapshotPartialFail = [bool]$SnapshotPartialFail; GoneBy = $GoneBy; GoneSub = $GoneSub; CarryStopStateBlocked = [bool]$CarryStopStateBlocked; StreamFileStuck = [bool]$StreamFileStuck; GoneAfterProbe = [bool]$GoneAfterProbe } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Scenario -Encoding utf8
 
             # ConsumptionPageFail runs the consumption phase (see
             # Get-UsageAggregates in the stand-in), MetricsTokenFail the
@@ -1232,6 +1247,14 @@ function Get-UsageAggregates
         # removes the zip Sub A wrote. Stream 0's own state file still holds
         # Sub A's report record, so the zip is a gap, as a success row's would be.
         $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -MissingStreamSummary -StandInInventory -GoneBy $script:SubC.Id -GoneSub $script:SubA.Id
+        $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
+        $Run.Console | Should -Match ([regex]::Escape($script:SubA.Id)) -Because $Run.Console
+        $Run.ZipCount | Should -Be 0 -Because $Run.Console
+        $Run.ExitCode | Should -Be 2 -Because $Run.Console
+    }
+
+    It 'two streams: a report zip of a stream with no summary file that is there at the first look and gone before the zips are picked is a gap, not a smaller bundle' {
+        $Run = Invoke-CarryOverRun -Subs @($script:SubA, $script:SubB, $script:SubC) -Streams 2 -MissingStreamSummary -StandInInventory -GoneSub $script:SubA.Id -GoneAfterProbe
         $Run.Console | Should -Match 'Per-subscription output verification failed\.' -Because $Run.Console
         $Run.Console | Should -Match ([regex]::Escape($script:SubA.Id)) -Because $Run.Console
         $Run.ZipCount | Should -Be 0 -Because $Run.Console

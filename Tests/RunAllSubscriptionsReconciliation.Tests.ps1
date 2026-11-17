@@ -409,6 +409,25 @@ Describe 'Resolve-StreamSummary (the one reader of a stream summary)' {
         $Items[0].Name | Should -Be 'ResourcesReport_a.zip'
     }
 
+    It 'Get-UnconfirmedReportRows makes a row for each completed id with a report zip record, there or not, and a second record for the same zip or id is no second zip' {
+        $Root = Join-Path $script:TestRoot ('unconf_' + [guid]::NewGuid().ToString().Substring(0, 6))
+        New-Item -ItemType Directory -Path (Join-Path $Root 'ResourcesReport_a') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $Root 'ResourcesReport_a/ResourcesReport_a.zip') -Value 'zip'
+        $Records = @(
+            [pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'ResourcesReport_a/ResourcesReport_a.zip' }
+            [pscustomobject]@{ Id = 'sub-b'; Name = 'B'; Zip = 'ResourcesReport_a/ResourcesReport_a.zip' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'C'; Zip = 'ResourcesReport_c/ResourcesReport_c.zip' }
+            [pscustomobject]@{ Id = 'sub-c'; Name = 'C'; Zip = 'ResourcesReport_d/ResourcesReport_d.zip' }
+            [pscustomobject]@{ Id = 'sub-x'; Name = 'X'; Zip = 'ResourcesReport_x/ResourcesReport_x.zip' }
+            [pscustomobject]@{ Id = 'sub-s'; Name = 'S'; Zip = 'ResourcesReport_s/ResourcesReport_s.zip' }
+        )
+        $Rows = @(Get-UnconfirmedReportRows -Records $Records -CompletedIds @('sub-a', 'sub-b', 'sub-c', 'sub-s') -SuccessIds @('sub-s') -InventoryRoot $Root)
+        @($Rows | ForEach-Object { $_.Id }) | Should -Be @('sub-a', 'sub-b', 'sub-c')
+        $Rows[0].Zip | Should -Be ([System.IO.Path]::GetFullPath((Join-Path $Root 'ResourcesReport_a/ResourcesReport_a.zip')))
+        $Rows[1].Zip | Should -BeNullOrEmpty
+        $Rows[2].Zip | Should -Be ([System.IO.Path]::GetFullPath((Join-Path $Root 'ResourcesReport_c/ResourcesReport_c.zip')))
+    }
+
     It 'Test-ReportZipRecordPath splits on the platform''s own separators: a backslash on Unix is part of one file name, both slashes split on Windows' {
         # The Windows cases pass that platform's separators, so they run anywhere.
         $Windows = [char[]]@('\', '/')

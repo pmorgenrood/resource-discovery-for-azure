@@ -3648,6 +3648,39 @@ function Test-ReportZipRecordPath
     return ($Parts.Count -ge 2 -and $Parts[-1] -like '*.zip')
 }
 
+# The expected rows of the output check for the report records of a stream whose
+# summary is missing or could not be read ($Records, from its own state file):
+# one row for each record that has the shape of a report zip record
+# (Test-ReportZipRecordPath, not rooted, no '..'), whose id the stream completed
+# ($CompletedIds) and that no success row ($SuccessIds) already covers. Each id
+# and each zip path counts once: a later record for a zip an earlier row has
+# already named gets a row with no zip, so it is a gap (one zip cannot stand in
+# for two subscriptions). A row is made whether or not its zip is on disk now,
+# so a zip that is gone by the time the zips are picked is a gap too.
+function Get-UnconfirmedReportRows
+{
+    param([object]$Records = @(), [object]$CompletedIds = @(), [object]$SuccessIds = @(), [Parameter(Mandatory = $true)][string]$InventoryRoot)
+    $SeenIds = @{}
+    $SeenZips = @{}
+    $PathCase = if ([System.IO.Path]::DirectorySeparatorChar -eq '/') { { param($P) $P } } else { { param($P) $P.ToLowerInvariant() } }
+    foreach ($Record in @($Records))
+    {
+        if ($null -eq $Record -or $Record -is [string] -or $Record -is [ValueType] -or $null -eq $Record.PSObject.Properties['Id']) { continue }
+        $Zip = $Record.PSObject.Properties['Zip']
+        if ($null -eq $Zip -or $Zip.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Zip.Value)) { continue }
+        if ([System.IO.Path]::IsPathRooted($Zip.Value) -or (@($Zip.Value -split '[\\/]') -contains '..') -or -not (Test-ReportZipRecordPath -Path $Zip.Value)) { continue }
+        $Id = [string]$Record.Id
+        if ($SeenIds.ContainsKey($Id) -or @($SuccessIds) -contains $Id -or @($CompletedIds) -notcontains $Id) { continue }
+        $SeenIds[$Id] = $true
+        $FullZip = [System.IO.Path]::GetFullPath((Join-Path $InventoryRoot $Zip.Value))
+        $Key = & $PathCase $FullZip
+        $Repeat = $SeenZips.ContainsKey($Key)
+        $SeenZips[$Key] = $true
+        $Name = $Record.PSObject.Properties['Name']
+        [pscustomobject]@{ Name = $(if ($null -eq $Name) { $Id } else { [string]$Name.Value }); Id = $Id; Count = 0; Skipped = 0; Zip = $(if ($Repeat) { $null } else { $FullZip }); FromRecord = $true }
+    }
+}
+
 # The report zips this run wrote, from its own records (New-CompletedReportRecord,
 # one per subscription that wrote a zip this run, complete or not), each once and
 # only when it is still on disk under the inventory root. Not every zip written
