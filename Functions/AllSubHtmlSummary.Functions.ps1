@@ -528,7 +528,11 @@ function New-RdaAllSubHtmlSummary
     {
         $Included = @($IncludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
         $Excluded = @($ExcludeFolders | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
-        $Folders = @($Folders | Where-Object { ($_.LastWriteTime -ge $SinceTime -and $Excluded -notcontains $_.FullName) -or $Included -contains $_.Name })
+        # With -ReportFolders the list below already names this run's folders,
+        # so the time is not tested: a share whose clock runs behind dates this
+        # run's folders before its start.
+        if ($null -ne $ReportFolders) { $Folders = @($Folders | Where-Object { $Excluded -notcontains $_.FullName -or $Included -contains $_.Name }) }
+        else { $Folders = @($Folders | Where-Object { ($_.LastWriteTime -ge $SinceTime -and $Excluded -notcontains $_.FullName) -or $Included -contains $_.Name }) }
     }
     if ($null -ne $ReportFolders)
     {

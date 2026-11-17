@@ -312,6 +312,24 @@ Describe 'New-RdaAllSubHtmlSummary aggregate report' {
         (Get-Card $Html 'Total resources') | Should -Be '2' -Because 'only the recent folder is in scope'
         (Get-Card $Html 'Subscriptions') | Should -Be '1'
     }
+
+    It 'with -ReportFolders the folders the list names are in scope whatever their time (a share whose clock runs behind)' {
+        $Run = New-Run
+        $Behind = New-SubFolder -Root $Run -Services @{ VirtualMachines = 4 } -SubName 'Behind Sub'
+        (Get-Item $Behind).LastWriteTime = (Get-Date).AddDays(-2)
+        $Other = New-SubFolder -Root $Run -Services @{ VirtualMachines = 9 } -SubName 'Other Sub'
+        (Get-Item $Other).LastWriteTime = (Get-Date).AddDays(-2)
+        $Out = Join-Path $Run 'main.html'
+
+        New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out -SinceTime (Get-Date).AddHours(-1) -ReportFolders @((Split-Path $Behind -Leaf)) | Out-Null
+        $Html = Get-Content -Path $Out -Raw
+        (Get-Card $Html 'Total resources') | Should -Be '4' -Because 'the listed folder counts although its time is before the start; the unlisted one does not'
+    }
+
+    It 'the wrapper does not test the time of the report folders whose HTML it copies, since the list of this run''s zips already scopes them' {
+        $Wrapper = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Run-AllSubscriptions.ps1') -Raw
+        $Wrapper | Should -Not -Match '\$_\.LastWriteTime -ge \$RunStartTime'
+    }
 }
 
 Describe 'New-RdaAllSubHtmlSummaryFromZip (rebuild from consolidated zip)' {

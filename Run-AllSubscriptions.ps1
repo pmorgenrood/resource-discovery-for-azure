@@ -4339,12 +4339,13 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
         #    'ResourcesReport' replaced by 'HTML'), matching the rewritten
         #    summary links. HTML only - no *.json/csv - so nothing is
         #    double-ingested and the folder name signals "report HTML, not
-        #    data". Scoped to THIS run by timestamp, plus the report folders
-        #    carried from an earlier run on -Resume, and only the folders whose
-        #    report zip is in the consolidated zip; a de-obfuscated
+        #    data". Only the folders whose report zip is in the consolidated
+        #    zip (this run's own records, plus the report folders carried from
+        #    an earlier run on -Resume), not by timestamp: a share whose clock
+        #    runs behind dates this run's folders early. A de-obfuscated
         #    *_revealed* report is never copied across.
         $InZipFolders = @($SubZips | ForEach-Object { $_.Directory.Name })
-        foreach ($SubDir in @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { ($_.LastWriteTime -ge $RunStartTime -or $CarriedFolderNames -contains $_.Name) -and $InZipFolders -contains $_.Name }))
+        foreach ($SubDir in @(Get-ChildItem -LiteralPath $InventoryRoot -Directory -Filter 'ResourcesReport*' -ErrorAction SilentlyContinue | Where-Object { $InZipFolders -contains $_.Name }))
         {
             $SubHtml = Get-ChildItem -LiteralPath $SubDir.FullName -Filter '*.html' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*_revealed*' } | Select-Object -First 1
             if ($null -eq $SubHtml) { continue }
