@@ -213,6 +213,8 @@ try
     $Scans = [System.Collections.Generic.List[object]]::new()
     $ReportExempt = @{}
     $Unresolved = @{}
+    # Per report: the consumption rows downstream drops in silence (see the row loop).
+    $DroppedReport = [System.Collections.Generic.List[object]]::new()
     $SubFolders = [System.Collections.Generic.List[string]]::new()
     $PerReportFailures = [System.Collections.Generic.List[object]]::new()
     $Version = $null
@@ -547,7 +549,14 @@ try
             Initialize-RdaOfflineType
             $BadRecord = [RdaCsvCheck]::FirstBadRecord($CsvIn, $Columns.Count)
             if ($BadRecord -gt 0) { Stop-RdaOfflineMask ("{0}: consumption row {1} is cut off, or holds more cells than the header names: it cannot be read. Nothing was written." -f $ReportZip.Name, $BadRecord) }
+            # The cells a run wrote empty with no quotes (a null value), per record: Import-Csv
+            # reads them as "", and they are given back as null so Export-Csv writes them as the
+            # run did (offline = live, byte for byte).
+            $BareCells = [RdaCsvCheck]::BareEmptyCells($CsvIn)
             $RowIndex = 0
+            # Rows downstream drops in silence, by kind: { Row, Id } with the row's masked id.
+            $NegativeRows = [System.Collections.Generic.List[object]]::new()
+            $NoMeterRows = [System.Collections.Generic.List[object]]::new()
             $TokenRegex = Get-RdaTokenRegex
             Import-Csv -LiteralPath $CsvIn | ForEach-Object {
                 $RowIndex++
@@ -582,6 +591,16 @@ try
                 {
                     Stop-RdaOfflineMask ("{0}: consumption row {1} has a quantity or time downstream cannot read. Nothing was written." -f $ReportZip.Name, $RowIndex)
                 }
+                # Rule: offline = live. A row with a negative Quantity or an empty MeterId is
+                # written byte for byte as a live -Obfuscate run writes it: unchanged, never
+                # dropped, fixed or refused.
+                # Reason: the client must not change data rows (the output contract), and a
+                # masked report must read downstream as the plain one does, so the offline mask
+                # may not differ from a run. Downstream drops such a row with no error, so the
+                # mask counts each kind and names the rows (row number and masked id) at the end:
+                # the loss is then not silent.
+                $IsNegative = $Qty -lt 0
+                $IsNoMeter = [string]::IsNullOrEmpty([string]$UsageRow.MeterId)
                 if ([string]$UsageRow.ResourceId -match $TokenRegex) { Stop-RdaOfflineMask ("{0} is already masked (its consumption holds masked ids). Nothing was written." -f $ReportZip.Name) }
                 # A row with fewer cells than the header is cut off (a run writes every cell, "" when empty).
                 $Short = $false
@@ -604,8 +623,21 @@ try
                 [void]$Exempt.Add([string]$Instance.'Microsoft.Resources'.Location)
                 Protect-RdaUsageRow -Row $UsageRow -InstanceObject $Instance
                 $UsageRow.InstanceData = $Instance | ConvertTo-Json -Compress
+                $Bare = if ($RowIndex -le $BareCells.Length) { $BareCells[$RowIndex - 1] } else { 0 }
+                if ($Bare -ne 0)
+                {
+                    $Cell = 0
+                    foreach ($P in $UsageRow.PSObject.Properties)
+                    {
+                        if ($Cell -lt 31 -and ($Bare -band (1 -shl $Cell)) -ne 0 -and [string]::IsNullOrEmpty([string]$P.Value)) { $P.Value = $null }
+                        $Cell++
+                    }
+                }
+                if ($IsNegative) { $NegativeRows.Add([pscustomobject]@{ Row = $RowIndex; Id = [string]$UsageRow.ResourceId }) }
+                if ($IsNoMeter) { $NoMeterRows.Add([pscustomobject]@{ Row = $RowIndex; Id = [string]$UsageRow.ResourceId }) }
                 $UsageRow
             } | Export-Csv -LiteralPath $CsvOut -Encoding utf8 -NoTypeInformation
+            if (($NegativeRows.Count + $NoMeterRows.Count) -gt 0) { $DroppedReport.Add([pscustomobject]@{ Zip = $ReportZip.Name; Negative = $NegativeRows.ToArray(); NoMeter = $NoMeterRows.ToArray() }) }
         }
 
         # --- The dictionary, then the logs and the report page -------------------
@@ -773,6 +805,22 @@ try
     foreach ($Key in ($Unresolved.Keys | Sort-Object))
     {
         Write-Host ("{0}: {1} reference(s) to a resource this report does not hold are written as 'obfuscated', as a run writes an id it does not know." -f $Key, $Unresolved[$Key]) -ForegroundColor Yellow
+    }
+    # Each kind is counted and named by row number and masked id (never a real value):
+    # the rows are written as a live run writes them (see the row loop), and downstream
+    # drops them with no error.
+    foreach ($D in $DroppedReport)
+    {
+        Write-Host ("In {0}, downstream drops these consumption rows with no error, so their usage is not counted. They are written unchanged, as a live run writes them:" -f $D.Zip) -ForegroundColor Yellow
+        foreach ($Kind in @(@{ Rows = $D.Negative; Text = 'a negative Quantity' }, @{ Rows = $D.NoMeter; Text = 'an empty MeterId' }))
+        {
+            $KindRows = @($Kind.Rows)
+            if ($KindRows.Count -eq 0) { continue }
+            $Shown = @($KindRows | Select-Object -First 10 | ForEach-Object { 'row {0} ({1})' -f $_.Row, $_.Id })
+            $More = if ($KindRows.Count -gt $Shown.Count) { ('; and {0} more' -f ($KindRows.Count - $Shown.Count)) } else { '' }
+            $Noun = if ($KindRows.Count -eq 1) { 'row has' } else { 'rows have' }
+            Write-Host ("  {0} {1} {2}: {3}{4}" -f $KindRows.Count, $Noun, $Kind.Text, ($Shown -join '; '), $More) -ForegroundColor Yellow
+        }
     }
     $Share = if ($null -ne $OuterName) { Join-Path $OutputDirectory $OuterName } else { Join-Path (Join-Path $OutputDirectory $SubFolders[0]) $ReportZips[0].Name }
     Write-Host ''

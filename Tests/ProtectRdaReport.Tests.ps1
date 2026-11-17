@@ -1936,6 +1936,32 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         ($R.Text -join "`n") | Should -Match 'row 1 is cut off, or holds more cells'
     }
 
+    It 'writes a row with a negative quantity or an empty MeterId unchanged, as a run does, and counts and names it' {
+        # Downstream drops such a row with no error; a run writes it as Azure gave it.
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = { param($T)
+                $Lines = $T -split "`n"
+                $Lines[1] = ([regex]'","24","1 Hour","').Replace($Lines[1], '","-24","1 Hour","', 1)
+                $Lines[2] = ([regex]',"meter-demo","Hours",').Replace($Lines[2], ',"","Hours",', 1)
+                $Lines -join "`n" } }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 0 -Because ($R.Text -join ' | ')
+        $Line = @($R.Text | Where-Object { $_ -match 'downstream drops these consumption rows' })
+        $Line.Count | Should -Be 1 -Because 'the mask must not pass such rows in silence'
+        $Line[0] | Should -Match '^In ResourcesReport_.+\.zip, '
+        @($R.Text | Where-Object { $_ -match '^  1 row has a negative Quantity: row 1 \(/subscriptions/' }).Count | Should -Be 1 -Because ($R.Text -join ' | ')
+        @($R.Text | Where-Object { $_ -match '^  1 row has an empty MeterId: row 2 \(/subscriptions/' }).Count | Should -Be 1 -Because ($R.Text -join ' | ')
+        $Folder = @(Get-ChildItem -LiteralPath $Out -Directory)[0].FullName
+        $Members = script:Read-Zip @(Get-ChildItem -LiteralPath $Folder -Filter 'ResourcesReport_*.zip')[0].FullName
+        $Rows = @($Members[@($Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
+        $Rows[0].Quantity | Should -Be '-24' -Because 'a run writes the quantity Azure gave'
+        $Rows[1].MeterId | Should -Be '' -Because 'a run writes the MeterId Azure gave'
+        # A report with no such row prints no such line.
+        $Clean = script:Invoke-Protect -Path $script:PlainRun.ZipPath -Out (Join-Path $script:Work ([guid]::NewGuid().ToString('N')))
+        $Clean.ExitCode | Should -Be 0
+        @($Clean.Text | Where-Object { $_ -match 'downstream drops these consumption rows|negative Quantity|empty MeterId' }).Count | Should -Be 0
+    }
+
     It 'counts the cells of each consumption record as Export-Csv writes them' {
         $F = Join-Path $script:Work 'cells.csv'
         Set-Content -LiteralPath $F -Value ('"A","B"' + "`r`n" + '"x, y","line one' + "`n" + 'line ""two"""' + "`r`n" + '"1","2"' + "`r`n") -NoNewline
@@ -1964,6 +1990,36 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         # What Export-Csv writes, a null cell too, reads clean.
         @([pscustomobject]@{ A = $null; B = 'x' }, [pscustomobject]@{ A = '1'; B = "two`nlines" }) | Export-Csv -LiteralPath $F -NoTypeInformation -Encoding utf8
         [RdaCsvCheck]::FirstBadRecord($F, 2) | Should -Be 0
+    }
+
+    It 'marks the cells of each consumption record that are empty with no quotes, as Export-Csv writes a null' {
+        $F = Join-Path $script:Work 'bare.csv'
+        Initialize-RdaOfflineType
+        # A quoted "" is an empty string, not marked; a bare empty cell is marked. The header is no record.
+        Set-Content -LiteralPath $F -Value ('"A","B","C"' + "`r`n" + ',"","x"' + "`r`n" + '"1",,' + "`r`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 6)
+        # A quoted cell that holds a comma, a newline and a quote is one cell, and its record one record.
+        Set-Content -LiteralPath $F -Value ('"A","B","C"' + "`r`n" + '"x, y","line one' + "`n" + 'line ""two""",' + "`r`n" + ',"a,b",""' + "`r`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(4, 1)
+        # CRLF and LF line ends give the same marks.
+        $Body = @('"A","B","C"', ',"","x"', '"1",,', ',,')
+        Set-Content -LiteralPath $F -Value (($Body -join "`r`n") + "`r`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 6, 7)
+        Set-Content -LiteralPath $F -Value (($Body -join "`n") + "`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 6, 7)
+        # A last line with no line break is still a record.
+        Set-Content -LiteralPath $F -Value ($Body -join "`r`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 6, 7)
+        # A record of more than 31 cells: only the first 31 are marked, and a later bare cell
+        # sets no bit (a shift past 31 would wrap onto the first cells).
+        $Header = (1..33 | ForEach-Object { '"H{0}"' -f $_ }) -join ','
+        $AllBare = ',' * 32
+        $LateBare = ((1..31 | ForEach-Object { '"v"' }) -join ',') + ',,'
+        Set-Content -LiteralPath $F -Value ($Header + "`r`n" + $AllBare + "`r`n" + $LateBare + "`r`n") -NoNewline
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(0x7FFFFFFF, 0)
+        # What Export-Csv writes: a null cell is bare, an empty string is quoted.
+        @([pscustomobject]@{ A = $null; B = ''; C = 'x' }, [pscustomobject]@{ A = '1'; B = "two`nlines"; C = $null }) | Export-Csv -LiteralPath $F -NoTypeInformation -Encoding utf8
+        [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 4)
     }
 
     It 'refuses a file whose name differs from the run''s only in case (downstream finds files by their exact start)' {
@@ -2228,5 +2284,81 @@ Describe 'Get-RdaFullIdInValue' {
         $Watch = [System.Diagnostics.Stopwatch]::StartNew()
         @(Get-RdaFullIdInValue -Value $Records).Count | Should -Be 1000
         $Watch.Elapsed.TotalSeconds | Should -BeLessThan 5
+    }
+}
+
+Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfuscate run writes them' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
+        # The same estate with one usage row of a negative quantity and one with an empty MeterId.
+        $script:PlainOdd = New-RdaSyntheticReportZip -RepoRoot $script:RepoRoot -TestsRoot $PSScriptRoot -Plain -DroppedRows
+        $script:LiveOdd = New-RdaSyntheticReportZip -RepoRoot $script:RepoRoot -TestsRoot $PSScriptRoot -DroppedRows
+        $script:Work = Join-Path ([IO.Path]::GetTempPath()) ('RdaProtectOdd_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:Work | Out-Null
+        $script:OddOut = Join-Path $script:Work 'masked'
+        $script:OddRun = script:Invoke-Protect -Path $script:PlainOdd.ZipPath -Out $script:OddOut
+        $Folder = @(Get-ChildItem -LiteralPath $script:OddOut -Directory -ErrorAction SilentlyContinue)[0]
+        $script:OddZip = if ($null -ne $Folder) { @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ResourcesReport_*.zip')[0].FullName } else { $null }
+        $script:OddDict = if ($null -ne $Folder) { @(Get-ChildItem -LiteralPath $Folder.FullName -Filter 'ObfuscationDictionary_*.json')[0].FullName } else { $null }
+        # The consumption CSV text of a report zip.
+        $script:CsvText = {
+            param([string]$Zip)
+            $M = script:Read-Zip $Zip
+            $M[@($M.Keys | Where-Object { $_ -like 'Consumption_*.csv' })[0]]
+        }
+    }
+    AfterAll {
+        Remove-RdaTestReportZip $script:PlainOdd
+        Remove-RdaTestReportZip $script:LiveOdd
+        if ($script:Work) { Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'gives the same bytes for a row with <Label>, tokens aside, and the same values through each side''s dictionary' -ForEach @(
+        @{ Label = 'a negative Quantity'; Pick = { param($R) $R.Quantity -eq '-24' } }
+        @{ Label = 'an empty MeterId'; Pick = { param($R) $R.MeterId -eq '' } }
+    ) {
+        $script:PlainOdd.Exit | Should -Be 0 -Because $script:PlainOdd.Console
+        $script:LiveOdd.Exit | Should -Be 0 -Because $script:LiveOdd.Console
+        $script:OddRun.ExitCode | Should -Be 0 -Because ($script:OddRun.Text -join ' | ')
+        $Lines = @{}
+        $Index = @{}
+        foreach ($Side in 'Live', 'Offline')
+        {
+            $Zip = if ($Side -eq 'Live') { $script:LiveOdd.ZipPath } else { $script:OddZip }
+            $Text = & $script:CsvText $Zip
+            $Lines[$Side] = @($Text -split "`r?`n" | Where-Object { $_ -ne '' })
+            $Rows = @($Text | ConvertFrom-Csv)
+            $Index[$Side] = @(for ($I = 0; $I -lt $Rows.Count; $I++) { if (& $Pick $Rows[$I]) { $I } })
+            $Index[$Side].Count | Should -Be 1 -Because "the $Side report holds one row with $Label"
+        }
+        $Index['Offline'][0] | Should -Be $Index['Live'][0] -Because 'the row keeps its place'
+        $Lines['Offline'][0] | Should -BeExactly $Lines['Live'][0] -Because 'the header is the run''s'
+        # The same bytes, each token (the two sides' tokens differ by design) written as <t>.
+        $T = (Get-RdaTokenPattern).TrimStart('^').TrimEnd('$')
+        $Bytes = foreach ($Side in 'Live', 'Offline') { , [Text.Encoding]::UTF8.GetBytes(($Lines[$Side][$Index[$Side][0] + 1] -replace $T, '<t>')) }
+        [Convert]::ToBase64String($Bytes[1]) | Should -BeExactly ([Convert]::ToBase64String($Bytes[0])) -Because ('offline = live for a row with ' + $Label)
+        # Every other line too: the header and each row, the same bytes, tokens aside.
+        $Lines['Offline'].Count | Should -Be $Lines['Live'].Count -Because 'both files hold the same rows'
+        for ($L = 0; $L -lt $Lines['Live'].Count; $L++)
+        {
+            ($Lines['Offline'][$L] -replace $T, '<t>') | Should -BeExactly ($Lines['Live'][$L] -replace $T, '<t>') -Because ('offline = live on line {0} of the consumption file' -f ($L + 1))
+        }
+        # And through each side's own dictionary, the same values.
+        $Live = script:Get-UnmaskedReport $script:LiveOdd.ZipPath $script:LiveOdd.DictionaryPath
+        $Offline = script:Get-UnmaskedReport $script:OddZip $script:OddDict
+        script:ConvertTo-SortedJson $Offline['Consumption'][$Index['Offline'][0]] | Should -BeExactly (script:ConvertTo-SortedJson $Live['Consumption'][$Index['Live'][0]])
+    }
+
+    It 'names each kind with its count, by row number and masked id only' {
+        $Text = @($script:OddRun.Text)
+        $Rows = @((& $script:CsvText $script:OddZip) | ConvertFrom-Csv)
+        foreach ($Kind in @(@{ Text = 'a negative Quantity'; Row = 1 }, @{ Text = 'an empty MeterId'; Row = 2 }))
+        {
+            $Line = @($Text | Where-Object { $_ -like ('  1 row has {0}: *' -f $Kind.Text) })
+            $Line.Count | Should -Be 1 -Because ($Text -join ' | ')
+            $Line[0] | Should -BeExactly ('  1 row has {0}: row {1} ({2})' -f $Kind.Text, $Kind.Row, $Rows[$Kind.Row - 1].ResourceId)
+        }
+        $Named = ($Text | Where-Object { $_ -match 'row has|downstream drops' }) -join "`n"
+        foreach ($Real in 'rg-demo', '12345678-1234-1234-1234-123456789012', 'vm-demo', 'osdisk-vm-demo', 'Consumption_') { $Named.Contains($Real) | Should -BeFalse -Because "'$Real' is a real value or a file name" }
     }
 }

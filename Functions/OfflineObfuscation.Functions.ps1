@@ -1088,6 +1088,49 @@ public static class RdaCsvCheck
             return 0;
         }
     }
+
+    // For each data record (after the header), in order, a mask of its cells that are
+    // empty with no quotes: bit i set for cell i (the first 31 cells). Export-Csv writes a
+    // null value so and an empty string as "", and Import-Csv reads both as "", so the
+    // mask lets a rewrite give each such cell back as written. Read FirstBadRecord first:
+    // this reads a file Export-Csv wrote.
+    public static int[] BareEmptyCells(string path)
+    {
+        var masks = new List<int>();
+        using (var r = new StreamReader(path, true))
+        {
+            long record = 0; int cell = 0, mask = 0, c; bool inQuotes = false, hadText = false, any = false;
+            while ((c = r.Read()) != -1)
+            {
+                if (inQuotes)
+                {
+                    if (c == '"') { if (r.Peek() == '"') r.Read(); else inQuotes = false; }
+                    continue;
+                }
+                if (c == ',') { if (!hadText && cell < 31) mask |= 1 << cell; cell++; hadText = false; any = true; continue; }
+                if (c == '\r') continue;
+                if (c == '\n')
+                {
+                    if (any || hadText)
+                    {
+                        if (!hadText && cell < 31) mask |= 1 << cell;
+                        if (record > 0) masks.Add(mask);
+                        record++;
+                    }
+                    cell = 0; mask = 0; hadText = false; any = false;
+                    continue;
+                }
+                if (c == '"') inQuotes = true;
+                hadText = true; any = true;
+            }
+            if (any || hadText)
+            {
+                if (!hadText && cell < 31) mask |= 1 << cell;
+                if (record > 0) masks.Add(mask);
+            }
+        }
+        return masks.ToArray();
+    }
 }
 '@ -ReferencedAssemblies System.IO.Compression, System.IO.Compression.ZipFile, System.Text.RegularExpressions, System.Collections, System.Runtime.Extensions, System.Text.Encoding.Extensions
 }

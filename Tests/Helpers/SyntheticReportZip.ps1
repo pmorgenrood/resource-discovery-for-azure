@@ -126,7 +126,9 @@ function Remove-RdaTestReportZip
 
 function New-RdaSyntheticReportZip
 {
-    param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain)
+    # -DroppedRows: the first usage row has a negative quantity and the second an empty
+    # MeterId, rows downstream drops with no error.
+    param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain, [switch]$DroppedRows)
 
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('RdaSyntheticReport_' + $PID + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $Tree = Join-Path $WorkDir 'tree'
@@ -159,7 +161,7 @@ Export-ModuleMember -Function Get-AzMetric
 
     $Harness = Join-Path $WorkDir 'run.ps1'
     @'
-param([string]$Tree, [string]$Out, [string]$Modules, [string]$StandIns, [switch]$Plain)
+param([string]$Tree, [string]$Out, [string]$Modules, [string]$StandIns, [switch]$Plain, [switch]$DroppedRows)
 $PSStyle.OutputRendering = 'PlainText'
 $env:PSModulePath = $Modules + [System.IO.Path]::PathSeparator + $env:PSModulePath
 $Global:RdaSessionInitialized = $true
@@ -277,6 +279,7 @@ $Global:StandInUsage = @(
         UsageStartTime   = [datetime]::SpecifyKind([datetime]'2026-10-01T00:00:00', 'Utc'); UsageEndTime = [datetime]::SpecifyKind([datetime]'2026-10-02T00:00:00', 'Utc')
     }
 }
+if ($DroppedRows) { $Global:StandInUsage[0].Quantity = [decimal]-24; $Global:StandInUsage[1].MeterId = '' }
 function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
@@ -335,6 +338,7 @@ exit $LASTEXITCODE
     $Pwsh = (Get-Process -Id $PID).Path
     $ArgList = @('-NoProfile', '-NonInteractive', '-File', $Harness, '-Tree', $Tree, '-Out', $Out, '-Modules', (Join-Path $WorkDir 'modules'), '-StandIns', (Join-Path $TestsRoot 'Helpers/AzPsStandIns.ps1'))
     if ($Plain) { $ArgList += '-Plain' }
+    if ($DroppedRows) { $ArgList += '-DroppedRows' }
     $Console = @(& $Pwsh @ArgList 2>&1 | ForEach-Object { [string]$_ })
     $Exit = $LASTEXITCODE
     $Zip = Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
