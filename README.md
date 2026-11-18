@@ -516,7 +516,7 @@ Upon completion, the script generates reports in the `InventoryReports` folder:
 
 | File | Description |
 |------|-------------|
-| `Consumption_ResourcesReport_(date).csv` | Cost and billing data |
+| `Consumption_ResourcesReport_(date).csv` | The file holds Azure usage only: one row per meter and resource, with quantity, unit and usage dates. It has no prices or cost amounts. (see [Consumption data](docs/consumption-data.md)) |
 | `Inventory_ResourcesReport_(date).json` | Complete resource inventory |
 | `Metrics_ResourcesReport_(date).json` | Performance metrics data |
 | `ResourcesReport_(date).html` | Self-contained HTML report (open in any browser; no Excel required) |
@@ -596,7 +596,7 @@ Get-ChildItem -File -Path ./* -Include *.html, Consumption_*.csv, Inventory_*.js
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|----------|
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
-| `SkipConsumption` | Switch | Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front) | False | `-SkipConsumption` |
+| `SkipConsumption` | Switch | Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front) | False | `-SkipConsumption` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
 | `IncludeNetworkResources` | Switch | Also pull the network types that no collector reads (virtual networks, NSGs, NICs, private endpoints, route tables and the like). They are left out by default because they can be most of the rows, time and memory of a run. Network costs still come from the consumption data either way. | False | `-IncludeNetworkResources` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
@@ -634,7 +634,7 @@ The debug log (`-Debug`) has a `Metrics batch` line in the metrics summary: requ
 metrics only. Lowering it (e.g. 31 → 14 or 7) reduces both run time and memory
 use, which helps on large estates that time out or hit out-of-memory errors
 during the metrics phase. It does **not** change which resources are found, and
-it does **not** affect cost/consumption data (that phase uses its own fixed
+it does **not** affect consumption (usage) data (that phase uses its own fixed
 window).
 
 The tradeoff is right-sizing accuracy: a shorter window samples fewer
@@ -697,7 +697,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `ConcurrencyLimit` | Integer | Forwarded to the inner script's metrics-collection throttle. Controls how many `Get-AzMetric` calls run in parallel within one subscription. | 6 | `-ConcurrencyLimit 12` |
 | `Obfuscate` | Switch | Forwarded. Replace resource IDs, names, subscriptions, resource groups, and tags with masked values. | False | `-Obfuscate` |
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
-| `SkipConsumption` | Switch | Forwarded. Skip cost/billing data collection and the up-front [consumption data check](#consumption-data-check-up-front). | False | `-SkipConsumption` |
+| `SkipConsumption` | Switch | Forwarded. Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front). | False | `-SkipConsumption` |
 | `IncludeNetworkResources` | Switch | Forwarded. Also pull the network types no collector reads; left out by default to save time and memory. Network costs still come from the consumption data. A run started without it continues only without it. | False | `-IncludeNetworkResources` |
 | `UseMetricsBatch` | Switch | Forwarded. Collect metrics with the Azure Monitor batch API (up to 50 resources per request); same metrics files. Before collecting, offers once to register `Microsoft.Insights` where it is missing. See [Faster metrics for big tenants](#faster-metrics-for-big-tenants--usemetricsbatch). | False | `-UseMetricsBatch` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
