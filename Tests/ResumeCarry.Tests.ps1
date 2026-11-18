@@ -413,7 +413,7 @@ Describe 'Get-ResumeCarriedReports: which earlier reports a -Resume run carries'
 
     It 'does not carry a zip at the top of the inventory folder, such as an earlier consolidated zip (a report zip is one folder down)' {
         # Carried in as an inner zip, its own reports would sit two zips deep,
-        # where downstream does not read them.
+        # where they are not read.
         Copy-Item -LiteralPath $script:Zip -Destination (Join-Path $script:Root 'AllSubscriptions_ResourcesReport_old.zip')
         $R = Get-ResumeCarriedReports -SkippedSubscriptions @($script:SubA) -Reports @([pscustomobject]@{ Id = 'sub-a'; Name = 'A'; Zip = 'AllSubscriptions_ResourcesReport_old.zip'; Obfuscated = $false }) -InventoryRoot $script:Root -Obfuscated $false
         @($R.Carried).Count | Should -Be 0

@@ -3,7 +3,7 @@ param($Sub, $Resources, $Task, $ResourceIdDictionary)
 
 # Microsoft Fabric capacities (microsoft.fabric/capacities): the capacity's SKU, how many hours it ran
 # in the consumption window (from the Azure activity log), and each Apache Airflow job's pool settings
-# (from the Fabric REST API), so the bill's Airflow CU-hours can be priced without a user guess.
+# (from the Fabric REST API), so the bill's Airflow CU-hours can be read without a user guess.
 #
 # What is never read: capacity admin e-mails, environment variables (no .../settings call is ever made) and
 # Airflow overrides. Workspace and job ids are used only to build the next Fabric call; workspace, job and pool
@@ -154,8 +154,8 @@ if ($Task -eq 'Processing')
         # zone, so the bill's UTC days are those local dates. The window is therefore those dates read as UTC
         # midnights (not today's UTC date, which differs from the local date for part of every day off UTC).
         # shortcut: the bill read builds its own dates later in the run, so a run that crosses local midnight between this
-        # collector and the consumption read gets a window one day off the bill; the server's Inconsistent check (design
-        # 5.4 step 5) is the guard. Upgrade: one window computed once per run in ResourceInventory.ps1 for both.
+        # collector and the consumption read gets a window one day off the bill; the Inconsistent check is the
+        # guard. Upgrade: one window computed once per run in ResourceInventory.ps1 for both.
         $LocalToday = (Get-Date).Date
         $WindowStart = [datetime]::SpecifyKind($LocalToday.AddDays(-31), [System.DateTimeKind]::Utc)
         $WindowEnd = [datetime]::SpecifyKind($LocalToday.AddDays(-1), [System.DateTimeKind]::Utc)

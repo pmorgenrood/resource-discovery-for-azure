@@ -127,8 +127,8 @@ function Remove-RdaTestReportZip
 function New-RdaSyntheticReportZip
 {
     # -DroppedRows: the first usage row has a negative quantity, the second an empty
-    # MeterId, and a last one no InstanceData (so an empty ResourceId): rows downstream
-    # drops with no error.
+    # MeterId, and a last one no InstanceData (so an empty ResourceId): rows whose
+    # usage is not counted.
     param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain, [switch]$DroppedRows)
 
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('RdaSyntheticReport_' + $PID + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))

@@ -62,7 +62,7 @@ holds plain copies of the report, so delete it.
 
 - An App Service's `SiteProperties` is masked part by part by the same function a `-Obfuscate` run uses (see
   docs/obfuscation-and-unmask.md); its keys can come out in another order, as the plain report is read without
-  their order. Downstream reads neither the field nor the order.
+  their order. Nothing reads the field or the order.
 - Like a `-Obfuscate` run, it copies the words Azure writes in fields no run masks (a size, a region, an id's
   provider and type words such as `microsoft.compute/virtualmachines`). It checks those words have Azure's form, and
   its leak scan finds one that is a name, group or subscription of the report of at least 5 characters that is 12 or
@@ -92,7 +92,7 @@ holds plain copies of the report, so delete it.
   run's Azure pull held that resource, the run would have written its token instead. The cases:
   - a field that names a resource by its name only, when the report holds no row of that name, or
     several (a disk's VM, an availability set's VMs, a Machine Learning workspace's storage account,
-    key vault, insights or registry, a scale set's container cluster). Downstream reads one of these:
+    key vault, insights or registry, a scale set's container cluster). One of these is read:
     a disk's `AssociatedResource`, matched to its VM's id, so such a disk is not linked to its VM;
   - a Front Door's WAF policies, always (no report section holds them; the field is a label);
   - an id field that points at a resource the report holds no row of (a deleted disk, a resource of a

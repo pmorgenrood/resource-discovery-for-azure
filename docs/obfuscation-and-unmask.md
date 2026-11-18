@@ -83,7 +83,7 @@ or digits it runs into, is one real part anywhere; so is a 4-part version such a
 one token, so `DOCKER|myreg.azurecr.io/team-app/web:1.2.3` is shared as
 `DOCKER|<token>.azurecr.io/<token>-<token>/<token>:1.2.3`. The tokens have the
 `prod_`/`nonprod_<guid>` form, so a masked value holds more `-` and `_` than the
-plain one. Nothing downstream reads this field.
+plain one. Nothing reads this field.
 
 ---
 

@@ -173,7 +173,7 @@ try
     if ($ReportZips.Count -eq 0) { Stop-RdaOfflineMask 'No ResourcesReport_*.zip report was found in -Path.' }
     # Each report's page sits in the folder the wrapper names after its stamp; no other page is known.
     $KnownOuter = @($ReportZips | ForEach-Object { $_.Name; ($_.Name -replace '^ResourcesReport_(.+)\.zip$', 'HTML$1/ResourcesReport_$1.html') }) + @('RunSummary.log', 'MainSummary.html')
-    # Names are matched case for case: a run writes them so, and downstream finds files by them.
+    # Names are matched case for case: a run writes them so, and files are found by them.
     foreach ($Member in @(Get-ChildItem -LiteralPath $InStage -Recurse -File -Force))
     {
         $Rel = [IO.Path]::GetRelativePath($InStage, $Member.FullName) -replace '\\', '/'
@@ -213,7 +213,7 @@ try
     $Scans = [System.Collections.Generic.List[object]]::new()
     $ReportExempt = @{}
     $Unresolved = @{}
-    # Per report: the consumption rows downstream drops in silence (see the row loop).
+    # Per report: the consumption rows whose usage is not counted (see the row loop).
     $DroppedReport = [System.Collections.Generic.List[object]]::new()
     $SubFolders = [System.Collections.Generic.List[string]]::new()
     $PerReportFailures = [System.Collections.Generic.List[object]]::new()
@@ -553,7 +553,7 @@ try
             # run did (offline = live, byte for byte).
             $BareCells = [RdaCsvCheck]::BareEmptyCells($CsvIn)
             $RowIndex = 0
-            # Rows downstream drops in silence, by kind: { Row, Id } with the row's masked id.
+            # Rows whose usage is not counted, by kind: { Row, Id } with the row's masked id.
             $NegativeRows = [System.Collections.Generic.List[object]]::new()
             $NoMeterRows = [System.Collections.Generic.List[object]]::new()
             $NoIdRows = [System.Collections.Generic.List[object]]::new()
@@ -583,20 +583,20 @@ try
                 }
                 # The id masking keeps an id's provider and type words: they must be Azure's.
                 if (-not (Test-RdaIdPathWord ([string]$UsageRow.ResourceId))) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id whose provider or type is not as Azure writes one. Nothing was written." -f $ReportZip.Name, $RowIndex) }
-                # Downstream drops the whole file over one cell it cannot read: the quantity a number
+                # One cell that cannot be read makes the whole file unusable: the quantity a number
                 # with a dot (as PowerShell writes one), the times as the run writes them
                 # ('M/d/yyyy h:mm:ss tt', invariant) or in ISO form.
                 $Qty = 0.0
                 if ([string]$UsageRow.Quantity -cnotmatch '^-?[0-9]+(?:\.[0-9]+)?(?:[Ee][-+]?[0-9]+)?\z' -or -not [double]::TryParse([string]$UsageRow.Quantity, [System.Globalization.NumberStyles]::Float, [cultureinfo]::InvariantCulture, [ref]$Qty) -or -not [double]::IsFinite($Qty) -or -not (Test-RdaUsageTime ([string]$UsageRow.UsageStartTime)) -or -not (Test-RdaUsageTime ([string]$UsageRow.UsageEndTime)))
                 {
-                    Stop-RdaOfflineMask ("{0}: consumption row {1} has a quantity or time downstream cannot read. Nothing was written." -f $ReportZip.Name, $RowIndex)
+                    Stop-RdaOfflineMask ("{0}: consumption row {1} has a quantity or time that cannot be read. Nothing was written." -f $ReportZip.Name, $RowIndex)
                 }
                 # Rule: offline = live. A row with a negative Quantity, an empty MeterId or an
                 # empty ResourceId is written byte for byte as a live -Obfuscate run writes it:
                 # unchanged, never dropped, fixed or refused.
                 # Reason: the client must not change data rows (the output contract), and a
-                # masked report must read downstream as the plain one does, so the offline mask
-                # may not differ from a run. Downstream drops such a row with no error, so the
+                # masked report must read as the plain one does, so the offline mask
+                # may not differ from a run. Such a row's usage is not counted, so the
                 # mask counts each kind and names the rows (row number and masked id, or "no id")
                 # at the end: the loss is then not silent.
                 $IsNegative = $Qty -lt 0
@@ -786,7 +786,7 @@ try
         # The inner zips and the bundle extras the wrapper adds, written by the run's
         # streaming zip writer (Compress-Archive keeps every entry in memory). That writer
         # puts folder contents (HTML<stamp>/) before files, so the entry order is not the
-        # wrapper's; downstream reads each inner zip by its name, not its place.
+        # wrapper's; each inner zip is read by its name, not its place.
         $OuterItems = @($SubFolders | ForEach-Object { Join-Path (Join-Path $WorkOut $_) ("ResourcesReport_{0}.zip" -f $_.Substring('ResourcesReport'.Length)) }) + @(Get-ChildItem -LiteralPath $Stage -Force | Sort-Object Name | ForEach-Object { $_.FullName })
         Compress-RdaReportArchive -Path @($OuterItems | ForEach-Object { [WildcardPattern]::Escape($_) }) -DestinationPath $OuterZip -CompressionLevel Optimal
         # Each report page copy with its own report's exemptions; the run's own summaries with none.
@@ -812,11 +812,11 @@ try
         Write-Host ("{0}: {1} reference(s) to a resource this report does not hold are written as 'obfuscated', as a run writes an id it does not know." -f $Key, $Unresolved[$Key]) -ForegroundColor Yellow
     }
     # Each kind is counted and named by row number and masked id (never a real value):
-    # the rows are written as a live run writes them (see the row loop), and downstream
-    # drops them with no error.
+    # the rows are written as a live run writes them (see the row loop), and their
+    # usage is not counted.
     foreach ($D in $DroppedReport)
     {
-        Write-Host ("In {0}, downstream drops these consumption rows with no error, so their usage is not counted. They are written unchanged, as a live run writes them:" -f $D.Zip) -ForegroundColor Yellow
+        Write-Host ("In {0}, the usage of these consumption rows is not counted. They are written unchanged, as a live run writes them:" -f $D.Zip) -ForegroundColor Yellow
         foreach ($Kind in @(@{ Rows = $D.Negative; Text = 'a negative Quantity' }, @{ Rows = $D.NoMeter; Text = 'an empty MeterId' }, @{ Rows = $D.NoId; Text = 'an empty ResourceId' }))
         {
             $KindRows = @($Kind.Rows)

@@ -438,7 +438,7 @@ Describe 'Names and types are kept as a run writes them' {
         Get-RdaUnknownInventoryShape -Rows @{ CloudServices = @(@{ ID = $Id; Roles = @('contoso-secret') }) } -Shape $script:Shape | Should -Match 'nested field'
         Get-RdaUnknownInventoryShape -Rows @{ CloudServices = @(@{ ID = $Id; Roles = 'contoso-secret' }) } -Shape $script:Shape | Should -Match 'nested field'
         Get-RdaUnknownInventoryShape -Rows @{ CloudServices = @(@{ ID = $Id; Roles = @() }) } -Shape $script:Shape | Should -BeNullOrEmpty
-        # Any other field holds one value; a list only of numbers (a SQL server's zones), never in a field downstream reads.
+        # Any other field holds one value; a list only of numbers (a SQL server's zones), never in a field that holds one value.
         Get-RdaUnknownInventoryShape -Rows @{ VirtualMachines = @(@{ ID = $Id; CPU = @([long]1, [long]2) }) } -Shape $script:Shape | Should -Match 'a list in a field'
         Get-RdaUnknownInventoryShape -Rows @{ VirtualMachines = @(@{ ID = $Id; Size = @('contoso-secret') }) } -Shape $script:Shape | Should -Match 'a list in a field'
         $SqlField = @($script:Shape.Sections['SQLSERVER'] | Where-Object { $_ -ceq 'ZoneRedundant' })[0]
@@ -452,7 +452,7 @@ Describe 'Names and types are kept as a run writes them' {
         # An object as Azure gave it, where the collector copies the field straight from Azure (an app's siteProperties).
         $Site = @{ metadata = $null; properties = @(@{ name = 'LinuxFxVersion'; value = 'DOTNETCORE|8.0' }, @{ name = 'WindowsFxVersion'; value = $null }); appSettings = $null }
         Get-RdaUnknownInventoryShape -Rows @{ AppServices = @(@{ ID = $Id; SiteProperties = $Site }) } -Shape $script:Shape | Should -BeNullOrEmpty
-        Get-RdaUnknownInventoryShape -Rows @{ AppServices = @(@{ ID = $Id; State = $Site }) } -Shape $script:Shape | Should -Match 'nested field' -Because 'downstream reads State as one value'
+        Get-RdaUnknownInventoryShape -Rows @{ AppServices = @(@{ ID = $Id; State = $Site }) } -Shape $script:Shape | Should -Match 'nested field' -Because 'State holds one value'
         Get-RdaUnknownInventoryShape -Rows @{ AppServices = @(@{ ID = $Id; ServerFarmId = $Site }) } -Shape $script:Shape | Should -Match 'nested field' -Because 'the collector builds ServerFarmId itself'
         # A deeper path from Azure ($Data.storageProfile.osDisk.osType) is a leaf value, never an object.
         Get-RdaUnknownInventoryShape -Rows @{ VirtualMachines = @(@{ ID = $Id; OSType = $Site }) } -Shape $script:Shape | Should -Match 'nested field' -Because 'Azure gives OSType as text'
@@ -1384,7 +1384,7 @@ Describe 'Protect-RdaReport.ps1 on the synthetic estate' {
         $Live = script:Get-UnmaskedReport $script:LiveRun.ZipPath $script:LiveRun.DictionaryPath
         # shortcut: the Front Door policy is named in the plain report only by its name, and the
         # policy is no inventory row, so offline writes 'obfuscated' (a run's value for an id it
-        # does not know) where the live run writes the policy's token; downstream reads neither.
+        # does not know) where the live run writes the policy's token; nothing reads either.
         script:Compare-Unmasked $Live $Offline -SkipField 'Frontdoor.WebApplicationFirewall' | Should -BeNullOrEmpty
     }
 
@@ -1920,10 +1920,10 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         ($R.Text -join "`n") | Should -Match 'row 1 has an id, location or meter'
         $R = & $Refused @{ 'Consumption_*.csv' = { param($T) $Lines = $T -split "`n"; $Lines[1] = $Lines[1] -replace '","(/subscriptions/[^"]+/virtualmachines/)vm-demo","eastus"', '","$1vm-other","eastus"'; $Lines -join "`n" } } 'a row id not its InstanceData id'
         ($R.Text -join "`n") | Should -Match 'row 1 has an id, location or meter'
-        # A quantity or time downstream cannot read (it then drops the whole file).
+        # A quantity or time that cannot be read (the whole file is then unusable).
         $R = & $Refused @{ 'Consumption_*.csv' = { param($T) ([regex]'","24","1 Hour","').Replace($T, '","2,4","1 Hour","', 1) } } 'a quantity with a comma'
         ($R.Text -join "`n") | Should -Match 'quantity or time'
-        # A quantity too big for a number (it overflows downstream's parse) is refused too.
+        # A quantity too big for a number (it overflows a number parse) is refused too.
         $R = & $Refused @{ 'Consumption_*.csv' = { param($T) ([regex]'","24","1 Hour","').Replace($T, '","1e999999","1 Hour","', 1) } } 'a quantity that overflows'
         ($R.Text -join "`n") | Should -Match 'quantity or time'
         $R = & $Refused @{ 'Consumption_*.csv' = { param($T) ([regex]'"\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2} [AP]M"').Replace($T, '"contoso-secret"', 1) } } 'a time a run does not write'
@@ -1937,7 +1937,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
     }
 
     It 'writes a row with a negative quantity or an empty MeterId unchanged, as a run does, and counts and names it' {
-        # Downstream drops such a row with no error; a run writes it as Azure gave it.
+        # Such a row's usage is not counted; a run writes it as Azure gave it.
         $Zip = & $script:Change @{ 'Consumption_*.csv' = { param($T)
                 $Lines = $T -split "`n"
                 $Lines[1] = ([regex]'","24","1 Hour","').Replace($Lines[1], '","-24","1 Hour","', 1)
@@ -1948,7 +1948,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
         $R = script:Invoke-Protect -Path $Zip -Out $Out
         $R.ExitCode | Should -Be 0 -Because ($R.Text -join ' | ')
-        $Line = @($R.Text | Where-Object { $_ -match 'downstream drops these consumption rows' })
+        $Line = @($R.Text | Where-Object { $_ -match 'the usage of these consumption rows is not counted' })
         $Line.Count | Should -Be 1 -Because 'the mask must not pass such rows in silence'
         $Line[0] | Should -Match '^In ResourcesReport_.+\.zip, '
         @($R.Text | Where-Object { $_ -match '^  1 row has a negative Quantity: row 1 \(/subscriptions/' }).Count | Should -Be 1 -Because ($R.Text -join ' | ')
@@ -1961,7 +1961,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         # A report with no such row prints no such line.
         $Clean = script:Invoke-Protect -Path $script:PlainRun.ZipPath -Out (Join-Path $script:Work ([guid]::NewGuid().ToString('N')))
         $Clean.ExitCode | Should -Be 0
-        @($Clean.Text | Where-Object { $_ -match 'downstream drops these consumption rows|negative Quantity|empty MeterId|empty ResourceId' }).Count | Should -Be 0
+        @($Clean.Text | Where-Object { $_ -match 'the usage of these consumption rows is not counted|negative Quantity|empty MeterId|empty ResourceId' }).Count | Should -Be 0
     }
 
     It 'counts the cells of each consumption record as Export-Csv writes them' {
@@ -2024,7 +2024,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         [RdaCsvCheck]::BareEmptyCells($F) | Should -Be @(1, 4)
     }
 
-    It 'refuses a file whose name differs from the run''s only in case (downstream finds files by their exact start)' {
+    It 'refuses a file whose name differs from the run''s only in case (files are found by their exact start)' {
         $Zip = & $script:Change @{}
         $Archive = [System.IO.Compression.ZipFile]::Open($Zip, 'Update')
         try
@@ -2289,7 +2289,7 @@ Describe 'Get-RdaFullIdInValue' {
     }
 }
 
-Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfuscate run writes them' {
+Describe 'Protect-RdaReport.ps1 writes the rows whose usage is not counted as a live -Obfuscate run writes them' {
     BeforeAll {
         . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
         # The same estate with one usage row of a negative quantity, one with an empty MeterId
@@ -2366,14 +2366,14 @@ Describe 'Protect-RdaReport.ps1 writes the rows downstream drops as a live -Obfu
             $Line[0] | Should -BeExactly ('  1 row has {0}: row {1} ({2})' -f $Kind.Text, $Kind.Row, $Id)
         }
         $Rows[$Rows.Count - 1].ResourceLocation | Should -Be '' -Because 'the last row is the one with no InstanceData'
-        $Named = ($Text | Where-Object { $_ -match 'row has|downstream drops' }) -join "`n"
+        $Named = ($Text | Where-Object { $_ -match 'row has|is not counted' }) -join "`n"
         foreach ($Real in 'rg-demo', '12345678-1234-1234-1234-123456789012', 'vm-demo', 'osdisk-vm-demo', 'Consumption_') { $Named.Contains($Real) | Should -BeFalse -Because "'$Real' is a real value or a file name" }
     }
 
     It 'has a live run, plain and masked, count and name those rows too, as it writes them unchanged' {
         foreach ($Run in $script:PlainOdd, $script:LiveOdd)
         {
-            $Run.Console | Should -Match 'Consumption for [^\r\n]+: 1 written row\(s\) have a negative Quantity, 1 an empty MeterId and 1 an empty ResourceId\. They are written as Azure gave them, but downstream drops such rows with no error' -Because $Run.Console
+            $Run.Console | Should -Match 'Consumption for [^\r\n]+: 1 written row\(s\) have a negative Quantity, 1 an empty MeterId and 1 an empty ResourceId\. They are written as Azure gave them, but their usage is not counted' -Because $Run.Console
         }
     }
 }

@@ -973,8 +973,8 @@ function Get-RdaSkippedNetworkCountFromRow
 #
 # No failure message text is written (see Get-RdaDiagnosticMessage): a line holds
 # its collector, its subscription token and the closed-list facts of the error
-# object. The subscription is its token in an obfuscated run, '<guid>' otherwise. Written as a HUMAN-READABLE .log (NOT .json) so the ingestion server
-# does not table-ingest it; the caller adds it to the zip Path array explicitly.
+# object. The subscription is its token in an obfuscated run, '<guid>' otherwise. Written as a HUMAN-READABLE .log (NOT .json) so it is not read
+# as report data; the caller adds it to the zip Path array explicitly.
 #
 # Wrapped in try/catch and returns the written file path on success or $null on
 # failure: the diagnostics log is a troubleshooting aid, not the report, so a

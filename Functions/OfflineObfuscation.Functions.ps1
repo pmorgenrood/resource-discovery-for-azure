@@ -1430,7 +1430,7 @@ function ConvertFrom-RdaRunSummaryText
     # Persian, Hijri or Thai on a host whose default calendar is one of those). This host's
     # culture first: a mask on the host that collected reads the times as written.
     # shortcut: a log written on another host in another calendar whose dates are also dates
-    # here is read in this host's calendar (the times are display only; downstream reads no
+    # here is read in this host's calendar (the times are display only; nothing reads the
     # run summary); upgrade by recording the writer's culture in the log.
     $Time = '(\d{4}-\d{2}-\d{2} \d{2}([:.])\d{2}\2\d{2})'
     # This host's culture as it is (a user's calendar choice kept), then the others by name.
@@ -1737,7 +1737,7 @@ function Get-RdaReportShape
     # A collector's output records are the hashtables it assigns to $Obj (each
     # collector then adds $Obj to its result); its other hashtables are its own
     # working data, whose keys no record has.
-    # Names are kept case for case: downstream reads sections and fields by their exact names.
+    # Names are kept case for case: sections and fields are read by their exact names.
     $Sections = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
     $Raw = @{}
     $Nested = @{}
@@ -1803,7 +1803,7 @@ function Get-RdaUnknownInventoryShape
 {
     param($Rows, $Shape)
 
-    # The fields downstream reads as one value (rdfa-downstream-invariants.md, 'What pricing reads').
+    # The fields that hold one value each.
     $OneValue = @('ID', 'Name', 'ResourceGroup', 'Subscription', 'Location', 'Size', 'CPU', 'Memory', 'PowerState', 'HybridBenefit', 'SKU', 'Sku', 'DiskIOPS', 'DiskMBps', 'State', 'Tier', 'Capacity', 'Status', 'VCores', 'LicenseType', 'StorageSizeInGB', 'SqlServerLicenseType', 'SqlImageSku', 'ElasticPoolID', 'Set', 'AssociatedResource')
     foreach ($Section in @($Rows.Keys))
     {
@@ -1811,8 +1811,8 @@ function Get-RdaUnknownInventoryShape
         $Fields = $Shape.Sections[$Section]
         foreach ($Row in @($Rows[$Section]))
         {
-            # Downstream reads these as text, and finds a resource by an ARM id: a number, or
-            # an id of another form, fails the upload or loses the resource.
+            # These are text, and a resource is found by its ARM id: a number, or an id
+            # of another form, breaks the report.
             foreach ($K in 'ID', 'Name', 'ResourceGroup', 'Subscription', 'SKU', 'Location')
             {
                 if ($Row.ContainsKey($K) -and $null -ne $Row[$K] -and $Row[$K] -isnot [string]) { return ('a {0} in the {1} section that is not text' -f $K, $Section) }
@@ -1838,7 +1838,7 @@ function Get-RdaUnknownInventoryShape
                     # numbers only: a list is taken there only, of numbers only.
                     if ($null -eq $Allowed -and $Row[$K] -is [array] -and (-not ($Section -ceq 'SQLSERVER' -and $K -ceq 'ZoneRedundant') -or @($Row[$K] | Where-Object { -not ($_ -is [long] -or ($_ -is [string] -and $_ -cmatch '^[0-9]+\z')) }).Count -gt 0)) { return ('a list in a field the {0} collector writes one value in' -f $Section) }
                     # An object as Azure gave it, in a field the collector copies straight from Azure,
-                    # and never in a field downstream reads as one value. Its values are not taken as
+                    # and never in a field that holds one value. Its values are not taken as
                     # Azure words: the leak scan looks for every real value in them.
                     if ($null -eq $Allowed -and $Row[$K] -is [hashtable])
                     {
