@@ -222,9 +222,9 @@ A run asks you to sign in at most once: the parallel collectors and the `Run-All
 
 ### Advanced Usage Examples
 
-For most runs, use the `Run-AllSubscriptions.ps1` wrapper (recommended) — it inventories the whole tenant and forwards the common options (`-SkipConsumption`, `-SkipMetrics`, `-ConcurrencyLimit`, `-Obfuscate`, `-DeviceLogin`), so they behave exactly as they would on the inner script:
+For most runs, use the `Run-AllSubscriptions.ps1` wrapper (recommended) — it inventories the whole tenant and forwards these options (`-SkipConsumption`, `-SkipMetrics`, `-ConcurrencyLimit`, `-Obfuscate`, `-DeviceLogin`), so they behave exactly as they would on the inner script:
 
-**Skip consumption (billing) data:**
+**Skip consumption (billing) data** (not for a normal run; see [When to use `-SkipConsumption`](#when-to-use--skipconsumption)):
 ```powershell
 ./Run-AllSubscriptions.ps1 -TenantID "contoso.onmicrosoft.com" -SkipConsumption
 ```
@@ -332,7 +332,7 @@ The run lists every failing subscription (name, id, outcome and the window queri
 - returns no usage above zero and the usage permission was not confirmed by both answers (for example role assignments not visible to the identity, the two answers disagreeing, or the permission granted only on a resource group);
 - returns a permission error (`Denied`), or an error that persists after the retries (`Error`).
 
-To inventory without consumption data, re-run with `-SkipConsumption`. The check reads at most 50 pages of usage per subscription; if none of them has a quantity above zero it is treated as only zero quantities, and the output says only the first 50 pages were read. When that subscription passes as `NoUsage`, the warning says only that the first 50 pages held no usage above zero, not that its consumption sheet will be empty: the consumption phase reads every page.
+Do not use `-SkipConsumption` to get past this check on a normal run: the report then has no usage rows (see [When to use `-SkipConsumption`](#when-to-use--skipconsumption)). The check reads at most 50 pages of usage per subscription; if none of them has a quantity above zero it is treated as only zero quantities, and the output says only the first 50 pages were read. When that subscription passes as `NoUsage`, the warning says only that the first 50 pages held no usage above zero, not that its consumption sheet will be empty: the consumption phase reads every page.
 
 A subscription with no resources at all in Resource Graph is not checked, because it has no usage to read, and the output says so.
 
@@ -533,6 +533,20 @@ A Consumption file starts like this (made-up test data). The full sample, with a
 "{""Microsoft.Resources"":{""ResourceUri"":""/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/rg-app-prod/providers/microsoft.compute/disks/vm-app-01_osdisk_1"",""Location"":""westeurope"",""additionalInfo"":{""ConsumptionMeter"":"""",""ImageType"":"""",""AHB"":"""",""vCores"":0,""VCPUs"":0,""ServiceType"":"""",""ResourceCategory"":"""",""Edition"":"""",""LicenseType"":"""",""HostLicenseType"":"""",""OS"":"""",""IsVM"":"""",""NumberOfCores"":0,""NumberOfLogicalProcessors"":0,""SLO"":"""",""ServerSku"":"""",""ServerEdition"":"""",""IsHAEnabled"":""""}}}","Storage","bf07323a-2702-5ff8-9802-27a9778ba970","P10 LRS Disk","EU West","Premium SSD Managed Disks","0.0522","1/Month","10/1/2026 12:00:00 AM","10/2/2026 12:00:00 AM","/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/rg-app-prod/providers/microsoft.compute/disks/vm-app-01_osdisk_1","westeurope",,,
 ```
 
+#### When to use `-SkipConsumption`
+
+Do not use `-SkipConsumption` for a normal run. A normal run needs the usage data.
+
+Use it only:
+
+- to troubleshoot a run, or
+- to collect certain services or metrics again, when you already have the usage data for that period.
+
+What you lose with `-SkipConsumption`:
+
+- The run reads no usage data. The `Consumption_*.csv` file holds only its header row, so the report has no usage rows.
+- The up-front [consumption data check](#consumption-data-check-up-front) is skipped.
+
 ### File Delivery
 
 1. **Locate the output:** Check the `InventoryReports` folder
@@ -604,7 +618,7 @@ Get-ChildItem -File -Path ./* -Include *.html, Consumption_*.csv, Inventory_*.js
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|----------|
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
-| `SkipConsumption` | Switch | Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front) | False | `-SkipConsumption` |
+| `SkipConsumption` | Switch | Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front). Not for a normal run: use it only to troubleshoot, or to collect certain services or metrics again when you already have the usage data for that period. See [When to use `-SkipConsumption`](#when-to-use--skipconsumption). | False | `-SkipConsumption` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
 | `IncludeNetworkResources` | Switch | Also pull the network types that no collector reads (virtual networks, NSGs, NICs, private endpoints, route tables and the like). They are left out by default because they can be most of the rows, time and memory of a run. Network costs still come from the consumption data either way. | False | `-IncludeNetworkResources` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
@@ -705,7 +719,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `ConcurrencyLimit` | Integer | Forwarded to the inner script's metrics-collection throttle. Controls how many `Get-AzMetric` calls run in parallel within one subscription. | 6 | `-ConcurrencyLimit 12` |
 | `Obfuscate` | Switch | Forwarded. Replace resource IDs, names, subscriptions, resource groups, and tags with masked values. | False | `-Obfuscate` |
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
-| `SkipConsumption` | Switch | Forwarded. Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front). | False | `-SkipConsumption` |
+| `SkipConsumption` | Switch | Forwarded. Skip usage (billing) data collection and the up-front [consumption data check](#consumption-data-check-up-front). Not for a normal run: use it only to troubleshoot, or to collect certain services or metrics again when you already have the usage data for that period. See [When to use `-SkipConsumption`](#when-to-use--skipconsumption). | False | `-SkipConsumption` |
 | `IncludeNetworkResources` | Switch | Forwarded. Also pull the network types no collector reads; left out by default to save time and memory. Network costs still come from the consumption data. A run started without it continues only without it. | False | `-IncludeNetworkResources` |
 | `UseMetricsBatch` | Switch | Forwarded. Collect metrics with the Azure Monitor batch API (up to 50 resources per request); same metrics files. Before collecting, offers once to register `Microsoft.Insights` where it is missing. See [Faster metrics for big tenants](#faster-metrics-for-big-tenants--usemetricsbatch). | False | `-UseMetricsBatch` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
@@ -747,7 +761,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 - `NoRows` and `NoPositiveQuantity` stop the run only when the role check did not confirm the usage permission by both of its answers. A subscription whose roles and Azure's effective permissions both include it passes with a yellow `NoUsage` warning instead (see [Consumption data check](#consumption-data-check-up-front)): typically a new subscription, one with only free resources, or one whose resources are paused. Its consumption sheet is empty.
 - Fix: give the signed-in identity `Microsoft.Commerce/UsageAggregates/read` on each listed subscription, at the subscription or above. The built-in **Reader** and **Billing Reader** roles include it; **Cost Management Reader does not**. Under "Usage permission found by the role check" the run says per subscription whether its roles include it.
 - If the identity already has it, the subscription may be partner-managed (CSP) without cost visibility for this identity, or on an offer the legacy usage API (`Get-UsageAggregates`) does not serve.
-- Or re-run with `-SkipConsumption` to inventory without consumption data.
+- Do not use `-SkipConsumption` to get past this check on a normal run: the report then has no usage rows. See [When to use `-SkipConsumption`](#when-to-use--skipconsumption).
 
 **Consumption sheet empty across many subs:**
 - Usually a broken `Az` PowerShell module install (manifest present, bundled MSAL/Azure.Core assemblies missing or version-mismatched).
@@ -761,7 +775,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 
 **Performance Issues:**
 - Reduce `ConcurrencyLimit` if experiencing timeouts
-- Use `SkipConsumption` to speed up execution. This is not recommended, as it greatly reduces the usefulness of the report.
+- Do not use `SkipConsumption` to speed up a normal run: the report then has no usage rows. See [When to use `-SkipConsumption`](#when-to-use--skipconsumption).
 - Consider targeting specific subscriptions or resource groups
 - For tenants with many subscriptions, use `-ParallelStreams` (see the Cloud Shell sizing table above).
 
