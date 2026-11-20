@@ -151,12 +151,13 @@ Describe 'Diagnostics log: metrics incomplete apart from metrics auth-skipped' {
 
         $AuthAt = [array]::IndexOf($Lines, 'Metrics auth-skipped subscriptions: 1')
         $AuthAt | Should -BeGreaterOrEqual 0
-        $Lines[$AuthAt + 1] | Should -Be "  [sub sub-a] $script:AuthMessage"
+        # No failure text is written: the line holds the subscription's label and the fixed words.
+        $Lines[$AuthAt + 1] | Should -Be '  [sub <guid>] (message not kept)'
         $Lines[$AuthAt + 2] | Should -Be ''
 
         $IncompleteAt = [array]::IndexOf($Lines, 'Metrics incomplete subscriptions: 2')
         $IncompleteAt | Should -BeGreaterOrEqual 0
-        @($Lines[($IncompleteAt + 1)..($IncompleteAt + 2)]) | Should -Be @("  [sub sub-b] $script:IncompleteTwo", "  [sub sub-c] $script:IncompleteOne")
+        @($Lines[($IncompleteAt + 1)..($IncompleteAt + 2)]) | Should -Be @('  [sub <guid>] (message not kept)', '  [sub <guid>] (message not kept)')
     }
 }
 

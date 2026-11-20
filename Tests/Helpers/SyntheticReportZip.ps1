@@ -126,7 +126,10 @@ function Remove-RdaTestReportZip
 
 function New-RdaSyntheticReportZip
 {
-    param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain)
+    # -DroppedRows: the first usage row has a negative quantity, the second an empty
+    # MeterId, and a last one no InstanceData (so an empty ResourceId): rows whose
+    # usage is not counted.
+    param([string]$RepoRoot, [string]$TestsRoot, [switch]$Plain, [switch]$DroppedRows)
 
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ('RdaSyntheticReport_' + $PID + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $Tree = Join-Path $WorkDir 'tree'
@@ -159,7 +162,7 @@ Export-ModuleMember -Function Get-AzMetric
 
     $Harness = Join-Path $WorkDir 'run.ps1'
     @'
-param([string]$Tree, [string]$Out, [string]$Modules, [string]$StandIns, [switch]$Plain)
+param([string]$Tree, [string]$Out, [string]$Modules, [string]$StandIns, [switch]$Plain, [switch]$DroppedRows)
 $PSStyle.OutputRendering = 'PlainText'
 $env:PSModulePath = $Modules + [System.IO.Path]::PathSeparator + $env:PSModulePath
 $Global:RdaSessionInitialized = $true
@@ -202,7 +205,9 @@ $Global:StandInRows = @(
     @{ id = "$Base/Microsoft.Web/serverFarms/plan-demo"; name = 'plan-demo'; type = 'microsoft.web/serverfarms'; kind = 'app'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'; sku = @{ name = 'P1v3'; tier = 'PremiumV3'; capacity = 1 }
         properties = @{ status = 'Ready'; numberOfSites = 1 } }
     @{ id = "$Base/Microsoft.Web/sites/app-demo"; name = 'app-demo'; type = 'microsoft.web/sites'; kind = 'app'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
-        properties = @{ enabled = $true; state = 'Running'; sku = 'PremiumV3'; availabilityState = 'Normal'; containerSize = 0; serverFarmId = "$Base/Microsoft.Web/serverFarms/plan-demo" } }
+        properties = @{ enabled = $true; state = 'Running'; sku = 'PremiumV3'; availabilityState = 'Normal'; containerSize = 0; serverFarmId = "$Base/Microsoft.Web/serverFarms/plan-demo"
+            # As Resource Graph gives it: a container image from the customer's own registry.
+            siteProperties = [ordered]@{ metadata = $null; properties = @([ordered]@{ name = 'LinuxFxVersion'; value = 'DOCKER|contosoregdemo.azurecr.io/teamdemo-api/webdemo:1.2.3' }, [ordered]@{ name = 'WindowsFxVersion'; value = $null }); appSettings = $null } } }
     @{ id = "$Base/Microsoft.Purview/accounts/pview-demo"; name = 'pview-demo'; type = 'microsoft.purview/accounts'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
         properties = @{ sku = @{ name = 'Standard'; capacity = 1 }; createdBy = 'creator-demo'; friendlyName = 'Purview Demo'; createdAt = '2024-03-15T09:41:27Z' } }
     @{ id = "$Base/Microsoft.KeyVault/vaults/kv-demo"; name = 'kv-demo'; type = 'microsoft.keyvault/vaults'; location = 'eastus'; subscriptionId = $SubId; resourceGroup = 'rg-demo'
@@ -275,6 +280,15 @@ $Global:StandInUsage = @(
         UsageStartTime   = [datetime]::SpecifyKind([datetime]'2026-10-01T00:00:00', 'Utc'); UsageEndTime = [datetime]::SpecifyKind([datetime]'2026-10-02T00:00:00', 'Utc')
     }
 }
+if ($DroppedRows)
+{
+    $Global:StandInUsage[0].Quantity = [decimal]-24
+    $Global:StandInUsage[1].MeterId = ''
+    # A last row with no InstanceData: it is written with an empty ResourceId.
+    $NoId = $Global:StandInUsage[2].PSObject.Copy()
+    $NoId.InstanceData = $null
+    $Global:StandInUsage += $NoId
+}
 function global:Invoke-StandInGraph
 {
     $Joined = $args -join ' '
@@ -298,12 +312,15 @@ function global:Get-AzComputeResourceSku
     param($Location)
     [pscustomobject]@{ Name = 'Standard_D2s_v3'; ResourceType = 'virtualMachines'; Capabilities = @([pscustomobject]@{ Name = 'vCPUs'; Value = '2' }, [pscustomobject]@{ Name = 'MemoryGB'; Value = '8' }) }
 }
-function global:Get-UsageAggregates
+function global:Get-AzUsageAggregate
 {
     [CmdletBinding()]
     param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
     [pscustomobject]@{ UsageAggregations = @($Global:StandInUsage | ForEach-Object { [pscustomobject]@{ Properties = $_.PSObject.Copy() } }); ContinuationToken = $null }
 }
+# Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is
+# loaded, and an alias wins over a function: the stand-in is the alias's target.
+function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)
@@ -330,6 +347,7 @@ exit $LASTEXITCODE
     $Pwsh = (Get-Process -Id $PID).Path
     $ArgList = @('-NoProfile', '-NonInteractive', '-File', $Harness, '-Tree', $Tree, '-Out', $Out, '-Modules', (Join-Path $WorkDir 'modules'), '-StandIns', (Join-Path $TestsRoot 'Helpers/AzPsStandIns.ps1'))
     if ($Plain) { $ArgList += '-Plain' }
+    if ($DroppedRows) { $ArgList += '-DroppedRows' }
     $Console = @(& $Pwsh @ArgList 2>&1 | ForEach-Object { [string]$_ })
     $Exit = $LASTEXITCODE
     $Zip = Get-ChildItem -Path $Out -Filter 'ResourcesReport_*.zip' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1

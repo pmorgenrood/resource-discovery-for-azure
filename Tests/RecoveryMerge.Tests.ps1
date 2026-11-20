@@ -147,6 +147,26 @@ Describe 'Merge-RecoveryData inventory splice' {
         @($Merged.VirtualMachines.Name) | Should -Not -Contain 'vm-old'
     }
 
+    It 'splices a FabricCapacities section with its nested Airflow jobs unchanged' {
+        $C = New-Case
+        $Fabric = (New-Record 'capdata01')
+        $Fabric['SKU'] = 'F64'
+        $Fabric['ActiveHours'] = 696
+        $Fabric['AirflowStatus'] = 'Collected'
+        $Fabric['AirflowJobs'] = @([ordered]@{ NodeSize = 'Small'; ShutdownPolicy = 'OneHourInactivity'; MinNodeCount = 5; MaxNodeCount = 7 })
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; FabricCapacities = @($Fabric) })
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+
+        $Merged = Get-Content -Path $Result.OutputInventory -Raw | ConvertFrom-Json
+        @($Merged.FabricCapacities).Count | Should -Be 1
+        $Merged.FabricCapacities[0].AirflowJobs[0].ShutdownPolicy | Should -Be 'OneHourInactivity'
+        $Merged.FabricCapacities[0].AirflowJobs[0].MaxNodeCount | Should -Be 7
+        $Merged.FabricCapacities[0].ActiveHours | Should -Be 696
+        @($Merged.VirtualMachines).Count | Should -Be 1
+    }
+
     It 'returns MergedServiceKeys listing exactly what was spliced' {
         $C = New-Case
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
@@ -398,7 +418,7 @@ Describe 'Merge-RecoveryData consumption handling' {
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
 
-        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
 
         $OutCsv = Join-Path $C.Output ('Consumption_{0}.csv' -f $script:GapBase)
         Test-Path -Path $OutCsv | Should -BeTrue

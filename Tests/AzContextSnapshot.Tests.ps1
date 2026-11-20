@@ -656,14 +656,12 @@ Describe 'Az context snapshot names, owners and files' {
         Set-Content -LiteralPath (Join-Path $Out '.rda-stream-azcontext-live.json') -Value '{}'
         # As on Windows: a wildcard over the folder lists dot-files, in the
         # bundle's own listing and in Compress-Archive -Path alike.
+        # The bundle is written entry by entry from the files this call wrote
+        # (no Compress-Archive over a folder), so whatever a wildcard lists
+        # cannot reach it; the entries below are what is checked.
         Mock Get-ChildItem -ParameterFilter { $Path -eq (Join-Path $Out '*') } -MockWith { Get-ChildItem -LiteralPath $Out -Force }
-        $RealCompress = Get-Command -Name Compress-Archive -Module Microsoft.PowerShell.Archive -CommandType Function, Cmdlet
-        Mock Compress-Archive -ParameterFilter { $DestinationPath -eq ($Out + '.zip') } -MockWith {
-            $Items = if ($LiteralPath) { @($LiteralPath) } else { @(Get-ChildItem -LiteralPath (Split-Path -Path @($Path)[0] -Parent) -Force | ForEach-Object { $_.FullName }) }
-            & $RealCompress -LiteralPath $Items -DestinationPath $DestinationPath -Force
-        }
         $null = New-RdaAllSubHtmlSummaryFromZip -InputZip $Outer -OutputDirectory $Out -KeepOriginalReports -PackageZip
-        Should -Invoke Compress-Archive -ParameterFilter { $DestinationPath -eq ($Out + '.zip') } -Times 1 -Exactly
+        Test-Path -LiteralPath ($Out + '.zip') -PathType Leaf | Should -BeTrue
         $Entries = @(script:Get-ZipEntry -Zip ($Out + '.zip'))
         $Entries | Should -Contain 'MainSummary.html'
         @($Entries | Where-Object { $_ -like 'ResourcesReport_20261030/*' }).Count | Should -BeGreaterThan 0
@@ -950,7 +948,7 @@ Start-Sleep -Seconds 600
         $Fatal.Count | Should -Be 2 -Because ($Result.Text -join ' | ')
         foreach ($Line in $Fatal)
         {
-            $Line | Should -BeLike ('*({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user''s Az profile files. Its subscriptions are reported as failed; run with -ParallelStreams 1 to collect them without stream workers.' -f $Detail)
+            $Line | Should -BeLike ('*({0}), so its Az context snapshot was not imported: importing it would write the token cache to the user''s Az profile files. Its subscriptions are reported as failed and stay on the retry list; the next run that continues this one collects them with one stream, which needs no Az context snapshot.' -f $Detail)
         }
         @($Result.Text | Where-Object { $_ -like '`[stream-?`] stream status: failed-to-start - Az context autosave could not be turned off*' }).Count | Should -Be 2
 
@@ -959,33 +957,32 @@ Start-Sleep -Seconds 600
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
     }
 
-    It 'keeps the subscriptions of a stream that did not load its snapshot on the retry list without counting a failed run, on every -Resume run, until the cause is fixed' {
+    It 'keeps the subscriptions of a stream that did not load its snapshot on the retry list without counting a failed run, and the next -Resume uses one stream, which needs no snapshot, and collects them while the cause stays' {
         $State = Join-Path $script:Root ('.resume-state-{0}.json' -f ([System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(([string]$script:Tenant).Trim().ToLowerInvariant()))).Substring(0, 12).ToLowerInvariant()))
         $Read = {
             $Entries = @((Get-Content -LiteralPath $State -Raw | ConvertFrom-Json).FailedAttempts | Where-Object { $null -ne $_ })
             @($Entries | Sort-Object -Property Id | ForEach-Object { '{0}={1}' -f $_.Id, $_.Attempts })
         }
-        # The cause stays: the first run and the next four -Resume runs (one more
-        # than the retry limit) each fail both streams, collect nothing, exit 2
-        # with the reason, and leave both subscriptions on the retry list at 0.
-        foreach ($Which in 'the first run', '-Resume 1', '-Resume 2', '-Resume 3', '-Resume 4')
-        {
-            $Result = script:Invoke-Wrapper -Streams 2 -Autosave 'stuck' -Resume:($Which -ne 'the first run')
-            $Result.ExitCode | Should -Be 2 -Because ('{0}: {1}' -f $Which, ($Result.Text -join ' | '))
-            @($Result.Text | Where-Object { $_ -like '`[stream-?`] FATAL: Az context autosave could not be turned off for this stream*' }).Count | Should -Be 2 -Because $Which
-            @($Result.Text | Where-Object { $_ -like 'Not retried:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 0 -Because ('{0}: the cause is the stream''s sign-in, not the subscriptions' -f $Which)
-            @($Result.Text | Where-Object { $_ -like 'Not counted toward the retry limit: 2 (Sub A, Sub B) - *' }).Count | Should -Be 1 -Because $Which
-            @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 0 -Because $Which
-            & $Read | Should -Be @('sub-a=0', 'sub-b=0') -Because $Which
-            Write-Host ('{0}: exit {1}, retry list {2}' -f $Which, $Result.ExitCode, ((& $Read) -join ', '))
-        }
-        # The cause fixed: the next -Resume collects both and clears the entries;
-        # the run after it is a clean run.
-        $Fixed = script:Invoke-Wrapper -Streams 2 -Resume
-        $Fixed.ExitCode | Should -Be 0 -Because ($Fixed.Text -join ' | ')
+        # The first run fails both streams, collects nothing, exits 2 with the
+        # reason, and leaves both subscriptions on the retry list at 0.
+        $Result = script:Invoke-Wrapper -Streams 2 -Autosave 'stuck'
+        $Result.ExitCode | Should -Be 2 -Because ($Result.Text -join ' | ')
+        @($Result.Text | Where-Object { $_ -like '`[stream-?`] FATAL: Az context autosave could not be turned off for this stream*' }).Count | Should -Be 2
+        @($Result.Text | Where-Object { $_ -like 'Not retried:*' -or $_ -like 'Retry Limit Reached:*' }).Count | Should -Be 0 -Because 'the cause is the stream''s sign-in, not the subscriptions'
+        @($Result.Text | Where-Object { $_ -like 'Not counted toward the retry limit: 2 (Sub A, Sub B) - *' }).Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 0
+        & $Read | Should -Be @('sub-a=0', 'sub-b=0')
+        # The cause stays, and -Resume asks for two streams again: streams would
+        # fail the same way on every run, and the retry limit never ends a run
+        # that is not counted. So the run uses one stream, which collects in its
+        # own process with no snapshot: it collects both and clears the entries.
+        $Next = script:Invoke-Wrapper -Streams 2 -Autosave 'stuck' -Resume
+        $Next.ExitCode | Should -Be 0 -Because ($Next.Text -join ' | ')
+        @($Next.Text | Where-Object { $_ -like 'Parallelism: -ParallelStreams 1 (the last run''s stream could not load its Az context snapshot for 2 subscription(s) on the retry list, so one stream instead of the 2 passed; this covers all of this run''s subscriptions, also when -ParallelStreams was passed, because one stream needs no snapshot)*' }).Count | Should -Be 1 -Because ($Next.Text -join ' | ')
+        @($Next.Text | Where-Object { $_ -like '*FATAL*' }).Count | Should -Be 0
         @(Get-ChildItem -LiteralPath $script:CaseHome -File -Filter 'collected-*.json').Count | Should -Be 2
         Test-Path -LiteralPath $State | Should -BeFalse -Because 'every subscription is collected, so the resume state is cleared'
-        Write-Host ('cause fixed, -Resume: exit {0}, resume state left: {1}' -f $Fixed.ExitCode, (Test-Path -LiteralPath $State))
+        Write-Host ('cause still there, -Resume: exit {0}, resume state left: {1}' -f $Next.ExitCode, (Test-Path -LiteralPath $State))
         script:Assert-CleanRun -Result (script:Invoke-Wrapper -Streams 2) -Because 'the run after it'
     }
 

@@ -27,7 +27,7 @@ BeforeAll {
     $script:FixedTime = [datetime]::new(2026, 1, 2, 3, 4, 6)
     $script:Sep = [System.IO.Path]::DirectorySeparatorChar
 
-    function New-FixtureFile
+    function Write-FixtureFile
     {
         param([string]$Path, [string]$Content, [datetime]$LastWriteTime = $script:FixedTime)
         [System.IO.File]::WriteAllText($Path, $Content)
@@ -35,7 +35,7 @@ BeforeAll {
     }
 
     # Deterministic, compressible JSON of roughly the shape the collectors write.
-    function New-JsonText
+    function Get-JsonText
     {
         param([int]$Records, [int]$Seed)
         $Builder = [System.Text.StringBuilder]::new()
@@ -52,31 +52,31 @@ BeforeAll {
     # A report folder with the files a run leaves behind, plus the edge cases
     # the *.json wildcard can meet: a hidden file, a directory whose name
     # matches, an empty file and a pre-1980 timestamp.
-    function New-ReportFolder
+    function Initialize-ReportFolder
     {
         param([string]$Root)
         New-Item -ItemType Directory -Path $Root | Out-Null
         $Name = 'ResourcesReport_2026-01-02_03_04'
-        New-FixtureFile (Join-Path $Root "$Name.html") ('<html><body>' + ('<p>report</p>' * 500) + '</body></html>')
-        New-FixtureFile (Join-Path $Root "Consumption_$Name.csv") ("InstanceData,MeterCategory`n" + ('a,b' + "`n") * 300)
-        New-FixtureFile (Join-Path $Root "Diagnostics_$Name.log") 'Phase timings:'
-        New-FixtureFile (Join-Path $Root "Inventory_$Name.json") (New-JsonText -Records 3000 -Seed 1)
-        New-FixtureFile (Join-Path $Root "Metrics_$Name.json") (New-JsonText -Records 2000 -Seed 2)
-        New-FixtureFile (Join-Path $Root "Metrics_${Name}_2.json") (New-JsonText -Records 1500 -Seed 3)
-        New-FixtureFile (Join-Path $Root "Full_$Name.json") (New-JsonText -Records 100 -Seed 4)
-        New-FixtureFile (Join-Path $Root "ObfuscationDictionary_$Name.json") '{"ResourceIdMap":{}}'
-        New-FixtureFile (Join-Path $Root "Heartbeat_$Name.json") '{"Phase":"Done"}'
-        New-FixtureFile (Join-Path $Root "DebugLog_$Name.json") '[]'
-        New-FixtureFile (Join-Path $Root "ErrorLog_$Name.json") '[]'
-        New-FixtureFile (Join-Path $Root "Empty_$Name.json") ''
-        New-FixtureFile (Join-Path $Root "Old_$Name.json") '{"Old":true}' -LastWriteTime ([datetime]::new(1975, 6, 1))
-        New-FixtureFile (Join-Path $Root "PowerShell_Transcript_$Name.txt") 'transcript'
+        Write-FixtureFile (Join-Path $Root "$Name.html") ('<html><body>' + ('<p>report</p>' * 500) + '</body></html>')
+        Write-FixtureFile (Join-Path $Root "Consumption_$Name.csv") ("InstanceData,MeterCategory`n" + ('a,b' + "`n") * 300)
+        Write-FixtureFile (Join-Path $Root "Diagnostics_$Name.log") 'Phase timings:'
+        Write-FixtureFile (Join-Path $Root "Inventory_$Name.json") (Get-JsonText -Records 3000 -Seed 1)
+        Write-FixtureFile (Join-Path $Root "Metrics_$Name.json") (Get-JsonText -Records 2000 -Seed 2)
+        Write-FixtureFile (Join-Path $Root "Metrics_${Name}_2.json") (Get-JsonText -Records 1500 -Seed 3)
+        Write-FixtureFile (Join-Path $Root "Full_$Name.json") (Get-JsonText -Records 100 -Seed 4)
+        Write-FixtureFile (Join-Path $Root "ObfuscationDictionary_$Name.json") '{"ResourceIdMap":{}}'
+        Write-FixtureFile (Join-Path $Root "Heartbeat_$Name.json") '{"Phase":"Done"}'
+        Write-FixtureFile (Join-Path $Root "DebugLog_$Name.json") '[]'
+        Write-FixtureFile (Join-Path $Root "ErrorLog_$Name.json") '[]'
+        Write-FixtureFile (Join-Path $Root "Empty_$Name.json") ''
+        Write-FixtureFile (Join-Path $Root "Old_$Name.json") '{"Old":true}' -LastWriteTime ([datetime]::new(1975, 6, 1))
+        Write-FixtureFile (Join-Path $Root "PowerShell_Transcript_$Name.txt") 'transcript'
         $Hidden = Join-Path $Root ".hidden_$Name.json"
-        New-FixtureFile $Hidden '{"Hidden":true}'
+        Write-FixtureFile $Hidden '{"Hidden":true}'
         if ($IsWindows) { [System.IO.File]::SetAttributes($Hidden, [System.IO.FileAttributes]::Hidden) }
         $Folder = Join-Path $Root 'Folder.json'
         New-Item -ItemType Directory -Path (Join-Path $Folder 'EmptySub') -Force | Out-Null
-        New-FixtureFile (Join-Path $Folder 'inner.txt') 'inner'
+        Write-FixtureFile (Join-Path $Folder 'inner.txt') 'inner'
     }
 
     # One row per entry, in archive order. An empty-folder entry has no source
@@ -143,7 +143,7 @@ BeforeAll {
     }
 
     $script:ReportDir = Join-Path $TestDrive 'report'
-    New-ReportFolder -Root $script:ReportDir
+    Initialize-ReportFolder -Root $script:ReportDir
     $script:ReportName = 'ResourcesReport_2026-01-02_03_04'
     $script:DefaultPath = $script:ReportDir + $script:Sep
     $script:HtmlFile = $script:DefaultPath + $script:ReportName + '.html'
@@ -249,10 +249,10 @@ Describe 'Compress-RdaReportArchive failure handling' {
     It 'leaves no zip at the final name and no temporary file when it fails part-way' {
         $Root = Join-Path $TestDrive 'failing'
         New-Item -ItemType Directory -Path $Root | Out-Null
-        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 2000 -Seed 8)
-        New-FixtureFile (Join-Path $Root 'b.json') (New-JsonText -Records 2000 -Seed 9)
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 2000 -Seed 8)
+        Write-FixtureFile (Join-Path $Root 'b.json') (Get-JsonText -Records 2000 -Seed 9)
         $Locked = Join-Path $Root 'z.json'
-        New-FixtureFile $Locked '{}'
+        Write-FixtureFile $Locked '{}'
         $Paths = @((Join-Path $Root 'a.json'), (Join-Path $Root 'b.json'), $Locked)
         $Before = Get-FolderListing $Root
 
@@ -293,7 +293,7 @@ Describe 'Compress-RdaReportArchive failure handling' {
     It 'fails when the destination already exists and leaves that file untouched' {
         $Root = Join-Path $TestDrive 'exists'
         New-Item -ItemType Directory -Path $Root | Out-Null
-        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 20 -Seed 10)
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 20 -Seed 10)
         $Destination = Join-Path $Root 'report.zip'
         [System.IO.File]::WriteAllBytes($Destination, [byte[]](1, 2, 3, 4))
         $Before = Get-FolderListing $Root
@@ -316,13 +316,113 @@ Describe 'Compress-RdaReportArchive failure handling' {
         [System.IO.File]::ReadAllBytes($Destination) | Should -Be @(1, 2, 3, 4)
         Get-FolderListing $Root | Should -Be $Before
     }
+
+    # A folder it cannot list must stop the zip, as Compress-Archive does: a zip made
+    # without that folder's files would be named as the run's report. Unix file modes
+    # only; root can read any folder.
+    It 'fails on a folder input it cannot read and leaves no zip and no temporary file' -Skip:($IsWindows -or [Environment]::UserName -eq 'root') {
+        $Root = Join-Path $TestDrive 'unreadable-dir'
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 20 -Seed 11)
+        $Closed = Join-Path $Root 'closed.json'
+        New-Item -ItemType Directory -Path $Closed | Out-Null
+        Write-FixtureFile (Join-Path $Closed 'inner.json') '{}'
+        $Destination = Join-Path $Root 'report.zip'
+        [System.IO.File]::SetUnixFileMode($Closed, [System.IO.UnixFileMode]::None)
+        try
+        {
+            $Before = Get-FolderListing $Root
+            $Caught = & {
+                $ErrorActionPreference = 'SilentlyContinue'
+                try
+                {
+                    Compress-RdaReportArchive -Path (Join-Path $Root 'a.json'), $Closed -CompressionLevel Fastest -DestinationPath $Destination -ErrorAction Stop 2>$null
+                    'not caught'
+                }
+                catch
+                {
+                    $_.Exception.Message
+                }
+            }
+            $Caught | Should -Not -Be 'not caught'
+            $Caught | Should -BeLike '*closed.json*'
+            Test-Path -LiteralPath $Destination | Should -BeFalse
+            Get-FolderListing $Root | Should -Be $Before
+        }
+        finally
+        {
+            [System.IO.File]::SetUnixFileMode($Closed, [System.IO.UnixFileMode]'UserRead, UserWrite, UserExecute')
+        }
+    }
+
+    It 'warns with the temporary file''s path when it cannot remove it after a failure' {
+        $Root = Join-Path $TestDrive 'cleanup-fails'
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 200 -Seed 12)
+        $Locked = Join-Path $Root 'z.json'
+        Write-FixtureFile $Locked '{}'
+        $Destination = Join-Path $Root 'report.zip'
+        # The removal does nothing, as when the file is locked or the folder is read-only.
+        Mock Remove-Item { }
+
+        $Hold = [System.IO.File]::Open($Locked, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try
+        {
+            $Warnings = $null
+            $Caught = try
+            {
+                Compress-RdaReportArchive -Path (Join-Path $Root 'a.json'), $Locked -CompressionLevel Fastest -DestinationPath $Destination -WarningVariable Warnings -WarningAction SilentlyContinue
+                'not caught'
+            }
+            catch
+            {
+                $_.Exception.Message
+            }
+        }
+        finally
+        {
+            $Hold.Dispose()
+        }
+        $Caught | Should -BeLike '*z.json*'
+        $Left = @(Get-ChildItem -LiteralPath $Root -Force -Filter '.rda-*.partial')
+        $Left.Count | Should -Be 1 -Because 'the stand-in removal left the temporary file'
+        @($Warnings | Where-Object { $null -ne $_ }).Count | Should -Be 1
+        [string]$Warnings[0] | Should -BeLike ('*{0}*delete it by hand*' -f $Left[0].FullName)
+        Test-Path -LiteralPath $Destination | Should -BeFalse
+    }
+
+    # Moving the zip to the final name is the last step that can fail: once it is there,
+    # nothing after it may turn a finished zip into a failed call.
+    It 'succeeds once the zip is at the final name, even when a later temp-file check would fail' {
+        $Root = Join-Path $TestDrive 'after-move'
+        New-Item -ItemType Directory -Path $Root | Out-Null
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 20 -Seed 13)
+        $Destination = Join-Path $Root 'report.zip'
+        Mock Test-Path { throw 'stand-in: the temp-file check failed' } -ParameterFilter { "$LiteralPath" -like '*.rda-*.partial' }
+
+        $Caught = & {
+            $ErrorActionPreference = 'SilentlyContinue'
+            try
+            {
+                Compress-RdaReportArchive -Path (Join-Path $Root 'a.json') -CompressionLevel Fastest -DestinationPath $Destination -ErrorAction Stop
+                'not caught'
+            }
+            catch
+            {
+                $_.Exception.Message
+            }
+        }
+        $Caught | Should -Be 'not caught'
+        Test-Path -LiteralPath $Destination | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $Root -Force -Filter '.rda-*.partial').Count | Should -Be 0
+    }
 }
 
 Describe 'Compress-RdaReportArchive with a long destination file name' {
     # Most Linux and Windows file systems allow 255 characters per file name.
     # The temporary file must fit wherever the final name fits.
     BeforeAll {
-        function New-LongZipName
+        function Get-LongZipName
         {
             param([int]$Length)
             $Prefix = 'ResourcesReport_2026-01-02_03_04_'
@@ -333,9 +433,9 @@ Describe 'Compress-RdaReportArchive with a long destination file name' {
     It 'writes a zip whose file name is <Length> characters' -ForEach @(@{ Length = 223 }, @{ Length = 250 }) {
         $Root = Join-Path $TestDrive "long-$Length"
         New-Item -ItemType Directory -Path $Root | Out-Null
-        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 200 -Seed 11)
-        New-FixtureFile (Join-Path $Root 'b.json') (New-JsonText -Records 100 -Seed 12)
-        $Name = New-LongZipName -Length $Length
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 200 -Seed 11)
+        Write-FixtureFile (Join-Path $Root 'b.json') (Get-JsonText -Records 100 -Seed 12)
+        $Name = Get-LongZipName -Length $Length
         $Name.Length | Should -Be $Length
         $Destination = Join-Path $Root $Name
 
@@ -354,12 +454,12 @@ Describe 'Compress-RdaReportArchive with a long destination file name' {
     It 'leaves no zip at the final name and no temporary file when it fails part-way with a 250-character name' {
         $Root = Join-Path $TestDrive 'long-failing'
         New-Item -ItemType Directory -Path $Root | Out-Null
-        New-FixtureFile (Join-Path $Root 'a.json') (New-JsonText -Records 2000 -Seed 13)
+        Write-FixtureFile (Join-Path $Root 'a.json') (Get-JsonText -Records 2000 -Seed 13)
         $Locked = Join-Path $Root 'z.json'
-        New-FixtureFile $Locked '{}'
+        Write-FixtureFile $Locked '{}'
         $Paths = @((Join-Path $Root 'a.json'), $Locked)
         $Before = Get-FolderListing $Root
-        $Destination = Join-Path $Root (New-LongZipName -Length 250)
+        $Destination = Join-Path $Root (Get-LongZipName -Length 250)
 
         # z.json is held open without sharing, so the failure comes after
         # a.json has been written to the temporary archive.
@@ -397,7 +497,6 @@ Describe 'ResourceInventory.ps1 report packaging' {
         @($Commands | Where-Object { $_.GetCommandName() -eq 'Compress-Archive' }).Count | Should -Be 0
         $Calls = @($Commands | Where-Object { $_.GetCommandName() -eq 'Compress-RdaReportArchive' })
         $Calls.Count | Should -Be 1
-        # -ErrorAction Stop: the zip step's catch must see any error (inventory-write fix).
         $Calls[0].Extent.Text | Should -Be 'Compress-RdaReportArchive @CompressionOutput -ErrorAction Stop'
     }
 }

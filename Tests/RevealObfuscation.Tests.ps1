@@ -47,6 +47,7 @@ BeforeAll {
     $script:TokRgCase = 'prod_' + [guid]::NewGuid().ToString()
     $script:TokTag = 'prod_' + [guid]::NewGuid().ToString()
     $script:TokFree = 'prod_' + [guid]::NewGuid().ToString()
+    $script:TokFabName = 'prod_' + [guid]::NewGuid().ToString()
 
     # Real values behind the tokens. Subscription name deliberately contains a
     # comma and an ampersand to exercise CSV quoting and HTML encoding.
@@ -60,12 +61,13 @@ BeforeAll {
     $IdVm = "$Base/$($script:RealRgName)/providers/Microsoft.Compute/virtualMachines/vm01"
     $IdAks = "$Base/$($script:RealRgAks)/providers/Microsoft.Compute/virtualMachines/aksnode0"
     $IdCase = "$Base/$($script:RealRgCase)/providers/Microsoft.Storage/storageAccounts/sa01"
+    $script:IdFabric = "$Base/$($script:RealRgName)/providers/Microsoft.Fabric/capacities/capdata01"
 
     # ---- Dictionary fixture (current shape: has SubscriptionNameMap + TagMap) ----
     $Dict = [ordered]@{
         GeneratedAt         = '2026-06-30 00:00:00'
         ResourceIdMap       = [ordered]@{ $script:TokId = $IdVm }
-        ResourceNameMap     = [ordered]@{ $script:TokName = $IdVm }
+        ResourceNameMap     = [ordered]@{ $script:TokName = $IdVm; $script:TokFabName = $script:IdFabric }
         SubscriptionMap     = [ordered]@{ $script:TokSub = $IdVm }
         ResourceGroupMap    = [ordered]@{
             $script:TokRg     = $IdVm
@@ -103,6 +105,21 @@ BeforeAll {
                 Name          = $script:TokName
                 Subscription  = $script:TokSub
                 ResourceGroup = $script:TokRgCase
+            }
+        )
+        # A Microsoft Fabric capacity row: its nested AirflowJobs hold only fixed words and numbers.
+        FabricCapacities = @(
+            [ordered]@{
+                # An ARM-shaped masked id, as -Obfuscate writes it (the contract's shape): token parts in a real path.
+                ID            = "/subscriptions/$($script:TokSub)/resourcegroups/$($script:TokRg)/providers/microsoft.fabric/capacities/$($script:TokFabName)"
+                Name          = $script:TokFabName
+                Subscription  = $script:TokSub
+                ResourceGroup = $script:TokRg
+                Location      = 'northeurope'
+                SKU           = 'F64'
+                ActiveHours   = 696
+                AirflowStatus = 'Collected'
+                AirflowJobs   = @( [ordered]@{ NodeSize = 'Large'; ShutdownPolicy = 'AlwaysOn'; MinNodeCount = 5; MaxNodeCount = 5 } )
             }
         )
     }
@@ -305,6 +322,22 @@ Describe "Reveal-Obfuscation -All full reveal" {
     It "leaves the lossy 'obfuscated' sentinel untouched (not recoverable)" {
         $script:RA.Inventory.VirtualMachines[0].Set | Should -Be 'obfuscated'
     }
+
+    It "reveals a Fabric capacity row and keeps its Airflow jobs as written" {
+        $Row = $script:RA.Inventory.FabricCapacities[0]
+        # Every token of the masked path is revealed. The subscription part is not checked here: on awslabs main
+        # Reveal writes the subscription's display name there (pre-existing, the same for every section's id).
+        $Row.ID | Should -Match ('(?i)^/subscriptions/[^/]+/resourcegroups/{0}/providers/microsoft\.fabric/capacities/capdata01$' -f [regex]::Escape($script:RealRgName))
+        $Row.ID | Should -Not -Match '(?:prod|nonprod)_[0-9a-f]{8}-'
+        $Row.Name | Should -Be 'capdata01'
+        $Row.ResourceGroup | Should -Be $script:RealRgName
+        $Row.Subscription | Should -Be $script:RealSubName
+        $Row.SKU | Should -Be 'F64'
+        $Row.ActiveHours | Should -Be 696
+        $Row.AirflowJobs[0].NodeSize | Should -Be 'Large'
+        $Row.AirflowJobs[0].MinNodeCount | Should -BeOfType [long]
+        $Row.AirflowJobs[0].MinNodeCount | Should -Be 5
+    }
 }
 
 Describe "Reveal-Obfuscation -Fields FreeText" {
@@ -357,6 +390,40 @@ Describe "Reveal-Obfuscation older / partial dictionaries" {
 
         $R = Invoke-Reveal -DictPath $LegacyDict
         $R.Inventory.VirtualMachines[0].Subscription | Should -Be '12345678-1234-1234-1234-123456789012'
+    }
+
+    It "reveals the name of a collector row with no id without its stand-in suffix" {
+        # A row with no id is filed under a stand-in path whose last segment is <name>~<hash>.
+        $NoIdDir = Join-Path $script:TmpDir ("noid_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $NoIdDir -Force | Out-Null
+        $NoIdDict = Join-Path $NoIdDir 'ObfuscationDictionary_NoId.json'
+        [ordered]@{
+            GeneratedAt     = '2026-06-30 00:00:00'
+            ResourceNameMap = [ordered]@{ $script:TokName = "/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-app/providers/rda.noid/virtualmachines/vm01~0a1b2c3d" }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $NoIdDict -Encoding utf8
+
+        $R = Invoke-Reveal -Fields @('ResourceName') -DictPath $NoIdDict
+        $R.Inventory.VirtualMachines[0].Name | Should -Be 'vm01'
+    }
+
+    It "reveals a no-id row's name whose stand-in carries a second-row count, and leaves a row with no name masked" {
+        $NoIdDir = Join-Path $script:TmpDir ("noid2_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $NoIdDir -Force | Out-Null
+        $NoIdDict = Join-Path $NoIdDir 'ObfuscationDictionary_NoId2.json'
+        [ordered]@{
+            GeneratedAt     = '2026-06-30 00:00:00'
+            ResourceNameMap = [ordered]@{ $script:TokName = "/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-app/providers/rda.noid/virtualmachines/vm01~0a1b2c3d-2" }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $NoIdDict -Encoding utf8
+        $R = Invoke-Reveal -Fields @('ResourceName') -DictPath $NoIdDict
+        $R.Inventory.VirtualMachines[0].Name | Should -Be 'vm01'
+
+        $NoNameDict = Join-Path $NoIdDir 'ObfuscationDictionary_NoName.json'
+        [ordered]@{
+            GeneratedAt     = '2026-06-30 00:00:00'
+            ResourceNameMap = [ordered]@{ $script:TokName = "/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-app/providers/rda.noid/virtualmachines/~noname~0a1b2c3d" }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $NoNameDict -Encoding utf8
+        $R = Invoke-Reveal -Fields @('ResourceName') -DictPath $NoNameDict
+        $R.Inventory.VirtualMachines[0].Name | Should -Be $script:TokName
     }
 
     It "leaves tag values masked when -Fields Tag is requested but the dictionary has no TagMap" {

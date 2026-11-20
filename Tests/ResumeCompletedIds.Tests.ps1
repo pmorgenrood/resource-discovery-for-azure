@@ -125,7 +125,11 @@ $Global:LASTEXITCODE = 0
     $script:SequentialRun = [scriptblock]::Create($Prelude + '. ' + $SeqText)
     # The fallback takes the pending list, which the wrapper builds just before it.
     $script:FallbackRun = [scriptblock]::Create($Prelude + "`$PendingSubscriptions = @(`$Subscriptions)`n" + $OneText)
-    $script:StreamMergeRun = [scriptblock]::Create($Prelude + $MergeText)
+    # The streams write their per-stream state files after the startup has run
+    # (a run without -Resume removes the ones an earlier run left there, after
+    # merging their retry entries), so the case writes them in between:
+    # $Global:RdaIdsTestStreamsRun stands for this run's streams.
+    $script:StreamMergeRun = [scriptblock]::Create($Prelude + "& `$Global:RdaIdsTestStreamsRun`n" + $MergeText)
 
     # Run one lifted block against a case folder. Returns the host lines it
     # printed and the names of the subscriptions the stand-in processed.
@@ -185,7 +189,7 @@ $Global:LASTEXITCODE = 0
 }
 
 AfterAll {
-    Remove-Variable -Name RdaIdsTestProcessed, RdaIdsTestRoot -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name RdaIdsTestProcessed, RdaIdsTestRoot, RdaIdsTestStreamsRun -Scope Global -ErrorAction SilentlyContinue
     if ($script:TestBase -and (Test-Path $script:TestBase)) { Remove-Item -Path $script:TestBase -Recurse -Force }
 }
 
@@ -263,8 +267,15 @@ Describe 'Other places that add to the completed list, starting from one earlier
     }
 
     It 'the end-of-run merge of per-stream state adds each stream''s ids separately' {
-        script:Save-TestStreamState -Root $script:Root -StreamId 0 -Subs @($script:B)
-        script:Save-TestStreamState -Root $script:Root -StreamId 1 -Subs @($script:C)
+        # This run's two streams, each writing its state file after the startup.
+        $Root = $script:Root
+        $B = $script:B
+        $C = $script:C
+        $Save = ${function:script:Save-TestStreamState}
+        $Global:RdaIdsTestStreamsRun = {
+            & $Save -Root $Root -StreamId 0 -Subs @($B)
+            & $Save -Root $Root -StreamId 1 -Subs @($C)
+        }.GetNewClosure()
         $null = script:Invoke-Wrapper -Block $script:StreamMergeRun -Root $script:Root -Subs $script:All
         script:Get-StateIds -Root $script:Root | Should -Be '3 id(s): Sub A, Sub B, Sub C'
         # The merge deletes the per-stream files it merged once the resume state

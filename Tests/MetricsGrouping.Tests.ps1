@@ -9,13 +9,15 @@
 #   - a metric requested with the 'Count' aggregation is read from each data
 #     point's Count, not from the number of data points;
 #   - a group that Azure rejects with BadRequest is not retried and falls back to
-#     one call per metric, so only the invalid metric is marked as an error;
+#     one call per metric, so only the invalid metric is marked as an error,
+#     also when its message holds '429' inside an id;
 #   - a group that fails for another reason (throttling, server error) is retried
 #     and does not fall back to one call per metric;
 #   - a request, grouped or for one metric, that still fails after its retries
 #     for a reason other than BadRequest makes its subscription metrics
 #     incomplete, and each subscription's entry counts its own failed resources;
 #   - one call never asks for more than 20 metric names;
+#   - a run with no metric definitions makes no call and writes no file;
 #   - the diagnostics summary counts metric definitions, not calls;
 #   - each metric's diagnostics time is the time of the request that answered it;
 #   - a batch written to Metrics_*.json never splits one call's metrics, and
@@ -99,6 +101,7 @@ function Get-AzMetric
     {
         'BadRequest' { throw "Operation returned an invalid status code 'BadRequest'" }
         'Status400' { throw [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest) }
+        'Status400With429' { throw [System.Net.Http.HttpRequestException]::new('Metric is not supported for resource 7f3a4290-1c2d-4e5f-8a9b-0c1d2e3f4a5b.', $null, [System.Net.HttpStatusCode]::BadRequest) }
         'Status500Wrapping400' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The request was rejected.', $null, [System.Net.HttpStatusCode]::BadRequest), [System.Net.HttpStatusCode]::InternalServerError) }
         'Status500Wrapping503' { throw [System.Net.Http.HttpRequestException]::new('The server failed.', [System.Net.Http.HttpRequestException]::new('The service is unavailable.', $null, [System.Net.HttpStatusCode]::ServiceUnavailable), [System.Net.HttpStatusCode]::InternalServerError) }
         'ServerError' { throw "Operation returned an invalid status code 'InternalServerError'" }
@@ -300,6 +303,16 @@ Describe 'Metrics.ps1 Azure Monitor requests per resource' {
         $Run.Records.Count | Should -Be 2
     }
 
+    It 'does not retry a one-definition request that Azure rejects with BadRequest' {
+        $Vm = New-TestResource -Type 'microsoft.compute/virtualmachines' -Provider 'Microsoft.Compute/virtualMachines' -Name 'vm-01'
+        $Run = Invoke-MetricsRun -Resources @($Vm) -RunName 'vm-single-badrequest' -Invalid 'vm-01|Percentage CPU'
+
+        # The same name is rejected the same way on every attempt, so it is asked for once.
+        @($Run.Calls | Where-Object { @($_.MetricName) -contains 'Percentage CPU' }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName) -contains 'Available Memory Bytes' }).Count | Should -Be 1
+        @($Run.Records | Where-Object { $_.MetricError } | ForEach-Object { $_.Metric }) | Should -Be @('Percentage CPU')
+    }
+
     It 'groups SQL database metrics by time window, time grain and aggregation' {
         $Dtu = New-TestResource -Type 'microsoft.sql/servers/databases' -Provider 'Microsoft.Sql/servers/sql-test/databases' -Name 'db-dtu' -Kind 'v12.0,user'
         $Serverless = New-TestResource -Type 'microsoft.sql/servers/databases' -Provider 'Microsoft.Sql/servers/sql-test/databases' -Name 'db-serverless' -Kind 'v12.0,user,vcore,serverless'
@@ -476,13 +489,29 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         $Single = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 1 })
         $Grouped = @($script:Rejected.Calls | Where-Object { @($_.MetricName).Count -eq 4 })
         $Grouped.Count | Should -Be 1
-        # A single-metric request keeps the full retry ladder (4 attempts), BadRequest included.
-        @($Single | Where-Object { $_.MetricName -eq 'Composite Disk Write Bytes/sec' }).Count | Should -Be 4
+        # A single-metric request that Azure rejects with BadRequest is not retried either:
+        # the same name is rejected the same way on every attempt.
+        @($Single | Where-Object { $_.MetricName -eq 'Composite Disk Write Bytes/sec' }).Count | Should -Be 1
         @($Single | Where-Object { $_.MetricName -ne 'Composite Disk Write Bytes/sec' }).Count | Should -Be 3
     }
 
     It 'recognises BadRequest from the status code when the message does not name it' {
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-status400' -MultiError 'Status400'
+
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
+        @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
+        $CleanMap = ConvertTo-RecordMap -Records $script:Clean.Records
+        $RunMap = ConvertTo-RecordMap -Records $Run.Records
+        @($RunMap.Keys | Sort-Object) | Should -Be @($CleanMap.Keys | Sort-Object)
+        foreach ($Key in $CleanMap.Keys)
+        {
+            $RunMap[$Key] | Should -Be $CleanMap[$Key]
+        }
+    }
+
+    It 'falls back per metric when a grouped BadRequest message holds 429 inside an id' {
+        # The 400 names no throttling; '429' is only part of a GUID in its message.
+        $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'fallback-status400-429' -MultiError 'Status400With429'
 
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 4 }).Count | Should -Be 1
         @($Run.Calls | Where-Object { @($_.MetricName).Count -eq 1 }).Count | Should -Be 4
@@ -554,6 +583,10 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         @($script:Clean.DebugLines | Where-Object { $_ -match '\[Metrics\] Metric definitions: 4 \| Success: 4 \| Timeout: 0 \| Throttled: 0 \| Error: 0 \| Elapsed: ' }).Count | Should -Be 1
         @($script:Rejected.DebugLines | Where-Object { $_ -match '\[Metrics\] Metric definitions: 4 \| Success: 3 \| Timeout: 0 \| Throttled: 0 \| Error: 1 \| Elapsed: ' }).Count | Should -Be 1
         @($script:Clean.DebugLines + $script:Rejected.DebugLines | Where-Object { $_ -match 'Total calls:' }).Count | Should -Be 0
+        # The lists under the outcome line are per metric definition too.
+        @($script:Rejected.DebugLines | Where-Object { $_ -match '\[Metrics\] Non-success metric definitions \(where it got stuck\):$' }).Count | Should -Be 1
+        @($script:Clean.DebugLines | Where-Object { $_ -match '\[Metrics\] Slowest 5 metric definitions:$' }).Count | Should -Be 1
+        @($script:Clean.DebugLines + $script:Rejected.DebugLines | Where-Object { $_ -match 'Non-success calls|Slowest 5 calls' }).Count | Should -Be 0
     }
 
     It 'reports the number of Azure Monitor requests in the diagnostics summary' {
@@ -581,7 +614,7 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         $Omitted = 'Composite Disk Write Operations/sec'
         $Run = Invoke-MetricsRun -Resources @($script:Disk) -RunName 'elapsed-omitted' -Omit $Omitted -SingleDelayMs 1500
 
-        # 'Slowest 5 calls' lists every record of this four-metric run with its time.
+        # 'Slowest 5 metric definitions' lists every record of this four-metric run with its time.
         $Elapsed = @{}
         foreach ($Name in $script:DiskMetricNames)
         {
@@ -596,6 +629,20 @@ Describe 'Metrics.ps1 fallback when Azure rejects a grouped request' {
         $Answered = @($script:DiskMetricNames | Where-Object { $_ -ne $Omitted } | ForEach-Object { $Elapsed[$_] })
         @($Answered | Select-Object -Unique).Count | Should -Be 1 -Because 'metrics answered by one request report that request''s time'
         $Elapsed[$Omitted] | Should -BeGreaterOrEqual ($Answered[0] + 1.49) -Because 'a fallback metric reports the group request plus its own request'
+    }
+}
+
+Describe 'Metrics.ps1 with no metric definitions' {
+
+    It 'makes no Get-AzMetric call and writes no Metrics file when no resource has metrics' {
+        # A storage account has no metric definitions in Metrics.ps1.
+        $Storage = New-TestResource -Type 'microsoft.storage/storageaccounts' -Provider 'Microsoft.Storage/storageAccounts' -Name 'st01'
+        $Run = Invoke-MetricsRun -Resources @($Storage) -RunName 'no-definitions'
+
+        $Run.Calls.Count | Should -Be 0
+        $Run.Files.Count | Should -Be 0
+        @($Run.DebugLines | Where-Object { $_ -match 'Starting metrics collection: 0 metric definition\(s\)' }).Count | Should -Be 1
+        @($Run.DebugLines | Where-Object { $_ -match 'Azure Monitor requests: 0 for 0 metric definition\(s\), of which 0 single-metric fallback request\(s\)' }).Count | Should -Be 1
     }
 }
 
@@ -765,8 +812,8 @@ Describe 'Metrics.ps1 subscriptions whose single-metric request still fails afte
         $Run = Invoke-MetricsRun -Resources @($script:IncompleteVm) -RunName 'single-badrequest' -SingleError 'BadRequest'
 
         @($Global:MetricsFailedSubs).Count | Should -Be 0
-        # The retries are unchanged: 4 attempts for each of the 2 metrics.
-        $Run.Calls.Count | Should -Be 8
+        # A BadRequest is not retried: 1 attempt for each of the 2 metrics.
+        $Run.Calls.Count | Should -Be 2
         @($Run.Records | Where-Object { $_.MetricError }).Count | Should -Be 2
     }
 

@@ -237,6 +237,7 @@ Describe 'The parallel wrapper waits for every stream job to finish' -Skip:$IsWi
         script:Get-NoSummaryLines $Run | Should -BeLike '`[stream-0`] WARNING: no summary file at *'
         # The job line names the stream, as the [stream-N] lines around it do.
         @($Run.Text | Where-Object { $_ -like '`[stream-*`] job ended in state *' }) | Should -Be @('[stream-0] job ended in state Failed')
-        @($Run.Text | Where-Object { $_ -like 'Subscriptions Failed:*stream-0 (no summary)*' }) | Should -HaveCount 1
+        # A stream with no summary is named as not confirmed, not as failed (#66).
+        @($Run.Text | Where-Object { $_ -like 'Stream Summary Missing:*stream-0 (2 subscription(s) not confirmed;*' }) | Should -HaveCount 1
     }
 }

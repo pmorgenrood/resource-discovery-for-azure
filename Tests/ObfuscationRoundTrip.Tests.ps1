@@ -111,12 +111,15 @@ function global:Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ I
 function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $Context) $null }
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
-function global:Get-UsageAggregates
+function global:Get-AzUsageAggregate
 {
     [CmdletBinding()]
     param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken)
     [pscustomobject]@{ UsageAggregations = @($Global:StandInUsage | ForEach-Object { [pscustomobject]@{ Properties = $_.PSObject.Copy() } }); ContinuationToken = $null }
 }
+# Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is
+# loaded, and an alias wins over a function: the stand-in is the alias's target.
+function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)

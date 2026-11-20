@@ -48,6 +48,10 @@ BeforeAll {
         }, $true) | Select-Object -First 1
     if ($null -eq $ConsumptionFn) { throw 'GetResorceConsumption was not found in ResourceInventory.ps1. Has it been renamed or removed?' }
     $script:ConsumptionFunctionText = $ConsumptionFn.Extent.Text
+    # Get-ReportFolderName, which the lifted function calls for the folder name.
+    $ReportFolderFn = @($Ast.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Get-ReportFolderName' }, $true))
+    if ($ReportFolderFn.Count -ne 1) { throw 'Get-ReportFolderName was not found in ResourceInventory.ps1.' }
+    $script:ConsumptionFunctionText = $ReportFolderFn[0].Extent.Text + "`n" + $script:ConsumptionFunctionText
 
     # Shims for Mock to intercept (see file header).
     function Set-AzContext

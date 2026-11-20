@@ -251,3 +251,48 @@ Describe 'Runs for two tenants at the same time in one inventory folder, two str
         $A.MainSummary | Should -Match ([regex]::Escape('2 subscription(s) in this run (2 visible to the tenant), 2 report(s) in this zip.'))
     }
 }
+
+Describe 'Runs for two tenants at the same time in one inventory folder, one stream summary of the first run cannot be read' -Skip:$IsWindows {
+    BeforeAll {
+        $script:CaseHome = Join-Path $script:TestBase ('case-' + [guid]::NewGuid().ToString().Substring(0, 8))
+        New-Item -ItemType Directory -Path $script:CaseHome -Force | Out-Null
+        $script:Root = Join-Path $script:CaseHome 'InventoryReports'
+        $ScenarioA = Join-Path $script:CaseHome 'scenario-a.json'
+        $ScenarioB = Join-Path $script:CaseHome 'scenario-b.json'
+        # As above: A's second subscription is held while B runs to its end.
+        # Then A's first stream summary is cut short, so A cannot name that
+        # stream's zips by its success rows, and A is released.
+        $Held = $script:SubsA[1].Id
+        script:Write-Scenario -Path $ScenarioA -Tenant $script:TenantA -Subs $script:SubsA -Hold @($Held)
+        script:Write-Scenario -Path $ScenarioB -Tenant $script:TenantB -Subs $script:SubsB
+        $RunA = script:Start-Run -Tenant $script:TenantA -Scenario $ScenarioA
+        script:Wait-File -Path (Join-Path $script:CaseHome ('held-' + $Held))
+        Start-Sleep -Seconds 4
+        $Before = @(Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $script:B = script:Wait-Run -Run (script:Start-Run -Tenant $script:TenantB -Scenario $ScenarioB)
+        $script:BundleB = @(Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File | Where-Object { $Before -notcontains $_.FullName } | ForEach-Object { $_.FullName })
+        # B has ended and removed its own summaries, so A's first stream's is the only one.
+        $script:CutSummaries = @(Get-ChildItem -LiteralPath $script:Root -Filter '.rda-stream-*-0-summary.json' -File -Force)
+        foreach ($Summary in $script:CutSummaries) { Set-Content -LiteralPath $Summary.FullName -Value '{"RunId":' -Encoding utf8 }
+        Set-Content -LiteralPath (Join-Path $script:CaseHome ('release-' + $Held)) -Value 'go'
+        $script:A = script:Wait-Run -Run $RunA
+        $script:BundleA = @(Get-ChildItem -LiteralPath $script:Root -Filter 'AllSubscriptions_*.zip' -File | Where-Object { $Before -notcontains $_.FullName -and $script:BundleB -notcontains $_.FullName } | ForEach-Object { $_.FullName })
+    }
+
+    It 'the first run reads its first stream summary as not readable and ends with exit 2' {
+        $script:CutSummaries.Count | Should -Be 1
+        $script:B.ExitCode | Should -Be 0 -Because ($script:B.Text -join "`n")
+        @($script:A.Text | Where-Object { $_ -match 'could not parse summary file' }) | Should -Not -BeNullOrEmpty -Because ($script:A.Text -join "`n")
+        $script:A.ExitCode | Should -Be 2 -Because ($script:A.Text -join "`n")
+    }
+
+    It 'the first run''s consolidated zip holds its own reports, from its records, and none of the other tenant''s' {
+        $script:BundleA.Count | Should -Be 1 -Because ($script:A.Text -join "`n")
+        $script:BundleB.Count | Should -Be 1
+        $A = script:Read-Bundle -Path $script:BundleA[0]
+        $B = script:Read-Bundle -Path $script:BundleB[0]
+        $A.Ids | Should -Be @($script:SubsA.Id | Sort-Object) -Because ($script:A.Text -join "`n")
+        $B.Ids | Should -Be @($script:SubsB.Id | Sort-Object)
+        foreach ($Sub in $script:SubsB) { $A.MainSummary | Should -Not -Match ([regex]::Escape($Sub.Id)) }
+    }
+}

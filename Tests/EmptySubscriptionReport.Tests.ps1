@@ -63,7 +63,9 @@ function global:Set-AzContext { [CmdletBinding()] param($Subscription, $Scope, $
 function global:Connect-AzAccount { throw 'no sign-in in this harness' }
 function global:Get-AzAccessToken { param($ResourceUrl) [pscustomobject]@{ Token = ('e30.' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"oid":"test-oid"}')).TrimEnd('=') + '.sig') } }
 function global:Get-AzMetric { [CmdletBinding()] param($ResourceId, $MetricName, $StartTime, $EndTime, $TimeGrain, $AggregationType, $DefaultProfile) }
-function global:Get-UsageAggregates { [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
+function global:Get-AzUsageAggregate { [CmdletBinding()] param($ReportedStartTime, $ReportedEndTime, $AggregationGranularity, $ShowDetails, $ContinuationToken) [pscustomobject]@{ UsageAggregations = @(); ContinuationToken = $null } }
+# Get-UsageAggregates is an alias of Get-AzUsageAggregate once Az.Billing is loaded.
+function global:Get-UsageAggregates { Get-AzUsageAggregate @args }
 function global:Invoke-AzRestMethod
 {
     param($Method, $Path, $Payload, $Uri)

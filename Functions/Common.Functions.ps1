@@ -176,11 +176,10 @@ function Write-RdaProgress
 #
 # Deliberately NOT baked in (kept separate on purpose):
 #   - Progress UI: that is Write-RdaProgress above (a bar, not a log line).
-#   - Obfuscation scrubbing (Protect-DiagnosticText): only the SHAREABLE
-#     Diagnostics_*.log needs scrubbing, and it is built once at packaging time
-#     from aggregated health globals - NOT line-by-line here. Scrubbing every
-#     log line would be slow and would destroy the local logs' raw
-#     troubleshooting value, so it stays out of the hot path.
+#   - The shareable Diagnostics_*.log: it is built once at packaging time from the aggregated
+#     health globals - NOT line-by-line here - and holds no failure message text at all
+#     (see Get-RdaDiagnosticMessage). The raw text stays in the local logs, so their
+#     troubleshooting value is kept and nothing needs scrubbing in the hot path.
 #   - Per-call logging from inside ForEach-Object -Parallel workers: concurrent
 #     appends to one file are not safe. Those paths record into a thread-safe
 #     bag and are logged as an aggregated summary on the main thread instead.
@@ -198,17 +197,10 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     $SubTag = if (-not [string]::IsNullOrEmpty($SubId)) { '[{0}] ' -f $SubId.Substring(0, [Math]::Min(8, $SubId.Length)) } else { '' }
     $Message = $SubTag + $Message
 
-    if (-not $NoConsole)
-    {
-        switch ($Severity)
-        {
-            "Info" { Write-Host $Message -ForegroundColor Cyan }
-            "Warning" { Write-Host $Message -ForegroundColor Yellow }
-            "Error" { Write-Host $Message -ForegroundColor Red }
-            "Success" { Write-Host $Message -ForegroundColor Green }
-            default { Write-Host $Message }
-        }
-    }
+    # The two file sinks' paths, read the same way: a call before setup (a start-up check)
+    # under a caller's Set-StrictMode would otherwise stop on the unset global.
+    $ErrorLogPath = Get-Variable -Name 'ErrorLogFile' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    $DebugLogPath = Get-Variable -Name 'DebugLogFile' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
 
     # Errors-only local sink: when an error-log path has been established append
     # error-severity messages to a dedicated, timestamped file.
@@ -218,14 +210,15 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     # interpolate raw $_.Exception.Message text and local paths (e.g. collector
     # failures, reconnect failures, HTML-gen failures) that carry real Azure
     # identifiers the obfuscation layer never touches. Shipping this file would
-    # leak them. Do NOT add $Global:ErrorLogFile to the Compress-Archive Path
-    # array without first scrubbing/obfuscating its contents. It is kept on disk
+    # leak them. Do NOT add $Global:ErrorLogFile to the report zip's Path array
+    # ($CompressionOutput in ResourceInventory.ps1, zipped by
+    # Compress-RdaReportArchive) without first scrubbing/obfuscating its contents. It is kept on disk
     # for local troubleshooting only, at the same trust level as the transcript.
-    if ($Severity -eq 'Error' -and -not [string]::IsNullOrEmpty($Global:ErrorLogFile))
+    if ($Severity -eq 'Error' -and -not [string]::IsNullOrEmpty($ErrorLogPath))
     {
         try
         {
-            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $Global:ErrorLogFile -Append -Encoding utf8
+            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $ErrorLogPath -Append -Encoding utf8
         }
         catch
         {
@@ -240,16 +233,35 @@ Function Global:Write-Log([string]$Message, [string]$Severity, [switch]$NoConsol
     # best-effort like the error sink; nothing is written until the global path
     # exists, so callers before setup (or a standalone extension run) are
     # unaffected.
-    if ($ToDebugLog -and -not [string]::IsNullOrEmpty($Global:DebugLogFile))
+    if ($ToDebugLog -and -not [string]::IsNullOrEmpty($DebugLogPath))
     {
         try
         {
-            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $Global:DebugLogFile -Append -Encoding utf8
+            ('{0} {1}' -f $DateTime, $Message) | Out-File -LiteralPath $DebugLogPath -Append -Encoding utf8
         }
         catch
         {
             # Never let a debug-log write failure interrupt the run.
         }
+    }
+
+    # The console last, and best effort: an information action of Stop (a preference or a
+    # default parameter value) makes Write-Host throw, which must neither skip the file
+    # sinks above nor replace the caller's own error.
+    if (-not $NoConsole)
+    {
+        try
+        {
+            switch ($Severity)
+            {
+                "Info" { Write-Host $Message -ForegroundColor Cyan }
+                "Warning" { Write-Host $Message -ForegroundColor Yellow }
+                "Error" { Write-Host $Message -ForegroundColor Red }
+                "Success" { Write-Host $Message -ForegroundColor Green }
+                default { Write-Host $Message }
+            }
+        }
+        catch { $null = $_ }
     }
 }
 
@@ -1220,7 +1232,7 @@ function Split-EmptySubscriptionsByRoleCheck
 }
 
 # ---- Consumption data check -------------------------------------------------
-# Consumption (usage) rows are what price a business case: they show whether a
+# Consumption (usage) rows show whether a
 # machine ran 4 hours or 400. A run without them is not useful, so when
 # consumption is requested (no -SkipConsumption) both entry points refuse to
 # start unless every in-scope subscription returns at least one usage row with
@@ -1328,7 +1340,15 @@ function Get-ConsumptionErrorStatusCode
     $Depth = 0
     while ($null -ne $Current -and $Depth -lt 6)
     {
-        foreach ($Candidate in @($Current.Response.StatusCode, $Current.StatusCode))
+        # Only some exceptions carry Response or StatusCode; read them only when
+        # present, so Set-StrictMode allows an exception without them.
+        $Props = $Current.PSObject.Properties
+        $Response = if ($null -ne $Props['Response']) { $Current.Response } else { $null }
+        $Candidates = @(
+            $(if ($null -ne $Response -and $null -ne $Response.PSObject.Properties['StatusCode']) { $Response.StatusCode })
+            $(if ($null -ne $Props['StatusCode']) { $Current.StatusCode })
+        )
+        foreach ($Candidate in $Candidates)
         {
             if ($null -eq $Candidate) { continue }
             try
@@ -1341,7 +1361,7 @@ function Get-ConsumptionErrorStatusCode
                 Write-Verbose ('Unrecognised status code value: {0}' -f $Candidate)
             }
         }
-        $Current = $Current.InnerException
+        $Current = if ($null -ne $Props['InnerException']) { $Current.InnerException } else { $null }
         $Depth++
     }
     return $null
@@ -1445,7 +1465,7 @@ function Invoke-ConsumptionCallWithRetry
 }
 
 # Resource counts per subscription from Resource Graph, used to exempt
-# subscriptions that hold no resources (nothing to price). With
+# subscriptions that hold no resources (no usage to read). With
 # -ResourceGroup only that resource group's resources are counted, matched the
 # way the inventory's own query matches it (lower-cased name, '=='). Resource
 # Graph returns no row for a subscription with zero resources, so every id in
@@ -1532,7 +1552,11 @@ function Get-ConsumptionRowResourceUri
     if ([string]::IsNullOrWhiteSpace([string]$InstanceData)) { return $null }
     try { $Info = [string]$InstanceData | ConvertFrom-Json -ErrorAction Stop }
     catch { return $null }
-    $Uri = $Info.'Microsoft.Resources'.resourceUri
+    # Read each level only when it is there: under Set-StrictMode a missing property stops the caller.
+    if ($null -eq $Info -or $null -eq $Info.PSObject.Properties['Microsoft.Resources']) { return $null }
+    $Resources = $Info.'Microsoft.Resources'
+    if ($null -eq $Resources -or $null -eq $Resources.PSObject.Properties['resourceUri']) { return $null }
+    $Uri = $Resources.resourceUri
     if ($Uri -isnot [string]) { return $null }
     return $Uri
 }
@@ -1699,7 +1723,7 @@ function Get-ConsumptionCheckVerdict
     $InRg = if ([string]::IsNullOrEmpty($ResourceGroup)) { '' } else { " in resource group '{0}'" -f $ResourceGroup }
     if ($null -ne $ResourceCount -and [int]$ResourceCount -eq 0)
     {
-        return [pscustomobject]@{ Outcome = 'Exempt'; Passed = $true; Detail = ('no resources{0} in Resource Graph; not checked (nothing to price)' -f $InRg) }
+        return [pscustomobject]@{ Outcome = 'Exempt'; Passed = $true; Detail = ('no resources{0} in Resource Graph; not checked (no usage to read)' -f $InRg) }
     }
     if ($null -eq $Probe)
     {
@@ -1994,7 +2018,7 @@ function Write-ConsumptionDataCheckReport
     $NoUsageEmpty = @($NoUsage | Where-Object { -not $_.PageCapReached })
     if ($Result.Exempt.Count -gt 0)
     {
-        Write-Host ('  {0} subscription(s) have no resources{1} in Resource Graph and were not checked (nothing to price).' -f $Result.Exempt.Count, $InRg) -ForegroundColor DarkGray
+        Write-Host ('  {0} subscription(s) have no resources{1} in Resource Graph and were not checked (no usage to read).' -f $Result.Exempt.Count, $InRg) -ForegroundColor DarkGray
     }
     if (-not $Result.ShouldBlock)
     {
@@ -2017,7 +2041,7 @@ function Write-ConsumptionDataCheckReport
     $CappedText = if ($FailedCapped.Count -gt 0) { ' ({0} of them: none above zero in the first {1} page(s) read; later pages were not checked)' -f $FailedCapped.Count, $FailedCapped[0].PagesRead } else { '' }
     Write-Host ''
     Write-Host ('ERROR: Consumption data was requested (no -SkipConsumption), but {0} of {1} checked subscription(s) returned no usage values{2} for {3}{4}.' -f $Result.Failed.Count, $Checked.Count, $ForRg, $WindowText, $CappedText) -ForegroundColor Red
-    Write-Host 'Without consumption the business case cannot be priced, so the run stops before any inventory or metrics work.' -ForegroundColor Red
+    Write-Host 'Without consumption the report has no usage data, so the run stops before any inventory or metrics work.' -ForegroundColor Red
     foreach ($Fail in $Result.Failed)
     {
         Write-Host ('  - {0} ({1}): {2} - {3}; window {4}' -f $Fail.Name, $Fail.Id, $Fail.Outcome, $Fail.Detail, $WindowText) -ForegroundColor Red
@@ -2201,8 +2225,10 @@ function Test-RdaInteractiveSession
 # PowerShell with -TenantId, so a subscription delegated to the tenant (Azure
 # Lighthouse), whose HomeTenantId is another tenant, is kept. A subscription
 # returned twice is listed once (first one kept, ids compared without case).
-# Every state is kept, as `az account list` listed them; the -RunAllSubs
-# wrapper applies its own Enabled filter. Each entry has the properties
+# Every state is kept; callers filter. A direct run without -SubscriptionID
+# keeps the Enabled ones. A direct run with -SubscriptionID keeps every state,
+# so the named one is found. Under -RunAllSubs every state is kept and the
+# wrapper chooses. Each entry has the properties
 # callers read: id, name, tenantId (the tenant asked when Az gives none),
 # homeTenantId and state.
 function Get-RdaTenantSubscriptions

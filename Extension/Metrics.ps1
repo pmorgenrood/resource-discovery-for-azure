@@ -37,94 +37,115 @@ if (-not (Get-Command -Name 'Write-RdaProgress' -ErrorAction SilentlyContinue))
 }
 
 
-if (-not (Get-Command -Name 'Resolve-ObfuscationToken' -ErrorAction SilentlyContinue))
+# The masking of a -Obfuscate run's metric records: each record's ID, Name,
+# Subscription and ResourceGroup become the tokens of its real id; a record whose
+# id the run has not masked gets the masked ARM path of Get-ObfuscatedResourceId
+# (from ResourceInventory.ps1), added to the dictionaries, and a record with no
+# id has its fields masked with the run's tokens or free-text tokens. Records
+# are changed in place. Run by this script on each batch of records, and by
+# Protect-RdaReport.ps1 on the records of a finished plain report, so both mask
+# a record the same way.
+function Protect-RdaMetricRecord
 {
-    function Resolve-ObfuscationToken
+    param($Metrics, $ResourceIdDictionary, $ResourceNameDictionary, $ResourceSubDictionary, $ResourceGroupDictionary)
+
+    foreach ($metric in $Metrics)
     {
-        param(
-            [string]$RealValue,
-            [string]$LookupKey,
-            $SharedDictionary,
-            [hashtable]$LocalCache,
-            [string]$TokenPrefix
-        )
+        $OriginalId = $metric.ID
+        if (![string]::IsNullOrEmpty($OriginalId) -and $null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0 -and $ResourceIdDictionary.ContainsKey($OriginalId))
+        {
+            $metric.ID = $ResourceIdDictionary[$OriginalId]
+            $metric.Name = $ResourceNameDictionary[$OriginalId]
+            $metric.Subscription = $ResourceSubDictionary[$OriginalId]
+            $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
+        }
+        else
+        {
+            if (![string]::IsNullOrEmpty($OriginalId))
+            {
+                # The masked path the inventory and consumption rows
+                # get (Get-ObfuscatedResourceId), from the run's own
+                # subscription, resource group and name tokens and their
+                # prefix rule, and the row's fields are that path's
+                # segments (Get-ObfuscatedResourceId records them).
+                $ObfuscatedId = Get-ObfuscatedResourceId -ResourceId $OriginalId
+                $ResourceIdDictionary[$OriginalId] = $ObfuscatedId
+                $FbPrefix = Get-ObfuscationPrefix $OriginalId
+                if (-not $ResourceNameDictionary.ContainsKey($OriginalId) -or [string]::IsNullOrEmpty($ResourceNameDictionary[$OriginalId])) { $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
+                if (-not $ResourceSubDictionary.ContainsKey($OriginalId) -or [string]::IsNullOrEmpty($ResourceSubDictionary[$OriginalId])) { $ResourceSubDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
+                if (-not $ResourceGroupDictionary.ContainsKey($OriginalId) -or [string]::IsNullOrEmpty($ResourceGroupDictionary[$OriginalId])) { $ResourceGroupDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
 
-        if ($null -ne $SharedDictionary -and $SharedDictionary.ContainsKey($LookupKey)) { return $SharedDictionary[$LookupKey] }
-        if ($LocalCache.ContainsKey($RealValue)) { return $LocalCache[$RealValue] }
-
-        $Token = $TokenPrefix + [guid]::NewGuid().ToString()
-        $LocalCache[$RealValue] = $Token
-        return $Token
+                $metric.ID = $ObfuscatedId
+                $metric.Name = $ResourceNameDictionary[$OriginalId]
+                $metric.Subscription = $ResourceSubDictionary[$OriginalId]
+                $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
+            }
+            else
+            {
+                # A row with no id has nothing to look up by id: mask
+                # its fields so no real name is left in the file.
+                # The group, the subscription (when one subscription
+                # has that display name; with two, the row does not
+                # say which, so neither one's token is given) and the
+                # name (when the run holds one resource of that name,
+                # group and subscription) take the tokens the
+                # inventory rows carry, so the row matches them by
+                # name and group.
+                # Any other field gets one token per real value, kept
+                # in the run's free-text dictionary so the dictionary
+                # file can reveal it.
+                $Replaced = @{}
+                $RealRgValue = [string]$metric.ResourceGroup
+                if (-not [string]::IsNullOrEmpty($RealRgValue) -and $null -ne $Global:ObfuscationResourceGroupTokens -and $Global:ObfuscationResourceGroupTokens.ContainsKey($RealRgValue))
+                {
+                    $metric.ResourceGroup = $Global:ObfuscationResourceGroupTokens[$RealRgValue]
+                    $Replaced['ResourceGroup'] = $true
+                }
+                $RealSubValue = [string]$metric.Subscription
+                $SubIdsOfName = @(@($Global:Subscriptions) | Where-Object { $null -ne $_ -and [string]$_.name -eq $RealSubValue -and -not [string]::IsNullOrEmpty([string]$_.id) } | ForEach-Object { [string]$_.id } | Select-Object -Unique)
+                if (-not [string]::IsNullOrEmpty($RealSubValue) -and $SubIdsOfName.Count -eq 1 -and $null -ne $Global:ObfuscationSubscriptionTokens -and $Global:ObfuscationSubscriptionTokens.ContainsKey($SubIdsOfName[0]))
+                {
+                    $metric.Subscription = $Global:ObfuscationSubscriptionTokens[$SubIdsOfName[0]]
+                    $Replaced['Subscription'] = $true
+                }
+                # (Rows with no id are rare; this scans the names.)
+                $RealNameValue = [string]$metric.Name
+                if (-not [string]::IsNullOrEmpty($RealNameValue) -and -not [string]::IsNullOrEmpty($RealRgValue) -and $SubIdsOfName.Count -eq 1 -and $null -ne $ResourceNameDictionary)
+                {
+                    $NameHits = [System.Collections.Generic.List[string]]::new()
+                    foreach ($NameKey in @($ResourceNameDictionary.Keys))
+                    {
+                        $KeyParts = ([string]$NameKey).Split('/')
+                        if ($KeyParts.Count -lt 9 -or $KeyParts[1] -ine 'subscriptions' -or $KeyParts[2] -ine $SubIdsOfName[0] -or $KeyParts[3] -ine 'resourcegroups' -or $KeyParts[4] -ine $RealRgValue) { continue }
+                        if ($KeyParts[-1] -ieq $RealNameValue -and -not [string]::IsNullOrEmpty($ResourceNameDictionary[$NameKey])) { $NameHits.Add([string]$ResourceNameDictionary[$NameKey]) }
+                    }
+                    if (@($NameHits | Select-Object -Unique).Count -eq 1)
+                    {
+                        $metric.Name = $NameHits[0]
+                        $Replaced['Name'] = $true
+                    }
+                }
+                foreach ($Field in 'Name', 'Subscription', 'ResourceGroup')
+                {
+                    $RealValue = [string]$metric.$Field
+                    if ($Replaced.ContainsKey($Field) -or [string]::IsNullOrEmpty($RealValue)) { continue }
+                    if ($null -eq $Global:FreeTextDictionary) { $Global:FreeTextDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]' }
+                    if (-not $Global:FreeTextDictionary.ContainsKey($RealValue)) { $Global:FreeTextDictionary[$RealValue] = (Get-ObfuscationPrefix $RealValue) + [guid]::NewGuid().ToString() }
+                    $metric.$Field = $Global:FreeTextDictionary[$RealValue]
+                }
+            }
+        }
     }
 }
 
-if (-not (Get-Command -Name 'Build-ObfuscatedResourceUri' -ErrorAction SilentlyContinue))
+# Under -Obfuscate a metric row whose resource the inventory does not hold is
+# masked with Get-ObfuscatedResourceId from ResourceInventory.ps1, so its id
+# and fields match the inventory and consumption rows. This script is run by
+# ResourceInventory.ps1, which defines it; run on its own, the rows could not
+# be masked that way, so it stops before any Azure call.
+if ($Obfuscate -and $Task -eq 'Processing' -and -not (Get-Command -Name 'Get-ObfuscatedResourceId' -CommandType Function -ErrorAction SilentlyContinue))
 {
-    function Build-ObfuscatedResourceUri
-    {
-        param(
-            [string]$RawUri,
-            [string]$Prefix,
-            $SubscriptionDictionary,
-            $ResourceGroupDictionary,
-            $NameDictionary,
-            [hashtable]$SubCache,
-            [hashtable]$RgCache,
-            [hashtable]$NameCache
-        )
-
-        if ([string]::IsNullOrEmpty($RawUri))
-        {
-            return 'obfuscated'
-        }
-
-        if ($RawUri -notmatch '^/subscriptions/([^/]+)(/resourcegroups/([^/]+))?(/providers/(.+))?$')
-        {
-            if (-not $NameCache.ContainsKey($RawUri))
-            {
-                $NameCache[$RawUri] = $Prefix + [guid]::NewGuid().ToString()
-            }
-            return $NameCache[$RawUri]
-        }
-
-        $RealSub = $Matches[1]
-        $RealRg = $Matches[3]
-        $RealProv = $Matches[5]
-
-        $ObfSub = Resolve-ObfuscationToken -RealValue $RealSub -LookupKey $RawUri -SharedDictionary $SubscriptionDictionary -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
-
-        $RebuiltUri = '/subscriptions/' + $ObfSub
-
-        if (-not [string]::IsNullOrEmpty($RealRg))
-        {
-            $RgTag = if ($RealRg -match '^mc_') { 'mc_' } else { '' }
-            $ObfRg = Resolve-ObfuscationToken -RealValue $RealRg -LookupKey $RawUri -SharedDictionary $ResourceGroupDictionary -LocalCache $RgCache -TokenPrefix ($Prefix + 'rg_' + $RgTag)
-            $RebuiltUri += '/resourcegroups/' + $ObfRg
-        }
-
-        if (-not [string]::IsNullOrEmpty($RealProv))
-        {
-            $ProvParts = $RealProv -split '/'
-            $Rebuilt = @()
-            for ($Pi = 0; $Pi -lt $ProvParts.Count; $Pi++)
-            {
-                $Part = $ProvParts[$Pi]
-                $IsNameSegment = ($Pi -ge 2 -and ($Pi % 2 -eq 0))
-                if ($IsNameSegment -and -not [string]::IsNullOrEmpty($Part) -and $Part -ne '$system')
-                {
-                    $NameSharedDict = if ($Pi -eq $ProvParts.Count - 1) { $NameDictionary } else { $null }
-                    $Rebuilt += Resolve-ObfuscationToken -RealValue $Part -LookupKey $RawUri -SharedDictionary $NameSharedDict -LocalCache $NameCache -TokenPrefix $Prefix
-                }
-                else
-                {
-                    $Rebuilt += $Part
-                }
-            }
-            $RebuiltUri += '/providers/' + ($Rebuilt -join '/')
-        }
-
-        return $RebuiltUri
-    }
+    throw 'Metrics.ps1 -Obfuscate needs Get-ObfuscatedResourceId from ResourceInventory.ps1. Run ResourceInventory.ps1 (or Run-AllSubscriptions.ps1) -Obfuscate, which runs this script.'
 }
 
 # One Azure Monitor metric request. Every request for the estate is built before
@@ -736,8 +757,8 @@ if ($Task -eq 'Processing')
     # end of the phase.
     $MetricFailedGroupIds = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
-    # $MetricCount is the number of definitions to send, as it was when the batch
-    # loop counted definitions: with none to send, no group and no call is made.
+    # $MetricCount is $MetricDefs.Count, set above. The guard keeps a run with no
+    # definitions from building groups or making any Get-AzMetric call.
     if ($MetricCount -gt 0)
     {
         $MetricGroups = Group-MetricDefinition -MetricDefs $MetricDefs
@@ -1034,8 +1055,9 @@ function Add-MetricRecord
         {
             $BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-            Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} call(s))" -f $RangeIdx, $BatchGroups.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
-            Write-Verbose ("[Metrics] Batch {0}: dispatching {1} metric call(s) (processed {2}/{3})." -f $RangeIdx, $BatchGroups.Count, $MetricsProcessed, $MetricCount)
+            Write-RdaProgress -Activity 'Metrics collection' -CurrentItem ("batch {0} ({1} request(s))" -f $RangeIdx, $BatchGroups.Count) -Index $MetricsProcessed -Total $MetricCount -BarOnly
+            # Grouped requests only: the single-metric fallbacks a group may need are counted in the summary.
+            Write-Verbose ("[Metrics] Batch {0}: dispatching {1} grouped request(s) for {2} metric definition(s) (processed {3}/{4})." -f $RangeIdx, $BatchGroups.Count, $BatchDefCount, $MetricsProcessed, $MetricCount)
 
             $DispatchItems = $BatchGroups
             if ($UseBatchApi)
@@ -1683,13 +1705,19 @@ function Add-MetricRecord
                                 catch
                                 {
                                     $LastError = $_.Exception.Message
-                                    # NotFound first: the throttle match below is a loose substring
+                                    # Check BadRequest first: a 400 message can hold '429'
+                                    # inside an id and must not be retried as throttled.
+                                    if ($StopOnBadRequest)
+                                    {
+                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
+                                    }
+                                    # NotFound before the throttle match, which is a loose substring
                                     # test that text inside a 404 message could meet by chance.
-                                    if (Test-MetricNotFound -Exception $_.Exception)
+                                    if (-not $BadRequest -and (Test-MetricNotFound -Exception $_.Exception))
                                     {
                                         $NotFound = $true
                                     }
-                                    elseif ($LastError -match '429|throttl|TooManyRequests|rate limit')
+                                    elseif (-not $BadRequest -and $LastError -match '429|throttl|TooManyRequests|rate limit')
                                     {
                                         $Throttled = $true
                                         $ThrottledAttempts++
@@ -1698,10 +1726,6 @@ function Add-MetricRecord
                                         {
                                             try { $RetryAfterSeconds = [double](Get-RdaRetryAfterSeconds -ErrorRecord $_) } catch { $RetryAfterSeconds = 0 }
                                         }
-                                    }
-                                    else
-                                    {
-                                        $BadRequest = Test-MetricBadRequest -Exception $_.Exception
                                     }
                                 }
                                 finally
@@ -1783,7 +1807,7 @@ function Add-MetricRecord
 
                 if ($GroupDefs.Count -eq 1)
                 {
-                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $GroupDefs[0].MetricName -Kind 'Request'
+                    $Request = Invoke-MetricRequest -Def $GroupDefs[0] -MetricNames $GroupDefs[0].MetricName -Kind 'Request' -StopOnBadRequest
                     if (-not $Request.Succeeded -and -not $Request.BadRequest)
                     {
                         $FailedGroupIds.Add([string]$GroupDefs[0].Id)
@@ -1837,9 +1861,11 @@ function Add-MetricRecord
                             # BadRequest, so a rejected group is not retried and falls back to one
                             # request per metric; only a metric that also fails on its own is
                             # marked as an error. A metric missing from a successful response is
-                            # requested on its own too. Its elapsed time includes the group request.
+                            # requested on its own too. A BadRequest on that single request is not
+                            # retried either: Azure rejects the same name the same way every time.
+                            # Its elapsed time includes the group request.
                             $SingleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                            $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback'
+                            $SingleRequest = Invoke-MetricRequest -Def $Def -MetricNames $Def.MetricName -Kind 'Fallback' -StopOnBadRequest
                             if (-not $SingleRequest.Succeeded -and -not $SingleRequest.BadRequest)
                             {
                                 $FailedGroupIds.Add([string]$Def.Id)
@@ -1872,44 +1898,11 @@ function Add-MetricRecord
             $DiagSlowest = @($DiagSlowest + $BatchDiag | Sort-Object ElapsedSec -Descending | Select-Object -First 5)
             $BatchDiag = $null
 
-            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} call record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $DiagTotal)
+            Write-Verbose ("[Metrics] Batch {0} complete in {1}s. Cumulative diagnostics: {2} metric definition record(s) so far." -f $RangeIdx, [math]::Round($BatchStopwatch.Elapsed.TotalSeconds, 1), $DiagTotal)
 
             if ($Obfuscate)
             {
-                foreach ($metric in $Tmp.Metrics)
-                {
-                    $OriginalId = $metric.ID
-                    if (![string]::IsNullOrEmpty($OriginalId) -and $null -ne $ResourceIdDictionary -and $ResourceIdDictionary.Count -gt 0 -and $ResourceIdDictionary.ContainsKey($OriginalId))
-                    {
-                        $metric.ID = $ResourceIdDictionary[$OriginalId]
-                        $metric.Name = $ResourceNameDictionary[$OriginalId]
-                        $metric.Subscription = $ResourceSubDictionary[$OriginalId]
-                        $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
-                    }
-                    else
-                    {
-                        if (![string]::IsNullOrEmpty($OriginalId))
-                        {
-                            $FbPrefix = if ($OriginalId -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b') { 'nonprod_' } else { 'prod_' }
-
-                            if (-not $script:MetricsFallbackSubCache) { $script:MetricsFallbackSubCache = @{} }
-                            if (-not $script:MetricsFallbackRgCache) { $script:MetricsFallbackRgCache = @{} }
-                            if (-not $script:MetricsFallbackNameCache) { $script:MetricsFallbackNameCache = @{} }
-
-                            $ObfuscatedId = Build-ObfuscatedResourceUri -RawUri $OriginalId -Prefix $FbPrefix -SubscriptionDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary -NameDictionary $ResourceNameDictionary -SubCache $script:MetricsFallbackSubCache -RgCache $script:MetricsFallbackRgCache -NameCache $script:MetricsFallbackNameCache
-
-                            $ResourceIdDictionary[$OriginalId] = $ObfuscatedId
-                            if (-not $ResourceNameDictionary.ContainsKey($OriginalId)) { $ResourceNameDictionary[$OriginalId] = $FbPrefix + [guid]::NewGuid().ToString() }
-                            if (-not $ResourceSubDictionary.ContainsKey($OriginalId)) { $ResourceSubDictionary[$OriginalId] = $FbPrefix + 'sub_' + [guid]::NewGuid().ToString() }
-                            if (-not $ResourceGroupDictionary.ContainsKey($OriginalId)) { $ResourceGroupDictionary[$OriginalId] = $FbPrefix + 'rg_' + [guid]::NewGuid().ToString() }
-
-                            $metric.ID = $ObfuscatedId
-                            $metric.Name = $ResourceNameDictionary[$OriginalId]
-                            $metric.Subscription = $ResourceSubDictionary[$OriginalId]
-                            $metric.ResourceGroup = $ResourceGroupDictionary[$OriginalId]
-                        }
-                    }
-                }
+                Protect-RdaMetricRecord -Metrics $Tmp.Metrics -ResourceIdDictionary $ResourceIdDictionary -ResourceNameDictionary $ResourceNameDictionary -ResourceSubDictionary $ResourceSubDictionary -ResourceGroupDictionary $ResourceGroupDictionary
             }
 
             $OutputPath = $FilePath + "_" + $RangeIdx + ".json"
@@ -1946,7 +1939,7 @@ function Add-MetricRecord
 
     if (($TimeoutCount + $ThrottledCount + $ErrorCount) -gt 0)
     {
-        Write-MetricsDiag ("Non-success calls (where it got stuck):")
+        Write-MetricsDiag ("Non-success metric definitions (where it got stuck):")
         # A 404 (NotFound, not retried) on a resource Resource Graph lists as being deleted is said so.
         $DeletingStates = Get-MetricDeletingState -Resources $Resources -Ids @($DiagNonSuccess | Where-Object { $_.NotFound } | ForEach-Object { [string]$_.Id } | Select-Object -Unique)
         foreach ($rec in ($DiagNonSuccess | Sort-Object ElapsedSec -Descending))
@@ -1963,7 +1956,7 @@ function Add-MetricRecord
     if ($DiagTotal -gt 0)
     {
         $Slowest = $DiagSlowest
-        Write-MetricsDiag ("Slowest 5 calls:")
+        Write-MetricsDiag ("Slowest 5 metric definitions:")
         foreach ($rec in $Slowest)
         {
             Write-MetricsDiag ("  {0}s idx={1} {2}/{3}/{4} interval={5} ({6})" -f $rec.ElapsedSec, $rec.MetricIndex, $rec.Service, $rec.Name, $rec.Metric, $rec.Interval, $rec.Outcome)

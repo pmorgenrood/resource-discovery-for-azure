@@ -59,66 +59,288 @@ Function Global:Protect-FreeTextValue([string]$Value)
     return $Global:FreeTextDictionary[$Value]
 }
 
-# Safe-by-construction scrub of a raw diagnostic / exception string so it is safe
-# to place in the SHAREABLE (obfuscated) diagnostics log. Two passes:
-#   1. Dictionary tokenization. $ValueMap is a REAL-value -> token lookup the
-#      caller builds from the run's obfuscation state. NOTE the four core
-#      dictionaries are keyed by the real ARM RESOURCE ID (not by name/RG/sub),
-#      so the caller derives the bare resource NAME, RG name and subscription
-#      GUID from those keys and adds them to $ValueMap, plus tag values and
-#      free-text values. Keys are applied longest-first so a full ARM path is
-#      tokenized as one unit before its shorter sub/RG/name substrings.
-#   2. Structured-identifier masking. Classes a raw exception can carry that the
-#      dictionaries do NOT cover are masked generically so none can ship:
-#      email/UPN -> <email>, IPv4 -> <ip>, Azure data-plane FQDNs -> <host>,
-#      *nix/Windows home paths -> <user>, and any REMAINING raw GUID (e.g. a
-#      tenant GUID) -> <guid>. The email/home-path patterns mirror the leak
-#      scans in Tests/Obfuscation.Tests.ps1 so a scrubbed message cannot trip
-#      them. A prod_/nonprod_ token's GUID is always preceded by '_', so the
-#      (?<!_) lookbehind + \b boundary leave real tokens intact.
-#
-# Intentionally over-inclusive: it may mask a substring that merely coincides
-# with a real value, but it never LEAKS a known value or a structured
-# identifier. Called only for the handful of error strings that go into the
-# shareable diagnostics log (collector failures + per-phase auth-skip messages),
-# never per log line, so the per-message cost (incl. the length sort) is off the
-# hot path. When obfuscation is off the caller does not build the shareable log,
-# so this is never reached in that mode. Defined Global to match
-# Protect-FreeTextValue. Residual note: a bare resource name that is NOT in the
-# report (never inventoried, so not in any dictionary) and is not GUID/host/
-# email/path shaped could still appear in words - the caller keeps this to the
-# obfuscated bundle (shared only with the ingestion party), not a public surface.
-Function Global:Protect-DiagnosticText([string]$Text, [System.Collections.IDictionary]$ValueMap)
-{
-    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+# Azure's fixed words in an App Service's siteProperties, by where they stand. A word is kept
+# only in its place, so a real name that is also one of these words elsewhere is masked.
+#   SettingNames: a whole value that names a setting (LinuxFxVersion).
+#   StackWords:   a whole value, or the part before '|' (DOCKER|..., DOTNETCORE|8.0).
+#   HostWords:    the registry host of a container image (myreg.azurecr.io).
+#   VersionWords: a word of a runtime version after '|' (18-lts, 17-java17, 3.x).
+$Global:RdaSiteWords = @{
+    SettingNames = [System.Collections.Generic.HashSet[string]]::new([string[]]@('linuxfxversion', 'windowsfxversion', 'current_stack'), [System.StringComparer]::OrdinalIgnoreCase)
+    StackWords   = [System.Collections.Generic.HashSet[string]]::new([string[]]@('docker', 'compose', 'kube', 'sitecontainers', 'dotnet', 'dotnet-isolated', 'dotnetcore', 'aspnet', 'node', 'python', 'php', 'java', 'javase', 'tomcat', 'jboss', 'jbosseap', 'wildfly', 'ruby', 'go', 'powershell', 'static'), [System.StringComparer]::OrdinalIgnoreCase)
+    HostWords    = [System.Collections.Generic.HashSet[string]]::new([string[]]@('azurecr', 'io', 'mcr', 'microsoft', 'com', 'docker'), [System.StringComparer]::OrdinalIgnoreCase)
+    VersionWords = [System.Collections.Generic.HashSet[string]]::new([string[]]@('lts', 'x', 'latest', 'isolated', 'preview'), [System.StringComparer]::OrdinalIgnoreCase)
+}
 
-    $Result = $Text
-    if ($null -ne $ValueMap -and $ValueMap.Count -gt 0)
+# One text of siteProperties masked: each run of letters or digits (any script) is kept when
+# $Keep says so, else it is one free-text token; separator runs stay. A GUID or an IP
+# address, with the letters or digits it runs into, is one token. So is a 4-part version
+# (1.0.0.123), which reads as an IPv4 address.
+function Global:Protect-RdaSiteText([string]$Text, [scriptblock]$Keep)
+{
+    $Out = [System.Text.StringBuilder]::new()
+    # A run is letters, digits and marks of any script, and any character outside the
+    # Basic Multilingual Plane (a surrogate pair), so none of them passes as a separator.
+    # Group 'one' is one real part whatever its parts: a GUID, an IPv4 address, a bracketed
+    # IPv6 one, each with the letters or digits it runs into (host10.20.30.40), and a bare
+    # IPv6 one (with '::', or all 8 groups).
+    $W = '[\p{L}\p{N}\p{M}\p{Cs}]'
+    $One = $W + '*(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|(?<![0-9])[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?![0-9])|\[(?=[0-9A-Fa-f.]*:[0-9A-Fa-f.]*:)[0-9A-Fa-f:.]+\])' + $W + '*'
+    # A bare IPv6 address: with '::', or all 8 groups, or 6 groups and an IPv4 tail
+    # (::ffff:192.0.2.128), with the letters or digits it runs into (host2001:db8::1).
+    # Its lookaheads are bounded (an address is at most 45 characters), so a long run of
+    # hex letters costs one short look per character. Words joined by '::' (std::string) are one
+    # token too: more is masked, nothing leaks.
+    $Bare6 = '(?<![\p{L}\p{N}\p{M}\p{Cs}:])' + $W + '*?(?=[0-9A-Fa-f:.]{0,45}[0-9A-Fa-f])(?=[0-9A-Fa-f:]{0,40}::|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){6}[0-9]{1,3}\.)(?:[0-9A-Fa-f]{0,4}:){2,7}(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?![0-9])|[0-9A-Fa-f]{1,4})?' + $W + '*'
+    # A ':' is a separator of its own, so a run of separators cannot take the '::' an IPv6 address starts with.
+    $Pattern = '(?<one>' + $One + '|' + $Bare6 + ')|' + $W + '+|[^\p{L}\p{N}\p{M}\p{Cs}:]+|:'
+    foreach ($M in [regex]::Matches($Text, $Pattern))
     {
-        foreach ($real in ($ValueMap.Keys | Sort-Object -Property Length -Descending))
+        $Part = $M.Value
+        $IsRun = $Part -match '^[\p{L}\p{N}\p{M}\p{Cs}]'
+        $IsOne = $M.Groups['one'].Success
+        $Out.Append($(if ($IsOne) { Protect-FreeTextValue $Part } elseif (-not $IsRun -or (& $Keep $Part)) { $Part } else { Protect-FreeTextValue $Part })) | Out-Null
+    }
+    $Out.ToString()
+}
+
+# True for an ISO time that is a real time (invariant): it holds no real text.
+function Global:Test-RdaSiteTime([string]$Text)
+{
+    $D = [DateTimeOffset]::MinValue
+    # The pull lower-cases Resource Graph's text, so a time can read 2026-11-15t09:00:00z.
+    $Text -cmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,7})?)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})?\z' -and [DateTimeOffset]::TryParse($Text, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$D)
+}
+
+# The masked form of an App Service's siteProperties under -Obfuscate (an owner call,
+# 2026-11-14, mask-keep-shape.md): keys, null and empty values, numbers and booleans are
+# kept, and a time; in each text value only Azure's own words in their place and short ASCII
+# numbers (up to 6 digits) where Azure writes one (a runtime version after '|', an image tag,
+# a registry port; anywhere else, an app setting's value too, a number can be the customer's) are kept,
+# every other run of letters or digits (any script) and every GUID is one free-text token
+# (Protect-FreeTextValue: the same for the same real part in every file, so Reveal gives it
+# back); separators stay. A text is a setting name, a stack word, 'STACK|version', or
+# 'DOCKER|<image>' (registry host words kept, path and tag parts masked, a digit tag or
+# 'latest' kept). One rule for the whole object, walked to its last value. Used by the
+# AppServices collector and by Protect-RdaReport.ps1, so both mask it the same way.
+# Returns the value as it is when obfuscation is off.
+# $Context: 'Setting' for the siteProperties object itself and for the value of a setting
+# Azure names ({name = LinuxFxVersion, WindowsFxVersion or CURRENT_STACK; value = ...} in its
+# 'properties' or 'metadata' list, or a text given alone), where Azure's stack, host and
+# version words stay; 'List' for those lists; 'Other' for every other value (an app
+# setting's value or key, any other key), where only a time stays and every other part is
+# a token.
+Function Global:Protect-SitePropertiesValue($Value, [string]$Context = 'Setting')
+{
+    if ($null -eq $Global:FreeTextDictionary -or $null -eq $Value) { return $Value }
+    $None = { param($P) $false }
+    if ($Value -is [string] -and $Context -ne 'Setting')
+    {
+        if ($Value -eq '' -or (Test-RdaSiteTime $Value)) { return $Value }
+        return (Protect-RdaSiteText $Value $None)
+    }
+    if ($Value -is [string])
+    {
+        # A time holds no real text (a [datetime] is kept below; a time's text here).
+        if ($Value -eq '' -or $Global:RdaSiteWords.SettingNames.Contains($Value) -or $Global:RdaSiteWords.StackWords.Contains($Value) -or (Test-RdaSiteTime $Value)) { return $Value }
+        # A number is kept only where Azure writes one: a runtime version, an image tag, a port.
+        # Anywhere else (an app setting's value, an image path) it can be the customer's.
+        $Bar = $Value.IndexOf('|')
+        if ($Bar -lt 0) { return (Protect-RdaSiteText $Value $None) }
+        $Stack = $Value.Substring(0, $Bar)
+        $Rest = $Value.Substring($Bar + 1)
+        # A head that is not a stack word: the whole value is the customer's, version and all.
+        if (-not $Global:RdaSiteWords.StackWords.Contains($Stack)) { return ((Protect-RdaSiteText $Stack $None) + '|' + (Protect-RdaSiteText $Rest $None)) }
+        $Head = $Stack
+        if ($Stack -iin 'docker', 'compose', 'kube', 'sitecontainers')
         {
-            if (-not [string]::IsNullOrEmpty($real) -and $Result.Contains($real))
+            # <host>/<path>[:<tag>]: the host's Azure words, a tag of digits or 'latest'.
+            $Slash = $Rest.IndexOf('/')
+            $HostPart = if ($Slash -gt 0 -and ($Rest.Substring(0, $Slash).Contains('.') -or $Rest.StartsWith('['))) { $Rest.Substring(0, $Slash) } else { '' }
+            $PathPart = $Rest.Substring($HostPart.Length)
+            $Colon = $PathPart.LastIndexOf(':')
+            $Tag = if ($Colon -ge 0 -and $PathPart.IndexOf('/', $Colon) -lt 0) { $PathPart.Substring($Colon + 1) } else { $null }
+            if ($null -ne $Tag) { $PathPart = $PathPart.Substring(0, $Colon) }
+            # The host's labels are masked but Azure's (a numeric one too: an IP is real); a port stays.
+            $Port = ''
+            if ($HostPart -cmatch '^(.*)(:[0-9]{1,5})\z') { $HostPart = $Matches[1]; $Port = $Matches[2] }
+            $Masked = (Protect-RdaSiteText $HostPart { param($P) $Global:RdaSiteWords.HostWords.Contains($P) }) + $Port + (Protect-RdaSiteText $PathPart $None)
+            if ($null -ne $Tag) { $Masked += ':' + (Protect-RdaSiteText $Tag { param($P) $P -cmatch '^[0-9]{1,6}\z' -or $P -ieq 'latest' }) }
+            return ($Head + '|' + $Masked)
+        }
+        # A runtime version (8.0, 18-lts, 17-java17).
+        return ($Head + '|' + (Protect-RdaSiteText $Rest { param($P) $P -cmatch '^[0-9]{1,6}\z' -or $Global:RdaSiteWords.VersionWords.Contains($P) -or $P -cmatch '^(?:java|jre|jdk)[0-9]{1,3}\z' }))
+    }
+    # The object Azure writes ($Context 'Setting': the siteProperties object itself, or a
+    # setting given alone) keeps its keys; its 'properties' and 'metadata' lists hold the
+    # settings ('List'). An object {name, value} there (or given alone) whose name is a setting
+    # Azure names keeps its name and its value is a setting's. Every other value is 'Other';
+    # in an 'Other' object (an app setting's dictionary) the keys are the customer's too.
+    $Pairs = $null
+    if ($Value -is [System.Collections.IDictionary]) { $Pairs = @(foreach ($Key in @($Value.Keys)) { , @($Key, $Value[$Key]) }) }
+    elseif ($Value -is [System.Management.Automation.PSCustomObject]) { $Pairs = @(foreach ($P in $Value.PSObject.Properties) { , @($P.Name, $P.Value) }) }
+    if ($null -ne $Pairs)
+    {
+        $SettingName = $null
+        if ($Context -ne 'Other') { foreach ($Pair in $Pairs) { if ([string]$Pair[0] -ieq 'name' -and $Pair[1] -is [string] -and $Global:RdaSiteWords.SettingNames.Contains($Pair[1])) { $SettingName = $Pair[1] } } }
+        $Masked = if ($Value -is [System.Collections.Specialized.OrderedDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) { [ordered]@{} } else { @{} }
+        foreach ($Pair in $Pairs)
+        {
+            $Key = [string]$Pair[0]
+            $OutKey = if ($Context -eq 'Setting' -or ($Context -eq 'List' -and $Key -iin 'name', 'value') -or $Key -eq '') { $Pair[0] } else { Protect-RdaSiteText $Key { param($P) $false } }
+            $Masked[$OutKey] = if ($null -ne $SettingName -and $Key -ieq 'name') { $Pair[1] }
+            elseif ($null -ne $SettingName -and $Key -ieq 'value') { Protect-SitePropertiesValue $Pair[1] 'Setting' }
+            elseif ($Context -eq 'Setting' -and $Key -iin 'properties', 'metadata') { Protect-SitePropertiesValue $Pair[1] 'List' }
+            else { Protect-SitePropertiesValue $Pair[1] 'Other' }
+        }
+        if ($Value -is [System.Management.Automation.PSCustomObject]) { return [pscustomobject]$Masked }
+        return $Masked
+    }
+    if ($Value -is [System.Collections.IEnumerable])
+    {
+        # The comma keeps a list of one (or none) a list.
+        return , @(foreach ($Item in $Value) { , (Protect-SitePropertiesValue $Item $Context) })
+    }
+    return $Value
+}
+
+# The shareable diagnostics log keeps no failure message text. An error's text can name
+# anything (a resource the report does not hold, a user, a host, a credential), and no
+# scrub of free text can be proved complete, so none is attempted: a failure line holds
+# its collector, its subscription token and only the closed-list facts read from the
+# error OBJECT, never parsed out of its message: the .NET exception type name, the HTTP
+# status number, and the Azure error code when it is in $Global:RdaDiagnosticErrorCodes.
+# Anything else is dropped. A run and an offline mask write the same line from the same
+# functions. The plain local log (the run's debug log) is not changed.
+$Global:RdaDiagnosticErrorCodes = @(
+    'AuthorizationFailed', 'AuthenticationFailed', 'InvalidAuthenticationToken', 'ExpiredAuthenticationToken',
+    'LinkedAuthorizationFailed', 'TooManyRequests', 'Throttled', 'RateLimitExceeded', 'QuotaExceeded',
+    'ResourceNotFound', 'ResourceGroupNotFound', 'SubscriptionNotFound', 'NotFound', 'Forbidden', 'BadRequest',
+    'Conflict', 'RequestTimeout', 'GatewayTimeout', 'BadGateway', 'ServiceUnavailable', 'InternalServerError',
+    'MissingSubscriptionRegistration', 'SubscriptionNotRegistered', 'NoRegisteredProviderFound',
+    'InvalidResourceType', 'InvalidApiVersionParameter'
+)
+
+# The exception types a line may name: this exact list, nothing else (a type from a customer's
+# own assembly, or any other name, is not kept).
+$Global:RdaDiagnosticExceptionTypes = @(
+    'System.Exception', 'System.AggregateException', 'System.ArgumentException', 'System.ArgumentNullException',
+    'System.ArgumentOutOfRangeException', 'System.FormatException', 'System.InvalidCastException',
+    'System.InvalidOperationException', 'System.NotSupportedException', 'System.NullReferenceException',
+    'System.OperationCanceledException', 'System.OutOfMemoryException', 'System.TimeoutException',
+    'System.UnauthorizedAccessException', 'System.Collections.Generic.KeyNotFoundException',
+    'System.IO.DirectoryNotFoundException', 'System.IO.FileNotFoundException', 'System.IO.InvalidDataException',
+    'System.IO.IOException', 'System.Net.WebException', 'System.Net.Http.HttpRequestException',
+    'System.Net.Sockets.SocketException', 'System.Security.Authentication.AuthenticationException',
+    'System.Threading.Tasks.TaskCanceledException', 'System.Text.Json.JsonException',
+    'System.Management.Automation.CmdletInvocationException', 'System.Management.Automation.ItemNotFoundException',
+    'System.Management.Automation.MethodInvocationException', 'System.Management.Automation.ParameterBindingException',
+    'System.Management.Automation.PSInvalidOperationException', 'System.Management.Automation.RemoteException',
+    'System.Management.Automation.RuntimeException', 'System.Management.Automation.ActionPreferenceStopException',
+    'Microsoft.Azure.Commands.Common.Exceptions.AzPSException', 'Azure.RequestFailedException',
+    'Azure.Identity.AuthenticationFailedException', 'Microsoft.Rest.Azure.CloudException',
+    'Microsoft.Identity.Client.MsalClientException', 'Microsoft.Identity.Client.MsalServiceException',
+    'Microsoft.Identity.Client.MsalUiRequiredException', 'Newtonsoft.Json.JsonReaderException',
+    'Newtonsoft.Json.JsonSerializationException'
+)
+
+# The facts of an error object, as the text a log line holds: 'exception=<type> status=<n> code=<code>',
+# each only when the object gives it and it is on the closed list; '' when none.
+Function Global:Get-RdaErrorFacts($ErrorRecord)
+{
+    # Called in a catch block: whatever the object does (a throwing getter, a value that does not
+    # fit), the failure being handled must go on, so any error here is 'no facts'.
+    try
+    {
+        $Facts = [System.Collections.Generic.List[string]]::new()
+        $Ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        if ($null -eq $Ex) { return '' }
+        $Read = { param($Object, [string[]]$Path)
+            $Cur = $Object
+            foreach ($Name in $Path)
             {
-                $Result = $Result.Replace($real, $ValueMap[$real])
+                if ($null -eq $Cur) { return $null }
+                $Prop = $Cur.psobject.Properties[$Name]
+                if ($null -eq $Prop) { return $null }
+                try { $Cur = $Prop.Value } catch { return $null }
             }
+            return $Cur
+        }
+        $TypeName = $Ex.GetType().FullName
+        if ($TypeName -cin $Global:RdaDiagnosticExceptionTypes) { $Facts.Add('exception=' + $TypeName) }
+        foreach ($Path in @(@('Response', 'StatusCode'), @('StatusCode'), @('Status')))
+        {
+            $Value = & $Read $Ex $Path
+            if ($null -eq $Value -or -not ($Value -is [int] -or $Value -is [System.Enum])) { continue }
+            $Number = 0L
+            try { $Number = [Convert]::ToInt64($Value) } catch { continue }
+            if ($Number -ge 100 -and $Number -le 599) { $Facts.Add('status=' + $Number); break }
+        }
+        foreach ($Path in @(@('Body', 'Code'), @('Error', 'Code'), @('ErrorCode'), @('Code')))
+        {
+            $Value = & $Read $Ex $Path
+            if ($Value -is [string] -and $Value -cin $Global:RdaDiagnosticErrorCodes) { $Facts.Add('code=' + $Value); break }
+        }
+        return ($Facts -join ' ')
+    }
+    catch { return '' }
+}
+
+# Facts text as a log line may hold it: each token in the closed grammar, in order, else dropped.
+Function Global:Test-RdaDiagnosticFacts([string]$Facts)
+{
+    # The writer's form only: single-space-separated tokens in this order, each at most once,
+    # page and records together; canonical whole numbers; no leading or trailing space.
+    if ([string]::IsNullOrEmpty($Facts)) { return $true }
+    $Order = @('exception', 'status', 'code', 'page', 'records')
+    $At = -1
+    foreach ($Part in $Facts.Split(' '))
+    {
+        if ($Part -cnotmatch '^(exception|status|code|page|records)=(.+)\z') { return $false }
+        $Name = $Matches[1]; $Value = $Matches[2]
+        $Next = [array]::IndexOf($Order, $Name)
+        if ($Next -le $At) { return $false }
+        $Valid = switch ($Name)
+        {
+            'exception' { $Value -cin $Global:RdaDiagnosticExceptionTypes }
+            'status' { $Value -cmatch '^[1-5][0-9]{2}\z' }
+            'code' { $Value -cin $Global:RdaDiagnosticErrorCodes }
+            'page' { $Value -cmatch '^(?:0|[1-9][0-9]{0,8})\z' }
+            'records' { $Value -cmatch '^(?:0|[1-9][0-9]{0,11})\z' }
+        }
+        if (-not $Valid) { return $false }
+        $At = $Next
+    }
+    # page and records come as a pair (the order above puts nothing between them).
+    if (($Facts -cmatch '(?:^| )page=') -ne ($Facts -cmatch '(?:^| )records=')) { return $false }
+    return $true
+}
+
+# What a failure entry prints where its message was: the text is never kept.
+Function Global:Get-RdaDiagnosticMessage($Entry)
+{
+    $Facts = $null
+    if ($null -ne $Entry -and $null -ne $Entry.psobject.Properties['Facts']) { $Facts = [string]$Entry.Facts }
+    # Where a consumption pull stopped: two whole numbers of the entry, not text.
+    if ($null -ne $Entry -and $Facts -cnotmatch 'page=' -and $null -ne $Entry.psobject.Properties['PageAtFailure'] -and $null -ne $Entry.psobject.Properties['RecordsCollected'])
+    {
+        $Page = 0; $Records = 0L
+        if ([int]::TryParse([string]$Entry.PageAtFailure, [ref]$Page) -and [long]::TryParse([string]$Entry.RecordsCollected, [ref]$Records) -and $Page -ge 0 -and $Records -ge 0 -and $Page -le 999999999 -and $Records -le 999999999999)
+        {
+            $Facts = (($Facts + (' page={0} records={1}' -f $Page, $Records))).Trim()
         }
     }
+    if ([string]::IsNullOrEmpty($Facts) -or -not (Test-RdaDiagnosticFacts $Facts)) { return '(message not kept)' }
+    return ('(message not kept: {0})' -f $Facts)
+}
 
-    # Auth artifacts first (highest severity): a SAS signature / token value in a
-    # URL or error must never ship even to the ingestion party. Mask the VALUE of
-    # sig=/signature=/sas=/(access|bearer)token=... and a 'Bearer <token>' header.
-    $Result = [regex]::Replace($Result, '(?i)\b(sig|signature|sas|accesstoken|access_token|bearertoken)=[^&\s"''<>]+', '$1=<redacted>')
-    $Result = [regex]::Replace($Result, '(?i)\bBearer\s+[A-Za-z0-9._\-]+', 'Bearer <redacted>')
-
-    $Result = [regex]::Replace($Result, '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '<email>')
-    $Result = [regex]::Replace($Result, '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '<ip>')
-    $Result = [regex]::Replace($Result, '(?i)\b[a-z0-9][a-z0-9-]*\.(?:blob|file|queue|table|dfs|vault|database|servicebus|azurewebsites|documents|search|azurecr|azuredatabricks|cognitiveservices|azconfig|azurefd|azure-api)\.[a-z0-9.]+\b', '<host>')
-    $Result = [regex]::Replace($Result, '(?i)\b[a-z0-9][a-z0-9-]*\.(?:cloudapp\.azure\.com|trafficmanager\.net|cache\.windows\.net)\b', '<host>')
-    $Result = [regex]::Replace($Result, '(?i)/home/[a-z0-9._-]+', '/home/<user>')
-    $Result = [regex]::Replace($Result, '(?i)C:\\Users\\[a-z0-9._-]+', 'C:\Users\<user>')
-    $Result = [regex]::Replace($Result, '(?<!_)\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '<guid>')
-
-    return $Result
+# A failure entry's subscription as the log writes it: its token when the run has one,
+# a label a writer gives ('(auth)', '(unknown)') or nothing, else '<guid>'.
+Function Global:Get-RdaDiagnosticSubLabel([string]$Id, [System.Collections.IDictionary]$SubMap)
+{
+    if ($Id -ceq '(auth)' -or $Id -ceq '(unknown)' -or [string]::IsNullOrEmpty($Id)) { return $Id }
+    if ($null -ne $SubMap -and $SubMap.Contains($Id.ToLowerInvariant())) { return [string]$SubMap[$Id.ToLowerInvariant()] }
+    return '<guid>'
 }
 
 # Resource Graph (the inventory's data path) through Invoke-AzRestMethod, so
@@ -555,23 +777,32 @@ function Invoke-AzGraphQuerySafe
 
 # The total of a count probe (`... | summarize count()`) across every row of an
 # Invoke-AzGraphQuerySafe result: one row per subscription batch. 0 for none.
-# A count_ that is present but not a whole number of 0 or more ends the function
-# with an error, as a failure in Invoke-AzGraphQuerySafe does, instead of being
-# read as 0, rounded or added as a negative number. 'Stop' here for the same
-# reason as there: the inventory's SilentlyContinue would otherwise let the
-# function go on past the throw.
+# A row that is null, or whose count_ is missing, null or not a whole number of
+# 0 or more, ends the function with an error, as a failure in
+# Invoke-AzGraphQuerySafe does, instead of being read as 0 (or skipped, which
+# counts too few), rounded or added as a negative number. An answer with no
+# rows at all is still 0. 'Stop' here for the same reason as there: the
+# inventory's SilentlyContinue would otherwise let the function go on past the
+# throw.
 function Get-AzGraphCount
 {
     param([Parameter(Mandatory = $true)]$Result)
     $ErrorActionPreference = 'Stop'
     $Total = [long]0
-    foreach ($Row in @($Result.data))
+    # Not `$Rows = if ...`: a statement's output is unrolled, so a lone null
+    # row would come out as no rows at all.
+    $Rows = @()
+    if ($null -ne $Result.data) { $Rows = @($Result.data) }
+    foreach ($Row in $Rows)
     {
-        if ($null -eq $Row -or $null -eq $Row.count_) { continue }
+        if ($null -eq $Row) { throw 'Resource Graph returned a count row that is null.' }
+        $HasCount = if ($Row -is [System.Collections.IDictionary]) { $Row.Contains('count_') } else { $null -ne $Row.PSObject.Properties['count_'] }
         $Value = [long]0
-        if (-not [long]::TryParse([string]$Row.count_, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Value) -or $Value -lt 0)
+        if (-not $HasCount -or $null -eq $Row.count_ -or -not [long]::TryParse([string]$Row.count_, [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$Value) -or $Value -lt 0)
         {
-            throw ("Resource Graph returned a count (count_, a {0}) that is not a whole number of 0 or more." -f $Row.count_.GetType().Name)
+            # Only the kind of value goes in the message, never the value.
+            $Kind = if (-not $HasCount) { 'missing' } elseif ($null -eq $Row.count_) { 'null' } else { 'a {0}' -f $Row.count_.GetType().Name }
+            throw ("Resource Graph returned a count (count_, {0}) that is not a whole number of 0 or more." -f $Kind)
         }
         $Total += $Value
     }
@@ -740,14 +971,10 @@ function Get-RdaSkippedNetworkCountFromRow
 # run for BOTH obfuscated and default (non-obfuscated) runs - the operator asked
 # for a diagnostic log on every run, not just obfuscated ones.
 #
-# Every free-text field that could carry an identifier (collector/phase failure
-# messages and the subscription id) is run through Protect-DiagnosticText:
-# dictionary-tokenized when an obfuscation dictionary exists (obfuscated run),
-# then any residual GUID/email/host/path masked by class. In a default run the
-# dictionaries are empty, so only the class masking applies - the log is still
-# scrubbed, but the surrounding bundle contains real identifiers, so the header
-# says so. Written as a HUMAN-READABLE .log (NOT .json) so the ingestion server
-# does not table-ingest it; the caller adds it to the zip Path array explicitly.
+# No failure message text is written (see Get-RdaDiagnosticMessage): a line holds
+# its collector, its subscription token and the closed-list facts of the error
+# object. The subscription is its token in an obfuscated run, '<guid>' otherwise. Written as a HUMAN-READABLE .log (NOT .json) so it is not read
+# as report data; the caller adds it to the zip Path array explicitly.
 #
 # Wrapped in try/catch and returns the written file path on success or $null on
 # failure: the diagnostics log is a troubleshooting aid, not the report, so a
@@ -769,52 +996,18 @@ function Write-RdaShareableDiagnosticsLog
 
     try
     {
-        # Real-value -> token scrub map for the free-text failure messages. The
-        # four core dictionaries are keyed by the real ARM RESOURCE ID (value =
-        # token), so derive the bare resource NAME (last path segment), RG name
-        # and subscription GUID from those keys and map each to the matching
-        # token - otherwise a bare name/RG/sub-GUID in an exception message would
-        # NOT be tokenized (only a full ARM path would). Tag values and free-text
-        # values are already real-value-keyed. Empty in a default run (no
-        # dictionaries), leaving Protect-DiagnosticText's class masking to act.
-        $DiagScrubMap = @{}
-        if ($null -ne $Global:ResourceIdDictionary)
+        # Subscription GUID -> token, for the entries' subscription label (no failure
+        # text is written, so nothing else is looked up). Empty in a default run.
+        $DiagSubMap = @{}
+        if ($null -ne $Global:ResourceIdDictionary -and $null -ne $Global:ResourceSubscriptionDictionary)
         {
             foreach ($realId in $Global:ResourceIdDictionary.Keys)
             {
-                if ([string]::IsNullOrEmpty($realId)) { continue }
-                if (-not $DiagScrubMap.ContainsKey($realId)) { $DiagScrubMap[$realId] = $Global:ResourceIdDictionary[$realId] }
-
-                $ShortName = ($realId -split '/')[-1]
-                if (-not [string]::IsNullOrEmpty($ShortName) -and $null -ne $Global:ResourceNameDictionary -and $Global:ResourceNameDictionary.ContainsKey($realId) -and -not $DiagScrubMap.ContainsKey($ShortName))
+                if ($realId -match '(?i)/subscriptions/([^/]+)' -and $Global:ResourceSubscriptionDictionary.ContainsKey($realId) -and -not $DiagSubMap.ContainsKey($Matches[1].ToLowerInvariant()))
                 {
-                    $DiagScrubMap[$ShortName] = $Global:ResourceNameDictionary[$realId]
-                }
-                if ($realId -match '(?i)/resourceGroups/([^/]+)')
-                {
-                    $RgName = $Matches[1]
-                    if (-not [string]::IsNullOrEmpty($RgName) -and $null -ne $Global:ResourceResourceGroupDictionary -and $Global:ResourceResourceGroupDictionary.ContainsKey($realId) -and -not $DiagScrubMap.ContainsKey($RgName))
-                    {
-                        $DiagScrubMap[$RgName] = $Global:ResourceResourceGroupDictionary[$realId]
-                    }
-                }
-                if ($realId -match '(?i)/subscriptions/([^/]+)')
-                {
-                    $SubGuid = $Matches[1]
-                    if (-not [string]::IsNullOrEmpty($SubGuid) -and $null -ne $Global:ResourceSubscriptionDictionary -and $Global:ResourceSubscriptionDictionary.ContainsKey($realId) -and -not $DiagScrubMap.ContainsKey($SubGuid))
-                    {
-                        $DiagScrubMap[$SubGuid] = $Global:ResourceSubscriptionDictionary[$realId]
-                    }
+                    $DiagSubMap[$Matches[1].ToLowerInvariant()] = $Global:ResourceSubscriptionDictionary[$realId]
                 }
             }
-        }
-        if ($null -ne $Global:TagValueDictionary)
-        {
-            foreach ($tagReal in $Global:TagValueDictionary.Keys) { if (-not [string]::IsNullOrEmpty($tagReal) -and -not $DiagScrubMap.ContainsKey($tagReal)) { $DiagScrubMap[$tagReal] = $Global:TagValueDictionary[$tagReal] } }
-        }
-        if ($null -ne $Global:FreeTextDictionary)
-        {
-            foreach ($ftReal in $Global:FreeTextDictionary.Keys) { if (-not [string]::IsNullOrEmpty($ftReal) -and -not $DiagScrubMap.ContainsKey($ftReal)) { $DiagScrubMap[$ftReal] = $Global:FreeTextDictionary[$ftReal] } }
         }
 
         # Phase durations rendered as "Nmin SS sec" (zero-padded seconds), e.g.
@@ -873,25 +1066,25 @@ function Write-RdaShareableDiagnosticsLog
         $DiagLines.Add(('Collector failures: {0}' -f $CollectorFails.Count))
         foreach ($cfItem in $CollectorFails)
         {
-            $DiagLines.Add(('  [sub {0}] {1}: {2}' -f (Protect-DiagnosticText ([string]$cfItem.Id) $DiagScrubMap), [string]$cfItem.Module, (Protect-DiagnosticText ([string]$cfItem.Message) $DiagScrubMap)))
+            $DiagLines.Add(('  [sub {0}] {1}: {2}' -f (Get-RdaDiagnosticSubLabel ([string]$cfItem.Id) $DiagSubMap), [string]$cfItem.Module, (Get-RdaDiagnosticMessage $cfItem)))
         }
         $DiagLines.Add('')
         $DiagLines.Add(('Metrics auth-skipped subscriptions: {0}' -f $MetricsSkips.Count))
         foreach ($msItem in $MetricsSkips)
         {
-            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$msItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$msItem.Message) $DiagScrubMap)))
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Get-RdaDiagnosticSubLabel ([string]$msItem.Id) $DiagSubMap), (Get-RdaDiagnosticMessage $msItem)))
         }
         $DiagLines.Add('')
         $DiagLines.Add(('Metrics incomplete subscriptions: {0}' -f $MetricsIncomplete.Count))
         foreach ($miItem in $MetricsIncomplete)
         {
-            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$miItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$miItem.Message) $DiagScrubMap)))
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Get-RdaDiagnosticSubLabel ([string]$miItem.Id) $DiagSubMap), (Get-RdaDiagnosticMessage $miItem)))
         }
         $DiagLines.Add('')
         $DiagLines.Add(('Consumption failed/incomplete subscriptions: {0}' -f $ConsumpSkips.Count))
         foreach ($csItem in $ConsumpSkips)
         {
-            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$csItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$csItem.Message) $DiagScrubMap)))
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Get-RdaDiagnosticSubLabel ([string]$csItem.Id) $DiagSubMap), (Get-RdaDiagnosticMessage $csItem)))
         }
 
         $DiagnosticsFile = ($DefaultPath + "Diagnostics_" + $ReportName + "_" + $RunDateTime + ".log")
@@ -980,7 +1173,9 @@ function Compress-RdaReportArchive
     {
         $ParentPath = ([System.IO.DirectoryInfo]::new($SourceDir)).Parent.FullName
         $Prefix = if ($ParentPath.Length -eq 3) { $ParentPath } else { $ParentPath + [System.IO.Path]::DirectorySeparatorChar }
-        foreach ($Child in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -ErrorAction Continue))
+        # -ErrorAction Stop: a folder it cannot list stops the zip, as in Compress-Archive,
+        # so a zip is never made without that folder's files.
+        foreach ($Child in @(Get-ChildItem -LiteralPath $SourceDir -Recurse -ErrorAction Stop))
         {
             $IsDirectory = $Child -is [System.IO.DirectoryInfo]
             if ($IsDirectory -and $Child.GetFiles().Count -ne 0) { continue }
@@ -1007,6 +1202,7 @@ function Compress-RdaReportArchive
     $TempPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($DestinationPath), $TempName)
     $ArchiveStream = $null
     $Archive = $null
+    $Moved = $false
     try
     {
         $ArchiveStream = [System.IO.File]::Open($TempPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -1032,6 +1228,8 @@ function Compress-RdaReportArchive
         if ($Entries.Count -gt 0)
         {
             [System.IO.File]::Move($TempPath, $DestinationPath)
+            # The last step that may fail: from here on nothing may fail the call.
+            $Moved = $true
         }
     }
     finally
@@ -1044,6 +1242,22 @@ function Compress-RdaReportArchive
             if ($null -eq $Disposable) { continue }
             try { $Disposable.Dispose() } catch { Write-Verbose ('Closing the partial archive failed: {0}' -f $_.Exception.Message) }
         }
-        if (Test-Path -LiteralPath $TempPath) { Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue }
+        # After the move there is no temporary file to remove. Before it, a failed clean-up
+        # only warns, so it never replaces the original error.
+        if (-not $Moved)
+        {
+            try
+            {
+                if (Test-Path -LiteralPath $TempPath)
+                {
+                    Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $TempPath) { Write-Warning ("Compress-RdaReportArchive: could not remove the temporary file '{0}'; delete it by hand." -f $TempPath) }
+                }
+            }
+            catch
+            {
+                Write-Warning ("Compress-RdaReportArchive: could not check or remove the temporary file '{0}': {1}; delete it by hand if it is there." -f $TempPath, $_.Exception.Message)
+            }
+        }
     }
 }

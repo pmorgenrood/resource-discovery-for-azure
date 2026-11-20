@@ -331,7 +331,7 @@ Describe 'Direct run that stops during setup' {
 
     It 'exits 1 when -ResourceGroup is given without -SubscriptionID' {
         $Run = Invoke-StandInRun -Service 'StandInWorking' -ResourceGroup 'rg-demo' -NoSubscriptionID
-        $Run.Console | Should -Match 'Resource Group Name present, but missing Subscription ID'
+        $Run.Console | Should -Match '-ResourceGroup was given without -SubscriptionID'
         $Run.Zip.Count | Should -Be 0
         $Run.ProcessExit | Should -Be 1
     }

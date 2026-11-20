@@ -214,6 +214,12 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         if ($Fn.Count -ne 1) { throw 'GetResorceConsumption was not found in ResourceInventory.ps1.' }
         $script:CollectionAst = $Fn[0]
         . ([scriptblock]::Create($Fn[0].Extent.Text))
+        # Get-ReportFolderName, which the lifted function calls for the folder name.
+        $Helper = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Get-ReportFolderName' }, $true))
+        if ($Helper.Count -ne 1) { throw 'Get-ReportFolderName was not found in ResourceInventory.ps1.' }
+        . ([scriptblock]::Create($Helper[0].Extent.Text))
+        # Get-RdaErrorFacts and the other helpers ResourceInventory.ps1 dot-sources at its start.
+        . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
         function Test-DataPlaneAuthReady { param($Phase) $true }
 
         function New-UsageRow
@@ -254,6 +260,18 @@ Describe 'Consumption phase (GetResorceConsumption in ResourceInventory.ps1)' {
         Remove-Variable -Name SubscriptionID, ResourceGroup, ConsumptionWindow -Scope Script -ErrorAction SilentlyContinue
     }
 
+
+    It 'writes a usage row without additionalInfo when the caller runs under Set-StrictMode -Version Latest' {
+        $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T10:00:00')
+        Mock Get-UsageAggregates { [pscustomobject]@{ UsageAggregations = @(New-UsageRow -ResourceUri '/subscriptions/sub-a/resourceGroups/rg-one/providers/Microsoft.Network/networkSecurityGroups/nsg-1'); ContinuationToken = $null } }
+        Set-StrictMode -Version Latest
+        try { GetResorceConsumption }
+        finally { Set-StrictMode -Off }
+        @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count | Should -Be 0
+        $Rows = @(Import-Csv -Path $Global:ConsumptionFileCsv)
+        $Rows.Count | Should -Be 1
+        ($Rows[0].InstanceData | ConvertFrom-Json).'Microsoft.Resources'.additionalInfo.vCores | Should -Be 0
+    }
     It 'collects the window the check queried at 23:59 when it runs after midnight' {
         $script:ConsumptionWindow = Get-ConsumptionWindow -Now ([datetime]'2026-10-27T23:59:00')
         Mock Get-Date { [datetime]'2026-10-28T00:01:00' }
@@ -944,6 +962,20 @@ Describe 'Resource group runs (-ResourceGroup)' {
         Get-ConsumptionRowResourceUri -InstanceData (@{ 'Microsoft.Resources' = @{ resourceUri = $script:InRg } } | ConvertTo-Json -Compress) | Should -Be $script:InRg
     }
 
+    It 'reads nothing, without an error, from InstanceData that lacks the URI under Set-StrictMode (<Case>)' -TestCases @(
+        @{ Case = 'empty object'; Raw = '{}' }
+        @{ Case = 'no URI property'; Raw = '{"Microsoft.Resources": {}}' }
+        @{ Case = 'a JSON number'; Raw = '5' }
+        @{ Case = 'a JSON array'; Raw = '[]' }
+        @{ Case = 'resources not an object'; Raw = '{"Microsoft.Resources": "x"}' }
+    ) {
+        # A caller's shell can run with strict mode on, which a missing property read stops on.
+        & {
+            Set-StrictMode -Version Latest
+            Get-ConsumptionRowResourceUri -InstanceData $Raw | Should -BeNullOrEmpty
+        }
+    }
+
     It 'does not pass on usage rows of other resource groups' {
         Mock Get-UsageAggregatesPage { New-RgUsagePage -Rows @(@{ Uri = $script:OtherRg; Quantity = 5 }, @{ Uri = $null; Raw = 'not json'; Quantity = 7 }) }
         $Probe = Invoke-ConsumptionValueProbe -SubscriptionId 'sub-a' -Window $script:Window -ResourceGroup 'rg-one'
@@ -975,7 +1007,7 @@ Describe 'Resource group runs (-ResourceGroup)' {
         $Result = Invoke-ConsumptionDataCheck -Subscriptions @([pscustomobject]@{ Id = 'sub-a'; Name = 'Alpha' }) -Window $script:Window -ResourceGroup 'RG-One'
         ($script:Payloads[0] | ConvertFrom-Json).query | Should -Be "resources | where resourceGroup == 'rg-one' | summarize ResourceCount = count() by subscriptionId"
         $Result.Results[0].Outcome | Should -Be 'Exempt'
-        $Result.Results[0].Detail | Should -Be "no resources in resource group 'RG-One' in Resource Graph; not checked (nothing to price)"
+        $Result.Results[0].Detail | Should -Be "no resources in resource group 'RG-One' in Resource Graph; not checked (no usage to read)"
         $Result.ShouldBlock | Should -BeFalse
         Should -Invoke Get-UsageAggregatesPage -Times 0 -Exactly
     }
