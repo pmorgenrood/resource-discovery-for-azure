@@ -636,8 +636,12 @@ try
                 # inside a text: so a name part left as written is refused here. Any other
                 # shape a run does not write (another number of segments, a flat token for an
                 # id a run masks part by part, a token of another form or hint) is refused too.
-                # The ResourceId is checked against the plain id; the ResourceUri must then be
-                # that same masked id, case for case, as a run writes both from one value.
+                # The ResourceId is checked against the plain id below. The ResourceUri check
+                # here cannot fail today: Protect-RdaUsageRow writes both cells from one value,
+                # and the checks above make the plain ResourceId equal the ResourceUri, case for
+                # case. It is kept only as a guard against a future change to
+                # Protect-RdaUsageRow that writes the two cells from different values (the
+                # tests put such a change in a copy of this tool, and this check stops it).
                 if ([string]$Instance.'Microsoft.Resources'.ResourceUri -cne [string]$UsageRow.ResourceId)
                 {
                     Stop-RdaOfflineMask ("{0}: consumption row {1}: the id in its InstanceData is not the row's masked id after masking (a run writes both from one value). Nothing was written." -f $ReportZip.Name, $RowIndex)

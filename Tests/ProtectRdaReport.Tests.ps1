@@ -2138,24 +2138,44 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
 
     # The id check after the row masking reads the row's ResourceId. A run writes
     # the InstanceData's ResourceUri from the same value, so it must be that same
-    # masked id, case for case: a copy of this tool whose row masking writes the
-    # ResourceUri in upper case (a fault no leak scan sees) is refused.
-    It 'refuses the report when, after the row masking, the id in a usage row''s InstanceData is not the row''s masked id' {
+    # masked id, case for case. That check cannot fail with today's
+    # Protect-RdaUsageRow: it guards a future change to it. Each case is a copy of
+    # this tool whose Protect-RdaUsageRow writes the two cells from different
+    # values, faults that no other check sees (another case, another token of the
+    # right shape) or sees only later (a plain id left in one cell), and the check
+    # must stop each one first.
+    It 'refuses the report when, after the row masking, the id in a usage row''s InstanceData is not the row''s masked id: <Case>' -ForEach @(
+        @{ Case = 'the ResourceUri written in upper case'; Find = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri'; Put = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri.ToUpperInvariant()' }
+        @{ Case = 'the ResourceUri left as the plain id'; Find = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri'; Put = '$InstanceObject.''Microsoft.Resources''.resourceUri = $RawUri' }
+        @{ Case = 'the ResourceUri given another token of the right shape'; Find = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri'; Put = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri -replace ''[0-9a-f]{12}\z'', ''000000000000''' }
+        @{ Case = 'the row''s ResourceId left as the plain id'; Find = '$Row.ResourceId = $ObfuscatedUri'; Put = '$Row.ResourceId = $RawUri' }
+    ) {
         $Zip = & $script:Change @{}
         $Tool = Join-Path $script:Work ('tool-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $Tool | Out-Null
         Get-ChildItem -LiteralPath $script:RepoRoot -Force | Where-Object { $_.Name -notin '.git', 'Tests' } | Copy-Item -Destination $Tool -Recurse
         $InvPath = Join-Path $Tool 'ResourceInventory.ps1'
-        $UriLine = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri'
         $InvText = [System.IO.File]::ReadAllText($InvPath)
-        ($InvText.Split($UriLine).Count - 1) | Should -Be 1 -Because 'the fault is put on the one line that writes the masked ResourceUri'
-        [System.IO.File]::WriteAllText($InvPath, $InvText.Replace($UriLine, $UriLine + '.ToUpperInvariant()'))
+        ($InvText.Split($Find).Count - 1) | Should -Be 1 -Because 'the fault is put on the one line of Protect-RdaUsageRow that writes that cell'
+        [System.IO.File]::WriteAllText($InvPath, $InvText.Replace($Find, $Put))
         $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
         $Text = @(& $script:Pwsh -NoProfile -NonInteractive -File (Join-Path $Tool 'Protect-RdaReport.ps1') -Path $Zip -OutputDirectory $Out 2>&1 | ForEach-Object { [string]$_ })
         $LASTEXITCODE | Should -Be 1 -Because ('the InstanceData id differs from the row''s masked id | {0}' -f ($Text -join ' | '))
         ($Text -join "`n") | Should -Match ('consumption row \d+: ' + [regex]::Escape("the id in its InstanceData is not the row's masked id after masking (a run writes both from one value). Nothing was written."))
         ($Text -join "`n") | Should -Not -Match 'rg-demo|vm-demo|12345678-1234' -Because 'the stop names no real value'
         Test-Path -LiteralPath $Out | Should -BeFalse -Because 'nothing is written'
+    }
+
+    # A doc check: the comment of that check says why it is kept although it cannot fail today.
+    It 'says, above the InstanceData id check, that it cannot fail today and guards a future change to Protect-RdaUsageRow' {
+        $Lines = [System.IO.File]::ReadAllLines((Join-Path $script:RepoRoot 'Protect-RdaReport.ps1'))
+        $At = @(for ($i = 0; $i -lt $Lines.Count; $i++) { if ($Lines[$i].Contains('if ([string]$Instance.''Microsoft.Resources''.ResourceUri -cne [string]$UsageRow.ResourceId)')) { $i } })
+        $At.Count | Should -Be 1
+        $Comment = @(for ($i = $At[0] - 1; $i -ge 0 -and $Lines[$i].TrimStart().StartsWith('#'); $i--) { $Lines[$i].Trim().TrimStart('#').Trim() })
+        [array]::Reverse($Comment)
+        $Text = $Comment -join ' '
+        $Text | Should -Match 'cannot fail today'
+        $Text | Should -Match 'guard against a future change to Protect-RdaUsageRow'
     }
 
     It 'masks a reservation''s tenant-scope usage row, and refuses the report when a name part of that id is left in a cell no one masks' {
