@@ -434,15 +434,24 @@ function Get-RdaRealValueSet
         foreach ($Id in $Map.Keys)
         {
             $Parts = ([string]$Id).Split('/')
-            if ($Parts.Count -lt 3 -or $Parts[1] -ine 'subscriptions') { & $Add $Id; continue }
             & $Add $Id
-            & $Add $Parts[2]
-            if ($Parts.Count -gt 4 -and $Parts[3] -ieq 'resourcegroups') { & $Add $Parts[4] }
+            # A subscription-scope id: its subscription and group are real values. A
+            # tenant-scope id ('/providers/<namespace>/<type>/<name>...', a reservation
+            # or a management group) has no subscription or group; its names are real
+            # values all the same. Any other key is taken whole only.
+            if ($Parts.Count -ge 3 -and $Parts[1] -ieq 'subscriptions')
+            {
+                & $Add $Parts[2]
+                if ($Parts.Count -gt 4 -and $Parts[3] -ieq 'resourcegroups') { & $Add $Parts[4] }
+                $From = 3
+            }
+            elseif ($Parts.Count -ge 3 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'providers') { $From = 1 }
+            else { continue }
             # After each 'providers' come the namespace and the type (Azure's words),
             # then the name, then a child type and its name, and so on. Every name is
             # a real value, Azure's fixed name '$system' too: a run gives it a token.
             $Providers = -1
-            for ($i = 3; $i -lt $Parts.Count; $i++)
+            for ($i = $From; $i -lt $Parts.Count; $i++)
             {
                 if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
                 if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
@@ -465,18 +474,22 @@ function Get-RdaRealValueSet
     foreach ($V in $ExtraValue)
     {
         & $Add $V
-        # A full id: its subscription, group and name parts are real values too.
+        # A full id: its subscription, group and name parts are real values too; a
+        # tenant-scope id ('/providers/...') has name parts only.
         $Parts = ([string]$V).Split('/')
         if ($Parts.Count -ge 3 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'subscriptions')
         {
             & $Add $Parts[2]
             if ($Parts.Count -gt 4 -and $Parts[3] -ieq 'resourcegroups') { & $Add $Parts[4] }
-            $Providers = -1
-            for ($i = 3; $i -lt $Parts.Count; $i++)
-            {
-                if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
-                if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
-            }
+            $From = 3
+        }
+        elseif ($Parts.Count -ge 3 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'providers') { $From = 1 }
+        else { continue }
+        $Providers = -1
+        for ($i = $From; $i -lt $Parts.Count; $i++)
+        {
+            if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
+            if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
         }
     }
     return $Set
@@ -1175,6 +1188,41 @@ function Test-RdaMaskedSlot
         }
     }
     return @($Bad | Select-Object -Unique)
+}
+
+# Whether $MaskedId is the id a -Obfuscate run writes for the plain consumption id
+# $PlainId: 'obfuscated' for an empty id; for an id the run masks part by part (a
+# '/subscriptions/<id>/...' path, or a tenant-scope id Test-RdaTenantScopeIdMaskable
+# takes) the same path with its subscription, its group and every name a token, as the
+# run's own Test-ObfuscatedIdShape reads it (a seeded run keeps an id by the same
+# check); for any other id one flat token, as Get-ObfuscatedResourceId writes it. So a
+# masked id that keeps a name part as written fails, whatever the name: Azure's fixed
+# name '$system', or a short name of letters only, neither of which the last leak scan
+# looks for inside a text.
+# Apart from that shape check, which mirrors the run's masking, every name slot of a
+# masked path must differ, in any case, from the plain id's segment there (the
+# subscription, the group and every name; the namespace and type words are kept): a
+# change that keeps a name both in the masking and in its mirror fails here too.
+function Test-RdaMaskedUsageId
+{
+    param([string]$PlainId, [string]$MaskedId)
+
+    if ([string]::IsNullOrEmpty($PlainId)) { return $MaskedId -ceq 'obfuscated' }
+    if ($PlainId -match '(?i)^/subscriptions/[^/]' -or (Test-RdaTenantScopeIdMaskable -ResourceId $PlainId))
+    {
+        $P = $PlainId.Split('/')
+        $M = ([string]$MaskedId).Split('/')
+        if ($P.Count -ne $M.Count) { return $false }
+        # The path pairs a word with a value from segment 1 on: subscriptions, resourcegroups,
+        # each type, with a name; providers with its namespace. An empty name is kept as written.
+        for ($i = 1; $i + 1 -lt $P.Count; $i += 2)
+        {
+            if ($P[$i] -ieq 'providers' -or [string]::IsNullOrEmpty($P[$i + 1])) { continue }
+            if ($M[$i + 1] -ieq $P[$i + 1]) { return $false }
+        }
+        return [bool](Test-ObfuscatedIdShape -RealId $PlainId -MaskedId $MaskedId)
+    }
+    return $MaskedId -ine $PlainId -and $MaskedId -cmatch '^(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 }
 
 function Test-RdaStrictUtf8File

@@ -558,6 +558,8 @@ try
             $NoMeterRows = [System.Collections.Generic.List[object]]::new()
             $NoIdRows = [System.Collections.Generic.List[object]]::new()
             $TokenRegex = Get-RdaTokenRegex
+            # Each plain id whose masked id was checked (see below), so an id is checked once.
+            $UsageIdsChecked = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
             Import-Csv -LiteralPath $CsvIn | ForEach-Object {
                 $RowIndex++
                 if ($RowIndex % 250000 -eq 0) { Write-Host ("  {0}: {1} consumption rows masked" -f $ReportZip.Name, $RowIndex) }
@@ -623,7 +625,25 @@ try
                     elseif (-not $Exempt.Contains($V) -and (Test-RdaAzureWordCandidate $V)) { [void]$Exempt.Add($V) }
                 }
                 [void]$Exempt.Add([string]$Instance.'Microsoft.Resources'.Location)
+                $PlainId = [string]$UsageRow.ResourceId
                 Protect-RdaUsageRow -Row $UsageRow -InstanceObject $Instance
+                # The masked id (the row's ResourceId and its InstanceData's ResourceUri) must be
+                # the one a run writes, every name part a token. The inventory and metric slot
+                # checks above never see an id that only billing holds, and the last leak scan
+                # does not look for a short name of letters, or Azure's fixed name '$system',
+                # inside a text: so a name part left as written is refused here. Any other
+                # shape a run does not write (another number of segments, a flat token for an
+                # id a run masks part by part, a token of another form or hint) is refused too.
+                # The ResourceId is checked against the plain id; the ResourceUri must then be
+                # that same masked id, case for case, as a run writes both from one value.
+                if ([string]$Instance.'Microsoft.Resources'.ResourceUri -cne [string]$UsageRow.ResourceId)
+                {
+                    Stop-RdaOfflineMask ("{0}: consumption row {1}: the id in its InstanceData is not the row's masked id after masking (a run writes both from one value). Nothing was written." -f $ReportZip.Name, $RowIndex)
+                }
+                if ($UsageIdsChecked.Add($PlainId) -and -not (Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId ([string]$UsageRow.ResourceId)))
+                {
+                    Stop-RdaOfflineMask ("{0}: consumption row {1}: its masked id is not the one a run writes (a name part left as written, or another shape). Nothing was written." -f $ReportZip.Name, $RowIndex)
+                }
                 $UsageRow.InstanceData = $Instance | ConvertTo-Json -Compress
                 $Bare = if ($RowIndex -le $BareCells.Length) { $BareCells[$RowIndex - 1] } else { 0 }
                 if ($Bare -ne 0)

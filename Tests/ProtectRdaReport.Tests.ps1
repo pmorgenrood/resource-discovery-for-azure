@@ -322,6 +322,72 @@ Describe 'The masked-field check, the real values and the exempt words' {
         $Set.Contains('serverfarms') | Should -BeFalse
     }
 
+    It 'takes a usage row''s masked id only as a run writes it: <Case>' -ForEach @(
+        @{ Case = 'every name a token'; Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/$system/topics/orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/topics/{t}'; Ok = $true }
+        @{ Case = 'the fixed name $system kept'; Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/$system'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/$system'; Ok = $false }
+        @{ Case = '$system kept as a parent'; Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/$SYSTEM/topics/orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/$SYSTEM/topics/{t}'; Ok = $false }
+        @{ Case = 'a short name of letters kept'; Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/sbbilling/queues/orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/queues/orders'; Ok = $false }
+        @{ Case = 'the group kept'; Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '/subscriptions/{t}/resourcegroups/rg/providers/microsoft.compute/disks/{t}'; Ok = $false }
+        @{ Case = 'a tenant-scope id with every name a token'; Plain = '/providers/microsoft.capacity/reservationorders/{s}/reservations/{s}'; Masked = '/providers/microsoft.capacity/reservationorders/{t}/reservations/{t}'; Ok = $true }
+        @{ Case = 'a tenant-scope id with a name kept'; Plain = '/providers/microsoft.capacity/reservationorders/{s}/reservations/{s}'; Masked = '/providers/microsoft.capacity/reservationorders/{t}/reservations/{s}'; Ok = $false }
+        @{ Case = 'a tenant-scope $system id as one flat token (not changed here)'; Plain = '/providers/microsoft.servicebus/namespaces/$system'; Masked = '{t}'; Ok = $true }
+        @{ Case = 'an id that is not an ARM path as one flat token'; Plain = 'marketplace-charge'; Masked = '{t}'; Ok = $true }
+        @{ Case = 'an id that is not an ARM path left as written'; Plain = 'marketplace-charge'; Masked = 'marketplace-charge'; Ok = $false }
+        @{ Case = 'an empty id as obfuscated'; Plain = ''; Masked = 'obfuscated'; Ok = $true }
+        @{ Case = 'a flat token for an id a run masks part by part'; Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '{t}'; Ok = $false }
+        @{ Case = 'a plain id in Azure''s casing, its masked id in lower-case words'; Plain = '/subscriptions/{s}/resourceGroups/RG-Bus/providers/Microsoft.ServiceBus/namespaces/$system/topics/Orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/topics/{t}'; Ok = $true }
+        @{ Case = 'a plain id in Azure''s casing, a name kept in another case'; Plain = '/subscriptions/{s}/resourceGroups/RG-Bus/providers/Microsoft.ServiceBus/namespaces/SbBilling/queues/Orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/queues/orders'; Ok = $false }
+    ) {
+        $S = '33333333-3333-3333-3333-333333333333'; $T = 'prod_11111111-1111-1111-1111-111111111111'
+        Test-RdaMaskedUsageId -PlainId $Plain.Replace('{s}', $S) -MaskedId $Masked.Replace('{t}', $T).Replace('{s}', $S) | Should -Be $Ok
+    }
+
+    # The run's shape check mirrors its masking, so a change that keeps a name in both
+    # passes it. Each case puts such a change into the shape check, as written in
+    # ResourceInventory.ps1, for this test only: the check on each name slot still
+    # refuses the id, and still takes one whose every name is a token.
+    It 'refuses a usage row''s masked id that keeps a name, also when the shape check is changed to keep it: <Case>' -ForEach @(
+        @{
+            Case = 'the fixed name $system, as an older build''s shape check kept it'
+            Find = 'if ($R[$i] -ieq ''providers'' -or [string]::IsNullOrEmpty($Next))'; Put = 'if ($R[$i] -ieq ''providers'' -or [string]::IsNullOrEmpty($Next) -or $Next -eq ''$system'')'
+            Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/$system'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/$system'
+        }
+        @{
+            Case = 'a short name of letters kept as written'
+            Find = 'elseif ($M[$i + 1] -cnotmatch $Token) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
+            Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/sbbilling/queues/orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/queues/ORDERS'
+        }
+        @{
+            Case = 'a tenant-scope name kept as written'
+            Find = 'elseif ($M[$i + 1] -cnotmatch $Token) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
+            Plain = '/providers/microsoft.capacity/reservationorders/{s}/reservations/{s}'; Masked = '/providers/microsoft.capacity/reservationorders/{t}/reservations/{s}'
+        }
+        @{
+            Case = 'the group kept as written'
+            Find = 'if ($M[$i + 1] -cnotmatch $RgToken) { return $false }'; Put = 'if ($M[$i + 1] -cnotmatch $RgToken -and $M[$i + 1] -ine $Next) { return $false }'
+            Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '/subscriptions/{t}/resourcegroups/rg/providers/microsoft.compute/disks/{t}'
+        }
+        @{
+            Case = 'the subscription kept as written'
+            Find = '$M[2] -cnotmatch $SubToken'; Put = '($M[2] -cnotmatch $SubToken -and $M[2] -ine $R[2])'
+            Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '/subscriptions/{s}/resourcegroups/{t}/providers/microsoft.compute/disks/{t}'
+        }
+    ) {
+        $S = '33333333-3333-3333-3333-333333333333'; $T = 'prod_11111111-1111-1111-1111-111111111111'
+        $PlainId = $Plain.Replace('{s}', $S)
+        $MaskedId = $Masked.Replace('{t}', $T).Replace('{s}', $S)
+        # Every name slot a token: the walk gives each pair's value a token, the namespace kept.
+        $Parts = $PlainId.Split('/')
+        for ($i = 1; $i + 1 -lt $Parts.Count; $i += 2) { if ($Parts[$i] -ine 'providers') { $Parts[$i + 1] = $T } }
+        $Good = $Parts -join '/'
+        Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId $Good | Should -BeTrue -Because 'an id whose every name is a token is the one a run writes'
+        $Real = ${function:Test-ObfuscatedIdShape}.ToString()
+        $Real.Contains($Find) | Should -BeTrue -Because 'the change is put into the shape check as it is written'
+        . ([scriptblock]::Create("function Test-ObfuscatedIdShape {`n" + $Real.Replace($Find, $Put) + "`n}"))
+        Test-ObfuscatedIdShape -RealId $PlainId -MaskedId $MaskedId | Should -BeTrue -Because 'the changed shape check takes the id that keeps a name'
+        Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId $MaskedId | Should -BeFalse
+    }
+
     It 'takes a $system name part from <Source> as a real value, so an inventory row or metric record that kept it stops the slot check' -ForEach @(
         @{ Source = 'the run''s dictionaries' }
         @{ Source = 'a full id passed in' }
@@ -349,6 +415,37 @@ Describe 'The masked-field check, the real values and the exempt words' {
             Test-RdaMaskedSlot -Row $Rec -Field 'ID', 'Name', 'ResourceGroup', 'Subscription' -RealValue $Set | Should -Be @('ID') -Because 'a metric record whose id kept $system as a parent name'
             Test-RdaMaskedSlot -Row @{ ID = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.servicebus/namespaces/$Tok/topics/$Tok"; Name = $Tok } -Field 'ID', 'Name' -RealValue $Set | Should -BeNullOrEmpty -Because 'the masked id holds tokens only'
             $Set.Contains('$system') | Should -BeTrue -Because 'a masked report leaves no name part as written, $system included'
+        }
+        finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
+    }
+
+    It 'takes the name parts of a tenant-scope id (no subscription) from <Source> as real values, so a masked id that kept one stops the slot check' -ForEach @(
+        @{ Source = 'the run''s dictionaries' }
+        @{ Source = 'a full id passed in' }
+    ) {
+        $Saved = @{}
+        foreach ($N in 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'TagValueDictionary', 'FreeTextDictionary') { $Saved[$N] = Get-Variable -Scope Global -Name $N -ValueOnly -ErrorAction SilentlyContinue; Set-Variable -Scope Global -Name $N -Value $null }
+        try
+        {
+            # A reservation and a management group: '/providers/<namespace>/<type>/<name>...',
+            # the path a run keeps for such an id, its names masked.
+            $OrderGuid = '44444444-4444-4444-4444-444444444444'; $ResGuid = '55555555-5555-5555-5555-555555555555'
+            $Res = "/providers/Microsoft.Capacity/reservationOrders/$OrderGuid/reservations/$ResGuid"
+            $Mg = '/providers/Microsoft.Management/managementGroups/mg-contoso-01'
+            if ($Source -like '*dictionaries')
+            {
+                $Ids = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                $Ids[$Res] = 'masked'; $Ids[$Mg] = 'masked'
+                Set-Variable -Scope Global -Name ResourceIdDictionary -Value $Ids
+                $Set = Get-RdaRealValueSet
+            }
+            else { $Set = Get-RdaRealValueSet -ExtraValue $Res, $Mg }
+            $Tok = 'prod_11111111-1111-1111-1111-111111111111'
+            Test-RdaMaskedSlot -Row @{ ID = "/providers/Microsoft.Capacity/reservationOrders/$Tok/reservations/$ResGuid" } -Field 'ID' -RealValue $Set | Should -Be @('ID') -Because 'the reservation''s own name was left'
+            Test-RdaMaskedSlot -Row @{ ID = "/providers/Microsoft.Capacity/reservationOrders/$OrderGuid/reservations/$Tok" } -Field 'ID' -RealValue $Set | Should -Be @('ID') -Because 'the order''s name was left as a parent'
+            Test-RdaMaskedSlot -Row @{ ID = "/providers/Microsoft.Capacity/reservationOrders/$Tok/reservations/$Tok" } -Field 'ID' -RealValue $Set | Should -BeNullOrEmpty -Because 'the masked id holds tokens only'
+            foreach ($V in $OrderGuid, $ResGuid, 'mg-contoso-01', $Res, $Mg) { $Set.Contains($V) | Should -BeTrue -Because $V }
+            foreach ($W in 'providers', 'Microsoft.Capacity', 'reservationOrders', 'reservations', 'Microsoft.Management', 'managementGroups') { $Set.Contains($W) | Should -BeFalse -Because "$W is Azure's word" }
         }
         finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
     }
@@ -1950,6 +2047,97 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
         @($Usage | Where-Object { $_.ResourceId -ceq $MaskedSb[0] }).Count | Should -Be 1 -Because 'the consumption row joins the inventory row by id'
         @($Usage | Where-Object { $_.ResourceId.StartsWith($MaskedSb[0] + '/topics/') }).Count | Should -Be 1 -Because 'the topic holds its namespace''s masked path'
+    }
+
+    It 'refuses the report when the masking leaves the name <Kept> of a usage row''s id as written, which the last leak scan cannot find in a text' -ForEach @(
+        @{ Kept = '$system'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/$system' }
+        @{ Kept = 'orders'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbbilling/queues/orders' }
+    ) {
+        # Each name is billed only (no inventory row or metric record holds it), so the
+        # inventory and metric slot checks never see it, and the last leak scan skips it
+        # (a short value of letters, or '$system', is not looked for inside a text).
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $Id).Replace('"Virtual Machines"', '"Service Bus"'))
+            $Lines -join "`n"
+        }.GetNewClosure()
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+
+        # Guard: this tool masks the row, and the check after the row masking takes it.
+        $M = & $script:Masked $Zip
+        $Csv = $M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]]
+        $Csv.IndexOf('/' + $Kept, [System.StringComparison]::Ordinal) | Should -Be -1 -Because 'the run gives the name a token'
+
+        # A copy of this tool whose id masking leaves only this name as written (a fault
+        # such as an older build's kept '$system'): the check after the row masking
+        # must refuse what it writes, and leave nothing behind.
+        $Tool = Join-Path $script:Work ('tool-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $Tool | Out-Null
+        Get-ChildItem -LiteralPath $script:RepoRoot -Force | Where-Object { $_.Name -notin '.git', 'Tests' } | Copy-Item -Destination $Tool -Recurse
+        $InvPath = Join-Path $Tool 'ResourceInventory.ps1'
+        $NameLine = '$Masked.Add($ResourceNameDictionary[$UpToName])'
+        $InvText = [System.IO.File]::ReadAllText($InvPath)
+        ($InvText.Split($NameLine).Count - 1) | Should -Be 1 -Because 'the fault is put on the one line that writes a name token'
+        [System.IO.File]::WriteAllText($InvPath, $InvText.Replace($NameLine, ('$Masked.Add($(if ($Next -ceq ''{0}'') {{ $Next }} else {{ $ResourceNameDictionary[$UpToName] }}))' -f $Kept)))
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $Text = @(& $script:Pwsh -NoProfile -NonInteractive -File (Join-Path $Tool 'Protect-RdaReport.ps1') -Path $Zip -OutputDirectory $Out 2>&1 | ForEach-Object { [string]$_ })
+        $LASTEXITCODE | Should -Be 1 -Because ('the masked usage id keeps {0} as written | {1}' -f $Kept, ($Text -join ' | '))
+        ($Text -join "`n") | Should -Match ('consumption row \d+: ' + [regex]::Escape('its masked id is not the one a run writes (a name part left as written, or another shape). Nothing was written.'))
+        ($Text -join "`n").IndexOf('/' + $Kept, [System.StringComparison]::Ordinal) | Should -Be -1 -Because 'the stop names no id'
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'nothing is written'
+    }
+
+    # The id check after the row masking reads the row's ResourceId. A run writes
+    # the InstanceData's ResourceUri from the same value, so it must be that same
+    # masked id, case for case: a copy of this tool whose row masking writes the
+    # ResourceUri in upper case (a fault no leak scan sees) is refused.
+    It 'refuses the report when, after the row masking, the id in a usage row''s InstanceData is not the row''s masked id' {
+        $Zip = & $script:Change @{}
+        $Tool = Join-Path $script:Work ('tool-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $Tool | Out-Null
+        Get-ChildItem -LiteralPath $script:RepoRoot -Force | Where-Object { $_.Name -notin '.git', 'Tests' } | Copy-Item -Destination $Tool -Recurse
+        $InvPath = Join-Path $Tool 'ResourceInventory.ps1'
+        $UriLine = '$InstanceObject.''Microsoft.Resources''.resourceUri = $ObfuscatedUri'
+        $InvText = [System.IO.File]::ReadAllText($InvPath)
+        ($InvText.Split($UriLine).Count - 1) | Should -Be 1 -Because 'the fault is put on the one line that writes the masked ResourceUri'
+        [System.IO.File]::WriteAllText($InvPath, $InvText.Replace($UriLine, $UriLine + '.ToUpperInvariant()'))
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $Text = @(& $script:Pwsh -NoProfile -NonInteractive -File (Join-Path $Tool 'Protect-RdaReport.ps1') -Path $Zip -OutputDirectory $Out 2>&1 | ForEach-Object { [string]$_ })
+        $LASTEXITCODE | Should -Be 1 -Because ('the InstanceData id differs from the row''s masked id | {0}' -f ($Text -join ' | '))
+        ($Text -join "`n") | Should -Match ('consumption row \d+: ' + [regex]::Escape("the id in its InstanceData is not the row's masked id after masking (a run writes both from one value). Nothing was written."))
+        ($Text -join "`n") | Should -Not -Match 'rg-demo|vm-demo|12345678-1234' -Because 'the stop names no real value'
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'nothing is written'
+    }
+
+    It 'masks a reservation''s tenant-scope usage row, and refuses the report when a name part of that id is left in a cell no one masks' {
+        $OrderGuid = '44444444-4444-4444-4444-444444444444'
+        $Reservation = "/providers/microsoft.capacity/reservationorders/$OrderGuid/reservations/55555555-5555-5555-5555-555555555555"
+        $AddRow = {
+            param([string]$T, [bool]$Plant)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Row = $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $Reservation)
+            # Only this usage row names the order; the report's pages do not.
+            if ($Plant) { $Row = ([regex]'""ImageType"":""""').Replace($Row, ('""ImageType"":""{0}""' -f $OrderGuid), 1) }
+            $Lines.Insert(1, $Row)
+            $Lines -join "`n"
+        }
+        $Clean = & $script:Masked (& $script:Change @{ 'Consumption_*.csv' = { param($T) & $AddRow $T $false } })
+        $Usage = @($Clean.Members[@($Clean.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
+        $Masked = @($Usage | Where-Object { $Clean.Dict.ResourceIdMap[$_.ResourceId] -eq $Reservation })
+        $Masked.Count | Should -Be 1
+        $Masked[0].ResourceId | Should -Match '^/providers/microsoft\.capacity/reservationorders/(?:prod|nonprod)_[0-9a-f-]{36}/reservations/(?:prod|nonprod)_[0-9a-f-]{36}$'
+
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path (& $script:Change @{ 'Consumption_*.csv' = { param($T) & $AddRow $T $true } }) -Out $Out
+        $R.ExitCode | Should -Be 1 -Because 'the order''s name is a real value the masked report must not hold'
+        ($R.Text -join "`n") | Should -Match 'A real name or id is still in: Consumption_'
+        ($R.Text -join "`n") | Should -Not -Match $OrderGuid -Because 'the message names no real value'
+        Test-Path -LiteralPath $Out | Should -BeFalse
     }
 
     It 'labels the page of a report over several subscriptions with their count, as the run does' {

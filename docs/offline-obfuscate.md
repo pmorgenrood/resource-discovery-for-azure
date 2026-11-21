@@ -47,7 +47,12 @@ It stops with exit code `1` and leaves nothing behind when:
   diagnostics log or main summary), or the main summary's failure counts do not fit the run summary's;
 - the report holds a file it does not know how to mask, or text a run does not write where it is (a
   phase or collector name the code has not, a line of a summary not in the writer's form);
-- a masked field, or any file it wrote, still holds a real name or id of the report.
+- a masked field, or any file it wrote, still holds a real name or id of the report;
+- a consumption row's masked id is not the one a run writes: every name part of it (the subscription, the group and
+  each name) must be a token, as a run's own shape check reads it, or one flat token for an id that is not an ARM
+  path. Each name part must also differ, in any case, from the plain id's part in that place, which does not rest on
+  the shape check. This is checked for each row's id after the row is masked, because the leak scan does not look for a short
+  name of letters only, or Azure's fixed name `$system`, inside a text.
 
 Its messages print no value from the report. Exit code `2` means `-Path` was not found, a script file
 the mask needs is missing, `-OutputDirectory` is not empty, is a drive or share root, or is inside a folder given
