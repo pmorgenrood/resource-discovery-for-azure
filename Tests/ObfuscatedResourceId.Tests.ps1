@@ -470,6 +470,45 @@ Describe 'The seed is checked when it is read' {
         (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm] | Should -BeIn @($First, $Second) -Because 'one of the two ids is kept'
     }
 
+    # The seed check drops a tag or free-text entry whose token is not of the run's form, equals
+    # its value, or is one the seed also uses in a path or for another value; the run then gives
+    # that value a new token. The 'preloaded' line counts the entries before that, so the run
+    # says how many it did not keep, as it does for seeded ids (a flat id among them).
+    It 'warns with the count of seeded tag and free-text entries it does not keep, and counts a flat id it does not keep among the seeded ids it does not keep' {
+        $script:SeedWarnings.Clear()
+        $SubTok = New-Tok; $RgTok = New-Tok; $NameTok = New-Tok; $Same = New-Tok
+        $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-w"
+        $Seed = @{
+            ResourceIdMap   = @{
+                "/subscriptions/$SubTok/resourcegroups/$RgTok/providers/microsoft.compute/virtualmachines/$NameTok" = $Vm
+                # A flat id whose token is not of the run's form, and one whose token is the group's.
+                'not-a-token' = 'flat-id-form'
+                $RgTok        = 'flat-id-shared'
+            }
+            ResourceNameMap = @{ $NameTok = $Vm }
+            # Kept: one each. Not kept: a token not of the form (tag and free text), one equal to
+            # its value (tag), and one the seed also uses in a path (the name's, the group's).
+            TagMap          = @{ (New-Tok) = 'tag-good'; ('prod_sub_' + [guid]::NewGuid().ToString()) = 'tag-form'; $Same = $Same; $NameTok = 'tag-shared' }
+            FreeTextMap     = @{ (New-Tok) = 'text good'; 'plain-text-token' = 'text form'; $RgTok = 'text shared' }
+        }
+        Invoke-SeededRun -SeedMaps $Seed -Rows @()
+        $Warn = $script:SeedWarnings -join "`n"
+        $Warn | Should -Match '\b3 seeded tag and 2 free-text mapping\(s\) were not kept\b'
+        $Warn | Should -Match 'those values get new tokens this run'
+        $Warn | Should -Match '\b2 seeded id\(s\) of another shape, or holding a subscription, resource group or parent with two tokens, or a token two subscriptions, groups or resources share, were not kept' -Because 'the two flat ids are counted among the seeded ids not kept'
+        foreach ($Real in 'tag-good', 'tag-form', 'tag-shared', 'text good', 'text form', 'text shared', 'flat-id-form', 'flat-id-shared', 'vm-w') { $Warn | Should -Not -Match ([regex]::Escape($Real)) -Because 'a warning holds no real value' }
+        @($Global:TagValueDictionary.Keys) | Should -Be @('tag-good')
+        @($Global:FreeTextDictionary.Keys) | Should -Be @('text good')
+    }
+
+    It 'writes no warning about tag or free-text entries when the seed''s are all kept' {
+        $script:SeedWarnings.Clear()
+        Invoke-SeededRun -SeedMaps @{ TagMap = @{ (New-Tok) = 'tag-good' }; FreeTextMap = @{ (New-Tok) = 'text good' } } -Rows @()
+        ($script:SeedWarnings -join "`n") | Should -Not -Match 'free-text mapping'
+        @($Global:TagValueDictionary.Keys) | Should -Be @('tag-good')
+        @($Global:FreeTextDictionary.Keys) | Should -Be @('text good')
+    }
+
     It 'keeps a good seeded id for a resource this run does not see' {
         $Gone = "$script:Base/microsoft.compute/virtualmachines/vm-gone"
         $Masked = "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.compute/virtualmachines/$(New-Tok)"

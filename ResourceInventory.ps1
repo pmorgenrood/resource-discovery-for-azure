@@ -1837,6 +1837,10 @@ Function RunInventorySetup()
             # seed) is not kept either, as Test-ObfuscatedIdShape refuses it.
             foreach ($K in @($RgLookup.Keys)) { if ([string]$RgLookup[$K] -cnotmatch ('^(prod|nonprod)_(mc_)?' + $SeedGuid + '$') -or [string]$RgLookup[$K] -ieq [string]$K) { [void]$RgLookup.Remove($K) } }
             foreach ($K in @($ResourceNameDictionary.Keys)) { if ([string]$ResourceNameDictionary[$K] -cnotmatch ('^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $SeedGuid + '$') -or [string]$ResourceNameDictionary[$K] -ieq @(([string]$K).Split('/'))[-1]) { [void]$ResourceNameDictionary.Remove($K) } }
+            # The seed's tag and free-text entries as preloaded, so the ones the checks below do
+            # not keep are counted in a warning (the 'preloaded' line counts them all).
+            $SeedTagCount = if ($null -ne $Global:TagValueDictionary) { $Global:TagValueDictionary.Count } else { 0 }
+            $SeedTextCount = if ($null -ne $Global:FreeTextDictionary) { $Global:FreeTextDictionary.Count } else { 0 }
             # A tag or free-text token is '<prefix>_<guid>', with no hint: one of another form,
             # or equal to the value it masks (ignoring case), is not kept either, so this run
             # gives that value a new token wherever it meets it.
@@ -2066,6 +2070,14 @@ Function RunInventorySetup()
             if ($SeedDropped -gt 0)
             {
                 Write-Log -Message ("Obfuscation dictionary: {0} seeded id(s) of another shape, or holding a subscription, resource group or parent with two tokens, or a token two subscriptions, groups or resources share, were not kept; their resources get new masked ids this run." -f $SeedDropped) -Severity 'Warning'
+            }
+            # The tag and free-text entries the checks above did not keep (a seeded flat id that
+            # is not kept is counted among the seeded ids, above).
+            $SeedTagDropped = $SeedTagCount - $(if ($null -ne $Global:TagValueDictionary) { $Global:TagValueDictionary.Count } else { 0 })
+            $SeedTextDropped = $SeedTextCount - $(if ($null -ne $Global:FreeTextDictionary) { $Global:FreeTextDictionary.Count } else { 0 })
+            if ($SeedTagDropped + $SeedTextDropped -gt 0)
+            {
+                Write-Log -Message ("Obfuscation dictionary: {0} seeded tag and {1} free-text mapping(s) were not kept (a token not of the form a run writes, a token equal to its value, or a token the seed also uses in a path or for another value); those values get new tokens this run." -f $SeedTagDropped, $SeedTextDropped) -Severity 'Warning'
             }
             # The slot index is only for this check: free it before the token loop.
             $SeedSlotsOf = $null
