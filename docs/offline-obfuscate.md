@@ -70,7 +70,9 @@ holds plain copies of the report, so delete it.
   their order. Nothing reads the field or the order.
 - Like a `-Obfuscate` run, it copies the words Azure writes in fields no run masks (a size, a region, an id's
   provider and type words such as `microsoft.compute/virtualmachines`). It checks those words have Azure's form, and
-  its leak scan finds one that is a name, group or subscription of the report of at least 5 characters that is 12 or
+  takes Azure's fixed word `$system` as a last type word with no name after it, as a run keeps it (Service Bus bills
+  `.../namespaces/<namespace>/$system`, which both write as `.../namespaces/<token>/$system`). Its leak scan
+  finds one that is a name, group or subscription of the report of at least 5 characters that is 12 or
   more long or holds a digit, and is not equal to or inside a value of a field no run masks. A shorter or letters-only one (a group
   `rg1` or `finance` written as a type word) is not found: no offline check can tell a word of Azure's form from
   Azure's own.

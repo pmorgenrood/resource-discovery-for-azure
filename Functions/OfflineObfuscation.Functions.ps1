@@ -2085,6 +2085,9 @@ function Publish-RdaOfflineOutput
 # and not equal to or inside a value of a field no run masks), not otherwise (a group 'rg1' or 'finance' as a type word). Not refused outright: a
 # real name may equal an Azure type word (a group 'servers'). Upgrade to a list of Azure's
 # types if a report ever holds such a word.
+# A last segment with no name after it may also be Azure's fixed word '$system' (any case):
+# Service Bus bills '.../namespaces/<namespace>/$system', and a run keeps that last type
+# segment as written ('.../namespaces/<token>/$system'), so the offline mask does too.
 function Test-RdaIdPathWord([string]$Id)
 {
     $Parts = $Id.Split('/')
@@ -2092,7 +2095,7 @@ function Test-RdaIdPathWord([string]$Id)
     for ($I = 3; $I -lt $Parts.Count; $I += 2)
     {
         $Segment = $Parts[$I]
-        if ($Segment -notmatch '^[A-Za-z][A-Za-z0-9]*\z') { return $false }
+        if ($Segment -notmatch '^[A-Za-z][A-Za-z0-9]*\z' -and -not ($I + 1 -ge $Parts.Count -and $Segment -ieq '$system')) { return $false }
         if ($I + 1 -ge $Parts.Count) { break }
         $Next = $Parts[$I + 1]
         if ($I -ne 3 -or $Segment -ine 'resourcegroups')

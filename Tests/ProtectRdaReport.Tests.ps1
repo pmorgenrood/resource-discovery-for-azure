@@ -635,6 +635,17 @@ Describe 'Names and types are kept as a run writes them' {
         $Bad = @{}; foreach ($K in $Rec.Keys) { $Bad[$(if ($K -eq 'MetricCount') { 'metriccount' } else { $K })] = $Rec[$K] }
         Test-RdaMetricRecordShape -Record $Bad -Shape $script:Shape | Should -BeFalse
     }
+
+    # A run keeps a last segment with no name after it as written, Azure's '$system' too
+    # (Service Bus bills '.../namespaces/<namespace>/$system'), so the offline mask takes it as
+    # a type word. '$system' with a name after it, and any other '$' word, are not Azure's form.
+    It 'takes a last type segment $system as Azure''s word, and no other $ word' {
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system' | Should -BeTrue
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$SYSTEM' | Should -BeTrue
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system/x' | Should -BeFalse
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$systemx' | Should -BeFalse
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$other' | Should -BeFalse
+    }
 }
 
 Describe 'Publish-RdaOfflineOutput' {
@@ -2060,6 +2071,28 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
         @($Usage | Where-Object { $_.ResourceId -ceq $MaskedSb[0] }).Count | Should -Be 1 -Because 'the consumption row joins the inventory row by id'
         @($Usage | Where-Object { $_.ResourceId.StartsWith($MaskedSb[0] + '/topics/') }).Count | Should -Be 1 -Because 'the topic holds its namespace''s masked path'
+    }
+
+    # A run keeps a last segment with no name after it as written, so a usage row of
+    # '.../namespaces/<namespace>/$system' is masked to '.../namespaces/<token>/$system'
+    # (Get-ObfuscatedResourceId). The offline mask writes the same, not a stop.
+    It 'masks a usage row whose id ends in the type word $system as a run masks it, keeping that word' {
+        $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/$system'
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $Plain).Replace('"Virtual Machines"', '"Service Bus"'))
+            $Lines -join "`n"
+        }.GetNewClosure()
+        $M = & $script:Masked (& $script:Change @{ 'Consumption_*.csv' = $AddRow })
+        $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
+        $Row = @($Usage | Where-Object { $M.Dict.ResourceIdMap[$_.ResourceId] -ceq $Plain })
+        $Row.Count | Should -Be 1 -Because 'the row is masked, and its masked id maps back to the plain id'
+        $Tok = '(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        $Row[0].ResourceId | Should -Match ('^/subscriptions/{0}/resourcegroups/{0}/providers/microsoft\.servicebus/namespaces/{0}/\$system\z' -f $Tok) -Because 'every name slot gets a token, and the last type word is kept as a run keeps it'
+        $Row[0].ResourceId.Contains('sbdemo01') | Should -BeFalse
     }
 
     It 'refuses the report when the masking leaves the name <Kept> of a usage row''s id as written, which the last leak scan cannot find in a text' -ForEach @(
