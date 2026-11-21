@@ -2464,6 +2464,34 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
     }
 
+    # An id that ends on the word providers ('/subscriptions/<id>/providers') or on the word
+    # resourceGroups ('/subscriptions/<id>/resourceGroups') with no value after it is stopped the
+    # same way, with a reason that names that word rather than a type word.
+    It 'refuses a usage row whose id ends on <Case> with no value after it, names that word in its reason, and writes nothing' -ForEach @(
+        @{ Case = 'the word providers (in a subscription id)'; Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/providers'; Want = "consumption row 1 has an id that ends on the word 'providers' with no provider namespace after it ('.../providers'). That is an id form this tool does not support" }
+        @{ Case = 'the word providers (in a group id)'; Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers'; Want = "consumption row 1 has an id that ends on the word 'providers' with no provider namespace after it ('.../providers'). That is an id form this tool does not support" }
+        @{ Case = 'the word resourceGroups'; Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups'; Want = "consumption row 1 has an id that ends on the word 'resourceGroups' with no group name after it ('/subscriptions/<id>/resourceGroups'). That is an id form this tool does not support" }
+    ) {
+        $script:TrailingWordPlain = $Plain
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $script:TrailingWordPlain))
+            $Lines -join "`n"
+        }
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape($Want)) -Because 'the stop names the word the id ends on'
+        ($R.Text -join ' ') | Should -Not -Match 'a type word with no name after it' -Because 'that word is not a type word'
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
+        ($R.Text -join ' ') | Should -Not -Match '12345678-1234-1234-1234-123456789012|rg-demo' -Because 'the stop names no id'
+        @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
+    }
+
     It 'refuses the report when the masking leaves the name <Kept> of a usage row''s id as written, which the last leak scan cannot find in a text' -ForEach @(
         @{ Kept = '$system'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/$system' }
         @{ Kept = 'orders'; Id = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbbilling/queues/orders' }

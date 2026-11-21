@@ -595,10 +595,17 @@ try
                 # A subscription id that ends on a type word, or on a provider namespace, with no
                 # name after it is a form this tool does not support either
                 # (Test-RdaTrailingTypeWordId): refused with its own reason, as masking the report
-                # again would stop here again. An odd number of segments is the namespace form.
+                # again would stop here again. An odd number of segments is the namespace form; an
+                # even one ends on a word, which the reason names when it is the word providers or
+                # the group word resourceGroups (segment 3), and else calls a type word.
                 if (Test-RdaTrailingTypeWordId ([string]$UsageRow.ResourceId))
                 {
-                    $EndsOn = if ((([string]$UsageRow.ResourceId).Split('/').Count % 2) -eq 1) { "a provider namespace with no type or name after it ('.../providers/<namespace>')" } else { "a type word with no name after it ('.../<type>/<name>/<type>')" }
+                    $IdParts = ([string]$UsageRow.ResourceId).Split('/')
+                    $EndsOn = if (($IdParts.Count % 2) -eq 1) { "a provider namespace with no type or name after it ('.../providers/<namespace>')" }
+                    elseif ($IdParts[-1] -ieq 'providers') { "the word 'providers' with no provider namespace after it ('.../providers')" }
+                    elseif ($IdParts.Count -eq 4 -and $IdParts[3] -ieq 'resourcegroups') { "the word 'resourceGroups' with no group name after it ('/subscriptions/<id>/resourceGroups')" }
+                    else { "a type word with no name after it ('.../<type>/<name>/<type>')" }
+                    $IdParts = $null
                     Stop-RdaOfflineMask ("{0}: consumption row {1} has an id that ends on {2}. That is an id form this tool does not support: no Azure billing row seen so far has it, and downstream would read that word as the resource's name. Ask the owner of this tool how to handle it. Nothing was written." -f $ReportZip.Name, $RowIndex, $EndsOn)
                 }
                 # One cell that cannot be read makes the whole file unusable: the quantity a number
