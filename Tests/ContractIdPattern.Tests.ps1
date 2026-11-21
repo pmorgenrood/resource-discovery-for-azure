@@ -77,7 +77,10 @@ Describe 'Get-RdaMaskedIdPattern' {
     }
 }
 
-Describe 'What the tests say about $system' {
+# A doc check, not a behaviour test: it reads comments only, so it passes on
+# code with or without the fix. The behaviour tests of the '$system' token are
+# in Tests/ObfuscateSystemName.Tests.ps1 and Tests/ObfuscatedResourceId.Tests.ps1.
+Describe 'Doc check (comments only, not behaviour): what the tests say about $system' {
     BeforeAll {
         # Whether a line is a stale comment about the fixed name (the test below):
         # one that calls a subscription-scope id with that name flat. A line that
