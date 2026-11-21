@@ -8,8 +8,7 @@
 # Definitions only, but for one step on load: it checks that
 # Functions/DictionaryTimeText.Functions.ps1 is next to it (throws if not, and
 # the throw stops the caller under any $ErrorActionPreference) and dot-sources
-# it, which defines Restore-DictionaryTimeText, the reader the recovery merge
-# uses too. Convert-RevealString references
+# it, which defines Restore-DictionaryTimeText. Convert-RevealString references
 # $Replacements / $tokenPattern / $script:fileHits which Invoke-RdaReveal (its
 # caller) establishes before invoking it, so the parent-scope lookup is safe.
 # =============================================================================

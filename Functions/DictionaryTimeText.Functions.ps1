@@ -4,7 +4,6 @@
 #
 # Restore-DictionaryTimeText, the one reader that gives back the text of a
 # dictionary value ConvertFrom-Json read as a time. Dot-sourced by
-# Functions/RecoveryMerge.Functions.ps1 (the merged dictionary) and by
 # Functions/RevealObfuscation.Functions.ps1 (the values Reveal puts back).
 # Definitions only - no top-level code, so loading it defines this one function
 # and changes nothing else in the caller's session.
@@ -35,9 +34,9 @@ function Restore-DictionaryTimeText([string]$Text, [System.Collections.Generic.L
     $Settings.MaxDepth = 1024
     $Settings.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
     $Root = [Newtonsoft.Json.JsonConvert]::DeserializeObject($Text, $Settings)
-    # Reveal reads a list of one object (no build writes one, and the merge
-    # refuses one), which ConvertFrom-Json gives as that object, so its values
-    # are looked up in that object.
+    # Reveal reads a list of one object (no build writes one), which
+    # ConvertFrom-Json gives as that object, so its values are looked up in
+    # that object.
     if ($Root -is [Newtonsoft.Json.Linq.JArray] -and $Root.Count -eq 1 -and $Root[0] -is [Newtonsoft.Json.Linq.JObject]) { $Root = $Root[0] }
     # A root that is not an object has no map to look up.
     if ($Root -isnot [Newtonsoft.Json.Linq.JObject]) { return }

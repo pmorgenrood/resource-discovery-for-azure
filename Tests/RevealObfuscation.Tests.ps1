@@ -1645,9 +1645,8 @@ Describe 'Reveal and a dictionary value that looks like a time' {
         $Html | Should -BeLike ('*<td>{0}</td><td>{0}</td>*' -f [WildcardPattern]::Escape($Encoded)) -Because 'the HTML report gets back the text the dictionary holds'
     }
 
-    # No build writes a dictionary file whose root is a list, and the merge refuses
-    # one. ConvertFrom-Json reads a list of one object as that object, so Reveal
-    # reveals such a file, and a value there that looks like a time gets back the
+    # No build writes a dictionary file whose root is a list. ConvertFrom-Json
+    # reads a list of one object as that object, so Reveal reveals such a file, and a value there that looks like a time gets back the
     # text the file holds, as it does in a dictionary whose root is an object.
     It 'reveals a dictionary file whose root is a list of one object that holds a value that looks like a time' {
         $Dir = Join-Path $script:TmpDir ('timelist_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -1695,8 +1694,8 @@ Describe 'Reveal and a dictionary value that looks like a time' {
 }
 
 # Reveal.ps1, and each of its per-folder jobs, dot-sources only
-# RevealObfuscation.Functions.ps1, which loads the reader the merge uses too. A
-# caller with no try, as an operator's own script is, runs in a child pwsh.
+# RevealObfuscation.Functions.ps1, which loads DictionaryTimeText.Functions.ps1
+# (Restore-DictionaryTimeText). A caller with no try, as an operator's own script is, runs in a child pwsh.
 Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.ps1 next to it' {
     It 'stops the caller when it is loaded, under ErrorActionPreference <Preference>' -ForEach @(
         @{ Preference = 'SilentlyContinue' }
