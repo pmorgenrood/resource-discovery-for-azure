@@ -486,6 +486,83 @@ Describe "Reveal-Obfuscation dictionary handling and source safety" {
     }
 }
 
+# Reveal puts a token's value wherever the token stands: in any field, and in a subscription,
+# group or name segment of an id. A dictionary that gives one token to two maps (changed or
+# merged by hand) would write one map's value into the other's fields, and -Fields would reveal
+# a field it does not name. A run gives each value a token of its own; SubscriptionMap and
+# SubscriptionNameMap hold one subscription's token by design. So Reveal checks every map,
+# ignoring case, whatever -Fields selects, and stops on a shared token before it writes anything.
+Describe "Reveal-Obfuscation stops on a dictionary that gives one token to two maps" {
+
+    BeforeAll {
+        $script:ClashId = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-other/providers/Microsoft.Compute/virtualMachines/vm-other'
+    }
+
+    It "stops with <Mode> on a token that <Case> share, names the token and both maps, and writes nothing" -ForEach @(
+        foreach ($Mode in '-Fields Tag', '-All')
+        {
+            @{ Mode = $Mode; Case = 'a tag value and a resource name'; Map = 'TagMap'; Tok = 'TokName'; Upper = $false; Value = 'real-tag'; Other = 'ResourceNameMap' }
+            @{ Mode = $Mode; Case = 'a tag value and a free-text value'; Map = 'TagMap'; Tok = 'TokFree'; Upper = $false; Value = 'real-tag'; Other = 'FreeTextMap' }
+            @{ Mode = $Mode; Case = 'a tag value and a resource group'; Map = 'TagMap'; Tok = 'TokRg'; Upper = $false; Value = 'real-tag'; Other = 'ResourceGroupMap' }
+            @{ Mode = $Mode; Case = 'a tag value and a subscription'; Map = 'TagMap'; Tok = 'TokSub'; Upper = $false; Value = 'real-tag'; Other = 'SubscriptionMap' }
+            @{ Mode = $Mode; Case = 'a subscription name and a tag value'; Map = 'SubscriptionNameMap'; Tok = 'TokTag'; Upper = $false; Value = 'real-sub-name'; Other = 'TagMap' }
+            @{ Mode = $Mode; Case = 'a free-text value and a resource name'; Map = 'FreeTextMap'; Tok = 'TokName'; Upper = $false; Value = 'real-free'; Other = 'ResourceNameMap' }
+            @{ Mode = $Mode; Case = 'a resource group and a resource name'; Map = 'ResourceGroupMap'; Tok = 'TokName'; Upper = $false; Value = 'ClashId'; Other = 'ResourceNameMap' }
+            @{ Mode = $Mode; Case = 'a subscription and a resource group'; Map = 'SubscriptionMap'; Tok = 'TokRg'; Upper = $false; Value = 'ClashId'; Other = 'ResourceGroupMap' }
+            @{ Mode = $Mode; Case = 'a resource name and a flat id'; Map = 'ResourceNameMap'; Tok = 'TokId'; Upper = $false; Value = 'ClashId'; Other = 'ResourceIdMap' }
+            @{ Mode = $Mode; Case = 'a tag value and a resource name (written in another case)'; Map = 'TagMap'; Tok = 'TokName'; Upper = $true; Value = 'real-tag'; Other = 'ResourceNameMap' }
+        }
+    ) {
+        $Token = (Get-Variable -Scope Script -Name $Tok -ValueOnly)
+        if ($Upper) { $Token = $Token.ToUpperInvariant() }
+        $Real = if ($Value -eq 'ClashId') { $script:ClashId } else { $Value }
+        $Dir = Join-Path $script:TmpDir ("clash_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        $D = Get-Content -LiteralPath $script:DictPath -Raw | ConvertFrom-Json -AsHashtable
+        $D[$Map][$Token] = $Real
+        $DictFile = Join-Path $Dir 'ObfuscationDictionary_Clash.json'
+        $D | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $DictFile -Encoding utf8
+        $Out = Join-Path $Dir 'out.zip'
+        $Splat = @{ InputZip = $script:InputZip; DictionaryPath = $DictFile; OutputZip = $Out }
+        if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('Tag') }
+
+        $Err = $null
+        try { & $script:RevealScript @Splat *>&1 | Out-Null }
+        catch { $Err = $_ }
+        $Err | Should -Not -BeNullOrEmpty -Because 'Reveal stops on a token two maps hold'
+        $Msg = $Err.Exception.Message
+        $Msg | Should -Match 'more than one map'
+        $Msg | Should -Match ([regex]::Escape($Token)) -Because 'the message names the token'
+        $Msg | Should -Match "\b$Map\b" -Because 'the message names the map'
+        $Msg | Should -Match "\b$Other\b" -Because 'the message names the other map'
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value'
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'no output zip is written'
+        Test-Path -LiteralPath (($Out -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
+        (Get-FileHash -Path $script:InputZip -Algorithm SHA256).Hash | Should -Be $script:InputZipHashBefore
+    }
+
+    It "reveals, with <Mode>, a dictionary whose one shared token is the subscription's, in SubscriptionMap and SubscriptionNameMap, as a run writes it" -ForEach @(
+        @{ Mode = '-Fields Tag' }
+        @{ Mode = '-All' }
+    ) {
+        $R = if ($Mode -eq '-All') { Invoke-Reveal -All } else { Invoke-Reveal -Fields @('Tag') }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
+        $R.Inventory.VirtualMachines[0].Tags[0].Value | Should -BeExactly $script:RealTagVal
+        if ($Mode -eq '-All')
+        {
+            $R.Inventory.VirtualMachines[0].Subscription | Should -BeExactly $script:RealSubName
+            $R.Inventory.VirtualMachines[0].Name | Should -BeExactly 'vm01'
+            $R.Csv[0].InstanceId | Should -BeExactly "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/$($script:RealRgName)/providers/Microsoft.Compute/virtualMachines/vm01"
+        }
+        else
+        {
+            $R.Inventory.VirtualMachines[0].Subscription | Should -BeExactly $script:TokSub
+            $R.Inventory.VirtualMachines[0].Name | Should -BeExactly $script:TokName
+        }
+    }
+}
+
 # =============================================================================
 # FreeText round-trip via FreeTextMap (P3) — fixture-independent
 # -----------------------------------------------------------------------------

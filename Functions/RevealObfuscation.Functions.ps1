@@ -62,6 +62,47 @@ function Get-SubGuidFromResourceId
     return $null
 }
 
+# The tokens a dictionary gives to more than one map, ignoring case, as Reveal looks a token
+# up. Reveal puts a token's value wherever the token stands: in any field, and in a
+# subscription, group or name segment of an id. So a token that two maps hold (a tag value's
+# token that is also a resource name's: a dictionary changed or merged by hand) would write
+# one map's value into the other's fields and ids, and -Fields would reveal a field it does
+# not name. A run gives every subscription, group, name, flat id, tag value and free-text
+# value a new token of its own. The one pair that holds the same tokens by design is
+# SubscriptionMap and SubscriptionNameMap: both are keyed by a subscription's token (its id
+# in one, its display name in the other), so they count as one map here. $Maps is map name ->
+# lookup table; every map Reveal reads is passed, whatever -Fields selects. Returns one entry
+# per shared token, with the maps that hold it, never a real value.
+function Get-RdaRevealSharedToken
+{
+    param([System.Collections.IDictionary]$Maps)
+
+    $FirstMap = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $Shared = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($MapName in @($Maps.Keys))
+    {
+        $Table = $Maps[$MapName]
+        if ($null -eq $Table) { continue }
+        $Owner = if ($MapName -ceq 'SubscriptionNameMap') { 'SubscriptionMap' } else { [string]$MapName }
+        foreach ($Token in $Table.Keys)
+        {
+            $Seen = $null
+            if (-not $FirstMap.TryGetValue([string]$Token, [ref]$Seen)) { $FirstMap[[string]$Token] = [string]$MapName; continue }
+            $SeenOwner = if ($Seen -ceq 'SubscriptionNameMap') { 'SubscriptionMap' } else { $Seen }
+            if ($SeenOwner -ceq $Owner) { continue }
+            $List = $null
+            if (-not $Shared.TryGetValue([string]$Token, [ref]$List))
+            {
+                $List = [System.Collections.Generic.List[string]]::new()
+                $List.Add($Seen)
+                $Shared[[string]$Token] = $List
+            }
+            if (-not $List.Contains([string]$MapName)) { $List.Add([string]$MapName) }
+        }
+    }
+    foreach ($Token in $Shared.Keys) { [pscustomobject]@{ Token = $Token; Maps = @($Shared[$Token]) } }
+}
+
 function Get-JsonEscaped
 {
     # Return the input string escaped for placement INSIDE a JSON string literal
@@ -261,6 +302,26 @@ function Invoke-RdaReveal
     $IdMap = ConvertTo-LookupTable $Dict.ResourceIdMap
     $NameMap = ConvertTo-LookupTable $Dict.ResourceNameMap
     $FreeTextMap = ConvertTo-LookupTable $Dict.FreeTextMap
+
+    # ---- One token, one map ------------------------------------------------
+    # Checked over every map, whatever -Fields selects, before any value is
+    # replaced (Get-RdaRevealSharedToken): a dictionary that gives one token to
+    # two maps would reveal one map's value in the other's places, so nothing
+    # is written.
+    $SharedTokens = @(Get-RdaRevealSharedToken -Maps ([ordered]@{
+                ResourceGroupMap    = $RgMap
+                SubscriptionMap     = $SubMap
+                SubscriptionNameMap = $SubNameMap
+                TagMap              = $TagMap
+                ResourceNameMap     = $NameMap
+                ResourceIdMap       = $IdMap
+                FreeTextMap         = $FreeTextMap
+            }))
+    if ($SharedTokens.Count -gt 0)
+    {
+        throw ("The dictionary gives {0} token(s) to more than one map, ignoring case (the first: '{1}', in {2}). Reveal puts a token's value wherever the token stands, so it would write one map's value into another map's fields and ids. Nothing was written. A run gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $SharedTokens.Count, $SharedTokens[0].Token, ($SharedTokens[0].Maps -join ' and '))
+    }
+    $SharedTokens = $null
 
     # ---- Build token -> real-value replacement map for selected fields -----
     $Replacements = @{}
