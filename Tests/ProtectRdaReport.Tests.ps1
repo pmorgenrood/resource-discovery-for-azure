@@ -828,6 +828,15 @@ Describe 'Names and types are kept as a run writes them' {
             $Text | Should -Not -Match 'the offline mask accepts it to match' -Because "$File no longer takes that form"
         }
     }
+
+    # Test-RdaTrailingTypeWordId counts only subscription ids: a run writes a tenant-scope id of
+    # that form as one flat token, so the doc says which ids the stop covers.
+    It 'says, in its doc, that it stops a usage row whose subscription id ends on another word with no value after it, and not a tenant-scope id of that form' {
+        $Text = ([System.IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/offline-obfuscate.md')) -replace '\s+', ' ') -replace '[`'']', ''
+        $Text | Should -Match ([regex]::Escape('A usage row whose subscription id (/subscriptions/...) ends on any other type word with no name after it'))
+        $Text | Should -Match ([regex]::Escape('on the word providers or resourceGroups with no value after it'))
+        $Text | Should -Match ([regex]::Escape('A tenant-scope id (/providers/...) of that form is not stopped: a run writes it as one flat token, which keeps no word.'))
+    }
 }
 
 Describe 'Publish-RdaOfflineOutput' {
