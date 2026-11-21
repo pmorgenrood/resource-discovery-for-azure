@@ -1816,6 +1816,9 @@ Function RunInventorySetup()
         # - a token that the seed gives two real subscriptions, groups or
         #   resources (in any slots) is the same: kept for none, every id
         #   holding it dropped. A SQL VM and its VM count as one resource.
+        #   A group's token that an older dictionary also gave the name after
+        #   a type word resourceGroups in a tenant-scope id is kept for the
+        #   group, and only those tenant-scope ids are dropped.
         if (-not [string]::IsNullOrEmpty($ObfuscationDictionary))
         {
             # The seed's maps first: a group or name token that is not of its
@@ -1914,6 +1917,28 @@ Function RunInventorySetup()
                     }
                 }
             }
+            # A token an older dictionary gave both a real group <x> and the name
+            # after a type word resourceGroups in a tenant-scope id
+            # ('/providers/<ns>/resourceGroups/<x>', which older builds read as
+            # a group slot) is that group's token: when that is its only clash,
+            # only the tenant-scope ids that hold it are dropped (their name gets
+            # a new token), and the group and every seeded id in it keep it.
+            $SeedTenantGroupTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($T in @($SeedTokenReals.Keys))
+            {
+                if ($SeedTokenReals[$T].Count -lt 2) { continue }
+                $SeedGroupReals = @($SeedTokenReals[$T] | Where-Object { $_.StartsWith('rg|', [System.StringComparison]::OrdinalIgnoreCase) })
+                if ($SeedGroupReals.Count -ne 1) { continue }
+                $SeedGroup = $SeedGroupReals[0].Substring(3)
+                $SeedOnlyTenant = $true
+                foreach ($SeedOther in $SeedTokenReals[$T])
+                {
+                    if ($SeedOther -ieq $SeedGroupReals[0]) { continue }
+                    $SeedOtherParts = if ($SeedOther.StartsWith('name|', [System.StringComparison]::OrdinalIgnoreCase)) { $SeedOther.Substring(5).Split('/') } else { @() }
+                    if (-not ($SeedOtherParts.Count -eq 5 -and $SeedOtherParts[0] -eq '' -and $SeedOtherParts[1] -ieq 'providers' -and $SeedOtherParts[3] -ieq 'resourcegroups' -and $SeedOtherParts[4] -ieq $SeedGroup)) { $SeedOnlyTenant = $false; break }
+                }
+                if ($SeedOnlyTenant) { [void]$SeedTenantGroupTokens.Add($T) }
+            }
             foreach ($SeedRealId in @($SeedSlotsOf.Keys))
             {
                 $Conflict = $false
@@ -1921,7 +1946,7 @@ Function RunInventorySetup()
                 {
                     if ($SeedSlotTokens[$Slot.Kind + '|' + $Slot.Real.ToLowerInvariant()].Count -gt 1) { $Conflict = $true; break }
                     if ($Slot.Kind -eq 'sub' -and $SeedSubTokenIds[$Slot.Token].Count -gt 1) { $Conflict = $true; break }
-                    if ($SeedTokenReals[[string]$Slot.Token].Count -gt 1) { $Conflict = $true; break }
+                    if ($SeedTokenReals[[string]$Slot.Token].Count -gt 1 -and -not ($Slot.Kind -eq 'rg' -and $SeedTenantGroupTokens.Contains([string]$Slot.Token))) { $Conflict = $true; break }
                 }
                 if ($Conflict)
                 {
@@ -1953,13 +1978,18 @@ Function RunInventorySetup()
                     'name' { [void]$ResourceNameDictionary.Remove($Real) }
                 }
             }
-            # A token given to two reals is kept for none of them.
+            # A token given to two reals is kept for none of them, except a
+            # group's token whose only clash is a tenant-scope id's name (above):
+            # it is kept for the group, and no name keeps it.
             $SharedTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-            foreach ($T in @($SeedTokenReals.Keys)) { if ($SeedTokenReals[$T].Count -gt 1) { [void]$SharedTokens.Add($T) } }
+            foreach ($T in @($SeedTokenReals.Keys)) { if ($SeedTokenReals[$T].Count -gt 1 -and -not $SeedTenantGroupTokens.Contains($T)) { [void]$SharedTokens.Add($T) } }
             if ($SharedTokens.Count -gt 0)
             {
                 foreach ($K in @($RgLookup.Keys)) { if ($SharedTokens.Contains([string]$RgLookup[$K])) { [void]$RgLookup.Remove($K) } }
-                foreach ($K in @($ResourceNameDictionary.Keys)) { if ($SharedTokens.Contains([string]$ResourceNameDictionary[$K])) { [void]$ResourceNameDictionary.Remove($K) } }
+            }
+            if ($SharedTokens.Count + $SeedTenantGroupTokens.Count -gt 0)
+            {
+                foreach ($K in @($ResourceNameDictionary.Keys)) { if ($SharedTokens.Contains([string]$ResourceNameDictionary[$K]) -or $SeedTenantGroupTokens.Contains([string]$ResourceNameDictionary[$K])) { [void]$ResourceNameDictionary.Remove($K) } }
             }
             Write-Log -Message ("Obfuscation dictionary: {0} subscription token(s) kept from the seeded ids." -f @($SubLookup.Keys).Count) -Severity 'Info'
             if ($SeedDropped -gt 0)
@@ -1971,6 +2001,7 @@ Function RunInventorySetup()
             $SeedSlotTokens = $null
             $SeedSubTokenIds = $null
             $SeedTokenReals = $null
+            $SeedTenantGroupTokens = $null
             $SharedTokens = $null
         }
 

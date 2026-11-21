@@ -699,6 +699,52 @@ Describe 'The seed is checked when it is read' {
         }
     }
 
+    # An older build read a segment 3 'resourceGroups' in a tenant-scope id as a
+    # group slot, so its dictionary gives '/providers/<ns>/resourceGroups/grp-a'
+    # the token of the real group grp-a. That token then has two real values, a
+    # group and a tenant-scope name: only the tenant-scope id is dropped (its name
+    # gets a new token), and every seeded id of the group keeps its tokens, in the
+    # first seeded run and the next.
+    It 'keeps the group token an older dictionary also gave the name after a type word resourceGroups in a tenant-scope id, drops only that id, and the next seeded run keeps both' {
+        $Vm = "/subscriptions/$script:Sub/resourcegroups/grp-a/providers/microsoft.compute/virtualmachines/vm-a"
+        $Disk = "/subscriptions/$script:Sub/resourcegroups/grp-a/providers/microsoft.compute/disks/disk-a"
+        $Ten = '/providers/Microsoft.Example/resourceGroups/grp-a'
+        $SubTok = New-Tok; $Grp = New-Tok; $VmTok = New-Tok; $DiskTok = New-Tok
+        $Older = @{
+            Vm   = "/subscriptions/$SubTok/resourcegroups/$Grp/providers/microsoft.compute/virtualmachines/$VmTok"
+            Disk = "/subscriptions/$SubTok/resourcegroups/$Grp/providers/microsoft.compute/disks/$DiskTok"
+            Ten  = "/providers/Microsoft.Example/resourceGroups/$Grp"
+        }
+        $Seed = @{
+            ResourceIdMap    = @{ $Older.Vm = $Vm; $Older.Disk = $Disk; $Older.Ten = $Ten }
+            ResourceNameMap  = @{ $VmTok = $Vm; $DiskTok = $Disk; $Grp = $Ten }
+            ResourceGroupMap = @{ $Grp = $Vm }
+            SubscriptionMap  = @{ $SubTok = $Vm }
+        }
+        # The run meets the VM and the tenant-scope row; the disk is a seeded id it does not see.
+        $Rows = @((New-Res $Vm), [pscustomobject]@{ id = $Ten; name = 'grp-a'; subscriptionId = ''; resourceGroup = '' })
+        $First = $null
+        foreach ($Run in 1, 2)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows $Rows
+            $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
+            $Now = @{ Vm = $Ids[$Vm]; Disk = $Ids[$Disk]; Ten = $Ids[$Ten] }
+            $Now.Vm | Should -BeExactly $Older.Vm -Because "run $Run keeps the VM's seeded id, its group token included"
+            $Now.Disk | Should -BeExactly $Older.Disk -Because "run $Run keeps every seeded id of the group"
+            $TenParts = $Now.Ten -split '/'
+            $TenParts.Count | Should -Be 5 -Because "run $Run keeps the tenant-scope id's shape"
+            ($TenParts[0..3] -join '/') | Should -BeExactly '/providers/Microsoft.Example/resourceGroups'
+            $TenParts[4] | Should -Match ('^' + $script:Token + '$')
+            $TenParts[4] | Should -Not -BeExactly $Grp -Because "run $Run gives the tenant-scope name its own token, not the group's"
+            if ($Run -eq 1) { $First = $Now }
+            else
+            {
+                foreach ($K in 'Vm', 'Disk', 'Ten') { $Now[$K] | Should -BeExactly $First[$K] -Because "run 2 keeps run 1's id ($K), letter for letter" }
+            }
+            $Seed = Get-RunDictionaryMaps
+        }
+    }
+
     # The seed's ResourceGroupMap maps each group token to one id. A run gives a
     # tenant-scope row ('/providers/...') a group token of its own, mapped to
     # its id, and a 'resourceGroups' segment there is a type word: only a
