@@ -1792,3 +1792,114 @@ Describe 'Reveal with report, dictionary, search and temp folders whose paths ho
         @([System.IO.Directory]::GetDirectories($Tmp, 'Reveal_*')) | Should -BeNullOrEmpty -Because 'the temp folder is removed after the reveal'
     }
 }
+
+# .NET reads a relative path against the process folder, and Set-Location in pwsh
+# does not move that folder. Reveal checks -InputZip, -OutputZip and
+# -DictionaryPath against the pwsh location, so it opens and writes them there too.
+# Each case runs Reveal in a child pwsh whose process folder is not its location.
+Describe 'Reveal with relative paths when the pwsh location is not the process folder' {
+    BeforeAll {
+        # A child pwsh: Set-Location to $Location, the process folder set to
+        # $ProcessDir after that, then Reveal.ps1 with the arguments given as text.
+        function script:Invoke-RelativeReveal([string]$Location, [string]$ProcessDir, [string]$RevealArgs)
+        {
+            $Q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+            $ChildFile = Join-Path $script:TmpDir ('relchild_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+            Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value (@(
+                    '$ErrorActionPreference = ''Stop'''
+                    ('Set-Location -LiteralPath {0}' -f (& $Q $Location))
+                    ('[Environment]::CurrentDirectory = {0}' -f (& $Q $ProcessDir))
+                    'Write-Output (''PROCESS_DIR='' + [Environment]::CurrentDirectory)'
+                    'Write-Output (''LOCATION='' + (Get-Location).ProviderPath)'
+                    ('& {0} {1} *>&1 | ForEach-Object {{ [string]$_ }}' -f (& $Q $script:RevealScript), $RevealArgs)
+                    'Write-Output ''REVEAL_DONE'''
+                ) -join [Environment]::NewLine)
+            $Lines = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{ Lines = $Lines; ExitCode = $LASTEXITCODE; Text = ($Lines -join [Environment]::NewLine) }
+        }
+        # The first VM's resource group and tag value in a revealed zip.
+        function script:Read-RelativeReveal([string]$Zip)
+        {
+            $Ex = Join-Path $script:TmpDir ('relex_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            Expand-Archive -LiteralPath $Zip -DestinationPath $Ex -Force
+            $Vm = ([System.IO.File]::ReadAllText((Join-Path $Ex 'Inventory_Test.json')) | ConvertFrom-Json).VirtualMachines[0]
+            [pscustomobject]@{
+                ResourceGroup = $Vm.ResourceGroup
+                Tag           = $Vm.Tags[0].Value
+                Members       = @(Get-ChildItem -LiteralPath $Ex -File | ForEach-Object Name | Sort-Object)
+            }
+        }
+        # A report folder with the fixture zip and a dictionary for it, and a
+        # process folder next to it. ProcDirAsNet is the process folder as .NET
+        # reads it back: on Linux and macOS it follows symlinks (getcwd), so a
+        # temp path through a symlink, such as /var on macOS, comes back in
+        # another spelling. It is read back here the same way the child does.
+        function script:New-RelativeFolderSet
+        {
+            $Root = Join-Path $script:TmpDir ('rel_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $Dir = Join-Path $Root 'report'
+            $ProcDir = Join-Path $Root 'process'
+            [System.IO.Directory]::CreateDirectory($Dir) | Out-Null
+            [System.IO.Directory]::CreateDirectory($ProcDir) | Out-Null
+            $SavedProcessDir = [Environment]::CurrentDirectory
+            try
+            {
+                [Environment]::CurrentDirectory = $ProcDir
+                $ProcDirAsNet = [Environment]::CurrentDirectory
+            }
+            finally
+            {
+                [Environment]::CurrentDirectory = $SavedProcessDir
+            }
+            [System.IO.File]::Copy($script:InputZip, (Join-Path $Dir 'ResourcesReport_Test.zip'))
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'ObfuscationDictionary_Test.json'), ([ordered]@{
+                        GeneratedAt      = '2026-06-30 00:00:00'
+                        ResourceGroupMap = [ordered]@{ $script:TokRg = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-relative/providers/Microsoft.Compute/virtualMachines/vm01' }
+                        TagMap           = [ordered]@{ $script:TokTag = 'tag-relative' }
+                    } | ConvertTo-Json -Depth 6))
+            [pscustomobject]@{ Dir = $Dir; ProcDir = $ProcDir; ProcDirAsNet = $ProcDirAsNet }
+        }
+    }
+
+    It 'reads the zip and dictionary at the pwsh location, not a zip of the same name in the process folder, and writes the revealed zip next to the input' {
+        $F = script:New-RelativeFolderSet
+        # A zip of the same name in the process folder, which holds a decoy member.
+        $DecoyStage = Join-Path $F.ProcDir 'stage'
+        [System.IO.Directory]::CreateDirectory($DecoyStage) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $DecoyStage 'Decoy.txt'), $script:TokRg)
+        Compress-Archive -LiteralPath (Join-Path $DecoyStage 'Decoy.txt') -DestinationPath (Join-Path $F.ProcDir 'ResourcesReport_Test.zip')
+        Remove-Item -LiteralPath $DecoyStage -Recurse -Force
+
+        $Run = script:Invoke-RelativeReveal -Location $F.Dir -ProcessDir $F.ProcDir -RevealArgs '-InputZip ./ResourcesReport_Test.zip -DictionaryPath ./ObfuscationDictionary_Test.json -Fields ResourceGroup, Tag'
+
+        $Run.Lines | Should -Contain ('PROCESS_DIR=' + $F.ProcDirAsNet) -Because ('the child runs with the process folder set apart. Output: ' + $Run.Text)
+        $Run.Lines | Should -Contain ('LOCATION=' + $F.Dir) -Because $Run.Text
+        $Run.ExitCode | Should -Be 0 -Because $Run.Text
+        $Run.Lines | Should -Contain 'REVEAL_DONE' -Because $Run.Text
+        $Out = Join-Path $F.Dir 'ResourcesReport_Test_revealed.zip'
+        [System.IO.File]::Exists($Out) | Should -BeTrue -Because ('with no -OutputZip the revealed zip is written next to the input at the pwsh location. Output: ' + $Run.Text)
+        $R = script:Read-RelativeReveal $Out
+        $R.Members | Should -Not -Contain 'Decoy.txt' -Because 'the zip revealed is the one at the pwsh location'
+        $R.ResourceGroup | Should -BeExactly 'rg-relative'
+        $R.Tag | Should -BeExactly 'tag-relative'
+        @(Get-ChildItem -LiteralPath $F.ProcDir -Force | ForEach-Object Name) | Should -Be @('ResourcesReport_Test.zip') -Because 'nothing is written to the process folder'
+    }
+
+    It 'writes a relative -OutputZip at the pwsh location, with the dictionary found there' {
+        $F = script:New-RelativeFolderSet
+        [System.IO.Directory]::CreateDirectory((Join-Path $F.Dir 'out')) | Out-Null
+
+        $Run = script:Invoke-RelativeReveal -Location $F.Dir -ProcessDir $F.ProcDir -RevealArgs '-InputZip ./ResourcesReport_Test.zip -OutputZip out/revealed.zip -Fields ResourceGroup, Tag'
+
+        $Run.Lines | Should -Contain ('PROCESS_DIR=' + $F.ProcDirAsNet) -Because ('the child runs with the process folder set apart. Output: ' + $Run.Text)
+        $Run.ExitCode | Should -Be 0 -Because $Run.Text
+        $Run.Lines | Should -Contain 'REVEAL_DONE' -Because $Run.Text
+        $Out = Join-Path $F.Dir 'out/revealed.zip'
+        [System.IO.File]::Exists($Out) | Should -BeTrue -Because ('the revealed zip is written at the path given, read against the pwsh location. Output: ' + $Run.Text)
+        @(Get-ChildItem -LiteralPath (Join-Path $F.Dir 'out') -Force | ForEach-Object Name) | Should -Be @('revealed.zip') -Because 'the partial zip is renamed to the final name'
+        $R = script:Read-RelativeReveal $Out
+        $R.ResourceGroup | Should -BeExactly 'rg-relative'
+        $R.Tag | Should -BeExactly 'tag-relative'
+        @(Get-ChildItem -LiteralPath $F.ProcDir -Force) | Should -BeNullOrEmpty -Because 'nothing is written to the process folder'
+    }
+}

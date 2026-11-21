@@ -176,10 +176,14 @@ function Invoke-RdaReveal
     # ---- Resolve inputs ----------------------------------------------------
     # Every path is used as written (-LiteralPath): a folder name can hold [ or ],
     # which -Path reads as a wildcard, so it would miss the file or find another.
+    # Each path checked here is then made full against the pwsh location: .NET
+    # (ZipFile, File.Move) reads a relative path against the process folder,
+    # which Set-Location does not move, so it would open or write another file.
     if (-not (Test-Path -LiteralPath $InputZip -PathType Leaf))
     {
         throw "Input zip not found: $InputZip"
     }
+    $InputZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputZip)
 
     if ([string]::IsNullOrEmpty($DictionaryPath))
     {
@@ -190,6 +194,7 @@ function Invoke-RdaReveal
     {
         throw "No ObfuscationDictionary_*.json found. Pass -DictionaryPath, or run from the folder that holds it."
     }
+    $DictionaryPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DictionaryPath)
 
     if ([string]::IsNullOrEmpty($OutputZip))
     {
@@ -197,6 +202,7 @@ function Invoke-RdaReveal
         $InBase = [System.IO.Path]::GetFileNameWithoutExtension($InputZip)
         $OutputZip = Join-Path $InDir ($InBase + '_revealed.zip')
     }
+    $OutputZip = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
 
     # -All is a convenience for a full reveal: expand to every dimension the
     # dictionary can reverse (overriding -Fields). NOTE this is NOT a perfect
@@ -389,10 +395,8 @@ function Invoke-RdaReveal
         # mapping for the selected fields is still an error (wrong dictionary
         # or wrong -Fields).
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $InputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputZip)
-        $OutputZipFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputZip)
         $HasToken = $false
-        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZipFull)
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($InputZip)
         try
         {
             foreach ($Entry in $Archive.Entries)
@@ -414,9 +418,9 @@ function Invoke-RdaReveal
         }
 
         # Same atomic swap as a revealed zip below: copy to .partial.zip, then move.
-        $OutputZipPartial = ($OutputZipFull -replace '\.zip$', '') + '.partial.zip'
-        [System.IO.File]::Copy($InputZipFull, $OutputZipPartial, $true)
-        [System.IO.File]::Move($OutputZipPartial, $OutputZipFull, $true)
+        $OutputZipPartial = ($OutputZip -replace '\.zip$', '') + '.partial.zip'
+        [System.IO.File]::Copy($InputZip, $OutputZipPartial, $true)
+        [System.IO.File]::Move($OutputZipPartial, $OutputZip, $true)
         Write-Host ""
         Write-Host "Nothing to reveal: this report carries no masked values (for example a subscription with no resources). Wrote an unchanged copy." -ForegroundColor Yellow
         Write-Host ("Output: {0}" -f $OutputZip) -ForegroundColor Green
