@@ -591,6 +591,83 @@ Describe 'The seed is checked when it is read' {
         }
     }
 
+    # A damaged or hand-combined seed can give a tag or free-text value a token that is not
+    # the run's '<prefix>_<guid>', or the value itself (which may look like a token). Such an
+    # entry is not kept, so the run masks the value again; a good entry keeps its token.
+    It 'masks again a <Map> value whose seeded token <Case>, keeps a good seeded token, and the next two seeded runs keep the new token' -ForEach @(
+        @{ Map = 'TagMap'; Case = 'is not of token form'; Kind = 'form' }
+        @{ Map = 'TagMap'; Case = 'equals the value'; Kind = 'same' }
+        @{ Map = 'TagMap'; Case = 'equals the value in another case'; Kind = 'upper' }
+        @{ Map = 'FreeTextMap'; Case = 'is not of token form'; Kind = 'form' }
+        @{ Map = 'FreeTextMap'; Case = 'equals the value'; Kind = 'same' }
+        @{ Map = 'FreeTextMap'; Case = 'equals the value in another case'; Kind = 'upper' }
+    ) {
+        # The run's own maskers: the collector row masking (tags) and the free-text one.
+        $RowFn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaCollectorRow' }, $false))
+        $RowFn.Count | Should -Be 1
+        . ([scriptblock]::Create($RowFn[0].Extent.Text))
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/ResourceInventory.Functions.ps1'), [ref]$null, [ref]$null)
+        $FreeFn = @($FnAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Global:Protect-FreeTextValue' }, $false))
+        $FreeFn.Count | Should -Be 1
+        . ([scriptblock]::Create($FreeFn[0].Extent.Text))
+        try
+        {
+            $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-a"
+            $Tok = New-Tok
+            $Real = switch ($Kind) { 'form' { 'payments-01' } 'same' { $Tok } 'upper' { $Tok.ToUpperInvariant() } }
+            $BadTok = if ($Kind -eq 'form') { 'tag_payments-01' } else { $Tok }
+            $GoodTok = New-Tok
+            $Seed = @{ $Map = @{ $BadTok = $Real; $GoodTok = 'finance-01' } }
+            $First = $null
+            foreach ($Run in 1, 2, 3)
+            {
+                Invoke-SeededRun -SeedMaps $Seed -Rows @(New-Res $Vm)
+                if ($Map -eq 'TagMap')
+                {
+                    $Row = @{ ID = $Vm; Name = 'vm-a'; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo'; Tags = @([pscustomobject]@{ Name = 'app'; Value = $Real }, [pscustomobject]@{ Name = 'team'; Value = 'finance-01' }) }
+                    Protect-RdaCollectorRow -Rows @($Row) -Collector 'VirtualMachines'
+                    $Masked = [string]$Row.Tags[0].Value
+                    $Good = [string]$Row.Tags[1].Value
+                }
+                else
+                {
+                    $Masked = Protect-FreeTextValue $Real
+                    $Good = Protect-FreeTextValue 'finance-01'
+                }
+                $Masked | Should -Not -Be $Real -Because "run $Run masks the value, letter case aside"
+                $Masked | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "run $Run writes the run's token form"
+                $Good | Should -BeExactly $GoodTok -Because "run $Run keeps a good seeded token"
+                if ($Run -eq 1) { $First = $Masked } else { $Masked | Should -BeExactly $First -Because "run $Run keeps run 1's token, letter for letter" }
+                $Seed = Get-RunDictionaryMaps
+            }
+        }
+        finally { Remove-Item -LiteralPath Function:\Protect-FreeTextValue -ErrorAction SilentlyContinue }
+    }
+
+    # A real id that is not an ARM path has one flat token. A seed that gives it itself (a
+    # real id that looks like a token) as its token is not kept, so the run masks it again.
+    It 'masks again a flat seeded id whose token equals its real id (<Case>), keeps a good flat seeded token, and the next two seeded runs keep the new token' -ForEach @(
+        @{ Case = 'the same case'; Upper = $false }
+        @{ Case = 'the real id in upper case'; Upper = $true }
+    ) {
+        $Tok = New-Tok
+        $Flat = if ($Upper) { $Tok.ToUpperInvariant() } else { $Tok }
+        $GoodFlat = 'marketplace-charge-01'
+        $GoodTok = New-Tok
+        $Seed = @{ ResourceIdMap = @{ $Tok = $Flat; $GoodTok = $GoodFlat } }
+        $First = $null
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows @((New-Res $Flat), (New-Res $GoodFlat))
+            $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
+            $Ids[$Flat] | Should -Not -Be $Flat -Because "run $Run masks the real id, letter case aside"
+            $Ids[$Flat] | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "run $Run writes one flat token"
+            $Ids[$GoodFlat] | Should -BeExactly $GoodTok -Because "run $Run keeps a good flat seeded token"
+            if ($Run -eq 1) { $First = $Ids[$Flat] } else { $Ids[$Flat] | Should -BeExactly $First -Because "run $Run keeps run 1's token, letter for letter" }
+            $Seed = Get-RunDictionaryMaps
+        }
+    }
+
     It 'gives a $system parent that the seeded ids give two tokens one new token, in its own id and its child''s, and the next two seeded runs keep both' {
         # The namespace's own seeded id and its topic's give the one real
         # '.../namespaces/$system' two tokens (a seed written before the slot
