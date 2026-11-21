@@ -593,7 +593,8 @@ try
                 # The id masking keeps an id's provider and type words: they must be Azure's.
                 if (-not (Test-RdaIdPathWord ([string]$UsageRow.ResourceId))) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id whose provider or type is not as Azure writes one. Nothing was written." -f $ReportZip.Name, $RowIndex) }
                 # A subscription id that ends on a type word, or on a provider namespace, with no
-                # name after it is a form this tool does not support either
+                # name after it, and a tenant-scope id a run masks part by part that ends on a
+                # provider namespace, are forms this tool does not support either
                 # (Test-RdaTrailingTypeWordId): refused with its own reason, as masking the report
                 # again would stop here again. An odd number of segments is the namespace form; an
                 # even one ends on a word, which the reason names when it is the word providers or

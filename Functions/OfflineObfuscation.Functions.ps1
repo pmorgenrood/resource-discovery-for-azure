@@ -1226,8 +1226,9 @@ function Test-RdaMaskedSlot
 # name '$system', or a short name of letters only, neither of which the last leak scan
 # looks for inside a text. An id that ends on the word '$system' with no name after it
 # fails too (Test-RdaTrailingSystemTypeId), and so does a subscription id that ends on any
-# other type word, or on a provider namespace, with no name after it
-# (Test-RdaTrailingTypeWordId): this tool does not support those forms.
+# other type word, or on a provider namespace, with no name after it, and a tenant-scope id
+# a run masks part by part that ends on a provider namespace (Test-RdaTrailingTypeWordId):
+# this tool does not support those forms.
 # Apart from that shape check, which mirrors the run's masking, every name slot of a
 # masked path must differ, in any case, from the plain id's segment there (the
 # subscription, the group and every name; the namespace and type words are kept): a
@@ -1239,10 +1240,10 @@ function Test-RdaMaskedUsageId
     if ([string]::IsNullOrEmpty($PlainId)) { return $MaskedId -ceq 'obfuscated' }
     if ($PlainId -match '(?i)^/subscriptions/[^/]' -or (Test-RdaTenantScopeIdMaskable -ResourceId $PlainId))
     {
-        # An id that ends on the word '$system', or a subscription id that ends on any other
-        # type word or on a provider namespace, with no name after it is a form this tool does
-        # not support (Test-RdaTrailingSystemTypeId, Test-RdaTrailingTypeWordId), whatever its
-        # other parts are.
+        # An id that ends on the word '$system', a subscription id that ends on any other
+        # type word or on a provider namespace, with no name after it, or a tenant-scope id
+        # that ends on a provider namespace is a form this tool does not support
+        # (Test-RdaTrailingSystemTypeId, Test-RdaTrailingTypeWordId), whatever its other parts are.
         if ((Test-RdaTrailingSystemTypeId $PlainId) -or (Test-RdaTrailingSystemTypeId ([string]$MaskedId)) -or (Test-RdaTrailingTypeWordId $PlainId) -or (Test-RdaTrailingTypeWordId ([string]$MaskedId))) { return $false }
         $P = $PlainId.Split('/')
         $M = ([string]$MaskedId).Split('/')
@@ -2167,8 +2168,8 @@ function Test-RdaIdPathWord([string]$Id)
 # row shows Azure billing such an id, and downstream reads the last segment as the resource's
 # name, so the offline mask refuses it (Protect-RdaReport.ps1, Test-RdaMaskedUsageId) and the
 # question of how to mask it is with the owner.
-# A tenant-scope id ('/providers/...') is counted too, unlike in Test-RdaTrailingTypeWordId, on
-# purpose. A run writes one that holds '$system' as one flat token (Test-RdaTenantScopeIdMaskable
+# A tenant-scope id ('/providers/...') is counted too, unlike a tenant-scope id that ends on
+# another word in Test-RdaTrailingTypeWordId, on purpose. A run writes one that holds '$system' as one flat token (Test-RdaTenantScopeIdMaskable
 # takes no id with a '$system' part), so nothing of it is kept as written and refusing it is not
 # needed to stop a leak. But that flat token is itself an open question with the owner: a path
 # form for it would be an id shape change, and in that form the last '$system' would be a word
@@ -2197,10 +2198,16 @@ function Test-RdaTrailingSystemTypeId([string]$Id)
 # the word before it is 'providers' (always in a word place there): then the last segment is
 # a namespace with no type or name after it ('.../providers/Microsoft.Compute'), which a run
 # keeps as written and downstream would read as the resource's name. That form is counted too.
+# So is a tenant-scope id that Test-RdaTenantScopeIdMaskable takes (a run masks it part by
+# part) and that ends on a namespace the same way
+# ('/providers/Microsoft.Management/managementGroups/<name>/providers/Microsoft.Authorization'):
+# a run keeps that namespace as its last segment too. The offline mask fails closed on it, as
+# on the subscription form; a run's masking is not changed here.
 function Test-RdaTrailingTypeWordId([string]$Id)
 {
     if ([string]::IsNullOrEmpty($Id)) { return $false }
     $Parts = $Id.Split('/')
+    if ($Parts.Count -ge 5 -and $Parts[-2] -ieq 'providers' -and (Test-RdaTenantScopeIdMaskable -ResourceId $Id)) { return $true }
     if ($Parts.Count -lt 4 -or $Parts[0] -ne '' -or $Parts[1] -ine 'subscriptions' -or $Parts[-1] -eq '') { return $false }
     return ($Parts.Count % 2) -eq 0 -or $Parts[-2] -ieq 'providers'
 }
