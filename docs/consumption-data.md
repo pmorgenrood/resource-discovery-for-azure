@@ -128,22 +128,39 @@ returned and these five are empty.
 
 ## Obfuscation of consumption data
 
-When `-Obfuscate` is used, consumption is masked with a scheme **separate** from
-the inventory obfuscation dictionary:
+When `-Obfuscate` is used, each usage row is masked with the run's own id masking
+and the run's own tokens, the ones its inventory and metrics use
+(`Protect-RdaUsageRow` in `ResourceInventory.ps1`; `Protect-RdaReport.ps1` masks a
+plain report's rows with the same function):
 
-- `ResourceId` / `resourceUri` is rebuilt segment-by-segment. The subscription
-  id, resource group name, and resource name segments are replaced with
-  `prod_`/`nonprod_` tokens, but the **ARM path structure is preserved**
-  (`/subscriptions/<tok>/resourcegroups/<tok>/providers/<rp>/<type>/<tok>`),
-  including the resource provider and type and the `mc_` AKS-managed-RG marker.
-  This lets the ingestion dashboard categorise rows (AKS, VMSS, etc.) without
-  seeing real identifiers.
-- The tokens use per-run caches keyed by the real value, so the same real
-  sub/RG/name always maps to the same token **within a run** (deterministic).
-- These caches are **independent of** the inventory `ObfuscationDictionary`.
-  Consumption tokens are therefore internally consistent but do **not** equal the
-  inventory tokens for the same resource — categorisation relies on the path
-  structure, not an ID-to-inventory join.
+- `ResourceId` and the `resourceUri` in `InstanceData` become the resource's masked
+  id. A resource the run has already masked (an inventory row, a metric record, or
+  an earlier usage row) takes that masked id letter for letter, so a usage row
+  joins its inventory row by id. Any other id is masked segment by segment: the
+  subscription id, the resource group name and each resource name (a parent's
+  included) are replaced with `prod_`/`nonprod_` tokens, and the `subscriptions`,
+  `resourcegroups` and `providers` words, the resource provider and each type are
+  kept, so the **ARM path structure is preserved**
+  (`/subscriptions/<tok>/resourcegroups/<tok>/providers/<rp>/<type>/<tok>`). Each
+  segment reuses the token its subscription, group or parent already has. Azure's
+  fixed name `$system` (Service Bus bills a namespace of that name) gets a token
+  like any name.
+- A name token is keyed by the real id up to that name, not by the bare name, so
+  two resources of one name in two groups get two tokens. Within a run, one real
+  id always gives the same masked id.
+- Every masked id goes into the run's dictionaries, so the local
+  `ObfuscationDictionary_*.json` (its `ResourceIdMap`) maps a usage row back, as
+  `Reveal.ps1` does.
+- The kept provider and type words let the ingestion dashboard categorise rows
+  (AKS, VMSS, etc.) without seeing real identifiers. A name token can carry a type
+  hint (`prod_aks_<guid>`): `databricks_` for a Databricks resource, `aks_` for a
+  resource in an AKS-managed resource group (`mc_...`), `vmss_` for a scale set's.
+  A resource group token carries no hint: the `mc_` of an AKS-managed group is not
+  kept.
+- A tenant-scope id (`/providers/...`, such as a reservation order) keeps its path,
+  with every name a token, when each name can be one. Any other value that is not
+  an ARM path, a tenant-scope id with an empty part or a `$system` part among them,
+  becomes one flat token. An empty id becomes `obfuscated`.
 - `ReservationId` and `ReservationOrderId` are flattened to `obfuscated`.
 
 ## Per-subscription health and failure-point reporting

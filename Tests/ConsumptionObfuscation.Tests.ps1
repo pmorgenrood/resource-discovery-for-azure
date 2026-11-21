@@ -13,112 +13,61 @@
 # inventory completed but consumption was silently truncated, ONLY under
 # -Obfuscate.
 #
-# This test is SELF-CONTAINED: it replicates the obfuscation guard
-# logic exactly as it appears in ResourceInventory.ps1 and proves a null/empty
-# resourceUri does not throw and yields the 'obfuscated' fallback token, while a
-# normal ARM-shaped uri still obfuscates deterministically. It does NOT need a
-# live Azure run or an output zip. If the guard logic in ResourceInventory.ps1
-# changes, update the helper below to match.
+# The test runs the run's own row masking, Protect-RdaUsageRow, and the id
+# masking it calls, taken from ResourceInventory.ps1 with the PowerShell AST
+# (as ObfuscateSystemName.Tests.ps1 does), so it tests the code and not a copy.
+# It proves a null/empty resourceUri does not throw and yields the 'obfuscated'
+# fallback token, while a normal ARM-shaped uri still obfuscates
+# deterministically, with the run's own tokens. It also reads the masking section of
+# docs/consumption-data.md, so the doc says what these tests prove. It does NOT need
+# a live Azure run or an output zip.
 
 BeforeAll {
-    # Faithful copy of the consumption resourceUri obfuscation block from
-    # ResourceInventory.ps1 GetResorceConsumption() (obfuscate branch). The test
-    # replicates the logic rather than calling production code, so it stays
-    # self-contained (no live Azure, no output zip).
+    $Script = Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'
+    $Ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
+    foreach ($Name in @('Get-ObfuscationPrefix', 'New-ObfuscatedNameToken', 'Get-ObfuscationSubscriptionIndex', 'Test-RdaTenantScopeIdMaskable', 'Get-ObfuscatedResourceId', 'Protect-RdaUsageRow'))
+    {
+        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq $Name }, $false))
+        if ($Fn.Count -ne 1) { throw "$Name was not found in ResourceInventory.ps1." }
+        . ([scriptblock]::Create($Fn[0].Extent.Text))
+    }
+
+    # The run's globals, as ResourceInventory.ps1 sets them, empty.
+    function Initialize-TestObfuscationState
+    {
+        Set-Variable -Scope Global -Name Subscriptions -Value @()
+        Set-Variable -Scope Global -Name ObfuscationSubscriptionIndex -Value $null
+        foreach ($D in 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary')
+        {
+            Set-Variable -Scope Global -Name $D -Value (New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase))
+        }
+        foreach ($D in 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens') { Set-Variable -Scope Global -Name $D -Value @{} }
+    }
+
+    # One usage record as the consumption loop builds it, masked by the run's
+    # Protect-RdaUsageRow; returns the row's masked ResourceId.
     function Get-ObfuscatedConsumptionUriForTest
     {
         param($RawUri)
+        $Row = [pscustomobject]@{ ResourceId = $RawUri; ReservationId = ''; ReservationOrderId = '' }
+        $Instance = [pscustomobject]@{ 'Microsoft.Resources' = [pscustomobject]@{ resourceUri = $RawUri; location = 'eastus' } }
+        Protect-RdaUsageRow -Row $Row -InstanceObject $Instance
+        return $Row.ResourceId
+    }
+}
 
-        $Prefix = if ($RawUri -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or $RawUri -match '(^|/|-)([dts])-') { 'nonprod_' } else { 'prod_' }
-
-        $ObfuscatedUri = $RawUri
-
-        if (-not $script:ConsumptionSubCache) { $script:ConsumptionSubCache = @{} }
-        if (-not $script:ConsumptionRgCache) { $script:ConsumptionRgCache = @{} }
-        if (-not $script:ConsumptionNameCache) { $script:ConsumptionNameCache = @{} }
-
-        if ($RawUri -match '^/subscriptions/([^/]+)(/resourcegroups/([^/]+))?(/providers/(.+))?$')
-        {
-            $RealSub = $matches[1]
-            $RealRg = $matches[3]
-            $RealProv = $matches[5]
-
-            $ObfSub = if ($script:ConsumptionSubCache.ContainsKey($RealSub)) { $script:ConsumptionSubCache[$RealSub] } else
-            {
-                $V = $Prefix + 'sub_' + [guid]::NewGuid().ToString()
-                $script:ConsumptionSubCache[$RealSub] = $V; $V
-            }
-
-            $RebuiltUri = '/subscriptions/' + $ObfSub
-
-            if (-not [string]::IsNullOrEmpty($RealRg))
-            {
-                $ObfRg = if ($script:ConsumptionRgCache.ContainsKey($RealRg)) { $script:ConsumptionRgCache[$RealRg] } else
-                {
-                    $IsMc = $RealRg -match '^mc_'
-                    $Tag = if ($IsMc) { 'mc_' } else { '' }
-                    $V = $Prefix + 'rg_' + $Tag + [guid]::NewGuid().ToString()
-                    $script:ConsumptionRgCache[$RealRg] = $V; $V
-                }
-                $RebuiltUri += '/resourcegroups/' + $ObfRg
-            }
-
-            if (-not [string]::IsNullOrEmpty($RealProv))
-            {
-                $ProvParts = $RealProv -split '/'
-                $Rebuilt = @()
-                for ($Pi = 0; $Pi -lt $ProvParts.Count; $Pi++)
-                {
-                    $Part = $ProvParts[$Pi]
-                    $IsNameSegment = ($Pi -ge 2 -and ($Pi % 2 -eq 0))
-                    if ($IsNameSegment -and -not [string]::IsNullOrEmpty($Part) -and $Part -ne '$system')
-                    {
-                        $ObfName = if ($script:ConsumptionNameCache.ContainsKey($Part)) { $script:ConsumptionNameCache[$Part] } else
-                        {
-                            $V = $Prefix + [guid]::NewGuid().ToString()
-                            $script:ConsumptionNameCache[$Part] = $V; $V
-                        }
-                        $Rebuilt += $ObfName
-                    }
-                    else
-                    {
-                        $Rebuilt += $Part
-                    }
-                }
-                $RebuiltUri += '/providers/' + ($Rebuilt -join '/')
-            }
-
-            $ObfuscatedUri = $RebuiltUri
-        }
-        else
-        {
-            # THE GUARD UNDER TEST: a null/empty resourceUri must not reach
-            # ContainsKey($null) (which throws). Return the 'obfuscated' fallback.
-            if ([string]::IsNullOrEmpty($RawUri))
-            {
-                $ObfuscatedUri = 'obfuscated'
-            }
-            else
-            {
-                if (-not $script:ConsumptionNameCache.ContainsKey($RawUri))
-                {
-                    $script:ConsumptionNameCache[$RawUri] = $Prefix + [guid]::NewGuid().ToString()
-                }
-                $ObfuscatedUri = $script:ConsumptionNameCache[$RawUri]
-            }
-        }
-
-        return $ObfuscatedUri
+AfterAll {
+    foreach ($Name in @('Subscriptions', 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'ObfuscationSubscriptionIndex'))
+    {
+        Remove-Variable -Name $Name -Scope Global -ErrorAction SilentlyContinue
     }
 }
 
 Describe "Consumption obfuscation null/empty resourceUri handling" {
 
     BeforeEach {
-        # Reset the per-run caches so determinism assertions are independent.
-        $script:ConsumptionSubCache = @{}
-        $script:ConsumptionRgCache = @{}
-        $script:ConsumptionNameCache = @{}
+        # Reset the run's dictionaries so determinism assertions are independent.
+        Initialize-TestObfuscationState
     }
 
     Context "null and empty URIs (the regression)" {
@@ -187,10 +136,71 @@ Describe "Consumption obfuscation null/empty resourceUri handling" {
             $Second | Should -BeExactly $First
         }
 
-        It "preserves the AKS-managed-RG marker (mc_) so AKS rows stay categorisable" {
+        It "gives a resource of an AKS-managed group (mc_) the aks_ hint on its name token, and its group token no hint, so AKS rows stay categorisable" {
+            # The run carries the marker on the resource's name token (its aks_ hint,
+            # New-ObfuscatedNameToken); the group token itself is prod_/nonprod_ + GUID.
             $Real = '/subscriptions/aaaa/resourcegroups/mc_aksrg_cluster_eastus/providers/microsoft.compute/virtualmachinescalesets/aks-nodepool'
             $Obf = Get-ObfuscatedConsumptionUriForTest -RawUri $Real
-            $Obf | Should -Match '/resourcegroups/(prod|nonprod)_rg_mc_'
+            ($Obf -split '/')[-1] | Should -Match '^(prod|nonprod)_aks_[0-9a-f-]{36}$'
+            ($Obf -split '/')[4] | Should -Match '^(prod|nonprod)_[0-9a-f-]{36}$' -Because 'a group token carries no mc_ or other hint'
+            $Obf | Should -Not -Match 'mc_aksrg_cluster_eastus|aks-nodepool'
         }
+
+        It "gives a usage row of a resource the run already masked that resource's masked id, letter for letter, in any case" {
+            # An inventory row's or metric record's id, masked first by the run.
+            $Real = '/subscriptions/aaaa/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1'
+            $Masked = '/subscriptions/prod_11111111-1111-1111-1111-111111111111/resourcegroups/prod_22222222-2222-2222-2222-222222222222/providers/microsoft.compute/virtualmachines/prod_33333333-3333-3333-3333-333333333333'
+            (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Real] = $Masked
+            Get-ObfuscatedConsumptionUriForTest -RawUri $Real | Should -BeExactly $Masked
+            Get-ObfuscatedConsumptionUriForTest -RawUri $Real.ToUpperInvariant() | Should -BeExactly $Masked
+        }
+
+        It "gives a resource only billing names the subscription and group tokens the run already holds, and records its masked id for the dictionary" {
+            $SubTok = 'prod_44444444-4444-4444-4444-444444444444'; $RgTok = 'nonprod_55555555-5555-5555-5555-555555555555'
+            (Get-Variable -Scope Global -Name ObfuscationSubscriptionTokens -ValueOnly)['aaaa'] = $SubTok
+            (Get-Variable -Scope Global -Name ObfuscationResourceGroupTokens -ValueOnly)['rg-dev'] = $RgTok
+            $Real = '/subscriptions/aaaa/resourcegroups/rg-dev/providers/microsoft.storage/storageaccounts/billedonly'
+            $Obf = Get-ObfuscatedConsumptionUriForTest -RawUri $Real
+            ($Obf -split '/')[2] | Should -BeExactly $SubTok
+            ($Obf -split '/')[4] | Should -BeExactly $RgTok
+            (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Real] | Should -BeExactly $Obf -Because 'the dictionary file''s ResourceIdMap is built from it, so Reveal maps the row back'
+        }
+    }
+
+    Context "a consumption id is masked as the run's own code masks it" {
+
+        It "gives a `$system name part a token, as every name" {
+            $Obf = Get-ObfuscatedConsumptionUriForTest -RawUri '/subscriptions/aaaa/resourcegroups/rg1/providers/microsoft.servicebus/namespaces/$system/topics/$system'
+            $Obf | Should -Not -Match ([regex]::Escape('$system'))
+            $Obf | Should -Match '^/subscriptions/(prod|nonprod)_[0-9a-f-]{36}/resourcegroups/(prod|nonprod)_[0-9a-f-]{36}/providers/microsoft\.servicebus/namespaces/(prod|nonprod)_[0-9a-f-]{36}/topics/(prod|nonprod)_[0-9a-f-]{36}$'
+        }
+
+        It "gives two resources of one name in two groups two name tokens (a name is keyed by its id, not by the bare name)" {
+            $A = Get-ObfuscatedConsumptionUriForTest -RawUri '/subscriptions/aaaa/resourcegroups/rg1/providers/microsoft.compute/virtualmachines/vm1'
+            $B = Get-ObfuscatedConsumptionUriForTest -RawUri '/subscriptions/aaaa/resourcegroups/rg2/providers/microsoft.compute/virtualmachines/vm1'
+            ($A -split '/')[-1] | Should -Not -BeExactly ($B -split '/')[-1]
+        }
+    }
+}
+
+# The doc's section on consumption masking must say what the tests above prove the
+# run does, so it is read for the two claims it once made that the run does not do.
+Describe 'docs/consumption-data.md on how a usage row is masked' {
+    BeforeAll {
+        $Doc = [System.IO.File]::ReadAllText((Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/consumption-data.md'))
+        $Start = $Doc.IndexOf('## Obfuscation of consumption data')
+        if ($Start -lt 0) { throw 'docs/consumption-data.md has no "Obfuscation of consumption data" section.' }
+        $End = $Doc.IndexOf("`n## ", $Start + 1)
+        $script:MaskDoc = if ($End -gt $Start) { $Doc.Substring($Start, $End - $Start) } else { $Doc.Substring($Start) }
+    }
+
+    It 'says a usage row takes the run''s own masked id and tokens, which the dictionary maps back, not tokens of its own' {
+        $script:MaskDoc | Should -Not -Match '(?i)independent of|separate from the inventory|not\W+equal the inventory' -Because 'a usage row of a resource the run masked takes that masked id (the test above)'
+        $script:MaskDoc | Should -Match 'ResourceIdMap' -Because 'every masked usage id is in the dictionary the run writes'
+    }
+
+    It 'puts the AKS hint on the name token, and claims no mc_ marker on the group token' {
+        $script:MaskDoc | Should -Not -Match '(?i)mc_`?\s+AKS-managed-RG marker' -Because 'a group token carries no hint (the test above)'
+        $script:MaskDoc | Should -Match 'aks_'
     }
 }
