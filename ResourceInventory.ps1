@@ -1777,11 +1777,15 @@ Function RunInventorySetup()
             # another one after a rename. A subscription's token comes from the
             # seeded ids of that subscription id (the seed check below); one
             # with no seeded id gets a new token, and has no seeded id to join.
+            # Only a subscription id's group slot names a group, as
+            # Get-ObfuscatedResourceId reads it: in a tenant-scope id
+            # ('/providers/...'), a 'resourceGroups' segment is a type word,
+            # and that row's group token is its own.
             if ($null -ne $SeedDictionary.ResourceGroupMap)
             {
                 foreach ($SeedProp in $SeedDictionary.ResourceGroupMap.PSObject.Properties)
                 {
-                    if ($SeedProp.Value -match '(?i)/resourcegroups/([^/]+)') { $RgLookup[$Matches[1]] = $SeedProp.Name }
+                    if ($SeedProp.Value -match '(?i)^/subscriptions/[^/]+/resourcegroups/([^/]+)') { $RgLookup[$Matches[1]] = $SeedProp.Name }
                 }
             }
 

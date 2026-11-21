@@ -426,6 +426,28 @@ Describe "Reveal-Obfuscation older / partial dictionaries" {
         $R.Inventory.VirtualMachines[0].Name | Should -Be $script:TokName
     }
 
+    # A tenant-scope row ('/providers/...') has no resource group: a run gives it
+    # a group token of its own, mapped to its id in ResourceGroupMap, and a
+    # 'resourceGroups' segment in such an id is a type word. Only a subscription
+    # id's group slot is read as a group, as the masking reads it.
+    It "leaves a group token masked whose ResourceGroupMap id is a tenant-scope id with a type word resourceGroups, and still reveals a subscription id's group" {
+        $TenDir = Join-Path $script:TmpDir ("tenant_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $TenDir -Force | Out-Null
+        $TenDict = Join-Path $TenDir 'ObfuscationDictionary_Tenant.json'
+        [ordered]@{
+            GeneratedAt      = '2026-06-30 00:00:00'
+            ResourceGroupMap = [ordered]@{
+                $script:TokRg    = '/providers/Microsoft.Example/resourceGroups/grp-a'
+                $script:TokRgAks = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/$($script:RealRgAks)/providers/Microsoft.Compute/virtualMachines/aksnode0"
+            }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $TenDict -Encoding utf8
+
+        $R = Invoke-Reveal -Fields @('ResourceGroup') -DictPath $TenDict
+        $R.Inventory.VirtualMachines[0].ResourceGroup | Should -BeExactly $script:TokRg -Because 'a tenant-scope id has no group to reveal'
+        $R.Inventory.VirtualMachines[1].ResourceGroup | Should -BeExactly $script:RealRgAks -Because 'a subscription id''s group is still revealed'
+        $R.Csv[0].InstanceId | Should -Not -Match 'grp-a' -Because 'the token is not a group in an ARM path either'
+    }
+
     It "leaves tag values masked when -Fields Tag is requested but the dictionary has no TagMap" {
         $NoTagDir = Join-Path $script:TmpDir ("notag_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $NoTagDir -Force | Out-Null

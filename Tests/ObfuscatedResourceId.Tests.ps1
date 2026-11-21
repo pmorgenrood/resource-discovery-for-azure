@@ -698,6 +698,25 @@ Describe 'The seed is checked when it is read' {
             $Seed = Get-RunDictionaryMaps
         }
     }
+
+    # The seed's ResourceGroupMap maps each group token to one id. A run gives a
+    # tenant-scope row ('/providers/...') a group token of its own, mapped to
+    # its id, and a 'resourceGroups' segment there is a type word: only a
+    # subscription id's group slot names a group, as Get-ObfuscatedResourceId
+    # and the seed check read it. So a group that is new in the seeded run gets
+    # its own token, not that row's.
+    It 'gives a new group in a seeded run its own token when the seed''s ResourceGroupMap names it only as <Case>' -ForEach @(
+        @{ Case = 'the name after a type word resourceGroups in a tenant-scope id'; Value = '/providers/Microsoft.Example/resourceGroups/grp-a'; Reused = $false }
+        @{ Case = 'a subscription id''s group (the seed''s token is kept)'; Value = "/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/grp-a/providers/microsoft.compute/virtualmachines/vm-old"; Reused = $true }
+    ) {
+        $Vm = "/subscriptions/$script:Sub/resourcegroups/grp-a/providers/microsoft.compute/virtualmachines/vm-new"
+        $Tok = New-Tok
+        Invoke-SeededRun -SeedMaps @{ ResourceIdMap = @{}; ResourceGroupMap = @{ $Tok = $Value } } -Rows @(New-Res $Vm)
+        $Group = ($Global:ResourceIdDictionary[$Vm] -split '/')[4]
+        $Group | Should -Match ('^' + $script:Token + '$')
+        if ($Reused) { $Group | Should -BeExactly $Tok -Because 'the seed names the real group grp-a' }
+        else { $Group | Should -Not -BeExactly $Tok -Because 'the seed names no group grp-a, only a tenant-scope id''s type word and name' }
+    }
 }
 
 Describe 'The seed''s parent tokens' {

@@ -39,10 +39,13 @@ function ConvertTo-LookupTable
     return $Table
 }
 
+# The group of a subscription id ('/subscriptions/<id>/resourceGroups/<group>/...'),
+# as the masking reads it. A tenant-scope id ('/providers/...') has none: a
+# 'resourceGroups' segment there is a type word.
 function Get-RgNameFromResourceId
 {
     param([string]$ResourceId)
-    if ($ResourceId -match '(?i)/resourceGroups/([^/]+)') { return $Matches[1] }
+    if ($ResourceId -match '(?i)^/subscriptions/[^/]+/resourceGroups/([^/]+)') { return $Matches[1] }
     return $null
 }
 
