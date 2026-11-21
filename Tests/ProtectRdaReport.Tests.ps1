@@ -1648,6 +1648,10 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
         @{ Case = 'an empty section no collector writes'; Kind = 'null-section'; Says = 'a section no collector writes' }
         @{ Case = 'a metric record without one of its fields'; Kind = 'metric-key'; Says = 'is not the shape a run writes' }
         @{ Case = 'a metric record with MetricError as text'; Kind = 'metric-type'; Says = 'is not the shape a run writes' }
+        @{ Case = 'a metric record with MetricSeries as text'; Kind = 'metric-series-text'; Says = 'is not the shape a run writes' }
+        @{ Case = 'a metric record of a failed call with MetricSeries as text'; Kind = 'metric-series-text-failed'; Says = 'is not the shape a run writes' }
+        @{ Case = 'a metric record of a failed call whose MetricSeries list holds a null'; Kind = 'metric-series-null-in-list'; Says = 'is not the shape a run writes' }
+        @{ Case = 'a metric record with a null MetricSeries and MetricError false'; Kind = 'metric-series-null-no-error'; Says = 'is not the shape a run writes' }
         @{ Case = 'an InstanceData value without one of main''s 18 fields'; Kind = 'info-key'; Says = 'not the shape a run writes' }
         @{ Case = 'usage of a subscription the report does not name'; Kind = 'other-sub'; Says = 'subscription the report does not name' }
         @{ Case = 'a consumption header that writes MeterCategory with a quote in it written twice (the name is Meter"Category)'; Kind = 'head-quote'; Says = 'columns are not the ones a run writes' }
@@ -1699,6 +1703,12 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
             'null-section' { & $script:Planted 'Inventory_*.json' { param($T) $T -replace '^\{', '{"Notes":null,' } }
             'metric-key' { & $script:Planted 'Metrics_*.json' { param($T) $Mx = ConvertFrom-RdaJsonText -Text $T; $Mx['Metrics'][0].Remove('MetricTotalCount'); ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress } }
             'metric-type' { & $script:Planted 'Metrics_*.json' { param($T) $Mx = ConvertFrom-RdaJsonText -Text $T; $Mx['Metrics'][0]['MetricError'] = 'false'; ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress } }
+            # Only a null series on a failed call is what a run writes; these stay refused.
+            { $_ -like 'metric-series-*' }
+            {
+                $script:SeriesSet = @{ 'metric-series-text' = @($false, '1,2'); 'metric-series-text-failed' = @($true, '1,2'); 'metric-series-null-in-list' = @($true, @(1, $null)); 'metric-series-null-no-error' = @($false, $null) }[$Kind]
+                & $script:Planted 'Metrics_*.json' { param($T) $Mx = ConvertFrom-RdaJsonText -Text $T; $Mx['Metrics'][0]['MetricError'] = $script:SeriesSet[0]; $Mx['Metrics'][0]['MetricSeries'] = $script:SeriesSet[1]; ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress }
+            }
             'info-key' { & $script:Planted 'Consumption_*.csv' { param($T) $T -replace '""AHB"":""[^"]*"",', '' } }
             'cut-row' { & $script:Planted 'Consumption_*.csv' { param($T) $L = @($T.TrimEnd() -split "`r?`n"); $L[-1] = $L[-1] -replace '(,[^,]*){3}$', ''; ($L -join "`n") + "`n" } }
             'other-sub' { & $script:Planted 'Consumption_*.csv' { param($T) $L = @($T.TrimEnd() -split "`r?`n"); $L[-1] = $L[-1] -replace '12345678-1234-1234-1234-123456789012', '99999999-9999-9999-9999-999999999999'; ($L -join "`n") + "`n" } }
@@ -2012,6 +2022,29 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
                 Dict    = Read-RdaJsonFile -Path @(Get-ChildItem -LiteralPath $Folder -Filter 'ObfuscationDictionary_*.json')[0].FullName
             }
         }
+        # Each masked metric record against the plain one, in order: the id maps back with
+        # the dictionary, the name, group and subscription are the masked id's own segments,
+        # and every other field is the plain one, value for value (JSON text with sorted keys).
+        $script:AssertMaskedMetric = {
+            param([string]$PlainZip, $M)
+            $PlainMembers = script:Read-Zip $PlainZip
+            $In = @((ConvertFrom-RdaJsonText -Text $PlainMembers[@($PlainMembers.Keys | Where-Object { $_ -like 'Metrics_*' })[0]])['Metrics'])
+            $Out = @((ConvertFrom-RdaJsonText -Text $M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Metrics_*' })[0]])['Metrics'])
+            $Out.Count | Should -Be $In.Count
+            for ($i = 0; $i -lt $In.Count; $i++)
+            {
+                $P = $In[$i]; $O = $Out[$i]
+                $M.Dict.ResourceIdMap[$O['ID']] | Should -BeExactly $P['ID'] -Because "record $i's masked id maps back to its plain id"
+                $Parts = $O['ID'].Split('/')
+                $O['Name'] | Should -BeExactly $Parts[-1]
+                $O['ResourceGroup'] | Should -BeExactly $Parts[4]
+                $O['Subscription'] | Should -BeExactly $Parts[2]
+                $Keep = $P.Clone(); $Back = $O.Clone()
+                foreach ($K in 'ID', 'Name', 'ResourceGroup', 'Subscription') { $Keep.Remove($K); $Back.Remove($K) }
+                (script:ConvertTo-SortedJson $Back) | Should -BeExactly (script:ConvertTo-SortedJson $Keep) -Because "record $i keeps every other field as written"
+            }
+            return , $Out
+        }
     }
     AfterAll {
         Remove-RdaTestReportZip $script:PlainRun
@@ -2028,6 +2061,34 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Rec[0]['ResourceGroup'] | Should -Be ($Rec[0]['ID'].Split('/')[4]) -Because 'the record joins by name, group and subscription when ids do not match'
         $M.Dict.ResourceGroupMap[$Rec[0]['ResourceGroup']] | Should -Match '/resourcegroups/rg-extra-01(/|$)'
         $Rec[0]['Name'] | Should -Be ($Rec[0]['ID'].Split('/')[-1])
+    }
+
+    # A run writes a null MetricSeries on a call that failed (Extension/Metrics.ps1,
+    # MetricError true). The offline mask passes it through as written, null kept.
+    It 'passes a metric record of a failed call (MetricError true, MetricSeries null) through as a run writes it, with only its id and names masked' {
+        $Zip = & $script:Change @{ 'Metrics_*.json' = {
+                param($T)
+                $Mx = ConvertFrom-RdaJsonText -Text $T
+                if (@($Mx['Metrics']).Count -lt 2) { throw 'the plain metrics file has fewer than two records' }
+                # As Add-MetricRecord's catch writes a failed call.
+                $R = $Mx['Metrics'][0]
+                $R['MetricError'] = $true; $R['MetricSeries'] = $null
+                foreach ($K in 'MetricPercentile', 'MetricValue', 'MetricCount', 'MetricTotalCount') { $R[$K] = 0 }
+                ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress
+            }
+        }
+        $M = & $script:Masked $Zip
+        $M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Metrics_*' })[0]] | Should -Match '"MetricSeries":null' -Because 'the null is kept as written'
+        $Out = & $script:AssertMaskedMetric $Zip $M
+        $Out[0].ContainsKey('MetricSeries') | Should -BeTrue
+        $null -eq $Out[0]['MetricSeries'] | Should -BeTrue
+        $Out[0]['MetricError'] | Should -BeTrue
+    }
+
+    It 'masks the metric records of a report whose records are all good as before: only ids and names change' {
+        $M = & $script:Masked $script:PlainRun.ZipPath
+        $Out = & $script:AssertMaskedMetric $script:PlainRun.ZipPath $M
+        @($Out | Where-Object { $null -eq $_['MetricSeries'] }).Count | Should -Be 0 -Because 'no good record has a null series'
     }
 
     It 'masks a Service Bus namespace named $system and its topic in the inventory, metrics and consumption, with no $system left in any of them' {

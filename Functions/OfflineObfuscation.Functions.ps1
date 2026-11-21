@@ -1916,7 +1916,10 @@ function Get-RdaUnknownInventoryShape
 # True when a metric record is the shape a run writes and the output contract
 # needs: every field of the run's record and no other, the four numbers numbers,
 # MetricError true or false, the series one number or a list of numbers, the
-# other fields text (or empty).
+# other fields text (or empty). A run writes a null series on a call that failed
+# (MetricError true, Extension/Metrics.ps1), so that record is read as the run
+# writes it, as the recovery merge reads it; text, a null inside a list, or a
+# null series with MetricError false is still not a record a run writes.
 function Test-RdaMetricRecordShape
 {
     param($Record, $Shape)
@@ -1936,7 +1939,7 @@ function Test-RdaMetricRecordShape
         {
             { $_ -in 'MetricCount', 'MetricValue', 'MetricPercentile', 'MetricTotalCount' } { if (-not (& $IsNumber $V)) { return $false } }
             'MetricError' { if ($V -isnot [bool]) { return $false } }
-            'MetricSeries' { if (-not ((& $IsNumber $V) -or ($V -is [array] -and @($V | Where-Object { -not (& $IsNumber $_) }).Count -eq 0))) { return $false } }
+            'MetricSeries' { if (-not (($null -eq $V -and $Record['MetricError'] -is [bool] -and $Record['MetricError']) -or (& $IsNumber $V) -or ($V -is [array] -and @($V | Where-Object { -not (& $IsNumber $_) }).Count -eq 0))) { return $false } }
             default { if ($null -ne $V -and $V -isnot [string]) { return $false } }
         }
     }
