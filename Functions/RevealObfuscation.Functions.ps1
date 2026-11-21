@@ -257,7 +257,10 @@ function Get-JsonEscaped
 # becomes the subscription id there, while elsewhere it is the display name.
 # When the resource id dimension is revealed, a whole masked id found in
 # $IdPathMap (masked id -> real id) is replaced as one value first; this also
-# restores ids whose segment tokens a dictionary does not hold one by one.
+# restores ids whose segment tokens a dictionary does not hold one by one. A
+# whole id is a subscription id ('/subscriptions/<token>...') or a tenant-scope
+# id ('/providers/<namespace>/<type>/<token>...', a reservation order), each
+# read up to the first character that ends a value in a file.
 function Convert-RevealString
 {
     param([string]$Text, [string]$EscapeMode = 'None')
@@ -285,7 +288,7 @@ function Convert-RevealString
     }
     if ($null -ne $IdPathMap -and $IdPathMap.Count -gt 0)
     {
-        $Text = [regex]::Replace($Text, '(?i)/subscriptions/(?:prod|nonprod)_[^"''\s,<>|\\]+', {
+        $Text = [regex]::Replace($Text, '(?i)(?:/subscriptions/(?:prod|nonprod)_|/providers/)[^"''\s,<>|\\]+', {
                 param($m)
                 if ($IdPathMap.ContainsKey($m.Value))
                 {

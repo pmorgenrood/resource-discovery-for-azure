@@ -904,6 +904,75 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
     }
 }
 
+# With -Fields ResourceId, a whole masked id that ResourceIdMap holds is replaced by its real id
+# first, so an id comes back even when the dictionary does not hold its parts one by one (an older
+# or partial dictionary). A tenant-scope id ('/providers/<namespace>/<type>/<name>...', a
+# reservation order) is a whole id there too.
+Describe "Reveal-Obfuscation reveals a tenant-scope id whole from ResourceIdMap" {
+
+    BeforeAll {
+        $script:TenSub = '12345678-1234-1234-1234-123456789012'
+        $script:TenTok = @{}
+        foreach ($K in 'Ro', 'R', 'Other', 'Sub', 'Rg', 'Vm') { $script:TenTok[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        $T = $script:TenTok
+        $script:TenIds = [ordered]@{
+            Order     = @{ M = "/providers/Microsoft.Capacity/reservationOrders/$($T.Ro)"; R = '/providers/Microsoft.Capacity/reservationOrders/ro-0001' }
+            Child     = @{ M = "/providers/Microsoft.Capacity/reservationOrders/$($T.Ro)/reservations/$($T.R)"; R = '/providers/Microsoft.Capacity/reservationOrders/ro-0001/reservations/r-0001' }
+            Vm        = @{ M = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm)"; R = "/subscriptions/$($script:TenSub)/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm01" }
+        }
+        # Not in the dictionary: it stays as written.
+        $script:TenUnknown = "/providers/Microsoft.Capacity/reservationOrders/$($T.Other)"
+
+        # A report zip of the given ids (inventory rows, consumption rows and their InstanceData)
+        # and a dictionary that holds only their ResourceIdMap entries.
+        function New-TenantReport
+        {
+            param([string[]]$Keys)
+            $Dir = Join-Path $script:TmpDir ("tenant_whole_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $Stage = Join-Path $Dir 'stage'
+            New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+            $Rows = @(foreach ($K in $Keys) { [ordered]@{ ID = $script:TenIds[$K].M } })
+            $Rows += [ordered]@{ ID = $script:TenUnknown }
+            [ordered]@{ Reservations = $Rows } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_Tenant.json') -Encoding utf8
+            @(foreach ($K in $Keys)
+                {
+                    $M = $script:TenIds[$K].M
+                    [pscustomobject]@{ ResourceId = $M; InstanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $M } } | ConvertTo-Json -Compress); Cost = '1.00' }
+                }) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_Tenant.csv') -NoTypeInformation -Encoding utf8
+            $Zip = Join-Path $Dir 'ResourcesReport_Tenant.zip'
+            Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+            $Map = [ordered]@{}
+            foreach ($K in $Keys) { $Map[$script:TenIds[$K].M] = $script:TenIds[$K].R }
+            $DictFile = Join-Path $Dir 'ObfuscationDictionary_Tenant.json'
+            [ordered]@{ GeneratedAt = '2026-06-30 00:00:00'; ResourceIdMap = $Map } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $DictFile -Encoding utf8
+            return [pscustomobject]@{ Dir = $Dir; Zip = $Zip; Dict = $DictFile }
+        }
+    }
+
+    It "reveals, with <Mode>, every id of a <Report> report from a dictionary that holds only ResourceIdMap, and leaves an id it does not hold as written" -ForEach @(
+        foreach ($Mode in '-Fields ResourceId', '-All')
+        {
+            @{ Mode = $Mode; Report = 'tenant-scope only'; Keys = @('Order', 'Child') }
+            @{ Mode = $Mode; Report = 'mixed tenant-scope and subscription'; Keys = @('Vm', 'Order', 'Child') }
+        }
+    ) {
+        $Rep = New-TenantReport -Keys $Keys
+        $Out = Join-Path $Rep.Dir 'out.zip'
+        $Splat = @{ InputZip = $Rep.Zip; DictionaryPath = $Rep.Dict; OutputZip = $Out }
+        if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceId') }
+        & $script:RevealScript @Splat *>&1 | Out-Null
+        Test-Path -LiteralPath $Out | Should -BeTrue
+        $Ex = Join-Path $Rep.Dir 'ex'
+        Expand-Archive -LiteralPath $Out -DestinationPath $Ex -Force
+        $Inv = Get-Content -LiteralPath (Join-Path $Ex 'Inventory_Tenant.json') -Raw | ConvertFrom-Json
+        $Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_Tenant.csv'))
+        $Want = @(foreach ($K in $Keys) { $script:TenIds[$K].R })
+        @($Inv.Reservations.ID) | Should -Be @($Want + $script:TenUnknown)
+        @($Csv.ResourceId) | Should -Be $Want
+        @($Csv | ForEach-Object { ($_.InstanceData | ConvertFrom-Json).'Microsoft.Resources'.resourceUri }) | Should -Be $Want -Because 'an id inside a JSON cell is revealed too'
+    }
+}
+
 Describe "Reveal's doc on a dictionary it refuses" {
 
     It "says that Reveal refuses a dictionary that gives one token to two maps, or whose ids hold a token for another kind of value or real value, writes nothing, and that the fix is the dictionary the run wrote" {
