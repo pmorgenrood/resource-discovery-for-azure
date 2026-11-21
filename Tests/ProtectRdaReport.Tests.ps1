@@ -681,6 +681,32 @@ Describe 'Names and types are kept as a run writes them' {
         Test-RdaMaskedUsageId -PlainId $Plain.Replace('/$system', '') -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.servicebus/namespaces/{0}' -f $Tok) | Should -BeTrue -Because 'the namespace''s own id is taken'
     }
 
+    # A subscription id pairs a word with a value from segment 1 on, so one with an even number
+    # of segments ends on a word with no value after it ('.../namespaces/<name>/topics').
+    # Downstream reads the last segment as the name, so the offline mask refuses that form too.
+    It 'reads a subscription id as ending on a type word with no name after it only when its last segment is a word: <Id>' -ForEach @(
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/topics'; Want = $true }
+        @{ Id = '/subscriptions/prod_x/resourcegroups/prod_y/providers/microsoft.storage/storageaccounts/prod_z/blobservices'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/topics/t-1'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/'; Want = $false }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/r-1/reservations'; Want = $false }
+        @{ Id = 'prod_x'; Want = $false }
+        @{ Id = ''; Want = $false }
+    ) {
+        Test-RdaTrailingTypeWordId $Id | Should -Be $Want
+    }
+
+    It 'refuses, as the masked id of a usage row, an id that ends on a type word with no name after it' {
+        $Tok = 'prod_{0}' -f [guid]::NewGuid()
+        $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/topics'
+        Test-RdaMaskedUsageId -PlainId $Plain -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.servicebus/namespaces/{0}/topics' -f $Tok) | Should -BeFalse
+        Test-RdaMaskedUsageId -PlainId ($Plain + '/topic-01') -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.servicebus/namespaces/{0}/topics/{0}' -f $Tok) | Should -BeTrue -Because 'a topic''s own id is taken'
+    }
+
     # No fixture or captured billing row shows Azure billing '.../namespaces/<namespace>/$system',
     # so the code and the doc say the offline mask refuses that form and leave it to the owner.
     It 'says, in its code and its doc, that it refuses an id that ends on the word $system with no name after it, and that the form is with the owner' {
@@ -2234,6 +2260,33 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         ($R.Text -join ' ') | Should -Match ([regex]::Escape("consumption row 1 has an id that ends on the word '`$system' with no name after it ('.../<type>/<name>/`$system'). That is an id form this tool does not support")) -Because 'the stop gives its own reason'
         ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
         ($R.Text -join ' ') | Should -Not -Match 'sbdemo01' -Because 'the stop names no id'
+        @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
+    }
+
+    # A usage row whose id ends on a type word with no name after it ('.../namespaces/<namespace>/topics')
+    # would be masked to '.../namespaces/<token>/topics', and downstream reads that last word as the
+    # resource's name. No captured billing row shows such an id, so the mask stops on it with its own
+    # reason, which masking again would not change, and writes nothing.
+    It 'refuses a usage row whose id ends on a type word with no name after it (<Case>), as an id form this tool does not support, and writes nothing' -ForEach @(
+        @{ Case = 'a Service Bus namespace''s topics'; Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/topics'; Category = 'Service Bus'; Name = 'sbdemo01' }
+        @{ Case = 'a storage account''s blob services'; Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.storage/storageaccounts/stdemo01/blobservices'; Category = 'Storage'; Name = 'stdemo01' }
+    ) {
+        $script:TrailingPlain = $Plain; $script:TrailingCategory = $Category
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $script:TrailingPlain).Replace('"Virtual Machines"', ('"{0}"' -f $script:TrailingCategory)))
+            $Lines -join "`n"
+        }
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape("consumption row 1 has an id that ends on a type word with no name after it ('.../<type>/<name>/<type>'). That is an id form this tool does not support")) -Because 'the stop gives its own reason'
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
+        ($R.Text -join ' ') | Should -Not -Match $Name -Because 'the stop names no id'
         @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
     }
 

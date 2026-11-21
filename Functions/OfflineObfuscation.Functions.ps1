@@ -1215,7 +1215,9 @@ function Test-RdaMaskedSlot
 # masked id that keeps a name part as written fails, whatever the name: Azure's fixed
 # name '$system', or a short name of letters only, neither of which the last leak scan
 # looks for inside a text. An id that ends on the word '$system' with no name after it
-# fails too (Test-RdaTrailingSystemTypeId): this tool does not support that form.
+# fails too (Test-RdaTrailingSystemTypeId), and so does a subscription id that ends on any
+# other type word with no name after it (Test-RdaTrailingTypeWordId): this tool does not
+# support those forms.
 # Apart from that shape check, which mirrors the run's masking, every name slot of a
 # masked path must differ, in any case, from the plain id's segment there (the
 # subscription, the group and every name; the namespace and type words are kept): a
@@ -1227,9 +1229,10 @@ function Test-RdaMaskedUsageId
     if ([string]::IsNullOrEmpty($PlainId)) { return $MaskedId -ceq 'obfuscated' }
     if ($PlainId -match '(?i)^/subscriptions/[^/]' -or (Test-RdaTenantScopeIdMaskable -ResourceId $PlainId))
     {
-        # An id that ends on the word '$system' with no name after it is a form this tool
-        # does not support (Test-RdaTrailingSystemTypeId), whatever its other parts are.
-        if ((Test-RdaTrailingSystemTypeId $PlainId) -or (Test-RdaTrailingSystemTypeId ([string]$MaskedId))) { return $false }
+        # An id that ends on the word '$system', or a subscription id that ends on any other
+        # type word, with no name after it is a form this tool does not support
+        # (Test-RdaTrailingSystemTypeId, Test-RdaTrailingTypeWordId), whatever its other parts are.
+        if ((Test-RdaTrailingSystemTypeId $PlainId) -or (Test-RdaTrailingSystemTypeId ([string]$MaskedId)) -or (Test-RdaTrailingTypeWordId $PlainId) -or (Test-RdaTrailingTypeWordId ([string]$MaskedId))) { return $false }
         $P = $PlainId.Split('/')
         $M = ([string]$MaskedId).Split('/')
         if ($P.Count -ne $M.Count) { return $false }
@@ -2152,6 +2155,24 @@ function Test-RdaTrailingSystemTypeId([string]$Id)
     if ([string]::IsNullOrEmpty($Id) -or -not $Id.EndsWith('/$system', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
     $Parts = $Id.Split('/')
     return $Parts[0] -eq '' -and ($Parts[1] -ieq 'subscriptions' -or $Parts[1] -ieq 'providers') -and ($Parts.Count % 2) -eq 0
+}
+
+# True when a subscription id ('/subscriptions/...', plain or masked) ends on a word with no
+# value after it, as in '.../namespaces/<name>/topics': a path pairs a word with a value from
+# segment 1 on, so its last segment is a word when it has an even number of segments. (A
+# last segment that is empty, an id that ends on '/', is not counted here: Test-RdaIdPathWord
+# refuses it.) A run keeps such a last word as written, and its shape check
+# (Test-ObfuscatedIdShape) takes it; that is not changed here. Downstream reads an id's last
+# segment as the resource's name, and no fixture or captured billing row shows Azure billing
+# such an id, so the offline mask refuses it (Protect-RdaReport.ps1, Test-RdaMaskedUsageId), as
+# it refuses a last word '$system', and how to mask it is with the owner. A run gives a
+# tenant-scope id of that form one flat token (Test-RdaTenantScopeIdMaskable), which holds no
+# word, so such an id is not counted.
+function Test-RdaTrailingTypeWordId([string]$Id)
+{
+    if ([string]::IsNullOrEmpty($Id)) { return $false }
+    $Parts = $Id.Split('/')
+    return $Parts.Count -ge 4 -and ($Parts.Count % 2) -eq 0 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'subscriptions' -and $Parts[-1] -ne ''
 }
 
 # The path where $Path really is: each part that is a link or junction followed (its target

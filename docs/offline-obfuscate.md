@@ -73,7 +73,9 @@ holds plain copies of the report, so delete it.
   An id whose last segment is the word `$system` with no name after it (`.../namespaces/<namespace>/$system`)
   is refused like any other word that is not of that form: it is an id form this tool does not support. No
   fixture or captured billing row shows Azure billing it, and downstream reads an id's last segment as the
-  resource's name, so how to mask it is with the owner; the mask stops on such a usage row and says so. Its leak scan
+  resource's name, so how to mask it is with the owner; the mask stops on such a usage row and says so. A usage row
+  whose id ends on any other type word with no name after it (`.../namespaces/<namespace>/topics`) is stopped the same
+  way, with its own reason: downstream would read that word as the resource's name. Its leak scan
   finds one that is a name, group or subscription of the report of at least 5 characters that is 12 or
   more long or holds a digit, and is not equal to or inside a value of a field no run masks. A shorter or letters-only one (a group
   `rg1` or `finance` written as a type word) is not found: no offline check can tell a word of Azure's form from
