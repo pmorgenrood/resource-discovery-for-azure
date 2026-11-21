@@ -783,6 +783,123 @@ Describe 'The seed is checked when it is read' {
         finally { Remove-Item -LiteralPath Function:\Protect-FreeTextValue -ErrorAction SilentlyContinue }
     }
 
+    # A damaged or hand-merged seed can give a flat id (a real id that is not an ARM path) the
+    # token it also gives a subscription, a group or a name, in an id's slot or in a map. Reveal
+    # puts a token's value wherever the token stands, and stops on a dictionary that holds one
+    # token in two maps, so the run must not write one. The path token is kept (ids join on it);
+    # the flat id gets a new token, and the next two seeded runs keep it. A tag or free-text value
+    # that shares a flat id's token is the one that gets a new token (the check before it), so the
+    # flat id keeps its token there. Reveal then gives each field its own value.
+    It 'gives <Who> a new token when the seed gives a flat id and <Case> one token, keeps the path tokens, the next two seeded runs keep it, and Reveal of ids alone and of all fields gives each field its own value' -ForEach @(
+        @{ Case = 'a resource''s name'; Slot = 'name'; Who = 'the flat id' }
+        @{ Case = 'a resource group'; Slot = 'rg'; Who = 'the flat id' }
+        @{ Case = 'a subscription'; Slot = 'sub'; Who = 'the flat id' }
+        @{ Case = 'a name in the name map only'; Slot = 'namemap'; Who = 'the flat id' }
+        @{ Case = 'a tag value'; Slot = 'tag'; Who = 'the tag value' }
+        @{ Case = 'a free-text value'; Slot = 'text'; Who = 'the free-text value' }
+    ) {
+        # The run's own maskers: the collector row masking (tags) and the free-text one.
+        $RowFn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaCollectorRow' }, $false))
+        $RowFn.Count | Should -Be 1
+        . ([scriptblock]::Create($RowFn[0].Extent.Text))
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/ResourceInventory.Functions.ps1'), [ref]$null, [ref]$null)
+        $FreeFn = @($FnAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Global:Protect-FreeTextValue' }, $false))
+        $FreeFn.Count | Should -Be 1
+        . ([scriptblock]::Create($FreeFn[0].Extent.Text))
+        try
+        {
+            $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-a"
+            $Other = "$script:Base/microsoft.compute/virtualmachines/vm-other"
+            $FlatReal = 'marketplace-charge-01'
+            $SubTok = New-Tok; $RgTok = New-Tok; $NameTok = New-Tok; $OtherTok = New-Tok; $TagTok = New-Tok; $TextTok = New-Tok
+            $FlatTok = switch ($Slot) { 'name' { $NameTok } 'rg' { $RgTok } 'sub' { $SubTok } 'namemap' { $OtherTok } 'tag' { $TagTok } 'text' { $TextTok } }
+            $NewFlat = $Slot -in @('name', 'rg', 'sub', 'namemap')
+            $VmMasked = "/subscriptions/$SubTok/resourcegroups/$RgTok/providers/microsoft.compute/virtualmachines/$NameTok"
+            $Seed = @{
+                ResourceIdMap    = @{ $VmMasked = $Vm; $FlatTok = $FlatReal }
+                ResourceNameMap  = @{ $NameTok = $Vm; $OtherTok = $Other }
+                ResourceGroupMap = @{ $RgTok = "/subscriptions/$script:Sub/resourcegroups/rg-demo" }
+                TagMap           = @{ $TagTok = 'payments-01' }
+                FreeTextMap      = @{ $TextTok = 'team notes 01' }
+            }
+            $Runs = [System.Collections.Generic.List[object]]::new()
+            foreach ($Run in 1, 2, 3)
+            {
+                Invoke-SeededRun -SeedMaps $Seed -Rows @((New-Res $Vm), (New-Res $FlatReal))
+                $Row = @{ ID = $Vm; Name = 'vm-a'; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo'; Tags = @([pscustomobject]@{ Name = 'app'; Value = 'payments-01' }) }
+                $FlatRow = @{ ID = $FlatReal; Name = 'charge-01'; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo' }
+                Protect-RdaCollectorRow -Rows @($Row, $FlatRow) -Collector 'VirtualMachines'
+                $Row['Description'] = Protect-FreeTextValue 'team notes 01'
+                $OtherNow = (Get-Variable -Scope Global -Name ResourceNameDictionary -ValueOnly)[$Other]
+                $Runs.Add([pscustomobject]@{ Run = $Run; Row = $Row; FlatRow = $FlatRow; Other = $OtherNow })
+                $Seed = Get-RunDictionaryMaps
+            }
+
+            # The third run's rows in a report, revealed with the third run's dictionary.
+            $Last = $Runs[2]
+            $Dir = Join-Path $script:SeedDir4 ('reveal-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+            $Stage = Join-Path $Dir 'stage'
+            New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+            @{ VirtualMachines = @($Last.Row, $Last.FlatRow) } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_Test.json') -Encoding utf8
+            $Zip = Join-Path $Dir 'ResourcesReport_Test.zip'
+            Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip
+            $DictPath = Join-Path $Dir 'ObfuscationDictionary_Test.json'
+            $Seed | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $DictPath -Encoding utf8
+            $RevealScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'Reveal.ps1'
+            $Reveal = {
+                param([hashtable]$With)
+                $Name = [guid]::NewGuid().ToString('N').Substring(0, 6)
+                $Out = Join-Path $Dir ('out-' + $Name + '.zip')
+                & $RevealScript -InputZip $Zip -DictionaryPath $DictPath -OutputZip $Out @With *>&1 | Out-Null
+                $Ex = Join-Path $Dir ('ex-' + $Name)
+                Expand-Archive -LiteralPath $Out -DestinationPath $Ex
+                @((Get-Content -LiteralPath (Join-Path $Ex 'Inventory_Test.json') -Raw | ConvertFrom-Json).VirtualMachines)
+            }
+
+            $Ids = & $Reveal @{ Fields = @('ResourceId') }
+            $Ids[0].ID | Should -BeExactly $Vm -Because 'Reveal of ids gives the id its value'
+            $Ids[1].ID | Should -BeExactly $FlatReal -Because 'Reveal of ids gives the flat id its value'
+            $Ids[0].Name | Should -BeExactly $NameTok -Because 'Reveal of ids leaves the name masked'
+            $Ids[0].ResourceGroup | Should -BeExactly $RgTok -Because 'Reveal of ids leaves the group masked'
+            $Ids[0].Subscription | Should -BeExactly $SubTok -Because 'Reveal of ids leaves the subscription masked'
+            $Ids[0].Tags[0].Value | Should -BeExactly ([string]$Last.Row['Tags'][0].Value) -Because 'Reveal of ids leaves the tag masked'
+            $Ids[0].Description | Should -BeExactly $Last.Row['Description'] -Because 'Reveal of ids leaves the free text masked'
+            $Full = & $Reveal @{ All = $true }
+            $Full[0].ID | Should -BeExactly $Vm -Because 'Reveal of all fields gives the id its own value'
+            $Full[1].ID | Should -BeExactly $FlatReal -Because 'Reveal of all fields gives the flat id its own value'
+            $Full[0].Name | Should -BeExactly 'vm-a' -Because 'Reveal of all fields gives the name its own value'
+            $Full[0].ResourceGroup | Should -BeExactly 'rg-demo' -Because 'Reveal of all fields gives the group its own value'
+            $Full[0].Subscription | Should -BeExactly 'Demo Subscription' -Because 'Reveal of all fields gives the subscription its own value'
+            $Full[0].Tags[0].Value | Should -BeExactly 'payments-01' -Because 'Reveal of all fields gives the tag its own value'
+            $Full[0].Description | Should -BeExactly 'team notes 01' -Because 'Reveal of all fields gives the free text its own value'
+
+            $TokenForm = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            foreach ($R in $Runs)
+            {
+                $R.Row['ID'] | Should -BeExactly $VmMasked -Because "run $($R.Run) keeps the seeded id"
+                $R.Row['Name'] | Should -BeExactly $NameTok -Because "run $($R.Run) keeps the name token"
+                $R.Row['ResourceGroup'] | Should -BeExactly $RgTok -Because "run $($R.Run) keeps the group token"
+                $R.Row['Subscription'] | Should -BeExactly $SubTok -Because "run $($R.Run) keeps the subscription token"
+                $R.Other | Should -BeExactly $OtherTok -Because "run $($R.Run) keeps the name map token of a resource it does not see"
+                foreach ($Check in @(
+                        [pscustomobject]@{ What = 'flat id'; Now = [string]$R.FlatRow['ID']; New = $NewFlat; Seeded = $FlatTok; First = [string]$Runs[0].FlatRow['ID'] }
+                        [pscustomobject]@{ What = 'tag'; Now = [string]$R.Row['Tags'][0].Value; New = $Slot -eq 'tag'; Seeded = $TagTok; First = [string]$Runs[0].Row['Tags'][0].Value }
+                        [pscustomobject]@{ What = 'free-text value'; Now = [string]$R.Row['Description']; New = $Slot -eq 'text'; Seeded = $TextTok; First = [string]$Runs[0].Row['Description'] }
+                    ))
+                {
+                    if ($Check.New)
+                    {
+                        $Check.Now | Should -Not -Be $FlatTok -Because "run $($R.Run) gives the $($Check.What) a token of its own"
+                        $Check.Now | Should -MatchExactly $TokenForm -Because "run $($R.Run) writes the run's token form for the $($Check.What)"
+                        $Check.Now | Should -BeExactly $Check.First -Because "run $($R.Run) keeps run 1's $($Check.What) token, letter for letter"
+                    }
+                    else { $Check.Now | Should -BeExactly $Check.Seeded -Because "run $($R.Run) keeps the $($Check.What)'s good seeded token" }
+                }
+            }
+        }
+        finally { Remove-Item -LiteralPath Function:\Protect-FreeTextValue -ErrorAction SilentlyContinue }
+    }
+
     It 'gives a $system parent that the seeded ids give two tokens one new token, in its own id and its child''s, and the next two seeded runs keep both' {
         # The namespace's own seeded id and its topic's give the one real
         # '.../namespaces/$system' two tokens (a seed written before the slot
@@ -1105,7 +1222,7 @@ Describe 'The seed''s parent tokens' {
 }
 
 Describe 'The seed check frees what it built' {
-    It 'sets <_> to null in the seeded branch, after it is last read and before the token loop' -ForEach @('SeedSlotsOf', 'SeedSlotTokens', 'SeedDictionary') {
+    It 'sets <_> to null in the seeded branch, after it is last read and before the token loop' -ForEach @('SeedSlotsOf', 'SeedSlotTokens', 'SeedDictionary', 'SeedFlatIds') {
         $Ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'ResourceInventory.ps1'), [ref]$null, [ref]$null)
         $Setup = $Ast.Find({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'RunInventorySetup' }, $true)
         # The token loop: inline, or the call of Add-RdaObfuscationToken that runs it.

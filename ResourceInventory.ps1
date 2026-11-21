@@ -1819,6 +1819,9 @@ Function RunInventorySetup()
         #   A group's token that an older dictionary also gave the name after
         #   a type word resourceGroups in a tenant-scope id is kept for the
         #   group, and only those tenant-scope ids are dropped;
+        # - a flat id token that the seed also gives a subscription, a group or
+        #   a name is kept for that path part only: the flat id is dropped and
+        #   gets a new token, so Reveal does not write one as the other;
         # - a tag or free-text token that the seed also uses in a path, or for
         #   another tag or free-text value, is kept for the path only: those
         #   tag and free-text values get new tokens, so Reveal of one field
@@ -1903,6 +1906,7 @@ Function RunInventorySetup()
                 [void]$SeedTokenReals[$T].Add('name|' + ([string]$K -replace '(?i)/providers/microsoft\.sqlvirtualmachine/sqlvirtualmachines/', '/providers/microsoft.compute/virtualmachines/'))
             }
             $SeedDropped = 0
+            $SeedFlatIds = [System.Collections.Generic.List[string]]::new()
             foreach ($SeedRealId in @($ResourceIdDictionary.Keys))
             {
                 $SeedMasked = $ResourceIdDictionary[$SeedRealId]
@@ -1918,6 +1922,7 @@ Function RunInventorySetup()
                         [void]$ResourceIdDictionary.Remove($SeedRealId)
                         $SeedDropped++
                     }
+                    else { $SeedFlatIds.Add($SeedRealId) }
                     continue
                 }
                 if (-not (Test-ObfuscatedIdShape -RealId $SeedRealId -MaskedId $SeedMasked))
@@ -1966,6 +1971,23 @@ Function RunInventorySetup()
                     }
                 }
             }
+            # A flat id's token stands for that one id, as a path token stands for one
+            # subscription, group or resource. Reveal replaces a token wherever it stands, so a
+            # flat token the seed also gives a subscription, a group or a name (in a slot of any
+            # good id, or in the group or name map) would reveal one meaning as the other. The
+            # path token is kept (ids join on it), and the flat id is not, so this run gives it
+            # a new token and the dictionary it writes shares none. (Ignoring case, as a token
+            # is matched, and before the checks below drop any id, as above. A tag or free-text
+            # token that a flat id holds was given up by the tag or free text, above.)
+            foreach ($SeedRealId in $SeedFlatIds)
+            {
+                if ($SeedTokenReals.ContainsKey([string]$ResourceIdDictionary[$SeedRealId]))
+                {
+                    [void]$ResourceIdDictionary.Remove($SeedRealId)
+                    $SeedDropped++
+                }
+            }
+            $SeedFlatIds = $null
             # A token an older dictionary gave both a real group <x> and the name
             # after a type word resourceGroups in a tenant-scope id
             # ('/providers/<ns>/resourceGroups/<x>', which older builds read as
