@@ -310,6 +310,11 @@ leaves the token masked in any other id path, and warns. The whole ids come
 back only with `-Fields ResourceId` (or `-All`); otherwise the ids keep that
 token.
 
+Older builds also gave the name in a tenant-scope id
+`/providers/<namespace>/resourceGroups/<x>` the token of group `<x>`. Reveal
+takes a group's token in that one place when the id's real name there is that
+group's name, and stops on any other use of a group's token as a name.
+
 ### Usage
 
 ```powershell

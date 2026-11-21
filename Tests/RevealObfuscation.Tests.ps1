@@ -904,6 +904,149 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
     }
 }
 
+# Older builds of this fork read a segment 3 'resourceGroups' as a group slot in a tenant-scope id
+# too, so '/providers/<namespace>/resourceGroups/<x>' got the token of group <x> (keyed by the
+# group's name), and its masked id went into ResourceIdMap like every id the run masked.
+# ResourceGroupMap keeps the last id the writer met for that token: the group's own subscription
+# id, or the tenant-scope id. Reveal takes that token in that one name slot when its real value
+# there is the group's, and still stops on any other kind clash.
+Describe "Reveal-Obfuscation reads an older dictionary that gave a tenant-scope id after the type word resourceGroups a group's token" {
+
+    BeforeAll {
+        $script:TgSub = '12345678-1234-1234-1234-123456789012'
+        $script:TgTok = @{}
+        foreach ($K in 'Sub', 'Rg', 'Vm', 'Rg2', 'Vm2') { $script:TgTok[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        $T = $script:TgTok
+        $script:TgRVm = "/subscriptions/$($script:TgSub)/resourceGroups/grp-a/providers/Microsoft.Compute/virtualMachines/vm-a"
+        $script:TgMVm = "/subscriptions/$($T.Sub)/resourceGroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm)"
+        # A second group, so -Fields ResourceGroup always has a group to reveal.
+        $script:TgRVm2 = "/subscriptions/$($script:TgSub)/resourceGroups/grp-b/providers/Microsoft.Compute/virtualMachines/vm-b"
+        $script:TgMVm2 = "/subscriptions/$($T.Sub)/resourceGroups/$($T.Rg2)/providers/Microsoft.Compute/virtualMachines/$($T.Vm2)"
+        $script:TgRTen = '/providers/Microsoft.Example/resourceGroups/grp-a'
+        $script:TgMTen = "/providers/Microsoft.Example/resourceGroups/$($T.Rg)"
+
+        function New-TgDictionary
+        {
+            param([string]$GroupMapId, [System.Collections.IDictionary]$Extra)
+            $Ids = [ordered]@{ $script:TgMVm = $script:TgRVm; $script:TgMVm2 = $script:TgRVm2; $script:TgMTen = $script:TgRTen }
+            if ($Extra) { foreach ($K in $Extra.Keys) { $Ids[$K] = $Extra[$K] } }
+            [ordered]@{
+                GeneratedAt         = '2026-06-30 00:00:00'
+                ResourceIdMap       = $Ids
+                ResourceNameMap     = [ordered]@{ $script:TgTok.Vm = $script:TgRVm; $script:TgTok.Vm2 = $script:TgRVm2 }
+                SubscriptionMap     = [ordered]@{ $script:TgTok.Sub = $script:TgRVm }
+                ResourceGroupMap    = [ordered]@{ $script:TgTok.Rg = $GroupMapId; $script:TgTok.Rg2 = $script:TgRVm2 }
+                SubscriptionNameMap = [ordered]@{ $script:TgTok.Sub = 'Contoso' }
+            }
+        }
+
+        $script:TgDir = Join-Path $script:TmpDir ("tenant_group_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $script:TgDir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        [ordered]@{
+            VirtualMachines = @(
+                [ordered]@{ ID = $script:TgMVm; Name = $T.Vm; Subscription = $T.Sub; ResourceGroup = $T.Rg }
+                [ordered]@{ ID = $script:TgMVm2; Name = $T.Vm2; Subscription = $T.Sub; ResourceGroup = $T.Rg2 }
+            )
+            Examples        = @([ordered]@{ ID = $script:TgMTen })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_TenantGroup.json') -Encoding utf8
+        @(
+            [pscustomobject]@{ ResourceId = $script:TgMVm; Cost = '1.00' }
+            [pscustomobject]@{ ResourceId = $script:TgMTen; Cost = '2.00' }
+        ) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_TenantGroup.csv') -NoTypeInformation -Encoding utf8
+        $script:TgZip = Join-Path $script:TgDir 'ResourcesReport_TenantGroup.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $script:TgZip -Force
+        $script:TgZipHash = (Get-FileHash -LiteralPath $script:TgZip -Algorithm SHA256).Hash
+
+        function Invoke-TgReveal
+        {
+            param([System.Collections.IDictionary]$Dict, [string]$Mode)
+            $Dir = Join-Path $script:TgDir ("run_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            $File = Join-Path $Dir 'ObfuscationDictionary_TenantGroup.json'
+            $Dict | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $File -Encoding utf8
+            $Out = Join-Path $Dir 'out.zip'
+            $Splat = @{ InputZip = $script:TgZip; DictionaryPath = $File; OutputZip = $Out }
+            if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceGroup') }
+            $Err = $null
+            try { & $script:RevealScript @Splat *>&1 | Out-Null }
+            catch { $Err = $_ }
+            $Result = [pscustomobject]@{ Error = $Err; OutputZip = $Out; Inventory = $null; Csv = $null }
+            if (Test-Path -LiteralPath $Out)
+            {
+                $Ex = Join-Path $Dir 'ex'
+                Expand-Archive -LiteralPath $Out -DestinationPath $Ex -Force
+                $Result.Inventory = Get-Content -LiteralPath (Join-Path $Ex 'Inventory_TenantGroup.json') -Raw | ConvertFrom-Json
+                $Result.Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_TenantGroup.csv'))
+            }
+            return $Result
+        }
+    }
+
+    It "reveals, with <Mode>, the dictionary whose ResourceGroupMap gives the token <Variant>, and gives the tenant-scope id back" -ForEach @(
+        foreach ($Mode in '-Fields ResourceGroup', '-All')
+        {
+            @{ Mode = $Mode; Variant = 'the group''s subscription id'; GroupMapId = 'Vm' }
+            @{ Mode = $Mode; Variant = 'the tenant-scope id'; GroupMapId = 'Ten' }
+        }
+    ) {
+        $T = $script:TgTok
+        $MapId = if ($GroupMapId -eq 'Vm') { $script:TgRVm } else { $script:TgRTen }
+        $R = Invoke-TgReveal -Dict (New-TgDictionary -GroupMapId $MapId) -Mode $Mode
+        $R.Error | Should -BeNullOrEmpty -Because 'the token stands for the one real value grp-a in the group slot and in the tenant-scope id'
+        Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
+        $Vm = @($R.Inventory.VirtualMachines)[0]
+        $Ten = @($R.Inventory.Examples)[0]
+        # A ResourceGroupMap id that is a tenant-scope id gives no group, so the token stays
+        # masked in fields and paths; a whole id still comes back from ResourceIdMap.
+        $Group = if ($GroupMapId -eq 'Vm') { 'grp-a' } else { $T.Rg }
+        $Vm.ResourceGroup | Should -BeExactly $Group
+        @($R.Inventory.VirtualMachines)[1].ResourceGroup | Should -BeExactly 'grp-b' -Because 'the other group is revealed in every mode'
+        if ($Mode -eq '-All')
+        {
+            $Vm.ID | Should -BeExactly $script:TgRVm
+            $Ten.ID | Should -BeExactly $script:TgRTen
+            @($R.Csv.ResourceId) | Should -Be @($script:TgRVm, $script:TgRTen)
+        }
+        else
+        {
+            $Vm.ID | Should -BeExactly $script:TgMVm.Replace("/$($T.Rg)/", "/$Group/")
+            # The token's value in the tenant-scope id is the group's, so writing it there is right.
+            $Ten.ID | Should -BeExactly ('/providers/Microsoft.Example/resourceGroups/' + $Group)
+            @($R.Csv.ResourceId) | Should -Be @($script:TgMVm.Replace("/$($T.Rg)/", "/$Group/"), ('/providers/Microsoft.Example/resourceGroups/' + $Group))
+        }
+        (Get-FileHash -LiteralPath $script:TgZip -Algorithm SHA256).Hash | Should -Be $script:TgZipHash
+    }
+
+    It "still stops with <Mode> when <Case>, and writes nothing" -ForEach @(
+        foreach ($Mode in '-Fields ResourceGroup', '-All')
+        {
+            @{ Mode = $Mode; Case = 'the tenant-scope id holds the group''s token for another name'; Extra = 'OtherName' }
+            @{ Mode = $Mode; Case = 'a tenant-scope id holds the group''s token after another type word'; Extra = 'OtherType' }
+            @{ Mode = $Mode; Case = 'the group''s token is in no map'; Extra = 'NoMap' }
+        }
+    ) {
+        $T = $script:TgTok
+        $D = New-TgDictionary -GroupMapId $script:TgRVm
+        switch ($Extra)
+        {
+            'OtherName' { $D.ResourceIdMap[$script:TgMTen] = '/providers/Microsoft.Example/resourceGroups/grp-other' }
+            'OtherType' { $D.ResourceIdMap["/providers/Microsoft.Example/widgets/$($T.Rg)"] = '/providers/Microsoft.Example/widgets/grp-a' }
+            'NoMap' { $D.Remove('ResourceGroupMap') }
+        }
+        $R = Invoke-TgReveal -Dict $D -Mode $Mode
+        $R.Error | Should -Not -BeNullOrEmpty -Because 'only that one form, with the group''s own value, is taken'
+        $Msg = $R.Error.Exception.Message
+        $Msg | Should -Match ([regex]::Escape($T.Rg)) -Because 'the message names the token'
+        $Msg | Should -Match ([regex]::Escape('a name slot of a ResourceIdMap id'))
+        $Msg | Should -Match ([regex]::Escape('for two kinds of value'))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        foreach ($Real in 'grp-a', 'grp-other', 'vm-a', $script:TgSub) { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeFalse -Because 'no output zip is written'
+        (Get-FileHash -LiteralPath $script:TgZip -Algorithm SHA256).Hash | Should -Be $script:TgZipHash
+    }
+}
+
 # With -Fields ResourceId, a whole masked id that ResourceIdMap holds is replaced by its real id
 # first, so an id comes back even when the dictionary does not hold its parts one by one (an older
 # or partial dictionary). A tenant-scope id ('/providers/<namespace>/<type>/<name>...', a
@@ -992,6 +1135,13 @@ Describe "Reveal's doc on a dictionary it refuses" {
         $Flat | Should -Match ([regex]::Escape('A run of this build never writes such a dictionary'))
         $Flat | Should -Match ([regex]::Escape('Older builds keyed a subscription''s token by its display name'))
         $Flat | Should -Match ([regex]::Escape('writes the display name in subscription fields and each whole id that `ResourceIdMap` holds, leaves the token masked in any other id path, and warns'))
+    }
+
+    It "says that Reveal takes an older build's group token in a tenant-scope id after the type word resourceGroups only when the name there is the group's" {
+        $Doc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw
+        $Flat = $Doc -replace '\s+', ' '
+        $Flat | Should -Match ([regex]::Escape('Older builds also gave the name in a tenant-scope id `/providers/<namespace>/resourceGroups/<x>` the token of group `<x>`.'))
+        $Flat | Should -Match ([regex]::Escape('takes a group''s token in that one place when the id''s real name there is that group''s name, and stops on any other use of a group''s token as a name'))
     }
 }
 

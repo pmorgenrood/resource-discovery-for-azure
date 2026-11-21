@@ -41,13 +41,18 @@ function ConvertTo-LookupTable
 # The group of a subscription id ('/subscriptions/<id>/resourceGroups/<group>/...'),
 # as the masking reads it. A tenant-scope id ('/providers/...') has none: a
 # 'resourceGroups' segment there is a type word.
-# Accepted gap: an older build's dictionary can map a group's token, in ResourceGroupMap,
-# to a tenant-scope id '/providers/<namespace>/resourceGroups/<x>' (older builds read that
-# segment as a group slot and gave the id the group's token). Reveal no longer reveals
-# group <x> from such an entry, so that token stays masked in a ResourceGroup field (a full
-# id is still revealed through ResourceIdMap). This is accepted because no provider is known
-# to bill such an id, and a run of this build no longer gives such an id a group's token,
-# so its dictionary has no such entry.
+# Accepted gap: older builds of this fork read the segment after a segment 3
+# 'resourceGroups' in a tenant-scope id ('/providers/<namespace>/resourceGroups/<x>') as a
+# group slot and gave it the token of group <x>, so their ResourceIdMap holds that masked
+# id, and ResourceGroupMap can map the token to that tenant-scope id (the writer keeps the
+# last id it meets for a token). Reveal reads no group from such a ResourceGroupMap entry,
+# so that token stays masked in ResourceGroup fields and in id paths; with -Fields
+# ResourceId the tenant-scope id, and every other id ResourceIdMap holds, still comes back
+# whole (Convert-RevealString). The slot check takes that token in that one name slot when
+# its real value there is the group's (Get-RdaRevealSharedToken), and stops on any other
+# use of a group's token as a name. This is accepted because no provider is known to bill
+# such an id, and a run of this build no longer gives such an id a group's token, so its
+# dictionary has no such entry.
 function Get-RgNameFromResourceId
 {
     param([string]$ResourceId)
@@ -96,6 +101,10 @@ function Get-SubGuidFromResourceId
 # 'name' instead: its display name is right for every one of them, but no one subscription id
 # is, so Reveal keeps it masked in an id path. Its kind is still checked in every slot. Any
 # other value clash in a subscription slot is returned as 'value', once every id is read.
+# One kind clash is not a fault either: older builds of this fork gave the name after a
+# segment 3 'resourceGroups' in a tenant-scope id the token of that group (see
+# Get-RgNameFromResourceId). A token ResourceGroupMap holds is taken in that one name slot
+# when its real value there is the group's; any other kind clash is returned.
 function Get-RdaRevealSharedToken
 {
     param([System.Collections.IDictionary]$Maps)
@@ -170,16 +179,29 @@ function Get-RdaRevealSharedToken
                 {
                     $Known[0] = if ($Seen -ceq 'SubscriptionNameMap') { 'SubscriptionMap' } else { $Seen }
                     $Known[1] = $Seen
-                    $Table = $Maps[$Kind]
-                    if ($Known[0] -ceq $Kind -and $null -ne $Table -and $Table.ContainsKey($Tok))
+                    # The value from the token's own map, whatever slot meets it first.
+                    $Own = [string]$Known[0]
+                    $Table = $Maps[$Own]
+                    if ($SlotPlace.ContainsKey($Own) -and $null -ne $Table -and $Table.ContainsKey($Tok))
                     {
-                        $MapValue = if ($Kind -ceq 'SubscriptionMap') { Get-SubGuidFromResourceId $Table[$Tok] } elseif ($Kind -ceq 'ResourceGroupMap') { Get-RgNameFromResourceId $Table[$Tok] } else { ([string]$Table[$Tok] -split '/')[-1] }
-                        if (-not [string]::IsNullOrEmpty($MapValue)) { $Known[2] = [string]$MapValue; $Known[3] = $Kind }
+                        $MapValue = if ($Own -ceq 'SubscriptionMap') { Get-SubGuidFromResourceId $Table[$Tok] } elseif ($Own -ceq 'ResourceGroupMap') { Get-RgNameFromResourceId $Table[$Tok] } else { ([string]$Table[$Tok] -split '/')[-1] }
+                        if (-not [string]::IsNullOrEmpty($MapValue)) { $Known[2] = [string]$MapValue; $Known[3] = $Own }
                     }
                 }
                 $Of[$Tok] = $Known
             }
             if ($Known[0] -ceq '') { continue }
+            # Older builds of this fork gave the name after a segment 3 'resourceGroups' in a
+            # tenant-scope id ('/providers/<namespace>/resourceGroups/<x>') the token of group
+            # <x>. That token, which ResourceGroupMap holds, is taken in that one name slot when
+            # its real value there is the group's, ignoring case: Reveal then writes the same
+            # value it stands for. A real value not known yet is taken from that slot, and the
+            # token's group slots must then hold it too.
+            if ($Kind -ceq 'ResourceNameMap' -and [string]$Known[1] -ceq 'ResourceGroupMap' -and $i -eq 4 -and $M[1] -ieq 'providers' -and $M[3] -ieq 'resourcegroups' -and $null -ne $Real -and ($null -eq $Known[2] -or [string]::Equals([string]$Known[2], $Real, $Ignore)))
+            {
+                if ($null -eq $Known[2]) { $Known[2] = $Real; $Known[3] = $Place }
+                continue
+            }
             if ($Known[0] -cne $Kind)
             {
                 $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[1], $Place); InIds = $true; Why = 'kind' })
