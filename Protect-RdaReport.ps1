@@ -45,7 +45,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
 
-foreach ($F in 'Functions/Common.Functions.ps1', 'Functions/ResourceInventory.Functions.ps1', 'Functions/InventoryJson.Functions.ps1', 'Functions/AllSubHtmlSummary.Functions.ps1', 'Functions/RunAllSubscriptions.Functions.ps1', 'Functions/OfflineObfuscation.Functions.ps1')
+foreach ($F in 'Functions/Common.Functions.ps1', 'Functions/ResourceInventory.Functions.ps1', 'Functions/InventoryJson.Functions.ps1', 'Functions/AllSubHtmlSummary.Functions.ps1', 'Functions/RunAllSubscriptions.Functions.ps1', 'Functions/CsvHeader.Functions.ps1', 'Functions/OfflineObfuscation.Functions.ps1')
 {
     $FPath = Join-Path $PSScriptRoot $F
     if (-not (Test-Path -LiteralPath $FPath -PathType Leaf)) { Write-Host ("ERROR: required file not found: {0}" -f $FPath) -ForegroundColor Red; exit 2 }
