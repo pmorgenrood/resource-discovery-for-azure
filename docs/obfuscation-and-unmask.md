@@ -297,10 +297,13 @@ error and writes no output zip when the dictionary gives one token to two maps
 (other than a subscription's token, which `SubscriptionMap` and
 `SubscriptionNameMap` both hold), or when an id in `ResourceIdMap` holds a token
 as another kind of value (a group's token as a resource's name, say) or for
-another real value than its map or another id gives it. Reveal puts a token's
-value wherever the token stands, so such a token would put one value in the
-place of another. A run of this build never writes such a dictionary: use the
-dictionary the run wrote with the report, not one edited or merged by hand.
+another real value than its map or another id gives it. It also stops when an id
+in `ResourceIdMap` holds a token that a map holds and has another number of
+parts than its real id, as Reveal then cannot tell which real part the token
+stands for. Reveal puts a token's value wherever the token stands, so such a
+token would put one value in the place of another. A run of this build never
+writes such a dictionary: use the dictionary the run wrote with the report, not
+one edited or merged by hand.
 
 Older builds keyed a subscription's token by its display name, so two
 subscriptions with one display name share one token there, and their ids hold

@@ -90,8 +90,12 @@ function Get-SubGuidFromResourceId
 # Reveal writes in a slot (the subscription id of a SubscriptionMap id, the group of a
 # ResourceGroupMap id, the last part of a ResourceNameMap id); a subscription's token in a
 # subscription slot, a group's in a group slot and a name's in a name slot are its own. Values
-# are compared only where the masked and the real id have as many parts. Each such token is
-# returned once, with InIds $true, the two places that differ and Why ('kind' or 'value').
+# are compared only where the masked and the real id have as many parts. In a key whose parts
+# do not line up, the real part at a token's place cannot be read, so a token a map holds there
+# in its own kind of slot is returned with Why 'parts' (a run writes every masked id with as
+# many parts as its real id, or as one flat token); a token no map holds is only kind-checked
+# there, as Reveal writes no value for it. Each such token is returned once, with InIds $true,
+# the two places (its map and the slot, for 'parts') and Why ('kind', 'value' or 'parts').
 # One value clash is not a fault of the dictionary: older builds keyed a subscription's token
 # by its display name (the upstream main branch, and this fork's builds before the token was
 # keyed by the subscription id), so two subscriptions with one display name share one token,
@@ -207,6 +211,18 @@ function Get-RdaRevealSharedToken
                 $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[1], $Place); InIds = $true; Why = 'kind' })
                 $Known[0] = ''
                 $null = $SubClash.Remove($Tok)
+            }
+            elseif (-not $Aligned)
+            {
+                # The real part at this place cannot be read, so the value Reveal would write
+                # here for a token a map holds cannot be checked. A token no map holds gets no
+                # value from Reveal, in a slot or a field.
+                if ($FirstMap.ContainsKey($Tok))
+                {
+                    $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[1], $Place); InIds = $true; Why = 'parts' })
+                    $Known[0] = ''
+                    $null = $SubClash.Remove($Tok)
+                }
             }
             elseif ($null -ne $Real)
             {
@@ -466,9 +482,11 @@ function Invoke-RdaReveal
     # replaced (Get-RdaRevealSharedToken): a dictionary that gives one token to
     # two maps would reveal one map's value in the other's places, so nothing
     # is written. The same holds for a token that an id in ResourceIdMap holds
-    # as another kind of value or for another real value, except a subscription
-    # token that older builds gave to two subscription ids with one display name
-    # (Why 'name'): that one is kept masked in id paths below.
+    # as another kind of value or for another real value, and for a token a map
+    # holds in an id with another number of parts than its real id (Why
+    # 'parts'), except a subscription token that older builds gave to two
+    # subscription ids with one display name (Why 'name'): that one is kept
+    # masked in id paths below.
     $Found = @(Get-RdaRevealSharedToken -Maps ([ordered]@{
                 ResourceGroupMap    = $RgMap
                 SubscriptionMap     = $SubMap
@@ -483,12 +501,20 @@ function Invoke-RdaReveal
     {
         throw ("The dictionary gives {0} token(s) to more than one map, ignoring case (the first: '{1}', in {2}). Reveal puts a token's value wherever the token stands, so it would write one map's value into another map's fields and ids. Nothing was written. A run of this build gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $SharedTokens.Count, $SharedTokens[0].Token, ($SharedTokens[0].Maps -join ' and '))
     }
-    $IdTokens = @($Found | Where-Object { $_.InIds -and $_.Why -cne 'name' })
+    $IdTokens = @($Found | Where-Object { $_.InIds -and $_.Why -cne 'name' -and $_.Why -cne 'parts' })
     if ($IdTokens.Count -gt 0)
     {
         $Why = if ($IdTokens[0].Why -ceq 'kind') { 'for two kinds of value' } else { 'for two real values' }
         throw ("The ids in the dictionary's ResourceIdMap hold {0} token(s) that do not stand for one kind of value and one real value, ignoring case (the first: '{1}', in {2} and in {3}, {4}). Reveal puts a token's value wherever the token stands, so it would write one value in the place of another in ids and fields. Nothing was written. A run of this build gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $IdTokens.Count, $IdTokens[0].Token, $IdTokens[0].Maps[0], $IdTokens[0].Maps[1], $Why)
     }
+    # A token a map holds in an id whose masked and real forms do not have as many parts
+    # (Why 'parts'): its real part there cannot be read, so its value cannot be checked.
+    $PartTokens = @($Found | Where-Object { $_.Why -ceq 'parts' })
+    if ($PartTokens.Count -gt 0)
+    {
+        throw ("The ids in the dictionary's ResourceIdMap hold {0} token(s) that a map holds, in a masked id with another number of parts than its real id (the first: '{1}', in {2} and in {3}). Reveal cannot tell which part of the real id such a token stands for, so it cannot check that the token stands for one real value, and it could write one value in the place of another in ids and fields. Nothing was written. A run of this build writes each masked id with as many parts as its real id: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $PartTokens.Count, $PartTokens[0].Token, $PartTokens[0].Maps[0], $PartTokens[0].Maps[1])
+    }
+    $PartTokens = $null
     # The subscription tokens older builds gave to two or more subscription ids whose
     # subscriptions share one display name (Get-RdaRevealSharedToken, Why 'name').
     $SubTokensByName = [System.Collections.Generic.List[string]]::new()

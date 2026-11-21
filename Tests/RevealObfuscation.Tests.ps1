@@ -658,6 +658,67 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
         (Get-FileHash -Path $script:InputZip -Algorithm SHA256).Hash | Should -Be $script:InputZipHashBefore
     }
 
+    # The same kind of slot, but the real id has more or fewer parts than the masked id, so the
+    # real part at a token's place cannot be read and its value cannot be checked: with
+    # -Fields ResourceName the name map's value would be written into the id, and with -All the
+    # whole real id would come back with a Name of another leaf. Every token a map holds in such
+    # an id is counted, and the first one the id holds is named.
+    It "stops with <Mode> on <Case>, names the first token a map holds there and both places, and writes nothing" -ForEach @(
+        foreach ($Mode in '-Fields ResourceName', '-All')
+        {
+            $Fab = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.fabric/capacities/{Fab}'
+            $FabReal = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/'
+            $RoReal = '/providers/Microsoft.Capacity/reservationOrders/ro01'
+            $RoName = @(@{ T = '{Ro}'; R = $RoReal })
+            $NameSlot = 'a name slot of a ResourceIdMap id'
+            $GroupSlot = 'the group slot of a ResourceIdMap id'
+            $SubSlot = 'the subscription slot of a ResourceIdMap id'
+            @{ Mode = $Mode; Case = 'the Fabric row''s own id, each token in its own slot, whose real id has one more part'; Tok = '{Sub}'; Count = 3; Ids = @(@{ M = $Fab; R = $FabReal + 'capdata01/extra' }); Names = @(); Places = @('SubscriptionMap', $SubSlot) }
+            @{ Mode = $Mode; Case = 'the Fabric row''s own id, whose real id has another name at the name''s place and one more part'; Tok = '{Sub}'; Count = 3; Ids = @(@{ M = $Fab; R = $FabReal + 'cap-other/extra' }); Names = @(); Places = @('SubscriptionMap', $SubSlot) }
+            @{ Mode = $Mode; Case = 'a resource name''s token in its own name slot of an id whose other tokens no map holds, whose real id has one more part'; Tok = '{Fab}'; Count = 1; Ids = @(@{ M = '/subscriptions/{New}/resourcegroups/{Child}/providers/microsoft.fabric/capacities/{Fab}'; R = $FabReal + 'cap-other/extra' }); Names = @(); Places = @('ResourceNameMap', $NameSlot) }
+            @{ Mode = $Mode; Case = 'a group''s token in its own group slot of an id whose other tokens no map holds, whose real id has fewer parts'; Tok = '{RgAks}'; Count = 1; Ids = @(@{ M = '/subscriptions/{New}/resourcegroups/{RgAks}/providers/microsoft.compute/disks/{Disk}'; R = '/subscriptions/{RealSub}/resourceGroups/MC_rg-aks_aks01_eastus' }); Names = @(); Places = @('ResourceGroupMap', $GroupSlot) }
+            @{ Mode = $Mode; Case = 'a resource name''s token in its own name slot of a tenant-scope id whose real id has more parts'; Tok = '{Ro}'; Count = 1; Ids = @(@{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}'; R = $RoReal + '/reservations/r01' }); Names = $RoName; Places = @('ResourceNameMap', $NameSlot) }
+            @{ Mode = $Mode; Case = 'a resource name''s token in its own name slot of a tenant-scope id whose real id has fewer parts'; Tok = '{Ro}'; Count = 1; Ids = @(@{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}/reservations/{New}'; R = $RoReal }); Names = $RoName; Places = @('ResourceNameMap', $NameSlot) }
+        }
+    ) {
+        $Token = Expand-SlotText $Tok
+        $Dict = New-SlotDictionary -Ids $Ids -Names $Names
+        $Out = Join-Path $Dict.Dir 'out.zip'
+        $Splat = @{ InputZip = $script:InputZip; DictionaryPath = $Dict.File; OutputZip = $Out }
+        if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceName') }
+
+        $Err = $null
+        try { & $script:RevealScript @Splat *>&1 | Out-Null }
+        catch { $Err = $_ }
+        $Err | Should -Not -BeNullOrEmpty -Because 'Reveal cannot check the value of a token a map holds in an id whose real id has another number of parts'
+        $Msg = $Err.Exception.Message
+        $Msg | Should -Match ([regex]::Escape("hold $Count token(s) that a map holds")) -Because 'every token a map holds in that id is counted'
+        $Msg | Should -Match ([regex]::Escape($Token)) -Because 'the message names the first such token'
+        foreach ($P in $Places) { $Msg | Should -Match ([regex]::Escape($P)) -Because 'the message names both places' }
+        $Msg | Should -Match ([regex]::Escape('in a masked id with another number of parts than its real id'))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        $Msg | Should -Not -Match ([regex]::Escape('for two kinds of value')) -Because 'the token is in its own kind of slot'
+        $Reals = [System.Collections.Generic.List[string]]::new()
+        foreach ($E in $Ids) { foreach ($Part in (Expand-SlotText $E.R).Split('/')) { if ($Part -and $Part -notin @('subscriptions', 'resourceGroups', 'providers')) { $Reals.Add($Part) } } }
+        $Reals.AddRange([string[]]@($script:RealRgName, $script:RealRgAks, $script:RealRgCase, $script:RealSubName, $script:RealTagVal, $script:RealFreeText, 'vm01', 'capdata01'))
+        foreach ($Real in $Reals) { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'no output zip is written'
+        Test-Path -LiteralPath (($Out -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
+        (Get-FileHash -Path $script:InputZip -Algorithm SHA256).Hash | Should -Be $script:InputZipHashBefore
+    }
+
+    # Reveal writes no value for a token that no map holds, in a slot or a field, so such a token in
+    # an id whose real id has another number of parts cannot put one value in another's place.
+    It "reveals, with <Mode>, a dictionary whose one id with another number of parts than its real id holds only tokens that no map holds" -ForEach @(
+        @{ Mode = '-Fields ResourceName' }
+        @{ Mode = '-All' }
+    ) {
+        $Dict = New-SlotDictionary -Ids @(@{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01/reservations/r01' })
+        $R = if ($Mode -eq '-All') { Invoke-Reveal -All -DictPath $Dict.File } else { Invoke-Reveal -Fields @('ResourceName') -DictPath $Dict.File }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
+        @($R.Inventory.FabricCapacities)[0].Name | Should -BeExactly 'capdata01'
+    }
+
     It "reveals, with <Mode>, a dictionary whose ids hold each subscription, group and name token in its own slot for its own value, as a run writes it" -ForEach @(
         @{ Mode = '-Fields ResourceGroup' }
         @{ Mode = '-All' }
@@ -1126,6 +1187,12 @@ Describe "Reveal's doc on a dictionary it refuses" {
         $Flat | Should -Match ([regex]::Escape('when an id in `ResourceIdMap` holds a token as another kind of value'))
         $Flat | Should -Match ([regex]::Escape('or for another real value'))
         $Flat | Should -Match ([regex]::Escape('use the dictionary the run wrote with the report, not one edited or merged by hand'))
+    }
+
+    It "says that Reveal refuses an id in ResourceIdMap that holds a token a map holds and has another number of parts than its real id" {
+        $Doc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw
+        $Flat = $Doc -replace '\s+', ' '
+        $Flat | Should -Match ([regex]::Escape('It also stops when an id in `ResourceIdMap` holds a token that a map holds and has another number of parts than its real id, as Reveal then cannot tell which real part the token stands for.'))
     }
 
     It "says that older builds gave two subscriptions with one display name one token, what Reveal does with that token, and that only a run of this build never writes a dictionary Reveal refuses" {
