@@ -711,6 +711,19 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
     }
 }
 
+Describe "Reveal's doc on a dictionary it refuses" {
+
+    It "says that Reveal refuses a dictionary that gives one token to two maps, or whose ids hold a token for another kind of value or real value, writes nothing, and that the fix is the dictionary the run wrote" {
+        $Doc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw
+        $Flat = $Doc -replace '\s+', ' '
+        $Flat | Should -Match ([regex]::Escape('stops with an error and writes no output zip when the dictionary gives one token to two maps'))
+        $Flat | Should -Match ([regex]::Escape('other than a subscription''s token, which `SubscriptionMap` and `SubscriptionNameMap` both hold'))
+        $Flat | Should -Match ([regex]::Escape('when an id in `ResourceIdMap` holds a token as another kind of value'))
+        $Flat | Should -Match ([regex]::Escape('or for another real value'))
+        $Flat | Should -Match ([regex]::Escape('use the dictionary the run wrote with the report, not one edited or merged by hand'))
+    }
+}
+
 # =============================================================================
 # FreeText round-trip via FreeTextMap (P3) — fixture-independent
 # -----------------------------------------------------------------------------
