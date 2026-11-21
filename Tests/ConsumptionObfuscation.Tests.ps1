@@ -203,4 +203,12 @@ Describe 'docs/consumption-data.md on how a usage row is masked' {
         $script:MaskDoc | Should -Not -Match '(?i)mc_`?\s+AKS-managed-RG marker' -Because 'a group token carries no hint (the test above)'
         $script:MaskDoc | Should -Match 'aks_'
     }
+
+    # A new group token has no hint, but a seeded run keeps an older group token with its mc_
+    # (Test-ObfuscatedIdShape and the seed's group-token check both take '(prod|nonprod)_(mc_)?<guid>').
+    It 'says a new group token carries no hint, and that a seeded run keeps an older mc_ token as it is' {
+        $Flat = $script:MaskDoc -replace '\s+', ' '
+        $Flat | Should -Not -Match ([regex]::Escape('the `mc_` of an AKS-managed group is not kept')) -Because 'a seeded run keeps an older mc_ group token'
+        $Flat | Should -Match ([regex]::Escape('A new group token carries no hint; a seeded run keeps an older `mc_` token as it is.'))
+    }
 }

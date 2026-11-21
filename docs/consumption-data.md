@@ -155,8 +155,8 @@ plain report's rows with the same function):
   (AKS, VMSS, etc.) without seeing real identifiers. A name token can carry a type
   hint (`prod_aks_<guid>`): `databricks_` for a Databricks resource, `aks_` for a
   resource in an AKS-managed resource group (`mc_...`), `vmss_` for a scale set's.
-  A resource group token carries no hint: the `mc_` of an AKS-managed group is not
-  kept.
+  A new group token carries no hint; a seeded run keeps an older `mc_` token as it
+  is.
 - A tenant-scope id (`/providers/...`, such as a reservation order) keeps its path,
   with every name a token, when each name can be one. Any other value that is not
   an ARM path, a tenant-scope id with an empty part or a `$system` part among them,
