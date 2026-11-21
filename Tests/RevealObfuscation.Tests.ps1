@@ -711,6 +711,199 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
     }
 }
 
+# Older builds key a subscription's token by its display name: the upstream main branch's
+# ResourceInventory.ps1 ($SubLookup[$RealSub], $RealSub the subscription's name), and this fork's
+# builds before the token was keyed by the subscription id. So two subscriptions with one display
+# name share one token. Every id of either holds it in its subscription slot, SubscriptionMap keeps
+# the one id the writer met last for it, and SubscriptionNameMap gives it that one name. Reveal
+# writes the name in subscription fields, and a whole id that ResourceIdMap holds as its real id,
+# and leaves the token masked in any other id path, as it cannot tell which subscription id the
+# token stands for there. It warns once. Any other clash of that token still stops it.
+Describe "Reveal-Obfuscation reads an older dictionary whose one subscription token stands for two subscriptions with one display name" {
+
+    BeforeAll {
+        $script:OldSub1 = [guid]::NewGuid().ToString()
+        $script:OldSub2 = [guid]::NewGuid().ToString()
+        $script:OldSubName = 'Pay-As-You-Go'
+        $script:OldTok = @{}
+        foreach ($K in 'Sub', 'Rg', 'Vm1', 'Vm2', 'Set', 'Tag', 'Disk', 'Sa') { $script:OldTok[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        # Build-ObfuscatedResourceUri's tokens for a consumption id no inventory row holds: its own
+        # subscription token (keyed by the subscription id) and group token, with type hints.
+        $script:OldTok['CSub'] = 'prod_sub_' + [guid]::NewGuid().ToString()
+        $script:OldTok['CRg'] = 'prod_rg_' + [guid]::NewGuid().ToString()
+        $T = $script:OldTok
+        $script:OldR1 = "/subscriptions/$($script:OldSub1)/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm-one"
+        $script:OldR2 = "/subscriptions/$($script:OldSub2)/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm-two"
+        $script:OldRDisk = "/subscriptions/$($script:OldSub2)/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk-two"
+        # Masked as that writer masks an inventory id: the subscription, the first group and the
+        # last segment replaced, the group word written 'resourcegroups'.
+        $script:OldM1 = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm1)"
+        $script:OldM2 = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm2)"
+        $script:OldMDisk = "/subscriptions/$($T.CSub)/resourcegroups/$($T.CRg)/providers/Microsoft.Compute/disks/$($T.Disk)"
+        # A scale set id that the dictionary does not hold whole.
+        $script:OldSetId = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachineScaleSets/$($T.Set)"
+
+        # The dictionary as that writer builds it from its token tables.
+        function New-OldDictionary
+        {
+            [ordered]@{
+                GeneratedAt         = '2026-06-30 00:00:00'
+                ResourceIdMap       = [ordered]@{ $script:OldM1 = $script:OldR1; $script:OldM2 = $script:OldR2; $script:OldMDisk = $script:OldRDisk }
+                ResourceNameMap     = [ordered]@{ $script:OldTok.Vm1 = $script:OldR1; $script:OldTok.Vm2 = $script:OldR2 }
+                # Keyed by token, so it keeps the last id the writer met for the shared token.
+                SubscriptionMap     = [ordered]@{ $script:OldTok.Sub = $script:OldR2 }
+                ResourceGroupMap    = [ordered]@{ $script:OldTok.Rg = $script:OldR2 }
+                SubscriptionNameMap = [ordered]@{ $script:OldTok.Sub = $script:OldSubName }
+                TagMap              = [ordered]@{ $script:OldTok.Tag = 'payments' }
+                FreeTextMap         = [ordered]@{}
+            }
+        }
+
+        $script:OldDir = Join-Path $script:TmpDir ("older_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $script:OldDir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        [ordered]@{
+            VirtualMachines = @(
+                [ordered]@{ ID = $script:OldM1; Name = $T.Vm1; Subscription = $T.Sub; ResourceGroup = $T.Rg; Set = $script:OldSetId; Tags = @([ordered]@{ Name = 'environment'; Value = $T.Tag }) }
+                [ordered]@{ ID = $script:OldM2; Name = $T.Vm2; Subscription = $T.Sub; ResourceGroup = $T.Rg; Tags = @([ordered]@{ Name = 'environment'; Value = $T.Tag }) }
+            )
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_Older.json') -Encoding utf8
+        @(
+            [pscustomobject]@{ ResourceId = $script:OldM1; Subscription = $T.Sub; Cost = '1.00' }
+            [pscustomobject]@{ ResourceId = $script:OldM2; Subscription = $T.Sub; Cost = '2.00' }
+            [pscustomobject]@{ ResourceId = $script:OldMDisk; Subscription = $T.CSub; Cost = '3.00' }
+        ) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_Older.csv') -NoTypeInformation -Encoding utf8
+        $script:OldZip = Join-Path $script:OldDir 'ResourcesReport_Older.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $script:OldZip -Force
+        $script:OldZipHash = (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash
+
+        # Runs Reveal.ps1 on the older report with $Dict; returns the error, the warnings, the
+        # output zip, and the revealed inventory, consumption rows and all member text.
+        function Invoke-OldReveal
+        {
+            param([System.Collections.IDictionary]$Dict, [string]$Mode)
+            $Dir = Join-Path $script:OldDir ("run_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            $File = Join-Path $Dir 'ObfuscationDictionary_Older.json'
+            $Dict | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $File -Encoding utf8
+            $Out = Join-Path $Dir 'out.zip'
+            $Splat = @{ InputZip = $script:OldZip; DictionaryPath = $File; OutputZip = $Out }
+            switch ($Mode)
+            {
+                '-All' { $Splat['All'] = $true }
+                '-Fields Tag' { $Splat['Fields'] = @('Tag') }
+                '-Fields Subscription' { $Splat['Fields'] = @('Subscription') }
+                default { }
+            }
+            $Err = $null
+            $Stream = @()
+            try { $Stream = @(& $script:RevealScript @Splat *>&1) }
+            catch { $Err = $_ }
+            $Result = [pscustomobject]@{
+                Error     = $Err
+                Warnings  = @($Stream | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } | ForEach-Object { [string]$_.Message })
+                OutputZip = $Out
+                Inventory = $null
+                Csv       = $null
+                Text      = $null
+            }
+            if (Test-Path -LiteralPath $Out)
+            {
+                $Ex = Join-Path $Dir 'ex'
+                Expand-Archive -LiteralPath $Out -DestinationPath $Ex -Force
+                $Result.Inventory = Get-Content -LiteralPath (Join-Path $Ex 'Inventory_Older.json') -Raw | ConvertFrom-Json
+                $Result.Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_Older.csv'))
+                $Result.Text = (Get-ChildItem -LiteralPath $Ex -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+            }
+            return $Result
+        }
+    }
+
+    It "reveals, with <Mode>, the report of two subscriptions with one display name and one token, keeps that token in an id path the dictionary does not hold whole, and warns <Warn> time(s)" -ForEach @(
+        @{ Mode = '-All'; Warn = 1 }
+        @{ Mode = '-Fields Tag'; Warn = 0 }
+        @{ Mode = '-Fields Subscription'; Warn = 1 }
+        @{ Mode = 'the default fields'; Warn = 1 }
+    ) {
+        $T = $script:OldTok
+        $R = Invoke-OldReveal -Dict (New-OldDictionary) -Mode $Mode
+        $R.Error | Should -BeNullOrEmpty -Because 'Reveal reads the dictionary an older build wrote'
+        Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
+        $Vm = @($R.Inventory.VirtualMachines)
+        $Rg = if ($Mode -in '-All', 'the default fields') { 'rg-app' } else { $T.Rg }
+        $Sub = if ($Mode -eq '-Fields Tag') { $T.Sub } else { $script:OldSubName }
+        $Tag = if ($Mode -in '-All', '-Fields Tag') { 'payments' } else { $T.Tag }
+        foreach ($Row in $Vm)
+        {
+            $Row.Subscription | Should -BeExactly $Sub -Because 'the subscription field gets the one display name both subscriptions have'
+            $Row.ResourceGroup | Should -BeExactly $Rg
+            $Row.Tags[0].Value | Should -BeExactly $Tag
+        }
+        # The set's id is not in ResourceIdMap: the shared token stays masked in its subscription
+        # slot, whatever is revealed, and only the group is revealed in it with the group.
+        $Vm[0].Set | Should -BeExactly ("/subscriptions/$($T.Sub)/resourcegroups/$Rg/providers/Microsoft.Compute/virtualMachineScaleSets/$($T.Set)")
+        if ($Mode -eq '-All')
+        {
+            # Each whole id comes back from ResourceIdMap with its own subscription id.
+            $Vm[0].ID | Should -BeExactly $script:OldR1
+            $Vm[1].ID | Should -BeExactly $script:OldR2
+            $Vm[0].Name | Should -BeExactly 'vm-one'
+            $Vm[1].Name | Should -BeExactly 'vm-two'
+            @($R.Csv.ResourceId) | Should -Be @($script:OldR1, $script:OldR2, $script:OldRDisk)
+        }
+        else
+        {
+            # No subscription id is written anywhere: the token keeps its place in every id.
+            $Vm[0].ID | Should -BeExactly $script:OldM1.Replace("/$($T.Rg)/", "/$Rg/")
+            $Vm[1].ID | Should -BeExactly $script:OldM2.Replace("/$($T.Rg)/", "/$Rg/")
+            $Vm[0].Name | Should -BeExactly $T.Vm1
+            @($R.Csv.ResourceId) | Should -Be @($script:OldM1.Replace("/$($T.Rg)/", "/$Rg/"), $script:OldM2.Replace("/$($T.Rg)/", "/$Rg/"), $script:OldMDisk)
+            $R.Text | Should -Not -Match ([regex]::Escape($script:OldSub1))
+            $R.Text | Should -Not -Match ([regex]::Escape($script:OldSub2))
+            $R.Text | Should -Not -Match ([regex]::Escape("/subscriptions/$($script:OldSubName)")) -Because 'the display name is not written in an id path'
+        }
+        $Mine = @($R.Warnings | Where-Object { $_ -match 'display name' -and $_ -match 'subscription id' })
+        $Mine.Count | Should -Be $Warn
+        foreach ($W in $Mine)
+        {
+            $W | Should -Match ([regex]::Escape($T.Sub)) -Because 'the warning names the token'
+            $W | Should -Match 'leaves it masked in any other id path'
+            foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'vm-one', 'rg-app') { $W | Should -Not -Match ([regex]::Escape($Real)) -Because 'the warning holds no real value' }
+        }
+        (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
+    }
+
+    It "still stops with <Mode> when <Case>, names the token and both places, and writes nothing" -ForEach @(
+        foreach ($Mode in '-All', '-Fields Tag')
+        {
+            @{ Mode = $Mode; Case = 'SubscriptionNameMap gives the token no name'; Change = 'NoName'; Places = @('SubscriptionMap', 'the subscription slot of a ResourceIdMap id'); Why = 'for two real values' }
+            @{ Mode = $Mode; Case = 'an id also holds the token as a resource''s name'; Change = 'AsName'; Places = @('SubscriptionMap', 'a name slot of a ResourceIdMap id'); Why = 'for two kinds of value' }
+            @{ Mode = $Mode; Case = 'a subscription slot holds the token for a value that is not a subscription id'; Change = 'NotGuid'; Places = @('SubscriptionMap', 'the subscription slot of a ResourceIdMap id'); Why = 'for two real values' }
+        }
+    ) {
+        $T = $script:OldTok
+        $D = New-OldDictionary
+        switch ($Change)
+        {
+            'NoName' { $D.Remove('SubscriptionNameMap') }
+            'AsName' { $D.ResourceIdMap["/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Storage/storageAccounts/$($T.Sub)"] = "/subscriptions/$($script:OldSub1)/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/sa-one" }
+            'NotGuid' { $D.ResourceIdMap["/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Storage/storageAccounts/$($T.Sa)"] = '/subscriptions/not-a-subscription-id/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/sa-one' }
+        }
+        $R = Invoke-OldReveal -Dict $D -Mode $Mode
+        $R.Error | Should -Not -BeNullOrEmpty -Because 'any other clash of the shared token still stops Reveal'
+        $Msg = $R.Error.Exception.Message
+        $Msg | Should -Match ([regex]::Escape($T.Sub)) -Because 'the message names the token'
+        foreach ($P in $Places) { $Msg | Should -Match ([regex]::Escape($P)) -Because 'the message names both places' }
+        $Msg | Should -Match ([regex]::Escape($Why))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        $Msg | Should -Match ([regex]::Escape('A run of this build gives each value a token of its own')) -Because 'older builds wrote one token for two subscription ids'
+        foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'not-a-subscription-id', 'sa-one', 'vm-one', 'rg-app') { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeFalse -Because 'no output zip is written'
+        Test-Path -LiteralPath (($R.OutputZip -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
+        (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
+    }
+}
+
 Describe "Reveal's doc on a dictionary it refuses" {
 
     It "says that Reveal refuses a dictionary that gives one token to two maps, or whose ids hold a token for another kind of value or real value, writes nothing, and that the fix is the dictionary the run wrote" {
@@ -721,6 +914,15 @@ Describe "Reveal's doc on a dictionary it refuses" {
         $Flat | Should -Match ([regex]::Escape('when an id in `ResourceIdMap` holds a token as another kind of value'))
         $Flat | Should -Match ([regex]::Escape('or for another real value'))
         $Flat | Should -Match ([regex]::Escape('use the dictionary the run wrote with the report, not one edited or merged by hand'))
+    }
+
+    It "says that older builds gave two subscriptions with one display name one token, what Reveal does with that token, and that only a run of this build never writes a dictionary Reveal refuses" {
+        $Doc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw
+        $Flat = $Doc -replace '\s+', ' '
+        $Flat | Should -Not -Match ([regex]::Escape('A run never writes such a dictionary')) -Because 'older builds wrote one token for two subscription ids'
+        $Flat | Should -Match ([regex]::Escape('A run of this build never writes such a dictionary'))
+        $Flat | Should -Match ([regex]::Escape('Older builds keyed a subscription''s token by its display name'))
+        $Flat | Should -Match ([regex]::Escape('writes the display name in subscription fields and each whole id that `ResourceIdMap` holds, leaves the token masked in any other id path, and warns'))
     }
 }
 

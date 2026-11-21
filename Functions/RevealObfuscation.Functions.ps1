@@ -87,6 +87,15 @@ function Get-SubGuidFromResourceId
 # subscription slot, a group's in a group slot and a name's in a name slot are its own. Values
 # are compared only where the masked and the real id have as many parts. Each such token is
 # returned once, with InIds $true, the two places that differ and Why ('kind' or 'value').
+# One value clash is not a fault of the dictionary: older builds keyed a subscription's token
+# by its display name (the upstream main branch, and this fork's builds before the token was
+# keyed by the subscription id), so two subscriptions with one display name share one token,
+# which their ids hold in the subscription slot for two subscription ids. Such a token, which
+# SubscriptionMap and SubscriptionNameMap both hold, with a name, and which the subscription
+# slots hold for two or more subscription ids (GUIDs) and nothing else, is returned with Why
+# 'name' instead: its display name is right for every one of them, but no one subscription id
+# is, so Reveal keeps it masked in an id path. Its kind is still checked in every slot. Any
+# other value clash in a subscription slot is returned as 'value', once every id is read.
 function Get-RdaRevealSharedToken
 {
     param([System.Collections.IDictionary]$Maps)
@@ -128,6 +137,10 @@ function Get-RdaRevealSharedToken
     # The kind is '' once the token is returned (or was, above), so it is not read again.
     $Of = [System.Collections.Generic.Dictionary[string, object[]]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $Clash = [System.Collections.Generic.List[object]]::new()
+    # Subscription token -> the real values its subscription slots hold, and its first value
+    # clash there (the two places), kept until every id is read (the older builds above).
+    $SubSlots = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $SubClash = [System.Collections.Generic.Dictionary[string, string[]]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($Entry in $IdTable.GetEnumerator())
     {
         $Masked = [string]$Entry.Key
@@ -171,17 +184,51 @@ function Get-RdaRevealSharedToken
             {
                 $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[1], $Place); InIds = $true; Why = 'kind' })
                 $Known[0] = ''
+                $null = $SubClash.Remove($Tok)
             }
             elseif ($null -ne $Real)
             {
+                if ($Kind -ceq 'SubscriptionMap')
+                {
+                    $Values = $null
+                    if (-not $SubSlots.TryGetValue($Tok, [ref]$Values))
+                    {
+                        $Values = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                        $SubSlots[$Tok] = $Values
+                    }
+                    $null = $Values.Add($Real)
+                }
                 if ($null -eq $Known[2]) { $Known[2] = $Real; $Known[3] = $Place }
                 elseif (-not [string]::Equals([string]$Known[2], $Real, $Ignore))
                 {
-                    $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[3], $Place); InIds = $true; Why = 'value' })
-                    $Known[0] = ''
+                    if ($Kind -ceq 'SubscriptionMap')
+                    {
+                        if (-not $SubClash.ContainsKey($Tok)) { $SubClash[$Tok] = @([string]$Known[3], $Place) }
+                    }
+                    else
+                    {
+                        $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[3], $Place); InIds = $true; Why = 'value' })
+                        $Known[0] = ''
+                    }
                 }
             }
         }
+    }
+    # A subscription slot's value clash, now that every id is read: the older builds' shape
+    # ('name') or a fault ('value').
+    $SubTable = $Maps['SubscriptionMap']
+    $SubNames = $Maps['SubscriptionNameMap']
+    foreach ($Tok in @($SubClash.Keys))
+    {
+        $Named = $null -ne $SubTable -and $SubTable.ContainsKey($Tok) -and $null -ne $SubNames -and $SubNames.ContainsKey($Tok) -and -not [string]::IsNullOrEmpty([string]$SubNames[$Tok])
+        $Values = $SubSlots[$Tok]
+        $SubIds = $Values.Count -ge 2
+        foreach ($Value in $Values)
+        {
+            $Guid = [guid]::Empty
+            if (-not [guid]::TryParseExact($Value, 'D', [ref]$Guid)) { $SubIds = $false; break }
+        }
+        $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @($SubClash[$Tok]); InIds = $true; Why = $(if ($Named -and $SubIds) { 'name' } else { 'value' }) })
     }
     $Clash
 }
@@ -253,6 +300,9 @@ function Convert-RevealString
             $Tok = $m.Groups['tok'].Value
             $Pre = $m.Groups['pre'].Value
             $Val = $null
+            # A token whose path value is $null (a subscription token older builds gave to two
+            # subscription ids, Invoke-RdaReveal) stays as written in a path: it does not fall
+            # back to its field value there.
             if ($m.Groups['pre'].Success -and $null -ne $PathReplacements -and $PathReplacements.ContainsKey($Tok)) { $Val = $PathReplacements[$Tok] }
             elseif ($Replacements.ContainsKey($Tok)) { $Val = $Replacements[$Tok] }
             if ($null -eq $Val) { return $m.Value }
@@ -391,7 +441,9 @@ function Invoke-RdaReveal
     # replaced (Get-RdaRevealSharedToken): a dictionary that gives one token to
     # two maps would reveal one map's value in the other's places, so nothing
     # is written. The same holds for a token that an id in ResourceIdMap holds
-    # as another kind of value or for another real value.
+    # as another kind of value or for another real value, except a subscription
+    # token that older builds gave to two subscription ids with one display name
+    # (Why 'name'): that one is kept masked in id paths below.
     $Found = @(Get-RdaRevealSharedToken -Maps ([ordered]@{
                 ResourceGroupMap    = $RgMap
                 SubscriptionMap     = $SubMap
@@ -404,14 +456,18 @@ function Invoke-RdaReveal
     $SharedTokens = @($Found | Where-Object { -not $_.InIds })
     if ($SharedTokens.Count -gt 0)
     {
-        throw ("The dictionary gives {0} token(s) to more than one map, ignoring case (the first: '{1}', in {2}). Reveal puts a token's value wherever the token stands, so it would write one map's value into another map's fields and ids. Nothing was written. A run gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $SharedTokens.Count, $SharedTokens[0].Token, ($SharedTokens[0].Maps -join ' and '))
+        throw ("The dictionary gives {0} token(s) to more than one map, ignoring case (the first: '{1}', in {2}). Reveal puts a token's value wherever the token stands, so it would write one map's value into another map's fields and ids. Nothing was written. A run of this build gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $SharedTokens.Count, $SharedTokens[0].Token, ($SharedTokens[0].Maps -join ' and '))
     }
-    $IdTokens = @($Found | Where-Object { $_.InIds })
+    $IdTokens = @($Found | Where-Object { $_.InIds -and $_.Why -cne 'name' })
     if ($IdTokens.Count -gt 0)
     {
         $Why = if ($IdTokens[0].Why -ceq 'kind') { 'for two kinds of value' } else { 'for two real values' }
-        throw ("The ids in the dictionary's ResourceIdMap hold {0} token(s) that do not stand for one kind of value and one real value, ignoring case (the first: '{1}', in {2} and in {3}, {4}). Reveal puts a token's value wherever the token stands, so it would write one value in the place of another in ids and fields. Nothing was written. A run gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $IdTokens.Count, $IdTokens[0].Token, $IdTokens[0].Maps[0], $IdTokens[0].Maps[1], $Why)
+        throw ("The ids in the dictionary's ResourceIdMap hold {0} token(s) that do not stand for one kind of value and one real value, ignoring case (the first: '{1}', in {2} and in {3}, {4}). Reveal puts a token's value wherever the token stands, so it would write one value in the place of another in ids and fields. Nothing was written. A run of this build gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $IdTokens.Count, $IdTokens[0].Token, $IdTokens[0].Maps[0], $IdTokens[0].Maps[1], $Why)
     }
+    # The subscription tokens older builds gave to two or more subscription ids whose
+    # subscriptions share one display name (Get-RdaRevealSharedToken, Why 'name').
+    $SubTokensByName = [System.Collections.Generic.List[string]]::new()
+    foreach ($Entry in $Found) { if ($Entry.Why -ceq 'name') { $SubTokensByName.Add([string]$Entry.Token) } }
     $Found = $null
     $SharedTokens = $null
     $IdTokens = $null
@@ -508,6 +564,15 @@ function Invoke-RdaReveal
         {
             $Guid = Get-SubGuidFromResourceId $SubMap[$token]
             if (-not [string]::IsNullOrEmpty($Guid)) { $PathReplacements[$token] = $Guid }
+        }
+        # A subscription token older builds gave to two or more subscription ids stands for
+        # no one of them in an id path. Its path value is $null, so Convert-RevealString
+        # leaves it masked there; its display name is still written in subscription fields,
+        # and a whole id that ResourceIdMap holds still comes back as its real id.
+        foreach ($token in $SubTokensByName) { $PathReplacements[$token] = $null }
+        if ($SubTokensByName.Count -gt 0)
+        {
+            Write-Warning ("The dictionary gives {0} subscription token(s) to two or more subscription ids whose subscriptions share one display name, as older builds wrote it when they keyed a subscription's token by its display name (the first: '{1}'). Reveal writes that display name in subscription fields, and with -Fields ResourceId each whole id that ResourceIdMap holds, but leaves it masked in any other id path, as it cannot tell which subscription id the token stands for there." -f $SubTokensByName.Count, $SubTokensByName[0])
         }
     }
     if ($Fields -contains 'ResourceGroup' -or $Fields -contains 'ResourceId')

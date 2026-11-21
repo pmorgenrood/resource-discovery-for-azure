@@ -299,8 +299,16 @@ error and writes no output zip when the dictionary gives one token to two maps
 as another kind of value (a group's token as a resource's name, say) or for
 another real value than its map or another id gives it. Reveal puts a token's
 value wherever the token stands, so such a token would put one value in the
-place of another. A run never writes such a dictionary: use the dictionary the
-run wrote with the report, not one edited or merged by hand.
+place of another. A run of this build never writes such a dictionary: use the
+dictionary the run wrote with the report, not one edited or merged by hand.
+
+Older builds keyed a subscription's token by its display name, so two
+subscriptions with one display name share one token there, and their ids hold
+it for two subscription ids. Reveal takes that one case: it writes the display
+name in subscription fields and each whole id that `ResourceIdMap` holds,
+leaves the token masked in any other id path, and warns. The whole ids come
+back only with `-Fields ResourceId` (or `-All`); otherwise the ids keep that
+token.
 
 ### Usage
 
