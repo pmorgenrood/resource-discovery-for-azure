@@ -2,10 +2,9 @@
 # =============================================================================
 # CsvHeader.Functions.ps1
 #
-# The one reader of a consumption file's header line: ConvertFrom-RdaCsvHeaderLine.
-# Dot-sourced by Functions/RecoveryMerge.Functions.ps1 (the merge's consumption
-# check) and by Protect-RdaReport.ps1 (the offline mask's column check), so both
-# read a header the same way.
+# The offline mask's reader of a consumption file's header line:
+# ConvertFrom-RdaCsvHeaderLine. Dot-sourced by Protect-RdaReport.ps1 (the
+# offline mask's column check).
 # Definitions only - no top-level code, so loading it defines this function and
 # changes nothing else in the caller's session.
 # =============================================================================

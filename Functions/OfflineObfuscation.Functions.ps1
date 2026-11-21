@@ -1925,10 +1925,8 @@ function Get-RdaUnknownInventoryShape
 # MetricError true or false, the series one number or a list of numbers, the
 # other fields text (or empty). A run writes a null series on a call that failed
 # (MetricError true, Extension/Metrics.ps1), so that record is read as the run
-# writes it, as the recovery merge reads it; text, a null inside a list, or a
-# null series with MetricError false is still not a record a run writes. The
-# recovery merge (Functions/RecoveryMerge.Functions.ps1) checks each metric
-# record it carries with this function too, so the two take the same records.
+# writes it; text, a null inside a list, or a null series with MetricError false
+# is still not a record a run writes.
 function Test-RdaMetricRecordShape
 {
     param($Record, $Shape)
@@ -1950,7 +1948,7 @@ function Test-RdaMetricRecordShape
             'MetricError' { if ($V -isnot [bool]) { return $false } }
             # Each point is checked in a loop, not a pipeline with a script block
             # per point: that took about 35 s on a file of 1,440,000 points (the
-            # recovery merge reads every record with this check too).
+            # offline mask reads every record of a metrics file with this check).
             'MetricSeries'
             {
                 if ($null -eq $V) { if (-not ($Record['MetricError'] -is [bool] -and $Record['MetricError'])) { return $false } }
@@ -2174,7 +2172,7 @@ function Resolve-RdaRealPath([string]$Path)
 }
 
 # ConvertFrom-RdaCsvHeaderLine, the reader of a consumption file's header line, is in
-# Functions/CsvHeader.Functions.ps1, which Protect-RdaReport.ps1 and the recovery merge load.
+# Functions/CsvHeader.Functions.ps1, which Protect-RdaReport.ps1 loads.
 
 # True for a consumption time as the run writes it ('M/d/yyyy h:mm:ss tt', invariant) or an
 # ISO 8601 time.
