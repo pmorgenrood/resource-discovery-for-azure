@@ -307,11 +307,23 @@ one edited or merged by hand.
 
 Older builds keyed a subscription's token by its display name, so two
 subscriptions with one display name share one token there, and their ids hold
-it for two subscription ids. Reveal takes that one case: it writes the display
+it for two subscription ids. Reveal takes that one case when the dictionary's
+`SubscriptionNameMap` gives the token its display name: it writes the display
 name in subscription fields and each whole id that `ResourceIdMap` holds,
 leaves the token masked in any other id path, and warns. The whole ids come
 back only with `-Fields ResourceId` (or `-All`); otherwise the ids keep that
-token.
+token. A dictionary from before `SubscriptionNameMap` existed, or one that
+gives the token no display name, is refused: no single value fits every place
+the token stands, as no one subscription id fits both subscriptions and there
+is no display name to write, so Reveal stops and writes nothing.
+
+Older builds also wrote the subscription's token in place of every
+`/subscriptions/<x>` part of an id, so the id of a child of a Service Bus topic
+subscription (`.../topics/<t>/subscriptions/<s>/rules/<r>`) holds the
+subscription's token where the topic subscription's name stands. Such a
+dictionary is refused: that token stands for the subscription in one place and
+for a name in the other, and Reveal reads a token after `/subscriptions/` as a
+subscription id, so it cannot write the name there.
 
 Older builds also gave the name in a tenant-scope id
 `/providers/<namespace>/resourceGroups/<x>` the token of group `<x>`. Reveal
@@ -354,7 +366,9 @@ group's name, and stops on any other use of a group's token as a name.
 > longer fully obfuscated — share it only with the party meant to ingest it. The
 > dictionary and this script stay local. Older dictionaries that predate
 > `SubscriptionNameMap` reveal the subscription **GUID** instead of the name
-> (with a warning); those that predate tag obfuscation have no `TagMap`, so
+> (with a warning), unless one token there stands for two subscription ids,
+> which Reveal refuses (see "How it stays valid"). Those that predate tag
+> obfuscation have no `TagMap`, so
 > `-Fields Tag` is skipped with a warning. A value that looks like a time (a tag
 > or free-text value in ISO 8601 or `/Date(...)/` form) is put back as the text
 > the dictionary holds, byte for byte.

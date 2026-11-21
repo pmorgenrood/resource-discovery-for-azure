@@ -963,6 +963,66 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         Test-Path -LiteralPath (($R.OutputZip -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
         (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
     }
+
+    # Older builds replaced every '/subscriptions/<x>' part of an id with the subscription's token, so
+    # a topic subscription's child id holds that token where the topic subscription's name stands.
+    # Reveal reads a token after '/subscriptions/' as a subscription id, so it cannot write that name.
+    It "stops with <Mode> on an older dictionary whose topic subscription's child id holds the subscription's token as the topic subscription's name, and writes nothing" -ForEach @(
+        @{ Mode = '-All' }
+        @{ Mode = '-Fields Subscription' }
+        @{ Mode = 'the default fields' }
+    ) {
+        $T = $script:OldTok
+        $D = New-OldDictionary
+        $Ns = 'prod_' + [guid]::NewGuid().ToString()
+        $Topic = 'prod_' + [guid]::NewGuid().ToString()
+        $Rule = 'prod_' + [guid]::NewGuid().ToString()
+        $D.ResourceIdMap["/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.ServiceBus/namespaces/$Ns/topics/$Topic/subscriptions/$($T.Sub)/rules/$Rule"] = "/subscriptions/$($script:OldSub1)/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns-one/topics/orders/subscriptions/audit/rules/rule-one"
+        $R = Invoke-OldReveal -Dict $D -Mode $Mode
+        $R.Error | Should -Not -BeNullOrEmpty -Because 'the token stands for the subscription in one place and for a name in the other'
+        $Msg = $R.Error.Exception.Message
+        $Msg | Should -Match ([regex]::Escape($T.Sub))
+        $Msg | Should -Match ([regex]::Escape('in SubscriptionMap and in a name slot of a ResourceIdMap id, for two kinds of value'))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'ns-one', 'orders', 'audit', 'rule-one', 'rg-app') { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeFalse -Because 'no output zip is written'
+        (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
+    }
+
+    # A dictionary from before SubscriptionNameMap existed holds no display name for the shared token,
+    # so neither one subscription id nor a name fits every place it stands, and Reveal refuses it. The
+    # dictionary was written by a run, not edited, so its message gives that reason and claims no edit.
+    It "stops with <Mode> on such an older dictionary when <Case>, says that no single value fits, claims no edit, and writes nothing" -ForEach @(
+        foreach ($Mode in '-All', '-Fields Tag', '-Fields Subscription', 'the default fields')
+        {
+            @{ Mode = $Mode; Case = 'it has no SubscriptionNameMap'; Change = 'NoMap' }
+            @{ Mode = $Mode; Case = 'its SubscriptionNameMap does not hold the token'; Change = 'NoEntry' }
+            @{ Mode = $Mode; Case = 'its SubscriptionNameMap gives the token an empty name'; Change = 'Empty' }
+        }
+    ) {
+        $T = $script:OldTok
+        $D = New-OldDictionary
+        switch ($Change)
+        {
+            'NoMap' { $D.Remove('SubscriptionNameMap') }
+            'NoEntry' { $D['SubscriptionNameMap'] = [ordered]@{} }
+            'Empty' { $D['SubscriptionNameMap'] = [ordered]@{ $T.Sub = '' } }
+        }
+        $R = Invoke-OldReveal -Dict $D -Mode $Mode
+        $R.Error | Should -Not -BeNullOrEmpty -Because 'no single value fits every place the shared token stands'
+        $Msg = $R.Error.Exception.Message
+        $Msg | Should -Match ([regex]::Escape('hold 1 subscription token(s) for two or more subscription ids, and the dictionary gives that token no display name'))
+        $Msg | Should -Match ([regex]::Escape($T.Sub)) -Because 'the message names the token'
+        $Msg | Should -Match ([regex]::Escape('in SubscriptionMap and in the subscription slot of a ResourceIdMap id, for two real values'))
+        $Msg | Should -Match ([regex]::Escape('a dictionary from before SubscriptionNameMap existed holds no display name for it'))
+        $Msg | Should -Match ([regex]::Escape('No single value fits every place the token stands'))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        $Msg | Should -Not -Match '(?i)by hand|edited|changed or merged' -Because 'an older dictionary a run wrote was not edited'
+        foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'vm-one', 'vm-two', 'disk-two', 'rg-app', 'payments') { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeFalse -Because 'no output zip is written'
+        Test-Path -LiteralPath (($R.OutputZip -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
+        (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
+    }
 }
 
 # Older builds of this fork read a segment 3 'resourceGroups' as a group slot in a tenant-scope id
@@ -1202,6 +1262,19 @@ Describe "Reveal's doc on a dictionary it refuses" {
         $Flat | Should -Match ([regex]::Escape('A run of this build never writes such a dictionary'))
         $Flat | Should -Match ([regex]::Escape('Older builds keyed a subscription''s token by its display name'))
         $Flat | Should -Match ([regex]::Escape('writes the display name in subscription fields and each whole id that `ResourceIdMap` holds, leaves the token masked in any other id path, and warns'))
+    }
+
+    It "says that Reveal takes an older build's shared subscription token only with its display name, refuses a dictionary from before SubscriptionNameMap whose one token stands for two subscription ids, and refuses a topic subscription's child id that holds the subscription's token" {
+        $Doc = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw
+        $Flat = $Doc -replace '\s+', ' '
+        $Flat | Should -Not -Match ([regex]::Escape('Reveal takes that one case: it writes')) -Because 'Reveal takes it only when SubscriptionNameMap gives the token its name'
+        $Flat | Should -Match ([regex]::Escape('Reveal takes that one case when the dictionary''s `SubscriptionNameMap` gives the token its display name'))
+        $Flat | Should -Match ([regex]::Escape('A dictionary from before `SubscriptionNameMap` existed, or one that gives the token no display name, is refused: no single value fits every place the token stands'))
+        # The note on older dictionaries is a block quote: its '>' line marks are taken out.
+        $Plain = ($Doc -replace '(?m)^>[ \t]?', '') -replace '\s+', ' '
+        $Plain | Should -Not -Match ([regex]::Escape('(with a warning); those that predate tag obfuscation')) -Because 'no GUID is written for a token that stands for two subscription ids'
+        $Plain | Should -Match ([regex]::Escape('(with a warning), unless one token there stands for two subscription ids, which Reveal refuses'))
+        $Flat | Should -Match ([regex]::Escape('so the id of a child of a Service Bus topic subscription (`.../topics/<t>/subscriptions/<s>/rules/<r>`) holds the subscription''s token where the topic subscription''s name stands. Such a dictionary is refused'))
     }
 
     It "says that Reveal takes an older build's group token in a tenant-scope id after the type word resourceGroups only when the name there is the group's" {
