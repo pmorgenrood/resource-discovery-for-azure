@@ -329,7 +329,9 @@ comma, or a free-text tag value) cannot corrupt the output:
 > dictionary and this script stay local. Older dictionaries that predate
 > `SubscriptionNameMap` reveal the subscription **GUID** instead of the name
 > (with a warning); those that predate tag obfuscation have no `TagMap`, so
-> `-Fields Tag` is skipped with a warning.
+> `-Fields Tag` is skipped with a warning. A value that looks like a time (a tag
+> or free-text value in ISO 8601 or `/Date(...)/` form) is put back as the text
+> the dictionary holds, byte for byte.
 
 ### 5.1 All-subscriptions mode (whole-tree reveal + consolidation)
 

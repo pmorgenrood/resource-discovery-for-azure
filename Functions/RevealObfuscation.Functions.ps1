@@ -5,10 +5,26 @@
 # Shared helper functions AND the single-report reveal engine (Invoke-RdaReveal)
 # for the reveal feature. Dot-sourced by Reveal.ps1 (and by the child jobs it
 # spawns for the multi-subscription path) so they load into that scope.
-# Definitions only - no top-level code. Convert-RevealString references
+# Definitions only, but for one step on load: it checks that
+# Functions/DictionaryTimeText.Functions.ps1 is next to it (throws if not, and
+# the throw stops the caller under any $ErrorActionPreference) and dot-sources
+# it, which defines Restore-DictionaryTimeText, the reader the recovery merge
+# uses too. Convert-RevealString references
 # $Replacements / $tokenPattern / $script:fileHits which Invoke-RdaReveal (its
 # caller) establishes before invoking it, so the parent-scope lookup is safe.
 # =============================================================================
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'DictionaryTimeText.Functions.ps1') -PathType Leaf))
+{
+    # A plain throw is skipped when the caller runs with $ErrorActionPreference
+    # 'SilentlyContinue' or 'Ignore'; thrown from a child scope set to Stop, it
+    # stops the caller under any preference, and the caller's own is left as it was.
+    & {
+        $ErrorActionPreference = 'Stop'
+        throw ("RevealObfuscation.Functions.ps1: required file not found: {0}. Keep the Functions folder together." -f (Join-Path $PSScriptRoot 'DictionaryTimeText.Functions.ps1'))
+    }
+}
+. (Join-Path $PSScriptRoot 'DictionaryTimeText.Functions.ps1')
+
 function ConvertTo-LookupTable
 {
     param($MapObject)
@@ -196,7 +212,30 @@ function Invoke-RdaReveal
     Write-Host ("Output zip  : {0}" -f $OutputZip)
 
     # ---- Load dictionary ---------------------------------------------------
-    $Dict = Get-Content -Path $DictionaryPath -Raw | ConvertFrom-Json
+    # ConvertFrom-Json reads a tag or free-text value that looks like a time
+    # (ISO 8601, or '/Date(...)/') as a DateTime, which would be put back as
+    # text in another form ('05/01/2023 08:00:00' for
+    # '2023-05-01T10:00:00.123+02:00' on a host at UTC). Each such map value
+    # gets back the text the file holds (Restore-DictionaryTimeText), so the
+    # revealed value is the text the dictionary holds. The file is read once;
+    # its text is read a second time only when it holds such a value.
+    $DictText = Get-Content -Path $DictionaryPath -Raw
+    $Dict = $DictText | ConvertFrom-Json
+    if ($Dict -is [System.Management.Automation.PSCustomObject])
+    {
+        $Times = [System.Collections.Generic.List[object]]::new()
+        foreach ($MapProp in $Dict.PSObject.Properties)
+        {
+            if ($MapProp.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            foreach ($Entry in $MapProp.Value.PSObject.Properties)
+            {
+                if ($Entry.Value -is [datetime]) { $Times.Add([pscustomobject]@{ Map = $MapProp.Name; Entry = $Entry }) }
+            }
+        }
+        if ($Times.Count -gt 0) { Restore-DictionaryTimeText -Text $DictText -Times $Times }
+        $Times = $null
+    }
+    $DictText = $null
 
     $RgMap = ConvertTo-LookupTable $Dict.ResourceGroupMap
     $SubMap = ConvertTo-LookupTable $Dict.SubscriptionMap

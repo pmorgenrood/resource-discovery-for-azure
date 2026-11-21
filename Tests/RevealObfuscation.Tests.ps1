@@ -1528,3 +1528,154 @@ Describe 'Reveal atomic output packaging (F3)' {
         Test-Path -LiteralPath $Partial | Should -BeFalse -Because 'the temp .partial.zip must be renamed away, never left behind on a successful reveal'
     }
 }
+
+# A tag or free-text value can be a text that looks like a time. ConvertFrom-Json
+# reads such a text as a DateTime, and a DateTime turned back into text has
+# another form ('05/01/2023 08:00:00' for '2023-05-01T10:00:00.123+02:00' on a host
+# at UTC). The revealed report must hold the text the dictionary holds, byte for
+# byte: in the inventory (read here with System.Text.Json, which has no date
+# handling), in a consumption cell and in the HTML report.
+Describe 'Reveal and a dictionary value that looks like a time' {
+    It 'puts back the text the dictionary holds, byte for byte: <Case>' -ForEach @(
+        @{ Case = 'an ISO time with a +02:00 offset'; Value = '2023-05-01T10:00:00.123+02:00' }
+        @{ Case = 'an ISO time with a -05:00 offset'; Value = '2023-05-01T10:00:00-05:00' }
+        @{ Case = 'an ISO time with a +05:45 offset'; Value = '2023-05-01T10:00:00.5+05:45' }
+        @{ Case = 'an ISO time with Z'; Value = '2023-05-01T10:00:00Z' }
+        @{ Case = 'an ISO time with Z and seven fraction digits'; Value = '2023-05-01T10:00:00.1230000Z' }
+        @{ Case = 'an ISO time with no offset'; Value = '2023-05-01T10:00:00' }
+        @{ Case = 'a /Date(...)/ time'; Value = '/Date(1682935200000)/' }
+        @{ Case = 'plain text'; Value = 'Contoso Production' }
+    ) {
+        $Dir = Join-Path $script:TmpDir ('time_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $Dir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        $TagTok = 'prod_' + [guid]::NewGuid().ToString()
+        $FreeTok = 'prod_' + [guid]::NewGuid().ToString()
+        $Inv = [ordered]@{
+            VirtualMachines = @(
+                [ordered]@{
+                    ID            = $script:TokId
+                    Name          = $script:TokName
+                    Subscription  = $script:TokSub
+                    ResourceGroup = $script:TokRg
+                    Description   = $FreeTok
+                    Tags          = @( [ordered]@{ Name = 'created'; Value = $TagTok } )
+                }
+            )
+        }
+        $Inv | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $Stage 'Inventory_Time.json') -Encoding utf8
+        @([pscustomobject]@{ Tag = $TagTok; Note = $FreeTok; Cost = '1.5' }) | Export-Csv -Path (Join-Path $Stage 'Consumption_Time.csv') -NoTypeInformation -Encoding utf8
+        "<html><body><table><tr><td>$TagTok</td><td>$FreeTok</td></tr></table></body></html>" | Set-Content -Path (Join-Path $Stage 'ResourcesReport_Time.html') -Encoding utf8
+        $Zip = Join-Path $Dir 'ResourcesReport_Time.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+        $DictPath = Join-Path $Dir 'ObfuscationDictionary_Time.json'
+        [ordered]@{
+            GeneratedAt      = '2026-06-30 00:00:00'
+            ResourceIdMap    = [ordered]@{ $script:TokId = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm01" }
+            ResourceGroupMap = [ordered]@{ $script:TokRg = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-app" }
+            TagMap           = [ordered]@{ $TagTok = $Value }
+            FreeTextMap      = [ordered]@{ $FreeTok = $Value }
+        } | ConvertTo-Json -Depth 6 | Set-Content -Path $DictPath -Encoding utf8
+        $DictDoc = [System.Text.Json.JsonDocument]::Parse([System.IO.File]::ReadAllText($DictPath))
+        try { $DictDoc.RootElement.GetProperty('TagMap').GetProperty($TagTok).GetString() | Should -BeExactly $Value -Because 'the dictionary holds the text as a run writes it' }
+        finally { $DictDoc.Dispose() }
+
+        $Out = Join-Path $Dir 'out.zip'
+        & $script:RevealScript -InputZip $Zip -DictionaryPath $DictPath -Fields Tag, FreeText -OutputZip $Out *>&1 | Out-Null
+        $Ex = Join-Path $Dir 'ex'
+        Expand-Archive -Path $Out -DestinationPath $Ex -Force
+
+        $InvText = [System.IO.File]::ReadAllText((Join-Path $Ex 'Inventory_Time.json'))
+        $Doc = [System.Text.Json.JsonDocument]::Parse($InvText)
+        try
+        {
+            $Vm = $Doc.RootElement.GetProperty('VirtualMachines')[0]
+            $Vm.GetProperty('Tags')[0].GetProperty('Value').GetString() | Should -BeExactly $Value -Because 'a tag value in the inventory gets back the text the dictionary holds'
+            $Vm.GetProperty('Description').GetString() | Should -BeExactly $Value -Because 'a free-text value in the inventory gets back the text the dictionary holds'
+        }
+        finally { $Doc.Dispose() }
+        $Row = @(Import-Csv -Path (Join-Path $Ex 'Consumption_Time.csv'))[0]
+        $Row.Tag | Should -BeExactly $Value -Because 'a tag value in a consumption cell gets back the text the dictionary holds'
+        $Row.Note | Should -BeExactly $Value -Because 'a free-text value in a consumption cell gets back the text the dictionary holds'
+        $Row.Cost | Should -BeExactly '1.5'
+        $Html = [System.IO.File]::ReadAllText((Join-Path $Ex 'ResourcesReport_Time.html'))
+        $Encoded = [System.Net.WebUtility]::HtmlEncode($Value)
+        $Html | Should -BeLike ('*<td>{0}</td><td>{0}</td>*' -f [WildcardPattern]::Escape($Encoded)) -Because 'the HTML report gets back the text the dictionary holds'
+    }
+
+    # No build writes a dictionary file whose root is a list, and the merge refuses
+    # one. ConvertFrom-Json reads a list of one object as that object, so Reveal
+    # reveals such a file, and a value there that looks like a time gets back the
+    # text the file holds, as it does in a dictionary whose root is an object.
+    It 'reveals a dictionary file whose root is a list of one object that holds a value that looks like a time' {
+        $Dir = Join-Path $script:TmpDir ('timelist_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $Dir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        $TagTok = 'prod_' + [guid]::NewGuid().ToString()
+        $FreeTok = 'prod_' + [guid]::NewGuid().ToString()
+        [ordered]@{
+            VirtualMachines = @(
+                [ordered]@{
+                    ID            = $script:TokId
+                    Name          = $script:TokName
+                    Subscription  = $script:TokSub
+                    ResourceGroup = $script:TokRg
+                    Description   = $FreeTok
+                    Tags          = @( [ordered]@{ Name = 'created'; Value = $TagTok } )
+                }
+            )
+        } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $Stage 'Inventory_Time.json') -Encoding utf8
+        $Zip = Join-Path $Dir 'ResourcesReport_Time.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+        $DictPath = Join-Path $Dir 'ObfuscationDictionary_Time.json'
+        $DictText = '[' + ([ordered]@{
+                GeneratedAt = '2026-06-30 00:00:00'
+                TagMap      = [ordered]@{ $TagTok = '2023-05-01T10:00:00Z' }
+                FreeTextMap = [ordered]@{ $FreeTok = 'Contoso Production' }
+            } | ConvertTo-Json -Depth 6) + ']'
+        [System.IO.File]::WriteAllText($DictPath, $DictText)
+
+        $Out = Join-Path $Dir 'out.zip'
+        & $script:RevealScript -InputZip $Zip -DictionaryPath $DictPath -Fields Tag, FreeText -OutputZip $Out *>&1 | Out-Null
+
+        [System.IO.File]::Exists($Out) | Should -BeTrue
+        $Ex = Join-Path $Dir 'ex'
+        Expand-Archive -Path $Out -DestinationPath $Ex -Force
+        $Doc = [System.Text.Json.JsonDocument]::Parse([System.IO.File]::ReadAllText((Join-Path $Ex 'Inventory_Time.json')))
+        try
+        {
+            $Vm = $Doc.RootElement.GetProperty('VirtualMachines')[0]
+            $Vm.GetProperty('Tags')[0].GetProperty('Value').GetString() | Should -BeExactly '2023-05-01T10:00:00Z' -Because 'the tag value gets back the text the dictionary file holds'
+            $Vm.GetProperty('Description').GetString() | Should -BeExactly 'Contoso Production'
+        }
+        finally { $Doc.Dispose() }
+    }
+}
+
+# Reveal.ps1, and each of its per-folder jobs, dot-sources only
+# RevealObfuscation.Functions.ps1, which loads the reader the merge uses too. A
+# caller with no try, as an operator's own script is, runs in a child pwsh.
+Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.ps1 next to it' {
+    It 'stops the caller when it is loaded, under ErrorActionPreference <Preference>' -ForEach @(
+        @{ Preference = 'SilentlyContinue' }
+        @{ Preference = 'Ignore' }
+        @{ Preference = 'Continue' }
+    ) {
+        $LoneDir = Join-Path $script:TmpDir ('lone_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $LoneDir -Force | Out-Null
+        $LoneFile = Join-Path $LoneDir 'RevealObfuscation.Functions.ps1'
+        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RevealObfuscation.Functions.ps1') -Destination $LoneFile
+        $Q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+        $ChildFile = Join-Path $LoneDir 'child.ps1'
+        Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value (@(
+                ('$ErrorActionPreference = {0}' -f (& $Q $Preference))
+                ('. {0}' -f (& $Q $LoneFile))
+                'Write-Output ''AFTER_LOAD'''
+            ) -join [Environment]::NewLine)
+        $ChildOutput = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+        $Because = $ChildOutput -join [Environment]::NewLine
+        $ChildOutput | Should -Not -Contain 'AFTER_LOAD' -Because ('the load must stop the caller, not let it go on. Output: ' + $Because)
+        $Because | Should -BeLike '*required file not found*DictionaryTimeText.Functions.ps1*Keep the Functions folder together*'
+        $LASTEXITCODE | Should -Not -Be 0 -Because $Because
+    }
+}
