@@ -50,27 +50,34 @@ function Get-RdaTokenPattern
 }
 
 # The masked id shape the output contract asks for, for the zip-backed tests:
-#   /subscriptions/<sub tok>/resourcegroups/<rg tok>/providers/<ns>/<type>/<name tok>[/<type>/<name tok>...][/$system]
+#   /subscriptions/<sub tok>/resourcegroups/<rg tok>/providers/<ns>/<type>/<name tok>[/<type>/<name tok>...]
 # Subscription and resource group tokens are prod_/nonprod_ + GUID (an AKS
 # node group keeps its mc_ hint), name tokens may carry the databricks_/aks_/
-# vmss_ hint, provider and type segments stay as written. A last type word
-# with no name after it may be '$system' and no other word: Service Bus bills
-# '.../namespaces/<namespace>/$system', and a run keeps that type word as
-# written ('.../namespaces/<name tok>/$system'). Shapes the contract
-# does not allow are accepted only by name, so a test says which it lets in:
+# vmss_ hint, provider and type segments stay as written. The id ends in a
+# name token, as downstream reads the last segment as the resource's name.
+# Shapes the contract does not allow are accepted only by name, so a test
+# says which it lets in (each switch adds its shape to the others):
 #   -AllowParked          G2: a subscription-scope id with no resourcegroups
 #                         segment, parked with the owner. (G1, the Service Bus
 #                         '$system' name kept as written, is masked now and
 #                         taken by no switch.)
 #   -AllowMetricFallback  F2: the metric fallback's own sub_/rg_ tokens
 #                         (Extension/Metrics.ps1), until it uses the shared ones.
+#   -AllowTrailingSystemType  a last type word '$system', and no other word,
+#                         after a name token, with no name after it
+#                         ('.../namespaces/<name tok>/$system'): a run keeps a
+#                         last type word as written, and the offline mask takes
+#                         that id (Functions/OfflineObfuscation.Functions.ps1
+#                         says Service Bus bills that form; whether it does is
+#                         with the owner). Downstream would read '$system' as
+#                         such a row's name.
 function Get-RdaContractIdPattern
 {
-    param([switch]$AllowParked, [switch]$AllowMetricFallback)
+    param([switch]$AllowParked, [switch]$AllowMetricFallback, [switch]$AllowTrailingSystemType)
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $P = '(?:prod|nonprod)_'
     $Names = '(?:/[a-z][a-z0-9.]*/' + $P + '(?:databricks_|aks_|vmss_)?' + $Guid + ')+'
-    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names + '(?:/\$system)?'
+    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names + $(if ($AllowTrailingSystemType) { '(?:/\$system)?' } else { '' })
     $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
     if ($AllowParked)
     {
@@ -83,13 +90,16 @@ function Get-RdaContractIdPattern
     return ('(?i)(?:' + ($Shapes -join '|') + ')')
 }
 
+# -AllowTrailingSystemType: a last type word '$system' (and no other word)
+# may follow a name token, as above; by default the id ends in a name token.
 function Get-RdaMaskedIdPattern
 {
+    param([switch]$AllowTrailingSystemType)
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    # A last type word '$system' (and no other word) may follow a name token, as above.
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+(?:/\$system)?)?$'
+    $Trailing = if ($AllowTrailingSystemType) { '(?:/\$system)?' } else { '' }
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+' + $Trailing + ')?$'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a
