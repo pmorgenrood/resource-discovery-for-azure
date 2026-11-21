@@ -16,7 +16,8 @@
 # a SQL server with a database and an elastic pool (SQLDB and SQLPOOL child
 # ids), a VM with a disk, and
 # usage rows that include resources not in the inventory (a database of the
-# same server, a Service Bus '$system' topic in another resource group, a disk
+# same server, a Service Bus '$system' topic in another resource group, a
+# Service Bus namespace '$system' in a group '$system' as Azure bills it, a disk
 # in an AKS-managed 'mc_' group, a subscription-level resource). The Azure CLI,
 # the Az cmdlets and Get-AzMetric are offline stand-ins. It then runs
 # Reveal.ps1 -All on the obfuscated zip and compares every inventory, metrics
@@ -83,6 +84,7 @@ $Global:StandInUsage = @(
     "/subscriptions/$SubId/resourceGroups/rg-demo/providers/Microsoft.Sql/servers/sqlsrv-demo/databases/sqldb-demo"
     "/subscriptions/$SubId/resourceGroups/rg-demo/providers/Microsoft.Sql/servers/sqlsrv-demo/databases/sqldb-gone"
     "/subscriptions/$SubId/resourceGroups/rg-gone/providers/Microsoft.ServiceBus/namespaces/sb-gone/topics/`$system"
+    "/subscriptions/$SubId/resourceGroups/`$system/providers/Microsoft.ServiceBus/namespaces/`$system"
     "/subscriptions/$SubId/resourceGroups/MC_rg-aks_aks-gone_eastus/providers/Microsoft.Compute/disks/osdisk-gone"
     "/subscriptions/$SubId/providers/Microsoft.Insights/components/insights-gone"
 ) | ForEach-Object {
@@ -227,7 +229,8 @@ exit $LASTEXITCODE
     $script:R = if (Test-Path -LiteralPath $script:RevealedZip) { Read-Report $script:RevealedZip } else { $null }
 
     # Every real identifying value of the synthetic estate, and the fixed name
-    # '$system' of the Service Bus topic: a name part the masked files leave out too.
+    # '$system' of the Service Bus topic, namespace and group: a name part the
+    # masked files leave out too.
     $script:RealValues = @('12345678-1234-1234-1234-123456789012', 'Demo Subscription', 'rg-demo', 'sqlsrv-demo', 'sqldb-demo', 'pool-demo', 'vm-test-demo', 'disk-demo',
         'sqldb-gone', 'rg-gone', 'sb-gone', 'mc_rg-aks_aks-gone_eastus', 'osdisk-gone', 'insights-gone', '$system')
 }
@@ -249,13 +252,13 @@ Describe 'The two runs' {
         Test-Path -LiteralPath $script:RevealedZip | Should -BeTrue
     }
 
-    It 'collect the same records: 4 inventory, metrics for the database and the VM, 5 usage rows' {
+    It 'collect the same records: 4 inventory, metrics for the database and the VM, 6 usage rows' {
         $script:P.Inventory.Count | Should -Be 4
         $script:O.Inventory.Count | Should -Be 4
         $script:P.Metrics.Count | Should -BeGreaterThan 0
         $script:O.Metrics.Count | Should -Be $script:P.Metrics.Count
-        $script:P.CsvRows.Count | Should -Be 5
-        $script:O.CsvRows.Count | Should -Be 5
+        $script:P.CsvRows.Count | Should -Be 6
+        $script:O.CsvRows.Count | Should -Be 6
     }
 }
 
@@ -288,6 +291,38 @@ Describe '-Obfuscate masks every identifying segment' {
         $DbMetrics = @($script:O.Metrics | ConvertFrom-Json | Where-Object { $_.Service -eq 'SQL Database' })
         $DbMetrics.Count | Should -BeGreaterThan 0
         foreach ($Metric in $DbMetrics) { $Metric.ID | Should -BeExactly $Database.ID }
+    }
+
+    # The form Azure bills a Service Bus namespace '$system' in: its group and
+    # its name are both '$system'. Each gets a token, as any name does.
+    It 'masks the billed Service Bus id whose group and namespace are both $system in its consumption row, its InstanceData and the dictionary, and Reveal gives it back' {
+        # The id of the stand-in usage row; the run reads it as Azure's usage
+        # gives it, so the plain run's row is the id as the run writes it.
+        $RealId = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/$system/providers/Microsoft.ServiceBus/namespaces/$system'
+        $Plain = @($script:P.CsvRows | Where-Object { $_.ResourceId -ieq $RealId })
+        $Plain.Count | Should -Be 1 -Because 'the plain run bills the namespace once'
+        $PlainId = $Plain[0].ResourceId
+        $Dict = Get-Content -LiteralPath $script:Obf.Dictionary.FullName -Raw | ConvertFrom-Json -AsHashtable
+        $Masked = @($Dict.ResourceIdMap.Keys | Where-Object { $Dict.ResourceIdMap[$_] -ceq $PlainId })
+        $Masked.Count | Should -Be 1 -Because 'the dictionary maps the billed id to one masked id'
+        $Parts = $Masked[0].Split('/')
+        $Real = $PlainId.Split('/')
+        $Parts.Count | Should -Be 9
+        $Real.Count | Should -Be 9
+        foreach ($Word in 1, 3, 5, 6, 7) { $Parts[$Word] | Should -BeExactly $Real[$Word] -Because 'the path words, the namespace and the type word stay as written' }
+        foreach ($Slot in 2, 4, 8) { $Parts[$Slot] | Should -Match '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "part $Slot is a subscription, group or name" }
+        $Rows = @($script:O.CsvRows | Where-Object { $_.ResourceId -ceq $Masked[0] })
+        $Rows.Count | Should -Be 1 -Because 'the consumption row holds the masked id'
+        ($Rows[0].InstanceData | ConvertFrom-Json).'Microsoft.Resources'.resourceUri | Should -BeExactly $Masked[0]
+        $Rows[0].InstanceData | Should -Not -Match '\$system'
+        foreach ($Map in @($Dict.Keys))
+        {
+            if ($Dict[$Map] -isnot [System.Collections.IDictionary]) { continue }
+            @($Dict[$Map].Keys | Where-Object { $_ -match '\$system' }) | Should -BeNullOrEmpty -Because "no masked value in $Map holds `$system"
+        }
+        $Revealed = @($script:R.CsvRows | Where-Object { $_.ResourceId -ceq $PlainId })
+        $Revealed.Count | Should -Be 1 -Because 'Reveal gives back the real id as the plain run writes it'
+        ($Revealed[0].InstanceData | ConvertFrom-Json).'Microsoft.Resources'.resourceUri | Should -BeExactly $PlainId
     }
 
     It 'uses the inventory''s tokens in the consumption row of a database of the same server that is not in the inventory' {
