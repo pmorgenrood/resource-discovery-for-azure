@@ -1302,6 +1302,26 @@ Describe "Reveal-Obfuscation input/dictionary resolution and failure paths (Task
         }
     }
 
+    Context "auto-discovery and a folder named like a dictionary" {
+
+        It "picks the newest dictionary file, not a newer folder whose name matches ObfuscationDictionary_*.json" {
+            $Search = Join-Path $script:TmpDir ("dirdict_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $Search -Force | Out-Null
+            $FileDict = Join-Path $Search 'ObfuscationDictionary_Valid.json'
+            [ordered]@{
+                GeneratedAt      = '2026-06-30 00:00:00'
+                ResourceGroupMap = [ordered]@{ $script:TokRg = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-file-dict/providers/Microsoft.Compute/virtualMachines/vm01" }
+            } | ConvertTo-Json -Depth 6 | Set-Content -Path $FileDict -Encoding utf8
+            $FolderDict = Join-Path $Search 'ObfuscationDictionary_Folder.json'
+            New-Item -ItemType Directory -Path $FolderDict -Force | Out-Null
+            (Get-Item -LiteralPath $FileDict).LastWriteTime = (Get-Date).AddMinutes(-30)
+            (Get-Item -LiteralPath $FolderDict).LastWriteTime = (Get-Date)
+
+            $R = Invoke-Reveal -Fields @('ResourceGroup') -SearchDir $Search
+            $R.Inventory.VirtualMachines[0].ResourceGroup | Should -BeExactly 'rg-file-dict' -Because 'a folder is not a dictionary, however new and whatever its name'
+        }
+    }
+
     Context "missing input ZIP (Req 10.2)" {
 
         It "throws an error that names the missing input file" {
