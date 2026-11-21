@@ -1173,14 +1173,17 @@ function Test-RdaMaskedSlot
             # a name slot (cut on - _ . as mask-keep-shape.md cuts a name) must be no real value.
             $Segments = ($T -replace $TokenRegex, '').Split('/')
             $Providers = -1
-            for ($Pi = 0; $Pi -lt $Segments.Count; $Pi++) { if ($Segments[$Pi] -ieq 'providers') { $Providers = $Pi; break } }
             for ($i = 0; $i -lt $Segments.Count; $i++)
             {
                 $Seg = $Segments[$i]
                 if ($Seg -eq '') { continue }
                 # The words of the path: subscriptions, resourcegroups, providers, and after
                 # providers the namespace and each type word (namespace and every other one after).
-                if ($Seg -in 'subscriptions', 'resourcegroups', 'providers') { continue }
+                # Counted again from each 'providers', as Get-RdaRealValueSet reads an id: in an
+                # extension id ('.../<name>/providers/microsoft.insights/<type>/<name>') the
+                # namespace after the second one is Azure's word, not a name.
+                if ($Seg -ieq 'providers') { $Providers = $i; continue }
+                if ($Seg -in 'subscriptions', 'resourcegroups') { continue }
                 # After providers: the namespace (1), then type words (2, 4, ...) between the names (3, 5, ...).
                 if ($Providers -ge 0 -and $i -gt $Providers -and (($i - $Providers) -eq 1 -or (($i - $Providers) % 2) -eq 0)) { continue }
                 if (@($Seg -split '[-_.]' | Where-Object { $_ -ne '' -and $RealValue.Contains($_) }).Count -gt 0 -or $RealValue.Contains($Seg)) { [void]$Bad.Add($F); break }

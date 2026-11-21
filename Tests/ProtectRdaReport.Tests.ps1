@@ -314,6 +314,18 @@ Describe 'The masked-field check, the real values and the exempt words' {
         Test-RdaMaskedSlot -Row @{ ID = "/subscriptions/$Tok/resourcegroups/rg-app-01/providers/microsoft.compute/virtualmachines/$Tok" } -Field 'ID' -RealValue $Real | Should -Be @('ID')
     }
 
+    # An extension id has a second 'providers': its namespace (microsoft.insights) is
+    # Azure's word, read from that 'providers' as Get-RdaRealValueSet reads it, so a
+    # report whose real group or name is 'insights' does not refuse the masked id.
+    It 'reads the namespace after the second providers of an extension id as Azure''s word, and still finds a real name after it' {
+        $Real = [System.Collections.Generic.HashSet[string]]::new([string[]]@('insights'), [System.StringComparer]::OrdinalIgnoreCase)
+        $Tok = 'prod_11111111-1111-1111-1111-111111111111'
+        $Ext = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.compute/virtualmachines/$Tok/providers/microsoft.insights/diagnosticsettings"
+        Test-RdaMaskedSlot -Row @{ ID = "$Ext/$Tok" } -Field 'ID' -RealValue $Real | Should -BeNullOrEmpty -Because 'every name part is a token'
+        Test-RdaMaskedSlot -Row @{ ID = "$Ext/insights" } -Field 'ID' -RealValue $Real | Should -Be @('ID') -Because 'the name after the second providers is still read'
+        Test-RdaMaskedSlot -Row @{ ID = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.compute/virtualmachines/insights/providers/microsoft.insights/diagnosticsettings/$Tok" } -Field 'ID' -RealValue $Real | Should -Be @('ID') -Because 'the name before the second providers is still read'
+    }
+
     It 'takes the subscription, group and name parts of a full id given as a real value' {
         $Global:ResourceIdDictionary = $null; $Global:ResourceNameDictionary = $null; $Global:ResourceSubscriptionDictionary = $null; $Global:ResourceResourceGroupDictionary = $null
         $Global:ObfuscationSubscriptionTokens = $null; $Global:ObfuscationResourceGroupTokens = $null; $Global:TagValueDictionary = $null; $Global:FreeTextDictionary = $null
