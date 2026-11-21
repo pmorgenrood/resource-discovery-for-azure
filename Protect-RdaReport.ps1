@@ -585,6 +585,10 @@ try
                 {
                     Stop-RdaOfflineMask ("{0}: consumption row {1} has an id, location or meter its InstanceData does not have. Nothing was written." -f $ReportZip.Name, $RowIndex)
                 }
+                # An id that ends on the word '$system' with no name after it is a form this
+                # tool does not support (Test-RdaTrailingSystemTypeId): refused with its own
+                # reason, as masking the report again would stop here again.
+                if (Test-RdaTrailingSystemTypeId ([string]$UsageRow.ResourceId)) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id that ends on the word '`$system' with no name after it ('.../<type>/<name>/`$system'). That is an id form this tool does not support: no Azure billing row seen so far has it, and downstream would read '`$system' as the resource's name. Ask the owner of this tool how to handle it. Nothing was written." -f $ReportZip.Name, $RowIndex) }
                 # The id masking keeps an id's provider and type words: they must be Azure's.
                 if (-not (Test-RdaIdPathWord ([string]$UsageRow.ResourceId))) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id whose provider or type is not as Azure writes one. Nothing was written." -f $ReportZip.Name, $RowIndex) }
                 # One cell that cannot be read makes the whole file unusable: the quantity a number

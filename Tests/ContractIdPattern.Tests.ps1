@@ -4,10 +4,11 @@
 # Offline tests of Get-RdaContractIdPattern (Tests/Helpers/SyntheticReportZip.ps1),
 # the masked id shape the zip-backed tests check inventory ids, cross-
 # references, metric ids and ResourceIdMap keys against. The contract shape
-# is the only one taken by default; the parked G2 shape, the metric
-# fallback's sub_/rg_ tokens (F2) and a last type word '$system' after a name
-# token only when a test names them. The G1 shape (a Service Bus '$system'
-# name kept as written) is masked now and never taken.
+# is the only one taken by default; the parked G2 shape and the metric
+# fallback's sub_/rg_ tokens (F2) only when a test names them. The G1 shape (a
+# Service Bus '$system' name kept as written) is masked now and never taken,
+# and an id that ends on the type word '$system' with no name after it is an
+# id form this tool does not support, which no switch takes.
 #
 # Run with: Invoke-Pester ./Tests/ContractIdPattern.Tests.ps1 -Output Detailed
 # =============================================================================
@@ -30,9 +31,10 @@ BeforeAll {
         NoProvider   = "/subscriptions/prod_$G/resourcegroups/prod_$G"
         FlatSentinel = "obfuscated_$G"
         # A run keeps a last type word with no name after it as written, so it
-        # would write this one for a billed '.../namespaces/<namespace>/$system'
-        # (whether Azure bills that form is with the owner). It ends on a type
-        # word, not a name token, so only -AllowTrailingSystemType takes it.
+        # would write this one for a billed '.../namespaces/<namespace>/$system'.
+        # No captured billing row shows that form, and downstream reads the last
+        # segment as the name: it is an id form this tool does not support (the
+        # offline mask and the recovery merge refuse it), and no pattern takes it.
         TypeSystem   = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$system"
         TypeOther    = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/topics"
         TypeSystemX  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$systemx"
@@ -41,7 +43,7 @@ BeforeAll {
     }
 }
 
-Describe 'A last type word $system after a name token, in both id patterns' {
+Describe 'An id that ends on the type word $system after a name token, in both id patterns' {
 
     It 'refuses TypeSystem by default in both patterns, with the other named shapes allowed too: the contract''s id ends in a name token' {
         $script:Ids.TypeSystem | Should -Not -Match (Get-RdaContractIdPattern)
@@ -49,24 +51,14 @@ Describe 'A last type word $system after a name token, in both id patterns' {
         $script:Ids.TypeSystem | Should -Not -Match (Get-RdaMaskedIdPattern)
     }
 
-    It 'takes TypeSystem only with -AllowTrailingSystemType, in both patterns, with the other named shapes too' {
-        $script:Ids.TypeSystem | Should -Match (Get-RdaContractIdPattern -AllowTrailingSystemType)
-        $script:Ids.TypeSystem | Should -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback -AllowTrailingSystemType)
-        $script:Ids.TypeSystem | Should -Match (Get-RdaMaskedIdPattern -AllowTrailingSystemType)
+    It 'has no switch that takes an id ending on the type word $system: <_>' -ForEach @('Get-RdaContractIdPattern', 'Get-RdaMaskedIdPattern') {
+        @((Get-Command $_).Parameters.Keys) | Should -Not -Contain 'AllowTrailingSystemType' -Because 'that id form is not supported, so no test may let it in'
     }
 
-    It 'still takes the contract shapes <_> with -AllowTrailingSystemType, and the masked id pattern reads them as without it' -ForEach @('Contract', 'ContractMc', 'ContractKid') {
-        $script:Ids[$_] | Should -Match (Get-RdaContractIdPattern -AllowTrailingSystemType)
-        ($script:Ids[$_] -match (Get-RdaMaskedIdPattern -AllowTrailingSystemType)) | Should -Be ($script:Ids[$_] -match (Get-RdaMaskedIdPattern))
-    }
-
-    It 'still refuses <_> in both patterns, by default and with -AllowTrailingSystemType: only the word $system may end an id with no name after it' -ForEach @('TypeOther', 'TypeSystemX', 'TypeSystemOn', 'SystemNoName', 'G1System', 'G1Nested') {
+    It 'still refuses <_> in both patterns, with the other named shapes allowed too: no id may end on a type word' -ForEach @('TypeSystem', 'TypeOther', 'TypeSystemX', 'TypeSystemOn', 'SystemNoName', 'G1System', 'G1Nested') {
         $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern)
         $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback)
         $script:Ids[$_] | Should -Not -Match (Get-RdaMaskedIdPattern)
-        $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern -AllowTrailingSystemType)
-        $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback -AllowTrailingSystemType)
-        $script:Ids[$_] | Should -Not -Match (Get-RdaMaskedIdPattern -AllowTrailingSystemType)
     }
 }
 

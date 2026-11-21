@@ -1201,7 +1201,8 @@ function Test-RdaMaskedSlot
 # check); for any other id one flat token, as Get-ObfuscatedResourceId writes it. So a
 # masked id that keeps a name part as written fails, whatever the name: Azure's fixed
 # name '$system', or a short name of letters only, neither of which the last leak scan
-# looks for inside a text.
+# looks for inside a text. An id that ends on the word '$system' with no name after it
+# fails too (Test-RdaTrailingSystemTypeId): this tool does not support that form.
 # Apart from that shape check, which mirrors the run's masking, every name slot of a
 # masked path must differ, in any case, from the plain id's segment there (the
 # subscription, the group and every name; the namespace and type words are kept): a
@@ -1213,6 +1214,9 @@ function Test-RdaMaskedUsageId
     if ([string]::IsNullOrEmpty($PlainId)) { return $MaskedId -ceq 'obfuscated' }
     if ($PlainId -match '(?i)^/subscriptions/[^/]' -or (Test-RdaTenantScopeIdMaskable -ResourceId $PlainId))
     {
+        # An id that ends on the word '$system' with no name after it is a form this tool
+        # does not support (Test-RdaTrailingSystemTypeId), whatever its other parts are.
+        if ((Test-RdaTrailingSystemTypeId $PlainId) -or (Test-RdaTrailingSystemTypeId ([string]$MaskedId))) { return $false }
         $P = $PlainId.Split('/')
         $M = ([string]$MaskedId).Split('/')
         if ($P.Count -ne $M.Count) { return $false }
@@ -2101,10 +2105,11 @@ function Publish-RdaOfflineOutput
 # and not equal to or inside a value of a field no run masks), not otherwise (a group 'rg1' or 'finance' as a type word). Not refused outright: a
 # real name may equal an Azure type word (a group 'servers'). Upgrade to a list of Azure's
 # types if a report ever holds such a word.
-# A last segment with no name after it may also be Azure's fixed word '$system' (any case):
-# a run keeps a trailing '$system' type word as written ('.../namespaces/<token>/$system'),
-# so the offline mask accepts it to match. Whether Azure bills that form is an open
-# question for the owner: no fixture or captured billing row shows it.
+# A last segment '$system' with no name after it ('.../namespaces/<name>/$system') is
+# refused like any other word that is not of that form: it is an id form this tool does not
+# support (Test-RdaTrailingSystemTypeId). No fixture or captured billing row shows Azure
+# billing it, and downstream reads an id's last segment as the resource's name, so how to
+# mask it is with the owner. A run keeps such a last type word as written (not changed here).
 function Test-RdaIdPathWord([string]$Id)
 {
     $Parts = $Id.Split('/')
@@ -2112,7 +2117,7 @@ function Test-RdaIdPathWord([string]$Id)
     for ($I = 3; $I -lt $Parts.Count; $I += 2)
     {
         $Segment = $Parts[$I]
-        if ($Segment -notmatch '^[A-Za-z][A-Za-z0-9]*\z' -and -not ($I + 1 -ge $Parts.Count -and $Segment -ieq '$system')) { return $false }
+        if ($Segment -notmatch '^[A-Za-z][A-Za-z0-9]*\z') { return $false }
         if ($I + 1 -ge $Parts.Count) { break }
         $Next = $Parts[$I + 1]
         if ($I -ne 3 -or $Segment -ine 'resourcegroups')
@@ -2121,6 +2126,20 @@ function Test-RdaIdPathWord([string]$Id)
         }
     }
     return $true
+}
+
+# True when an id ('/subscriptions/...' or '/providers/...', plain or masked) ends on the word
+# '$system' (any case) with no name after it, as in '.../namespaces/<name>/$system': an id form
+# this tool does not support. A path pairs a word with a value from segment 1 on, so its last
+# segment is a word when it has an even number of segments. No fixture or captured billing
+# row shows Azure billing such an id, and downstream reads the last segment as the resource's
+# name, so the offline mask refuses it (Protect-RdaReport.ps1, Test-RdaMaskedUsageId) and the
+# question of how to mask it is with the owner.
+function Test-RdaTrailingSystemTypeId([string]$Id)
+{
+    if ([string]::IsNullOrEmpty($Id) -or -not $Id.EndsWith('/$system', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $Parts = $Id.Split('/')
+    return $Parts[0] -eq '' -and ($Parts[1] -ieq 'subscriptions' -or $Parts[1] -ieq 'providers') -and ($Parts.Count % 2) -eq 0
 }
 
 # The path where $Path really is: each part that is a link or junction followed (its target

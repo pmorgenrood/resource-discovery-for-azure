@@ -648,28 +648,49 @@ Describe 'Names and types are kept as a run writes them' {
         Test-RdaMetricRecordShape -Record $Bad -Shape $script:Shape | Should -BeFalse
     }
 
-    # A run keeps a last segment with no name after it as written, Azure's '$system' too
-    # ('.../namespaces/<token>/$system'), so the offline mask takes it as a type word to match
-    # (whether Azure bills that form is an open question for the owner). '$system' with a name
-    # after it, and any other '$' word, are not Azure's form.
-    It 'takes a last type segment $system as Azure''s word, and no other $ word' {
-        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system' | Should -BeTrue
-        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$SYSTEM' | Should -BeTrue
+    # An id that ends on '$system' with no name after it ('.../namespaces/<name>/$system') is
+    # a form this tool does not support: no fixture or captured billing row shows it, and
+    # downstream reads the last segment as the name. So the path word check refuses it, as
+    # it refuses '$system' with a name after it and any other '$' word.
+    It 'refuses a last segment $system with no name after it, and every other $ word' {
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system' | Should -BeFalse
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$SYSTEM' | Should -BeFalse
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system/x' | Should -BeFalse
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$systemx' | Should -BeFalse
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$other' | Should -BeFalse
+        Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/topics' | Should -BeTrue -Because 'a last type word of Azure''s form is still taken'
+    }
+
+    It 'reads an id as ending on the word $system only when that is its last segment with no name after it: <Id>' -ForEach @(
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system'; Want = $true }
+        @{ Id = '/subscriptions/prod_x/resourcegroups/prod_y/providers/microsoft.servicebus/namespaces/prod_z/$SYSTEM'; Want = $true }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/r-1/$system'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/$system'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/topics/$system'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$systemx'; Want = $false }
+        @{ Id = 'prod_$system'; Want = $false }
+        @{ Id = ''; Want = $false }
+    ) {
+        Test-RdaTrailingSystemTypeId $Id | Should -Be $Want
+    }
+
+    It 'refuses, as the masked id of a usage row, an id that ends on the word $system with no name after it' {
+        $Tok = 'prod_{0}' -f [guid]::NewGuid()
+        $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/$system'
+        Test-RdaMaskedUsageId -PlainId $Plain -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.servicebus/namespaces/{0}/$system' -f $Tok) | Should -BeFalse
+        Test-RdaMaskedUsageId -PlainId $Plain.Replace('/$system', '') -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.servicebus/namespaces/{0}' -f $Tok) | Should -BeTrue -Because 'the namespace''s own id is taken'
     }
 
     # No fixture or captured billing row shows Azure billing '.../namespaces/<namespace>/$system',
-    # so the code and the doc give why the offline mask takes it (to match a run) and leave
-    # whether Azure bills it to the owner, rather than state it as fact.
-    It 'says, in its code and its doc, that it takes a trailing $system type word to match a run, and that whether Azure bills it is open' {
+    # so the code and the doc say the offline mask refuses that form and leave it to the owner.
+    It 'says, in its code and its doc, that it refuses an id that ends on the word $system with no name after it, and that the form is with the owner' {
         $Root = Split-Path $PSScriptRoot -Parent
         foreach ($File in 'Functions/OfflineObfuscation.Functions.ps1', 'docs/offline-obfuscate.md')
         {
             $Text = ([System.IO.File]::ReadAllText((Join-Path $Root $File)) -replace '(?m)^\s*#\s?', ' ' -replace '\s+', ' ') -replace '[`'']', ''
-            $Text | Should -Match ([regex]::Escape('a run keeps a trailing $system type word as written (.../namespaces/<token>/$system), so the offline mask accepts it to match. Whether Azure bills that form is an open question for the owner: no fixture or captured billing row shows it.')) -Because "$File gives the reason and leaves the billing form open"
-            $Text | Should -Not -Match 'Service Bus bills \.\.\./namespaces/<namespace>/\$system' -Because "$File does not state that form as fact"
+            $Text | Should -Match ([regex]::Escape('is refused like any other word that is not of that form: it is an id form this tool does not support')) -Because "$File says the form is refused"
+            $Text | Should -Match ([regex]::Escape('so how to mask it is with the owner')) -Because "$File leaves the form to the owner"
+            $Text | Should -Not -Match 'the offline mask accepts it to match' -Because "$File no longer takes that form"
         }
     }
 }
@@ -2160,10 +2181,11 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         @($Usage | Where-Object { $_.ResourceId.StartsWith($MaskedSb[0] + '/topics/') }).Count | Should -Be 1 -Because 'the topic holds its namespace''s masked path'
     }
 
-    # A run keeps a last segment with no name after it as written, so a usage row of
-    # '.../namespaces/<namespace>/$system' is masked to '.../namespaces/<token>/$system'
-    # (Get-ObfuscatedResourceId). The offline mask writes the same, not a stop.
-    It 'masks a usage row whose id ends in the type word $system as a run masks it, keeping that word' {
+    # A usage row of '.../namespaces/<namespace>/$system' (an id that ends on '$system' with
+    # no name after it) is an id form this tool does not support: no captured billing row
+    # shows it, and downstream would read '$system' as the name. The mask stops on it with
+    # that reason, which masking again would not change, and writes nothing.
+    It 'refuses a usage row whose id ends on the word $system with no name after it, as an id form this tool does not support, and writes nothing' {
         $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/$system'
         $AddRow = {
             param([string]$T)
@@ -2173,13 +2195,14 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
             $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $Plain).Replace('"Virtual Machines"', '"Service Bus"'))
             $Lines -join "`n"
         }.GetNewClosure()
-        $M = & $script:Masked (& $script:Change @{ 'Consumption_*.csv' = $AddRow })
-        $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
-        $Row = @($Usage | Where-Object { $M.Dict.ResourceIdMap[$_.ResourceId] -ceq $Plain })
-        $Row.Count | Should -Be 1 -Because 'the row is masked, and its masked id maps back to the plain id'
-        $Tok = '(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-        $Row[0].ResourceId | Should -Match ('^/subscriptions/{0}/resourcegroups/{0}/providers/microsoft\.servicebus/namespaces/{0}/\$system\z' -f $Tok) -Because 'every name slot gets a token, and the last type word is kept as a run keeps it'
-        $Row[0].ResourceId.Contains('sbdemo01') | Should -BeFalse
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape("consumption row 1 has an id that ends on the word '`$system' with no name after it ('.../<type>/<name>/`$system'). That is an id form this tool does not support")) -Because 'the stop gives its own reason'
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
+        ($R.Text -join ' ') | Should -Not -Match 'sbdemo01' -Because 'the stop names no id'
+        @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
     }
 
     It 'refuses the report when the masking leaves the name <Kept> of a usage row''s id as written, which the last leak scan cannot find in a text' -ForEach @(

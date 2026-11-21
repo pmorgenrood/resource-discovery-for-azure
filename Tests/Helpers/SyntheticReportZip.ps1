@@ -63,21 +63,17 @@ function Get-RdaTokenPattern
 #                         taken by no switch.)
 #   -AllowMetricFallback  F2: the metric fallback's own sub_/rg_ tokens
 #                         (Extension/Metrics.ps1), until it uses the shared ones.
-#   -AllowTrailingSystemType  a last type word '$system', and no other word,
-#                         after a name token, with no name after it
-#                         ('.../namespaces/<name tok>/$system'): a run keeps a
-#                         last type word as written, and the offline mask takes
-#                         that id (Functions/OfflineObfuscation.Functions.ps1
-#                         says Service Bus bills that form; whether it does is
-#                         with the owner). Downstream would read '$system' as
-#                         such a row's name.
+# No switch takes an id that ends on a type word, '$system' included
+# ('.../namespaces/<name tok>/$system'): that is an id form this tool does not
+# support (the offline mask and the recovery merge refuse it), and its handling
+# is with the owner.
 function Get-RdaContractIdPattern
 {
-    param([switch]$AllowParked, [switch]$AllowMetricFallback, [switch]$AllowTrailingSystemType)
+    param([switch]$AllowParked, [switch]$AllowMetricFallback)
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $P = '(?:prod|nonprod)_'
     $Names = '(?:/[a-z][a-z0-9.]*/' + $P + '(?:databricks_|aks_|vmss_)?' + $Guid + ')+'
-    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names + $(if ($AllowTrailingSystemType) { '(?:/\$system)?' } else { '' })
+    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names
     $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
     if ($AllowParked)
     {
@@ -90,16 +86,13 @@ function Get-RdaContractIdPattern
     return ('(?i)(?:' + ($Shapes -join '|') + ')')
 }
 
-# -AllowTrailingSystemType: a last type word '$system' (and no other word)
-# may follow a name token, as above; by default the id ends in a name token.
+# The id ends in a name token, as above: no switch takes a last type word.
 function Get-RdaMaskedIdPattern
 {
-    param([switch]$AllowTrailingSystemType)
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    $Trailing = if ($AllowTrailingSystemType) { '(?:/\$system)?' } else { '' }
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+' + $Trailing + ')?$'
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+)?$'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a
