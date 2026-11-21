@@ -655,6 +655,49 @@ Describe 'The seed is checked when it is read' {
             $Seed2 = Get-RunDictionaryMaps
         }
     }
+
+    # A tenant-scope id ('/providers/...') has no resource group: a segment 3
+    # 'resourceGroups' in it is a type word, as Test-ObfuscatedIdShape and the seed
+    # check read it, so the name after it gets a name token. Given the group token
+    # of a real group of that name, the seed check would see one token for two real
+    # values and drop it, and the id would change on every seeded run.
+    It 'gives the name after a type word resourceGroups in a tenant-scope id a name token, not a real group''s token, and the next two seeded runs keep it' {
+        $Vm = "/subscriptions/$script:Sub/resourcegroups/grp-a/providers/microsoft.compute/virtualmachines/vm-a"
+        # One held by an inventory row (no group, as Resource Graph gives a tenant-scope row), one by a usage row only.
+        $TenInv = '/providers/Microsoft.Example/resourceGroups/grp-a'
+        $TenUse = '/providers/Microsoft.Other/resourceGroups/grp-a'
+        $Rows = @((New-Res $Vm), [pscustomobject]@{ id = $TenInv; name = 'grp-a'; subscriptionId = ''; resourceGroup = '' })
+        $Seed = @{ ResourceIdMap = @{} }
+        $First = $null
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows $Rows
+            $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
+            # The usage row's id, as Protect-RdaUsageRow masks one: the seeded id, else a new one.
+            if (-not $Ids.ContainsKey($TenUse)) { $Ids[$TenUse] = Get-ObfuscatedResourceId -ResourceId $TenUse }
+            $Now = @{ Vm = $Ids[$Vm]; Inv = $Ids[$TenInv]; Use = $Ids[$TenUse] }
+            $GroupToken = ($Now.Vm -split '/')[4]
+            foreach ($Pair in @(@($TenInv, $Now.Inv), @($TenUse, $Now.Use)))
+            {
+                $Parts = $Pair[1] -split '/'
+                $Parts.Count | Should -Be 5 -Because "run $Run keeps the id's shape"
+                ($Parts[0..3] -join '/') | Should -BeExactly (($Pair[0] -split '/')[0..3] -join '/') -Because 'the provider and type words are kept as written'
+                $Parts[4] | Should -Match ('^' + $script:Token + '$')
+                $Parts[4] | Should -Not -BeExactly $GroupToken -Because "run $Run gives the name its own token, not the token of the real group grp-a"
+                $Parts[4] | Should -BeExactly $Global:ResourceNameDictionary[$Pair[0]] -Because 'the name token is recorded, so the dictionary reverses it'
+                Test-ObfuscatedIdShape -RealId $Pair[0] -MaskedId $Pair[1] | Should -BeTrue -Because "run $Run writes the shape the seed check keeps"
+            }
+            # The tenant-scope row has no group: its group field never takes its name token.
+            $Global:ResourceResourceGroupDictionary[$TenInv] | Should -Not -BeExactly ($Now.Inv -split '/')[4] -Because "run $Run reads a group token only from a subscription id's group slot"
+            $Global:ResourceResourceGroupDictionary[$TenInv] | Should -Not -BeExactly $GroupToken
+            if ($Run -eq 1) { $First = $Now }
+            else
+            {
+                foreach ($K in 'Vm', 'Inv', 'Use') { $Now[$K] | Should -BeExactly $First[$K] -Because "run $Run keeps run 1's id ($K), letter for letter" }
+            }
+            $Seed = Get-RunDictionaryMaps
+        }
+    }
 }
 
 Describe 'The seed''s parent tokens' {

@@ -270,7 +270,11 @@ function Get-ObfuscatedResourceId
         $Masked.Add($Segment)
         if ($i + 1 -ge $Parts.Count) { break }
         $Next = $Parts[$i + 1]
-        if ($i -eq 3 -and $Segment -ieq 'resourcegroups')
+        # A group slot only in a subscription id, as Test-ObfuscatedIdShape and the
+        # seed check read it: in a tenant-scope id ('/providers/...', which starts
+        # at $i = 1) a segment 3 'resourcegroups' is a type word, and the name after
+        # it gets a name token, never the token of a real group of that name.
+        if ($i -eq 3 -and $Segment -ieq 'resourcegroups' -and $Parts[1] -ieq 'subscriptions')
         {
             if (-not $Global:ObfuscationResourceGroupTokens.ContainsKey($Next)) { $Global:ObfuscationResourceGroupTokens[$Next] = (Get-ObfuscationPrefix $Next) + [guid]::NewGuid().ToString() }
             $Masked.Add($Global:ObfuscationResourceGroupTokens[$Next])
@@ -510,7 +514,9 @@ function Add-RdaObfuscationToken
             $ObfuscatedID = $ResourceIdDictionary[$resourceItem.ID]
             $SeedParts = ([string]$ObfuscatedID).Split('/')
             if ($SeedParts.Count -ge 3 -and $SeedParts[1] -ieq 'subscriptions' -and -not [string]::IsNullOrEmpty($SeedParts[2])) { $ObfuscatedSubscription = $SeedParts[2] }
-            if ($SeedParts.Count -ge 5 -and $SeedParts[3] -ieq 'resourcegroups' -and -not [string]::IsNullOrEmpty($SeedParts[4])) { $ObfuscatedResourceGroup = $SeedParts[4] }
+            # A group token only from a subscription id's group slot: in a tenant-scope
+            # id that slot is a name token (Get-ObfuscatedResourceId).
+            if ($SeedParts.Count -ge 5 -and $SeedParts[1] -ieq 'subscriptions' -and $SeedParts[3] -ieq 'resourcegroups' -and -not [string]::IsNullOrEmpty($SeedParts[4])) { $ObfuscatedResourceGroup = $SeedParts[4] }
             if ($SeedParts.Count -ge 2 -and -not [string]::IsNullOrEmpty($SeedParts[-1])) { $ObfuscatedName = $SeedParts[-1] }
             elseif ($ResourceNameDictionary.ContainsKey($resourceItem.ID) -and -not [string]::IsNullOrEmpty($ResourceNameDictionary[$resourceItem.ID])) { $ObfuscatedName = $ResourceNameDictionary[$resourceItem.ID] }
         }
