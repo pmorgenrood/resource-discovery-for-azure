@@ -65,7 +65,7 @@ function Get-RdaTokenPattern
 #                         (Extension/Metrics.ps1), until it uses the shared ones.
 # No switch takes an id that ends on a type word, '$system' included
 # ('.../namespaces/<name tok>/$system'): that is an id form this tool does not
-# support (the offline mask and the recovery merge refuse it), and its handling
+# support (the offline mask refuses it), and its handling
 # is with the owner.
 function Get-RdaContractIdPattern
 {

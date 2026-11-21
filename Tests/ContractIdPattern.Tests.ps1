@@ -34,7 +34,7 @@ BeforeAll {
         # would write this one for a billed '.../namespaces/<namespace>/$system'.
         # No captured billing row shows that form, and downstream reads the last
         # segment as the name: it is an id form this tool does not support (the
-        # offline mask and the recovery merge refuse it), and no pattern takes it.
+        # offline mask refuses it), and no pattern takes it.
         TypeSystem   = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$system"
         TypeOther    = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/topics"
         TypeSystemX  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$systemx"
