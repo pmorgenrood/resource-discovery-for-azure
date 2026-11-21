@@ -1201,8 +1201,12 @@ function Test-RdaMaskedSlot
                 # Get-RdaRealValueSet reads an id): in an extension id
                 # ('.../<name>/providers/microsoft.insights/<type>/<name>') the namespace after
                 # the second one is Azure's word, not a name. A name 'providers' is a name.
+                # 'subscriptions' is the path's word only at segment 1, and 'resourcegroups' only
+                # at segment 3 of a subscription id, as the run reads a group slot
+                # (Get-ObfuscatedResourceId): a name that is either word (a storage account may be
+                # named so) is a name. After a namespace either word is a type word, read below.
                 if (($i % 2) -eq 1 -and $Seg -ieq 'providers') { $Providers = $i; continue }
-                if ($Seg -in 'subscriptions', 'resourcegroups') { continue }
+                if (($i -eq 1 -and $Seg -ieq 'subscriptions') -or ($i -eq 3 -and $Seg -ieq 'resourcegroups' -and $Segments[1] -ieq 'subscriptions')) { continue }
                 # After providers: the namespace (1), then type words (2, 4, ...) between the names (3, 5, ...).
                 if ($Providers -ge 0 -and $i -gt $Providers -and (($i - $Providers) -eq 1 -or (($i - $Providers) % 2) -eq 0)) { continue }
                 if (@($Seg -split '[-_.]' | Where-Object { $_ -ne '' -and $RealValue.Contains($_) }).Count -gt 0 -or $RealValue.Contains($Seg)) { [void]$Bad.Add($F); break }

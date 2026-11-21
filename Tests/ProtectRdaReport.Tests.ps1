@@ -494,6 +494,28 @@ Describe 'The masked-field check, the real values and the exempt words' {
             # A 'providers' in a word place still starts the count again: an extension id's
             # namespace and type after it are Azure's words.
             Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/providers/microsoft.insights/diagnosticsettings/$Tok" } -Field 'ID' -RealValue $Set | Should -BeNullOrEmpty
+            # A name can be the word 'subscriptions' or 'resourcegroups' too (a storage account may be
+            # named so). Only a 'subscriptions' at segment 1 and a 'resourcegroups' at segment 3 of a
+            # subscription id are the path's own words, as the run reads them; one in a name place is a name.
+            foreach ($Word in 'subscriptions', 'resourcegroups')
+            {
+                $WordReal = "/subscriptions/33333333-3333-3333-3333-333333333333/resourcegroups/rg-st-01/providers/microsoft.storage/storageaccounts/$Word/blobservices/default"
+                if ($Source -like '*dictionaries')
+                {
+                    $WordIds = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                    $WordIds[$WordReal] = 'masked'
+                    Set-Variable -Scope Global -Name ResourceIdDictionary -Value $WordIds
+                    $WordSet = Get-RdaRealValueSet
+                }
+                else { $WordSet = Get-RdaRealValueSet -ExtraValue $WordReal }
+                $WordSet.Contains($Word) | Should -BeTrue -Because "$Word is a name in that id"
+                Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/$Tok" } -Field 'ID' -RealValue $WordSet | Should -BeNullOrEmpty -Because "the masked id holds tokens only, and its own $Word word is in its place"
+                Test-RdaMaskedSlot -Row @{ ID = "$Base/$Word/blobservices/$Tok" } -Field 'ID' -RealValue $WordSet | Should -Be @('ID') -Because "the account's name $Word was left"
+                Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/default" } -Field 'ID' -RealValue $WordSet | Should -Be @('ID') -Because 'the name after it was left'
+                Test-RdaMaskedSlot -Row @{ ID = "$Base/$Word/blobservices/default" } -Field 'ID' -RealValue $WordSet | Should -Be @('ID') -Because 'both names were left'
+                # In a tenant-scope id the same word after a namespace is a type word.
+                Test-RdaMaskedSlot -Row @{ ID = "/providers/microsoft.example/$Word/$Tok" } -Field 'ID' -RealValue $WordSet | Should -BeNullOrEmpty -Because "$Word is a type word there"
+            }
         }
         finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
     }
