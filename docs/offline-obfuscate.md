@@ -69,7 +69,8 @@ holds plain copies of the report, so delete it.
   docs/obfuscation-and-unmask.md); its keys can come out in another order, as the plain report is read without
   their order. Nothing reads the field or the order.
 - Like a `-Obfuscate` run, it copies the words Azure writes in fields no run masks (a size, a region, an id's
-  provider and type words such as `microsoft.compute/virtualmachines`). It checks those words have Azure's form.
+  provider and type words such as `microsoft.compute/virtualmachines`). It checks those words have Azure's form,
+  in a `/subscriptions/...` id and in a tenant-scope id whose path a run keeps (`/providers/<namespace>/<type>/<name>...`).
   An id whose last segment is the word `$system` with no name after it (`.../namespaces/<namespace>/$system`)
   is refused like any other word that is not of that form: it is an id form this tool does not support. No
   fixture or captured billing row shows Azure billing it, and downstream reads an id's last segment as the

@@ -707,6 +707,23 @@ Describe 'Names and types are kept as a run writes them' {
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/topics' | Should -BeTrue -Because 'a last type word of Azure''s form is still taken'
     }
 
+    # A run keeps the path of a tenant-scope id that Test-RdaTenantScopeIdMaskable takes
+    # ('/providers/<namespace>/<type>/<name>...'), with its namespace and type words as
+    # written, so the path word check reads those words too, from segment 1 on.
+    It 'reads the namespace and type words of a tenant-scope id a run masks part by part, from segment 1 on: <Id>' -ForEach @(
+        @{ Id = '/providers/Microsoft.Capacity/Contoso-Secret-Word/r-1'; Want = $false }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/r-1/contoso-secret/r-2'; Want = $false }
+        @{ Id = '/providers/contoso-secret/reservationorders/r-1'; Want = $false }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/r-1/providers/contoso_secret/x/y'; Want = $false }
+        @{ Id = '/providers/Microsoft.Management/managementGroups/mg-1'; Want = $true }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/r-1/reservations/r-2'; Want = $true }
+        @{ Id = '/providers/Microsoft.Authorization/roleDefinitions/r-1/providers/Microsoft.Insights/diagnosticSettings/d-1'; Want = $true }
+        @{ Id = '/providers/microsoft.capacity/reservationorders/providers/reservations/r-2'; Want = $true }
+        @{ Id = '/providers/Microsoft.Capacity/Contoso-Secret-Word'; Want = $true }
+    ) {
+        Test-RdaIdPathWord $Id | Should -Be $Want -Because $(if (-not (Test-RdaTenantScopeIdMaskable -ResourceId $Id)) { 'a run writes this id as one flat token, which keeps none of its words' } elseif ($Want) { 'every namespace and type word is of Azure''s form' } else { 'a run would keep a word that is not of Azure''s form as written' })
+    }
+
     It 'reads an id as ending on the word $system only when that is its last segment with no name after it: <Id>' -ForEach @(
         @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system'; Want = $true }
         @{ Id = '/subscriptions/prod_x/resourcegroups/prod_y/providers/microsoft.servicebus/namespaces/prod_z/$SYSTEM'; Want = $true }
@@ -2353,6 +2370,28 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         ($R.Text -join ' ') | Should -Match ([regex]::Escape("consumption row 1 has an id that ends on a type word with no name after it ('.../<type>/<name>/<type>'). That is an id form this tool does not support")) -Because 'the stop gives its own reason'
         ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
         ($R.Text -join ' ') | Should -Not -Match $Name -Because 'the stop names no id'
+        @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
+    }
+
+    # A run keeps the namespace and type words of a tenant-scope id it masks part by part
+    # ('/providers/<namespace>/<type>/<name>'). A usage row whose type word is not of Azure's
+    # form would be shared with that word as written, so the mask stops on it and writes nothing.
+    It 'refuses a usage row whose tenant-scope id has a type word that is not of Azure''s form, and writes nothing' {
+        $script:TenantPlain = '/providers/Microsoft.Capacity/Contoso-Secret-Word/r-1'
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $script:TenantPlain).Replace('"Virtual Machines"', '"Reservations"'))
+            $Lines -join "`n"
+        }
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape('consumption row 1 has an id whose provider or type is not as Azure writes one. Nothing was written.')) -Because 'the path word check stops on it'
+        ($R.Text -join ' ') | Should -Not -Match 'Contoso-Secret-Word' -Because 'the stop names no id'
         @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
     }
 

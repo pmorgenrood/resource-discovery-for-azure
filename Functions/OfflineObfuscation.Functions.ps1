@@ -2115,11 +2115,15 @@ function Publish-RdaOfflineOutput
     }
 }
 
-# True when every segment the id masking keeps as written (Get-ObfuscatedResourceId: from
-# index 3, each odd segment, and the segment after 'providers') is in the form Azure writes
-# such words: a namespace (microsoft.compute, 84codes.cloudamqp) after 'providers', a type
-# word (virtualmachines) elsewhere. Names are masked and not looked at; an id that is not
-# '/subscriptions/<id>/...' is masked whole (a flat token) and keeps nothing.
+# True when every segment the id masking keeps as written (Get-ObfuscatedResourceId: each odd
+# segment, and the segment after 'providers') is in the form Azure writes such words: a
+# namespace (microsoft.compute, 84codes.cloudamqp) after 'providers', a type word
+# (virtualmachines) elsewhere. In a '/subscriptions/<id>/...' id the words are read from
+# index 3 on. A tenant-scope id that Test-RdaTenantScopeIdMaskable takes
+# ('/providers/<namespace>/<type>/<name>...') keeps its path, its namespace and type words
+# as written, so its words are read from index 1 on: 'providers', its dotted namespace, then
+# each type word. Names are masked and not looked at; any other id is masked whole (a flat
+# token) and keeps nothing.
 # shortcut: these words are Azure's, copied unmasked as a run copies them, like a Size. A
 # letters-and-digits word that is a real name passes here; the leak scan still finds it when
 # it is a report value it looks for (5 characters or more, and 12 or more or holding a digit,
@@ -2134,8 +2138,10 @@ function Publish-RdaOfflineOutput
 function Test-RdaIdPathWord([string]$Id)
 {
     $Parts = $Id.Split('/')
-    if ($Parts.Count -lt 3 -or $Parts[0] -ne '' -or $Parts[1] -ine 'subscriptions' -or [string]::IsNullOrEmpty($Parts[2])) { return $true }
-    for ($I = 3; $I -lt $Parts.Count; $I += 2)
+    if ($Parts.Count -ge 3 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'subscriptions' -and -not [string]::IsNullOrEmpty($Parts[2])) { $Start = 3 }
+    elseif (Test-RdaTenantScopeIdMaskable -ResourceId $Id) { $Start = 1 }
+    else { return $true }
+    for ($I = $Start; $I -lt $Parts.Count; $I += 2)
     {
         $Segment = $Parts[$I]
         if ($Segment -notmatch '^[A-Za-z][A-Za-z0-9]*\z') { return $false }
