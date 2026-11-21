@@ -89,8 +89,9 @@ holds plain copies of the report, so delete it.
   control characters only, so `caf\u00e9` written by another tool is not read as the letter) and with a space written
   as `+`. Each level of decoding is read on its own, so a value that reads plain at one level only is found. Limit: an escape of a byte that is no UTF-8 character (`%A0`, a Latin-1 form) stays as written,
   so a value glued to it is not found in that reading; Azure writes UTF-8.
-- Any full id (`/subscriptions/...`, with or without its first `/`, or URL-encoded) in any field of the plain report,
-  a field no rule masks too, is a real value:
+- Any full id (`/subscriptions/...`, or a tenant-scope `/providers/<namespace>/<type>/<name>...` such as a management
+  group or a reservation, with or without its first `/`, or URL-encoded) in any field of the plain report or any
+  consumption cell, a field no rule masks too, is a real value:
   its subscription, group and name parts must not be in the masked report, or it is refused.
 - A record of a subscription the report names nowhere (no display name on any record, and none on the page) is
   refused: the run's token loop would not give its id a token, so the id could not keep its ARM shape.

@@ -502,23 +502,36 @@ function ConvertFrom-RdaUrlEscape([string]$Text)
     return $Text
 }
 
-# Every full id ('/subscriptions/...', with or without its first '/', or URL-encoded) in
-# any text inside $Value (strings, dictionaries and lists, walked with a stack, not by
-# recursion: a metric series holds hundreds of numbers per record, which are skipped).
-# An id ends at whitespace, a quote or a mark no id holds (<>,;|[]{}?#&=), or at a ')'
-# with no '(' of its own (a group name may hold both).
+# The form of a full id inside a text: a '/subscriptions/...' path, or a tenant-scope path
+# ('/providers/<namespace>/<type>/<name>...', a management group or a reservation, which has
+# no subscription), each with or without its first '/'. The namespace is Azure's dotted
+# word and the type has a name after it, so the word 'providers' alone, or a provider path
+# with no name, is not an id. One pattern with both forms, so the '/providers/...' part of a
+# subscription id is read in that id, not again as an id of its own. An id ends at
+# whitespace, a quote or a mark no id holds (<>,;|[]{}?#&=).
+function Get-RdaFullIdPattern
+{
+    return '(?i)(?<![A-Za-z0-9_])/?(?:subscriptions/[^\s"''<>,;|\[\]{}?#&=]+|providers/[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+/[^/\s"''<>,;|\[\]{}?#&=]+/[^\s"''<>,;|\[\]{}?#&=]+)'
+}
+
+# Every full id (Get-RdaFullIdPattern: '/subscriptions/...' or '/providers/...', with or
+# without its first '/', or URL-encoded) in any text inside $Value (strings, dictionaries and
+# lists, walked with a stack, not by recursion: a metric series holds hundreds of numbers per
+# record, which are skipped). An id also ends at a ')' with no '(' of its own (a group name
+# may hold both).
 function Get-RdaFullIdInValue
 {
     param($Value)
     $Ids = [System.Collections.Generic.List[string]]::new()
     $Stack = [System.Collections.Generic.Stack[object]]::new()
     $Stack.Push($Value)
+    $Pattern = Get-RdaFullIdPattern
     while ($Stack.Count -gt 0)
     {
         $V = $Stack.Pop()
         if ($V -is [string])
         {
-            if ($V.IndexOf('subscriptions', [StringComparison]::OrdinalIgnoreCase) -lt 0 -and $V.IndexOf('%') -lt 0) { continue }
+            if ($V.IndexOf('subscriptions', [StringComparison]::OrdinalIgnoreCase) -lt 0 -and $V.IndexOf('providers', [StringComparison]::OrdinalIgnoreCase) -lt 0 -and $V.IndexOf('%') -lt 0) { continue }
             # The text as is, and each level of it decoded until nothing changes (at most 32, as the leak scan).
             $Texts = [System.Collections.Generic.List[string]]::new()
             $Texts.Add($V)
@@ -526,7 +539,7 @@ function Get-RdaFullIdInValue
             for ($i = 0; $i -lt 32 -and $D.IndexOf('%') -ge 0; $i++) { $Next = [uri]::UnescapeDataString($D); if ($Next -ceq $D) { break }; $D = $Next; $Texts.Add($D) }
             foreach ($Text in $Texts)
             {
-                foreach ($M in [regex]::Matches($Text, '(?i)(?<![A-Za-z0-9_])/?subscriptions/[^\s"''<>,;|\[\]{}?#&=]+'))
+                foreach ($M in [regex]::Matches($Text, $Pattern))
                 {
                     # A group name may hold '(' and ')'; a ')' with no '(' of its own closes the text around the id.
                     $Id = $M.Value
@@ -1962,11 +1975,12 @@ function Test-RdaMetricRecordShape
 }
 
 # An id or a GUID is never one of Azure's words: a value holding one (a planted id in a
-# field no one masks), URL-encoded too, is scanned like any text.
+# field no one masks, a tenant-scope id too: Get-RdaFullIdPattern), URL-encoded too, is
+# scanned like any text.
 function Test-RdaAzureWordCandidate([string]$Text)
 {
     $Plain = ConvertFrom-RdaUrlEscape $Text
-    $Text -match '[a-z]' -and $Plain -notmatch '(?i)/subscriptions/|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $Text -match '[a-z]' -and $Plain -notmatch '(?i)/subscriptions/|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' -and $Plain -notmatch (Get-RdaFullIdPattern)
 }
 
 # Adds to $Exempt (Test-RdaMaskedOutputLeak) the values a plain report holds in fields

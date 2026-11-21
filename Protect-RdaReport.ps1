@@ -443,8 +443,9 @@ try
         }
         foreach ($MObj in $Metrics.Values) { foreach ($Rec in @($MObj['Metrics'])) { if ($Rec -is [hashtable]) { & $AddTokenRow ([string]$Rec['ID']) $null $null } } }
         # Any full id in any field of the plain report, a field no rule masks too (an id no
-        # row holds): its subscription, group and name parts are real values the masked
-        # report must not hold (Get-RdaRealValueSet splits it), so the leak scan finds it.
+        # row holds, a tenant-scope id too): its subscription, group and name parts are real
+        # values the masked report must not hold (Get-RdaRealValueSet splits it), so the leak
+        # scan finds it.
         # A Databricks workspace's managed group, masked by the row masking with no
         # field rule: its plain name must not be in the masked report either.
         if ($Rows.ContainsKey('Databricks')) { foreach ($Row in $Rows['Databricks']) { $V = [string]$Row['ManagedResourceGroup']; if ($V -notin @('', 'obfuscated')) { $ExtraReal.Add($V) } } }
@@ -625,8 +626,9 @@ try
                 $Unmasked = @(foreach ($P in $UsageRow.PSObject.Properties) { if ($P.Name -notin 'InstanceData', 'ResourceId', 'ReservationId', 'ReservationOrderId') { [string]$P.Value } }) + @(foreach ($P in $Instance.'Microsoft.Resources'.additionalInfo.PSObject.Properties) { [string]$P.Value })
                 foreach ($V in $Unmasked)
                 {
-                    # A full id in any form (with or without its first '/', URL-encoded): its parts are real values.
-                    $CellIds = if ($V.IndexOf('%') -ge 0 -or $V.IndexOf('subscriptions', [StringComparison]::OrdinalIgnoreCase) -ge 0) { @(Get-RdaFullIdInValue -Value $V) } else { @() }
+                    # A full id in any form ('/subscriptions/...' or a tenant-scope '/providers/...',
+                    # with or without its first '/', URL-encoded): its parts are real values.
+                    $CellIds = if ($V.IndexOf('%') -ge 0 -or $V.IndexOf('subscriptions', [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $V.IndexOf('providers', [StringComparison]::OrdinalIgnoreCase) -ge 0) { @(Get-RdaFullIdInValue -Value $V) } else { @() }
                     if ($CellIds.Count -gt 0) { $ExtraReal.AddRange([string[]]$CellIds) }
                     elseif (-not $Exempt.Contains($V) -and (Test-RdaAzureWordCandidate $V)) { [void]$Exempt.Add($V) }
                 }

@@ -1787,6 +1787,38 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
         @(Get-ChildItem -LiteralPath $Given -Force).Count | Should -Be 0
         ($R.Text -join "`n") | Should -Not -Match 'rg-demo|vm-web-01|12345678-1234' -Because 'the message names no real value'
     }
+
+    # A tenant-scope id ('/providers/<namespace>/<type>/<name>...': a management group, a
+    # reservation) has no subscription: its name parts are real values all the same, and a
+    # field or cell no one masks keeps them as written, so the report is refused.
+    It 'refuses a tenant-scope id no row holds, <Case>, exit 1, leaving no output folder' -ForEach @(
+        @{ Case = 'planted in a field no rule masks'; Kind = 'inventory'; Secret = 'mg-secret-77' }
+        @{ Case = 'URL-encoded, in a field no rule masks'; Kind = 'inventory-encoded'; Secret = 'mg-secret-78' }
+        @{ Case = 'without its first slash, in a URL in a field no rule masks'; Kind = 'inventory-url'; Secret = 'mg-secret-81' }
+        @{ Case = 'of a reservation, planted in a metric record'; Kind = 'metric'; Secret = 'order-secret-79' }
+        @{ Case = 'in a consumption cell no one masks'; Kind = 'usage'; Secret = 'mg-secret-80' }
+        @{ Case = 'URL-encoded, in a consumption cell no one masks'; Kind = 'usage-encoded'; Secret = 'mg-secret-82' }
+    ) {
+        $Mg = "/providers/Microsoft.Management/managementGroups/$Secret"
+        $script:TenantText = switch ($Kind)
+        {
+            'inventory' { $Mg }
+            'inventory-encoded' { 'https://h/x?scope=' + [uri]::EscapeDataString($Mg) }
+            'inventory-url' { "https://management.azure.com$($Mg)?api-version=2020-05-01" }
+            'metric' { "see /providers/Microsoft.Capacity/reservationOrders/$Secret/reservations/res-secret-79 now" }
+            'usage' { $Mg }
+            'usage-encoded' { 'https://h/x?scope=' + [uri]::EscapeDataString($Mg) }
+        }
+        $In = if ($Kind -like 'inventory*') { & $script:Planted 'Inventory_*.json' { param($T) $New = $T -replace '"OSDisk":"[^"]*"', ('"OSDisk":"{0}"' -f $script:TenantText); if ($New -ceq $T) { throw 'no OSDisk was changed' }; $New } }
+        elseif ($Kind -eq 'metric') { & $script:Planted 'Metrics_*.json' { param($T) $Mx = ConvertFrom-RdaJsonText -Text $T; $Mx['Metrics'][0]['Metric'] = $script:TenantText; ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress } }
+        else { & $script:Planted 'Consumption_*.csv' { param($T) $New = ([regex]'""ImageType"":""[^"]*""').Replace($T, ('""ImageType"":""{0}""' -f $script:TenantText), 1); if ($New -ceq $T) { throw 'no consumption cell was changed' }; $New } }
+        $Out = Join-Path $script:Work ('out-tenant-' + $Kind)
+        $R = script:Invoke-Protect -Path $In -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join "`n") | Should -Match ([regex]::Escape('real name or id is still in'))
+        ($R.Text -join "`n") | Should -Not -Match $Secret -Because 'the message names no real value'
+        Test-Path -LiteralPath $Out | Should -BeFalse
+    }
 }
 
 Describe 'Protect-RdaReport.ps1 takes a consolidated zip, an unzipped one, and a report with no record' {
@@ -2724,6 +2756,36 @@ Describe 'Get-RdaFullIdInValue' {
         $Watch = [System.Diagnostics.Stopwatch]::StartNew()
         @(Get-RdaFullIdInValue -Value $Records).Count | Should -Be 1000
         $Watch.Elapsed.TotalSeconds | Should -BeLessThan 5
+    }
+
+    # A tenant-scope id ('/providers/<namespace>/<type>/<name>...': a management group, a
+    # reservation) has no subscription, so it is found by its own form, in the same forms.
+    It 'finds a tenant-scope id in any text inside a value, in each form, and not the provider part of a subscription id again' {
+        $Mg = '/providers/Microsoft.Management/managementGroups/mg-secret-01'
+        $Res = '/providers/Microsoft.Capacity/reservationOrders/order-01/reservations/res-01'
+        $Value = @{ A = "($Mg)"; B = @("u=https://management.azure.com$($Res)?api-version=1", 7, $null); C = @{ D = [uri]::EscapeDataString($Mg) }; E = $Res.Substring(1) + '#frag' }
+        $Found = @(Get-RdaFullIdInValue -Value $Value)
+        $Found.Count | Should -Be 4
+        @($Found | Sort-Object -Unique) | Should -Be @($Res, $Mg)
+        $Twice = $Mg; for ($k = 0; $k -lt 3; $k++) { $Twice = [uri]::EscapeDataString($Twice) }
+        @(Get-RdaFullIdInValue -Value @($Twice)) | Should -Contain $Mg
+        @(Get-RdaFullIdInValue -Value @{ Scopes = @{ $Mg = @{} } }) | Should -Contain $Mg -Because 'an id used as a key'
+        # A subscription id is found once, whole: the '/providers/...' part inside it is not a second id.
+        $Sub = '/subscriptions/0fa1c2d3-0000-4000-8000-00000000abcd/resourcegroups/rg(1)/providers/microsoft.compute/virtualmachines/vm-x/providers/microsoft.insights/diagnosticsettings/ds-x'
+        @(Get-RdaFullIdInValue -Value @("see $Sub and $Mg")) | Should -Be @($Sub, $Mg)
+        # A text with the word only, or a provider path with no name, holds no id.
+        @(Get-RdaFullIdInValue -Value @('the providers/vendors list', '/providers/Microsoft.Insights/metricDefinitions', 'providers')).Count | Should -Be 0
+    }
+}
+
+Describe 'Test-RdaAzureWordCandidate' {
+    It 'takes no value that holds a tenant-scope id, in any form, as one of Azure''s words' {
+        foreach ($V in '/providers/Microsoft.Management/managementGroups/mg-secret-01', ('https://h/x?scope=' + [uri]::EscapeDataString('/providers/Microsoft.Management/managementGroups/mg-secret-01')), 'https://management.azure.com/providers/Microsoft.Capacity/reservationOrders/order-01?api-version=1')
+        {
+            Test-RdaAzureWordCandidate $V | Should -BeFalse -Because $V
+        }
+        Test-RdaAzureWordCandidate 'Standard_D2s_v3' | Should -BeTrue -Because 'a SKU is Azure''s word'
+        Test-RdaAzureWordCandidate '/providers/Microsoft.Insights/metricDefinitions' | Should -BeTrue -Because 'a provider path with no name holds no id'
     }
 }
 
