@@ -1679,3 +1679,116 @@ Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.p
         $LASTEXITCODE | Should -Not -Be 0 -Because $Because
     }
 }
+
+# A folder name can hold [ or ], which -Path reads as a wildcard: '[ab]' matches
+# one 'a' or 'b'. Reveal finds, reads and writes the report zip, the dictionary,
+# the folder it searches for the dictionary, its temp folder and the files in it
+# by their literal paths.
+Describe 'Reveal with report, dictionary, search and temp folders whose paths hold [ and ]' {
+    BeforeAll {
+        # A dictionary that maps the fixture's resource group and tag tokens to the values given.
+        function script:Write-BracketDictionary([string]$Path, [string]$RgName, [string]$TagValue)
+        {
+            $Text = [ordered]@{
+                GeneratedAt      = '2026-06-30 00:00:00'
+                ResourceGroupMap = [ordered]@{ $script:TokRg = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/$RgName/providers/Microsoft.Compute/virtualMachines/vm01" }
+                TagMap           = [ordered]@{ $script:TokTag = $TagValue }
+            } | ConvertTo-Json -Depth 6
+            [System.IO.File]::WriteAllText($Path, $Text)
+        }
+        # The first VM's resource group and tag value, and the members' text, in a revealed zip.
+        function script:Read-BracketReveal([string]$Zip)
+        {
+            $Ex = Join-Path $script:TmpDir ('bex_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            Expand-Archive -LiteralPath $Zip -DestinationPath $Ex -Force
+            $Vm = ([System.IO.File]::ReadAllText((Join-Path $Ex 'Inventory_Test.json')) | ConvertFrom-Json).VirtualMachines[0]
+            [pscustomobject]@{
+                ResourceGroup = $Vm.ResourceGroup
+                Tag           = $Vm.Tags[0].Value
+                CsvRow        = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_Test.csv'))[0]
+                Html          = [System.IO.File]::ReadAllText((Join-Path $Ex 'ResourcesReport_Test.html'))
+            }
+        }
+        function script:New-BracketId { [guid]::NewGuid().ToString('N').Substring(0, 8) }
+    }
+
+    It 'reads the report zip and the dictionary in such a folder, and writes the revealed zip next to them in place of a partial zip left there' {
+        $Dir = Join-Path $script:TmpDir ('rep [ab] ' + (script:New-BracketId))
+        [System.IO.Directory]::CreateDirectory($Dir) | Out-Null
+        $Zip = Join-Path $Dir 'ResourcesReport_Test.zip'
+        [System.IO.File]::Copy($script:InputZip, $Zip)
+        $Dict = Join-Path $Dir 'ObfuscationDictionary_Test.json'
+        script:Write-BracketDictionary -Path $Dict -RgName 'rg-bracket' -TagValue 'tag-bracket'
+        $Out = Join-Path $Dir 'ResourcesReport_Test_revealed.zip'
+        $Partial = Join-Path $Dir 'ResourcesReport_Test_revealed.partial.zip'
+        [System.IO.File]::WriteAllText($Partial, 'left by a run that was stopped')
+
+        & $script:RevealScript -InputZip $Zip -DictionaryPath $Dict -Fields ResourceGroup, Tag *>&1 | Out-Null
+
+        [System.IO.File]::Exists($Out) | Should -BeTrue -Because 'with no -OutputZip the revealed zip is written next to the input'
+        [System.IO.File]::Exists($Partial) | Should -BeFalse -Because 'the partial zip a stopped run left is replaced, then renamed to the final name'
+        $R = script:Read-BracketReveal $Out
+        $R.ResourceGroup | Should -BeExactly 'rg-bracket'
+        $R.Tag | Should -BeExactly 'tag-bracket'
+    }
+
+    It 'finds the dictionary in a -SearchDirectory whose name holds [ and ]' {
+        $Id = script:New-BracketId
+        $Search = Join-Path $script:TmpDir ("dicts[ab] $Id")
+        $Decoy = Join-Path $script:TmpDir ("dictsa $Id")
+        [System.IO.Directory]::CreateDirectory($Search) | Out-Null
+        [System.IO.Directory]::CreateDirectory($Decoy) | Out-Null
+        script:Write-BracketDictionary -Path (Join-Path $Search 'ObfuscationDictionary_Test.json') -RgName 'rg-searched' -TagValue 'tag-searched'
+        script:Write-BracketDictionary -Path (Join-Path $Decoy 'ObfuscationDictionary_Test.json') -RgName 'rg-decoy' -TagValue 'tag-decoy'
+        $Out = Join-Path $script:TmpDir ("bout_$Id.zip")
+
+        & $script:RevealScript -InputZip $script:InputZip -SearchDirectory $Search -Fields ResourceGroup, Tag -OutputZip $Out *>&1 | Out-Null
+
+        $R = script:Read-BracketReveal $Out
+        $R.ResourceGroup | Should -BeExactly 'rg-searched' -Because 'the dictionary is the one in the folder named, not one in a folder its name matches as a wildcard'
+        $R.Tag | Should -BeExactly 'tag-searched'
+    }
+
+    It 'reads the -DictionaryPath it is given, not a file at a path its name matches as a wildcard' {
+        $Id = script:New-BracketId
+        $DictDir = Join-Path $script:TmpDir ("dict[ab] $Id")
+        $Decoy = Join-Path $script:TmpDir ("dicta $Id")
+        [System.IO.Directory]::CreateDirectory($DictDir) | Out-Null
+        [System.IO.Directory]::CreateDirectory($Decoy) | Out-Null
+        $Dict = Join-Path $DictDir 'ObfuscationDictionary_Test.json'
+        script:Write-BracketDictionary -Path $Dict -RgName 'rg-given' -TagValue 'tag-given'
+        script:Write-BracketDictionary -Path (Join-Path $Decoy 'ObfuscationDictionary_Test.json') -RgName 'rg-decoy' -TagValue 'tag-decoy'
+        $Out = Join-Path $script:TmpDir ("bout_$Id.zip")
+
+        & $script:RevealScript -InputZip $script:InputZip -DictionaryPath $Dict -Fields ResourceGroup, Tag -OutputZip $Out *>&1 | Out-Null
+
+        $R = script:Read-BracketReveal $Out
+        $R.ResourceGroup | Should -BeExactly 'rg-given'
+        $R.Tag | Should -BeExactly 'tag-given'
+    }
+
+    It 'reveals every member file, and removes its temp folder, when the temp path holds [ and ]' {
+        $Id = script:New-BracketId
+        $Tmp = Join-Path $script:TmpDir ("tmp [ab] $Id")
+        [System.IO.Directory]::CreateDirectory($Tmp) | Out-Null
+        $Out = Join-Path $script:TmpDir ("bout_$Id.zip")
+        $Saved = @{ TMPDIR = $env:TMPDIR; TMP = $env:TMP; TEMP = $env:TEMP }
+        try
+        {
+            $env:TMPDIR = $Tmp; $env:TMP = $Tmp; $env:TEMP = $Tmp
+            [System.IO.Path]::GetTempPath().TrimEnd([System.IO.Path]::DirectorySeparatorChar) | Should -BeExactly $Tmp -Because 'the reveal makes its temp folder here'
+            & $script:RevealScript -InputZip $script:InputZip -DictionaryPath $script:DictPath -Fields ResourceGroup, Subscription, Tag -OutputZip $Out *>&1 | Out-Null
+        }
+        finally
+        {
+            $env:TMPDIR = $Saved.TMPDIR; $env:TMP = $Saved.TMP; $env:TEMP = $Saved.TEMP
+        }
+
+        $R = script:Read-BracketReveal $Out
+        $R.ResourceGroup | Should -BeExactly $script:RealRgName -Because 'the inventory member is revealed'
+        $R.Tag | Should -BeExactly $script:RealTagVal
+        $R.CsvRow.Subscription | Should -BeExactly $script:RealSubName -Because 'the consumption member is revealed'
+        $R.Html | Should -BeLike ('*<td>{0}</td>*' -f [WildcardPattern]::Escape([System.Net.WebUtility]::HtmlEncode($script:RealSubName))) -Because 'the HTML member is revealed'
+        @([System.IO.Directory]::GetDirectories($Tmp, 'Reveal_*')) | Should -BeNullOrEmpty -Because 'the temp folder is removed after the reveal'
+    }
+}
