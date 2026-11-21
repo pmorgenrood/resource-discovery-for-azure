@@ -592,10 +592,15 @@ try
                 if (Test-RdaTrailingSystemTypeId ([string]$UsageRow.ResourceId)) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id that ends on the word '`$system' with no name after it ('.../<type>/<name>/`$system'). That is an id form this tool does not support: no Azure billing row seen so far has it, and downstream would read '`$system' as the resource's name. Ask the owner of this tool how to handle it. Nothing was written." -f $ReportZip.Name, $RowIndex) }
                 # The id masking keeps an id's provider and type words: they must be Azure's.
                 if (-not (Test-RdaIdPathWord ([string]$UsageRow.ResourceId))) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id whose provider or type is not as Azure writes one. Nothing was written." -f $ReportZip.Name, $RowIndex) }
-                # A subscription id that ends on a type word with no name after it is a form this
-                # tool does not support either (Test-RdaTrailingTypeWordId): refused with its own
-                # reason, as masking the report again would stop here again.
-                if (Test-RdaTrailingTypeWordId ([string]$UsageRow.ResourceId)) { Stop-RdaOfflineMask ("{0}: consumption row {1} has an id that ends on a type word with no name after it ('.../<type>/<name>/<type>'). That is an id form this tool does not support: no Azure billing row seen so far has it, and downstream would read that word as the resource's name. Ask the owner of this tool how to handle it. Nothing was written." -f $ReportZip.Name, $RowIndex) }
+                # A subscription id that ends on a type word, or on a provider namespace, with no
+                # name after it is a form this tool does not support either
+                # (Test-RdaTrailingTypeWordId): refused with its own reason, as masking the report
+                # again would stop here again. An odd number of segments is the namespace form.
+                if (Test-RdaTrailingTypeWordId ([string]$UsageRow.ResourceId))
+                {
+                    $EndsOn = if ((([string]$UsageRow.ResourceId).Split('/').Count % 2) -eq 1) { "a provider namespace with no type or name after it ('.../providers/<namespace>')" } else { "a type word with no name after it ('.../<type>/<name>/<type>')" }
+                    Stop-RdaOfflineMask ("{0}: consumption row {1} has an id that ends on {2}. That is an id form this tool does not support: no Azure billing row seen so far has it, and downstream would read that word as the resource's name. Ask the owner of this tool how to handle it. Nothing was written." -f $ReportZip.Name, $RowIndex, $EndsOn)
+                }
                 # One cell that cannot be read makes the whole file unusable: the quantity a number
                 # with a dot (as PowerShell writes one), the times as the run writes them
                 # ('M/d/yyyy h:mm:ss tt', invariant) or in ISO form.

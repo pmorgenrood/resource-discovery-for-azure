@@ -1222,8 +1222,8 @@ function Test-RdaMaskedSlot
 # name '$system', or a short name of letters only, neither of which the last leak scan
 # looks for inside a text. An id that ends on the word '$system' with no name after it
 # fails too (Test-RdaTrailingSystemTypeId), and so does a subscription id that ends on any
-# other type word with no name after it (Test-RdaTrailingTypeWordId): this tool does not
-# support those forms.
+# other type word, or on a provider namespace, with no name after it
+# (Test-RdaTrailingTypeWordId): this tool does not support those forms.
 # Apart from that shape check, which mirrors the run's masking, every name slot of a
 # masked path must differ, in any case, from the plain id's segment there (the
 # subscription, the group and every name; the namespace and type words are kept): a
@@ -1236,8 +1236,9 @@ function Test-RdaMaskedUsageId
     if ($PlainId -match '(?i)^/subscriptions/[^/]' -or (Test-RdaTenantScopeIdMaskable -ResourceId $PlainId))
     {
         # An id that ends on the word '$system', or a subscription id that ends on any other
-        # type word, with no name after it is a form this tool does not support
-        # (Test-RdaTrailingSystemTypeId, Test-RdaTrailingTypeWordId), whatever its other parts are.
+        # type word or on a provider namespace, with no name after it is a form this tool does
+        # not support (Test-RdaTrailingSystemTypeId, Test-RdaTrailingTypeWordId), whatever its
+        # other parts are.
         if ((Test-RdaTrailingSystemTypeId $PlainId) -or (Test-RdaTrailingSystemTypeId ([string]$MaskedId)) -or (Test-RdaTrailingTypeWordId $PlainId) -or (Test-RdaTrailingTypeWordId ([string]$MaskedId))) { return $false }
         $P = $PlainId.Split('/')
         $M = ([string]$MaskedId).Split('/')
@@ -2188,11 +2189,16 @@ function Test-RdaTrailingSystemTypeId([string]$Id)
 # it refuses a last word '$system', and how to mask it is with the owner. A run gives a
 # tenant-scope id of that form one flat token (Test-RdaTenantScopeIdMaskable), which holds no
 # word, so such an id is not counted.
+# A subscription id with an odd number of segments ends on a value, which a run masks unless
+# the word before it is 'providers' (always in a word place there): then the last segment is
+# a namespace with no type or name after it ('.../providers/Microsoft.Compute'), which a run
+# keeps as written and downstream would read as the resource's name. That form is counted too.
 function Test-RdaTrailingTypeWordId([string]$Id)
 {
     if ([string]::IsNullOrEmpty($Id)) { return $false }
     $Parts = $Id.Split('/')
-    return $Parts.Count -ge 4 -and ($Parts.Count % 2) -eq 0 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'subscriptions' -and $Parts[-1] -ne ''
+    if ($Parts.Count -lt 4 -or $Parts[0] -ne '' -or $Parts[1] -ine 'subscriptions' -or $Parts[-1] -eq '') { return $false }
+    return ($Parts.Count % 2) -eq 0 -or $Parts[-2] -ieq 'providers'
 }
 
 # The path where $Path really is: each part that is a link or junction followed (its target

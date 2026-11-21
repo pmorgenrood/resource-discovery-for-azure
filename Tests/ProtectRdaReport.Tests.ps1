@@ -763,6 +763,30 @@ Describe 'Names and types are kept as a run writes them' {
         Test-RdaTrailingTypeWordId $Id | Should -Be $Want
     }
 
+    # A subscription id with an odd number of segments ends on a value. When the segment before
+    # it is a providers in a word place, that value is a namespace with no type or name after it
+    # ('.../providers/Microsoft.Compute'), and downstream would read the namespace as the name.
+    It 'reads a subscription id as ending on a provider namespace with no type or name after it only when its last segment follows a providers in a word place: <Id>' -ForEach @(
+        @{ Id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Compute'; Want = $true }
+        @{ Id = '/subscriptions/s/providers/Microsoft.Compute'; Want = $true }
+        @{ Id = '/subscriptions/prod_x/resourcegroups/prod_y/providers/microsoft.compute/virtualmachines/prod_z/providers/Microsoft.Insights'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/providers/providers/microsoft.compute'; Want = $true }
+        @{ Id = '/subscriptions/s/resourcegroups/providers'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/microsoft.storage/storageaccounts/providers'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/Microsoft.Compute/virtualMachines/vm-a'; Want = $false }
+        @{ Id = '/subscriptions/s/resourcegroups/g/providers/'; Want = $false }
+        @{ Id = '/providers/Microsoft.Capacity'; Want = $false }
+    ) {
+        Test-RdaTrailingTypeWordId $Id | Should -Be $Want
+    }
+
+    It 'refuses, as the masked id of a usage row, an id that ends on a provider namespace with no type or name after it' {
+        $Tok = 'prod_{0}' -f [guid]::NewGuid()
+        $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/Microsoft.Compute'
+        Test-RdaMaskedUsageId -PlainId $Plain -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/Microsoft.Compute' -f $Tok) | Should -BeFalse
+        Test-RdaMaskedUsageId -PlainId ($Plain + '/virtualMachines/vm-a') -MaskedId ('/subscriptions/{0}/resourcegroups/{0}/providers/Microsoft.Compute/virtualMachines/{0}' -f $Tok) | Should -BeTrue -Because 'a virtual machine''s own id is taken'
+    }
+
     It 'refuses, as the masked id of a usage row, an id that ends on a type word with no name after it' {
         $Tok = 'prod_{0}' -f [guid]::NewGuid()
         $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/sbdemo01/topics'
@@ -2392,6 +2416,29 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
         ($R.Text -join ' ') | Should -Match ([regex]::Escape('consumption row 1 has an id whose provider or type is not as Azure writes one. Nothing was written.')) -Because 'the path word check stops on it'
         ($R.Text -join ' ') | Should -Not -Match 'Contoso-Secret-Word' -Because 'the stop names no id'
+        @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
+    }
+
+    # A usage row whose id ends on a provider namespace ('.../resourcegroups/<group>/providers/Microsoft.Compute')
+    # would be masked to '.../resourcegroups/<token>/providers/Microsoft.Compute', and downstream reads that
+    # namespace as the resource's name. No captured billing row shows such an id, so the mask stops on it
+    # with its own reason, which masking again would not change, and writes nothing.
+    It 'refuses a usage row whose id ends on a provider namespace with no type or name after it, as an id form this tool does not support, and writes nothing' {
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/Microsoft.Compute'))
+            $Lines -join "`n"
+        }
+        $Zip = & $script:Change @{ 'Consumption_*.csv' = $AddRow }
+        $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
+        $R = script:Invoke-Protect -Path $Zip -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape("consumption row 1 has an id that ends on a provider namespace with no type or name after it ('.../providers/<namespace>'). That is an id form this tool does not support")) -Because 'the stop gives its own reason'
+        ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
+        ($R.Text -join ' ') | Should -Not -Match 'rg-demo' -Because 'the stop names no id'
         @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
     }
 
