@@ -450,10 +450,14 @@ function Get-RdaRealValueSet
             # After each 'providers' come the namespace and the type (Azure's words),
             # then the name, then a child type and its name, and so on. Every name is
             # a real value, Azure's fixed name '$system' too: a run gives it a token.
+            # Only a 'providers' in a word place (an odd segment: a path pairs a word
+            # with a value from segment 1 on, as Get-ObfuscatedResourceId pairs it)
+            # starts that count again; a name 'providers' (a storage account may be
+            # named so) is a name.
             $Providers = -1
             for ($i = $From; $i -lt $Parts.Count; $i++)
             {
-                if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
+                if (($i % 2) -eq 1 -and $Parts[$i] -ieq 'providers') { $Providers = $i; continue }
                 if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
             }
         }
@@ -485,10 +489,11 @@ function Get-RdaRealValueSet
         }
         elseif ($Parts.Count -ge 3 -and $Parts[0] -eq '' -and $Parts[1] -ieq 'providers') { $From = 1 }
         else { continue }
+        # Counted again only from a 'providers' in a word place, as above.
         $Providers = -1
         for ($i = $From; $i -lt $Parts.Count; $i++)
         {
-            if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
+            if (($i % 2) -eq 1 -and $Parts[$i] -ieq 'providers') { $Providers = $i; continue }
             if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
         }
     }
@@ -1192,10 +1197,11 @@ function Test-RdaMaskedSlot
                 if ($Seg -eq '') { continue }
                 # The words of the path: subscriptions, resourcegroups, providers, and after
                 # providers the namespace and each type word (namespace and every other one after).
-                # Counted again from each 'providers', as Get-RdaRealValueSet reads an id: in an
-                # extension id ('.../<name>/providers/microsoft.insights/<type>/<name>') the
-                # namespace after the second one is Azure's word, not a name.
-                if ($Seg -ieq 'providers') { $Providers = $i; continue }
+                # Counted again from each 'providers' in a word place (an odd segment, as
+                # Get-RdaRealValueSet reads an id): in an extension id
+                # ('.../<name>/providers/microsoft.insights/<type>/<name>') the namespace after
+                # the second one is Azure's word, not a name. A name 'providers' is a name.
+                if (($i % 2) -eq 1 -and $Seg -ieq 'providers') { $Providers = $i; continue }
                 if ($Seg -in 'subscriptions', 'resourcegroups') { continue }
                 # After providers: the namespace (1), then type words (2, 4, ...) between the names (3, 5, ...).
                 if ($Providers -ge 0 -and $i -gt $Providers -and (($i - $Providers) -eq 1 -or (($i - $Providers) % 2) -eq 0)) { continue }

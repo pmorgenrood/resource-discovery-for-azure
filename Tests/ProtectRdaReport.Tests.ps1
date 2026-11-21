@@ -462,6 +462,52 @@ Describe 'The masked-field check, the real values and the exempt words' {
         finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
     }
 
+    # A name can be the word 'providers' (a storage account named so). A path pairs a word with
+    # a value from segment 1 on, as Get-ObfuscatedResourceId pairs it, so only a 'providers' in a
+    # word place starts the count of namespace, type and name words again; one in a name place
+    # is a name, and so are the names after it.
+    It 'reads a resource named providers, and the names after it, as names, from <Source>, so a masked id that kept one stops the slot check' -ForEach @(
+        @{ Source = 'the run''s dictionaries' }
+        @{ Source = 'a full id passed in' }
+    ) {
+        $Saved = @{}
+        foreach ($N in 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'TagValueDictionary', 'FreeTextDictionary') { $Saved[$N] = Get-Variable -Scope Global -Name $N -ValueOnly -ErrorAction SilentlyContinue; Set-Variable -Scope Global -Name $N -Value $null }
+        try
+        {
+            $Real = '/subscriptions/33333333-3333-3333-3333-333333333333/resourcegroups/rg-st-01/providers/microsoft.storage/storageaccounts/providers/blobservices/default'
+            if ($Source -like '*dictionaries')
+            {
+                $Ids = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                $Ids[$Real] = 'masked'
+                Set-Variable -Scope Global -Name ResourceIdDictionary -Value $Ids
+                $Set = Get-RdaRealValueSet
+            }
+            else { $Set = Get-RdaRealValueSet -ExtraValue $Real }
+            foreach ($V in 'providers', 'default', 'rg-st-01') { $Set.Contains($V) | Should -BeTrue -Because "$V is a name in that id" }
+            foreach ($W in 'microsoft.storage', 'storageaccounts', 'blobservices') { $Set.Contains($W) | Should -BeFalse -Because "$W is Azure's word" }
+            $Tok = 'prod_11111111-1111-1111-1111-111111111111'
+            $Base = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.storage/storageaccounts"
+            Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/$Tok" } -Field 'ID' -RealValue $Set | Should -BeNullOrEmpty -Because 'the masked id holds tokens only'
+            Test-RdaMaskedSlot -Row @{ ID = "$Base/providers/blobservices/$Tok" } -Field 'ID' -RealValue $Set | Should -Be @('ID') -Because 'the account''s name was left'
+            Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/default" } -Field 'ID' -RealValue $Set | Should -Be @('ID') -Because 'the name after it was left'
+            Test-RdaMaskedSlot -Row @{ ID = "$Base/providers/blobservices/default" } -Field 'ID' -RealValue $Set | Should -Be @('ID') -Because 'both names were left'
+            # A 'providers' in a word place still starts the count again: an extension id's
+            # namespace and type after it are Azure's words.
+            Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/providers/microsoft.insights/diagnosticsettings/$Tok" } -Field 'ID' -RealValue $Set | Should -BeNullOrEmpty
+        }
+        finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
+    }
+
+    It 'reads a masked id''s name slot that holds the word providers as a name in the slot check, and the words after it by their place' {
+        $Real = [System.Collections.Generic.HashSet[string]]::new([string[]]@('providers', 'contoso'), [System.StringComparer]::OrdinalIgnoreCase)
+        $Tok = 'prod_11111111-1111-1111-1111-111111111111'
+        $Base = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.storage/storageaccounts"
+        Test-RdaMaskedSlot -Row @{ ID = "$Base/providers/blobservices/$Tok" } -Field 'ID' -RealValue $Real | Should -Be @('ID') -Because 'the name providers was left'
+        # Read from the 'providers' in a word place: 'blobservices' is a type word, 'contoso' a name.
+        Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/contoso" } -Field 'ID' -RealValue $Real | Should -Be @('ID')
+        Test-RdaMaskedSlot -Row @{ ID = "$Base/$Tok/blobservices/$Tok" } -Field 'ID' -RealValue $Real | Should -BeNullOrEmpty -Because 'Azure''s words in their places are not names'
+    }
+
     It 'takes no value of a list a rule masks inside (a cloud service''s Roles) as an Azure word' {
         $Exempt = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $Rows = @{ CloudServices = @(@{ ID = 'x'; Name = 'n'; Location = 'eastus'; Roles = @(@{ RoleName = 'contoso-api-web'; SkuName = 'standard_d2' }) }) }
@@ -2261,6 +2307,26 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         ($R.Text -join ' ') | Should -Match ([regex]::Escape('Ask the owner of this tool how to handle it. Nothing was written.'))
         ($R.Text -join ' ') | Should -Not -Match 'sbdemo01' -Because 'the stop names no id'
         @(Get-ChildItem -LiteralPath $Out -Recurse -File -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'nothing was written'
+    }
+
+    # A storage account may be named 'providers'. A run masks each name by its place, that one too,
+    # and the offline mask's checks read it as a name, so such a report is masked as a run masks it.
+    It 'masks a usage row of a storage account named providers as a run masks it, every name a token' {
+        $Plain = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.storage/storageaccounts/providers/blobservices/default'
+        $AddRow = {
+            param([string]$T)
+            $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+            $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+            if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+            $Lines.Insert(1, $Vm.Replace('/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.compute/virtualmachines/vm-demo', $Plain).Replace('"Virtual Machines"', '"Storage"'))
+            $Lines -join "`n"
+        }.GetNewClosure()
+        $M = & $script:Masked (& $script:Change @{ 'Consumption_*.csv' = $AddRow })
+        $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
+        $Row = @($Usage | Where-Object { $M.Dict.ResourceIdMap[$_.ResourceId] -ceq $Plain })
+        $Row.Count | Should -Be 1 -Because 'the row is masked, and its masked id maps back to the plain id'
+        $Tok = '(?:prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+        $Row[0].ResourceId | Should -Match ('^/subscriptions/{0}/resourcegroups/{0}/providers/microsoft\.storage/storageaccounts/{0}/blobservices/{0}\z' -f $Tok) -Because 'every name slot gets a token, the name providers too'
     }
 
     # A usage row whose id ends on a type word with no name after it ('.../namespaces/<namespace>/topics')
