@@ -41,6 +41,13 @@ function ConvertTo-LookupTable
 # The group of a subscription id ('/subscriptions/<id>/resourceGroups/<group>/...'),
 # as the masking reads it. A tenant-scope id ('/providers/...') has none: a
 # 'resourceGroups' segment there is a type word.
+# Accepted gap: an older build's dictionary can map a group's token, in ResourceGroupMap,
+# to a tenant-scope id '/providers/<namespace>/resourceGroups/<x>' (older builds read that
+# segment as a group slot and gave the id the group's token). Reveal no longer reveals
+# group <x> from such an entry, so that token stays masked in a ResourceGroup field (a full
+# id is still revealed through ResourceIdMap). This is accepted because no provider is known
+# to bill such an id, and a run of this build no longer gives such an id a group's token,
+# so its dictionary has no such entry.
 function Get-RgNameFromResourceId
 {
     param([string]$ResourceId)
