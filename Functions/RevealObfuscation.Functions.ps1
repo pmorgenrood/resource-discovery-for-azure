@@ -72,7 +72,21 @@ function Get-SubGuidFromResourceId
 # SubscriptionMap and SubscriptionNameMap: both are keyed by a subscription's token (its id
 # in one, its display name in the other), so they count as one map here. $Maps is map name ->
 # lookup table; every map Reveal reads is passed, whatever -Fields selects. Returns one entry
-# per shared token, with the maps that hold it, never a real value.
+# per shared token, with the maps that hold it, never a real value (InIds $false).
+# A path-shaped ResourceIdMap key (a masked id, '/...') holds tokens of its own, so it is
+# then read slot by slot against its real id: the subscription slot ('/subscriptions/<token>'),
+# the group slot (only '/subscriptions/<id>/resourceGroups/<token>', as the masking reads it)
+# and every other token, which is a name. A slot is of the kind of SubscriptionMap,
+# ResourceGroupMap or ResourceNameMap, and its real value is the real id's part at its place.
+# Reveal writes a token's path value in a slot and its map value in every field that holds it,
+# so each token must stand for one kind of value and one real value, ignoring case, in every
+# map and slot: a group's token as a resource's name in an id would reveal that resource's
+# Name with -Fields ResourceGroup and write the group into the id. A map's value is the one
+# Reveal writes in a slot (the subscription id of a SubscriptionMap id, the group of a
+# ResourceGroupMap id, the last part of a ResourceNameMap id); a subscription's token in a
+# subscription slot, a group's in a group slot and a name's in a name slot are its own. Values
+# are compared only where the masked and the real id have as many parts. Each such token is
+# returned once, with InIds $true, the two places that differ and Why ('kind' or 'value').
 function Get-RdaRevealSharedToken
 {
     param([System.Collections.IDictionary]$Maps)
@@ -100,7 +114,76 @@ function Get-RdaRevealSharedToken
             if (-not $List.Contains([string]$MapName)) { $List.Add([string]$MapName) }
         }
     }
-    foreach ($Token in $Shared.Keys) { [pscustomobject]@{ Token = $Token; Maps = @($Shared[$Token]) } }
+    foreach ($Token in $Shared.Keys) { [pscustomobject]@{ Token = $Token; Maps = @($Shared[$Token]); InIds = $false; Why = 'map' } }
+
+    # ---- The tokens inside the ids of ResourceIdMap ----
+    $IdTable = $Maps['ResourceIdMap']
+    if ($null -eq $IdTable) { return }
+    $Ignore = [System.StringComparison]::OrdinalIgnoreCase
+    $TokenRx = [regex]::new('^(?:prod|nonprod)_(?:[a-z0-9]+_)*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z', 'IgnoreCase, CultureInvariant')
+    $SlotPlace = @{ SubscriptionMap = 'the subscription slot of a ResourceIdMap id'; ResourceGroupMap = 'the group slot of a ResourceIdMap id'; ResourceNameMap = 'a name slot of a ResourceIdMap id' }
+    # Token -> @(kind, place of the kind, real value or $null, place of the value), set at
+    # the first slot that holds the token: the kind is its map's when a map holds it, else
+    # that slot's, and the value its map's when the map gives one, else that slot's real part.
+    # The kind is '' once the token is returned (or was, above), so it is not read again.
+    $Of = [System.Collections.Generic.Dictionary[string, object[]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $Clash = [System.Collections.Generic.List[object]]::new()
+    foreach ($Entry in $IdTable.GetEnumerator())
+    {
+        $Masked = [string]$Entry.Key
+        if (-not $Masked.StartsWith('/')) { continue }
+        $M = $Masked.Split('/')
+        $R = ([string]$Entry.Value).Split('/')
+        $Aligned = $R.Count -eq $M.Count
+        $InSub = $M.Count -gt 2 -and $M[1] -ieq 'subscriptions'
+        for ($i = 1; $i -lt $M.Count; $i++)
+        {
+            $Tok = $M[$i]
+            # The shortest token, 'prod_' and a GUID, has 41 characters. A part already met
+            # as a token is not matched against the token form again.
+            if ($Tok.Length -lt 41) { continue }
+            $Known = $null
+            $IsNew = -not $Of.TryGetValue($Tok, [ref]$Known)
+            if ($IsNew -and -not $TokenRx.IsMatch($Tok)) { continue }
+            $Kind = if ($InSub -and $i -eq 2) { 'SubscriptionMap' } elseif ($InSub -and $i -eq 4 -and $M[3] -ieq 'resourcegroups') { 'ResourceGroupMap' } else { 'ResourceNameMap' }
+            $Place = $SlotPlace[$Kind]
+            $Real = if ($Aligned) { $R[$i] } else { $null }
+            if ($IsNew)
+            {
+                if ($Shared.ContainsKey($Tok)) { $Of[$Tok] = @('', $null, $null, $null); continue }
+                $Known = @($Kind, $Place, $null, $null)
+                $Seen = $null
+                if ($FirstMap.TryGetValue($Tok, [ref]$Seen))
+                {
+                    $Known[0] = if ($Seen -ceq 'SubscriptionNameMap') { 'SubscriptionMap' } else { $Seen }
+                    $Known[1] = $Seen
+                    $Table = $Maps[$Kind]
+                    if ($Known[0] -ceq $Kind -and $null -ne $Table -and $Table.ContainsKey($Tok))
+                    {
+                        $MapValue = if ($Kind -ceq 'SubscriptionMap') { Get-SubGuidFromResourceId $Table[$Tok] } elseif ($Kind -ceq 'ResourceGroupMap') { Get-RgNameFromResourceId $Table[$Tok] } else { ([string]$Table[$Tok] -split '/')[-1] }
+                        if (-not [string]::IsNullOrEmpty($MapValue)) { $Known[2] = [string]$MapValue; $Known[3] = $Kind }
+                    }
+                }
+                $Of[$Tok] = $Known
+            }
+            if ($Known[0] -ceq '') { continue }
+            if ($Known[0] -cne $Kind)
+            {
+                $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[1], $Place); InIds = $true; Why = 'kind' })
+                $Known[0] = ''
+            }
+            elseif ($null -ne $Real)
+            {
+                if ($null -eq $Known[2]) { $Known[2] = $Real; $Known[3] = $Place }
+                elseif (-not [string]::Equals([string]$Known[2], $Real, $Ignore))
+                {
+                    $Clash.Add([pscustomobject]@{ Token = $Tok; Maps = @([string]$Known[3], $Place); InIds = $true; Why = 'value' })
+                    $Known[0] = ''
+                }
+            }
+        }
+    }
+    $Clash
 }
 
 function Get-JsonEscaped
@@ -307,8 +390,9 @@ function Invoke-RdaReveal
     # Checked over every map, whatever -Fields selects, before any value is
     # replaced (Get-RdaRevealSharedToken): a dictionary that gives one token to
     # two maps would reveal one map's value in the other's places, so nothing
-    # is written.
-    $SharedTokens = @(Get-RdaRevealSharedToken -Maps ([ordered]@{
+    # is written. The same holds for a token that an id in ResourceIdMap holds
+    # as another kind of value or for another real value.
+    $Found = @(Get-RdaRevealSharedToken -Maps ([ordered]@{
                 ResourceGroupMap    = $RgMap
                 SubscriptionMap     = $SubMap
                 SubscriptionNameMap = $SubNameMap
@@ -317,11 +401,20 @@ function Invoke-RdaReveal
                 ResourceIdMap       = $IdMap
                 FreeTextMap         = $FreeTextMap
             }))
+    $SharedTokens = @($Found | Where-Object { -not $_.InIds })
     if ($SharedTokens.Count -gt 0)
     {
         throw ("The dictionary gives {0} token(s) to more than one map, ignoring case (the first: '{1}', in {2}). Reveal puts a token's value wherever the token stands, so it would write one map's value into another map's fields and ids. Nothing was written. A run gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $SharedTokens.Count, $SharedTokens[0].Token, ($SharedTokens[0].Maps -join ' and '))
     }
+    $IdTokens = @($Found | Where-Object { $_.InIds })
+    if ($IdTokens.Count -gt 0)
+    {
+        $Why = if ($IdTokens[0].Why -ceq 'kind') { 'for two kinds of value' } else { 'for two real values' }
+        throw ("The ids in the dictionary's ResourceIdMap hold {0} token(s) that do not stand for one kind of value and one real value, ignoring case (the first: '{1}', in {2} and in {3}, {4}). Reveal puts a token's value wherever the token stands, so it would write one value in the place of another in ids and fields. Nothing was written. A run gives each value a token of its own: use the dictionary the run wrote with this report, not one changed or merged by hand." -f $IdTokens.Count, $IdTokens[0].Token, $IdTokens[0].Maps[0], $IdTokens[0].Maps[1], $Why)
+    }
+    $Found = $null
     $SharedTokens = $null
+    $IdTokens = $null
 
     # ---- Build token -> real-value replacement map for selected fields -----
     $Replacements = @{}

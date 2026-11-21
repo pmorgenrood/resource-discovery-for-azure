@@ -563,6 +563,154 @@ Describe "Reveal-Obfuscation stops on a dictionary that gives one token to two m
     }
 }
 
+# A path-shaped ResourceIdMap key (a masked id) holds a token in its subscription slot, its group
+# slot ('/subscriptions/<id>/resourceGroups/<x>' only) and each name slot. Reveal puts a token's
+# path value in a slot and its map value in every field that holds it. So a token an id holds as
+# another kind of value (a group's token as a resource's name) would reveal a field -Fields does
+# not name and write the group into the id, and a token an id holds for another real value would
+# write the wrong value into the id. A run gives each slot the token of its own subscription, group
+# or name. So Reveal reads every such key slot by slot against its real id, ignoring case, and
+# stops before it writes anything.
+Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for another kind of value or another real value" {
+
+    BeforeAll {
+        $script:SlotRealSub = '12345678-1234-1234-1234-123456789012'
+        $script:SlotOtherSub = [guid]::NewGuid().ToString()
+        $script:SlotTok = @{}
+        foreach ($K in 'New', 'Child', 'Sa', 'Ns', 'Topic', 'Ts', 'Ro', 'Disk') { $script:SlotTok[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        # '{Name}' in a case's text -> the token or value it stands for, at run time.
+        function Expand-SlotText
+        {
+            param([string]$Text, [switch]$Upper)
+            $Values = @{
+                Sub = $script:TokSub; Rg = $script:TokRg; RgAks = $script:TokRgAks; RgCase = $script:TokRgCase; Name = $script:TokName; Fab = $script:TokFabName
+                Tag = $script:TokTag; Free = $script:TokFree; Id = $script:TokId; RealSub = $script:SlotRealSub; OtherSub = $script:SlotOtherSub
+                UpperRgAks = $script:TokRgAks.ToUpperInvariant()
+            }
+            foreach ($K in $script:SlotTok.Keys) { $Values[$K] = $script:SlotTok[$K] }
+            foreach ($K in $Values.Keys) { $Text = $Text.Replace('{' + $K + '}', $Values[$K]) }
+            return $Text
+        }
+        # The test dictionary with the case's ids added to ResourceIdMap (and names to ResourceNameMap).
+        function New-SlotDictionary
+        {
+            param([object[]]$Ids, [object[]]$Names)
+            $Dir = Join-Path $script:TmpDir ("slot_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+            $D = Get-Content -LiteralPath $script:DictPath -Raw | ConvertFrom-Json -AsHashtable
+            foreach ($E in @($Ids)) { if ($null -ne $E) { $D['ResourceIdMap'][(Expand-SlotText $E.M)] = (Expand-SlotText $E.R) } }
+            foreach ($E in @($Names)) { if ($null -ne $E) { $D['ResourceNameMap'][(Expand-SlotText $E.T)] = (Expand-SlotText $E.R) } }
+            $File = Join-Path $Dir 'ObfuscationDictionary_Slot.json'
+            $D | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $File -Encoding utf8
+            return [pscustomobject]@{ Dir = $Dir; File = $File }
+        }
+    }
+
+    It "stops with <Mode> on <Case>, names the token and both places, and writes nothing" -ForEach @(
+        foreach ($Mode in '-Fields ResourceGroup', '-All')
+        {
+            $Fab = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.fabric/capacities/'
+            $FabReal = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/capdata01'
+            $Kinds = 'for two kinds of value'
+            $Values = 'for two real values'
+            $NameSlot = 'a name slot of a ResourceIdMap id'
+            $GroupSlot = 'the group slot of a ResourceIdMap id'
+            $SubSlot = 'the subscription slot of a ResourceIdMap id'
+            @{ Mode = $Mode; Case = 'a group''s token that an id holds only as a resource''s name'; Tok = '{RgAks}'; Ids = @(@{ M = $Fab + '{RgAks}'; R = $FabReal }); Places = @('ResourceGroupMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a resource name''s token that an id holds as its group'; Tok = '{Fab}'; Ids = @(@{ M = '/subscriptions/{Sub}/resourcegroups/{Fab}/providers/microsoft.fabric/capacities/{New}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/cap-new' }); Places = @('ResourceNameMap', $GroupSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a subscription''s token that an id holds as a resource''s name'; Tok = '{Sub}'; Ids = @(@{ M = $Fab + '{Sub}'; R = $FabReal }); Places = @('SubscriptionMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a group''s token that an id holds as its subscription'; Tok = '{RgAks}'; Ids = @(@{ M = '/subscriptions/{RgAks}/resourcegroups/{Rg}/providers/microsoft.fabric/capacities/{Fab}'; R = $FabReal }); Places = @('ResourceGroupMap', $SubSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a tag value''s token that an id holds as a resource''s name'; Tok = '{Tag}'; Ids = @(@{ M = $Fab + '{Tag}'; R = $FabReal }); Places = @('TagMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a free-text value''s token that an id holds as its group'; Tok = '{Free}'; Ids = @(@{ M = '/subscriptions/{Sub}/resourcegroups/{Free}/providers/microsoft.fabric/capacities/{Fab}'; R = $FabReal }); Places = @('FreeTextMap', $GroupSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a flat id''s token that an id holds as a resource''s name'; Tok = '{Id}'; Ids = @(@{ M = $Fab + '{Id}'; R = $FabReal }); Places = @('ResourceIdMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a group''s token that a tenant-scope id holds after its type word resourceGroups'; Tok = '{RgAks}'; Ids = @(@{ M = '/providers/Microsoft.Example/resourceGroups/{RgAks}'; R = '/providers/Microsoft.Example/resourceGroups/grp-a' }); Places = @('ResourceGroupMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a token in no map that one id holds as its group and another as a name'; Tok = '{New}'; Ids = @(@{ M = '/subscriptions/{Sub}/resourcegroups/{New}/providers/microsoft.fabric/capacities/{Fab}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-new/providers/Microsoft.Fabric/capacities/capdata01' }, @{ M = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.storage/storageaccounts/{New}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/sa-two' }); Places = @($GroupSlot, $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a group''s token, written in another case, that an id holds as a resource''s name'; Tok = '{UpperRgAks}'; Ids = @(@{ M = $Fab + '{UpperRgAks}'; R = $FabReal }); Places = @('ResourceGroupMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a group''s token that an id holds as a name, where the real id has another number of parts'; Tok = '{RgAks}'; Ids = @(@{ M = $Fab + '{RgAks}'; R = $FabReal + '/extra' }); Places = @('ResourceGroupMap', $NameSlot); Why = $Kinds }
+            @{ Mode = $Mode; Case = 'a resource name''s token that an id holds for another name'; Tok = '{Name}'; Ids = @(@{ M = $Fab + '{Name}'; R = $FabReal }); Places = @('ResourceNameMap', $NameSlot); Why = $Values }
+            @{ Mode = $Mode; Case = 'a group''s token that an id holds for another group'; Tok = '{RgAks}'; Ids = @(@{ M = '/subscriptions/{Sub}/resourcegroups/{RgAks}/providers/microsoft.fabric/capacities/{Fab}'; R = $FabReal }); Places = @('ResourceGroupMap', $GroupSlot); Why = $Values }
+            @{ Mode = $Mode; Case = 'a subscription''s token that an id holds for another subscription'; Tok = '{Sub}'; Ids = @(@{ M = $Fab + '{Fab}'; R = '/subscriptions/{OtherSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/capdata01' }); Places = @('SubscriptionMap', $SubSlot); Why = $Values }
+            @{ Mode = $Mode; Case = 'a token in no map that two ids hold as the names of two resources'; Tok = '{New}'; Ids = @(@{ M = $Fab + '{New}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/cap-one' }, @{ M = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.storage/storageaccounts/{New}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Storage/storageAccounts/sa-two' }); Places = @($NameSlot, $NameSlot); Why = $Values }
+        }
+    ) {
+        $Token = Expand-SlotText $Tok
+        $Dict = New-SlotDictionary -Ids $Ids
+        $Out = Join-Path $Dict.Dir 'out.zip'
+        $Splat = @{ InputZip = $script:InputZip; DictionaryPath = $Dict.File; OutputZip = $Out }
+        if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceGroup') }
+
+        $Err = $null
+        try { & $script:RevealScript @Splat *>&1 | Out-Null }
+        catch { $Err = $_ }
+        $Err | Should -Not -BeNullOrEmpty -Because 'Reveal stops on a token an id holds for another kind of value or another real value'
+        $Msg = $Err.Exception.Message
+        $Msg | Should -Match ([regex]::Escape($Token)) -Because 'the message names the token'
+        foreach ($P in $Places) { $Msg | Should -Match ([regex]::Escape($P)) -Because 'the message names both places' }
+        $Msg | Should -Match ([regex]::Escape($Why))
+        $Msg | Should -Match ([regex]::Escape('Nothing was written.'))
+        # No real part of the case's ids, and no real value of the fixture, is in the message.
+        $Reals = [System.Collections.Generic.List[string]]::new()
+        foreach ($E in $Ids) { foreach ($Part in (Expand-SlotText $E.R).Split('/')) { if ($Part -and $Part -notin @('subscriptions', 'resourceGroups', 'providers')) { $Reals.Add($Part) } } }
+        $Reals.AddRange([string[]]@($script:RealRgName, $script:RealRgAks, $script:RealRgCase, $script:RealSubName, $script:RealTagVal, $script:RealFreeText, 'vm01'))
+        foreach ($Real in $Reals) { $Msg | Should -Not -Match ([regex]::Escape($Real)) -Because 'the message holds no real value' }
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'no output zip is written'
+        Test-Path -LiteralPath (($Out -replace '\.zip$', '') + '.partial.zip') | Should -BeFalse -Because 'no partial zip is left'
+        (Get-FileHash -Path $script:InputZip -Algorithm SHA256).Hash | Should -Be $script:InputZipHashBefore
+    }
+
+    It "reveals, with <Mode>, a dictionary whose ids hold each subscription, group and name token in its own slot for its own value, as a run writes it" -ForEach @(
+        @{ Mode = '-Fields ResourceGroup' }
+        @{ Mode = '-All' }
+        @{ Mode = 'the default fields' }
+    ) {
+        $FabId = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.fabric/capacities/{Fab}'
+        $FabRealId = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Fabric/capacities/capdata01'
+        $Ids = @(
+            # The Fabric row's own id: each token in its own slot.
+            @{ M = $FabId; R = $FabRealId }
+            # A child id holds its parent's name token.
+            @{ M = $FabId + '/workspaces/{Child}'; R = $FabRealId + '/workspaces/ws01' }
+            # A group and a name written in other casings than their maps' ids.
+            @{ M = '/subscriptions/{Sub}/resourcegroups/{RgCase}/providers/microsoft.storage/storageaccounts/{Sa}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-App/providers/Microsoft.Storage/storageAccounts/SA01' }
+            # A later word subscriptions is a type word: the token after it is a name.
+            @{ M = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.servicebus/namespaces/{Ns}/topics/{Topic}/subscriptions/{Ts}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns01/topics/orders/subscriptions/audit' }
+            # A tenant-scope id: every token is a name.
+            @{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01' }
+            # A token in no map, in its own name slot.
+            @{ M = '/subscriptions/{Sub}/resourcegroups/{Rg}/providers/microsoft.compute/disks/{Disk}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/disk01' }
+        )
+        $Names = @(
+            @{ T = '{Child}'; R = $FabRealId + '/workspaces/ws01' }
+            @{ T = '{Sa}'; R = '/subscriptions/{RealSub}/resourceGroups/RG-APP/providers/Microsoft.Storage/storageAccounts/sa01' }
+            @{ T = '{Ns}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns01' }
+            @{ T = '{Topic}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns01/topics/orders' }
+            @{ T = '{Ts}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns01/topics/orders/subscriptions/audit' }
+            @{ T = '{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01' }
+        )
+        $Dict = New-SlotDictionary -Ids $Ids -Names $Names
+        $R = switch ($Mode) { '-All' { Invoke-Reveal -All -DictPath $Dict.File } '-Fields ResourceGroup' { Invoke-Reveal -Fields @('ResourceGroup') -DictPath $Dict.File } default { Invoke-Reveal -DictPath $Dict.File } }
+        Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
+        $Fabric = @($R.Inventory.FabricCapacities)[0]
+        $Masked = Expand-SlotText $FabId
+        if ($Mode -eq '-All')
+        {
+            $Fabric.ID | Should -BeExactly (Expand-SlotText $FabRealId)
+            $Fabric.Name | Should -BeExactly 'capdata01'
+            $Fabric.ResourceGroup | Should -BeExactly $script:RealRgName
+        }
+        else
+        {
+            # The group is revealed in the id, and with the default fields the subscription too
+            # (as its id there); the name stays masked.
+            $Expected = $Masked.Replace("/$($script:TokRg)/", "/$($script:RealRgName)/")
+            if ($Mode -eq 'the default fields') { $Expected = $Expected.Replace("/subscriptions/$($script:TokSub)/", "/subscriptions/$($script:SlotRealSub)/") }
+            $Fabric.ID | Should -BeExactly $Expected
+            $Fabric.Name | Should -BeExactly $script:TokFabName -Because 'the name stays masked'
+            $Fabric.ResourceGroup | Should -BeExactly $script:RealRgName
+        }
+    }
+}
+
 # =============================================================================
 # FreeText round-trip via FreeTextMap (P3) — fixture-independent
 # -----------------------------------------------------------------------------
