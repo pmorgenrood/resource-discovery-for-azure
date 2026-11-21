@@ -354,22 +354,22 @@ Describe 'The masked-field check, the real values and the exempt words' {
         }
         @{
             Case = 'a short name of letters kept as written'
-            Find = 'elseif ($M[$i + 1] -cnotmatch $Token) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
+            Find = 'elseif ($M[$i + 1] -cnotmatch $Token -or $M[$i + 1] -ieq $Next) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
             Plain = '/subscriptions/{s}/resourcegroups/rg-bus/providers/microsoft.servicebus/namespaces/sbbilling/queues/orders'; Masked = '/subscriptions/{t}/resourcegroups/{t}/providers/microsoft.servicebus/namespaces/{t}/queues/ORDERS'
         }
         @{
             Case = 'a tenant-scope name kept as written'
-            Find = 'elseif ($M[$i + 1] -cnotmatch $Token) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
+            Find = 'elseif ($M[$i + 1] -cnotmatch $Token -or $M[$i + 1] -ieq $Next) { return $false }'; Put = 'elseif ($M[$i + 1] -cnotmatch $Token -and $M[$i + 1] -ine $Next) { return $false }'
             Plain = '/providers/microsoft.capacity/reservationorders/{s}/reservations/{s}'; Masked = '/providers/microsoft.capacity/reservationorders/{t}/reservations/{s}'
         }
         @{
             Case = 'the group kept as written'
-            Find = 'if ($M[$i + 1] -cnotmatch $RgToken) { return $false }'; Put = 'if ($M[$i + 1] -cnotmatch $RgToken -and $M[$i + 1] -ine $Next) { return $false }'
+            Find = 'if ($M[$i + 1] -cnotmatch $RgToken -or $M[$i + 1] -ieq $Next) { return $false }'; Put = 'if ($M[$i + 1] -cnotmatch $RgToken -and $M[$i + 1] -ine $Next) { return $false }'
             Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '/subscriptions/{t}/resourcegroups/rg/providers/microsoft.compute/disks/{t}'
         }
         @{
             Case = 'the subscription kept as written'
-            Find = '$M[2] -cnotmatch $SubToken'; Put = '($M[2] -cnotmatch $SubToken -and $M[2] -ine $R[2])'
+            Find = '$M[2] -cnotmatch $SubToken -or $M[2] -ieq $R[2]'; Put = '($M[2] -cnotmatch $SubToken -and $M[2] -ine $R[2])'
             Plain = '/subscriptions/{s}/resourcegroups/rg/providers/microsoft.compute/disks/d1'; Masked = '/subscriptions/{s}/resourcegroups/{t}/providers/microsoft.compute/disks/{t}'
         }
     ) {

@@ -560,6 +560,37 @@ Describe 'The seed is checked when it is read' {
         }
     }
 
+    It 'masks again a seeded id whose group or name slot kept a real part that looks like a token (<Case>), and the next two seeded runs keep it' -ForEach @(
+        @{ Case = 'the same case'; Upper = $false }
+        @{ Case = 'the real parts in upper case'; Upper = $true }
+    ) {
+        # A damaged or hand-combined seed whose masked id holds the real group and
+        # name as they are: each real part is shaped like a token, so only the
+        # check that a slot differs from its real part finds it.
+        $G = { [guid]::NewGuid().ToString() }
+        $RgReal = 'prod_' + (& $G); $NameReal = 'prod_' + (& $G)
+        $Vm = "/subscriptions/$script:Sub/resourcegroups/$RgReal/providers/microsoft.compute/virtualmachines/$NameReal"
+        $Kept = "/subscriptions/$(New-Tok)/resourcegroups/$RgReal/providers/microsoft.compute/virtualmachines/$NameReal"
+        if ($Upper) { $Vm = $Vm -replace [regex]::Escape($RgReal), $RgReal.ToUpperInvariant() -replace [regex]::Escape($NameReal), $NameReal.ToUpperInvariant() }
+        $Seed = @{
+            ResourceIdMap    = @{ $Kept = $Vm }
+            ResourceNameMap  = @{ $NameReal = $Vm }
+            ResourceGroupMap = @{ $RgReal = "/subscriptions/$script:Sub/resourcegroups/$(($Vm -split '/')[4])" }
+        }
+        $First = $null
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows @(New-Res $Vm)
+            $Id = (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm]
+            $Parts = $Id -split '/'
+            $Parts[4] | Should -Not -Be ($Vm -split '/')[4] -Because "run $Run masks the real group, letter case aside"
+            $Parts[-1] | Should -Not -Be ($Vm -split '/')[-1] -Because "run $Run masks the real name, letter case aside"
+            Test-ObfuscatedIdShape -RealId $Vm -MaskedId $Id | Should -BeTrue -Because "run $Run writes the contract shape"
+            if ($Run -eq 1) { $First = $Id } else { $Id | Should -BeExactly $First -Because "run $Run keeps run 1's id, letter for letter" }
+            $Seed = Get-RunDictionaryMaps
+        }
+    }
+
     It 'gives a $system parent that the seeded ids give two tokens one new token, in its own id and its child''s, and the next two seeded runs keep both' {
         # The namespace's own seeded id and its topic's give the one real
         # '.../namespaces/$system' two tokens (a seed written before the slot
@@ -820,6 +851,28 @@ Describe 'Test-ObfuscatedIdShape' {
         @{ Label = 'a word in a name token'; Masked = '/subscriptions/{0}/resourcegroups/{0}/providers/microsoft.sql/servers/prod_secret_0f0e0d0c-0b0a-4908-8706-050403020100/databases/{0}' }
     ) {
         Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.sql/servers/srv-a/databases/db-a" -MaskedId ($Masked -f $script:T) | Should -BeFalse
+    }
+
+    It 'refuses a <Slot> slot that holds its real part, which looks like a token (<Case>)' -ForEach @(
+        @{ Slot = 'subscription'; Case = 'same case'; Index = 2; Upper = $false }
+        @{ Slot = 'resource group'; Case = 'same case'; Index = 4; Upper = $false }
+        @{ Slot = 'parent name'; Case = 'same case'; Index = 8; Upper = $false }
+        @{ Slot = 'name'; Case = 'same case'; Index = 10; Upper = $false }
+        @{ Slot = 'resource group'; Case = 'the real part in upper case'; Index = 4; Upper = $true }
+        @{ Slot = 'name'; Case = 'the real part in upper case'; Index = 10; Upper = $true }
+    ) {
+        $Tok = { 'prod_' + [guid]::NewGuid().ToString() }
+        $Masked = @('', 'subscriptions', (& $Tok), 'resourcegroups', (& $Tok), 'providers', 'microsoft.sql', 'servers', (& $Tok), 'databases', (& $Tok))
+        $Real = @('', 'subscriptions', $script:Sub, 'resourcegroups', 'rg-demo', 'providers', 'microsoft.sql', 'servers', 'srv-a', 'databases', 'db-a')
+        $Real[$Index] = if ($Upper) { $Masked[$Index].ToUpperInvariant() } else { $Masked[$Index] }
+        Test-ObfuscatedIdShape -RealId ($Real -join '/') -MaskedId ($Masked -join '/') | Should -BeFalse -Because 'a masked slot never keeps its real part'
+        $Real[$Index] = & $Tok
+        Test-ObfuscatedIdShape -RealId ($Real -join '/') -MaskedId ($Masked -join '/') | Should -BeTrue -Because 'a real part that only looks like a token is masked by another one'
+    }
+
+    It 'refuses a tenant-scope name slot that holds its real part' {
+        $Tok = 'prod_' + [guid]::NewGuid().ToString()
+        Test-ObfuscatedIdShape -RealId "/providers/Microsoft.Capacity/reservationOrders/$Tok" -MaskedId "/providers/Microsoft.Capacity/reservationOrders/$Tok" | Should -BeFalse
     }
 }
 

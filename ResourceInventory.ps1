@@ -299,9 +299,12 @@ function Get-ObfuscatedResourceId
 # writes: the same segments, with the subscription, the resource group and
 # every name segment a prod_/nonprod_ token ('$system' included), and the
 # 'subscriptions', 'resourcegroups', 'providers', namespace and type segments
-# as in the real id (ignoring case). A seeded id from an older dictionary
-# (which masked only the last name, so a parent's real name was left) or a
-# flat seeded token fails, and the run masks the real id again.
+# as in the real id (ignoring case). Each token slot must differ from the
+# real part it masks, ignoring case: a real name that looks like a token
+# (prod_<guid>) is never kept as its own token, as a fresh token never equals
+# it. A seeded id from an older dictionary (which masked only the last name,
+# so a parent's real name was left), a flat seeded token, or a damaged seed
+# that kept a real part fails, and the run masks the real id again.
 function Test-ObfuscatedIdShape
 {
     param([string]$RealId, [string]$MaskedId)
@@ -319,7 +322,7 @@ function Test-ObfuscatedIdShape
     $Token = '^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '$'
     if ($R[1] -ieq 'subscriptions')
     {
-        if ($M[1] -ine 'subscriptions' -or $M[2] -cnotmatch $SubToken) { return $false }
+        if ($M[1] -ine 'subscriptions' -or $M[2] -cnotmatch $SubToken -or $M[2] -ieq $R[2]) { return $false }
         $i = 3
     }
     elseif ($R[1] -ieq 'providers') { $i = 1 }
@@ -335,9 +338,9 @@ function Test-ObfuscatedIdShape
         }
         elseif ($i -eq 3 -and $R[$i] -ieq 'resourcegroups' -and $R[1] -ieq 'subscriptions')
         {
-            if ($M[$i + 1] -cnotmatch $RgToken) { return $false }
+            if ($M[$i + 1] -cnotmatch $RgToken -or $M[$i + 1] -ieq $Next) { return $false }
         }
-        elseif ($M[$i + 1] -cnotmatch $Token) { return $false }
+        elseif ($M[$i + 1] -cnotmatch $Token -or $M[$i + 1] -ieq $Next) { return $false }
         $i += 2
     }
     return $true
@@ -1810,8 +1813,10 @@ Function RunInventorySetup()
             # so no id is built from it again. (Subscription tokens come only
             # from good seeded ids, checked below.)
             $SeedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-            foreach ($K in @($RgLookup.Keys)) { if ([string]$RgLookup[$K] -cnotmatch ('^(prod|nonprod)_(mc_)?' + $SeedGuid + '$')) { [void]$RgLookup.Remove($K) } }
-            foreach ($K in @($ResourceNameDictionary.Keys)) { if ([string]$ResourceNameDictionary[$K] -cnotmatch ('^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $SeedGuid + '$')) { [void]$ResourceNameDictionary.Remove($K) } }
+            # A token equal to the real part it masks (ignoring case: a damaged
+            # seed) is not kept either, as Test-ObfuscatedIdShape refuses it.
+            foreach ($K in @($RgLookup.Keys)) { if ([string]$RgLookup[$K] -cnotmatch ('^(prod|nonprod)_(mc_)?' + $SeedGuid + '$') -or [string]$RgLookup[$K] -ieq [string]$K) { [void]$RgLookup.Remove($K) } }
+            foreach ($K in @($ResourceNameDictionary.Keys)) { if ([string]$ResourceNameDictionary[$K] -cnotmatch ('^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $SeedGuid + '$') -or [string]$ResourceNameDictionary[$K] -ieq @(([string]$K).Split('/'))[-1]) { [void]$ResourceNameDictionary.Remove($K) } }
             $SeedSlotTokens = @{}
             $SeedSlotsOf = @{}
             $SeedSubTokenIds = @{}
