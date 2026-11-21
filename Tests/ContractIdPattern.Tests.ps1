@@ -28,6 +28,28 @@ BeforeAll {
         RealName     = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.compute/virtualmachines/vm-web-01"
         NoProvider   = "/subscriptions/prod_$G/resourcegroups/prod_$G"
         FlatSentinel = "obfuscated_$G"
+        # A run keeps a last type word with no name after it as written, and Service
+        # Bus bills '.../namespaces/<namespace>/$system', so a run writes this one.
+        TypeSystem   = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$system"
+        TypeOther    = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/topics"
+        TypeSystemX  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$systemx"
+        TypeSystemOn = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.servicebus/namespaces/prod_$G/`$system/topics"
+        SystemNoName = "/subscriptions/prod_$G/resourcegroups/prod_$G/`$system"
+    }
+}
+
+Describe 'A last type word $system after a name token, in both id patterns' {
+
+    It 'takes TypeSystem by default, with every named shape allowed, and in the masked id pattern' {
+        $script:Ids.TypeSystem | Should -Match (Get-RdaContractIdPattern)
+        $script:Ids.TypeSystem | Should -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback)
+        $script:Ids.TypeSystem | Should -Match (Get-RdaMaskedIdPattern)
+    }
+
+    It 'still refuses <_> in both patterns: only the word $system may end an id with no name after it' -ForEach @('TypeOther', 'TypeSystemX', 'TypeSystemOn', 'SystemNoName', 'G1System', 'G1Nested') {
+        $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern)
+        $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback)
+        $script:Ids[$_] | Should -Not -Match (Get-RdaMaskedIdPattern)
     }
 }
 

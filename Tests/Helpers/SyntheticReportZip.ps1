@@ -50,10 +50,13 @@ function Get-RdaTokenPattern
 }
 
 # The masked id shape the output contract asks for, for the zip-backed tests:
-#   /subscriptions/<sub tok>/resourcegroups/<rg tok>/providers/<ns>/<type>/<name tok>[/<type>/<name tok>...]
+#   /subscriptions/<sub tok>/resourcegroups/<rg tok>/providers/<ns>/<type>/<name tok>[/<type>/<name tok>...][/$system]
 # Subscription and resource group tokens are prod_/nonprod_ + GUID (an AKS
 # node group keeps its mc_ hint), name tokens may carry the databricks_/aks_/
-# vmss_ hint, provider and type segments stay as written. Shapes the contract
+# vmss_ hint, provider and type segments stay as written. A last type word
+# with no name after it may be '$system' and no other word: Service Bus bills
+# '.../namespaces/<namespace>/$system', and a run keeps that type word as
+# written ('.../namespaces/<name tok>/$system'). Shapes the contract
 # does not allow are accepted only by name, so a test says which it lets in:
 #   -AllowParked          G2: a subscription-scope id with no resourcegroups
 #                         segment, parked with the owner. (G1, the Service Bus
@@ -67,7 +70,7 @@ function Get-RdaContractIdPattern
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $P = '(?:prod|nonprod)_'
     $Names = '(?:/[a-z][a-z0-9.]*/' + $P + '(?:databricks_|aks_|vmss_)?' + $Guid + ')+'
-    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names
+    $Providers = '/providers/[a-z][a-z0-9.]*' + $Names + '(?:/\$system)?'
     $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
     if ($AllowParked)
     {
@@ -85,7 +88,8 @@ function Get-RdaMaskedIdPattern
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)*$'
+    # A last type word '$system' (and no other word) may follow a name token, as above.
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+(?:/\$system)?)?$'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a
