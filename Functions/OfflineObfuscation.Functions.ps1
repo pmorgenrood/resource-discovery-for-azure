@@ -2162,6 +2162,14 @@ function Test-RdaIdPathWord([string]$Id)
 # row shows Azure billing such an id, and downstream reads the last segment as the resource's
 # name, so the offline mask refuses it (Protect-RdaReport.ps1, Test-RdaMaskedUsageId) and the
 # question of how to mask it is with the owner.
+# A tenant-scope id ('/providers/...') is counted too, unlike in Test-RdaTrailingTypeWordId, on
+# purpose. A run writes one that holds '$system' as one flat token (Test-RdaTenantScopeIdMaskable
+# takes no id with a '$system' part), so nothing of it is kept as written and refusing it is not
+# needed to stop a leak. But that flat token is itself an open question with the owner: a path
+# form for it would be an id shape change, and in that form the last '$system' would be a word
+# kept as written, as in a subscription id. So the offline mask refuses a last '$system' in both
+# forms until the owner rules, failing closed, and one ruling covers both. The test of this
+# function in Tests/ProtectRdaReport.Tests.ps1 holds the tenant-scope case.
 function Test-RdaTrailingSystemTypeId([string]$Id)
 {
     if ([string]::IsNullOrEmpty($Id) -or -not $Id.EndsWith('/$system', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
