@@ -1922,7 +1922,9 @@ function Get-RdaUnknownInventoryShape
 # other fields text (or empty). A run writes a null series on a call that failed
 # (MetricError true, Extension/Metrics.ps1), so that record is read as the run
 # writes it, as the recovery merge reads it; text, a null inside a list, or a
-# null series with MetricError false is still not a record a run writes.
+# null series with MetricError false is still not a record a run writes. The
+# recovery merge (Functions/RecoveryMerge.Functions.ps1) checks each metric
+# record it carries with this function too, so the two take the same records.
 function Test-RdaMetricRecordShape
 {
     param($Record, $Shape)
@@ -1942,7 +1944,15 @@ function Test-RdaMetricRecordShape
         {
             { $_ -in 'MetricCount', 'MetricValue', 'MetricPercentile', 'MetricTotalCount' } { if (-not (& $IsNumber $V)) { return $false } }
             'MetricError' { if ($V -isnot [bool]) { return $false } }
-            'MetricSeries' { if (-not (($null -eq $V -and $Record['MetricError'] -is [bool] -and $Record['MetricError']) -or (& $IsNumber $V) -or ($V -is [array] -and @($V | Where-Object { -not (& $IsNumber $_) }).Count -eq 0))) { return $false } }
+            # Each point is checked in a loop, not a pipeline with a script block
+            # per point: that took about 35 s on a file of 1,440,000 points (the
+            # recovery merge reads every record with this check too).
+            'MetricSeries'
+            {
+                if ($null -eq $V) { if (-not ($Record['MetricError'] -is [bool] -and $Record['MetricError'])) { return $false } }
+                elseif ($V -is [array]) { foreach ($Point in $V) { if (-not ($Point -is [long] -or $Point -is [double])) { return $false } } }
+                elseif (-not (& $IsNumber $V)) { return $false }
+            }
             default { if ($null -ne $V -and $V -isnot [string]) { return $false } }
         }
     }
