@@ -432,7 +432,7 @@ Describe 'The seed is checked when it is read' {
         $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-a"
         $M = { "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.compute/virtualmachines/$(New-Tok)" }
         Invoke-SeededRun -SeedMaps @{ ResourceIdMap = @{ (& $M) = $Vm; (& $M) = $Vm.ToUpperInvariant() } } -Rows @()
-        ($script:SeedWarnings -join "`n") | Should -Match 'gives 1 resource\(s\) two masked ids by case.*only one can be kept.*collect the gap bundle on this build'
+        ($script:SeedWarnings -join "`n") | Should -Match 'gives 1 resource\(s\) two masked ids \(by another casing, shape or token; an older build''s file, or one merged from runs not seeded from each other\).*only one can be kept.*collect the gap bundle on this build'
         # One good and one flat variant, in both orders: the good one is kept.
         foreach ($Order in 1, 2)
         {
@@ -442,6 +442,32 @@ Describe 'The seed is checked when it is read' {
             Invoke-SeededRun -SeedMaps @{ ResourceIdMap = $Map } -Rows @()
             $Global:ResourceIdDictionary[$Vm] | Should -BeExactly $Good -Because "order $Order"
         }
+    }
+
+    It 'warns, naming shape as well as case, when the seed gives one resource two masked ids of two shapes in one case, and keeps the one of the right shape' {
+        # A merged dictionary of an older build's bundle and a new one gives one real
+        # id, in one case, a flat or partly masked id and a good one.
+        $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-b"
+        foreach ($Order in 1, 2)
+        {
+            $script:SeedWarnings.Clear()
+            $Good = "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.compute/virtualmachines/$(New-Tok)"; $Flat = New-Tok
+            $Map = [ordered]@{}
+            if ($Order -eq 1) { $Map[$Good] = $Vm; $Map[$Flat] = $Vm } else { $Map[$Flat] = $Vm; $Map[$Good] = $Vm }
+            Invoke-SeededRun -SeedMaps @{ ResourceIdMap = $Map } -Rows @()
+            ($script:SeedWarnings -join "`n") | Should -Match 'gives 1 resource\(s\) two masked ids \(by another casing, shape or token; an older build''s file, or one merged from runs not seeded from each other\).*only one can be kept' -Because "order $Order"
+            (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm] | Should -BeExactly $Good -Because "order $Order"
+        }
+    }
+
+    It 'warns, naming another token, when the seed gives one resource two masked ids of the right shape in one case (a dictionary merged from runs not seeded from each other)' {
+        $script:SeedWarnings.Clear()
+        $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-c"
+        $M = { "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.compute/virtualmachines/$(New-Tok)" }
+        $First = & $M; $Second = & $M
+        Invoke-SeededRun -SeedMaps @{ ResourceIdMap = [ordered]@{ $First = $Vm; $Second = $Vm } } -Rows @()
+        ($script:SeedWarnings -join "`n") | Should -Match 'gives 1 resource\(s\) two masked ids \(by another casing, shape or token; an older build''s file, or one merged from runs not seeded from each other\).*only one can be kept.*collect the gap bundle on this build'
+        (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm] | Should -BeIn @($First, $Second) -Because 'one of the two ids is kept'
     }
 
     It 'keeps a good seeded id for a resource this run does not see' {
