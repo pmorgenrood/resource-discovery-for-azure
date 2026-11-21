@@ -637,14 +637,28 @@ Describe 'Names and types are kept as a run writes them' {
     }
 
     # A run keeps a last segment with no name after it as written, Azure's '$system' too
-    # (Service Bus bills '.../namespaces/<namespace>/$system'), so the offline mask takes it as
-    # a type word. '$system' with a name after it, and any other '$' word, are not Azure's form.
+    # ('.../namespaces/<token>/$system'), so the offline mask takes it as a type word to match
+    # (whether Azure bills that form is an open question for the owner). '$system' with a name
+    # after it, and any other '$' word, are not Azure's form.
     It 'takes a last type segment $system as Azure''s word, and no other $ word' {
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system' | Should -BeTrue
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$SYSTEM' | Should -BeTrue
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$system/x' | Should -BeFalse
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$systemx' | Should -BeFalse
         Test-RdaIdPathWord '/subscriptions/s/resourcegroups/g/providers/microsoft.servicebus/namespaces/ns-a/$other' | Should -BeFalse
+    }
+
+    # No fixture or captured billing row shows Azure billing '.../namespaces/<namespace>/$system',
+    # so the code and the doc give why the offline mask takes it (to match a run) and leave
+    # whether Azure bills it to the owner, rather than state it as fact.
+    It 'says, in its code and its doc, that it takes a trailing $system type word to match a run, and that whether Azure bills it is open' {
+        $Root = Split-Path $PSScriptRoot -Parent
+        foreach ($File in 'Functions/OfflineObfuscation.Functions.ps1', 'docs/offline-obfuscate.md')
+        {
+            $Text = ([System.IO.File]::ReadAllText((Join-Path $Root $File)) -replace '(?m)^\s*#\s?', ' ' -replace '\s+', ' ') -replace '[`'']', ''
+            $Text | Should -Match ([regex]::Escape('a run keeps a trailing $system type word as written (.../namespaces/<token>/$system), so the offline mask accepts it to match. Whether Azure bills that form is an open question for the owner: no fixture or captured billing row shows it.')) -Because "$File gives the reason and leaves the billing form open"
+            $Text | Should -Not -Match 'Service Bus bills \.\.\./namespaces/<namespace>/\$system' -Because "$File does not state that form as fact"
+        }
     }
 }
 

@@ -2089,8 +2089,9 @@ function Publish-RdaOfflineOutput
 # real name may equal an Azure type word (a group 'servers'). Upgrade to a list of Azure's
 # types if a report ever holds such a word.
 # A last segment with no name after it may also be Azure's fixed word '$system' (any case):
-# Service Bus bills '.../namespaces/<namespace>/$system', and a run keeps that last type
-# segment as written ('.../namespaces/<token>/$system'), so the offline mask does too.
+# a run keeps a trailing '$system' type word as written ('.../namespaces/<token>/$system'),
+# so the offline mask accepts it to match. Whether Azure bills that form is an open
+# question for the owner: no fixture or captured billing row shows it.
 function Test-RdaIdPathWord([string]$Id)
 {
     $Parts = $Id.Split('/')
