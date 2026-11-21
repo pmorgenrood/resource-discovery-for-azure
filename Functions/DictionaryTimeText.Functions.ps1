@@ -18,15 +18,14 @@
 # $Text: the dictionary file's text, as ConvertFrom-Json was given it.
 # $Times: each value ConvertFrom-Json read as a time, as
 #   [pscustomobject]@{ Map = <name of its map>; Entry = <its PSPropertyInfo> }.
-# $GeneratedAt (optional): the dictionary's GeneratedAt PSPropertyInfo.
 # The same text is read again by the reader ConvertFrom-Json uses
 # (Newtonsoft.Json, with its settings) with date handling off, so every key is
-# the same, and each noted value, and a GeneratedAt read as a time, gets back
-# the text the file holds. A caller reads the text again only for a dictionary
-# with such a value. A root that is a list of one object is read as that object,
-# as ConvertFrom-Json without -NoEnumerate gives it; when the root is not an
-# object after that, nothing is changed.
-function Restore-DictionaryTimeText([string]$Text, [System.Collections.Generic.List[object]]$Times, $GeneratedAt)
+# the same, and each noted value gets back the text the file holds. A caller
+# reads the text again only for a dictionary with such a value. A root that is
+# a list of one object is read as that object, as ConvertFrom-Json without
+# -NoEnumerate gives it; when the root is not an object after that, nothing is
+# changed.
+function Restore-DictionaryTimeText([string]$Text, [System.Collections.Generic.List[object]]$Times)
 {
     $Settings = [Newtonsoft.Json.JsonSerializerSettings]::new()
     $Settings.TypeNameHandling = [Newtonsoft.Json.TypeNameHandling]::None
@@ -42,5 +41,4 @@ function Restore-DictionaryTimeText([string]$Text, [System.Collections.Generic.L
     if ($Root -isnot [Newtonsoft.Json.Linq.JObject]) { return }
     $Ordinal = [System.StringComparison]::Ordinal
     foreach ($Time in $Times) { $Time.Entry.Value = $Root.GetValue($Time.Map, $Ordinal).GetValue($Time.Entry.Name, $Ordinal).Value }
-    if ($null -ne $GeneratedAt -and $GeneratedAt.Value -is [datetime]) { $GeneratedAt.Value = $Root.GetValue($GeneratedAt.Name, $Ordinal).Value }
 }

@@ -1721,6 +1721,19 @@ Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.p
     }
 }
 
+# Reveal is the one caller of Restore-DictionaryTimeText, and it passes the dictionary's
+# text and the values read as a time, nothing else.
+Describe 'Restore-DictionaryTimeText takes what its one caller passes' {
+    It 'has only the parameters Text and Times, and its file names no other one' {
+        $File = Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/DictionaryTimeText.Functions.ps1'
+        $Ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$null, [ref]$null)
+        $Fn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Restore-DictionaryTimeText' }, $false))
+        $Fn.Count | Should -Be 1
+        @($Fn[0].Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Should -Be @('Text', 'Times')
+        [System.IO.File]::ReadAllText($File) | Should -Not -Match 'GeneratedAt' -Because 'no caller passes a GeneratedAt'
+    }
+}
+
 # A folder name can hold [ or ], which -Path reads as a wildcard: '[ab]' matches
 # one 'a' or 'b'. Reveal finds, reads and writes the report zip, the dictionary,
 # the folder it searches for the dictionary, its temp folder and the files in it
