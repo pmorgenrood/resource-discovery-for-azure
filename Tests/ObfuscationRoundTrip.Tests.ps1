@@ -226,9 +226,10 @@ exit $LASTEXITCODE
     $script:O = if ($null -ne $script:Obf.Zip) { Read-Report $script:Obf.Zip.FullName } else { $null }
     $script:R = if (Test-Path -LiteralPath $script:RevealedZip) { Read-Report $script:RevealedZip } else { $null }
 
-    # Every real identifying value of the synthetic estate.
+    # Every real identifying value of the synthetic estate, and the fixed name
+    # '$system' of the Service Bus topic: a name part the masked files leave out too.
     $script:RealValues = @('12345678-1234-1234-1234-123456789012', 'Demo Subscription', 'rg-demo', 'sqlsrv-demo', 'sqldb-demo', 'pool-demo', 'vm-test-demo', 'disk-demo',
-        'sqldb-gone', 'rg-gone', 'sb-gone', 'mc_rg-aks_aks-gone_eastus', 'osdisk-gone', 'insights-gone')
+        'sqldb-gone', 'rg-gone', 'sb-gone', 'mc_rg-aks_aks-gone_eastus', 'osdisk-gone', 'insights-gone', '$system')
 }
 
 AfterAll {

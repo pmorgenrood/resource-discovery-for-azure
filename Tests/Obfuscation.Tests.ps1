@@ -212,7 +212,7 @@ Describe "Inventory ID Obfuscation" {
                 {
                     if ($null -ne $resource.Subscription) { $Parts[2] | Should -BeExactly $resource.Subscription -Because "the subscription segment of '$($resource.ID)' should be the record's Subscription token" }
                     if ($Parts.Count -gt 4 -and $Parts[3] -eq 'resourcegroups' -and $null -ne $resource.ResourceGroup) { $Parts[4] | Should -BeExactly $resource.ResourceGroup -Because "the resource group segment of '$($resource.ID)' should be the record's ResourceGroup token" }
-                    if ($null -ne $resource.Name -and $Parts[-1] -ne '$system') { $Parts[-1] | Should -BeExactly $resource.Name -Because "the last segment of '$($resource.ID)' should be the record's Name token" }
+                    if ($null -ne $resource.Name) { $Parts[-1] | Should -BeExactly $resource.Name -Because "the last segment of '$($resource.ID)' should be the record's Name token" }
                 }
             }
         }
@@ -306,7 +306,7 @@ Describe "Consumption Obfuscation" {
     # type. The pre-2026 behaviour replaced the whole URI with a flat token,
     # which broke AKS / VMSS / Container Instance / Container Registry / Kusto
     # detection on the dashboard. Tests must accept BOTH shapes:
-    #   - flat: prod_<guid>            (legacy / non-ARM uris like $system)
+    #   - flat: prod_<guid>            (legacy / non-ARM uris)
     #   - ARM:  /subscriptions/...     (the new structure-preserving shape, every
     #           name segment a token: Get-RdaObfuscatedIdPattern)
     # And separately enforce the no-leak invariants that actually matter.

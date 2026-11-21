@@ -127,11 +127,11 @@ Describe 'Get-ObfuscatedResourceId' {
         $Global:ResourceResourceGroupDictionary[$Id] | Should -BeExactly $Global:ObfuscationResourceGroupTokens['rg-demo']
     }
 
-    It 'masks a subscription-level id, keeps the name ''$system'', and gives an AKS-managed resource the aks_ hint' {
+    It 'masks a subscription-level id, gives the name ''$system'' a token, and gives an AKS-managed resource the aks_ hint' {
         $SubLevel = Get-ObfuscatedResourceId -ResourceId "/subscriptions/$script:Sub/providers/microsoft.insights/components/ai-a"
         $SubLevel | Should -Match ('^/subscriptions/' + $script:Token + '/providers/microsoft.insights/components/' + $script:Token + '$')
         $System = Get-ObfuscatedResourceId -ResourceId "$script:Base/microsoft.servicebus/namespaces/sb-a/topics/`$system"
-        ($System -split '/')[-1] | Should -BeExactly '$system'
+        ($System -split '/')[-1] | Should -Match ('^' + $script:Token + '$') -Because 'the contract leaves no name part as written, $system included'
         $Aks = Get-ObfuscatedResourceId -ResourceId "/subscriptions/$script:Sub/resourcegroups/mc_rg_aks_eastus/providers/microsoft.compute/disks/osdisk-a"
         ($Aks -split '/')[-1] | Should -Match '^(prod|nonprod)_aks_'
     }
@@ -507,11 +507,62 @@ Describe 'The seed is checked when it is read' {
         }
     }
 
-    It 'records no ''$system'' name token for a seeded Service Bus id that keeps it' {
+    It 'masks again a seeded Service Bus id that kept the name ''$system'', with the seed''s group token, and the next two seeded runs keep it' {
         $Sys = "$script:Base/microsoft.servicebus/namespaces/`$system"
-        Invoke-SeededRun -SeedMaps @{ ResourceIdMap = @{ "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.servicebus/namespaces/`$system" = $Sys } } -Rows @()
-        $Global:ResourceIdDictionary.ContainsKey($Sys) | Should -BeTrue
-        @($Global:ResourceNameDictionary.Values | Where-Object { $_ -eq '$system' }) | Should -BeNullOrEmpty
+        $RgTok = New-Tok
+        $Seed = @{
+            ResourceIdMap    = @{ "/subscriptions/$(New-Tok)/resourcegroups/$RgTok/providers/microsoft.servicebus/namespaces/`$system" = $Sys }
+            ResourceGroupMap = @{ $RgTok = $Sys }
+        }
+        $First = $null
+        Invoke-SeededRun -SeedMaps $Seed -Rows @()
+        (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly).ContainsKey($Sys) | Should -BeFalse -Because 'a run that does not see the resource does not carry the old id on'
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows @(New-Res $Sys)
+            $Id = (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Sys]
+            $Id | Should -Not -Match ([regex]::Escape('$system')) -Because "run $Run leaves no name part as written"
+            Test-ObfuscatedIdShape -RealId $Sys -MaskedId $Id | Should -BeTrue -Because "run $Run writes the contract shape"
+            ($Id -split '/')[-1] | Should -BeExactly $Global:ResourceNameDictionary[$Sys] -Because 'the name token is recorded, so the dictionary reverses it'
+            if ($Run -eq 1)
+            {
+                ($Id -split '/')[4] | Should -BeExactly $RgTok -Because 'the seed''s group token is kept'
+                $First = $Id
+            }
+            else { $Id | Should -BeExactly $First -Because "run $Run keeps run 1's id, letter for letter" }
+            $Seed = Get-RunDictionaryMaps
+        }
+    }
+
+    It 'gives a $system parent that the seeded ids give two tokens one new token, in its own id and its child''s, and the next two seeded runs keep both' {
+        # The namespace's own seeded id and its topic's give the one real
+        # '.../namespaces/$system' two tokens (a seed written before the slot
+        # check read a $system slot): both ids are dropped and masked again.
+        $Ns = "$script:Base/microsoft.servicebus/namespaces/`$system"
+        $Topic = "$Ns/topics/topic-a"
+        $P = "/subscriptions/$(New-Tok)/resourcegroups/$(New-Tok)/providers/microsoft.servicebus/namespaces"
+        $T1 = New-Tok; $T2 = New-Tok
+        $Seed = @{ ResourceIdMap = @{ "$P/$T1" = $Ns; "$P/$T2/topics/$(New-Tok)" = $Topic } }
+        $Parent = $null
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows @((New-Res $Ns), (New-Res $Topic))
+            $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
+            $NsId = $Ids[$Ns]; $TopicId = $Ids[$Topic]
+            foreach ($Pair in @(@($Ns, $NsId), @($Topic, $TopicId)))
+            {
+                $Pair[1] | Should -Not -Match ([regex]::Escape('$system')) -Because "run $Run leaves no name part as written"
+                Test-ObfuscatedIdShape -RealId $Pair[0] -MaskedId $Pair[1] | Should -BeTrue -Because "run $Run writes the contract shape"
+            }
+            ($TopicId -split '/')[8] | Should -BeExactly ($NsId -split '/')[-1] -Because "run $Run gives the namespace one token, in its own id and its topic's"
+            if ($Run -eq 1)
+            {
+                ($NsId -split '/')[-1] | Should -Not -BeIn @($T1, $T2) -Because 'a parent the seed gives two tokens starts again with a new one'
+                $Parent = ($NsId -split '/')[-1]
+            }
+            else { ($NsId -split '/')[-1] | Should -BeExactly $Parent -Because "run $Run keeps run 1's namespace token" }
+            $Seed = Get-RunDictionaryMaps
+        }
     }
 
     It 'takes the subscription and group tokens of the seeded ids over a map entry that disagrees' {
@@ -725,11 +776,12 @@ Describe 'Test-ObfuscatedIdShape' {
         $script:T = 'prod_0f0e0d0c-0b0a-4908-8706-050403020100'
     }
 
-    It 'takes what Get-ObfuscatedResourceId writes, a $system name and a tenant-scope id' {
+    It 'takes what Get-ObfuscatedResourceId writes, a $system name masked and a tenant-scope id' {
         Reset-ObfuscationState
         $Real = "$script:Base/microsoft.sql/servers/srv-a/databases/db-a"
         Test-ObfuscatedIdShape -RealId $Real -MaskedId (Get-ObfuscatedResourceId -ResourceId $Real) | Should -BeTrue
-        Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.servicebus/namespaces/`$system" -MaskedId "/subscriptions/$script:T/resourcegroups/$script:T/providers/microsoft.servicebus/namespaces/`$system" | Should -BeTrue
+        Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.servicebus/namespaces/`$system" -MaskedId "/subscriptions/$script:T/resourcegroups/$script:T/providers/microsoft.servicebus/namespaces/$script:T" | Should -BeTrue
+        Test-ObfuscatedIdShape -RealId "$script:Base/microsoft.servicebus/namespaces/`$system" -MaskedId "/subscriptions/$script:T/resourcegroups/$script:T/providers/microsoft.servicebus/namespaces/`$system" | Should -BeFalse -Because 'a kept $system is a name part left as written'
         Test-ObfuscatedIdShape -RealId '/providers/Microsoft.Capacity/reservationOrders/ro-a' -MaskedId "/providers/Microsoft.Capacity/reservationOrders/$script:T" | Should -BeTrue
     }
 

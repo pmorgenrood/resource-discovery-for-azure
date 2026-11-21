@@ -276,9 +276,12 @@ function Get-ObfuscatedResourceId
             $Masked.Add($Global:ObfuscationResourceGroupTokens[$Next])
             if (-not $ResourceResourceGroupDictionary.ContainsKey($ResourceId)) { $ResourceResourceGroupDictionary[$ResourceId] = $Global:ObfuscationResourceGroupTokens[$Next] }
         }
-        elseif ($Segment -ieq 'providers' -or [string]::IsNullOrEmpty($Next) -or $Next -eq '$system')
+        elseif ($Segment -ieq 'providers' -or [string]::IsNullOrEmpty($Next))
         {
-            # A provider namespace, an empty segment, or the fixed name '$system'.
+            # A provider namespace or an empty segment. A name slot that holds
+            # Azure's fixed name '$system' (Service Bus bills a '$system'
+            # namespace) gets a token like any other name: the contract leaves
+            # no name part as written.
             $Masked.Add($Next)
         }
         else
@@ -294,7 +297,7 @@ function Get-ObfuscatedResourceId
 
 # Whether $MaskedId is the masked form of $RealId that Get-ObfuscatedResourceId
 # writes: the same segments, with the subscription, the resource group and
-# every name segment a prod_/nonprod_ token (a '$system' name kept), and the
+# every name segment a prod_/nonprod_ token ('$system' included), and the
 # 'subscriptions', 'resourcegroups', 'providers', namespace and type segments
 # as in the real id (ignoring case). A seeded id from an older dictionary
 # (which masked only the last name, so a parent's real name was left) or a
@@ -326,7 +329,7 @@ function Test-ObfuscatedIdShape
         if ($M[$i] -ine $R[$i]) { return $false }
         if ($i + 1 -ge $R.Count) { break }
         $Next = $R[$i + 1]
-        if ($R[$i] -ieq 'providers' -or [string]::IsNullOrEmpty($Next) -or $Next -eq '$system')
+        if ($R[$i] -ieq 'providers' -or [string]::IsNullOrEmpty($Next))
         {
             if ($M[$i + 1] -ine $Next) { return $false }
         }
@@ -1870,7 +1873,7 @@ Function RunInventorySetup()
                 {
                     $Next = $RealParts[$i + 1]
                     if ($i -eq 3 -and $RealParts[1] -ieq 'subscriptions' -and $RealParts[$i] -ieq 'resourcegroups') { $Slots.Add([pscustomobject]@{ Kind = 'rg'; Real = $Next; Token = $MaskedParts[$i + 1] }) }
-                    elseif (-not ($RealParts[$i] -ieq 'providers' -or [string]::IsNullOrEmpty($Next) -or $Next -eq '$system')) { $Slots.Add([pscustomobject]@{ Kind = 'name'; Real = ($RealParts[0..($i + 1)] -join '/'); Token = $MaskedParts[$i + 1] }) }
+                    elseif (-not ($RealParts[$i] -ieq 'providers' -or [string]::IsNullOrEmpty($Next))) { $Slots.Add([pscustomobject]@{ Kind = 'name'; Real = ($RealParts[0..($i + 1)] -join '/'); Token = $MaskedParts[$i + 1] }) }
                     $i += 2
                 }
                 $SeedSlotsOf[$SeedRealId] = $Slots

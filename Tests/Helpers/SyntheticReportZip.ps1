@@ -42,8 +42,8 @@
 #     resource's id, consumption ResourceIds): the ARM id with its subscription,
 #     resource group and each resource name replaced by a token. Namespace and
 #     type segments are kept, the subscription and resource group tokens carry no
-#     type hint, and the fixed name '$system' is kept (Get-ObfuscatedResourceId
-#     in ResourceInventory.ps1).
+#     type hint, and the fixed name '$system' gets a token like any name
+#     (Get-ObfuscatedResourceId in ResourceInventory.ps1).
 function Get-RdaTokenPattern
 {
     '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -55,9 +55,10 @@ function Get-RdaTokenPattern
 # node group keeps its mc_ hint), name tokens may carry the databricks_/aks_/
 # vmss_ hint, provider and type segments stay as written. Shapes the contract
 # does not allow are accepted only by name, so a test says which it lets in:
-#   -AllowParked          G1: the Service Bus '$system' namespace name kept
-#                         as written; G2: a subscription-scope id with no
-#                         resourcegroups segment. Both parked with the owner.
+#   -AllowParked          G2: a subscription-scope id with no resourcegroups
+#                         segment, parked with the owner. (G1, the Service Bus
+#                         '$system' name kept as written, is masked now and
+#                         taken by no switch.)
 #   -AllowMetricFallback  F2: the metric fallback's own sub_/rg_ tokens
 #                         (Extension/Metrics.ps1), until it uses the shared ones.
 function Get-RdaContractIdPattern
@@ -70,10 +71,6 @@ function Get-RdaContractIdPattern
     $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
     if ($AllowParked)
     {
-        # G1: '$system' in any name slot of a Service Bus namespace id (the
-        # namespace itself, or a topic or queue under it), at least once.
-        $SbName = '(?:' + $P + $Guid + '|\$system)'
-        $Shapes += '^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + $Guid + '/providers/microsoft\.servicebus/namespaces/' + $SbName + '(?:/[a-z][a-z0-9.]*/' + $SbName + ')*$'
         $Shapes += '^/subscriptions/' + $P + $Guid + $Providers + '$'
     }
     if ($AllowMetricFallback)
@@ -88,7 +85,7 @@ function Get-RdaMaskedIdPattern
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:/providers/[^/]+(?:/[^/]+/(?:' + $Name + '|\$system))+)*$'
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)*$'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a

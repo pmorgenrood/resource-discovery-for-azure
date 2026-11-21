@@ -439,12 +439,13 @@ function Get-RdaRealValueSet
             & $Add $Parts[2]
             if ($Parts.Count -gt 4 -and $Parts[3] -ieq 'resourcegroups') { & $Add $Parts[4] }
             # After each 'providers' come the namespace and the type (Azure's words),
-            # then the name, then a child type and its name, and so on.
+            # then the name, then a child type and its name, and so on. Every name is
+            # a real value, Azure's fixed name '$system' too: a run gives it a token.
             $Providers = -1
             for ($i = 3; $i -lt $Parts.Count; $i++)
             {
                 if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
-                if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1 -and $Parts[$i] -ne '$system') { & $Add $Parts[$i] }
+                if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
             }
         }
     }
@@ -474,7 +475,7 @@ function Get-RdaRealValueSet
             for ($i = 3; $i -lt $Parts.Count; $i++)
             {
                 if ($Parts[$i] -ieq 'providers') { $Providers = $i; continue }
-                if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1 -and $Parts[$i] -ne '$system') { & $Add $Parts[$i] }
+                if ($Providers -ge 0 -and ($i - $Providers) -ge 3 -and (($i - $Providers) % 2) -eq 1) { & $Add $Parts[$i] }
             }
         }
     }

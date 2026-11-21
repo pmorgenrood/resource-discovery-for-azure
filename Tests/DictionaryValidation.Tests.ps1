@@ -48,7 +48,7 @@ BeforeAll {
     # token, so a real name left in any of them fails. Name tokens may carry
     # the databricks_/aks_/vmss_ type hint; provider and type segments stay as written.
     $MaskedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    # The shapes only the parked G1/G2 ids and the metric fallback (F2) write
+    # The shapes only the parked G2 ids and the metric fallback (F2) write
     # are let in by name (Get-RdaContractIdPattern); nothing else is.
     . (Join-Path $PSScriptRoot 'Helpers/SyntheticReportZip.ps1')
     $script:MaskedIdPattern = Get-RdaContractIdPattern -AllowParked -AllowMetricFallback

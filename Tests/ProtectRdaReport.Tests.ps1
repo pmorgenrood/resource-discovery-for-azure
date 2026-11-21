@@ -322,6 +322,37 @@ Describe 'The masked-field check, the real values and the exempt words' {
         $Set.Contains('serverfarms') | Should -BeFalse
     }
 
+    It 'takes a $system name part from <Source> as a real value, so an inventory row or metric record that kept it stops the slot check' -ForEach @(
+        @{ Source = 'the run''s dictionaries' }
+        @{ Source = 'a full id passed in' }
+    ) {
+        $Saved = @{}
+        foreach ($N in 'ResourceIdDictionary', 'ResourceNameDictionary', 'ResourceSubscriptionDictionary', 'ResourceResourceGroupDictionary', 'ObfuscationSubscriptionTokens', 'ObfuscationResourceGroupTokens', 'TagValueDictionary', 'FreeTextDictionary') { $Saved[$N] = Get-Variable -Scope Global -Name $N -ValueOnly -ErrorAction SilentlyContinue; Set-Variable -Scope Global -Name $N -Value $null }
+        try
+        {
+            # A Service Bus namespace named '$system' in a group of another name, so
+            # only the name part can bring '$system' into the set.
+            $Real = '/subscriptions/33333333-3333-3333-3333-333333333333/resourcegroups/rg-bus-01/providers/microsoft.servicebus/namespaces/$system'
+            if ($Source -like '*dictionaries')
+            {
+                $Ids = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                $Ids[$Real] = 'masked'
+                Set-Variable -Scope Global -Name ResourceIdDictionary -Value $Ids
+                $Set = Get-RdaRealValueSet
+            }
+            else { $Set = Get-RdaRealValueSet -ExtraValue $Real }
+            $Tok = 'prod_11111111-1111-1111-1111-111111111111'
+            $Kept = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.servicebus/namespaces/`$system"
+            $Row = @{ ID = $Kept; Name = $Tok; ResourceGroup = $Tok; Subscription = $Tok }
+            Test-RdaMaskedSlot -Row $Row -Field 'ID', 'Name', 'ResourceGroup', 'Subscription', 'Tags' -RealValue $Set | Should -Be @('ID') -Because 'an inventory row whose id kept $system'
+            $Rec = @{ ID = "$Kept/topics/$Tok"; Name = $Tok; ResourceGroup = $Tok; Subscription = $Tok }
+            Test-RdaMaskedSlot -Row $Rec -Field 'ID', 'Name', 'ResourceGroup', 'Subscription' -RealValue $Set | Should -Be @('ID') -Because 'a metric record whose id kept $system as a parent name'
+            Test-RdaMaskedSlot -Row @{ ID = "/subscriptions/$Tok/resourcegroups/$Tok/providers/microsoft.servicebus/namespaces/$Tok/topics/$Tok"; Name = $Tok } -Field 'ID', 'Name' -RealValue $Set | Should -BeNullOrEmpty -Because 'the masked id holds tokens only'
+            $Set.Contains('$system') | Should -BeTrue -Because 'a masked report leaves no name part as written, $system included'
+        }
+        finally { foreach ($N in $Saved.Keys) { Set-Variable -Scope Global -Name $N -Value $Saved[$N] } }
+    }
+
     It 'takes no value of a list a rule masks inside (a cloud service''s Roles) as an Azure word' {
         $Exempt = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $Rows = @{ CloudServices = @(@{ ID = 'x'; Name = 'n'; Location = 'eastus'; Roles = @(@{ RoleName = 'contoso-api-web'; SkuName = 'standard_d2' }) }) }
@@ -1876,6 +1907,49 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Rec[0]['ResourceGroup'] | Should -Be ($Rec[0]['ID'].Split('/')[4]) -Because 'the record joins by name, group and subscription when ids do not match'
         $M.Dict.ResourceGroupMap[$Rec[0]['ResourceGroup']] | Should -Match '/resourcegroups/rg-extra-01(/|$)'
         $Rec[0]['Name'] | Should -Be ($Rec[0]['ID'].Split('/')[-1])
+    }
+
+    It 'masks a Service Bus namespace named $system and its topic in the inventory, metrics and consumption, with no $system left in any of them' {
+        $Sys = '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-demo/providers/microsoft.servicebus/namespaces/$system'
+        $SbRow = '{"ID":"' + $Sys + '","Subscription":"Demo Subscription","ResourceGroup":"rg-demo","Name":"$system","Location":"eastus","SKU":"Standard","Status":"Active","GeoRep":false,"ThroughputUnits":null,"CreatedTime":"2024-03-15 09:41"}'
+        $SbMetric = '{"ID":"' + $Sys + '","Subscription":"Demo Subscription","ResourceGroup":"rg-demo","Name":"$system","Location":"eastus","Service":"Service Bus","Metric":"IncomingMessages","MetricAggregate":"Total","MetricTimeGrain":"01:00:00","MetricMeasure":"Total","MetricPercentile":0,"MetricValue":0,"MetricCount":0,"MetricTotalCount":0,"MetricSeries":0,"MetricError":false}'
+        $Zip = & $script:Change @{
+            'Inventory_*.json' = {
+                param($T)
+                foreach ($Empty in '"ServiceBUS":[]', '"ServiceBUS":null') { if ($T.Contains($Empty)) { return $T.Replace($Empty, '"ServiceBUS":[' + $SbRow + ']') } }
+                throw 'the plain inventory has no empty ServiceBUS section to add the namespace to'
+            }
+            'Metrics_*.json'   = {
+                param($T)
+                if (-not $T.StartsWith('{"Metrics":[')) { throw 'the plain metrics file does not start as a run writes it' }
+                $Rest = $T.Substring('{"Metrics":['.Length)
+                '{"Metrics":[' + $SbMetric + $(if ($Rest.StartsWith(']')) { '' } else { ',' }) + $Rest
+            }
+            'Consumption_*.csv' = {
+                param($T)
+                $Lines = [System.Collections.Generic.List[string]]($T -split "`n")
+                $Vm = @($Lines | Where-Object { $_.Contains('/microsoft.compute/virtualmachines/vm-demo"') })[0]
+                if ($null -eq $Vm) { throw 'the plain consumption file has no vm-demo row to copy' }
+                $Row = $Vm.Replace('microsoft.compute/virtualmachines/vm-demo', 'microsoft.servicebus/namespaces/$system').Replace('"Virtual Machines"', '"Service Bus"')
+                $Lines.Insert(1, $Row)
+                $Lines.Insert(2, $Row.Replace('namespaces/$system', 'namespaces/$system/topics/topic-demo'))
+                $Lines -join "`n"
+            }
+        }
+        $M = & $script:Masked $Zip
+        foreach ($Member in @($M.Members.Keys | Where-Object { $_ -like 'Inventory_*' -or $_ -like 'Metrics_*' -or $_ -like 'Consumption_*' }))
+        {
+            $M.Members[$Member].IndexOf('$system', [System.StringComparison]::OrdinalIgnoreCase) | Should -Be -1 -Because "the masked $Member leaves no name part as written"
+        }
+        $MaskedSb = @($M.Dict.ResourceIdMap.Keys | Where-Object { $M.Dict.ResourceIdMap[$_] -eq $Sys })
+        $MaskedSb.Count | Should -Be 1 -Because 'one masked id for the namespace, which Reveal maps back'
+        $Inv = ConvertFrom-RdaJsonText -Text $M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Inventory_*' })[0]]
+        @($Inv['ServiceBUS'])[0]['ID'] | Should -BeExactly $MaskedSb[0] -Because 'the inventory id is the dictionary key'
+        $Records = (ConvertFrom-RdaJsonText -Text $M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Metrics_*' })[0]])['Metrics']
+        @($Records | Where-Object { $_['ID'] -ceq $MaskedSb[0] }).Count | Should -Be 1 -Because 'the metric record joins the inventory row by id'
+        $Usage = @($M.Members[@($M.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
+        @($Usage | Where-Object { $_.ResourceId -ceq $MaskedSb[0] }).Count | Should -Be 1 -Because 'the consumption row joins the inventory row by id'
+        @($Usage | Where-Object { $_.ResourceId.StartsWith($MaskedSb[0] + '/topics/') }).Count | Should -Be 1 -Because 'the topic holds its namespace''s masked path'
     }
 
     It 'labels the page of a report over several subscriptions with their count, as the run does' {
