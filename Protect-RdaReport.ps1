@@ -542,8 +542,10 @@ try
         }
         else
         {
-            $Columns = @(($Header.TrimStart([char]0xFEFF) -replace '"', '') -split ',')
-            if (($Columns -join ',') -cne ($Shape.ConsumptionColumns -join ',')) { Stop-RdaOfflineMask ("{0}: the consumption file's columns are not the ones a run writes. Nothing was written." -f $ReportZip.Name) }
+            # Each name as the header holds it, read as CSV (a name with a '"' written twice is
+            # that name, not the one with the quotes taken out), and in the run's order.
+            $Columns = ConvertFrom-RdaCsvHeaderLine ($Header.TrimStart([char]0xFEFF))
+            if ($null -eq $Columns -or -not [System.Linq.Enumerable]::SequenceEqual([string[]]$Columns, [string[]]$Shape.ConsumptionColumns, [System.StringComparer]::Ordinal)) { Stop-RdaOfflineMask ("{0}: the consumption file's columns are not the ones a run writes. Nothing was written." -f $ReportZip.Name) }
             # Import-Csv drops a cell past the header's count, so each record's cells are counted first.
             Initialize-RdaOfflineType
             $BadRecord = [RdaCsvCheck]::FirstBadRecord($CsvIn, $Columns.Count)

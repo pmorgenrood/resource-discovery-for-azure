@@ -1639,6 +1639,12 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
         @{ Case = 'a metric record with MetricError as text'; Kind = 'metric-type'; Says = 'is not the shape a run writes' }
         @{ Case = 'an InstanceData value without one of main''s 18 fields'; Kind = 'info-key'; Says = 'not the shape a run writes' }
         @{ Case = 'usage of a subscription the report does not name'; Kind = 'other-sub'; Says = 'subscription the report does not name' }
+        @{ Case = 'a consumption header that writes MeterCategory with a quote in it written twice (the name is Meter"Category)'; Kind = 'head-quote'; Says = 'columns are not the ones a run writes' }
+        @{ Case = 'a consumption header with text after the closing quote of a name'; Kind = 'head-after-quote'; Says = 'columns are not the ones a run writes' }
+        @{ Case = 'a consumption header with a quote inside a plain name'; Kind = 'head-plain-quote'; Says = 'columns are not the ones a run writes' }
+        @{ Case = 'a consumption header that names ResourceId twice'; Kind = 'head-twice'; Says = 'columns are not the ones a run writes' }
+        @{ Case = 'a consumption header without MeterCategory'; Kind = 'head-missing'; Says = 'columns are not the ones a run writes' }
+        @{ Case = 'a consumption header that holds two names in one quoted cell'; Kind = 'head-comma'; Says = 'columns are not the ones a run writes' }
     ) {
         $In = switch ($Kind)
         {
@@ -1685,6 +1691,13 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
             'info-key' { & $script:Planted 'Consumption_*.csv' { param($T) $T -replace '""AHB"":""[^"]*"",', '' } }
             'cut-row' { & $script:Planted 'Consumption_*.csv' { param($T) $L = @($T.TrimEnd() -split "`r?`n"); $L[-1] = $L[-1] -replace '(,[^,]*){3}$', ''; ($L -join "`n") + "`n" } }
             'other-sub' { & $script:Planted 'Consumption_*.csv' { param($T) $L = @($T.TrimEnd() -split "`r?`n"); $L[-1] = $L[-1] -replace '12345678-1234-1234-1234-123456789012', '99999999-9999-9999-9999-999999999999'; ($L -join "`n") + "`n" } }
+            # The header only (its first line) is changed; each case checks that it was.
+            { $_ -like 'head-*' }
+            {
+                $Swap = @{ 'head-quote' = @('"MeterCategory"', '"Meter""Category"'); 'head-after-quote' = @('"MeterName"', '"Meter"Name'); 'head-plain-quote' = @('"MeterId"', 'Meter"Id'); 'head-twice' = @('"Unit"', '"ResourceId"'); 'head-missing' = @('"MeterCategory",', ''); 'head-comma' = @('"MeterSubCategory","', '"MeterSubCategory,') }[$Kind]
+                $script:HeadSwap = $Swap
+                & $script:Planted 'Consumption_*.csv' { param($T) $L = $T -split "`n", 2; $New = $L[0].Replace($script:HeadSwap[0], $script:HeadSwap[1]); if ($New -ceq $L[0]) { throw 'the header was not changed' }; $New + "`n" + $L[1] }
+            }
             { $_ -in 'crc', 'cut-zip' }
             {
                 $Copy = Join-Path $script:Work ([guid]::NewGuid().ToString('N') + '.zip')
