@@ -1818,7 +1818,11 @@ Function RunInventorySetup()
         #   holding it dropped. A SQL VM and its VM count as one resource.
         #   A group's token that an older dictionary also gave the name after
         #   a type word resourceGroups in a tenant-scope id is kept for the
-        #   group, and only those tenant-scope ids are dropped.
+        #   group, and only those tenant-scope ids are dropped;
+        # - a tag or free-text token that the seed also uses in a path, or for
+        #   another tag or free-text value, is kept for the path only: those
+        #   tag and free-text values get new tokens, so Reveal of one field
+        #   does not rewrite another.
         if (-not [string]::IsNullOrEmpty($ObfuscationDictionary))
         {
             # The seed's maps first: a group or name token that is not of its
@@ -1838,6 +1842,42 @@ Function RunInventorySetup()
                 if ($null -eq $SeedValueMap) { continue }
                 foreach ($K in @($SeedValueMap.Keys)) { if ([string]$SeedValueMap[$K] -cnotmatch ('^(prod|nonprod)_' + $SeedGuid + '$') -or [string]$SeedValueMap[$K] -ieq [string]$K) { [void]$SeedValueMap.Remove($K) } }
             }
+            # A tag or free-text token stands for one value, as a path token does. Reveal
+            # replaces a token wherever it stands, so a token the seed also uses in a path
+            # (a subscription, group or name slot of any seeded id, a flat id token, a group
+            # or name map entry), or for a value of the other map or another value, would
+            # reveal one meaning as the other. The path token is kept (ids join on it), and
+            # every tag and free-text entry that holds such a token is not kept, so this run
+            # gives those values new tokens and the dictionary it writes shares none.
+            # (Ignoring case, as a token is matched; the seed's ids are read as given,
+            # before the check below drops any, so no token of the seed is shared.)
+            $SeedValueOwners = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($SeedValueMap in @($Global:TagValueDictionary, $Global:FreeTextDictionary))
+            {
+                if ($null -eq $SeedValueMap) { continue }
+                foreach ($V in @($SeedValueMap.Values)) { $SeedValueOwners[[string]$V] = 1 + $(if ($SeedValueOwners.ContainsKey([string]$V)) { $SeedValueOwners[[string]$V] } else { 0 }) }
+            }
+            if ($SeedValueOwners.Count -gt 0)
+            {
+                $SeedValueShared = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($T in @($SeedValueOwners.Keys)) { if ($SeedValueOwners[$T] -gt 1) { [void]$SeedValueShared.Add($T) } }
+                foreach ($SeedMasked in @($ResourceIdDictionary.Values)) { foreach ($SeedPart in ([string]$SeedMasked).Split('/')) { if ($SeedValueOwners.ContainsKey($SeedPart)) { [void]$SeedValueShared.Add($SeedPart) } } }
+                foreach ($SeedPathMap in @($SubLookup, $RgLookup, $ResourceNameDictionary, $ResourceSubscriptionDictionary, $ResourceResourceGroupDictionary))
+                {
+                    if ($null -eq $SeedPathMap) { continue }
+                    foreach ($V in @($SeedPathMap.Values)) { if ($SeedValueOwners.ContainsKey([string]$V)) { [void]$SeedValueShared.Add([string]$V) } }
+                }
+                if ($SeedValueShared.Count -gt 0)
+                {
+                    foreach ($SeedValueMap in @($Global:TagValueDictionary, $Global:FreeTextDictionary))
+                    {
+                        if ($null -eq $SeedValueMap) { continue }
+                        foreach ($K in @($SeedValueMap.Keys)) { if ($SeedValueShared.Contains([string]$SeedValueMap[$K])) { [void]$SeedValueMap.Remove($K) } }
+                    }
+                }
+            }
+            $SeedValueOwners = $null
+            $SeedValueShared = $null
             $SeedSlotTokens = @{}
             $SeedSlotsOf = @{}
             $SeedSubTokenIds = @{}
