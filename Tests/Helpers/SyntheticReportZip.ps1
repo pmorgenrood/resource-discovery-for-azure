@@ -44,9 +44,17 @@
 #     type segments are kept, the subscription and resource group tokens carry no
 #     type hint, and the fixed name '$system' gets a token like any name
 #     (Get-ObfuscatedResourceId in ResourceInventory.ps1).
+# Every pattern here ends at '\z', the end of the text: '$' also matches just before
+# a last line feed, so it would take a token or an id with a line feed after it. The
+# run's own token checks end at '\z' too (Test-ObfuscatedIdShape).
+# -Unanchored gives the token form with no '^' or '\z', for a test that puts a token
+# inside a larger pattern.
 function Get-RdaTokenPattern
 {
-    '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    param([switch]$Unanchored)
+    $Token = '(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    if ($Unanchored) { return $Token }
+    return ('^' + $Token + '\z')
 }
 
 # The masked id shape the output contract asks for, for the zip-backed tests:
@@ -74,14 +82,14 @@ function Get-RdaContractIdPattern
     $P = '(?:prod|nonprod)_'
     $Names = '(?:/[a-z][a-z0-9.]*/' + $P + '(?:databricks_|aks_|vmss_)?' + $Guid + ')+'
     $Providers = '/providers/[a-z][a-z0-9.]*' + $Names
-    $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '$')
+    $Shapes = @('^/subscriptions/' + $P + $Guid + '/resourcegroups/' + $P + '(?:mc_)?' + $Guid + $Providers + '\z')
     if ($AllowParked)
     {
-        $Shapes += '^/subscriptions/' + $P + $Guid + $Providers + '$'
+        $Shapes += '^/subscriptions/' + $P + $Guid + $Providers + '\z'
     }
     if ($AllowMetricFallback)
     {
-        $Shapes += '^/subscriptions/' + $P + 'sub_' + $Guid + '(?:/resourcegroups/' + $P + 'rg_(?:mc_)?' + $Guid + ')?' + $Providers + '$'
+        $Shapes += '^/subscriptions/' + $P + 'sub_' + $Guid + '(?:/resourcegroups/' + $P + 'rg_(?:mc_)?' + $Guid + ')?' + $Providers + '\z'
     }
     return ('(?i)(?:' + ($Shapes -join '|') + ')')
 }
@@ -92,7 +100,7 @@ function Get-RdaMaskedIdPattern
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+)?$'
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+)?\z'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a

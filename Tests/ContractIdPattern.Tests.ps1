@@ -27,6 +27,7 @@ BeforeAll {
         SystemOther  = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.storage/storageaccounts/`$system"
         SubTokenOnly = "/subscriptions/prod_sub_$G/resourcegroups/prod_$G/providers/microsoft.compute/virtualmachines/prod_$G"
         Flat         = "prod_$G"
+        TokenHint    = "nonprod_vmss_$G"
         RealName     = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.compute/virtualmachines/vm-web-01"
         NoProvider   = "/subscriptions/prod_$G/resourcegroups/prod_$G"
         FlatSentinel = "obfuscated_$G"
@@ -105,6 +106,52 @@ Describe 'Get-RdaMaskedIdPattern' {
 
     It 'writes a name slot as the name token itself, with no group of one alternative around it' {
         (Get-RdaMaskedIdPattern) | Should -Not -Match ([regex]::Escape('/(?:(?:prod|nonprod)_'))
+    }
+}
+
+# Each pattern ends at '\z', the end of the text. '$' also matches just before a last
+# line feed, so it would take a token or an id with a line feed after it, which is no
+# token or id that downstream joins on. The run's own token checks end at '\z' too
+# (Test-ObfuscatedIdShape in ResourceInventory.ps1).
+Describe 'The token and id patterns end at the end of the text, not before a last line feed' {
+
+    It 'refuses <Id> with a line feed after it, in <Command> <Switches>, and takes it without' -ForEach @(
+        @{ Id = 'Flat'; Command = 'Get-RdaTokenPattern'; Switches = @() }
+        @{ Id = 'TokenHint'; Command = 'Get-RdaTokenPattern'; Switches = @() }
+        @{ Id = 'Contract'; Command = 'Get-RdaMaskedIdPattern'; Switches = @() }
+        @{ Id = 'ContractKid'; Command = 'Get-RdaMaskedIdPattern'; Switches = @() }
+        @{ Id = 'G2NoRg'; Command = 'Get-RdaMaskedIdPattern'; Switches = @() }
+        @{ Id = 'Contract'; Command = 'Get-RdaObfuscatedIdPattern'; Switches = @() }
+        @{ Id = 'Flat'; Command = 'Get-RdaObfuscatedIdPattern'; Switches = @() }
+        @{ Id = 'Contract'; Command = 'Get-RdaContractIdPattern'; Switches = @() }
+        @{ Id = 'ContractMc'; Command = 'Get-RdaContractIdPattern'; Switches = @() }
+        @{ Id = 'ContractKid'; Command = 'Get-RdaContractIdPattern'; Switches = @() }
+        @{ Id = 'G2NoRg'; Command = 'Get-RdaContractIdPattern'; Switches = @('AllowParked') }
+        @{ Id = 'F2Fallback'; Command = 'Get-RdaContractIdPattern'; Switches = @('AllowMetricFallback') }
+        @{ Id = 'Contract'; Command = 'Get-RdaContractIdPattern'; Switches = @('AllowParked', 'AllowMetricFallback') }
+    ) {
+        $Splat = @{}
+        foreach ($Name in $Switches) { $Splat[$Name] = $true }
+        $Pattern = & $Command @Splat
+        $script:Ids[$Id] | Should -Match $Pattern
+        ($script:Ids[$Id] + "`n") | Should -Not -Match $Pattern -Because 'a line feed is no part of a token or an id'
+    }
+
+    It 'refuses, in the copy in Tests/Helpers/ContractIdPattern.ps1, <_> with a line feed after it, and takes it without' -ForEach @('Contract', 'ContractMc', 'ContractKid') {
+        # The copy is loaded in a child scope, so it does not replace this file's function.
+        $Copy = & {
+            . (Join-Path $PSScriptRoot 'Helpers/ContractIdPattern.ps1')
+            [pscustomobject]@{ File = (Get-Command -Name 'Get-RdaContractIdPattern').ScriptBlock.File; Pattern = Get-RdaContractIdPattern }
+        }
+        Split-Path -Leaf $Copy.File | Should -BeExactly 'ContractIdPattern.ps1'
+        $script:Ids[$_] | Should -Match $Copy.Pattern
+        ($script:Ids[$_] + "`n") | Should -Not -Match $Copy.Pattern -Because 'a line feed is no part of an id'
+    }
+
+    It 'gives the token form with no anchors with -Unanchored, for a test that puts a token inside a larger pattern' {
+        $Body = Get-RdaTokenPattern -Unanchored
+        ('^' + $Body + '\z') | Should -BeExactly (Get-RdaTokenPattern)
+        ('DOCKER|{0}.azurecr.io/{1}:1.2.3' -f $script:Ids.Flat, $script:Ids.TokenHint) | Should -Match ('^DOCKER\|{0}\.azurecr\.io/{0}:1\.2\.3\z' -f $Body)
     }
 }
 

@@ -1817,7 +1817,7 @@ Describe 'Protect-RdaReport.ps1 on the synthetic estate' {
         {
             $Masked = & $Site $Zip
             $Value = $Masked['properties'][0]['value']
-            $T = (Get-RdaTokenPattern).TrimStart('^').TrimEnd('$')
+            $T = Get-RdaTokenPattern -Unanchored
             $Value | Should -Match ('^DOCKER\|{0}\.azurecr\.io/{0}-{0}/{0}:1\.2\.3$' -f $T) -Because $Zip
             $Masked['properties'][0]['name'] | Should -Be 'LinuxFxVersion'
             $Masked['properties'][1]['value'] | Should -BeNullOrEmpty
@@ -3176,7 +3176,7 @@ Describe 'Protect-RdaReport.ps1 writes the rows whose usage is not counted as a 
         $Index['Offline'][0] | Should -Be $Index['Live'][0] -Because 'the row keeps its place'
         $Lines['Offline'][0] | Should -BeExactly $Lines['Live'][0] -Because 'the header is the run''s'
         # The same bytes, each token (the two sides' tokens differ by design) written as <t>.
-        $T = (Get-RdaTokenPattern).TrimStart('^').TrimEnd('$')
+        $T = Get-RdaTokenPattern -Unanchored
         $Bytes = foreach ($Side in 'Live', 'Offline') { , [Text.Encoding]::UTF8.GetBytes(($Lines[$Side][$Index[$Side][0] + 1] -replace $T, '<t>')) }
         [Convert]::ToBase64String($Bytes[1]) | Should -BeExactly ([Convert]::ToBase64String($Bytes[0])) -Because ('offline = live for a row with ' + $Label)
         # Every other line too: the header and each row, the same bytes, tokens aside.
