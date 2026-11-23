@@ -497,16 +497,16 @@ Describe 'The seed is checked when it is read' {
         $Warn | Should -Match 'those values get new tokens this run'
         $Warn | Should -Match '\b2 seeded id\(s\) of another shape, or holding a subscription, resource group or parent with two tokens, or a token two subscriptions, groups or resources share, were not kept' -Because 'the two flat ids are counted among the seeded ids not kept'
         foreach ($Real in 'tag-good', 'tag-form', 'tag-shared', 'text good', 'text form', 'text shared', 'flat-id-form', 'flat-id-shared', 'vm-w') { $Warn | Should -Not -Match ([regex]::Escape($Real)) -Because 'a warning holds no real value' }
-        @($Global:TagValueDictionary.Keys) | Should -Be @('tag-good')
-        @($Global:FreeTextDictionary.Keys) | Should -Be @('text good')
+        @((Get-Variable -Scope Global -Name TagValueDictionary -ValueOnly).Keys) | Should -Be @('tag-good')
+        @((Get-Variable -Scope Global -Name FreeTextDictionary -ValueOnly).Keys) | Should -Be @('text good')
     }
 
     It 'writes no warning about tag or free-text entries when the seed''s are all kept' {
         $script:SeedWarnings.Clear()
         Invoke-SeededRun -SeedMaps @{ TagMap = @{ (New-Tok) = 'tag-good' }; FreeTextMap = @{ (New-Tok) = 'text good' } } -Rows @()
         ($script:SeedWarnings -join "`n") | Should -Not -Match 'free-text mapping'
-        @($Global:TagValueDictionary.Keys) | Should -Be @('tag-good')
-        @($Global:FreeTextDictionary.Keys) | Should -Be @('text good')
+        @((Get-Variable -Scope Global -Name TagValueDictionary -ValueOnly).Keys) | Should -Be @('tag-good')
+        @((Get-Variable -Scope Global -Name FreeTextDictionary -ValueOnly).Keys) | Should -Be @('text good')
     }
 
     It 'keeps a good seeded id for a resource this run does not see' {
@@ -588,7 +588,7 @@ Describe 'The seed is checked when it is read' {
             $Id = (Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Sys]
             $Id | Should -Not -Match ([regex]::Escape('$system')) -Because "run $Run leaves no name part as written"
             Test-ObfuscatedIdShape -RealId $Sys -MaskedId $Id | Should -BeTrue -Because "run $Run writes the contract shape"
-            ($Id -split '/')[-1] | Should -BeExactly $Global:ResourceNameDictionary[$Sys] -Because 'the name token is recorded, so the dictionary reverses it'
+            ($Id -split '/')[-1] | Should -BeExactly (Get-Variable -Scope Global -Name ResourceNameDictionary -ValueOnly)[$Sys] -Because 'the name token is recorded, so the dictionary reverses it'
             if ($Run -eq 1)
             {
                 ($Id -split '/')[4] | Should -BeExactly $RgTok -Because 'the seed''s group token is kept'
@@ -1032,12 +1032,13 @@ Describe 'The seed is checked when it is read' {
                 ($Parts[0..3] -join '/') | Should -BeExactly (($Pair[0] -split '/')[0..3] -join '/') -Because 'the provider and type words are kept as written'
                 $Parts[4] | Should -Match ('^' + $script:Token + '$')
                 $Parts[4] | Should -Not -BeExactly $GroupToken -Because "run $Run gives the name its own token, not the token of the real group grp-a"
-                $Parts[4] | Should -BeExactly $Global:ResourceNameDictionary[$Pair[0]] -Because 'the name token is recorded, so the dictionary reverses it'
+                $Parts[4] | Should -BeExactly (Get-Variable -Scope Global -Name ResourceNameDictionary -ValueOnly)[$Pair[0]] -Because 'the name token is recorded, so the dictionary reverses it'
                 Test-ObfuscatedIdShape -RealId $Pair[0] -MaskedId $Pair[1] | Should -BeTrue -Because "run $Run writes the shape the seed check keeps"
             }
             # The tenant-scope row has no group: its group field never takes its name token.
-            $Global:ResourceResourceGroupDictionary[$TenInv] | Should -Not -BeExactly ($Now.Inv -split '/')[4] -Because "run $Run reads a group token only from a subscription id's group slot"
-            $Global:ResourceResourceGroupDictionary[$TenInv] | Should -Not -BeExactly $GroupToken
+            $Groups = Get-Variable -Scope Global -Name ResourceResourceGroupDictionary -ValueOnly
+            $Groups[$TenInv] | Should -Not -BeExactly ($Now.Inv -split '/')[4] -Because "run $Run reads a group token only from a subscription id's group slot"
+            $Groups[$TenInv] | Should -Not -BeExactly $GroupToken
             if ($Run -eq 1) { $First = $Now }
             else
             {
@@ -1106,7 +1107,7 @@ Describe 'The seed is checked when it is read' {
         $Vm = "/subscriptions/$script:Sub/resourcegroups/grp-a/providers/microsoft.compute/virtualmachines/vm-new"
         $Tok = New-Tok
         Invoke-SeededRun -SeedMaps @{ ResourceIdMap = @{}; ResourceGroupMap = @{ $Tok = $Value } } -Rows @(New-Res $Vm)
-        $Group = ($Global:ResourceIdDictionary[$Vm] -split '/')[4]
+        $Group = ((Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm] -split '/')[4]
         $Group | Should -Match ('^' + $script:Token + '$')
         if ($Reused) { $Group | Should -BeExactly $Tok -Because 'the seed names the real group grp-a' }
         else { $Group | Should -Not -BeExactly $Tok -Because 'the seed names no group grp-a, only a tenant-scope id''s type word and name' }

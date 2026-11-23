@@ -581,7 +581,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
         # '{Name}' in a case's text -> the token or value it stands for, at run time.
         function Expand-SlotText
         {
-            param([string]$Text, [switch]$Upper)
+            param([string]$Text)
             $Values = @{
                 Sub = $script:TokSub; Rg = $script:TokRg; RgAks = $script:TokRgAks; RgCase = $script:TokRgCase; Name = $script:TokName; Fab = $script:TokFabName
                 Tag = $script:TokTag; Free = $script:TokFree; Id = $script:TokId; RealSub = $script:SlotRealSub; OtherSub = $script:SlotOtherSub
@@ -592,7 +592,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
             return $Text
         }
         # The test dictionary with the case's ids added to ResourceIdMap (and names to ResourceNameMap).
-        function New-SlotDictionary
+        function Write-SlotDictionary
         {
             param([object[]]$Ids, [object[]]$Names)
             $Dir = Join-Path $script:TmpDir ("slot_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -634,7 +634,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
         }
     ) {
         $Token = Expand-SlotText $Tok
-        $Dict = New-SlotDictionary -Ids $Ids
+        $Dict = Write-SlotDictionary -Ids $Ids
         $Out = Join-Path $Dict.Dir 'out.zip'
         $Splat = @{ InputZip = $script:InputZip; DictionaryPath = $Dict.File; OutputZip = $Out }
         if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceGroup') }
@@ -682,7 +682,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
         }
     ) {
         $Token = Expand-SlotText $Tok
-        $Dict = New-SlotDictionary -Ids $Ids -Names $Names
+        $Dict = Write-SlotDictionary -Ids $Ids -Names $Names
         $Out = Join-Path $Dict.Dir 'out.zip'
         $Splat = @{ InputZip = $script:InputZip; DictionaryPath = $Dict.File; OutputZip = $Out }
         if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceName') }
@@ -713,7 +713,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
         @{ Mode = '-Fields ResourceName' }
         @{ Mode = '-All' }
     ) {
-        $Dict = New-SlotDictionary -Ids @(@{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01/reservations/r01' })
+        $Dict = Write-SlotDictionary -Ids @(@{ M = '/providers/Microsoft.Capacity/reservationOrders/{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01/reservations/r01' })
         $R = if ($Mode -eq '-All') { Invoke-Reveal -All -DictPath $Dict.File } else { Invoke-Reveal -Fields @('ResourceName') -DictPath $Dict.File }
         Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
         @($R.Inventory.FabricCapacities)[0].Name | Should -BeExactly 'capdata01'
@@ -748,7 +748,7 @@ Describe "Reveal-Obfuscation stops on a dictionary whose ids hold a token for an
             @{ T = '{Ts}'; R = '/subscriptions/{RealSub}/resourceGroups/rg-app/providers/Microsoft.ServiceBus/namespaces/ns01/topics/orders/subscriptions/audit' }
             @{ T = '{Ro}'; R = '/providers/Microsoft.Capacity/reservationOrders/ro01' }
         )
-        $Dict = New-SlotDictionary -Ids $Ids -Names $Names
+        $Dict = Write-SlotDictionary -Ids $Ids -Names $Names
         $R = switch ($Mode) { '-All' { Invoke-Reveal -All -DictPath $Dict.File } '-Fields ResourceGroup' { Invoke-Reveal -Fields @('ResourceGroup') -DictPath $Dict.File } default { Invoke-Reveal -DictPath $Dict.File } }
         Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
         $Fabric = @($R.Inventory.FabricCapacities)[0]
@@ -805,7 +805,7 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         $script:OldSetId = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachineScaleSets/$($T.Set)"
 
         # The dictionary as that writer builds it from its token tables.
-        function New-OldDictionary
+        function Get-OldDictionary
         {
             [ordered]@{
                 GeneratedAt         = '2026-06-30 00:00:00'
@@ -887,7 +887,7 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         @{ Mode = 'the default fields'; Warn = 1 }
     ) {
         $T = $script:OldTok
-        $R = Invoke-OldReveal -Dict (New-OldDictionary) -Mode $Mode
+        $R = Invoke-OldReveal -Dict (Get-OldDictionary) -Mode $Mode
         $R.Error | Should -BeNullOrEmpty -Because 'Reveal reads the dictionary an older build wrote'
         Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
         $Vm = @($R.Inventory.VirtualMachines)
@@ -943,7 +943,7 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         }
     ) {
         $T = $script:OldTok
-        $D = New-OldDictionary
+        $D = Get-OldDictionary
         switch ($Change)
         {
             'NoName' { $D.Remove('SubscriptionNameMap') }
@@ -973,7 +973,7 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         @{ Mode = 'the default fields' }
     ) {
         $T = $script:OldTok
-        $D = New-OldDictionary
+        $D = Get-OldDictionary
         $Ns = 'prod_' + [guid]::NewGuid().ToString()
         $Topic = 'prod_' + [guid]::NewGuid().ToString()
         $Rule = 'prod_' + [guid]::NewGuid().ToString()
@@ -1001,7 +1001,7 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
         }
     ) {
         $T = $script:OldTok
-        $D = New-OldDictionary
+        $D = Get-OldDictionary
         switch ($Change)
         {
             'NoMap' { $D.Remove('SubscriptionNameMap') }
@@ -1046,7 +1046,7 @@ Describe "Reveal-Obfuscation reads an older dictionary that gave a tenant-scope 
         $script:TgRTen = '/providers/Microsoft.Example/resourceGroups/grp-a'
         $script:TgMTen = "/providers/Microsoft.Example/resourceGroups/$($T.Rg)"
 
-        function New-TgDictionary
+        function Get-TgDictionary
         {
             param([string]$GroupMapId, [System.Collections.IDictionary]$Extra)
             $Ids = [ordered]@{ $script:TgMVm = $script:TgRVm; $script:TgMVm2 = $script:TgRVm2; $script:TgMTen = $script:TgRTen }
@@ -1113,7 +1113,7 @@ Describe "Reveal-Obfuscation reads an older dictionary that gave a tenant-scope 
     ) {
         $T = $script:TgTok
         $MapId = if ($GroupMapId -eq 'Vm') { $script:TgRVm } else { $script:TgRTen }
-        $R = Invoke-TgReveal -Dict (New-TgDictionary -GroupMapId $MapId) -Mode $Mode
+        $R = Invoke-TgReveal -Dict (Get-TgDictionary -GroupMapId $MapId) -Mode $Mode
         $R.Error | Should -BeNullOrEmpty -Because 'the token stands for the one real value grp-a in the group slot and in the tenant-scope id'
         Test-Path -LiteralPath $R.OutputZip | Should -BeTrue
         $Vm = @($R.Inventory.VirtualMachines)[0]
@@ -1148,7 +1148,7 @@ Describe "Reveal-Obfuscation reads an older dictionary that gave a tenant-scope 
         }
     ) {
         $T = $script:TgTok
-        $D = New-TgDictionary -GroupMapId $script:TgRVm
+        $D = Get-TgDictionary -GroupMapId $script:TgRVm
         switch ($Extra)
         {
             'OtherName' { $D.ResourceIdMap[$script:TgMTen] = '/providers/Microsoft.Example/resourceGroups/grp-other' }
@@ -1189,7 +1189,7 @@ Describe "Reveal-Obfuscation reveals a tenant-scope id whole from ResourceIdMap"
 
         # A report zip of the given ids (inventory rows, consumption rows and their InstanceData)
         # and a dictionary that holds only their ResourceIdMap entries.
-        function New-TenantReport
+        function Write-TenantReport
         {
             param([string[]]$Keys)
             $Dir = Join-Path $script:TmpDir ("tenant_whole_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -1220,7 +1220,7 @@ Describe "Reveal-Obfuscation reveals a tenant-scope id whole from ResourceIdMap"
             @{ Mode = $Mode; Report = 'mixed tenant-scope and subscription'; Keys = @('Vm', 'Order', 'Child') }
         }
     ) {
-        $Rep = New-TenantReport -Keys $Keys
+        $Rep = Write-TenantReport -Keys $Keys
         $Out = Join-Path $Rep.Dir 'out.zip'
         $Splat = @{ InputZip = $Rep.Zip; DictionaryPath = $Rep.Dict; OutputZip = $Out }
         if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceId') }
