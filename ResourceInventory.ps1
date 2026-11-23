@@ -282,14 +282,14 @@ function Get-ObfuscatedResourceId
         }
         elseif ($Segment -ieq 'providers' -or [string]::IsNullOrEmpty($Next))
         {
-            # A provider namespace or an empty segment. A name slot that holds
-            # Azure's fixed name '$system' (Service Bus bills a '$system'
-            # namespace) gets a token like any other name: the contract leaves
-            # no name part as written.
+            # A provider namespace or an empty segment.
             $Masked.Add($Next)
         }
         else
         {
+            # A name slot. One that holds Azure's fixed name '$system' (Service
+            # Bus bills a '$system' namespace) gets a token like any other name:
+            # the contract leaves no name part as written.
             $UpToName = $Parts[0..($i + 1)] -join '/'
             if (-not $ResourceNameDictionary.ContainsKey($UpToName) -or [string]::IsNullOrEmpty($ResourceNameDictionary[$UpToName])) { $ResourceNameDictionary[$UpToName] = New-ObfuscatedNameToken -ResourceId $UpToName -Name $Next }
             $Masked.Add($ResourceNameDictionary[$UpToName])
