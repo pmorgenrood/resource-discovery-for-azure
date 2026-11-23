@@ -1237,6 +1237,97 @@ Describe "Reveal-Obfuscation reveals a tenant-scope id whole from ResourceIdMap"
     }
 }
 
+# A whole id in a text ends where the offline mask's reader (Get-RdaFullIdInValue) ends one: at
+# whitespace, a quote, a mark no id holds (<>,;|[]{}?#&=), or a ')' with no '(' of its own. So an
+# id in prose, a URL, a log line or a page comes back whole from a dictionary that holds only
+# ResourceIdMap, a subscription id and a tenant-scope id alike.
+Describe "Reveal-Obfuscation reveals a whole id that a mark of the text around it ends" {
+
+    BeforeAll {
+        $T = @{}
+        foreach ($K in 'Sub', 'Rg', 'Vm', 'Ro', 'Other') { $T[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        # The real group holds '(' and ')', as an Azure group name may.
+        $script:MarkIds = @{
+            Subscription  = @{ M = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm)"; R = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg(app)/providers/Microsoft.Compute/virtualMachines/vm01' }
+            'tenant-scope' = @{ M = "/providers/Microsoft.Capacity/reservationOrders/$($T.Ro)"; R = '/providers/Microsoft.Capacity/reservationOrders/ro-0001' }
+        }
+        # Not in the dictionary: it stays as written.
+        $script:MarkUnknown = "kept ($("/providers/Microsoft.Capacity/reservationOrders/$($T.Other)"));"
+
+        # The report's files with the line, its id written as $Id: a log, a page (in a cell and
+        # in a link, HTML-encoded as the report writes a value), the inventory (a JSON string)
+        # and the usage file (a CSV cell).
+        function Get-MarkFileText
+        {
+            param([string]$Line, [string]$Id)
+            $Text = $Line.Replace('<ID>', $Id)
+            $Html = [System.Net.WebUtility]::HtmlEncode($Text)
+            $Kept = [System.Net.WebUtility]::HtmlEncode($script:MarkUnknown)
+            [ordered]@{
+                Log  = $Text + "`n" + $script:MarkUnknown + "`n"
+                Html = "<html><body><table><tr><td>$Html</td><td><a href=`"$Html`">link</a></td></tr><tr><td>$Kept</td></tr></table></body></html>"
+                Json = [ordered]@{ Notes = @($Text, $script:MarkUnknown) } | ConvertTo-Json -Depth 4
+                Note = $Text
+            }
+        }
+        function Write-MarkReport
+        {
+            param([string]$Line, [string]$Kind)
+            $Dir = Join-Path $script:TmpDir ('mark_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $Stage = Join-Path $Dir 'stage'
+            New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+            $F = Get-MarkFileText -Line $Line -Id $script:MarkIds[$Kind].M
+            [System.IO.File]::WriteAllText((Join-Path $Stage 'Diagnostics_Mark.log'), $F.Log)
+            [System.IO.File]::WriteAllText((Join-Path $Stage 'ResourcesReport_Mark.html'), $F.Html)
+            [System.IO.File]::WriteAllText((Join-Path $Stage 'Inventory_Mark.json'), $F.Json)
+            @([pscustomobject]@{ ResourceId = $script:MarkIds[$Kind].M; Note = $F.Note }, [pscustomobject]@{ ResourceId = ''; Note = $script:MarkUnknown }) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_Mark.csv') -NoTypeInformation -Encoding utf8
+            $Zip = Join-Path $Dir 'ResourcesReport_Mark.zip'
+            Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+            $DictFile = Join-Path $Dir 'ObfuscationDictionary_Mark.json'
+            [ordered]@{ GeneratedAt = '2026-06-30 00:00:00'; ResourceIdMap = [ordered]@{ $script:MarkIds[$Kind].M = $script:MarkIds[$Kind].R } } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $DictFile -Encoding utf8
+            return [pscustomobject]@{ Dir = $Dir; Zip = $Zip; Dict = $DictFile }
+        }
+    }
+
+    It "reveals, with <Mode>, a <Kind> id <Place>, in a log, a page, a JSON string and a CSV cell, from a dictionary that holds only ResourceIdMap" -ForEach @(
+        foreach ($Mode in '-Fields ResourceId', '-All')
+        {
+            foreach ($Kind in 'Subscription', 'tenant-scope')
+            {
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in brackets in prose'; Line = 'moved (<ID>) to the new plan' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in two brackets'; Line = 'see ((<ID>))' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'before a semicolon'; Line = 'ids: <ID>; next' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in a URL with ?api-version='; Line = 'GET https://management.azure.com<ID>?api-version=2023-04-01&x=1' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'after and before #'; Line = 'https://portal.azure.com/#resource<ID>#overview' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in square brackets'; Line = 'scope [<ID>]' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in braces'; Line = 'scope {<ID>}' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'before &'; Line = 'scope=<ID>&next=1' }
+                @{ Mode = $Mode; Kind = $Kind; Place = 'before ='; Line = '<ID>=on' }
+                # A quote ends the id, and in a JSON file the escape mark '\' before it; a page
+                # writes the quote '&quot;', so there '&' ends it.
+                @{ Mode = $Mode; Kind = $Kind; Place = 'in a JSON text'; Line = '{"id":"<ID>"}' }
+            }
+        }
+    ) {
+        $Rep = Write-MarkReport -Line $Line -Kind $Kind
+        $Out = Join-Path $Rep.Dir 'out.zip'
+        $Splat = @{ InputZip = $Rep.Zip; DictionaryPath = $Rep.Dict; OutputZip = $Out }
+        if ($Mode -eq '-All') { $Splat['All'] = $true } else { $Splat['Fields'] = @('ResourceId') }
+        & $script:RevealScript @Splat *>&1 | Out-Null
+        Test-Path -LiteralPath $Out | Should -BeTrue
+        $Ex = Join-Path $Rep.Dir 'ex'
+        Expand-Archive -LiteralPath $Out -DestinationPath $Ex -Force
+        $Want = Get-MarkFileText -Line $Line -Id $script:MarkIds[$Kind].R
+        Get-Content -LiteralPath (Join-Path $Ex 'Diagnostics_Mark.log') -Raw | Should -BeExactly $Want.Log -Because 'the log line holds the real id, and the id the dictionary does not hold stays as written'
+        Get-Content -LiteralPath (Join-Path $Ex 'ResourcesReport_Mark.html') -Raw | Should -BeExactly $Want.Html -Because 'the page holds the real id in the cell and the link'
+        @((Get-Content -LiteralPath (Join-Path $Ex 'Inventory_Mark.json') -Raw | ConvertFrom-Json).Notes) | Should -Be @(($Want.Json | ConvertFrom-Json).Notes) -Because 'the JSON string holds the real id'
+        $Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_Mark.csv'))
+        $Csv[0].ResourceId | Should -BeExactly $script:MarkIds[$Kind].R
+        $Csv[0].Note | Should -BeExactly $Want.Note -Because 'the CSV cell holds the real id'
+        $Csv[1].Note | Should -BeExactly $script:MarkUnknown
+    }
+}
+
 Describe "Reveal's doc on a dictionary it refuses" {
 
     It "says that Reveal refuses a dictionary that gives one token to two maps, or whose ids hold a token for another kind of value or real value, writes nothing, and that the fix is the dictionary the run wrote" {
@@ -2516,6 +2607,35 @@ Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.p
         $Because = $ChildOutput -join [Environment]::NewLine
         $ChildOutput | Should -Not -Contain 'AFTER_LOAD' -Because ('the load must stop the caller, not let it go on. Output: ' + $Because)
         $Because | Should -BeLike '*required file not found*DictionaryTimeText.Functions.ps1*Keep the Functions folder together*'
+        $LASTEXITCODE | Should -Not -Be 0 -Because $Because
+    }
+}
+
+# RevealObfuscation.Functions.ps1 also loads OfflineObfuscation.Functions.ps1, for the rule of
+# where a whole id ends in a text (Get-RdaIdEndMark), so Reveal and the offline mask read an id
+# alike. Without that file next to it, Reveal could not read an id at all.
+Describe 'RevealObfuscation.Functions.ps1 with no OfflineObfuscation.Functions.ps1 next to it' {
+    It 'stops the caller when it is loaded, under ErrorActionPreference <Preference>' -ForEach @(
+        @{ Preference = 'SilentlyContinue' }
+        @{ Preference = 'Ignore' }
+        @{ Preference = 'Continue' }
+    ) {
+        $LoneDir = Join-Path $script:TmpDir ('lone_offline_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $LoneDir -Force | Out-Null
+        $LoneFile = Join-Path $LoneDir 'RevealObfuscation.Functions.ps1'
+        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RevealObfuscation.Functions.ps1') -Destination $LoneFile
+        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/DictionaryTimeText.Functions.ps1') -Destination (Join-Path $LoneDir 'DictionaryTimeText.Functions.ps1')
+        $Q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+        $ChildFile = Join-Path $LoneDir 'child.ps1'
+        Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value (@(
+                ('$ErrorActionPreference = {0}' -f (& $Q $Preference))
+                ('. {0}' -f (& $Q $LoneFile))
+                'Write-Output ''AFTER_LOAD'''
+            ) -join [Environment]::NewLine)
+        $ChildOutput = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
+        $Because = $ChildOutput -join [Environment]::NewLine
+        $ChildOutput | Should -Not -Contain 'AFTER_LOAD' -Because ('the load must stop the caller, not let it go on. Output: ' + $Because)
+        $Because | Should -BeLike '*required file not found*OfflineObfuscation.Functions.ps1*Keep the Functions folder together*'
         $LASTEXITCODE | Should -Not -Be 0 -Because $Because
     }
 }

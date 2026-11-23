@@ -507,16 +507,35 @@ function ConvertFrom-RdaUrlEscape([string]$Text)
     return $Text
 }
 
+# The marks that end a full id inside a text: whitespace, a quote or a mark no id holds
+# (<>,;|[]{}?#&=), as the body of a regex character class. Get-RdaFullIdPattern reads an id up
+# to the first of them, and so does Reveal's whole-id pass (Convert-RevealString,
+# Functions/RevealObfuscation.Functions.ps1, which loads this file), so the offline mask and
+# Reveal read one id in a text alike.
+function Get-RdaIdEndMark
+{
+    return '\s"''<>,;|\[\]{}?#&='
+}
+
+# $Id, a full id read from a text, with each ')' at its end that has no '(' of its own taken
+# off: a group name may hold '(' and ')', so only such a ')' closes the text around the id.
+function Get-RdaIdBeforeCloseParen([string]$Id)
+{
+    while ($Id.EndsWith(')') -and ($Id.Split('(').Count -lt $Id.Split(')').Count)) { $Id = $Id.Substring(0, $Id.Length - 1) }
+    return $Id
+}
+
 # The form of a full id inside a text: a '/subscriptions/...' path, or a tenant-scope path
 # ('/providers/<namespace>/<type>/<name>...', a management group or a reservation, which has
 # no subscription), each with or without its first '/'. The namespace is Azure's dotted
 # word and the type has a name after it, so the word 'providers' alone, or a provider path
 # with no name, is not an id. One pattern with both forms, so the '/providers/...' part of a
-# subscription id is read in that id, not again as an id of its own. An id ends at
-# whitespace, a quote or a mark no id holds (<>,;|[]{}?#&=).
+# subscription id is read in that id, not again as an id of its own. An id ends at a mark of
+# Get-RdaIdEndMark.
 function Get-RdaFullIdPattern
 {
-    return '(?i)(?<![A-Za-z0-9_])/?(?:subscriptions/[^\s"''<>,;|\[\]{}?#&=]+|providers/[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+/[^/\s"''<>,;|\[\]{}?#&=]+/[^\s"''<>,;|\[\]{}?#&=]+)'
+    $End = Get-RdaIdEndMark
+    return '(?i)(?<![A-Za-z0-9_])/?(?:subscriptions/[^' + $End + ']+|providers/[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+/[^/' + $End + ']+/[^' + $End + ']+)'
 }
 
 # Every full id (Get-RdaFullIdPattern: '/subscriptions/...' or '/providers/...', with or
@@ -548,7 +567,7 @@ function Get-RdaFullIdInValue
                 {
                     # A group name may hold '(' and ')'; a ')' with no '(' of its own closes the text around the id.
                     $Id = $M.Value
-                    while ($Id.EndsWith(')') -and ($Id.Split('(').Count -lt $Id.Split(')').Count)) { $Id = $Id.Substring(0, $Id.Length - 1) }
+                    if ($Id.EndsWith(')')) { $Id = Get-RdaIdBeforeCloseParen $Id }
                     $Ids.Add($(if ($Id.StartsWith('/')) { $Id } else { '/' + $Id }))
                 }
             }

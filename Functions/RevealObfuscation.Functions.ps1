@@ -5,10 +5,14 @@
 # Shared helper functions AND the single-report reveal engine (Invoke-RdaReveal)
 # for the reveal feature. Dot-sourced by Reveal.ps1 (and by the child jobs it
 # spawns for the multi-subscription path) so they load into that scope.
-# Definitions only, but for one step on load: it checks that
-# Functions/DictionaryTimeText.Functions.ps1 is next to it (throws if not, and
+# Definitions only, but for two steps on load: it checks that
+# Functions/DictionaryTimeText.Functions.ps1 and then
+# Functions/OfflineObfuscation.Functions.ps1 are next to it (throws if not, and
 # the throw stops the caller under any $ErrorActionPreference) and dot-sources
-# it, which defines Restore-DictionaryTimeText. Convert-RevealString references
+# them. The first defines Restore-DictionaryTimeText; the second (definitions
+# only) gives the rule for where a whole id ends in a text (Get-RdaIdEndMark,
+# Get-RdaIdBeforeCloseParen), which the offline mask reads ids by, so Reveal
+# reads one id in a text as the offline mask does. Convert-RevealString references
 # $Replacements / $tokenPattern / $script:fileHits which Invoke-RdaReveal (its
 # caller) establishes before invoking it, so the parent-scope lookup is safe.
 # =============================================================================
@@ -23,6 +27,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'DictionaryTimeText.Fu
     }
 }
 . (Join-Path $PSScriptRoot 'DictionaryTimeText.Functions.ps1')
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1') -PathType Leaf))
+{
+    # Thrown as above, so it stops the caller under any preference.
+    & {
+        $ErrorActionPreference = 'Stop'
+        throw ("RevealObfuscation.Functions.ps1: required file not found: {0}. Keep the Functions folder together." -f (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1'))
+    }
+}
+. (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1')
 
 function ConvertTo-LookupTable
 {
@@ -305,10 +318,14 @@ function Get-JsonEscaped
 # restores ids whose segment tokens a dictionary does not hold one by one. A
 # whole id is a subscription id ('/subscriptions/<token>...') or a tenant-scope
 # id ('/providers/<namespace>/<type>/<token>...', a reservation order), each
-# read up to the first character that ends a value in a file.
+# read as the offline mask reads an id in a text (-WholeIdPattern, built once
+# by Invoke-RdaReveal from Get-RdaIdEndMark): up to whitespace, a quote or a
+# mark no id holds (<>,;|[]{}?#&=), or the escape mark '\' of a JSON file, and
+# without a ')' at its end that has no '(' of its own
+# (Get-RdaIdBeforeCloseParen). So an id in prose, a URL or a page is found.
 function Convert-RevealString
 {
-    param([string]$Text, [string]$EscapeMode = 'None')
+    param([string]$Text, [string]$EscapeMode = 'None', [string]$WholeIdPattern)
     # Fast path: every obfuscation token starts with the literal 'prod_' or
     # 'nonprod_' prefix (plain or type-hinted, e.g. prod_<guid> / prod_aks_<guid>),
     # so text containing neither substring cannot contain a token - return it
@@ -331,14 +348,17 @@ function Convert-RevealString
             default { return $Val }
         }
     }
-    if ($null -ne $IdPathMap -and $IdPathMap.Count -gt 0)
+    if ($null -ne $IdPathMap -and $IdPathMap.Count -gt 0 -and -not [string]::IsNullOrEmpty($WholeIdPattern))
     {
-        $Text = [regex]::Replace($Text, '(?i)(?:/subscriptions/(?:prod|nonprod)_|/providers/)[^"''\s,<>|\\]+', {
+        $Text = [regex]::Replace($Text, $WholeIdPattern, {
                 param($m)
-                if ($IdPathMap.ContainsKey($m.Value))
+                # The ')' that closes the text around the id stays after the real id.
+                $Id = $m.Value
+                if ($Id.EndsWith(')')) { $Id = Get-RdaIdBeforeCloseParen $Id }
+                if ($IdPathMap.ContainsKey($Id))
                 {
                     $script:FileHits++
-                    return (& $Escape $IdPathMap[$m.Value])
+                    return (& $Escape $IdPathMap[$Id]) + $m.Value.Substring($Id.Length)
                 }
                 return $m.Value
             })
@@ -660,7 +680,11 @@ function Invoke-RdaReveal
         }
     }
 
-    # Whole masked ids (ResourceIdMap keys that are paths) -> real ids.
+    # Whole masked ids (ResourceIdMap keys that are paths) -> real ids, each read in a text up
+    # to a mark that ends an id for the offline mask (Get-RdaIdEndMark), or the escape mark '\'
+    # of a JSON file, which Reveal reads as the file holds it (Convert-RevealString). Built
+    # once here, not per cell.
+    $WholeIdPattern = '(?i)(?:/subscriptions/(?:prod|nonprod)_|/providers/)[^' + (Get-RdaIdEndMark) + '\\]+'
     $IdPathMap = @{}
     if ($Fields -contains 'ResourceId')
     {
@@ -776,7 +800,7 @@ function Invoke-RdaReveal
                         {
                             if ($null -ne $prop.Value -and $prop.Value -is [string] -and $prop.Value.Length -gt 0)
                             {
-                                $prop.Value = Convert-RevealString -Text $prop.Value -EscapeMode 'None'
+                                $prop.Value = Convert-RevealString -Text $prop.Value -EscapeMode 'None' -WholeIdPattern $WholeIdPattern
                             }
                         }
                     }
@@ -798,7 +822,7 @@ function Invoke-RdaReveal
                     '.htm' { 'Html' }
                     default { 'None' }
                 }
-                $NewContent = Convert-RevealString -Text $Content -EscapeMode $EscapeMode
+                $NewContent = Convert-RevealString -Text $Content -EscapeMode $EscapeMode -WholeIdPattern $WholeIdPattern
                 $BannerReplaced = $false
                 if ($EscapeMode -eq 'Html' -and $NewContent -match '<div class="privacy-banner obfuscated">')
                 {
