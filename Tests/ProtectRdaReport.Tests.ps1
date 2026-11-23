@@ -940,11 +940,15 @@ Describe 'Protect-SitePropertiesValue masks the real parts and keeps the shape' 
             Test-RdaSitePropertiesMasked $Out | Should -BeTrue
             Test-RdaSitePropertiesMasked ('DOTNETCORE|8.0 ' + $Name) | Should -BeFalse
             Test-RdaSitePropertiesMasked 'DOCKER|private.azurecr.io/custom123' | Should -BeFalse
+            # A leak check of a real value's digits reads the text outside the tokens, since a token's
+            # random GUID can hold those digits; a real value left in is still outside them.
             # A long number (an account id) is masked; a GUID run into letters is one part, not a GUID and a word.
-            Protect-SitePropertiesValue 'DOCKER|123456789012.dkr.ecr.eu-west-1.amazonaws.com/web:1' | Should -Not -Match '123456789012'
+            ((Protect-SitePropertiesValue 'DOCKER|123456789012.dkr.ecr.eu-west-1.amazonaws.com/web:1') -replace $T, '') | Should -Not -Match '123456789012'
             $Glued = Protect-SitePropertiesValue 'x 11111111-2222-3333-4444-555555555555ab'
             Test-RdaSitePropertiesMasked $Glued | Should -BeTrue
-            $Glued | Should -Not -Match '555555555555ab|2222|3333|4444'
+            ($Glued -replace $T, '') | Should -Not -Match '555555555555ab|2222|3333|4444'
+            # The real GUID does not come back as a token's GUID either.
+            $Glued | Should -Not -Match '11111111-2222-3333-4444-555555555555'
             # A time is kept as it is.
             Protect-SitePropertiesValue '2026-11-15T09:00:00Z' | Should -Be '2026-11-15T09:00:00Z'
             # A time only when it is a real time.
@@ -966,7 +970,7 @@ Describe 'Protect-SitePropertiesValue masks the real parts and keeps the shape' 
             # An IP is one real part anywhere; a bracketed IPv6 registry host is masked, its port kept.
             Protect-SitePropertiesValue 'note 10.1.2.3 end' | Should -Not -Match '10\.1\.2\.3|\b(10|1|2|3)\b'
             $V6 = Protect-SitePropertiesValue 'DOCKER|[1234:5678:9012:3456:7890:1234:5678:9012]:5000/team/image:1'
-            $V6 | Should -Not -Match '5678|9012'
+            ($V6 -replace $T, '') | Should -Not -Match '5678|9012'
             $V6 | Should -Match (':5000/{0}/{0}:1$' -f $T)
             # A bare IPv6 address, and an IP run into letters, are one real part too.
             Protect-SitePropertiesValue 'conn 2001:db8::8a2e:370:7334 ok' | Should -Match ('^{0} {0} {0}$' -f $T)
@@ -1009,7 +1013,7 @@ Describe 'Protect-SitePropertiesValue masks the real parts and keeps the shape' 
             # A setting only in the 'properties' or 'metadata' list Azure writes; elsewhere (an app setting) it is
             # the customer's, and so are an app setting dictionary's keys.
             $Nested = Protect-SitePropertiesValue @{ appSettings = @(@{ name = 'LinuxFxVersion'; value = 'PYTHON|450012' }); properties = @(@{ name = 'LinuxFxVersion'; value = 'PYTHON|3.11' }) }
-            (ConvertTo-Json -InputObject $Nested['appSettings'] -Compress -Depth 5) | Should -Not -Match '450012|LinuxFxVersion|PYTHON'
+            ((ConvertTo-Json -InputObject $Nested['appSettings'] -Compress -Depth 5) -replace $T, '') | Should -Not -Match '450012|LinuxFxVersion|PYTHON'
             $Nested['properties'][0]['value'] | Should -Be 'PYTHON|3.11'
             $Keys = Protect-SitePropertiesValue @{ appSettings = @{ CustomerKey = 'v1' } }
             @($Keys['appSettings'].Keys) | Should -Match ('^{0}$' -f $T)
