@@ -707,6 +707,104 @@ Describe 'The seed is checked when it is read' {
         }
     }
 
+    # A token ends where the value ends. A seed whose token has a line feed after it (a hand-edited
+    # or merged file; a regex '$' also matches before a last line feed) is not kept, so the run
+    # masks the value again and the next seeded runs keep the new token. The same seed with no
+    # line feed keeps its token.
+    It 'masks again the <Slot> of <Case> whose seeded token ends in a line feed, the next two seeded runs keep the new token, and keeps the token without it' -ForEach @(
+        @{ Case = 'a seeded id'; Slot = 'subscription slot'; Index = 2 }
+        @{ Case = 'a seeded id'; Slot = 'resource group slot'; Index = 4 }
+        @{ Case = 'a seeded id'; Slot = 'parent name slot'; Index = 8 }
+        @{ Case = 'a seeded id'; Slot = 'name slot'; Index = 10 }
+        @{ Case = 'a ResourceGroupMap entry'; Slot = 'resource group'; Index = 4 }
+        @{ Case = 'a ResourceNameMap entry'; Slot = 'name'; Index = 10 }
+        @{ Case = 'a flat seeded id'; Slot = 'token'; Index = 0 }
+    ) {
+        $Db = "$script:Base/microsoft.sql/servers/srv-lf/databases/db-lf"
+        $Flat = 'marketplace-charge-lf'
+        foreach ($Lf in "`n", '')
+        {
+            $Tok = New-Tok
+            $Seed = switch ($Case)
+            {
+                'a seeded id'
+                {
+                    $Parts = @('', 'subscriptions', (New-Tok), 'resourcegroups', (New-Tok), 'providers', 'microsoft.sql', 'servers', (New-Tok), 'databases', (New-Tok))
+                    $Parts[$Index] = $Tok + $Lf
+                    @{ ResourceIdMap = @{ ($Parts -join '/') = $Db } }
+                }
+                'a ResourceGroupMap entry' { @{ ResourceGroupMap = @{ ($Tok + $Lf) = "/subscriptions/$script:Sub/resourcegroups/rg-demo" } } }
+                'a ResourceNameMap entry' { @{ ResourceNameMap = @{ ($Tok + $Lf) = $Db } } }
+                'a flat seeded id' { @{ ResourceIdMap = @{ ($Tok + $Lf) = $Flat } } }
+            }
+            $Rows = if ($Case -eq 'a flat seeded id') { @(New-Res $Flat) } else { @(New-Res $Db) }
+            $Because = if ($Lf) { 'with a line feed' } else { 'without a line feed' }
+            $First = $null
+            foreach ($Run in 1, 2, 3)
+            {
+                Invoke-SeededRun -SeedMaps $Seed -Rows $Rows
+                $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
+                $Got = if ($Case -eq 'a flat seeded id') { $Ids[$Flat] } else { ($Ids[$Db] -split '/')[$Index] }
+                $Got | Should -MatchExactly '\A(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "run $Run, seeded $Because, writes a token with no line feed"
+                if ($Case -ne 'a flat seeded id') { Test-ObfuscatedIdShape -RealId $Db -MaskedId $Ids[$Db] | Should -BeTrue -Because "run $Run writes the contract shape" }
+                if ($Run -eq 1)
+                {
+                    if ($Lf) { $Got | Should -Not -Be $Tok -Because 'the seeded token with a line feed is not kept, so the value gets a new token' }
+                    else { $Got | Should -BeExactly $Tok -Because 'a seeded token as a run writes it is kept' }
+                    $First = $Got
+                }
+                else { $Got | Should -BeExactly $First -Because "run $Run, seeded $Because, keeps run 1's token, letter for letter" }
+                $Seed = Get-RunDictionaryMaps
+            }
+        }
+    }
+
+    It 'masks again a <Map> value whose seeded token ends in a line feed, the next two seeded runs keep the new token, and keeps the token without it' -ForEach @(
+        @{ Map = 'TagMap' }
+        @{ Map = 'FreeTextMap' }
+    ) {
+        # The run's own maskers: the collector row masking (tags) and the free-text one.
+        $RowFn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaCollectorRow' }, $false))
+        $RowFn.Count | Should -Be 1
+        . ([scriptblock]::Create($RowFn[0].Extent.Text))
+        $FnAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/ResourceInventory.Functions.ps1'), [ref]$null, [ref]$null)
+        $FreeFn = @($FnAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Global:Protect-FreeTextValue' }, $false))
+        $FreeFn.Count | Should -Be 1
+        . ([scriptblock]::Create($FreeFn[0].Extent.Text))
+        try
+        {
+            $Vm = "$script:Base/microsoft.compute/virtualmachines/vm-a"
+            foreach ($Lf in "`n", '')
+            {
+                $Tok = New-Tok
+                $Seed = @{ $Map = @{ ($Tok + $Lf) = 'billing-07' } }
+                $Because = if ($Lf) { 'with a line feed' } else { 'without a line feed' }
+                $First = $null
+                foreach ($Run in 1, 2, 3)
+                {
+                    Invoke-SeededRun -SeedMaps $Seed -Rows @(New-Res $Vm)
+                    if ($Map -eq 'TagMap')
+                    {
+                        $Row = @{ ID = $Vm; Name = 'vm-a'; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo'; Tags = @([pscustomobject]@{ Name = 'app'; Value = 'billing-07' }) }
+                        Protect-RdaCollectorRow -Rows @($Row) -Collector 'VirtualMachines'
+                        $Got = [string]$Row.Tags[0].Value
+                    }
+                    else { $Got = Protect-FreeTextValue 'billing-07' }
+                    $Got | Should -MatchExactly '\A(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "run $Run, seeded $Because, writes a token with no line feed"
+                    if ($Run -eq 1)
+                    {
+                        if ($Lf) { $Got | Should -Not -Be $Tok -Because 'the seeded token with a line feed is not kept, so the value gets a new token' }
+                        else { $Got | Should -BeExactly $Tok -Because 'a seeded token as a run writes it is kept' }
+                        $First = $Got
+                    }
+                    else { $Got | Should -BeExactly $First -Because "run $Run, seeded $Because, keeps run 1's token, letter for letter" }
+                    $Seed = Get-RunDictionaryMaps
+                }
+            }
+        }
+        finally { Remove-Item -LiteralPath Function:\Protect-FreeTextValue -ErrorAction SilentlyContinue }
+    }
+
     # A damaged or hand-merged seed can give a tag or free-text value a token the seed also
     # uses for a subscription, a group, a name or a flat id, or for a value of the other map.
     # Reveal replaces a token wherever it stands, so revealing one meaning would rewrite the
@@ -1330,6 +1428,31 @@ Describe 'Test-ObfuscatedIdShape' {
     It 'refuses a tenant-scope name slot that holds its real part' {
         $Tok = 'prod_' + [guid]::NewGuid().ToString()
         Test-ObfuscatedIdShape -RealId "/providers/Microsoft.Capacity/reservationOrders/$Tok" -MaskedId "/providers/Microsoft.Capacity/reservationOrders/$Tok" | Should -BeFalse
+    }
+
+    # A token ends where its slot ends: a line feed after it (a regex '$' also matches before a
+    # last line feed) is no part of a token a run writes.
+    It 'refuses a token that ends in a line feed in the <Slot> slot, and takes the same id without it' -ForEach @(
+        @{ Slot = 'subscription'; Index = 2; Hint = '' }
+        @{ Slot = 'resource group'; Index = 4; Hint = '' }
+        @{ Slot = 'resource group, with the older mc_ hint,'; Index = 4; Hint = 'mc_' }
+        @{ Slot = 'parent name'; Index = 8; Hint = '' }
+        @{ Slot = 'name'; Index = 10; Hint = '' }
+        @{ Slot = 'name, with the aks_ hint,'; Index = 10; Hint = 'aks_' }
+    ) {
+        $Tok = { param($H) 'prod_' + $H + [guid]::NewGuid().ToString() }
+        $Masked = @('', 'subscriptions', (& $Tok ''), 'resourcegroups', (& $Tok ''), 'providers', 'microsoft.sql', 'servers', (& $Tok ''), 'databases', (& $Tok ''))
+        $Masked[$Index] = & $Tok $Hint
+        $Real = "$script:Base/microsoft.sql/servers/srv-a/databases/db-a"
+        Test-ObfuscatedIdShape -RealId $Real -MaskedId ($Masked -join '/') | Should -BeTrue -Because 'the token as a run writes it is taken'
+        $Masked[$Index] += "`n"
+        Test-ObfuscatedIdShape -RealId $Real -MaskedId ($Masked -join '/') | Should -BeFalse -Because 'a line feed is no part of a token'
+    }
+
+    It 'refuses a tenant-scope name token that ends in a line feed, and takes it without' {
+        $Tok = 'prod_' + [guid]::NewGuid().ToString()
+        Test-ObfuscatedIdShape -RealId '/providers/Microsoft.Capacity/reservationOrders/ro-a' -MaskedId "/providers/Microsoft.Capacity/reservationOrders/$Tok" | Should -BeTrue
+        Test-ObfuscatedIdShape -RealId '/providers/Microsoft.Capacity/reservationOrders/ro-a' -MaskedId "/providers/Microsoft.Capacity/reservationOrders/$Tok`n" | Should -BeFalse -Because 'a line feed is no part of a token'
     }
 }
 

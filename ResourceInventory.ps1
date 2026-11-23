@@ -321,9 +321,11 @@ function Test-ObfuscatedIdShape
     # databricks_/aks_/vmss_ hint. So the metric step's old sub_/rg_ tokens,
     # or any other word in a token, fail.
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $SubToken = '^(prod|nonprod)_' + $Guid + '$'
-    $RgToken = '^(prod|nonprod)_(mc_)?' + $Guid + '$'
-    $Token = '^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '$'
+    # Each ends at '\z', the end of the slot: '$' also matches before a last line feed, so it
+    # would take a token with a line feed after it.
+    $SubToken = '^(prod|nonprod)_' + $Guid + '\z'
+    $RgToken = '^(prod|nonprod)_(mc_)?' + $Guid + '\z'
+    $Token = '^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $Guid + '\z'
     if ($R[1] -ieq 'subscriptions')
     {
         if ($M[1] -ine 'subscriptions' -or $M[2] -cnotmatch $SubToken -or $M[2] -ieq $R[2]) { return $false }
@@ -1835,8 +1837,10 @@ Function RunInventorySetup()
             $SeedGuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
             # A token equal to the real part it masks (ignoring case: a damaged
             # seed) is not kept either, as Test-ObfuscatedIdShape refuses it.
-            foreach ($K in @($RgLookup.Keys)) { if ([string]$RgLookup[$K] -cnotmatch ('^(prod|nonprod)_(mc_)?' + $SeedGuid + '$') -or [string]$RgLookup[$K] -ieq [string]$K) { [void]$RgLookup.Remove($K) } }
-            foreach ($K in @($ResourceNameDictionary.Keys)) { if ([string]$ResourceNameDictionary[$K] -cnotmatch ('^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $SeedGuid + '$') -or [string]$ResourceNameDictionary[$K] -ieq @(([string]$K).Split('/'))[-1]) { [void]$ResourceNameDictionary.Remove($K) } }
+            # Every token form here ends at '\z', as in Test-ObfuscatedIdShape: '$'
+            # would also take a token with a line feed after it.
+            foreach ($K in @($RgLookup.Keys)) { if ([string]$RgLookup[$K] -cnotmatch ('^(prod|nonprod)_(mc_)?' + $SeedGuid + '\z') -or [string]$RgLookup[$K] -ieq [string]$K) { [void]$RgLookup.Remove($K) } }
+            foreach ($K in @($ResourceNameDictionary.Keys)) { if ([string]$ResourceNameDictionary[$K] -cnotmatch ('^(prod|nonprod)_(databricks_|aks_|vmss_)?' + $SeedGuid + '\z') -or [string]$ResourceNameDictionary[$K] -ieq @(([string]$K).Split('/'))[-1]) { [void]$ResourceNameDictionary.Remove($K) } }
             # The seed's tag and free-text entries as preloaded, so the ones the checks below do
             # not keep are counted in a warning (the 'preloaded' line counts them all).
             $SeedTagCount = if ($null -ne $Global:TagValueDictionary) { $Global:TagValueDictionary.Count } else { 0 }
@@ -1847,7 +1851,7 @@ Function RunInventorySetup()
             foreach ($SeedValueMap in @($Global:TagValueDictionary, $Global:FreeTextDictionary))
             {
                 if ($null -eq $SeedValueMap) { continue }
-                foreach ($K in @($SeedValueMap.Keys)) { if ([string]$SeedValueMap[$K] -cnotmatch ('^(prod|nonprod)_' + $SeedGuid + '$') -or [string]$SeedValueMap[$K] -ieq [string]$K) { [void]$SeedValueMap.Remove($K) } }
+                foreach ($K in @($SeedValueMap.Keys)) { if ([string]$SeedValueMap[$K] -cnotmatch ('^(prod|nonprod)_' + $SeedGuid + '\z') -or [string]$SeedValueMap[$K] -ieq [string]$K) { [void]$SeedValueMap.Remove($K) } }
             }
             # A tag or free-text token stands for one value, as a path token does. Reveal
             # replaces a token wherever it stands, so a token the seed also uses in a path
@@ -1921,7 +1925,7 @@ Function RunInventorySetup()
                 # case: a real id that looks like a token) is not kept.
                 if ($SeedRealId -notmatch '(?i)^/subscriptions/[^/]' -and -not (Test-RdaTenantScopeIdMaskable -ResourceId $SeedRealId))
                 {
-                    if ([string]$SeedMasked -cnotmatch ('^(prod|nonprod)_' + $SeedGuid + '$') -or [string]$SeedMasked -ieq [string]$SeedRealId)
+                    if ([string]$SeedMasked -cnotmatch ('^(prod|nonprod)_' + $SeedGuid + '\z') -or [string]$SeedMasked -ieq [string]$SeedRealId)
                     {
                         [void]$ResourceIdDictionary.Remove($SeedRealId)
                         $SeedDropped++

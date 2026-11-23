@@ -400,6 +400,26 @@ Describe 'The masked-field check, the real values and the exempt words' {
         Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId $MaskedId | Should -BeFalse
     }
 
+    # A token ends where its slot ends: a line feed after it (a regex '$' also matches before a
+    # last line feed) is no part of a token a run writes, so the offline mask refuses such a
+    # masked usage id, through the run's own shape check.
+    It 'refuses, as the masked id of a usage row, an id whose <Slot> token ends in a line feed, and takes it without' -ForEach @(
+        @{ Slot = 'subscription'; Plain = '/subscriptions/{s}/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-a'; Index = 2 }
+        @{ Slot = 'resource group'; Plain = '/subscriptions/{s}/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-a'; Index = 4 }
+        @{ Slot = 'name'; Plain = '/subscriptions/{s}/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-a'; Index = 8 }
+        @{ Slot = 'tenant-scope name'; Plain = '/providers/Microsoft.Capacity/reservationOrders/ro-a'; Index = 4 }
+        @{ Slot = 'flat'; Plain = 'marketplace-charge-a'; Index = -1 }
+    ) {
+        $PlainId = $Plain.Replace('{s}', '33333333-3333-3333-3333-333333333333')
+        $Parts = $PlainId.Split('/')
+        if ($Index -lt 0) { $Parts = @('prod_' + [guid]::NewGuid().ToString()) }
+        else { for ($i = 1; $i + 1 -lt $Parts.Count; $i += 2) { if ($Parts[$i] -ine 'providers') { $Parts[$i + 1] = 'prod_' + [guid]::NewGuid().ToString() } } }
+        $Good = $Parts -join '/'
+        Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId $Good | Should -BeTrue -Because 'the token as a run writes it is taken'
+        $Parts[[math]::Max($Index, 0)] += "`n"
+        Test-RdaMaskedUsageId -PlainId $PlainId -MaskedId ($Parts -join '/') | Should -BeFalse -Because 'a line feed is no part of a token'
+    }
+
     It 'takes a $system name part from <Source> as a real value, so an inventory row or metric record that kept it stops the slot check' -ForEach @(
         @{ Source = 'the run''s dictionaries' }
         @{ Source = 'a full id passed in' }
