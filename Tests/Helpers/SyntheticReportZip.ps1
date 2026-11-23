@@ -95,12 +95,19 @@ function Get-RdaContractIdPattern
 }
 
 # The id ends in a name token, as above: no switch takes a last type word.
+# It holds one or more '/providers/<namespace>/<type>/<name tok>[/<type>/<name tok>...]'
+# chains, so a bare '/subscriptions/<tok>' or '/subscriptions/<tok>/resourcegroups/<tok>',
+# which names no resource, is refused: the contract's id ends in a provider type and a
+# name token. No run writes one: the collectors' rows and cross-references hold
+# resource ids, metrics name inventory resources, and no bill row seen has a resource
+# id without a provider. The subscription-scope id with no resourcegroups segment
+# ('/subscriptions/<tok>/providers/...', the parked G2 shape) is still taken.
 function Get-RdaMaskedIdPattern
 {
     $Guid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     $Scope = '(?:prod|nonprod)_' + $Guid
     $Name = '(?:prod|nonprod)_(?:databricks_|aks_|vmss_)?' + $Guid
-    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+)?\z'
+    '^/subscriptions/' + $Scope + '(?:/resourcegroups/' + $Scope + ')?(?:/providers/[^/]+(?:/[^/]+/' + $Name + ')+)+\z'
 }
 
 # A masked resource id, or a token (an id that is not an ARM id is masked to a

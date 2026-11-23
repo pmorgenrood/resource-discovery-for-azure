@@ -30,6 +30,8 @@ BeforeAll {
         TokenHint    = "nonprod_vmss_$G"
         RealName     = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.compute/virtualmachines/vm-web-01"
         NoProvider   = "/subscriptions/prod_$G/resourcegroups/prod_$G"
+        SubOnly      = "/subscriptions/prod_$G"
+        Extension    = "/subscriptions/prod_$G/resourcegroups/prod_$G/providers/microsoft.compute/virtualmachines/prod_$G/providers/microsoft.insights/diagnosticsettings/prod_$G"
         FlatSentinel = "obfuscated_$G"
         # A run keeps a last type word with no name after it as written, so it
         # would write this one for a billed '.../namespaces/<namespace>/$system'.
@@ -106,6 +108,17 @@ Describe 'Get-RdaMaskedIdPattern' {
 
     It 'writes a name slot as the name token itself, with no group of one alternative around it' {
         (Get-RdaMaskedIdPattern) | Should -Not -Match ([regex]::Escape('/(?:(?:prod|nonprod)_'))
+    }
+
+    It 'refuses <_>, which names no resource: a masked id holds at least one provider, type and name token' -ForEach @('SubOnly', 'NoProvider') {
+        $script:Ids[$_] | Should -Not -Match (Get-RdaMaskedIdPattern)
+        $script:Ids[$_] | Should -Not -Match (Get-RdaObfuscatedIdPattern)
+        $script:Ids[$_] | Should -Not -Match (Get-RdaContractIdPattern -AllowParked -AllowMetricFallback)
+    }
+
+    It 'still takes <_>: the subscription-scope id with no resourcegroups segment, a child id and an extension id' -ForEach @('G2NoRg', 'Contract', 'ContractKid', 'Extension') {
+        $script:Ids[$_] | Should -Match (Get-RdaMaskedIdPattern)
+        $script:Ids[$_] | Should -Match (Get-RdaObfuscatedIdPattern)
     }
 }
 
