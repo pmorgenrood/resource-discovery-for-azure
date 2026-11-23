@@ -7,10 +7,10 @@
 # spawns for the multi-subscription path) so they load into that scope.
 # Definitions only, but for two steps on load: it checks that
 # Functions/DictionaryTimeText.Functions.ps1 and then
-# Functions/OfflineObfuscation.Functions.ps1 are next to it (throws if not, and
-# the throw stops the caller under any $ErrorActionPreference) and dot-sources
-# them. The first defines Restore-DictionaryTimeText; the second (definitions
-# only) gives the rule for where a whole id ends in a text (Get-RdaIdEndMark,
+# Functions/IdText.Functions.ps1 are next to it (throws if not, and the throw
+# stops the caller under any $ErrorActionPreference) and dot-sources them. The
+# first defines Restore-DictionaryTimeText; the second (definitions only) gives
+# the rule for where a whole id ends in a text (Get-RdaIdEndMark,
 # Get-RdaIdBeforeCloseParen), which the offline mask reads ids by, so Reveal
 # reads one id in a text as the offline mask does. Convert-RevealString references
 # $Replacements / $tokenPattern / $script:fileHits which Invoke-RdaReveal (its
@@ -27,15 +27,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'DictionaryTimeText.Fu
     }
 }
 . (Join-Path $PSScriptRoot 'DictionaryTimeText.Functions.ps1')
-if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1') -PathType Leaf))
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'IdText.Functions.ps1') -PathType Leaf))
 {
     # Thrown as above, so it stops the caller under any preference.
     & {
         $ErrorActionPreference = 'Stop'
-        throw ("RevealObfuscation.Functions.ps1: required file not found: {0}. Keep the Functions folder together." -f (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1'))
+        throw ("RevealObfuscation.Functions.ps1: required file not found: {0}. Keep the Functions folder together." -f (Join-Path $PSScriptRoot 'IdText.Functions.ps1'))
     }
 }
-. (Join-Path $PSScriptRoot 'OfflineObfuscation.Functions.ps1')
+. (Join-Path $PSScriptRoot 'IdText.Functions.ps1')
 
 function ConvertTo-LookupTable
 {

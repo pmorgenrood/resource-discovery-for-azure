@@ -2611,20 +2611,25 @@ Describe 'RevealObfuscation.Functions.ps1 with no DictionaryTimeText.Functions.p
     }
 }
 
-# RevealObfuscation.Functions.ps1 also loads OfflineObfuscation.Functions.ps1, for the rule of
-# where a whole id ends in a text (Get-RdaIdEndMark), so Reveal and the offline mask read an id
-# alike. Without that file next to it, Reveal could not read an id at all.
-Describe 'RevealObfuscation.Functions.ps1 with no OfflineObfuscation.Functions.ps1 next to it' {
+# RevealObfuscation.Functions.ps1 also loads IdText.Functions.ps1, the rule of where a whole id
+# ends in a text (Get-RdaIdEndMark, Get-RdaIdBeforeCloseParen), which the offline mask reads ids
+# by too, so Reveal and the offline mask read an id alike. Without that file next to it, Reveal
+# could not read an id at all, even with every other file of the Functions folder there.
+Describe 'RevealObfuscation.Functions.ps1 with no IdText.Functions.ps1 next to it' {
     It 'stops the caller when it is loaded, under ErrorActionPreference <Preference>' -ForEach @(
         @{ Preference = 'SilentlyContinue' }
         @{ Preference = 'Ignore' }
         @{ Preference = 'Continue' }
     ) {
-        $LoneDir = Join-Path $script:TmpDir ('lone_offline_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $LoneDir = Join-Path $script:TmpDir ('lone_idtext_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $LoneDir -Force | Out-Null
         $LoneFile = Join-Path $LoneDir 'RevealObfuscation.Functions.ps1'
-        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/RevealObfuscation.Functions.ps1') -Destination $LoneFile
-        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions/DictionaryTimeText.Functions.ps1') -Destination (Join-Path $LoneDir 'DictionaryTimeText.Functions.ps1')
+        foreach ($File in @(Get-ChildItem -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Functions') -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'IdText.Functions.ps1' }))
+        {
+            Copy-Item -LiteralPath $File.FullName -Destination (Join-Path $LoneDir $File.Name)
+        }
+        Test-Path -LiteralPath $LoneFile | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $LoneDir 'OfflineObfuscation.Functions.ps1') | Should -BeTrue -Because 'the offline mask''s file is there, and Reveal still stops'
         $Q = { param($s) "'" + ($s -replace "'", "''") + "'" }
         $ChildFile = Join-Path $LoneDir 'child.ps1'
         Set-Content -LiteralPath $ChildFile -Encoding utf8 -Value (@(
@@ -2635,8 +2640,118 @@ Describe 'RevealObfuscation.Functions.ps1 with no OfflineObfuscation.Functions.p
         $ChildOutput = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $ChildFile 2>&1 | ForEach-Object { [string]$_ })
         $Because = $ChildOutput -join [Environment]::NewLine
         $ChildOutput | Should -Not -Contain 'AFTER_LOAD' -Because ('the load must stop the caller, not let it go on. Output: ' + $Because)
-        $Because | Should -BeLike '*required file not found*OfflineObfuscation.Functions.ps1*Keep the Functions folder together*'
+        $Because | Should -BeLike '*required file not found*IdText.Functions.ps1*Keep the Functions folder together*'
         $LASTEXITCODE | Should -Not -Be 0 -Because $Because
+    }
+}
+
+# Reveal needs only the rule of where an id ends from the offline mask's side, so it loads
+# IdText.Functions.ps1 and not the offline mask's own file (OfflineObfuscation.Functions.ps1).
+# Reveal.ps1 and each of its per-folder jobs load only RevealObfuscation.Functions.ps1, so a tree
+# with no OfflineObfuscation.Functions.ps1 still reveals an id that a bracket or a URL mark ends,
+# in one report and in a per-folder job of the all-subscriptions mode.
+Describe 'Reveal reads where an id ends without the offline mask''s file' {
+    BeforeAll {
+        $script:IdRepo = Split-Path $PSScriptRoot -Parent
+        $script:IdPwsh = (Get-Process -Id $PID).Path
+        $T = @{}
+        foreach ($K in 'Sub', 'Rg', 'Vm') { $T[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        $script:IdMasked = "/subscriptions/$($T.Sub)/resourcegroups/$($T.Rg)/providers/Microsoft.Compute/virtualMachines/$($T.Vm)"
+        # The real group holds '(' and ')', so the ')' after the id is one with no '(' of its own.
+        $script:IdReal = '/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg(app)/providers/Microsoft.Compute/virtualMachines/vm01'
+        $script:IdLines = @('moved (<ID>) to the new plan', 'GET https://management.azure.com<ID>?api-version=2023-04-01&x=1')
+
+        # The log text with each line's id written as $Id.
+        function Get-IdLogText([string]$Id) { (@($script:IdLines | ForEach-Object { $_.Replace('<ID>', $Id) }) -join "`n") + "`n" }
+
+        # A report zip (a log and a usage file) and its dictionary, which holds only ResourceIdMap,
+        # in $Dir, named as a run names them.
+        function Write-IdReport([string]$Dir)
+        {
+            $Stage = Join-Path $Dir ('stage_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $Stage 'Diagnostics_Id.log'), (Get-IdLogText $script:IdMasked))
+            @([pscustomobject]@{ ResourceId = $script:IdMasked; Note = "moved ($($script:IdMasked)) to the new plan" }) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_Id.csv') -NoTypeInformation -Encoding utf8
+            $Zip = Join-Path $Dir 'ResourcesReport_Id.zip'
+            Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip -Force
+            Remove-Item -LiteralPath $Stage -Recurse -Force
+            $DictFile = Join-Path $Dir 'ObfuscationDictionary_ResourcesReport_Id.json'
+            [ordered]@{ GeneratedAt = '2026-06-30 00:00:00'; ResourceIdMap = [ordered]@{ $script:IdMasked = $script:IdReal } } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $DictFile -Encoding utf8
+            return [pscustomobject]@{ Zip = $Zip; Dict = $DictFile }
+        }
+
+        # Reveal.ps1 and every file of the Functions folder but OfflineObfuscation.Functions.ps1.
+        function Write-TreeWithoutOffline([string]$Dir)
+        {
+            New-Item -ItemType Directory -Path (Join-Path $Dir 'Functions') -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $script:IdRepo 'Reveal.ps1') -Destination (Join-Path $Dir 'Reveal.ps1')
+            foreach ($File in @(Get-ChildItem -LiteralPath (Join-Path $script:IdRepo 'Functions') -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'OfflineObfuscation.Functions.ps1' }))
+            {
+                Copy-Item -LiteralPath $File.FullName -Destination (Join-Path $Dir "Functions/$($File.Name)")
+            }
+            return $Dir
+        }
+    }
+
+    It 'defines Get-RdaIdEndMark and Get-RdaIdBeforeCloseParen, and no function of OfflineObfuscation.Functions.ps1, once RevealObfuscation.Functions.ps1 is loaded' {
+        $OfflineAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $script:IdRepo 'Functions/OfflineObfuscation.Functions.ps1'), [ref]$null, [ref]$null)
+        $OfflineNames = @($OfflineAst.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Name })
+        $OfflineNames.Count | Should -BeGreaterThan 30 -Because 'the offline mask''s file defines its functions'
+        $Child = & $script:IdPwsh -NoProfile -NonInteractive -Command {
+            param($RevealFile, [string[]]$Names)
+            $ErrorActionPreference = 'Stop'
+            . $RevealFile
+            [pscustomobject]@{
+                Offline = @($Names | Where-Object { Get-Command -Name $_ -CommandType Function -ErrorAction SilentlyContinue })
+                EndMark = Get-RdaIdEndMark
+                Before  = Get-RdaIdBeforeCloseParen '/subscriptions/x/resourceGroups/rg(app)/providers/a.b/c/d))'
+            }
+        } -args (Join-Path $script:IdRepo 'Functions/RevealObfuscation.Functions.ps1'), $OfflineNames
+        $LASTEXITCODE | Should -Be 0
+        @($Child.Offline) | Should -BeNullOrEmpty -Because ('Reveal loads none of the offline mask''s functions; it loaded: ' + (@($Child.Offline) -join ', '))
+        $Child.EndMark | Should -BeExactly '\s"''<>,;|\[\]{}?#&=' -Because 'Reveal ends an id at the marks the offline mask ends one at'
+        $Child.Before | Should -BeExactly '/subscriptions/x/resourceGroups/rg(app)/providers/a.b/c/d' -Because 'each '')'' with no ''('' of its own is taken off, and the group''s own '')'' is kept'
+    }
+
+    It 'reveals, in <Mode>, an id that a bracket or a URL mark ends, from a tree with no OfflineObfuscation.Functions.ps1' -ForEach @(
+        @{ Mode = 'one report (-InputZip)' }
+        @{ Mode = 'a per-folder job (-InventoryRoot)' }
+    ) {
+        $Work = Join-Path $script:TmpDir ('idtree_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Tree = Write-TreeWithoutOffline (Join-Path $Work 'tree')
+        Test-Path -LiteralPath (Join-Path $Tree 'Functions/OfflineObfuscation.Functions.ps1') | Should -BeFalse
+        $Out = Join-Path $Work 'out/revealed.zip'
+        New-Item -ItemType Directory -Path (Split-Path $Out -Parent) -Force | Out-Null
+        if ($Mode -like 'one report*')
+        {
+            $ReportDir = Join-Path $Work 'report'
+            New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
+            $Rep = Write-IdReport $ReportDir
+            $Console = @(& $script:IdPwsh -NoProfile -NonInteractive -File (Join-Path $Tree 'Reveal.ps1') -InputZip $Rep.Zip -DictionaryPath $Rep.Dict -Fields ResourceId -OutputZip $Out 2>&1 | ForEach-Object { [string]$_ })
+            $Exit = $LASTEXITCODE
+            $Revealed = $Out
+        }
+        else
+        {
+            $Root = Join-Path $Work 'root'
+            $Folder = Join-Path $Root 'sub-one'
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+            $null = Write-IdReport $Folder
+            $Console = @(& $script:IdPwsh -NoProfile -NonInteractive -File (Join-Path $Tree 'Reveal.ps1') -InventoryRoot $Root -Fields ResourceId -OutputZip $Out -FolderTimeoutMinutes 5 2>&1 | ForEach-Object { [string]$_ })
+            $Exit = $LASTEXITCODE
+            $Outer = Join-Path $Work 'outer'
+            if (Test-Path -LiteralPath $Out) { Expand-Archive -LiteralPath $Out -DestinationPath $Outer -Force }
+            $Revealed = Join-Path $Outer 'ResourcesReport_Id.zip'
+        }
+        $Because = $Console -join [Environment]::NewLine
+        $Exit | Should -Be 0 -Because $Because
+        Test-Path -LiteralPath $Revealed | Should -BeTrue -Because $Because
+        $Ex = Join-Path $Work 'ex'
+        Expand-Archive -LiteralPath $Revealed -DestinationPath $Ex -Force
+        Get-Content -LiteralPath (Join-Path $Ex 'Diagnostics_Id.log') -Raw | Should -BeExactly (Get-IdLogText $script:IdReal) -Because 'each line holds the real id, and the bracket and the URL marks after it stay as written'
+        $Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_Id.csv'))
+        $Csv[0].ResourceId | Should -BeExactly $script:IdReal
+        $Csv[0].Note | Should -BeExactly "moved ($($script:IdReal)) to the new plan"
     }
 }
 

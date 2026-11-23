@@ -15,6 +15,7 @@ BeforeAll {
     . (Join-Path $script:RepoRoot 'Functions/ResourceInventory.Functions.ps1')
     . (Join-Path $script:RepoRoot 'Functions/RunAllSubscriptions.Functions.ps1')
     . (Join-Path $script:RepoRoot 'Functions/AllSubHtmlSummary.Functions.ps1')
+    . (Join-Path $script:RepoRoot 'Functions/IdText.Functions.ps1')
     . (Join-Path $script:RepoRoot 'Functions/OfflineObfuscation.Functions.ps1')
     foreach ($Block in (Get-RdaLiveMaskFunction -RepoRoot $script:RepoRoot)) { . $Block }
 
@@ -3124,6 +3125,30 @@ Describe 'Test-RdaAzureWordCandidate' {
         }
         Test-RdaAzureWordCandidate 'Standard_D2s_v3' | Should -BeTrue -Because 'a SKU is Azure''s word'
         Test-RdaAzureWordCandidate '/providers/Microsoft.Insights/metricDefinitions' | Should -BeTrue -Because 'a provider path with no name holds no id'
+    }
+}
+
+# The rule of where a whole id ends in a text (Get-RdaIdEndMark, Get-RdaIdBeforeCloseParen) is in
+# Functions/IdText.Functions.ps1, which Protect-RdaReport.ps1 loads with its other files, so a
+# missing file stops it before it reads or writes anything, as a missing file of its list does.
+Describe 'Protect-RdaReport.ps1 with no IdText.Functions.ps1 next to it' {
+    It 'stops with exit 2, names the file, and writes nothing' {
+        $Tree = Join-Path $TestDrive ('tree_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path (Join-Path $Tree 'Functions') -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Protect-RdaReport.ps1') -Destination (Join-Path $Tree 'Protect-RdaReport.ps1')
+        foreach ($File in @(Get-ChildItem -LiteralPath (Join-Path $script:RepoRoot 'Functions') -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'IdText.Functions.ps1' }))
+        {
+            Copy-Item -LiteralPath $File.FullName -Destination (Join-Path $Tree "Functions/$($File.Name)")
+        }
+        $In = Join-Path $TestDrive ('in_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $In -Force | Out-Null
+        $Out = Join-Path $TestDrive ('out_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Text = @(& $script:Pwsh -NoProfile -NonInteractive -File (Join-Path $Tree 'Protect-RdaReport.ps1') -Path $In -OutputDirectory $Out 2>&1 | ForEach-Object { [string]$_ })
+        $Exit = $LASTEXITCODE
+        $Because = $Text -join [Environment]::NewLine
+        $Exit | Should -Be 2 -Because $Because
+        $Because | Should -BeLike ('*ERROR: required file not found: {0}*' -f (Join-Path $Tree 'Functions/IdText.Functions.ps1')) -Because $Because
+        Test-Path -LiteralPath $Out | Should -BeFalse -Because 'nothing is written'
     }
 }
 

@@ -507,23 +507,10 @@ function ConvertFrom-RdaUrlEscape([string]$Text)
     return $Text
 }
 
-# The marks that end a full id inside a text: whitespace, a quote or a mark no id holds
-# (<>,;|[]{}?#&=), as the body of a regex character class. Get-RdaFullIdPattern reads an id up
-# to the first of them, and so does Reveal's whole-id pass (Convert-RevealString,
-# Functions/RevealObfuscation.Functions.ps1, which loads this file), so the offline mask and
-# Reveal read one id in a text alike.
-function Get-RdaIdEndMark
-{
-    return '\s"''<>,;|\[\]{}?#&='
-}
-
-# $Id, a full id read from a text, with each ')' at its end that has no '(' of its own taken
-# off: a group name may hold '(' and ')', so only such a ')' closes the text around the id.
-function Get-RdaIdBeforeCloseParen([string]$Id)
-{
-    while ($Id.EndsWith(')') -and ($Id.Split('(').Count -lt $Id.Split(')').Count)) { $Id = $Id.Substring(0, $Id.Length - 1) }
-    return $Id
-}
+# Get-RdaIdEndMark (the marks that end a full id inside a text) and Get-RdaIdBeforeCloseParen
+# (an id with the ')' that closes the text around it taken off) are in
+# Functions/IdText.Functions.ps1, which Protect-RdaReport.ps1 loads. Reveal's whole-id pass
+# loads that file too, so the offline mask and Reveal read one id in a text alike.
 
 # The form of a full id inside a text: a '/subscriptions/...' path, or a tenant-scope path
 # ('/providers/<namespace>/<type>/<name>...', a management group or a reservation, which has
