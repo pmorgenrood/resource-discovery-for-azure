@@ -380,10 +380,13 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
             -TenantId $RealTenant `
             -FailedSubscriptions @('Contoso-Prod-Sub') `
             -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam-Billing'; Id = '12345678-1234-1234-1234-123456789012' }) `
+            -MarketplaceFailedSubs @([pscustomobject]@{ Name = 'Wingtip-Marketplace'; Id = '12345678-1234-1234-1234-123456789012' }, [pscustomobject]@{ Name = '(auth)'; Id = '(auth)' }) `
             -MetricsFailedSubs @([pscustomobject]@{ Name = 'Northwind-Metrics'; Id = '12345678-1234-1234-1234-123456789012' }) | Out-Null
         $Html = Get-Content -Path $Out -Raw
 
         # No real identifiers reach the shareable summary.
+        $Html | Should -Not -Match 'Wingtip-Marketplace'
+        $Html | Should -Match '1 subscription\(s\) had Marketplace \(third-party billing\) issues'
         $Html | Should -Not -Match ([regex]::Escape($RealTenant))
         $Html | Should -Not -Match 'Tenant:'
         $Html | Should -Not -Match 'Contoso-Prod-Sub'
@@ -402,9 +405,11 @@ Describe 'New-RdaAllSubHtmlSummary obfuscation redaction (shareable-bundle leak 
 
         New-RdaAllSubHtmlSummary -RunOutputDirectory $Run -HtmlFile $Out `
             -TenantId '12345678-1234-1234-1234-123456789012' `
-            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam-Billing'; Id = '12345678-1234-1234-1234-123456789012' }) | Out-Null
+            -ConsumptionFailedSubs @([pscustomobject]@{ Name = 'Fabrikam-Billing'; Id = '12345678-1234-1234-1234-123456789012' }) `
+            -MarketplaceFailedSubs @([pscustomobject]@{ Name = 'Wingtip-Marketplace'; Id = '12345678-1234-1234-1234-123456789012' }) | Out-Null
         $Html = Get-Content -Path $Out -Raw
 
+        $Html | Should -Match 'Wingtip-Marketplace' -Because 'an identifiable bundle names the subs with Marketplace issues'
         $Html | Should -Match 'Tenant:' -Because 'an identifiable bundle shows the tenant'
         $Html | Should -Match 'Fabrikam-Billing' -Because 'an identifiable bundle names the affected subs'
     }

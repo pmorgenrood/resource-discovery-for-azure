@@ -50,6 +50,7 @@ param (
     [switch] $Obfuscate,
     [switch] $SkipMetrics,
     [switch] $SkipConsumption,
+    [switch] $SkipMarketplace,
     [int]    $ConcurrencyLimit = 6
 )
 
@@ -88,6 +89,8 @@ if ($SubscriptionIds.Count -eq 0)
         ResourceCounts        = @()
         ConsumptionRecords    = 0
         ConsumptionFailedSubs = @()
+        MarketplaceRecords    = 0
+        MarketplaceFailedSubs = @()
         MetricsFailedSubs     = @()
     } | ConvertTo-Json -Depth 5 | Set-Content -Path $StreamSummaryPath -Encoding utf8
     exit 0
@@ -166,6 +169,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($SkipMarketplace) { $InventoryPassthrough['SkipMarketplace'] = $true }
 $InventoryPassthrough['ConcurrencyLimit'] = $ConcurrencyLimit
 
 # ---- Per-sub iteration -------------------------------------------------------
@@ -190,6 +194,8 @@ $FailedSubs = @()
 # 100-record subs).
 $Global:ConsumptionRecordCount = 0
 $Global:ConsumptionFailedSubs = @()
+$Global:MarketplaceRecordCount = 0
+$Global:MarketplaceFailedSubs = @()
 
 # Per-subscription metrics-phase auth health. ResourceInventory.ps1 appends to
 # $Global:MetricsFailedSubs (in this worker's scope, since it is invoked via `&`)
@@ -316,6 +322,8 @@ for ($i = 0; $i -lt $PairCount; $i++)
 # the per-iteration double-counting trap.
 $ConsumptionTotal = if ($null -ne $Global:ConsumptionRecordCount) { [int]$Global:ConsumptionRecordCount } else { 0 }
 $ConsumptionFailedSubs = if ($null -ne $Global:ConsumptionFailedSubs) { @($Global:ConsumptionFailedSubs) } else { @() }
+$MarketplaceTotal = if ($null -ne $Global:MarketplaceRecordCount) { [int]$Global:MarketplaceRecordCount } else { 0 }
+$MarketplaceFailedSubs = if ($null -ne $Global:MarketplaceFailedSubs) { @($Global:MarketplaceFailedSubs) } else { @() }
 $MetricsFailedSubs = if ($null -ne $Global:MetricsFailedSubs) { @($Global:MetricsFailedSubs) } else { @() }
 $CollectorFailures = if ($null -ne $Global:CollectorFailures) { @($Global:CollectorFailures) } else { @() }
 
@@ -328,7 +336,9 @@ $Summary = [pscustomobject]@{
     Failed                 = $FailedSubs
     ResourceCounts         = $ResourceCounts
     ConsumptionRecords     = $ConsumptionTotal
-    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Select-Object -Unique)
+    ConsumptionFailedSubs  = @($ConsumptionFailedSubs | Sort-Object -Property Id, Message -Unique)
+    MarketplaceRecords     = $MarketplaceTotal
+    MarketplaceFailedSubs  = @($MarketplaceFailedSubs | Sort-Object -Property Id, Message -Unique)
     MetricsFailedSubs      = @($MetricsFailedSubs)
     CollectorFailures      = @($CollectorFailures)
 }

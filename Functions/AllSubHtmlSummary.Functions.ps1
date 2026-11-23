@@ -191,6 +191,7 @@ function New-RdaAllSubHtmlSummary
         # array; when empty the corresponding banner is omitted.
         $FailedSubscriptions = @(),
         $ConsumptionFailedSubs = @(),
+        $MarketplaceFailedSubs = @(),
         $MetricsFailedSubs = @(),
         $CollectorFailures = @(),
 
@@ -319,6 +320,7 @@ function New-RdaAllSubHtmlSummary
     # read-only; a null/empty collection renders nothing.
     $FailedList = @(@($FailedSubscriptions) | Where-Object { $_ })
     $ConsumpList = @(@($ConsumptionFailedSubs) | Where-Object { $_ -and $_.Id -ne '(auth)' })
+    $MarketplaceList = @(@($MarketplaceFailedSubs) | Where-Object { $_ -and $_.Id -notin '(auth)', '(claude file)' })
     $MetricsList = @(@($MetricsFailedSubs) | Where-Object { $_ })
     $CollectorList = @(@($CollectorFailures) | Where-Object { $_ })
 
@@ -347,6 +349,17 @@ function New-RdaAllSubHtmlSummary
         else
         {
             [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had consumption (billing) issues.</b> Cost data may be incomplete for: {1}</div>', $ConsumpList.Count, (ConvertTo-HtmlSafe (($ConsumpList | ForEach-Object { [string]$_.Name }) -join ', ')))
+        }
+    }
+    if ($MarketplaceList.Count -gt 0)
+    {
+        if ($IsObfuscated)
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had Marketplace (third-party billing) issues.</b> Marketplace charges may be incomplete for those subscriptions.</div>', $MarketplaceList.Count)
+        }
+        else
+        {
+            [void]$Banners.AppendFormat('<div class="banner warn"><b>{0} subscription(s) had Marketplace (third-party billing) issues.</b> Marketplace charges may be incomplete for: {1}</div>', $MarketplaceList.Count, (ConvertTo-HtmlSafe (($MarketplaceList | ForEach-Object { [string]$_.Name }) -join ', ')))
         }
     }
     if ($MetricsList.Count -gt 0)

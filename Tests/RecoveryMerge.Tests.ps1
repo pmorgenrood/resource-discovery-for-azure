@@ -99,6 +99,15 @@ BeforeAll {
 
     $script:GapBase = 'GapReport_20260101_000000'
     $script:RecBase = 'RecReport_20260102_000000'
+
+    # A file in the shape the collection writes. Offer names a row; Tokens and Errors count records.
+    function script:New-ClaudeJson([string]$Offer = '', [int]$Tokens = 0, [int]$Errors = 0)
+    {
+        $Rows = @(); if ($Offer) { $Rows = @([ordered]@{ PublisherName = 'Anthropic'; OfferName = $Offer; PlanName = 'p'; ConsumedService = 's'; ConsumedQuantity = 1; UnitOfMeasure = '1 ccu'; PretaxCost = 1; Currency = 'USD'; IsEstimated = $false; MeterId = 'm'; UsageStart = '2026-01-01T00:00:00Z'; UsageEnd = '2026-01-01T23:59:59Z'; SubscriptionGuid = 'g'; ResourceGroup = 'r'; InstanceId = 'i'; InstanceName = 'n'; AlsoInConsumption = $false; AlsoInConsumptionMatch = 'None'; ResourceInConsumption = $false }) }
+        $Tok = @(); if ($Tokens) { $Tok = @(1..$Tokens | ForEach-Object { [ordered]@{ ID = 'i'; Subscription = 's'; ResourceGroup = 'r'; Name = 'n'; Location = 'l'; ModelName = 'claude-x'; Metric = 'InputTokens'; TimeGrain = '1.00:00:00'; StartTime = '2026-01-01T00:00:00Z'; EndTime = '2026-01-02T00:00:00Z'; Total = [long]5; DailySeries = [long[]]@(5) } }) }
+        $Err = @(); if ($Errors) { $Err = @(1..$Errors | ForEach-Object { [ordered]@{ Source = 'AzureMonitor'; Scope = 'x'; Message = 'm' } }) }
+        ([ordered]@{ SchemaVersion = 1; Obfuscated = $false; Reason = 'r'; RowsWindowStart = '2026-01-01T00:00:00Z'; RowsWindowEnd = '2026-01-02T00:00:00Z'; TokenWindowStart = '2026-01-01T00:00:00Z'; TokenWindowEnd = '2026-01-02T00:00:00Z'; ConsumptionRowsCompared = 0; OtherMarketplaceRowsSkipped = 0; NonClaudeTokenSeriesSkipped = 0; Rows = [object[]]$Rows; TokenUsage = [object[]]$Tok; Errors = [object[]]$Err } | ConvertTo-Json -Depth 6)
+    }
 }
 
 AfterAll {
@@ -245,6 +254,110 @@ Describe 'Merge-RecoveryData consumption handling' {
 
         { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption } |
             Should -Throw -ExpectedMessage '*has no Consumption_*'
+    }
+
+    It 'carries the gap Claude Marketplace file forward with the gap consumption file, and zips it' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv "$script:CsvHeader`n{},Compute,m1,GAP-METER,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,"
+        (script:New-ClaudeJson -Offer 'gap-offer') | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+        (script:New-ClaudeJson -Offer 'rec-offer') | Out-File -FilePath (Join-Path $C.Recovery ('ClaudeMarketPlace_{0}.json' -f $script:RecBase)) -Encoding utf8
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+
+        $Out = Join-Path $C.Output ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)
+        (Get-Content -Path $Out -Raw) | Should -Match 'gap-offer'
+        (Get-Content -Path $Out -Raw) | Should -Not -Match 'rec-offer'
+        (Get-ZipEntryNames $Result.OutputZip) | Should -Contain ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)
+    }
+
+    It 'leaves the word Inventory out of the Claude Marketplace file name, as the collection does' {
+        $C = New-Case
+        $Base = 'MyINVENTORYReport_20260101_000000'
+        New-Bundle -Dir $C.Gap -Base $Base -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        (script:New-ClaudeJson) | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $Base)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output
+
+        $Names = @(Get-ZipEntryNames $Result.OutputZip)
+        @($Names | Where-Object { $_ -like '*Inventory*' -and $_ -like '*.json' -and $_ -notlike 'Inventory_*' -and $_ -notlike 'Metrics_*' }).Count | Should -Be 0
+        $Names | Should -Contain 'ClaudeMarketPlace_MyInvReport_20260101_000000.json'
+    }
+
+    It 'takes the Claude Marketplace file from the recovery bundle under -RecoverConsumption' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv "$script:CsvHeader`n{},Compute,m1,GAP-METER,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,"
+        (script:New-ClaudeJson -Offer 'gap-offer') | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv "$script:CsvHeader`n{},Compute,m1,REC-METER,eastus,vm,9,Hours,2026-01-01,2026-01-02,/id,eastus,,,,"
+        (script:New-ClaudeJson -Offer 'rec-offer') | Out-File -FilePath (Join-Path $C.Recovery ('ClaudeMarketPlace_{0}.json' -f $script:RecBase)) -Encoding utf8
+
+        $null = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption
+
+        (Get-Content -Path (Join-Path $C.Output ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Raw) | Should -Match 'rec-offer'
+    }
+
+    It 'warns when the file it leaves out has rows' {
+        $C = New-Case
+        $Csv = "$script:CsvHeader`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv
+        (script:New-ClaudeJson -Offer 'gap-offer') | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv
+        (script:New-ClaudeJson) | Out-File -FilePath (Join-Path $C.Recovery ('ClaudeMarketPlace_{0}.json' -f $script:RecBase)) -Encoding utf8
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
+
+        ($Result.Warnings -join "`n") | Should -Match "other bundle's Claude Marketplace file has 1 row"
+    }
+
+    It 'warns about the token counts and failures of the file it leaves out, not only its rows' {
+        $C = New-Case
+        $Csv = "$script:CsvHeader`\n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,,"
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv
+        (script:New-ClaudeJson -Tokens 1 -Errors 1) | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv
+        (script:New-ClaudeJson) | Out-File -FilePath (Join-Path $C.Recovery ('ClaudeMarketPlace_{0}.json' -f $script:RecBase)) -Encoding utf8
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
+
+        ($Result.Warnings -join "`\n") | Should -Match '0 Rows, 1 TokenUsage, 1 Errors'
+    }
+
+    It 'stops when the file it carries is cut short or has the wrong shape: <Name>' -ForEach @(
+        @{ Name = 'cut short'; Text = '{"Rows":[{"OfferName":'; Make = $null }
+        @{ Name = 'lists only'; Text = '{"Rows":[]}'; Make = $null }
+        @{ Name = 'a number'; Text = '3'; Make = $null }
+        @{ Name = 'lists of wrong type'; Text = '{"Rows":null,"TokenUsage":{},"Errors":"not-a-list"}'; Make = $null }
+        @{ Name = 'null quantity'; Text = '{"Rows":[{"ConsumedQuantity":null,"PretaxCost":1,"AlsoInConsumption":false}],"TokenUsage":[],"Errors":[]}'; Make = $null }
+        @{ Name = 'null in series'; Text = '{"Rows":[],"TokenUsage":[{"Total":5,"DailySeries":[1,null]}],"Errors":[]}'; Make = $null }
+        @{ Name = 'error with no source'; Text = '{"Rows":[],"TokenUsage":[],"Errors":[{"Scope":"x"}]}'; Make = $null }
+        @{ Name = 'scalar series'; Text = $null; Make = @{ Args = @{ Tokens = 1 }; From = '"DailySeries": \[\s*5\s*\]'; To = '"DailySeries": 5' } }
+        @{ Name = 'unknown match value'; Text = $null; Make = @{ Args = @{ Offer = 'o' }; From = '"AlsoInConsumptionMatch": "None"'; To = '"AlsoInConsumptionMatch": "Maybe"' } }
+        @{ Name = 'unknown error source'; Text = $null; Make = @{ Args = @{ Errors = 1 }; From = '"Source": "AzureMonitor"'; To = '"Source": "Other"' } }
+        @{ Name = 'missing top-level flag'; Text = $null; Make = @{ Args = @{}; From = '"Obfuscated": false,'; To = '' } }
+        @{ Name = 'a date that is not UTC text'; Text = $null; Make = @{ Args = @{ Offer = 'o' }; From = '"UsageStart": "2026-01-01T00:00:00Z"'; To = '"UsageStart": "2026-01-01T00:00:00+03:00"' } }
+        @{ Name = 'a window date with no time'; Text = $null; Make = @{ Args = @{}; From = '"TokenWindowEnd": "2026-01-02T00:00:00Z"'; To = '"TokenWindowEnd": "2026-01-02"' } }
+        @{ Name = 'text where a flag belongs'; Text = $null; Make = @{ Args = @{ Offer = 'o' }; From = '"IsEstimated": false'; To = '"IsEstimated": "no"' } }
+    ) {
+        if ($null -ne $Make) { $MakeArgs = $Make.Args; $Text = (script:New-ClaudeJson @MakeArgs) -replace $Make.From, $Make.To }
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        $Text | Out-File -FilePath (Join-Path $C.Gap ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) -Encoding utf8
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        { Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output } | Should -Throw '*is not usable*'
+    }
+
+    It 'writes no Claude Marketplace file and warns when the source bundle has none' {
+        $C = New-Case
+        New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) })
+        New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; AppServices = @((New-Record 'app01')) })
+
+        $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -WarningAction SilentlyContinue
+
+        Test-Path (Join-Path $C.Output ('ClaudeMarketPlace_{0}.json' -f $script:GapBase)) | Should -BeFalse
+        ($Result.Warnings -join "`
+") | Should -Match 'no ClaudeMarketPlace_\*\.json'
     }
 
     It 'writes a canonical header-only CSV when neither bundle has consumption' {
@@ -470,6 +583,8 @@ Describe 'Merge-RecoveryData guards (advisory warnings)' {
         $Csv = "$script:CsvHeader`n{},Compute,m1,MET,eastus,vm,1,Hours,2026-01-01,2026-01-02,/id,eastus,,,"
         New-Bundle -Dir $C.Gap -Base $script:GapBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv -Dictionary $GapDict
         New-Bundle -Dir $C.Recovery -Base $script:RecBase -Inventory ([ordered]@{ Version = '3.2.3'; VirtualMachines = @((New-Record 'vm01')) }) -ConsumptionCsv $Csv -Dictionary $RecDict
+        # A bundle from this version always has its Claude Marketplace file.
+        (script:New-ClaudeJson) | Out-File -FilePath (Join-Path $C.Recovery ('ClaudeMarketPlace_{0}.json' -f $script:RecBase)) -Encoding utf8
 
         $Result = Merge-RecoveryData -GapBundlePath $C.Gap -RecoveryBundlePath $C.Recovery -OutputPath $C.Output -RecoverConsumption -WarningAction SilentlyContinue
 

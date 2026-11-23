@@ -5,6 +5,7 @@ param (
     [switch]$Obfuscate,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
+    [switch]$SkipMarketplace,
     [switch]$Resume,
     # Retry only the subscriptions that failed on a previous run: the script
     # processes exactly the failures recorded in the resume-state file and
@@ -484,6 +485,12 @@ $Global:MetricsFailedSubs = @()
 #     in its summary JSON; the aggregation loop below concatenates them.
 $Global:CollectorFailures = @()
 
+# Marketplace totals of this run. A wrapper run in a PowerShell process that already ran one starts from
+# zero, not from the earlier run's counts and failures. A parallel run reads each stream's own totals
+# from its summary, and a sequential run adds to these.
+$Global:MarketplaceRecordCount = 0
+$Global:MarketplaceFailedSubs = @()
+
 # Inventory root (used for resume state, consolidated output, and the wrapper
 # transcript). Computed up front so the transcript can be started before
 # anything else writes to the host.
@@ -948,6 +955,7 @@ if ($DeviceLogin) { $InventoryPassthrough['DeviceLogin'] = $true }
 if ($Obfuscate) { $InventoryPassthrough['Obfuscate'] = $true }
 if ($SkipMetrics) { $InventoryPassthrough['SkipMetrics'] = $true }
 if ($SkipConsumption) { $InventoryPassthrough['SkipConsumption'] = $true }
+if ($SkipMarketplace) { $InventoryPassthrough['SkipMarketplace'] = $true }
 # Always forward ConcurrencyLimit so the operator can tune metrics-phase
 # throttling end-to-end from a single param instead of editing the inner
 # script's default. Defaults to 6 (the inner script's existing default), so
@@ -1348,6 +1356,7 @@ else
                 if ($Obfuscate) { $WorkerArgs.Obfuscate = $true }
                 if ($SkipMetrics) { $WorkerArgs.SkipMetrics = $true }
                 if ($SkipConsumption) { $WorkerArgs.SkipConsumption = $true }
+                if ($SkipMarketplace) { $WorkerArgs.SkipMarketplace = $true }
 
                 $Jobs += Start-Job -ScriptBlock {
                     param($WorkerScript, $WorkerArgs)
@@ -1459,6 +1468,17 @@ else
                 {
                     if ($null -eq $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs = @() }
                     $Global:ConsumptionFailedSubs += @($StreamSummary.ConsumptionFailedSubs)
+                }
+
+                if ($null -ne $StreamSummary.MarketplaceRecords)
+                {
+                    if ($null -eq $Global:MarketplaceRecordCount) { $Global:MarketplaceRecordCount = 0 }
+                    $Global:MarketplaceRecordCount = [int]$Global:MarketplaceRecordCount + [int]$StreamSummary.MarketplaceRecords
+                }
+                if ($StreamSummary.MarketplaceFailedSubs -and $StreamSummary.MarketplaceFailedSubs.Count -gt 0)
+                {
+                    if ($null -eq $Global:MarketplaceFailedSubs) { $Global:MarketplaceFailedSubs = @() }
+                    $Global:MarketplaceFailedSubs += @($StreamSummary.MarketplaceFailedSubs)
                 }
 
                 if ($StreamSummary.MetricsFailedSubs -and $StreamSummary.MetricsFailedSubs.Count -gt 0)
@@ -1746,6 +1766,7 @@ if ($null -ne $OuterZipFile)
         New-RdaAllSubHtmlSummary -RunOutputDirectory $InventoryRoot -HtmlFile $MainSummaryFile -SinceTime $RunStartTime `
             -FailedSubscriptions $FailedSubscriptions `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
+            -MarketplaceFailedSubs $Global:MarketplaceFailedSubs `
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -CollectorFailures $Global:CollectorFailures `
             -TenantId $TenantID -Version $MainVer -PlatOS $PSVersionTable.OS `
@@ -1907,6 +1928,30 @@ if ($ConsumptionRecords -gt 0 -or $ConsumptionFailures.Count -gt 0)
 {
     Write-Host ("Consumption Records:     {0:N0} record(s) collected" -f $ConsumptionRecords) -ForegroundColor Green
 }
+$MarketplaceRecords = if ($null -ne $Global:MarketplaceRecordCount) { [int]$Global:MarketplaceRecordCount } else { 0 }
+$MarketplaceFailures = if ($null -ne $Global:MarketplaceFailedSubs) { @($Global:MarketplaceFailedSubs) } else { @() }
+if ($MarketplaceRecords -gt 0 -or $MarketplaceFailures.Count -gt 0)
+{
+    Write-Host ("Claude Marketplace Rows: {0:N0} row(s) collected" -f $MarketplaceRecords) -ForegroundColor Green
+}
+$MarketplaceSubFailures = @($MarketplaceFailures | Where-Object { $_.Id -notin '(auth)', '(claude file)' })
+if ($MarketplaceSubFailures.Count -gt 0)
+{
+    Write-Host ""
+    Write-Host ("Marketplace Failures:    {0} subscription(s)" -f $MarketplaceSubFailures.Count) -ForegroundColor Yellow
+    foreach ($mf in ($MarketplaceSubFailures | Sort-Object -Property Id, Message -Unique))
+    {
+        Write-Host ("  - {0} ({1})" -f $mf.Name, $mf.Id) -ForegroundColor Yellow
+    }
+    foreach ($m in @($MarketplaceSubFailures | Select-Object -ExpandProperty Message -Unique))
+    {
+        Write-Host ("  - {0}" -f $m) -ForegroundColor Yellow
+    }
+    Write-Host "  Note: the Marketplace file in the output report may be empty or incomplete for these subscriptions." -ForegroundColor Yellow
+    Write-Host "  -Resume and -ResumeFailedOnly do not collect it again for a subscription that finished. Run the subscription again without them to collect it." -ForegroundColor Yellow
+    Write-Host ""
+}
+
 if ($ConsumptionFailures.Count -gt 0)
 {
     Write-Host ""
@@ -2054,6 +2099,7 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
         #    runs emit counts only (the wrapper holds no per-sub obfuscation
         #    dictionary); default runs include per-sub detail.
         $ConsumptionRecordTotal = if ($null -ne $Global:ConsumptionRecordCount) { [int]$Global:ConsumptionRecordCount } else { 0 }
+        $MarketplaceRecordTotal = if ($null -ne $Global:MarketplaceRecordCount) { [int]$Global:MarketplaceRecordCount } else { 0 }
         $RunSummaryLines = Get-RunSummaryLogContent `
             -InvocationParameters $PSBoundParameters `
             -Version $BundleVer `
@@ -2066,6 +2112,8 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
             -MetricsFailedSubs $Global:MetricsFailedSubs `
             -ConsumptionFailedSubs $Global:ConsumptionFailedSubs `
             -ConsumptionRecordCount $ConsumptionRecordTotal `
+            -MarketplaceFailedSubs $Global:MarketplaceFailedSubs `
+            -MarketplaceRecordCount $MarketplaceRecordTotal `
             -HostVCpu $AutoTune.VCpu -HostRamGB $AutoTune.RamGB `
             -Streams $ParallelStreams -StreamsSource $StreamsSrc `
             -Concurrency $ConcurrencyLimit -ConcurrencySource $ConcurrencySrc `
@@ -2129,12 +2177,17 @@ if ($null -ne $OuterZipFile -and (Test-Path -LiteralPath $OuterZipFile))
 # (no -SkipConsumption) auth skips. The Excel sheets are intentionally NOT
 # annotated (server-side ingestion expects fixed columns); this banner is the
 # human-facing signal, and the non-zero exit below is the machine-facing one.
+# A Marketplace sign-in skip is shown in its own warning below. It does not set the exit code: the Claude
+# Marketplace file is an extra file, and a failure there never fails the run.
 $AuthSkippedPhases = @()
 if (@($Global:MetricsFailedSubs).Count -gt 0) { $AuthSkippedPhases += 'Metrics' }
 $ConsumptionAuthSkipped = @(
     if ($null -ne $Global:ConsumptionFailedSubs) { $Global:ConsumptionFailedSubs } else { @() }
 ) | Where-Object { $_.Id -eq '(auth)' }
 if ($ConsumptionAuthSkipped.Count -gt 0) { $AuthSkippedPhases += 'Consumption' }
+$MarketplaceAuthSkipped = @(
+    if ($null -ne $Global:MarketplaceFailedSubs) { $Global:MarketplaceFailedSubs } else { @() }
+) | Where-Object { $_.Id -eq '(auth)' }
 
 if ($AuthSkippedPhases.Count -gt 0)
 {
@@ -2146,6 +2199,12 @@ if ($AuthSkippedPhases.Count -gt 0)
     Write-Host "Fix: run Connect-AzAccount (or pass -appid/-secret/-tenant), then re-run." -ForegroundColor Red
     Write-Host "The rest of the inventory completed and the report was still produced." -ForegroundColor Yellow
     Write-Host "=========================================================" -ForegroundColor Red
+}
+
+if ($MarketplaceAuthSkipped.Count -gt 0)
+{
+    Write-Host ""
+    Write-Host "Marketplace: the Claude Marketplace file could not be collected (no usable Azure context/token). The file is in the report with an error record. The exit code is not changed." -ForegroundColor Yellow
 }
 
 # Machine-facing signal for collector failures (#22), distinct from the auth

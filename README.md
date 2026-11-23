@@ -365,6 +365,7 @@ Upon completion, the script generates reports in the `InventoryReports` folder:
 | File | Description |
 |------|-------------|
 | `Consumption_ResourcesReport_(date).csv` | The file holds Azure usage only: one row per meter and resource, with quantity, unit and usage dates. It has no prices or cost amounts. (see [Consumption data](docs/consumption-data.md)) |
+| `ClaudeMarketPlace_ResourcesReport_(date).json` | Anthropic (Claude) Marketplace charges for the run's date window, with the Claude token counts Azure Monitor keeps per model. Empty lists and a reason when there were none or the phase was skipped (`-SkipMarketplace`, `-SkipConsumption`). (see [Claude Marketplace file](docs/consumption-data.md#claude-marketplace-file-claudemarketplace_reportname_timestampjson)) |
 | `Inventory_ResourcesReport_(date).json` | Complete resource inventory |
 | `Metrics_ResourcesReport_(date).json` | Performance metrics data |
 | `ResourcesReport_(date).html` | Self-contained HTML report (open in any browser; no Excel required) |
@@ -448,7 +449,8 @@ Compress-Archive -Path ./* -DestinationPath "CompanyName_ResourcesReport_$(Get-D
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|----------|
 | `ConcurrencyLimit` | Integer | Parallel execution limit | 6 | `-ConcurrencyLimit 8` |
-| `SkipConsumption` | Switch | Skip usage (billing) data collection | False | `-SkipConsumption` |
+| `SkipConsumption` | Switch | Skip usage (billing) data collection. This also skips the Claude Marketplace file. | False | `-SkipConsumption` |
+| `SkipMarketplace` | Switch | Skip the Claude Marketplace file, `ClaudeMarketPlace_<ReportName>_<timestamp>.json`. The file is still in the zip, with empty lists. | False | `-SkipMarketplace` |
 | `SkipMetrics` | Switch | Skip Azure Monitor metrics collection | False | `-SkipMetrics` |
 | `MetricsLookbackDays` | Integer | Days of metric history to collect for the trend metrics. Lower values reduce run time and memory use. | 31 | `-MetricsLookbackDays 14` |
 
@@ -504,7 +506,7 @@ ACR storage, serverless SQL `app_cpu_billed`) use a fixed 1-day window and are
 ### Run-AllSubscriptions Wrapper Parameters
 
 These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper forwards `-DeviceLogin`, 
-`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, and `-ConcurrencyLimit` to the inner `ResourceInventory.ps1`, so they behave the same in both contexts.
+`-Obfuscate`, `-SkipMetrics`, `-SkipConsumption`, `-SkipMarketplace`, and `-ConcurrencyLimit` to the inner `ResourceInventory.ps1`, so they behave the same in both contexts.
 
 | Parameter | Type | Description | Default | Example |
 |-----------|------|-------------|---------|---------|
@@ -518,6 +520,7 @@ These are the parameters specific to `Run-AllSubscriptions.ps1`. The wrapper for
 | `Obfuscate` | Switch | Forwarded. Replace resource IDs, names, subscriptions, resource groups, and tags with masked values. | False | `-Obfuscate` |
 | `SkipMetrics` | Switch | Forwarded. Skip Azure Monitor metrics collection. | False | `-SkipMetrics` |
 | `SkipConsumption` | Switch | Forwarded. Skip usage (billing) data collection. | False | `-SkipConsumption` |
+| `SkipMarketplace` | Switch | Forwarded. Skip the Claude Marketplace file. | False | `-SkipMarketplace` |
 | `DeviceLogin` | Switch | Forwarded. Use device-code authentication (browser flow with a code). | False | `-DeviceLogin` |
 
 ## Troubleshooting

@@ -286,6 +286,22 @@ function Write-RdaShareableDiagnosticsLog
                 }
             }
         }
+        # A subscription, group or name that only the Marketplace phase saw has a dictionary key that is not a
+        # full resource id, so it is read from its own dictionary.
+        if ($null -ne $Global:ResourceSubscriptionDictionary)
+        {
+            foreach ($subKey in $Global:ResourceSubscriptionDictionary.Keys)
+            {
+                if ($subKey -match '(?i)^/subscriptions/([^/]+)$' -and -not $DiagScrubMap.ContainsKey($Matches[1])) { $DiagScrubMap[$Matches[1]] = $Global:ResourceSubscriptionDictionary[$subKey] }
+            }
+        }
+        if ($null -ne $Global:ResourceResourceGroupDictionary)
+        {
+            foreach ($rgKey in $Global:ResourceResourceGroupDictionary.Keys)
+            {
+                if ($rgKey -match '(?i)^/subscriptions/[^/]+/resourcegroups/([^/]+)$' -and -not $DiagScrubMap.ContainsKey($Matches[1])) { $DiagScrubMap[$Matches[1]] = $Global:ResourceResourceGroupDictionary[$rgKey] }
+            }
+        }
         if ($null -ne $Global:TagValueDictionary)
         {
             foreach ($tagReal in $Global:TagValueDictionary.Keys) { if (-not [string]::IsNullOrEmpty($tagReal) -and -not $DiagScrubMap.ContainsKey($tagReal)) { $DiagScrubMap[$tagReal] = $Global:TagValueDictionary[$tagReal] } }
@@ -316,6 +332,8 @@ function Write-RdaShareableDiagnosticsLog
         $CollectorFails = @(@($Global:CollectorFailures) | Where-Object { $null -ne $_ })
         $MetricsSkips = @(@($Global:MetricsFailedSubs) | Where-Object { $null -ne $_ })
         $ConsumpSkips = @(@($Global:ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+        # Only this call's entries: the global list keeps growing across a wrapper's calls.
+        $MarketplaceSkips = @(@($Global:MarketplaceFailedSubs) | Where-Object { $null -ne $_ } | Select-Object -Skip ([int]$script:MarketplaceFailuresBefore) | Where-Object { $_.Id -ne '(claude file)' })
 
         $DiagLines = [System.Collections.Generic.List[string]]::new()
         if ($Obfuscated)
@@ -361,6 +379,13 @@ function Write-RdaShareableDiagnosticsLog
         foreach ($csItem in $ConsumpSkips)
         {
             $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$csItem.Id) $DiagScrubMap), (Protect-DiagnosticText ([string]$csItem.Message) $DiagScrubMap)))
+        }
+
+        $DiagLines.Add('')
+        $DiagLines.Add(('Marketplace failed/incomplete subscriptions: {0}' -f $MarketplaceSkips.Count))
+        foreach ($mpItem in $MarketplaceSkips)
+        {
+            $DiagLines.Add(('  [sub {0}] {1}' -f (Protect-DiagnosticText ([string]$mpItem.Id) $DiagScrubMap), $(if ($Obfuscated) { 'Marketplace charges could not be read for this subscription. The run log on the machine holds the cause.' } else { [string]$mpItem.Message })))
         }
 
         $DiagnosticsFile = ($DefaultPath + "Diagnostics_" + $ReportName + "_" + $RunDateTime + ".log")
@@ -606,5 +631,203 @@ function Compress-RdaReportArchive
                 Write-Warning ("Compress-RdaReportArchive: could not check or remove the temporary file '{0}': {1}; delete it by hand if it is there." -f $TempPath, $_.Exception.Message)
             }
         }
+    }
+}
+
+Function Global:Get-RdaArmIdParts
+{
+    # The subscription and resource group of an Azure resource id, read with an ignore-case match that does not
+    # depend on the culture of the thread (a tr-TR thread does not match an upper-case I). Returns $null when the
+    # text is not an id that starts with /subscriptions/<id>. ResourceGroup is empty for an id with no group.
+    param([AllowNull()][AllowEmptyString()][string]$Id)
+
+    if ([string]::IsNullOrEmpty($Id)) { return $null }
+    $M = [regex]::Match($Id, '^/subscriptions/([^/]+)(/resourcegroups/([^/]+))?', 'IgnoreCase, CultureInvariant')
+    if (-not $M.Success) { return $null }
+    return [pscustomobject]@{ Subscription = $M.Groups[1].Value; ResourceGroup = $M.Groups[3].Value }
+}
+
+Function Global:Get-RdaMarketplaceResourceId([string]$InstanceId)
+{
+    # Get-AzConsumptionMarketplace documents InstanceId as "subscriptions/..." with no leading slash. The
+    # masking and the id joins read the ARM form, "/subscriptions/...".
+    if ([regex]::IsMatch($InstanceId, '^subscriptions/', 'IgnoreCase, CultureInvariant')) { return ('/' + $InstanceId) }
+    return $InstanceId
+}
+
+Function Global:Get-RdaMarketplaceCanonicalId
+{
+    # The Azure resource id of a Marketplace row, as /subscriptions/<id>[/resourcegroups/<group>]/providers/...,
+    # with the leading slash Azure leaves out added. Returns $null when the row has no InstanceId or its
+    # InstanceId is not an id of that shape.
+    param([Parameter(Mandatory = $true)]$Row)
+
+    $Id = Get-RdaMarketplaceResourceId -InstanceId ([string]$Row.InstanceId)
+    if ([regex]::IsMatch($Id, '^/subscriptions/[^/]+(/resourcegroups/[^/]+)?/providers/.+', 'IgnoreCase, CultureInvariant')) { return $Id }
+    return $null
+}
+
+Function Global:ConvertTo-RdaMarketplaceRow
+{
+    # Maps one Marketplace usage row (the shape Get-AzConsumptionMarketplace returns) to the flat
+    # object that becomes a row of ClaudeMarketPlace_<ReportName>_<stamp>.json (ConvertTo-RdaClaudeMarketplaceRecord).
+    #
+    # Under -Obfuscate:
+    #   - PublisherName, OfferName and PlanName stay readable: they name the product, not the customer.
+    #   - InstanceId is an ARM id and is masked like a consumption ResourceId, with the same tokens.
+    #     An id the caller already masked (IdLookup, raw id -> masked id, ignoring case) keeps its token.
+    #   - SubscriptionGuid and SubscriptionName hold one subscription, so both get the token the
+    #     other files use for it (SubGuidTokenMap, a guid -> token view of the run's dictionary).
+    #   - ResourceGroup gets the token the other files use for that group (RgTokenMap).
+    #   - A subscription or group the other files do not hold gets a token from the local caches.
+    #   - InstanceName is tokenised in the local name cache.
+    param(
+        [Parameter(Mandatory = $true)]$Row,
+        [bool]$Obfuscate = $false,
+        # Raw resource id -> masked id, ignoring case: the ids the inventory and earlier rows already masked.
+        $IdLookup = $null,
+        # $Global:ResourceNameDictionary: resource id -> the masked name of that resource.
+        $NameDictionary = $null,
+        $SubGuidTokenMap = $null,
+        $RgTokenMap = $null,
+        [hashtable]$SubCache = $null,
+        [hashtable]$RgCache = $null,
+        [hashtable]$NameCache = $null
+    )
+
+    # Azure writes InstanceId without its leading slash. The plain file keeps what Azure wrote, with the slash.
+    $OutInstanceId = if ([string]::IsNullOrEmpty($Row.InstanceId)) { $Row.InstanceId } else { Get-RdaMarketplaceResourceId -InstanceId ([string]$Row.InstanceId) }
+    $OutResourceGroup = $Row.ResourceGroup
+    $OutSubscriptionName = $Row.SubscriptionName
+    $OutInstanceName = $Row.InstanceName
+    $OutSubscriptionGuid = $Row.SubscriptionGuid
+
+    if ($Obfuscate)
+    {
+        if ($null -eq $SubCache) { $SubCache = @{} }
+        if ($null -eq $RgCache) { $RgCache = @{} }
+        if ($null -eq $NameCache) { $NameCache = @{} }
+
+        $Prefix = if ("$($Row.InstanceId) $($Row.InstanceName) $($Row.ResourceGroup)" -match '\b(dev|test|qa|tst|development|non-prod|uat|nonprod)\b' -or "$($Row.InstanceId)" -match '(^|/|-)([dts])-') { 'nonprod_' } else { 'prod_' }
+
+        # The row's own id when it is an Azure id. An InstanceId that is not one (or is empty) has no path to
+        # keep the shape of, so it is masked as free text, which the dictionary can undo.
+        $RawId = Get-RdaMarketplaceCanonicalId -Row $Row
+        if (-not [string]::IsNullOrEmpty($Row.InstanceId))
+        {
+            if ($null -eq $RawId)
+            {
+                $OutInstanceId = Protect-FreeTextValue ([string]$Row.InstanceId)
+            }
+            elseif ($null -ne $IdLookup -and $IdLookup.ContainsKey($RawId))
+            {
+                $OutInstanceId = $IdLookup[$RawId]
+                # The subscription and group of this path already have a token in it. The row's own subscription and
+                # group columns take those same tokens, so one real value has one token in the row.
+                $RealParts = Get-RdaArmIdParts -Id $RawId
+                $MaskedParts = Get-RdaArmIdParts -Id $OutInstanceId
+                if ($null -ne $RealParts -and $null -ne $MaskedParts)
+                {
+                    if (-not $SubCache.ContainsKey($RealParts.Subscription)) { $SubCache[$RealParts.Subscription] = $MaskedParts.Subscription }
+                    if (-not [string]::IsNullOrEmpty($RealParts.ResourceGroup) -and -not [string]::IsNullOrEmpty($MaskedParts.ResourceGroup) -and -not $RgCache.ContainsKey($RealParts.ResourceGroup)) { $RgCache[$RealParts.ResourceGroup] = $MaskedParts.ResourceGroup }
+                }
+            }
+            else
+            {
+                # The id's own subscription and group segments get the token the other files use for them.
+                # Build-ObfuscatedResourceUri looks those up by the full resource id, which a Marketplace
+                # resource is not in, so the caches are seeded here.
+                $IdParts = Get-RdaArmIdParts -Id $RawId
+                if ($null -ne $IdParts)
+                {
+                    $IdSub = $IdParts.Subscription
+                    $IdRg = $IdParts.ResourceGroup
+                    if ($null -ne $SubGuidTokenMap -and $SubGuidTokenMap.ContainsKey($IdSub)) { $SubCache[$IdSub] = $SubGuidTokenMap[$IdSub] }
+                    if (-not [string]::IsNullOrEmpty($IdRg) -and $null -ne $RgTokenMap -and $RgTokenMap.ContainsKey($IdRg)) { $RgCache[$IdRg] = $RgTokenMap[$IdRg] }
+                }
+                $OutInstanceId = Build-ObfuscatedResourceUri -RawUri $RawId.ToLowerInvariant() -Prefix $Prefix -SubscriptionDictionary $null -ResourceGroupDictionary $null -NameDictionary $NameDictionary -SubCache $SubCache -RgCache $RgCache -NameCache $NameCache
+            }
+        }
+
+        # The subscription and group columns take the tokens that the masked id path holds, when the path is the
+        # row's own subscription and group, so one real value has one token inside the row.
+        $PathSubToken = $null
+        $PathRgToken = $null
+        $RealPathParts = Get-RdaArmIdParts -Id $RawId
+        $MaskedPathParts = Get-RdaArmIdParts -Id $OutInstanceId
+        if ($null -ne $RealPathParts -and $null -ne $MaskedPathParts)
+        {
+            if ($RealPathParts.Subscription -ieq $Row.SubscriptionGuid) { $PathSubToken = $MaskedPathParts.Subscription }
+            if (-not [string]::IsNullOrEmpty($RealPathParts.ResourceGroup) -and $RealPathParts.ResourceGroup -ieq $Row.ResourceGroup -and -not [string]::IsNullOrEmpty($MaskedPathParts.ResourceGroup)) { $PathRgToken = $MaskedPathParts.ResourceGroup }
+        }
+
+        $SharedSubToken = $null
+        if ($null -ne $PathSubToken)
+        {
+            $SharedSubToken = $PathSubToken
+            $OutSubscriptionGuid = $SharedSubToken
+        }
+        elseif (-not [string]::IsNullOrEmpty($Row.SubscriptionGuid))
+        {
+            $SharedSubToken = Resolve-ObfuscationToken -RealValue $Row.SubscriptionGuid -LookupKey $Row.SubscriptionGuid -SharedDictionary $SubGuidTokenMap -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
+            $OutSubscriptionGuid = $SharedSubToken
+        }
+
+        if (-not [string]::IsNullOrEmpty($Row.SubscriptionName))
+        {
+            if ($null -ne $SharedSubToken)
+            {
+                $OutSubscriptionName = $SharedSubToken
+            }
+            else
+            {
+                $OutSubscriptionName = Resolve-ObfuscationToken -RealValue $Row.SubscriptionName -LookupKey $Row.SubscriptionName -SharedDictionary $null -LocalCache $SubCache -TokenPrefix ($Prefix + 'sub_')
+            }
+        }
+
+        if ($null -ne $PathRgToken)
+        {
+            $OutResourceGroup = $PathRgToken
+        }
+        elseif (-not [string]::IsNullOrEmpty($Row.ResourceGroup))
+        {
+            $RgTag = if ($Row.ResourceGroup -match '^mc_') { 'mc_' } else { '' }
+            $OutResourceGroup = Resolve-ObfuscationToken -RealValue $Row.ResourceGroup -LookupKey $Row.ResourceGroup -SharedDictionary $RgTokenMap -LocalCache $RgCache -TokenPrefix ($Prefix + 'rg_' + $RgTag)
+        }
+
+        if (-not [string]::IsNullOrEmpty($Row.InstanceName))
+        {
+            # An id that was already masked has its name token in the last segment of the masked id, and the
+            # instance name is that same name. Use it, so one real name has one token.
+            $KnownIdName = $null
+            if ($null -ne $IdLookup -and $null -ne $RawId -and $IdLookup.ContainsKey($RawId))
+            {
+                $KnownRawName = ($RawId -split '/')[-1]
+                if ($KnownRawName -ieq $Row.InstanceName) { $KnownIdName = ($OutInstanceId -split '/')[-1] }
+            }
+            $OutInstanceName = if ($null -ne $KnownIdName) { $KnownIdName }
+            elseif ($null -eq $RawId) { Protect-FreeTextValue ([string]$Row.InstanceName) }
+            else { Resolve-ObfuscationToken -RealValue $Row.InstanceName -LookupKey $Row.InstanceName -SharedDictionary $null -LocalCache $NameCache -TokenPrefix $Prefix }
+        }
+    }
+
+    return [PSCustomObject]@{
+        PublisherName    = $Row.PublisherName
+        OfferName        = $Row.OfferName
+        PlanName         = $Row.PlanName
+        ConsumedService  = $Row.ConsumedService
+        ConsumedQuantity = $Row.ConsumedQuantity
+        UnitOfMeasure    = $Row.UnitOfMeasure
+        PretaxCost       = $Row.PretaxCost
+        Currency         = $Row.Currency
+        IsEstimated      = $Row.IsEstimated
+        MeterId          = $Row.MeterId
+        UsageStart       = $Row.UsageStart
+        UsageEnd         = $Row.UsageEnd
+        SubscriptionGuid = $OutSubscriptionGuid
+        SubscriptionName = $OutSubscriptionName
+        ResourceGroup    = $OutResourceGroup
+        InstanceId       = $OutInstanceId
+        InstanceName     = $OutInstanceName
     }
 }

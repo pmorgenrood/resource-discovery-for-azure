@@ -924,6 +924,8 @@ function Get-RunSummaryLogContent
         $MetricsFailedSubs = @(),
         $ConsumptionFailedSubs = @(),
         [int]$ConsumptionRecordCount = 0,
+        $MarketplaceFailedSubs = @(),
+        [int]$MarketplaceRecordCount = 0,
         # Host size and resolved parallelism (run-environment metadata, not
         # identifiers). Emitted in both modes. Defaults mean "not supplied" and
         # the whole section is omitted (keeps standalone/offline callers clean).
@@ -955,6 +957,9 @@ function Get-RunSummaryLogContent
     $Collector = @(@($CollectorFailures) | Where-Object { $null -ne $_ })
     $Metrics = @(@($MetricsFailedSubs) | Where-Object { $null -ne $_ })
     $Consumption = @(@($ConsumptionFailedSubs) | Where-Object { $null -ne $_ })
+    # The Claude file's own failure is not a subscription: it is in the file's Errors and the run log.
+    $MarketplaceAuthSkip = @(@($MarketplaceFailedSubs) | Where-Object { $null -ne $_ -and $_.Id -eq '(auth)' }).Count
+    $Marketplace = @(@($MarketplaceFailedSubs) | Where-Object { $null -ne $_ -and $_.Id -notin '(auth)', '(claude file)' })
 
     $Lines = [System.Collections.Generic.List[string]]::new()
     $Lines.Add('Resource Discovery for Azure - run summary')
@@ -1069,10 +1074,13 @@ function Get-RunSummaryLogContent
     $Lines.Add('')
     $Lines.Add('Health:')
     $Lines.Add(('  Consumption records collected : {0}' -f $ConsumptionRecordCount))
+    $Lines.Add(('  Claude Marketplace rows       : {0}' -f $MarketplaceRecordCount))
     $Lines.Add(('  Failed subscriptions          : {0}' -f $Failed.Count))
     $Lines.Add(('  Collector failures            : {0}' -f $Collector.Count))
     $Lines.Add(('  Metrics auth-skipped subs     : {0}' -f $Metrics.Count))
     $Lines.Add(('  Consumption failed subs       : {0}' -f $Consumption.Count))
+    $Lines.Add(('  Marketplace failed subs       : {0}' -f $Marketplace.Count))
+    if ($MarketplaceAuthSkip -gt 0) { $Lines.Add('  Marketplace phase skipped     : no usable Azure sign-in') }
 
     # Per-subscription detail is emitted ONLY for a non-obfuscated bundle, where
     # real names already appear throughout the report. An obfuscated bundle stops
@@ -1108,6 +1116,12 @@ function Get-RunSummaryLogContent
             $Lines.Add('')
             $Lines.Add('Consumption failed subscriptions (detail):')
             foreach ($ConsumpSub in $Consumption) { $Lines.Add(('  - {0} ({1}): {2}' -f [string]$ConsumpSub.Name, [string]$ConsumpSub.Id, [string]$ConsumpSub.Message)) }
+        }
+        if ($Marketplace.Count -gt 0)
+        {
+            $Lines.Add('')
+            $Lines.Add('Marketplace failed subscriptions (detail):')
+            foreach ($MarketSub in $Marketplace) { $Lines.Add(('  - {0} ({1}): {2}' -f [string]$MarketSub.Name, [string]$MarketSub.Id, [string]$MarketSub.Message)) }
         }
     }
 

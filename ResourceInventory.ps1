@@ -10,6 +10,7 @@ param ($TenantID,
     [switch]$Debug,
     [switch]$SkipMetrics,
     [switch]$SkipConsumption,
+    [switch]$SkipMarketplace,
     [switch]$DeviceLogin,
     [switch]$Obfuscate,
     [switch]$RunAllSubs,
@@ -35,6 +36,15 @@ if (-not (Test-Path -Path $CommonFunctionsFile -PathType Leaf))
     exit 1
 }
 . $CommonFunctionsFile
+
+$ClaudeMarketplaceFunctionsFile = Join-Path $PSScriptRoot 'Functions/ClaudeMarketplace.Functions.ps1'
+if (-not (Test-Path -Path $ClaudeMarketplaceFunctionsFile -PathType Leaf))
+{
+    Write-Host "ERROR: Required functions file not found: $ClaudeMarketplaceFunctionsFile" -ForegroundColor Red
+    Write-Host "Ensure the 'Functions' folder ships alongside this script." -ForegroundColor Yellow
+    exit 1
+}
+. $ClaudeMarketplaceFunctionsFile
 
 if ($Debug.IsPresent) { $DebugPreference = 'Continue' }
 
@@ -814,6 +824,9 @@ function ExecuteInventoryProcessing()
         $Global:JsonFile = ($DefaultPath + "Inventory_" + $Global:ReportName + "_" + $CurrentDateTime + ".json")
         $Global:MetricsJsonFile = ($DefaultPath + "Metrics_" + $Global:ReportName + "_" + $CurrentDateTime + ".json")
         $Global:ConsumptionFileCsv = ($DefaultPath + "Consumption_" + $Global:ReportName + "_" + $CurrentDateTime + ".csv")
+        # The word Inventory is taken out of the report name here: a reader takes the first .json file whose name holds it as
+        # the inventory, and this file's name sorts before Inventory_*.json.
+        $Global:ClaudeMarketplaceFile = ($DefaultPath + "ClaudeMarketPlace_" + ([regex]::Replace($Global:ReportName, 'inventory', 'Inv', 'IgnoreCase, CultureInvariant')) + "_" + $CurrentDateTime + ".json")
 
         if ($RunAllSubs.IsPresent)
         {
@@ -1248,8 +1261,14 @@ function ExecuteInventoryProcessing()
         [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
         [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
 
-        $ReportedStartTime = (Get-Date).AddDays(-31).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
-        $ReportedEndTime = (Get-Date).AddDays(-1).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
+        # One clock read for the usage window and the Marketplace window, so a run across midnight cannot split them.
+        $ConsumptionNow = Get-Date
+        $ReportedStartTime = $ConsumptionNow.AddDays(-31).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
+        $ReportedEndTime = $ConsumptionNow.AddDays(-1).Date.AddHours(0).AddMinutes(0).AddSeconds(0).DateTime
+        # The Marketplace phase reads the same calendar dates. They are kept as dates: the two variables
+        # above hold text, because .DateTime on a date is its text form.
+        $script:ConsumptionWindowStart = $ConsumptionNow.AddDays(-31).Date
+        $script:ConsumptionWindowEnd = $ConsumptionNow.AddDays(-1).Date
 
         if (-not (Test-DataPlaneAuthReady -Phase 'Consumption'))
         {
@@ -1485,9 +1504,445 @@ function ExecuteInventoryProcessing()
         $DebugPreference = "Continue"
     }
 
+    function Add-MarketplaceDictionaryEntries($Row, $ExportRow)
+    {
+        # Writes the masked subscription, group, instance id and instance name of one Marketplace row
+        # into the run's dictionaries when the inventory did not already hold them.
+        $RawId = Get-RdaMarketplaceCanonicalId -Row $Row
+        # A row with no instance id has an empty masked id here, so no id is recorded for it.
+        if (![string]::IsNullOrEmpty($RawId) -and ![string]::IsNullOrEmpty($ExportRow.InstanceId) -and $null -ne $script:MarketplaceIdLookup -and !$script:MarketplaceIdLookup.ContainsKey($RawId))
+        {
+            $script:MarketplaceIdLookup[$RawId] = $ExportRow.InstanceId
+            if ($null -ne $Global:ResourceIdDictionary -and !$Global:ResourceIdDictionary.ContainsKey($RawId)) { $Global:ResourceIdDictionary[$RawId] = $ExportRow.InstanceId }
+        }
+        # The name token has its own entry, kept when the id was already known: Consumption can have made the id and
+        # kept its name token in a cache the dictionary file does not read.
+        if (![string]::IsNullOrEmpty($RawId) -and ![string]::IsNullOrEmpty($ExportRow.InstanceName) -and $null -ne $Global:ResourceNameDictionary -and !$Global:ResourceNameDictionary.ContainsKey($RawId) -and !$Global:ResourceNameDictionary.ContainsValue($ExportRow.InstanceName)) { $Global:ResourceNameDictionary[$RawId] = $ExportRow.InstanceName }
+
+        if (![string]::IsNullOrEmpty($Row.SubscriptionGuid) -and $null -ne $Global:ResourceSubscriptionDictionary)
+        {
+            $SubKey = '/subscriptions/' + $Row.SubscriptionGuid
+            # Only a token no entry holds yet is added: the inventory's entries for the same subscription stay as they are.
+            if (!$Global:ResourceSubscriptionDictionary.ContainsKey($SubKey) -and !$Global:ResourceSubscriptionDictionary.ContainsValue($ExportRow.SubscriptionGuid)) { $Global:ResourceSubscriptionDictionary[$SubKey] = $ExportRow.SubscriptionGuid }
+            if (![string]::IsNullOrEmpty($Row.ResourceGroup) -and $null -ne $Global:ResourceResourceGroupDictionary)
+            {
+                $RgKey = $SubKey + '/resourcegroups/' + $Row.ResourceGroup
+                if (!$Global:ResourceResourceGroupDictionary.ContainsKey($RgKey) -and !$Global:ResourceResourceGroupDictionary.ContainsValue($ExportRow.ResourceGroup)) { $Global:ResourceResourceGroupDictionary[$RgKey] = $ExportRow.ResourceGroup }
+            }
+        }
+    }
+
+    function Add-ClaudeMarketplaceError([string]$SubscriptionId, [string]$Message, $SubGuidTokenMap = $null)
+    {
+        # One error record for the Claude Marketplace file. Under -Obfuscate the subscription gets the token the
+        # other files use for it (a token that no other file holds is also written to the dictionary), and the
+        # message is a fixed sentence: the full text stays in the run log.
+        $Scope = $SubscriptionId
+        if ($Obfuscate.IsPresent -and $SubscriptionId -match '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$')
+        {
+            if (-not $script:MarketplaceSubCache) { $script:MarketplaceSubCache = @{} }
+            $Scope = Resolve-ObfuscationToken -RealValue $SubscriptionId -LookupKey $SubscriptionId -SharedDictionary $SubGuidTokenMap -LocalCache $script:MarketplaceSubCache -TokenPrefix 'prod_sub_'
+            $SubKey = '/subscriptions/' + $SubscriptionId
+            if ($null -ne $Global:ResourceSubscriptionDictionary -and !$Global:ResourceSubscriptionDictionary.ContainsKey($SubKey) -and !$Global:ResourceSubscriptionDictionary.ContainsValue($Scope)) { $Global:ResourceSubscriptionDictionary[$SubKey] = $Scope }
+        }
+        elseif ($Obfuscate.IsPresent -and $SubscriptionId -ne '(all subscriptions)')
+        {
+            $Scope = 'obfuscated'
+        }
+        $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Marketplace -Scope $Scope -Message $Message -Obfuscate $Obfuscate.IsPresent))
+    }
+
+    function WriteClaudeMarketplaceFile()
+    {
+        # Reads the Claude token counts of the Foundry accounts (unless the sign-in failed) and writes
+        # ClaudeMarketPlace_<ReportName>_<stamp>.json from the rows GetMarketplaceConsumption kept. The file is
+        # written even when nothing was found. A failure here is logged and never stops the run; the report
+        # step then writes the file with empty lists.
+        $DebugPreference = "SilentlyContinue"
+        try
+        {
+            $TokenResult = $null
+            if ($script:ClaudeAuthFailed)
+            {
+                $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source AzureMonitor -Scope '(all accounts)' -Message 'Token counts skipped: no usable Azure context/token.' -Obfuscate $Obfuscate.IsPresent))
+            }
+            else
+            {
+                # Its own try: a failure in the token step must not lose the Marketplace rows already collected.
+                try
+                {
+                    $TokenResult = Invoke-RdaClaudeTokenCollection -Accounts $script:ClaudeTokenAccounts -Subscriptions $Global:Subscriptions -Obfuscate $Obfuscate.IsPresent -ResourceIdDictionary $ResourceIdDictionary -ResourceNameDictionary $ResourceNameDictionary -ResourceSubDictionary $ResourceSubscriptionDictionary -ResourceGroupDictionary $ResourceResourceGroupDictionary -LookbackDays 31
+                    foreach ($TokenError in $TokenResult.Errors) { $script:ClaudeErrors.Add($TokenError) }
+                    if ($TokenResult.Accounts -gt 0)
+                    {
+                        Write-Log -Message ('Claude token counts: {0} Foundry account(s), {1} record(s), {2} account(s) read only in part or not at all, {3} non-Claude series left out.' -f $TokenResult.Accounts, $TokenResult.Records.Count, $TokenResult.Failed, $TokenResult.NonClaudeSeries) -Severity $(if ($TokenResult.Failed -gt 0) { 'Warning' } else { 'Info' })
+                    }
+                }
+                catch
+                {
+                    $TokenResult = $null
+                    Write-Log -Message ('Claude token counts were not collected: {0}' -f $_.Exception.Message) -Severity 'Warning'
+                    $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source AzureMonitor -Scope '(all accounts)' -Message $_.Exception.Message -Obfuscate $Obfuscate.IsPresent))
+                }
+            }
+
+            # Which of the rows are also in the Consumption file: it is read once, after it was written.
+            $ConsumptionRowsRead = [long]0
+            try
+            {
+                $TokenToSubscription = $null
+                if ($Obfuscate.IsPresent -and @($script:ClaudeRows).Count -gt 0)
+                {
+                    # masked subscription token -> real id, from the run's dictionary and the caches that hold tokens made later
+                    $TokenToSubscription = @{}
+                    # Two subscriptions with one display name share a token, so a token can stand for several ids.
+                    $AddToken = { param($Token, $RealId) if (-not $TokenToSubscription.ContainsKey($Token)) { $TokenToSubscription[$Token] = [System.Collections.Generic.List[string]]::new() }; if ($TokenToSubscription[$Token] -notcontains $RealId) { $TokenToSubscription[$Token].Add($RealId) } }
+                    foreach ($DictKey in @($Global:ResourceSubscriptionDictionary.Keys)) { $KeyParts = Get-RdaArmIdParts -Id $DictKey; if ($null -ne $KeyParts) { & $AddToken ([string]$Global:ResourceSubscriptionDictionary[$DictKey]) $KeyParts.Subscription } }
+                    foreach ($Cache in @($script:ConsumptionSubCache, $script:MarketplaceSubCache)) { if ($null -ne $Cache) { foreach ($RealSub in $Cache.Keys) { & $AddToken ([string]$Cache[$RealSub]) ([string]$RealSub) } } }
+                }
+                $MatchStats = @{}
+                $ConsumptionRowsRead = Set-RdaConsumptionMatch -CsvPath $Global:ConsumptionFileCsv -Records $script:ClaudeRows -RecordSubscriptions @($script:ClaudeRowSubscriptions) -TokenToSubscription $TokenToSubscription -Stats $MatchStats
+                if ([long]$MatchStats['NearMiss'] -gt 0)
+                {
+                    Write-Log -Message ('Claude Marketplace: {0} Consumption row(s) have the meter, day and subscription of a Marketplace row but another quantity.' -f $MatchStats['NearMiss']) -Severity 'Warning'
+                    $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Consumption -Message 'Some Consumption rows have the meter, day and subscription of a Marketplace row but another quantity, so AlsoInConsumption false may be wrong.' -Obfuscate $Obfuscate.IsPresent))
+                }
+                if ([long]$MatchStats['Unreadable'] -gt 0)
+                {
+                    Write-Log -Message ('Claude Marketplace: {0} Consumption row(s) with the meter of a Marketplace row could not be compared (no known subscription, date or quantity).' -f $MatchStats['Unreadable']) -Severity 'Warning'
+                    $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Consumption -Message 'Some Consumption rows with the meter of a Marketplace row could not be compared.' -Obfuscate $Obfuscate.IsPresent))
+                }
+            }
+            catch
+            {
+                Write-Log -Message ('Claude Marketplace: the Consumption file could not be compared: {0}' -f $_.Exception.Message) -Severity 'Warning'
+                # A comparison that stopped half way is not kept: every row reads false, as the error says.
+                foreach ($ClaudeRecord in $script:ClaudeRows) { $ClaudeRecord['AlsoInConsumption'] = $false; $ClaudeRecord['AlsoInConsumptionMatch'] = 'None'; $ClaudeRecord['ResourceInConsumption'] = $false }
+                $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Consumption -Message 'The Consumption file could not be read, so AlsoInConsumption may be wrong (false).' -Obfuscate $Obfuscate.IsPresent))
+            }
+            # Only the failures this run's consumption phase added: the list keeps growing across a wrapper's calls.
+            if (@($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ } | Select-Object -Skip ([int]$script:ConsumptionFailuresBefore)).Count -gt 0)
+            {
+                $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Consumption -Message 'The consumption phase had failures, so the Consumption file may be incomplete and AlsoInConsumption false may be wrong.' -Obfuscate $Obfuscate.IsPresent))
+            }
+
+            $WriteArgs = @{
+                FilePath                    = $Global:ClaudeMarketplaceFile
+                Rows                        = $script:ClaudeRows
+                TokenUsage                  = $(if ($null -ne $TokenResult) { $TokenResult.Records } else { @() })
+                Errors                      = $script:ClaudeErrors
+                Obfuscated                  = $Obfuscate.IsPresent
+                RowsWindowStart             = $script:ClaudeRowsWindowStart
+                RowsWindowEnd               = $script:ClaudeRowsWindowEnd
+                TokenWindowStart            = $(if ($null -ne $TokenResult) { $TokenResult.Window.Start } else { $null })
+                TokenWindowEnd              = $(if ($null -ne $TokenResult) { $TokenResult.Window.End } else { $null })
+                ConsumptionRowsCompared     = $ConsumptionRowsRead
+                OtherMarketplaceRowsSkipped = [int]$script:ClaudeOtherRowsSkipped
+                NonClaudeTokenSeriesSkipped = $(if ($null -ne $TokenResult) { [int]$TokenResult.NonClaudeSeries } else { 0 })
+            }
+            Write-RdaClaudeMarketplaceFile @WriteArgs
+        }
+        catch
+        {
+            Write-Log -Message ('The Claude Marketplace file was not written: {0}' -f $_.Exception.Message) -Severity 'Warning'
+            $script:ClaudeWriteFailed = $true
+            $Global:MarketplaceFailedSubs += [pscustomobject]@{
+                Name             = '(claude file)'
+                Id               = '(claude file)'
+                Message          = ('The Claude Marketplace file was not written: {0}' -f $_.Exception.Message)
+                Complete         = $false
+                RecordsCollected = 0
+            }
+        }
+        finally
+        {
+            # The copies of the run's dictionaries are not kept past this phase.
+            $script:MarketplaceIdLookup = $null
+            $script:MarketplaceNameLookup = $null
+        }
+    }
+
+    function GetMarketplaceConsumption()
+    {
+        # Collects the Azure Marketplace (third-party) charges of each subscription with
+        # Get-AzConsumptionMarketplace (Az.Billing). The Anthropic / Claude rows are kept in $script:ClaudeRows;
+        # WriteClaudeMarketplaceFile writes them to ClaudeMarketPlace_<ReportName>_<stamp>.json. Rows of other
+        # publishers are counted and left out.
+        # The usage call used by GetResorceConsumption returns Azure's own meters; the charges seen so far
+        # were in no other file. The cmdlet needs the same Cost Management Reader or Billing Reader
+        # access as the consumption call, and it follows the service's paging itself. Do not pass -Top:
+        # it caps the rows returned.
+        # Docs: https://learn.microsoft.com/en-us/powershell/module/az.billing/get-azconsumptionmarketplace
+        $DebugPreference = "SilentlyContinue"
+
+        [System.Threading.Thread]::CurrentThread.CurrentUICulture = "en-US";
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = "en-US";
+
+        # The calendar dates GetResorceConsumption read, passed as UTC dates: the cmdlet's date parameters are UTC.
+        $WindowStart = if ($null -ne $script:ConsumptionWindowStart) { $script:ConsumptionWindowStart } else { (Get-Date).AddDays(-31).Date }
+        $WindowEnd = if ($null -ne $script:ConsumptionWindowEnd) { $script:ConsumptionWindowEnd } else { (Get-Date).AddDays(-1).Date }
+        $MarketplaceStartDate = [datetime]::SpecifyKind($WindowStart.Date, [System.DateTimeKind]::Utc)
+        # The cmdlet keeps a row when its usage end is on or before the end date, and a day row ends at 23:59:59, so the
+        # end date is the day after the last day wanted.
+        $MarketplaceEndDate = [datetime]::SpecifyKind($WindowEnd.Date.AddDays(1), [System.DateTimeKind]::Utc)
+        # A UTC day that is still running is not asked for: its row is partial and changes later in the day.
+        if ($MarketplaceEndDate -gt [datetime]::UtcNow.Date) { $MarketplaceEndDate = [datetime]::SpecifyKind([datetime]::UtcNow.Date, [System.DateTimeKind]::Utc) }
+
+        if ($null -eq $Global:MarketplaceRecordCount) { $Global:MarketplaceRecordCount = 0 }
+        if ($null -eq $Global:MarketplaceFailedSubs) { $Global:MarketplaceFailedSubs = @() }
+        # Per call, unlike the two globals above, which the wrapper keeps adding to across calls.
+        $MarketplaceRecordsThisRun = 0
+        $MarketplaceFailedSubsThisRun = 0
+        $script:ClaudeRows = [System.Collections.Generic.List[object]]::new()
+        $script:ClaudeRowSubscriptions = [System.Collections.Generic.List[string]]::new()
+        $script:ClaudeErrors = [System.Collections.Generic.List[object]]::new()
+        $script:ClaudeOtherRowsSkipped = 0
+        $script:ClaudeAuthFailed = $false
+        $script:ClaudeRowsWindowStart = $MarketplaceStartDate
+        $script:ClaudeRowsWindowEnd = $MarketplaceEndDate
+
+        if (-not (Test-DataPlaneAuthReady -Phase 'Marketplace'))
+        {
+            $script:ClaudeAuthFailed = $true
+            Add-ClaudeMarketplaceError -SubscriptionId '(all subscriptions)' -Message 'Marketplace phase skipped: no usable Azure context/token after one reconnect attempt.'
+
+            Write-Log -Message ('Marketplace: SKIPPED - could not establish a usable Azure context/token after one reconnect attempt. Marketplace data was requested (no -SkipConsumption or -SkipMarketplace) but cannot be collected. Re-authenticate (Connect-AzAccount) or pass -appid/-secret/-tenant, then re-run. The rest of the inventory will continue.') -Severity 'Error'
+            $Global:MarketplaceFailedSubs += [pscustomobject]@{
+                Name             = '(all subscriptions)'
+                Id               = '(auth)'
+                Message          = 'Marketplace phase skipped: no usable Azure context/token after one reconnect attempt.'
+                Complete         = $false
+                RecordsCollected = 0
+            }
+            return
+        }
+
+        # guid -> token and group name -> token views of the run's dictionaries, so a Marketplace row
+        # holds the same subscription and group tokens as the other files. The dictionaries are keyed
+        # by resource id, so the guid and the group name are read out of each key.
+        $SubGuidTokenMap = $null
+        $RgTokenMap = $null
+        if ($Obfuscate.IsPresent)
+        {
+            $SubGuidTokenMap = @{}
+            if ($null -ne $Global:ResourceSubscriptionDictionary)
+            {
+                foreach ($DictKey in $Global:ResourceSubscriptionDictionary.Keys)
+                {
+                    if ($DictKey -match '(?i)/subscriptions/([^/]+)' -and -not $SubGuidTokenMap.ContainsKey($Matches[1]))
+                    {
+                        $SubGuidTokenMap[$Matches[1]] = $Global:ResourceSubscriptionDictionary[$DictKey]
+                    }
+                }
+            }
+
+            $RgTokenMap = @{}
+            if ($null -ne $Global:ResourceResourceGroupDictionary)
+            {
+                foreach ($DictKey in $Global:ResourceResourceGroupDictionary.Keys)
+                {
+                    if ($DictKey -match '(?i)/resourcegroups/([^/]+)' -and -not $RgTokenMap.ContainsKey($Matches[1]))
+                    {
+                        $RgTokenMap[$Matches[1]] = $Global:ResourceResourceGroupDictionary[$DictKey]
+                    }
+                }
+            }
+
+            if (-not $script:MarketplaceSubCache) { $script:MarketplaceSubCache = @{} }
+            if (-not $script:MarketplaceRgCache) { $script:MarketplaceRgCache = @{} }
+            if (-not $script:MarketplaceNameCache) { $script:MarketplaceNameCache = @{} }
+            # A subscription, group or name that only the consumption phase saw already has its token there. This file
+            # takes the same one, so one real value has one token in every file.
+            foreach ($Pair in @(@($script:ConsumptionSubCache, $script:MarketplaceSubCache), @($script:ConsumptionRgCache, $script:MarketplaceRgCache), @($script:ConsumptionNameCache, $script:MarketplaceNameCache)))
+            {
+                if ($null -eq $Pair[0]) { continue }
+                foreach ($CacheKey in $Pair[0].Keys) { if (-not $Pair[1].ContainsKey($CacheKey)) { $Pair[1][$CacheKey] = $Pair[0][$CacheKey] } }
+            }
+
+            # Raw id -> masked id, ignoring case, so an id the inventory or an earlier row masked keeps its
+            # token. The run's dictionary is case-sensitive, and Azure billing ids differ in case from ARM ids.
+            # The two lookups are copies of the run's largest dictionaries, so they are built when the first
+            # Anthropic row is found, not before: most runs find none.
+            $script:MarketplaceIdLookup = @{}
+            $script:MarketplaceNameLookup = @{}
+            $script:MarketplaceLookupsBuilt = $false
+        }
+
+        $MarketplaceTargetFound = $false
+        foreach ($sub in $Global:Subscriptions)
+        {
+            if (![string]::IsNullOrEmpty($SubscriptionID))
+            {
+                if ($SubscriptionID -ne $sub.Id)
+                {
+                    continue
+                }
+            }
+            $MarketplaceTargetFound = $true
+
+            $ContextOk = $false
+            $ContextSwitchError = $null
+            try
+            {
+                $null = Set-AzContext -Subscription $sub.id -ErrorAction Stop
+                $ContextOk = ((Get-AzContext).Subscription.Id -eq $sub.id)
+            }
+            catch
+            {
+                $ContextSwitchError = $_.Exception.Message
+            }
+
+            if (-not $ContextOk)
+            {
+                $SkipMessage = ("Marketplace SKIPPED: could not switch the Azure context to this subscription{0}. The signed-in identity likely lacks access to it. Skipped to avoid attributing another subscription's Marketplace data to this one." -f $(if ($ContextSwitchError) { " ($ContextSwitchError)" } else { ' (context did not match the target after Set-AzContext)' }))
+                Write-Log -Message ("Marketplace: {0} - {1}" -f $sub.Name, $SkipMessage) -Severity 'Error'
+                $Global:MarketplaceFailedSubs += [pscustomobject]@{
+                    Name             = $sub.Name
+                    Id               = $sub.Id
+                    Message          = $SkipMessage
+                    Complete         = $false
+                    RecordsCollected = 0
+                }
+                Add-ClaudeMarketplaceError -SubscriptionId $sub.Id -Message $SkipMessage -SubGuidTokenMap $SubGuidTokenMap
+                $MarketplaceFailedSubsThisRun++
+                continue
+            }
+
+            Write-Log -Message ("Gathering Marketplace consumption for: {0}" -f $sub.Name) -Severity 'Info'
+
+            $MarketplaceRecordsThisSub = 0
+            $MarketplaceFailedThisSub = $false
+            $MarketplaceFailureMessage = $null
+
+            try
+            {
+                $MarketplaceMaxRetries = 3
+                $MarketplaceAttempt = 0
+                while ($true)
+                {
+                    try
+                    {
+                        $MarketplaceParams = @{ StartDate = $MarketplaceStartDate; EndDate = $MarketplaceEndDate; ErrorAction = 'Stop' }
+                        if (![string]::IsNullOrEmpty($ResourceGroup)) { $MarketplaceParams.ResourceGroup = $ResourceGroup }
+                        $MarketplaceData = @(Get-AzConsumptionMarketplace @MarketplaceParams)
+                        break
+                    }
+                    catch
+                    {
+                        # A 400, 401, 403 or 404 answers the same on every try (an agreement type this endpoint
+                        # does not serve, or no access), so it ends this subscription's pull at once.
+                        if ($_.Exception.Message -match '(?i)supports only Enterprise Agreement|offer type')
+                        {
+                            throw ("Marketplace charges are not available for this subscription's agreement type, so none were collected: {0}" -f $_.Exception.Message)
+                        }
+                        if (-not (Test-RdaClaudeThrottle -ErrorMessage $_.Exception.Message) -and $_.Exception.Message -match '(?i)\b(400|401|403|404)\b|BadRequest|Unauthorized|Forbidden|NotFound|AuthorizationFailed') { throw }
+                        $MarketplaceAttempt++
+                        if ($MarketplaceAttempt -gt $MarketplaceMaxRetries) { throw }
+                        $MarketplaceBackoffSeconds = [int][math]::Pow(2, $MarketplaceAttempt)
+                        Write-Log -Message ("Marketplace query failed for {0} (attempt {1}/{2}): {3}. Retrying in {4}s..." -f $sub.Name, $MarketplaceAttempt, $MarketplaceMaxRetries, $_.Exception.Message, $MarketplaceBackoffSeconds) -Severity 'Warning'
+                        Start-Sleep -Seconds $MarketplaceBackoffSeconds
+                    }
+                }
+
+                $MarketplaceExport = [System.Collections.ArrayList]::new()
+                $RealRowSubscriptions = [System.Collections.Generic.List[string]]::new()
+                foreach ($Row in $MarketplaceData)
+                {
+                    if ($null -eq $Row) { continue }
+                    # Only Anthropic / Claude charges go in the file. A masked token is made only for those.
+                    if (-not (Test-RdaClaudeMarketplaceRow -Row $Row)) { $script:ClaudeOtherRowsSkipped++; continue }
+                    if ($Obfuscate.IsPresent -and -not $script:MarketplaceLookupsBuilt)
+                    {
+                        $script:MarketplaceLookupsBuilt = $true
+                        if ($null -ne $Global:ResourceIdDictionary)
+                        {
+                            foreach ($DictKey in $Global:ResourceIdDictionary.Keys) { if (-not $script:MarketplaceIdLookup.ContainsKey($DictKey)) { $script:MarketplaceIdLookup[$DictKey] = $Global:ResourceIdDictionary[$DictKey] } }
+                        }
+                        # The same for the name tokens, so a name matches the inventory's whatever the case of the id.
+                        if ($null -ne $Global:ResourceNameDictionary)
+                        {
+                            foreach ($DictKey in $Global:ResourceNameDictionary.Keys) { if (-not $script:MarketplaceNameLookup.ContainsKey($DictKey)) { $script:MarketplaceNameLookup[$DictKey] = $Global:ResourceNameDictionary[$DictKey] } }
+                        }
+                    }
+                    $ExportRow = ConvertTo-RdaMarketplaceRow -Row $Row -Obfuscate:$Obfuscate.IsPresent -IdLookup $script:MarketplaceIdLookup -NameDictionary $script:MarketplaceNameLookup -SubGuidTokenMap $SubGuidTokenMap -RgTokenMap $RgTokenMap -SubCache $script:MarketplaceSubCache -RgCache $script:MarketplaceRgCache -NameCache $script:MarketplaceNameCache
+                    $null = $MarketplaceExport.Add($ExportRow)
+                    # The real subscription of the row, kept apart from the file, for the comparison with the Consumption file.
+                    $RealRowSubscriptions.Add($(if (-not [string]::IsNullOrEmpty($Row.SubscriptionGuid)) { [string]$Row.SubscriptionGuid } else { [string]$sub.Id }))
+
+                    # A token the inventory did not make has no dictionary entry yet. Record it, so the
+                    # dictionary file can reverse it and the same value keeps one token.
+                    if ($Obfuscate.IsPresent)
+                    {
+                        Add-MarketplaceDictionaryEntries -Row $Row -ExportRow $ExportRow
+                    }
+                }
+
+                for ($RowIndex = 0; $RowIndex -lt $MarketplaceExport.Count; $RowIndex++)
+                {
+                    $ExportRow = $MarketplaceExport[$RowIndex]
+                    $ClaudeRecord = ConvertTo-RdaClaudeMarketplaceRecord -ExportRow $ExportRow
+                    $script:ClaudeRows.Add($ClaudeRecord)
+                    if ([string]::IsNullOrEmpty($ClaudeRecord.UsageStart) -or [string]::IsNullOrEmpty($ClaudeRecord.UsageEnd))
+                    {
+                        # The row is kept, with an empty date, so a charge is never dropped for a missing date.
+                        Add-ClaudeMarketplaceError -SubscriptionId $sub.Id -Message 'A Marketplace row had no usable usage date. It is in the file with an empty date.' -SubGuidTokenMap $SubGuidTokenMap
+                    }
+                    $script:ClaudeRowSubscriptions.Add($RealRowSubscriptions[$RowIndex])
+                }
+
+                $MarketplaceRecordsThisSub = $MarketplaceExport.Count
+                Write-Log -Message ("Marketplace records found for {0}: {1}" -f $sub.Name, $MarketplaceRecordsThisSub) -Severity 'Info'
+            }
+            catch
+            {
+                $MarketplaceFailedThisSub = $true
+                $MarketplaceFailureMessage = ("{0} (this subscription's Marketplace data is INCOMPLETE)" -f $_.Exception.Message)
+                Write-Log -Message ("Marketplace query failed for {0}: {1}" -f $sub.Name, $MarketplaceFailureMessage) -Severity 'Warning'
+            }
+
+            $Global:MarketplaceRecordCount += $MarketplaceRecordsThisSub
+            $MarketplaceRecordsThisRun += $MarketplaceRecordsThisSub
+            if ($MarketplaceFailedThisSub)
+            {
+                $Global:MarketplaceFailedSubs += [pscustomobject]@{
+                    Name             = $sub.Name
+                    Id               = $sub.Id
+                    Message          = $MarketplaceFailureMessage
+                    Complete         = $false
+                    RecordsCollected = $MarketplaceRecordsThisSub
+                }
+                Add-ClaudeMarketplaceError -SubscriptionId $sub.Id -Message $MarketplaceFailureMessage -SubGuidTokenMap $SubGuidTokenMap
+                $MarketplaceFailedSubsThisRun++
+            }
+        }
+
+        if (![string]::IsNullOrEmpty($SubscriptionID) -and -not $MarketplaceTargetFound)
+        {
+            $MissingTargetMessage = ("Marketplace SKIPPED: subscription {0} (-SubscriptionID) is not in this run's subscription list, so no Marketplace data was collected for it. The signed-in identity cannot see it, or -TenantID names a different tenant." -f $SubscriptionID)
+            Write-Log -Message $MissingTargetMessage -Severity 'Error'
+            $Global:MarketplaceFailedSubs += [pscustomobject]@{
+                Name             = $SubscriptionID
+                Id               = $SubscriptionID
+                Message          = $MissingTargetMessage
+                Complete         = $false
+                RecordsCollected = 0
+            }
+            Add-ClaudeMarketplaceError -SubscriptionId $SubscriptionID -Message $MissingTargetMessage -SubGuidTokenMap $SubGuidTokenMap
+            $MarketplaceFailedSubsThisRun++
+        }
+
+        # No rows and no failure: say only what the endpoint answered.
+        if ($MarketplaceRecordsThisRun -eq 0 -and $MarketplaceFailedSubsThisRun -eq 0)
+        {
+            Write-Log -Message ('Marketplace: 0 Anthropic/Claude rows collected for the subscription(s) in scope for this run. The Microsoft.Consumption/marketplaces endpoint answered without an error and returned no Anthropic/Claude rows for the window. That is all this says: the endpoint serves only some agreement types and bills some charges late, so it does not show that no Marketplace charge exists.') -Severity 'Warning'
+        }
+    }
+
     InitializeInventoryProcessing
 
     $script:PhaseTimings = [ordered]@{}
+    # The diagnostics log lists only the Marketplace failures of this call, whether or not the phase runs.
+    $script:MarketplaceFailuresBefore = @($Global:MarketplaceFailedSubs | Where-Object { $null -ne $_ }).Count
 
     $MetricsPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
     CreateMetricsJob
@@ -1502,6 +1957,13 @@ function ExecuteInventoryProcessing()
 
     # Nothing reads the collector output or the discovery rows after the inventory is written, and
     # on a large estate the report step needs that memory. The count stays in $Global:ResourceCount.
+    # The Claude token counts are read in the Marketplace phase, after this release, so the few Foundry
+    # accounts are kept here.
+    $script:ClaudeTokenAccounts = if (!$SkipConsumption.IsPresent -and !$SkipMarketplace.IsPresent)
+    {
+        @($Global:Resources | Where-Object { $null -ne $_ -and [string]$_.TYPE -ieq 'microsoft.cognitiveservices/accounts' } | ForEach-Object { [pscustomobject]@{ id = [string]$_.id; name = [string]$_.name; resourceGroup = [string]$_.resourceGroup; subscriptionId = [string]$_.subscriptionId; location = [string]$_.location; kind = [string]$_.kind } })
+    }
+    else { @() }
     $Global:SmaResources = $null
     $Global:Resources = $null
     # Setting the two globals to $null does not free the rows on its own. Az cmdlets leave their stream
@@ -1534,9 +1996,33 @@ function ExecuteInventoryProcessing()
     if (!$SkipConsumption.IsPresent)
     {
         $ConsumptionPhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:ConsumptionFailuresBefore = @($Global:ConsumptionFailedSubs | Where-Object { $null -ne $_ }).Count
         GetResorceConsumption
         $ConsumptionPhaseTimer.Stop()
         $script:PhaseTimings['Consumption / cost collection (billing)'] = $ConsumptionPhaseTimer.Elapsed
+
+        # The Marketplace endpoint needs the same billing access as consumption, so -SkipConsumption
+        # also skips it.
+        if (!$SkipMarketplace.IsPresent)
+        {
+            $MarketplacePhaseTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            # The file is an extra: nothing that goes wrong in this phase may stop the run or the report.
+            try
+            {
+                GetMarketplaceConsumption
+            }
+            catch
+            {
+                Write-Log -Message ('The Marketplace phase stopped: {0}' -f $_.Exception.Message) -Severity 'Warning'
+                if ($null -eq $script:ClaudeRows) { $script:ClaudeRows = [System.Collections.Generic.List[object]]::new() }
+                if ($null -eq $script:ClaudeErrors) { $script:ClaudeErrors = [System.Collections.Generic.List[object]]::new() }
+                $script:ClaudeErrors.Add((New-RdaClaudeMarketplaceError -Source Marketplace -Scope '(all subscriptions)' -Message $_.Exception.Message -Obfuscate $Obfuscate.IsPresent))
+                $Global:MarketplaceFailedSubs += [pscustomobject]@{ Name = '(all subscriptions)'; Id = '(auth)'; Message = ('The Marketplace phase stopped: {0}' -f $_.Exception.Message); Complete = $false; RecordsCollected = 0 }
+            }
+            WriteClaudeMarketplaceFile
+            $MarketplacePhaseTimer.Stop()
+            $script:PhaseTimings['Marketplace collection (billing)'] = $MarketplacePhaseTimer.Elapsed
+        }
     }
 }
 
@@ -1865,6 +2351,26 @@ if ($ConsumptionCreated)
 if ($SkipConsumption.IsPresent -or !$ConsumptionCreated -or $ConsumptionEmpty)
 {
     "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File $Global:ConsumptionFileCsv -Encoding utf8
+}
+
+# Like the consumption file, the Claude Marketplace file is always in the report: with empty lists and a
+# reason when the phase was skipped or did not write it. It is a .json file, so the zip step below takes it
+# with the other JSON files.
+if ($SkipConsumption.IsPresent -or $SkipMarketplace.IsPresent -or !(Test-Path -LiteralPath $Global:ClaudeMarketplaceFile))
+{
+    $ClaudeNotCollected = if ($SkipMarketplace.IsPresent) { '-SkipMarketplace was given.' }
+    elseif ($SkipConsumption.IsPresent) { '-SkipConsumption was given, which also skips this file.' }
+    else { 'the collection did not finish, see the run log.' }
+    $ClaudeFallbackErrors = @()
+    if ($script:ClaudeWriteFailed) { $ClaudeFallbackErrors = @(New-RdaClaudeMarketplaceError -Source File -Message 'The file could not be written by the collection. The run log holds the cause.' -Obfuscate $Obfuscate.IsPresent) }
+    try
+    {
+        Write-RdaClaudeMarketplaceFile -FilePath $Global:ClaudeMarketplaceFile -Rows @() -TokenUsage @() -Errors $ClaudeFallbackErrors -NotCollected $ClaudeNotCollected -Obfuscated $Obfuscate.IsPresent
+    }
+    catch
+    {
+        Write-Log -Message ('The Claude Marketplace file could not be written: {0}' -f $_.Exception.Message) -Severity 'Error'
+    }
 }
 
 $JsonWildCard = $DefaultPath + "*.json"

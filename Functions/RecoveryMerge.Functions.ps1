@@ -175,6 +175,7 @@ function Merge-RecoveryData
     $GapInventoryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Inventory_*.json'
     $RecoveryInventoryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'Inventory_*.json'
     $GapConsumptionFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'Consumption_*.csv'  -Optional
+    $GapClaudeFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ClaudeMarketPlace_*.json' -Optional
     $GapDictionaryFile = Get-BundleFile -Directory $GapBundlePath      -Filter 'ObfuscationDictionary_*.json' -Optional
     $RecoveryDictionaryFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ObfuscationDictionary_*.json' -Optional
 
@@ -327,6 +328,8 @@ function Merge-RecoveryData
 
     $OutInventoryFile = Join-Path $OutputPath ("Inventory_{0}.json" -f $BundleBase)
     $OutConsumptionFile = Join-Path $OutputPath ("Consumption_{0}.csv" -f $BundleBase)
+    # The word Inventory is taken out of the name, as the collection does: this file must never be taken as the inventory.
+    $OutClaudeFile = Join-Path $OutputPath ("ClaudeMarketPlace_{0}.json" -f ([regex]::Replace($BundleBase, 'inventory', 'Inv', 'IgnoreCase, CultureInvariant')))
     $OutMetricsFile = Join-Path $OutputPath ("Metrics_{0}.json" -f $BundleBase)
     $OutHtmlFile = Join-Path $OutputPath ("{0}.html" -f $BundleBase)
     $OutZipFile = Join-Path $OutputPath ("{0}.zip" -f $BundleBase)
@@ -394,6 +397,100 @@ function Merge-RecoveryData
     else
     {
         "InstanceData,MeterCategory,MeterId,MeterName,MeterRegion,MeterSubCategory,Quantity,Unit,UsageStartTime,UsageEndTime,ResourceId,ResourceLocation,ConsumptionMeter,ReservationId,ReservationOrderId" | Out-File -FilePath $OutConsumptionFile -Encoding utf8
+    }
+    # -- Claude Marketplace file: it goes with the consumption file it was collected with, so it comes from the
+    #    same bundle. A bundle without one (an older run) gives a merged bundle without one, and a warning.
+    $ClaudeSourceFile = $GapClaudeFile
+    if ($ConsumptionSource -eq 'recovery')
+    {
+        $ClaudeSourceFile = Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ClaudeMarketPlace_*.json' -Optional
+    }
+    if ($ClaudeSourceFile)
+    {
+        # The file is read before it is carried: a file that is cut short or has the wrong shape is not shipped.
+        try
+        {
+            $ClaudeRaw = Get-Content -Path $ClaudeSourceFile.FullName -Raw
+            # A date is empty or exactly yyyy-MM-ddTHH:mm:ssZ in the text of the file (ConvertFrom-Json would read it as a date).
+            foreach ($DateMatch in [regex]::Matches($ClaudeRaw, '"(RowsWindowStart|RowsWindowEnd|TokenWindowStart|TokenWindowEnd|UsageStart|UsageEnd|StartTime|EndTime)"\s*:\s*"([^"]*)"'))
+            {
+                if ($DateMatch.Groups[2].Value -ne '' -and $DateMatch.Groups[2].Value -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$') { throw ('{0} is not a UTC date' -f $DateMatch.Groups[1].Value) }
+            }
+            $ClaudeDoc = $ClaudeRaw | ConvertFrom-Json -ErrorAction Stop
+            if ($ClaudeDoc -isnot [System.Management.Automation.PSCustomObject]) { throw 'it is not one JSON object' }
+            $ClaudeNames = @($ClaudeDoc.PSObject.Properties.Name)
+            foreach ($ListName in 'Rows', 'TokenUsage', 'Errors')
+            {
+                if ($ClaudeNames -notcontains $ListName) { throw ('it has no {0} list' -f $ListName) }
+                if ($ClaudeDoc.$ListName -isnot [System.Array]) { throw ('{0} is not a list' -f $ListName) }
+            }
+            # Every field the collection writes must be there with its type: a number is a JSON number and never null,
+            # a flag is true or false, a date is text, a series is a list of numbers.
+            $IsNumber = { param($V) $null -ne $V -and $V -is [ValueType] -and $V -isnot [bool] }
+            $IsText = { param($V) $V -is [string] }
+            # ConvertFrom-Json turns an ISO date string into a date, so a date field is text or a date.
+            $IsDate = { param($V) $V -is [string] -or $V -is [datetime] }
+            $Check = {
+                param($Obj, $Spec, $What)
+                foreach ($Field in $Spec.Keys)
+                {
+                    if (@($Obj.PSObject.Properties.Name) -notcontains $Field) { throw ('{0} has no {1}' -f $What, $Field) }
+                    $V = $Obj.$Field
+                    $Ok = switch ($Spec[$Field])
+                    {
+                        'number' { & $IsNumber $V }
+                        'text' { & $IsText $V }
+                        'date' { & $IsDate $V }
+                        'bool' { $V -is [bool] }
+                        'list' { $V -is [System.Array] }
+                        'numbers' { ($V -is [System.Array]) -and (@($V | Where-Object { -not (& $IsNumber $_) }).Count -eq 0) }
+                    }
+                    if (-not $Ok) { throw ('{0} has a wrong value in {1}' -f $What, $Field) }
+                }
+            }
+            & $Check $ClaudeDoc ([ordered]@{ SchemaVersion = 'number'; Obfuscated = 'bool'; Reason = 'text'; RowsWindowStart = 'date'; RowsWindowEnd = 'date'; TokenWindowStart = 'date'; TokenWindowEnd = 'date'; ConsumptionRowsCompared = 'number'; OtherMarketplaceRowsSkipped = 'number'; NonClaudeTokenSeriesSkipped = 'number' }) 'the file'
+            foreach ($ClaudeRow in $ClaudeDoc.Rows)
+            {
+                & $Check $ClaudeRow ([ordered]@{ PublisherName = 'text'; OfferName = 'text'; PlanName = 'text'; ConsumedService = 'text'; ConsumedQuantity = 'number'; UnitOfMeasure = 'text'; PretaxCost = 'number'; Currency = 'text'; IsEstimated = 'bool'; MeterId = 'text'; UsageStart = 'date'; UsageEnd = 'date'; SubscriptionGuid = 'text'; ResourceGroup = 'text'; InstanceId = 'text'; InstanceName = 'text'; AlsoInConsumption = 'bool'; AlsoInConsumptionMatch = 'text'; ResourceInConsumption = 'bool' }) 'a row'
+                if ($ClaudeRow.AlsoInConsumptionMatch -notin 'MeterDayQuantity', 'None') { throw 'a row has an unknown AlsoInConsumptionMatch' }
+            }
+            foreach ($ClaudeToken in $ClaudeDoc.TokenUsage)
+            {
+                & $Check $ClaudeToken ([ordered]@{ ID = 'text'; Subscription = 'text'; ResourceGroup = 'text'; Name = 'text'; Location = 'text'; ModelName = 'text'; Metric = 'text'; TimeGrain = 'text'; StartTime = 'date'; EndTime = 'date'; Total = 'number'; DailySeries = 'numbers' }) 'a token record'
+            }
+            foreach ($ClaudeError in $ClaudeDoc.Errors)
+            {
+                & $Check $ClaudeError ([ordered]@{ Source = 'text'; Scope = 'text'; Message = 'text' }) 'an error record'
+                if ($ClaudeError.Source -notin 'Marketplace', 'AzureMonitor', 'Consumption', 'File') { throw 'an error record has an unknown Source' }
+            }
+        }
+        catch
+        {
+            throw ("Merge-RecoveryData: the Claude Marketplace file '{0}' is not usable: {1}" -f $ClaudeSourceFile.Name, $_.Exception.Message)
+        }
+        Copy-Item -Path $ClaudeSourceFile.FullName -Destination $OutClaudeFile -Force
+        # The other bundle's file is not carried: say so when it held anything.
+        $OtherClaudeFile = if ($ConsumptionSource -eq 'recovery') { $GapClaudeFile } else { Get-BundleFile -Directory $RecoveryBundlePath -Filter 'ClaudeMarketPlace_*.json' -Optional }
+        if ($OtherClaudeFile)
+        {
+            try
+            {
+                $OtherClaudeDoc = Get-Content -Path $OtherClaudeFile.FullName -Raw | ConvertFrom-Json -ErrorAction Stop
+                $OtherCounts = 'Rows', 'TokenUsage', 'Errors' | ForEach-Object { '{0} {1}' -f @($OtherClaudeDoc.$_).Count, $_ }
+                if (@('Rows', 'TokenUsage', 'Errors' | Where-Object { @($OtherClaudeDoc.$_).Count -gt 0 }).Count -gt 0)
+                {
+                    Add-MergeWarning ('the other bundle''s Claude Marketplace file has {0}, which are not in the merged bundle. The merged bundle holds the {1} bundle''s file, because it goes with the {1} consumption file.' -f ($OtherCounts -join ', '), $ConsumptionSource)
+                }
+            }
+            catch
+            {
+                Add-MergeWarning ('the other bundle''s Claude Marketplace file could not be read, so it is not in the merged bundle: {0}' -f $_.Exception.Message)
+            }
+        }
+    }
+    else
+    {
+        Add-MergeWarning ('the {0} bundle has no ClaudeMarketPlace_*.json, so the merged bundle has none either. Claude Marketplace charges and token counts collected for it, if any, are not in this bundle.' -f $ConsumptionSource)
     }
     # -- Metrics source. By default carry ALL gap Metrics_*.json forward verbatim.
     #    The metrics phase writes one file per batch (Metrics_<base>__<idx>.json),
