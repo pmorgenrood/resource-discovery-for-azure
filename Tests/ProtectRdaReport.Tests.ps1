@@ -303,6 +303,61 @@ Describe 'Test-RdaMaskedOutputLeak' {
         }
         finally { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
     }
+
+    # A tenant-scope id ('/providers/<namespace>/<type>/<name>...') is looked for whole: a short name
+    # ('foo') is not looked for alone. Get-RdaFullIdInValue writes each id it finds with a first '/', so
+    # the scan must find the id as the text holds it: with no '/' before it, with a letter or digit right
+    # before its '/', with a letter outside ASCII right before its 'providers', URL-encoded so, or in capitals.
+    It 'finds the tenant-scope id Get-RdaFullIdInValue reads in <Case>, as each kind of file writes it, though its name is short' -ForEach @(
+        @{ Case = 'a text with no ''/'' before it'; Text = 'providers/Microsoft.Management/managementGroups/foo'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'prose with no ''/'' before it'; Text = 'moved to providers/Microsoft.Management/managementGroups/foo today'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a URL whose host comes right before it'; Text = 'https://management.azure.com/providers/Microsoft.Management/managementGroups/foo?api-version=2020-05-01'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a text with a digit right before its ''/'''; Text = 'x9/providers/Microsoft.Management/managementGroups/foo'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a text in capitals with no ''/'' before it'; Text = 'PROVIDERS/MICROSOFT.MANAGEMENT/MANAGEMENTGROUPS/FOO'; Id = '/PROVIDERS/MICROSOFT.MANAGEMENT/MANAGEMENTGROUPS/FOO' }
+        @{ Case = 'a URL-encoded text with no ''/'' before it'; Text = 'https://h/x?scope=providers%2FMicrosoft.Management%2FmanagementGroups%2Ffoo'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a text URL-encoded twice with no ''/'' before it'; Text = 'https://h/x?scope=providers%252FMicrosoft.Management%252FmanagementGroups%252Ffoo'; Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a text with a letter outside ASCII right before its ''providers'''; Text = ('caf' + [char]0xE9 + 'providers/Microsoft.Management/managementGroups/foo'); Id = '/providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'a reservation id with no ''/'' before it'; Text = 'see providers/Microsoft.Capacity/reservationOrders/ord/reservations/res now'; Id = '/providers/Microsoft.Capacity/reservationOrders/ord/reservations/res' }
+    ) {
+        $Found = @(Get-RdaFullIdInValue -Value @($Text))
+        $Found.Count | Should -Be 1 -Because 'the finder reads the id in the text'
+        $Found[0] | Should -BeExactly $Id -Because 'the finder writes the id it reads with a first ''/'''
+        $Real = @(Get-RdaRealValueSet -ExtraValue $Found)
+        $Real | Should -Contain $Found[0]
+        $Dir = Join-Path ([IO.Path]::GetTempPath()) ('RdaLeakTenant_' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Dir | Out-Null
+        try
+        {
+            $Files = @{
+                'a.txt'  = $Text
+                'b.json' = (ConvertTo-Json -InputObject @{ OSDisk = $Text } -Compress)
+                'c.csv'  = ('"x","{0}"' -f $Text.Replace('"', '""'))
+                'd.html' = ('<td>{0}</td>' -f [System.Net.WebUtility]::HtmlEncode($Text))
+            }
+            foreach ($K in $Files.Keys)
+            {
+                Set-Content -LiteralPath (Join-Path $Dir $K) -Value $Files[$K] -NoNewline -Encoding utf8
+                @(Test-RdaMaskedOutputLeak -Path (Join-Path $Dir $K) -RealValue $Real).Count | Should -Be 1 -Because "$K holds $Text"
+            }
+        }
+        finally { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'does not find a tenant-scope id in its masked form, in a longer name, or in a provider path with no name' {
+        $Real = @(Get-RdaRealValueSet -ExtraValue @('/providers/Microsoft.Management/managementGroups/foo'))
+        $Token = 'prod_0fa1c2d3-0000-4000-8000-00000000abcd'
+        $Dir = Join-Path ([IO.Path]::GetTempPath()) ('RdaLeakTenantNo_' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Dir | Out-Null
+        try
+        {
+            foreach ($Text in "/providers/Microsoft.Management/managementGroups/$Token", "providers/Microsoft.Management/managementGroups/$Token", ('https://h/x?scope=' + [uri]::EscapeDataString("/providers/Microsoft.Management/managementGroups/$Token")), 'providers/Microsoft.Management/managementGroups/foobar', 'providers/Microsoft.Management/managementGroups/foo2', 'Microsoft.Management/managementGroups/food', 'providers/Microsoft.Management/managementGroups', "/subscriptions/$Token/resourcegroups/$Token/providers/Microsoft.Compute/virtualMachines/$Token")
+            {
+                Set-Content -LiteralPath (Join-Path $Dir 'a.txt') -Value $Text -NoNewline -Encoding utf8
+                @(Test-RdaMaskedOutputLeak -Path (Join-Path $Dir 'a.txt') -RealValue $Real).Count | Should -Be 0 -Because $Text
+            }
+        }
+        finally { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'The masked-field check, the real values and the exempt words' {
@@ -2014,6 +2069,32 @@ Describe 'Protect-RdaReport.ps1 refuses what it cannot mask fully' {
         $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
         ($R.Text -join "`n") | Should -Match ([regex]::Escape('real name or id is still in'))
         ($R.Text -join "`n") | Should -Not -Match $Secret -Because 'the message names no real value'
+        Test-Path -LiteralPath $Out | Should -BeFalse
+    }
+
+    # A tenant-scope id whose name is short ('foo', which the last scan does not look for alone) is
+    # found only by the whole id, so the scan looks for it as the text holds it: with no '/' before it,
+    # right after the host of a URL, URL-encoded so, or right after a letter outside ASCII.
+    # Get-RdaFullIdInValue writes each id it finds with a first '/', which such a text does not hold
+    # as a whole word.
+    It 'refuses a tenant-scope id with a short name held <Case>, exit 1, leaving no output folder' -ForEach @(
+        @{ Case = 'with no ''/'' before it, in a field no rule masks'; Kind = 'inventory'; Text = 'providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'right after the host of a URL, in a field no rule masks'; Kind = 'inventory'; Text = 'https://management.azure.com/providers/Microsoft.Management/managementGroups/foo?api-version=2020-05-01' }
+        @{ Case = 'URL-encoded with no ''/'' before it, in a field no rule masks'; Kind = 'inventory'; Text = 'https://h/x?scope=providers%2FMicrosoft.Management%2FmanagementGroups%2Ffoo' }
+        @{ Case = 'right after a letter outside ASCII, in a field no rule masks'; Kind = 'inventory'; Text = ('caf' + [char]0xE9 + 'providers/Microsoft.Management/managementGroups/foo') }
+        @{ Case = 'with no ''/'' before it, in a metric record'; Kind = 'metric'; Text = 'see providers/Microsoft.Capacity/reservationOrders/ord/reservations/res now' }
+        @{ Case = 'with no ''/'' before it, in a consumption cell no one masks'; Kind = 'usage'; Text = 'providers/Microsoft.Management/managementGroups/foo' }
+        @{ Case = 'right after the host of a URL, in a consumption cell no one masks'; Kind = 'usage'; Text = 'https://management.azure.com/providers/Microsoft.Management/managementGroups/foo?api-version=2020-05-01' }
+    ) {
+        $script:TenantText = $Text
+        $In = if ($Kind -eq 'inventory') { & $script:Planted 'Inventory_*.json' { param($T) $New = $T -replace '"OSDisk":"[^"]*"', ('"OSDisk":"{0}"' -f $script:TenantText); if ($New -ceq $T) { throw 'no OSDisk was changed' }; $New } }
+        elseif ($Kind -eq 'metric') { & $script:Planted 'Metrics_*.json' { param($T) $Mx = ConvertFrom-RdaJsonText -Text $T; $Mx['Metrics'][0]['Metric'] = $script:TenantText; ConvertTo-Json -InputObject ([pscustomobject]@{ Metrics = @($Mx['Metrics']) }) -Depth 10 -Compress } }
+        else { & $script:Planted 'Consumption_*.csv' { param($T) $New = ([regex]'""ImageType"":""[^"]*""').Replace($T, ('""ImageType"":""{0}""' -f $script:TenantText), 1); if ($New -ceq $T) { throw 'no consumption cell was changed' }; $New } }
+        $Out = Join-Path $script:Work ('out-tenant-short-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $R = script:Invoke-Protect -Path $In -Out $Out
+        $R.ExitCode | Should -Be 1 -Because ($R.Text -join ' | ')
+        ($R.Text -join "`n") | Should -Match ([regex]::Escape('real name or id is still in'))
+        ($R.Text -join "`n") | Should -Not -Match '(?i)managementGroups/foo|reservationOrders/ord' -Because 'the message names no real value'
         Test-Path -LiteralPath $Out | Should -BeFalse
     }
 }

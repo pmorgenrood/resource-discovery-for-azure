@@ -102,6 +102,9 @@ holds plain copies of the report, so delete it.
   group or a reservation, with or without its first `/`, or URL-encoded) in any field of the plain report or any
   consumption cell, a field no rule masks too, is a real value:
   its subscription, group and name parts must not be in the masked report, or it is refused.
+  A tenant-scope id is also looked for whole, because a short name in it is not looked for alone. It is looked for
+  as a text may hold it: with or without its first `/`, and from its namespace on, so a letter right before its `/`
+  or its `providers` does not hide it.
 - A record of a subscription the report names nowhere (no display name on any record, and none on the page) is
   refused: the run's token loop would not give its id a token, so the id could not keep its ARM shape.
 - A `-Obfuscate` run times one more phase, the network id query for masked ids; a plain run does not,

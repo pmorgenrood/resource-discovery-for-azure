@@ -583,10 +583,21 @@ function Test-RdaMaskedOutputLeak
 {
     param([Parameter(Mandatory = $true)][string[]]$Path, [Parameter(Mandatory = $true)]$RealValue, $Exempt)
 
-    # A full id is not looked for whole: its subscription, group and name parts are
-    # real values of their own, so a leaked id is found by its parts.
+    # A subscription id ('/subscriptions/...') is not looked for whole: its subscription, group
+    # and name parts are real values of their own, so a leaked id is found by its parts.
+    # A tenant-scope id ('/providers/<namespace>/<type>/<name>...') is looked for whole, as its
+    # short names are not looked for alone, so it is also looked for as a text may hold it:
+    # without its first '/' (Get-RdaFullIdInValue writes each id it finds with one, and a text
+    # may have none, or a letter or digit glued to it), and from its namespace on, which a '/'
+    # always comes before (a letter outside ASCII glued to its 'providers' is a letter to the
+    # scan, not to the finder).
+    $Looked = foreach ($Real in $RealValue)
+    {
+        $Real
+        if ([string]$Real -match '(?i)\A/providers/.') { ([string]$Real).Substring(1); ([string]$Real).Substring('/providers/'.Length) }
+    }
     $Strong = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($V in $RealValue)
+    foreach ($V in $Looked)
     {
         if ($V.Length -lt 5 -or $V -eq 'obfuscated' -or $V -match '^/subscriptions/' -or -not ($V -match '[0-9\-_./]' -or $V.Length -ge 12)) { continue }
         if ($null -ne $Exempt -and $Exempt.Contains($V)) { continue }
