@@ -83,7 +83,7 @@ Describe 'A $system name part under -Obfuscate' {
         $Masked | Should -Not -Match ([regex]::Escape('$system'))
         $Masked | Should -Not -Match 'sb-orders|rg-bus'
         ($Masked -split '/').Count | Should -Be ($Real -split '/').Count
-        foreach ($Slot in @(Get-NameSlot $Masked)) { $Slot | Should -Match ('^' + $script:Token + '$') }
+        foreach ($Slot in @(Get-NameSlot $Masked)) { $Slot | Should -Match ('^' + $script:Token + '\z') }
         Test-ObfuscatedIdShape -RealId $Real -MaskedId $Masked | Should -BeTrue
     }
 

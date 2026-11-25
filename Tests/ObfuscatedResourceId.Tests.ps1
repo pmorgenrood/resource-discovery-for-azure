@@ -83,7 +83,7 @@ Describe 'Get-ObfuscatedResourceId' {
         {
             if ($RealParts[$i] -in @($Names + @('rg-demo', $script:Sub)))
             {
-                $MaskedParts[$i] | Should -Match ('^' + $script:Token + '$')
+                $MaskedParts[$i] | Should -Match ('^' + $script:Token + '\z')
                 $MaskedParts[$i] | Should -Not -Be $RealParts[$i] -Because 'a real part is never kept, even one shaped like a token, letter case aside'
             }
             else { $MaskedParts[$i] | Should -BeExactly $RealParts[$i] }
@@ -129,9 +129,9 @@ Describe 'Get-ObfuscatedResourceId' {
 
     It 'masks a subscription-level id, gives the name ''$system'' a token, and gives an AKS-managed resource the aks_ hint' {
         $SubLevel = Get-ObfuscatedResourceId -ResourceId "/subscriptions/$script:Sub/providers/microsoft.insights/components/ai-a"
-        $SubLevel | Should -Match ('^/subscriptions/' + $script:Token + '/providers/microsoft.insights/components/' + $script:Token + '$')
+        $SubLevel | Should -Match ('^/subscriptions/' + $script:Token + '/providers/microsoft.insights/components/' + $script:Token + '\z')
         $System = Get-ObfuscatedResourceId -ResourceId "$script:Base/microsoft.servicebus/namespaces/sb-a/topics/`$system"
-        ($System -split '/')[-1] | Should -Match ('^' + $script:Token + '$') -Because 'the contract leaves no name part as written, $system included'
+        ($System -split '/')[-1] | Should -Match ('^' + $script:Token + '\z') -Because 'the contract leaves no name part as written, $system included'
         $Aks = Get-ObfuscatedResourceId -ResourceId "/subscriptions/$script:Sub/resourcegroups/mc_rg_aks_eastus/providers/microsoft.compute/disks/osdisk-a"
         ($Aks -split '/')[-1] | Should -Match '^(prod|nonprod)_aks_'
     }
@@ -139,11 +139,11 @@ Describe 'Get-ObfuscatedResourceId' {
     It 'keeps the path of a tenant-scope id (no subscription), masks each name, and gives a parent one token' {
         $Order = '/providers/Microsoft.Capacity/reservationOrders/ro-a'
         $Masked = Get-ObfuscatedResourceId -ResourceId "$Order/reservations/res-a"
-        $Masked | Should -Match ('^/providers/Microsoft\.Capacity/reservationOrders/' + $script:Token + '/reservations/' + $script:Token + '$')
+        $Masked | Should -Match ('^/providers/Microsoft\.Capacity/reservationOrders/' + $script:Token + '/reservations/' + $script:Token + '\z')
         $Masked | Should -Not -Match 'ro-a|res-a'
         $Second = Get-ObfuscatedResourceId -ResourceId "$Order/reservations/res-b"
         ($Second -split '/')[4] | Should -BeExactly ($Masked -split '/')[4] -Because 'one reservation order keeps one token'
-        (Get-ObfuscatedResourceId -ResourceId '/providers/Microsoft.Management/managementGroups/mg-a') | Should -Match ('^/providers/Microsoft\.Management/managementGroups/' + $script:Token + '$')
+        (Get-ObfuscatedResourceId -ResourceId '/providers/Microsoft.Management/managementGroups/mg-a') | Should -Match ('^/providers/Microsoft\.Management/managementGroups/' + $script:Token + '\z')
         $Global:ResourceNameDictionary.ContainsKey("$Order/reservations/res-a") | Should -BeTrue -Because 'the dictionary can reverse every segment'
     }
 
@@ -154,12 +154,12 @@ Describe 'Get-ObfuscatedResourceId' {
         @{ Label = 'a trailing slash'; Id = '/providers/Microsoft.Capacity/reservationOrders/ro-a/' }
     ) {
         $Masked = Get-ObfuscatedResourceId -ResourceId $Id
-        $Masked | Should -Match ('^' + $script:Token + '$')
+        $Masked | Should -Match ('^' + $script:Token + '\z')
     }
 
     It 'returns ''obfuscated'' for an empty id and one token for an id that is not subscription-scoped' {
         Get-ObfuscatedResourceId -ResourceId '' | Should -BeExactly 'obfuscated'
-        Get-ObfuscatedResourceId -ResourceId 'not-an-arm-id' | Should -Match ('^' + $script:Token + '$')
+        Get-ObfuscatedResourceId -ResourceId 'not-an-arm-id' | Should -Match ('^' + $script:Token + '\z')
     }
 }
 
@@ -195,7 +195,7 @@ Describe 'The dictionary build writes the name token New-ObfuscatedNameToken wri
         $Case = @($script:Cases | Where-Object { $_.Id.EndsWith('/' + $Id) })[0]
         $Expected = (New-ObfuscatedNameToken -ResourceId $Case.Id -Name $Case.Name) -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', '<guid>'
         $Written = $Global:ResourceNameDictionary[$Case.Id]
-        $Written | Should -Match ('^' + $script:Token + '$')
+        $Written | Should -Match ('^' + $script:Token + '\z')
         ($Written -replace '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', '<guid>') | Should -BeExactly $Expected
     }
 }
@@ -674,7 +674,7 @@ Describe 'The seed is checked when it is read' {
                     $Good = Protect-FreeTextValue 'finance-01'
                 }
                 $Masked | Should -Not -Be $Real -Because "run $Run masks the value, letter case aside"
-                $Masked | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "run $Run writes the run's token form"
+                $Masked | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "run $Run writes the run's token form"
                 $Good | Should -BeExactly $GoodTok -Because "run $Run keeps a good seeded token"
                 if ($Run -eq 1) { $First = $Masked } else { $Masked | Should -BeExactly $First -Because "run $Run keeps run 1's token, letter for letter" }
                 $Seed = Get-RunDictionaryMaps
@@ -700,7 +700,7 @@ Describe 'The seed is checked when it is read' {
             Invoke-SeededRun -SeedMaps $Seed -Rows @((New-Res $Flat), (New-Res $GoodFlat))
             $Ids = Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly
             $Ids[$Flat] | Should -Not -Be $Flat -Because "run $Run masks the real id, letter case aside"
-            $Ids[$Flat] | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "run $Run writes one flat token"
+            $Ids[$Flat] | Should -MatchExactly '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "run $Run writes one flat token"
             $Ids[$GoodFlat] | Should -BeExactly $GoodTok -Because "run $Run keeps a good flat seeded token"
             if ($Run -eq 1) { $First = $Ids[$Flat] } else { $Ids[$Flat] | Should -BeExactly $First -Because "run $Run keeps run 1's token, letter for letter" }
             $Seed = Get-RunDictionaryMaps
@@ -894,7 +894,7 @@ Describe 'The seed is checked when it is read' {
             $Full[0].Description | Should -BeExactly 'team notes 01' -Because 'Reveal of all fields gives the free text its own value'
             $Full[1].ID | Should -BeExactly $FlatReal -Because 'Reveal of all fields gives the flat id its own value'
 
-            $TokenForm = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            $TokenForm = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
             foreach ($R in $Runs)
             {
                 $R.Row['ID'] | Should -BeExactly $VmMasked -Because "run $($R.Run) keeps the seeded id"
@@ -1010,7 +1010,7 @@ Describe 'The seed is checked when it is read' {
             $Full[0].Tags[0].Value | Should -BeExactly 'payments-01' -Because 'Reveal of all fields gives the tag its own value'
             $Full[0].Description | Should -BeExactly 'team notes 01' -Because 'Reveal of all fields gives the free text its own value'
 
-            $TokenForm = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            $TokenForm = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
             foreach ($R in $Runs)
             {
                 $R.Row['ID'] | Should -BeExactly $VmMasked -Because "run $($R.Run) keeps the seeded id"
@@ -1198,7 +1198,7 @@ Describe 'The seed is checked when it is read' {
                 $Parts = $Pair[1] -split '/'
                 $Parts.Count | Should -Be 5 -Because "run $Run keeps the id's shape"
                 ($Parts[0..3] -join '/') | Should -BeExactly (($Pair[0] -split '/')[0..3] -join '/') -Because 'the provider and type words are kept as written'
-                $Parts[4] | Should -Match ('^' + $script:Token + '$')
+                $Parts[4] | Should -Match ('^' + $script:Token + '\z')
                 $Parts[4] | Should -Not -BeExactly $GroupToken -Because "run $Run gives the name its own token, not the token of the real group grp-a"
                 $Parts[4] | Should -BeExactly (Get-Variable -Scope Global -Name ResourceNameDictionary -ValueOnly)[$Pair[0]] -Because 'the name token is recorded, so the dictionary reverses it'
                 Test-ObfuscatedIdShape -RealId $Pair[0] -MaskedId $Pair[1] | Should -BeTrue -Because "run $Run writes the shape the seed check keeps"
@@ -1251,7 +1251,7 @@ Describe 'The seed is checked when it is read' {
             $TenParts = $Now.Ten -split '/'
             $TenParts.Count | Should -Be 5 -Because "run $Run keeps the tenant-scope id's shape"
             ($TenParts[0..3] -join '/') | Should -BeExactly '/providers/Microsoft.Example/resourceGroups'
-            $TenParts[4] | Should -Match ('^' + $script:Token + '$')
+            $TenParts[4] | Should -Match ('^' + $script:Token + '\z')
             $TenParts[4] | Should -Not -BeExactly $Grp -Because "run $Run gives the tenant-scope name its own token, not the group's"
             if ($Run -eq 1) { $First = $Now }
             else
@@ -1276,7 +1276,7 @@ Describe 'The seed is checked when it is read' {
         $Tok = New-Tok
         Invoke-SeededRun -SeedMaps @{ ResourceIdMap = @{}; ResourceGroupMap = @{ $Tok = $Value } } -Rows @(New-Res $Vm)
         $Group = ((Get-Variable -Scope Global -Name ResourceIdDictionary -ValueOnly)[$Vm] -split '/')[4]
-        $Group | Should -Match ('^' + $script:Token + '$')
+        $Group | Should -Match ('^' + $script:Token + '\z')
         if ($Reused) { $Group | Should -BeExactly $Tok -Because 'the seed names the real group grp-a' }
         else { $Group | Should -Not -BeExactly $Tok -Because 'the seed names no group grp-a, only a tenant-scope id''s type word and name' }
     }
@@ -1534,7 +1534,7 @@ Describe 'A tenant-scope id keeps its shape (it has no subscription)' {
         @{ Label = 'management group'; Id = '/providers/Microsoft.Management/managementGroups/mg-a'; Prefix = '/providers/Microsoft.Management/managementGroups/' }
     ) {
         $Masked = Get-ObfuscatedResourceId -ResourceId $Id
-        $Masked | Should -Match ('^' + [regex]::Escape($Prefix) + $script:Token + '$')
+        $Masked | Should -Match ('^' + [regex]::Escape($Prefix) + $script:Token + '\z')
         $Masked | Should -Not -Match '/subscriptions/'
         $Masked | Should -Not -Match 'ro-a|mg-a'
     }
@@ -1546,9 +1546,9 @@ Describe 'A tenant-scope id keeps its shape (it has no subscription)' {
         $Parts[1] | Should -BeExactly 'providers'
         $Parts[2] | Should -BeExactly 'Microsoft.Capacity'
         $Parts[3] | Should -BeExactly 'reservationOrders'
-        $Parts[4] | Should -Match ('^' + $script:Token + '$')
+        $Parts[4] | Should -Match ('^' + $script:Token + '\z')
         $Parts[5] | Should -BeExactly 'reservations'
-        $Parts[6] | Should -Match ('^' + $script:Token + '$')
+        $Parts[6] | Should -Match ('^' + $script:Token + '\z')
         # Reservation rows are found by their path segments: the order part of the
         # reservation's masked id is the masked id of the order itself.
         $Order = Get-ObfuscatedResourceId -ResourceId '/providers/Microsoft.Capacity/reservationOrders/ro-a'

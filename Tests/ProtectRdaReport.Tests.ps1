@@ -1449,7 +1449,7 @@ Describe 'Protect-RdaOfflineField masks a collector field from its plain value' 
 
     It 'masks each role name of a cloud service, inside its Roles list' {
         $R = & $script:Mask 'CloudServices' @{ ID = 'x'; Roles = @(@{ RoleName = 'web-role-01'; SkuName = 'Standard_D2' }, @{ RoleName = 'worker-role-01'; SkuName = 'Standard_D2' }) }
-        foreach ($Role in $R.Roles) { $Role.RoleName | Should -Match '^(non)?prod_[0-9a-f-]{36}$'; $Role.SkuName | Should -Be 'Standard_D2' }
+        foreach ($Role in $R.Roles) { $Role.RoleName | Should -Match '^(non)?prod_[0-9a-f-]{36}\z'; $Role.SkuName | Should -Be 'Standard_D2' }
         $Shape = Get-RdaReportShape -RepoRoot $script:RepoRoot
         Get-RdaUnknownInventoryShape -Rows @{ CloudServices = @(@{ ID = '/subscriptions/s/resourcegroups/g/providers/microsoft.compute/cloudservices/n'; Name = 'n'; Subscription = 's'; ResourceGroup = 'g'; Location = 'l'; Roles = @(@{ RoleName = 'r'; SkuName = 'k'; SkuTier = 't'; SkuCapacity = 1 }) }) } -Shape $Shape | Should -BeNullOrEmpty
         Get-RdaUnknownInventoryShape -Rows @{ CloudServices = @(@{ ID = '/subscriptions/s/resourcegroups/g/providers/microsoft.compute/cloudservices/n'; Name = 'n'; Subscription = 's'; ResourceGroup = 'g'; Location = 'l'; Roles = @(@{ RoleName = 'r'; Owner = 'someone' }) }) } -Shape $Shape | Should -Be 'a nested field the CloudServices collector does not write'
@@ -1483,7 +1483,7 @@ Describe 'Protect-RdaOfflineField masks a collector field from its plain value' 
         (& $script:Mask 'NetApp' @{ ID = 'x'; NetAppAccount = 'acct'; CapacityPool = 'pool'; Volume = 'vol' }).Volume | Should -Be 'obfuscated'
         (& $script:Mask 'DataExplorerCluster' @{ ID = 'x'; StateReason = 'why' }).StateReason | Should -BeNullOrEmpty
         $Token = (& $script:Mask 'AKS' @{ ID = 'x'; NodePoolName = 'pool-dev' }).NodePoolName
-        $Token | Should -Match '^nonprod_[0-9a-f-]{36}$'
+        $Token | Should -Match '^nonprod_[0-9a-f-]{36}\z'
         (& $script:Mask 'AKS' @{ ID = 'y'; NodePoolName = 'pool-dev' }).NodePoolName | Should -Be $Token -Because 'one real value has one token'
         (& $script:Mask 'Frontdoor' @{ ID = 'x'; WebApplicationFirewall = 'waf-one, waf-two (1 of 3 endpoints without WAF)' }).WebApplicationFirewall | Should -Be 'obfuscated, obfuscated (1 of 3 endpoints without WAF)'
         (& $script:Mask 'Frontdoor' @{ ID = 'x'; WebApplicationFirewall = 'Unknown' }).WebApplicationFirewall | Should -Be 'Unknown'
@@ -2677,7 +2677,7 @@ Describe 'Protect-RdaReport.ps1 masks what a plain report holds only in part as 
         $Usage = @($Clean.Members[@($Clean.Members.Keys | Where-Object { $_ -like 'Consumption_*' })[0]] | ConvertFrom-Csv)
         $Masked = @($Usage | Where-Object { $Clean.Dict.ResourceIdMap[$_.ResourceId] -eq $Reservation })
         $Masked.Count | Should -Be 1
-        $Masked[0].ResourceId | Should -Match '^/providers/microsoft\.capacity/reservationorders/(?:prod|nonprod)_[0-9a-f-]{36}/reservations/(?:prod|nonprod)_[0-9a-f-]{36}$'
+        $Masked[0].ResourceId | Should -Match '^/providers/microsoft\.capacity/reservationorders/(?:prod|nonprod)_[0-9a-f-]{36}/reservations/(?:prod|nonprod)_[0-9a-f-]{36}\z'
 
         $Out = Join-Path $script:Work ([guid]::NewGuid().ToString('N'))
         $R = script:Invoke-Protect -Path (& $script:Change @{ 'Consumption_*.csv' = { param($T) & $AddRow $T $true } }) -Out $Out

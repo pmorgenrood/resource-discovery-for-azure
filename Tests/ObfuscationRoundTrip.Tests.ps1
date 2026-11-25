@@ -310,7 +310,7 @@ Describe '-Obfuscate masks every identifying segment' {
         $Parts.Count | Should -Be 9
         $Real.Count | Should -Be 9
         foreach ($Word in 1, 3, 5, 6, 7) { $Parts[$Word] | Should -BeExactly $Real[$Word] -Because 'the path words, the namespace and the type word stay as written' }
-        foreach ($Slot in 2, 4, 8) { $Parts[$Slot] | Should -Match '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -Because "part $Slot is a subscription, group or name" }
+        foreach ($Slot in 2, 4, 8) { $Parts[$Slot] | Should -Match '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "part $Slot is a subscription, group or name" }
         $Rows = @($script:O.CsvRows | Where-Object { $_.ResourceId -ceq $Masked[0] })
         $Rows.Count | Should -Be 1 -Because 'the consumption row holds the masked id'
         ($Rows[0].InstanceData | ConvertFrom-Json).'Microsoft.Resources'.resourceUri | Should -BeExactly $Masked[0]
@@ -437,7 +437,7 @@ Describe 'The report HTML of the obfuscated run and its Reveal.ps1 -All copy' {
     It 'keeps a cell longer than 200 characters whole when its cut would split a masked token' {
         $Masked = @($script:O.Raw.VMDisk)[0].AssociatedResource
         $Masked.Length | Should -BeGreaterThan 200
-        $Masked | Should -Match '/nonprod_[0-9a-f-]{36}$'
+        $Masked | Should -Match '/nonprod_[0-9a-f-]{36}\z'
         $script:O.Html.Contains('<td>' + $Masked + '</td>') | Should -BeTrue -Because "the cell should hold '$Masked' whole"
     }
 

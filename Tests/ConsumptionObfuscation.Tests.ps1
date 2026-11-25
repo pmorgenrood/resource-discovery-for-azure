@@ -141,8 +141,8 @@ Describe "Consumption obfuscation null/empty resourceUri handling" {
             # New-ObfuscatedNameToken); the group token itself is prod_/nonprod_ + GUID.
             $Real = '/subscriptions/aaaa/resourcegroups/mc_aksrg_cluster_eastus/providers/microsoft.compute/virtualmachinescalesets/aks-nodepool'
             $Obf = Get-ObfuscatedConsumptionUriForTest -RawUri $Real
-            ($Obf -split '/')[-1] | Should -Match '^(prod|nonprod)_aks_[0-9a-f-]{36}$'
-            ($Obf -split '/')[4] | Should -Match '^(prod|nonprod)_[0-9a-f-]{36}$' -Because 'a group token carries no mc_ or other hint'
+            ($Obf -split '/')[-1] | Should -Match '^(prod|nonprod)_aks_[0-9a-f-]{36}\z'
+            ($Obf -split '/')[4] | Should -Match '^(prod|nonprod)_[0-9a-f-]{36}\z' -Because 'a group token carries no mc_ or other hint'
             $Obf | Should -Not -Match 'mc_aksrg_cluster_eastus|aks-nodepool'
         }
 
@@ -172,7 +172,7 @@ Describe "Consumption obfuscation null/empty resourceUri handling" {
         It "gives a `$system name part a token, as every name" {
             $Obf = Get-ObfuscatedConsumptionUriForTest -RawUri '/subscriptions/aaaa/resourcegroups/rg1/providers/microsoft.servicebus/namespaces/$system/topics/$system'
             $Obf | Should -Not -Match ([regex]::Escape('$system'))
-            $Obf | Should -Match '^/subscriptions/(prod|nonprod)_[0-9a-f-]{36}/resourcegroups/(prod|nonprod)_[0-9a-f-]{36}/providers/microsoft\.servicebus/namespaces/(prod|nonprod)_[0-9a-f-]{36}/topics/(prod|nonprod)_[0-9a-f-]{36}$'
+            $Obf | Should -Match '^/subscriptions/(prod|nonprod)_[0-9a-f-]{36}/resourcegroups/(prod|nonprod)_[0-9a-f-]{36}/providers/microsoft\.servicebus/namespaces/(prod|nonprod)_[0-9a-f-]{36}/topics/(prod|nonprod)_[0-9a-f-]{36}\z'
         }
 
         It "gives two resources of one name in two groups two name tokens (a name is keyed by its id, not by the bare name)" {

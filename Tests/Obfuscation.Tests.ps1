@@ -69,7 +69,7 @@ BeforeAll {
     # shape (AKS-managed RGs, Databricks-managed clusters, VMSS instances
     # inside AKS node pools). See ResourceInventory.ps1 lines 650-655 and
     # 1030-1034 for where these are produced.
-    $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    $script:ObfuscationPattern = '^(prod|nonprod)_(databricks_|aks_|vmss_)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 
     # A resource id (ID, and a cross-reference to another resource's id) is
     # masked segment by segment and keeps its ARM shape, so ids still join
@@ -497,7 +497,7 @@ Describe "Non-Obfuscated Mode Safety" {
 Describe "Cross-Reference Field Obfuscation" {
     # Helper: field should be obfuscated, null, or a safe non-ID value like 'None' or 'obfuscated'
     BeforeAll {
-        $script:SafePattern = '^((prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|None|obfuscated)$'
+        $script:SafePattern = '^((prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|None|obfuscated)\z'
         $script:AzureIdPattern = '/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}'
     }
 
@@ -1045,7 +1045,7 @@ Describe "Tag Tokenization — keys kept, values masked, mixed-case regression (
             }
         }
 
-        $script:TagTokenPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        $script:TagTokenPattern = '^(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
         $script:RiSourcePath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'ResourceInventory.ps1'
     }
 
