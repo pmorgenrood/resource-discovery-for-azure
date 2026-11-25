@@ -1328,6 +1328,104 @@ Describe "Reveal-Obfuscation reveals a whole id that a mark of the text around i
     }
 }
 
+# A real id can hold a part shaped like a token: a resource named 'prod_<guid>', which a seeded
+# run keeps as its real name when an earlier dictionary gave that text to another resource as
+# its token. Reveal writes a whole id that ResourceIdMap holds back as the dictionary gives it,
+# in the same pass as the tokens, so a part of the real id that is another value's token stays
+# as it is: the real id it puts in is not read again for tokens.
+Describe "Reveal-Obfuscation writes back a real id whose part is another value's token as the dictionary gives it" {
+
+    BeforeAll {
+        $T = @{}
+        foreach ($K in 'Sub', 'Rg', 'RgC', 'NameA', 'NameB', 'NameC', 'NameE', 'Ro', 'Tag') { $T[$K] = 'prod_' + [guid]::NewGuid().ToString() }
+        $script:NtTok = $T
+        $G = '12345678-1234-1234-1234-123456789012'
+        $Mp = "/subscriptions/$($T.Sub)/resourcegroups"
+        # A: the name is B's name token. C: the group is the group token of rg-app. E: the name
+        # holds the tag's token after a '-'. Ro: a tenant-scope order named as A's name token.
+        $script:NtIds = [ordered]@{
+            A  = @{ M = "$Mp/$($T.Rg)/providers/microsoft.compute/virtualmachines/$($T.NameA)"; R = "/subscriptions/$G/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/$($T.NameB)" }
+            B  = @{ M = "$Mp/$($T.Rg)/providers/microsoft.compute/virtualmachines/$($T.NameB)"; R = "/subscriptions/$G/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/other-real-name" }
+            C  = @{ M = "$Mp/$($T.RgC)/providers/microsoft.storage/storageaccounts/$($T.NameC)"; R = "/subscriptions/$G/resourceGroups/$($T.Rg)/providers/Microsoft.Storage/storageAccounts/sa01" }
+            E  = @{ M = "$Mp/$($T.Rg)/providers/microsoft.compute/virtualmachines/$($T.NameE)"; R = "/subscriptions/$G/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm-$($T.Tag)" }
+            Ro = @{ M = "/providers/Microsoft.Capacity/reservationOrders/$($T.Ro)"; R = "/providers/Microsoft.Capacity/reservationOrders/$($T.NameA)" }
+        }
+        # Not in ResourceIdMap: its tokens are revealed one by one.
+        $script:NtSetM = "$Mp/$($T.Rg)/providers/microsoft.compute/virtualmachinescalesets/$($T.NameB)"
+        $script:NtLog = { param($A, $Ro, $Tag) "moved $A to plan 2; order $Ro; tag $Tag`n" }
+
+        $script:NtDir = Join-Path $script:TmpDir ('nametok_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $Stage = Join-Path $script:NtDir 'stage'
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+        $I = $script:NtIds
+        [ordered]@{
+            VirtualMachines = @(
+                [ordered]@{ ID = $I.A.M; Name = $T.NameA; Subscription = $T.Sub; ResourceGroup = $T.Rg; Set = $script:NtSetM }
+                [ordered]@{ ID = $I.B.M; Name = $T.NameB; Subscription = $T.Sub; ResourceGroup = $T.Rg }
+                [ordered]@{ ID = $I.E.M; Name = $T.NameE; Subscription = $T.Sub; ResourceGroup = $T.Rg; Tags = @([ordered]@{ Name = 'app'; Value = $T.Tag }) }
+            )
+            StorageAccounts = @([ordered]@{ ID = $I.C.M; Name = $T.NameC; Subscription = $T.Sub; ResourceGroup = $T.RgC })
+            Reservations    = @([ordered]@{ ID = $I.Ro.M; Name = $T.Ro })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_NameTok.json') -Encoding utf8
+        @(foreach ($K in $I.Keys)
+            {
+                [pscustomobject]@{ ResourceId = $I[$K].M; InstanceData = (@{ 'Microsoft.Resources' = @{ resourceUri = $I[$K].M } } | ConvertTo-Json -Compress); Cost = '1.00' }
+            }) | Export-Csv -LiteralPath (Join-Path $Stage 'Consumption_NameTok.csv') -NoTypeInformation -Encoding utf8
+        [System.IO.File]::WriteAllText((Join-Path $Stage 'Diagnostics_NameTok.log'), (& $script:NtLog $I.A.M $I.Ro.M $T.Tag))
+        $script:NtZip = Join-Path $script:NtDir 'ResourcesReport_NameTok.zip'
+        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $script:NtZip -Force
+        $IdMap = [ordered]@{}
+        foreach ($K in $I.Keys) { $IdMap[$I[$K].M] = $I[$K].R }
+        $script:NtDict = Join-Path $script:NtDir 'ObfuscationDictionary_NameTok.json'
+        [ordered]@{
+            GeneratedAt         = '2026-06-30 00:00:00'
+            ResourceIdMap       = $IdMap
+            ResourceNameMap     = [ordered]@{ $T.NameA = $I.A.R; $T.NameB = $I.B.R; $T.NameC = $I.C.R; $T.NameE = $I.E.R; $T.Ro = $I.Ro.R }
+            SubscriptionMap     = [ordered]@{ $T.Sub = $I.A.R }
+            SubscriptionNameMap = [ordered]@{ $T.Sub = 'Demo Subscription' }
+            ResourceGroupMap    = [ordered]@{ $T.Rg = $I.B.R; $T.RgC = $I.C.R }
+            TagMap              = [ordered]@{ $T.Tag = 'payments' }
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:NtDict -Encoding utf8
+    }
+
+    It "reveals, with <Mode>, each id ResourceIdMap holds as its real id, in the inventory, the usage file, a JSON cell and a log, and still reveals the tokens around it" -ForEach @(
+        @{ Mode = '-Fields ResourceId'; All = $false; Fields = @('ResourceId') }
+        @{ Mode = '-All'; All = $true; Fields = @() }
+        @{ Mode = '-Fields ResourceName, ResourceId'; All = $false; Fields = @('ResourceName', 'ResourceId') }
+        @{ Mode = '-Fields ResourceGroup, Tag, ResourceId'; All = $false; Fields = @('ResourceGroup', 'Tag', 'ResourceId') }
+    ) {
+        $T = $script:NtTok
+        $I = $script:NtIds
+        $Out = Join-Path $script:NtDir ('out_' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.zip')
+        $Splat = @{ InputZip = $script:NtZip; DictionaryPath = $script:NtDict; OutputZip = $Out }
+        if ($All) { $Splat['All'] = $true } else { $Splat['Fields'] = $Fields }
+        & $script:RevealScript @Splat *>&1 | Out-Null
+        Test-Path -LiteralPath $Out | Should -BeTrue
+        $Ex = $Out + '.ex'
+        Expand-Archive -LiteralPath $Out -DestinationPath $Ex -Force
+        $Inv = Get-Content -LiteralPath (Join-Path $Ex 'Inventory_NameTok.json') -Raw | ConvertFrom-Json
+        $Inv.VirtualMachines[0].ID | Should -BeExactly $I.A.R -Because 'a real name that is another resource''s name token stays as it is'
+        $Inv.VirtualMachines[1].ID | Should -BeExactly $I.B.R
+        $Inv.VirtualMachines[2].ID | Should -BeExactly $I.E.R -Because 'a real name that holds a tag''s token stays as it is'
+        $Inv.StorageAccounts[0].ID | Should -BeExactly $I.C.R -Because 'a real group that is another group''s token stays as it is'
+        $Inv.Reservations[0].ID | Should -BeExactly $I.Ro.R -Because 'a tenant-scope id whose name is another name''s token stays as it is'
+        $Csv = @(Import-Csv -LiteralPath (Join-Path $Ex 'Consumption_NameTok.csv'))
+        $Want = @(foreach ($K in $I.Keys) { $I[$K].R })
+        @($Csv.ResourceId) | Should -Be $Want
+        @($Csv | ForEach-Object { ($_.InstanceData | ConvertFrom-Json).'Microsoft.Resources'.resourceUri }) | Should -Be $Want -Because 'an id inside a JSON cell is written back as it is too'
+
+        # The tokens around the ids are still revealed, each by the fields chosen.
+        $TagNow = if ($All -or $Fields -contains 'Tag') { 'payments' } else { $T.Tag }
+        Get-Content -LiteralPath (Join-Path $Ex 'Diagnostics_NameTok.log') -Raw | Should -BeExactly (& $script:NtLog $I.A.R $I.Ro.R $TagNow)
+        $Inv.VirtualMachines[2].Tags[0].Value | Should -BeExactly $TagNow
+        $Inv.VirtualMachines[1].Name | Should -BeExactly $(if ($All -or $Fields -contains 'ResourceName') { 'other-real-name' } else { $T.NameB })
+        $Inv.VirtualMachines[0].Name | Should -BeExactly $(if ($All -or $Fields -contains 'ResourceName') { $T.NameB } else { $T.NameA }) -Because 'the name field gives A its real name, which is B''s token'
+        $Inv.StorageAccounts[0].ResourceGroup | Should -BeExactly $(if ($All -or $Fields -contains 'ResourceGroup') { $T.Rg } else { $T.RgC }) -Because 'the group field gives C its real group, which is the token of rg-app'
+        # An id ResourceIdMap does not hold is revealed token by token, as before.
+        $Inv.VirtualMachines[0].Set | Should -BeExactly '/subscriptions/12345678-1234-1234-1234-123456789012/resourcegroups/rg-app/providers/microsoft.compute/virtualmachinescalesets/other-real-name'
+    }
+}
+
 Describe "Reveal's doc on a dictionary it refuses" {
 
     It "says that Reveal refuses a dictionary that gives one token to two maps, or whose ids hold a token for another kind of value or real value, writes nothing, and that the fix is the dictionary the run wrote" {

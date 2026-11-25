@@ -314,8 +314,9 @@ function Get-JsonEscaped
 # in $PathReplacements first: a subscription token after '/subscriptions/'
 # becomes the subscription id there, while elsewhere it is the display name.
 # When the resource id dimension is revealed, a whole masked id found in
-# $IdPathMap (masked id -> real id) is replaced as one value first; this also
-# restores ids whose segment tokens a dictionary does not hold one by one. A
+# $IdPathMap (masked id -> real id) is replaced as one value, in the same
+# pass as the tokens, so the real id put in is not read again for tokens; this
+# also restores ids whose segment tokens a dictionary does not hold one by one. A
 # whole id is a subscription id ('/subscriptions/<token>...') or a tenant-scope
 # id ('/providers/<namespace>/<type>/<token>...', a reservation order), each
 # read as the offline mask reads an id in a text (-WholeIdPattern, built once
@@ -348,35 +349,46 @@ function Convert-RevealString
             default { return $Val }
         }
     }
+    $TokenOnly = '(?<pre>(?i:/subscriptions/)|/)?(?<tok>' + $TokenPattern + ')'
+    # One callback for a whole id and for a token. A regex replace never reads the text it
+    # has put in, so a real value written here is never read again for tokens: a real id
+    # whose name is shaped like another value's token (a resource named 'prod_<guid>') comes
+    # back as it is.
+    $RevealMatch = {
+        param($m)
+        if ($m.Groups['whole'].Success)
+        {
+            # The ')' that closes the text around the id stays after the real id.
+            $Id = $m.Value
+            if ($Id.EndsWith(')')) { $Id = Get-RdaIdBeforeCloseParen $Id }
+            if ($IdPathMap.ContainsKey($Id))
+            {
+                $script:FileHits++
+                return (& $Escape $IdPathMap[$Id]) + $m.Value.Substring($Id.Length)
+            }
+            # Not a whole id the dictionary holds: its own tokens are revealed one by one,
+            # in the text as written.
+            return [regex]::Replace($m.Value, $TokenOnly, $RevealMatch)
+        }
+        $Tok = $m.Groups['tok'].Value
+        $Pre = $m.Groups['pre'].Value
+        $Val = $null
+        # A token whose path value is $null (a subscription token older builds gave to two
+        # subscription ids, Invoke-RdaReveal) stays as written in a path: it does not fall
+        # back to its field value there.
+        if ($m.Groups['pre'].Success -and $null -ne $PathReplacements -and $PathReplacements.ContainsKey($Tok)) { $Val = $PathReplacements[$Tok] }
+        elseif ($Replacements.ContainsKey($Tok)) { $Val = $Replacements[$Tok] }
+        if ($null -eq $Val) { return $m.Value }
+        $script:FileHits++
+        return $Pre + (& $Escape $Val)
+    }
     if ($null -ne $IdPathMap -and $IdPathMap.Count -gt 0 -and -not [string]::IsNullOrEmpty($WholeIdPattern))
     {
-        $Text = [regex]::Replace($Text, $WholeIdPattern, {
-                param($m)
-                # The ')' that closes the text around the id stays after the real id.
-                $Id = $m.Value
-                if ($Id.EndsWith(')')) { $Id = Get-RdaIdBeforeCloseParen $Id }
-                if ($IdPathMap.ContainsKey($Id))
-                {
-                    $script:FileHits++
-                    return (& $Escape $IdPathMap[$Id]) + $m.Value.Substring($Id.Length)
-                }
-                return $m.Value
-            })
+        # The whole id comes first in the alternation, so at each place a whole id is read
+        # before a token in it; the '(?i)' of -WholeIdPattern holds only inside its group.
+        return [regex]::Replace($Text, ('(?<whole>' + $WholeIdPattern + ')|' + $TokenOnly), $RevealMatch)
     }
-    return [regex]::Replace($Text, ('(?<pre>(?i:/subscriptions/)|/)?(?<tok>' + $TokenPattern + ')'), {
-            param($m)
-            $Tok = $m.Groups['tok'].Value
-            $Pre = $m.Groups['pre'].Value
-            $Val = $null
-            # A token whose path value is $null (a subscription token older builds gave to two
-            # subscription ids, Invoke-RdaReveal) stays as written in a path: it does not fall
-            # back to its field value there.
-            if ($m.Groups['pre'].Success -and $null -ne $PathReplacements -and $PathReplacements.ContainsKey($Tok)) { $Val = $PathReplacements[$Tok] }
-            elseif ($Replacements.ContainsKey($Tok)) { $Val = $Replacements[$Tok] }
-            if ($null -eq $Val) { return $m.Value }
-            $script:FileHits++
-            return $Pre + (& $Escape $Val)
-        })
+    return [regex]::Replace($Text, $TokenOnly, $RevealMatch)
 }
 
 

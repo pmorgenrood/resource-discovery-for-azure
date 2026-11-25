@@ -1037,6 +1037,76 @@ Describe 'The seed is checked when it is read' {
         finally { Remove-Item -LiteralPath Function:\Protect-FreeTextValue -ErrorAction SilentlyContinue }
     }
 
+    # A real resource can be named like a token: here a VM is named with the text of the name
+    # token the seed gave another VM. The seed check keeps both (the text is a real name, not a
+    # token of this VM), the run gives the VM a name token of its own, and the next two seeded
+    # runs keep every token. Reveal of each run's report with that run's dictionary writes each
+    # id back as the dictionary gives it, so the real name that is the other VM's token stays as
+    # it is and is not revealed again as the other VM's name.
+    It 'keeps a real name that is another resource''s seeded name token over three seeded runs, and Reveal of <Mode> gives each run''s ids and names their own real values' -ForEach @(
+        @{ Mode = 'ids alone'; All = $false; Fields = @('ResourceId') }
+        @{ Mode = 'all fields'; All = $true; Fields = @() }
+        @{ Mode = 'names and ids'; All = $false; Fields = @('ResourceName', 'ResourceId') }
+    ) {
+        # The run's own collector row masking.
+        $RowFn = @($Ast.FindAll({ param($N) $N -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $N.Name -eq 'Protect-RdaCollectorRow' }, $false))
+        $RowFn.Count | Should -Be 1
+        . ([scriptblock]::Create($RowFn[0].Extent.Text))
+        $Other = "$script:Base/microsoft.compute/virtualmachines/other-real-name"
+        $SubTok = New-Tok; $RgTok = New-Tok; $OtherTok = New-Tok
+        # A real VM whose name is the text of the other VM's seeded name token.
+        $Named = "$script:Base/microsoft.compute/virtualmachines/$OtherTok"
+        $OtherMasked = "/subscriptions/$SubTok/resourcegroups/$RgTok/providers/microsoft.compute/virtualmachines/$OtherTok"
+        $Seed = @{
+            ResourceIdMap    = @{ $OtherMasked = $Other }
+            ResourceNameMap  = @{ $OtherTok = $Other }
+            ResourceGroupMap = @{ $RgTok = "/subscriptions/$script:Sub/resourcegroups/rg-demo" }
+        }
+        $RevealScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'Reveal.ps1'
+        $First = $null
+        foreach ($Run in 1, 2, 3)
+        {
+            Invoke-SeededRun -SeedMaps $Seed -Rows @((New-Res $Named), (New-Res $Other))
+            $RowA = @{ ID = $Named; Name = $OtherTok; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo' }
+            $RowB = @{ ID = $Other; Name = 'other-real-name'; Subscription = 'Demo Subscription'; ResourceGroup = 'rg-demo' }
+            Protect-RdaCollectorRow -Rows @($RowA, $RowB) -Collector 'VirtualMachines'
+            $Seed = Get-RunDictionaryMaps
+
+            $RowB['ID'] | Should -BeExactly $OtherMasked -Because "run $Run keeps the other VM's seeded id"
+            $RowB['Name'] | Should -BeExactly $OtherTok -Because "run $Run keeps the other VM's seeded name token"
+            $NameTok = ([string]$RowA['ID'] -split '/')[-1]
+            $NameTok | Should -Not -Be $OtherTok -Because "run $Run gives the VM named as a token a name token of its own"
+            $NameTok | Should -MatchExactly '\A(prod|nonprod)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z' -Because "run $Run writes the run's token form"
+            $RowA['Name'] | Should -BeExactly $NameTok -Because "run $Run writes that token in the VM's name field"
+            Test-ObfuscatedIdShape -RealId $Named -MaskedId $RowA['ID'] | Should -BeTrue -Because "run $Run writes the contract shape"
+            if ($Run -eq 1) { $First = $RowA['ID'] } else { $RowA['ID'] | Should -BeExactly $First -Because "run $Run keeps run 1's id, letter for letter" }
+
+            # This run's rows in a report, revealed with this run's dictionary.
+            $Dir = Join-Path $script:SeedDir4 ('reveal-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+            $Stage = Join-Path $Dir 'stage'
+            New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+            @{ VirtualMachines = @($RowA, $RowB) } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Stage 'Inventory_Test.json') -Encoding utf8
+            $Zip = Join-Path $Dir 'ResourcesReport_Test.zip'
+            Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip
+            $DictPath = Join-Path $Dir 'ObfuscationDictionary_Test.json'
+            $Seed | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $DictPath -Encoding utf8
+            $Out = Join-Path $Dir 'out.zip'
+            $With = if ($All) { @{ All = $true } } else { @{ Fields = $Fields } }
+            & $RevealScript -InputZip $Zip -DictionaryPath $DictPath -OutputZip $Out @With *>&1 | Out-Null
+            Test-Path -LiteralPath $Out | Should -BeTrue -Because "Reveal takes run $Run's dictionary"
+            Expand-Archive -LiteralPath $Out -DestinationPath (Join-Path $Dir 'ex')
+            $Got = @((Get-Content -LiteralPath (Join-Path $Dir 'ex/Inventory_Test.json') -Raw | ConvertFrom-Json).VirtualMachines)
+            $Got[0].ID | Should -BeExactly $Named -Because "Reveal of run $Run gives the VM named as a token its own real id"
+            $Got[1].ID | Should -BeExactly $Other -Because "Reveal of run $Run gives the other VM its own real id"
+            if ($All -or $Fields -contains 'ResourceName')
+            {
+                $Got[0].Name | Should -BeExactly $OtherTok -Because "Reveal of run $Run gives the VM named as a token its own real name"
+                $Got[1].Name | Should -BeExactly 'other-real-name' -Because "Reveal of run $Run gives the other VM its own real name"
+            }
+            else { $Got[0].Name | Should -BeExactly $NameTok -Because "Reveal of ids alone leaves run $Run's name token" }
+        }
+    }
+
     It 'gives a $system parent that the seeded ids give two tokens one new token, in its own id and its child''s, and the next two seeded runs keep both' {
         # The namespace's own seeded id and its topic's give the one real
         # '.../namespaces/$system' two tokens (a seed written before the slot
