@@ -290,6 +290,8 @@ $RevealedCount = 0
 $ResumedCount = 0
 $SkippedItems = @()
 $FailedItems = @()
+# Warnings a folder's reveal wrote; the folder is still revealed, and the exit code is not changed.
+$WarnedItems = @()
 
 # Hard cap on how long a single folder's reveal may run. A pathological report
 # (e.g. an unusually large or malformed zip) can make Expand-Archive /
@@ -370,7 +372,13 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
         $Job = Start-Job -ScriptBlock {
             param($RevealFunctions, $InputZip, $DictionaryPath, $Fields, $OutputZip)
             . $RevealFunctions
-            Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip *> $null
+            # The reveal's warnings (such as a token it leaves masked in id paths) are the job's
+            # output, as text, so the parent shows them for this folder. Every other stream of
+            # the reveal stays hidden, as before; a stop is still thrown to the parent.
+            foreach ($Record in @(Invoke-RdaReveal -InputZip $InputZip -DictionaryPath $DictionaryPath -Fields $Fields -OutputZip $OutputZip 3>&1 2>$null 4>$null 5>$null 6>$null))
+            {
+                if ($Record -is [System.Management.Automation.WarningRecord]) { [string]$Record.Message }
+            }
         } -ArgumentList $RevealFunctions, $Item.Zip, $Item.Dict, $Fields, $Item.OutPath
         $LaunchUtc = [DateTime]::UtcNow
         $Running.Add([pscustomobject]@{ Item = $Item; Job = $Job; StartUtc = $LaunchUtc; Deadline = $LaunchUtc.AddSeconds($RevealTimeoutSeconds) })
@@ -386,8 +394,9 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
         {
             try
             {
-                # Re-throw any terminating error the child raised into the catch.
-                Receive-Job -Job $R.Job -ErrorAction Stop | Out-Null
+                # Re-throw any terminating error the child raised into the catch. The job's
+                # output is the reveal's warnings, shown for this folder and in the summary.
+                $JobWarnings = @(Receive-Job -Job $R.Job -ErrorAction Stop)
                 if (Test-Path -LiteralPath $R.Item.OutPath)
                 {
                     $RevealedCount++
@@ -395,6 +404,11 @@ while ($Queue.Count -gt 0 -or $Running.Count -gt 0)
                 else
                 {
                     $FailedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Reason = 'reveal completed but produced no output zip' }
+                }
+                foreach ($Warning in $JobWarnings)
+                {
+                    $WarnedItems += [pscustomobject]@{ Folder = $R.Item.Folder; Message = [string]$Warning }
+                    Write-Host ("  WARN: {0} - {1}" -f $R.Item.Folder, $Warning) -ForegroundColor Yellow
                 }
             }
             catch
@@ -470,6 +484,7 @@ Write-Host ("Revealed successfully            : {0}" -f $RevealedCount) -Foregro
 Write-Host ("Skipped (already revealed-resume): {0}" -f $ResumedCount) -ForegroundColor $(if ($ResumedCount -gt 0) { 'Cyan' } else { 'Green' })
 Write-Host ("Skipped (missing zip or dict)    : {0}" -f $SkippedItems.Count) -ForegroundColor $(if ($SkippedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 Write-Host ("Failed during reveal             : {0}" -f $FailedItems.Count) -ForegroundColor $(if ($FailedItems.Count -gt 0) { 'Red' } else { 'Green' })
+Write-Host ("Warnings during reveal           : {0}" -f $WarnedItems.Count) -ForegroundColor $(if ($WarnedItems.Count -gt 0) { 'Yellow' } else { 'Green' })
 
 foreach ($s in $SkippedItems)
 {
@@ -478,6 +493,10 @@ foreach ($s in $SkippedItems)
 foreach ($f in $FailedItems)
 {
     Write-Host ("  FAIL: {0} - {1}" -f $f.Folder, $f.Reason) -ForegroundColor Red
+}
+foreach ($w in $WarnedItems)
+{
+    Write-Host ("  WARN: {0} - {1}" -f $w.Folder, $w.Message) -ForegroundColor Yellow
 }
 
 Write-Host ""

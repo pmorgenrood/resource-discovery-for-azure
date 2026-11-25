@@ -777,8 +777,8 @@ function Invoke-RdaReveal
         # steps run. Uses the shared Write-RdaProgress when it is
         # loaded (single-report mode via Reveal.ps1, which dot-sources
         # Common.Functions); in the all-subscriptions child job the helper is
-        # absent AND the job's output is suppressed, so guard on its presence and
-        # no-op there (the wrapper shows a per-folder heartbeat instead).
+        # absent AND the job's output is hidden but for its warnings, so guard on its
+        # presence and no-op there (the wrapper shows a per-folder heartbeat instead).
         $EmitProgress = [bool](Get-Command -Name Write-RdaProgress -ErrorAction SilentlyContinue)
         if ($EmitProgress) { Write-RdaProgress -Activity 'Revealing report' -CurrentItem 'Expanding archive' -Index 1 -Total 3 }
         # Use System.IO.Compression directly instead of Expand-Archive /

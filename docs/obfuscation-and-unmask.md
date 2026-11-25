@@ -399,7 +399,9 @@ All-subscriptions-mode parameters: `-InventoryRoot`, `-StagingDirectory`,
 `-RemoveStaging`, `-Resume` (plus the common `-Fields`, `-All`, `-OutputZip`).
 Each per-folder reveal runs in a time-bounded background job so one pathological
 report cannot stall the whole batch; failed/timed-out folders are reported and
-recoverable with `-Resume`.
+recoverable with `-Resume`. A warning a folder's reveal writes (such as a token
+it leaves masked in id paths) is shown with the folder's name when that folder
+is done, and again in the summary; the folder still counts as revealed.
 
 ---
 

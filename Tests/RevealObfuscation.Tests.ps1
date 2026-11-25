@@ -878,6 +878,55 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
             }
             return $Result
         }
+
+        # Runs Reveal.ps1 in the all-subscriptions mode, in its own pwsh, on a tree with the folders
+        # sub-old (the older report and dictionary, whose reveal warns) and sub-new (this file's
+        # report and dictionary, as a run of this build writes them), and sub-bad (the older report
+        # with -BadDictionary) when one is given. Returns the console lines, the exit code and the
+        # outer zip.
+        function Invoke-OldTreeReveal
+        {
+            param([string[]]$Extra, [System.Collections.IDictionary]$BadDictionary)
+            $Dir = Join-Path $script:OldDir ("tree_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $Root = Join-Path $Dir 'root'
+            foreach ($Name in 'sub-old', 'sub-new') { New-Item -ItemType Directory -Path (Join-Path $Root $Name) -Force | Out-Null }
+            Copy-Item -LiteralPath $script:OldZip -Destination (Join-Path $Root 'sub-old/ResourcesReport_Older.zip')
+            Get-OldDictionary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Root 'sub-old/ObfuscationDictionary_Older.json') -Encoding utf8
+            Copy-Item -LiteralPath $script:InputZip -Destination (Join-Path $Root 'sub-new/ResourcesReport_Test.zip')
+            Copy-Item -LiteralPath $script:DictPath -Destination (Join-Path $Root 'sub-new/ObfuscationDictionary_Test.json')
+            if ($null -ne $BadDictionary)
+            {
+                New-Item -ItemType Directory -Path (Join-Path $Root 'sub-bad') -Force | Out-Null
+                Copy-Item -LiteralPath $script:OldZip -Destination (Join-Path $Root 'sub-bad/ResourcesReport_Bad.zip')
+                $BadDictionary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Root 'sub-bad/ObfuscationDictionary_Bad.json') -Encoding utf8
+            }
+            $Out = Join-Path $Dir 'outer.zip'
+            $Pwsh = (Get-Process -Id $PID).Path
+            $Console = @(& $Pwsh -NoProfile -NonInteractive -File $script:RevealScript -InventoryRoot $Root -OutputZip $Out -FolderTimeoutMinutes 5 @Extra 2>&1 | ForEach-Object { [string]$_ -replace '\x1b\[[0-9;]*m', '' })
+            return [pscustomobject]@{ Console = $Console; Exit = $LASTEXITCODE; OutputZip = $Out }
+        }
+
+        # The older folder's warning is shown with its folder's name when that folder is done and
+        # again in the summary, $Warn time(s) each, with the summary's count; no other folder warns,
+        # and the warning names the token and holds no real value.
+        function Assert-OldTreeWarning
+        {
+            param([object]$Run, [int]$Warn)
+            $Because = $Run.Console -join [Environment]::NewLine
+            $Summary = [array]::IndexOf([string[]]$Run.Console, '================ Reveal Summary ================')
+            $Summary | Should -BeGreaterThan -1 -Because $Because
+            $Mine = @(for ($i = 0; $i -lt $Run.Console.Count; $i++) { if ($Run.Console[$i] -like '  WARN: sub-old - *' -and $Run.Console[$i] -match 'display name' -and $Run.Console[$i] -match 'subscription id') { $i } })
+            @($Mine | Where-Object { $_ -lt $Summary }).Count | Should -Be $Warn -Because ('the warning is shown when its folder is done: ' + $Because)
+            @($Mine | Where-Object { $_ -gt $Summary }).Count | Should -Be $Warn -Because ('the warning is shown again in the summary: ' + $Because)
+            @($Run.Console | Where-Object { $_ -match "^Warnings during reveal\s+: $Warn$" }).Count | Should -Be 1 -Because $Because
+            @($Run.Console | Where-Object { $_ -like '  WARN: *' -and $_ -notlike '  WARN: sub-old - *' }).Count | Should -Be 0 -Because 'no other folder warns'
+            foreach ($i in $Mine)
+            {
+                $Run.Console[$i] | Should -Match ([regex]::Escape($script:OldTok.Sub)) -Because 'the warning names the token'
+                $Run.Console[$i] | Should -Match 'leaves it masked in any other id path'
+                foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'vm-one', 'rg-app') { $Run.Console[$i] | Should -Not -Match ([regex]::Escape($Real)) -Because 'the warning holds no real value' }
+            }
+        }
     }
 
     It "reveals, with <Mode>, the report of two subscriptions with one display name and one token, keeps that token in an id path the dictionary does not hold whole, and warns <Warn> time(s)" -ForEach @(
@@ -932,6 +981,41 @@ Describe "Reveal-Obfuscation reads an older dictionary whose one subscription to
             foreach ($Real in $script:OldSub1, $script:OldSub2, $script:OldSubName, 'vm-one', 'rg-app') { $W | Should -Not -Match ([regex]::Escape($Real)) -Because 'the warning holds no real value' }
         }
         (Get-FileHash -LiteralPath $script:OldZip -Algorithm SHA256).Hash | Should -Be $script:OldZipHash
+    }
+
+    # In the all-subscriptions mode each folder is revealed in a job. The reveal's warnings come
+    # back from the job: each one is shown with its folder's name when that folder is done, and
+    # again in the summary. The folder still counts as revealed and the exit code is unchanged.
+    It "shows, in the all-subscriptions mode with <Mode>, the warning of the folder whose older dictionary gives two subscriptions one token, with its folder's name, <Warn> time(s), and again in the summary" -ForEach @(
+        @{ Mode = 'the default fields'; Extra = @(); Warn = 1 }
+        @{ Mode = '-All'; Extra = @('-All'); Warn = 1 }
+        @{ Mode = '-Fields Tag'; Extra = @('-Fields', 'Tag'); Warn = 0 }
+    ) {
+        $Run = Invoke-OldTreeReveal -Extra $Extra
+        $Because = $Run.Console -join [Environment]::NewLine
+        $Run.Exit | Should -Be 0 -Because $Because
+        Test-Path -LiteralPath $Run.OutputZip | Should -BeTrue -Because $Because
+        @($Run.Console | Where-Object { $_ -match '^Revealed successfully\s+: 2$' }).Count | Should -Be 1 -Because 'both folders are revealed'
+        @($Run.Console | Where-Object { $_ -match '^Failed during reveal\s+: 0$' }).Count | Should -Be 1
+        Assert-OldTreeWarning -Run $Run -Warn $Warn
+    }
+
+    It "still records a folder whose dictionary Reveal refuses as FAIL, with exit 4, and shows the warning of the folder it reveals" {
+        $Bad = Get-OldDictionary
+        $Bad.Remove('SubscriptionNameMap')
+        $Run = Invoke-OldTreeReveal -Extra @() -BadDictionary $Bad
+        $Because = $Run.Console -join [Environment]::NewLine
+        $Run.Exit | Should -Be 4 -Because ('a folder that failed gives exit 4, as before: ' + $Because)
+        @($Run.Console | Where-Object { $_ -match '^Revealed successfully\s+: 2$' }).Count | Should -Be 1 -Because $Because
+        @($Run.Console | Where-Object { $_ -match '^Failed during reveal\s+: 1$' }).Count | Should -Be 1 -Because $Because
+        @($Run.Console | Where-Object { $_ -like '  FAIL: sub-bad - *' -and $_ -match 'no display name' }).Count | Should -Be 1 -Because 'the refused folder is a FAIL with its reason, as before'
+        @($Run.Console | Where-Object { $_ -like '  WARN: sub-bad - *' }).Count | Should -Be 0 -Because 'the refused folder wrote no warning before it stopped'
+        Assert-OldTreeWarning -Run $Run -Warn 1
+    }
+
+    It "says in the doc that a folder's warnings are shown with its name when it is done and again in the summary, and that the folder still counts as revealed" {
+        $Doc = (Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/obfuscation-and-unmask.md') -Raw) -replace '\s+', ' '
+        $Doc | Should -Match ([regex]::Escape("A warning a folder's reveal writes (such as a token it leaves masked in id paths) is shown with the folder's name when that folder is done, and again in the summary; the folder still counts as revealed."))
     }
 
     It "still stops with <Mode> when <Case>, names the token and both places, and writes nothing" -ForEach @(
